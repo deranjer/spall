@@ -372,6 +372,72 @@ impl LabelCache {
         Self::default()
     }
 
+    /// Warm exact local connectivity and content digests from an immutable live volume.
+    /// Workers compute only; this caller validates revisions and publishes cache entries.
+    /// One queued 64-brick batch per worker bounds temporary labels, even for large worlds.
+    /// Global support is still assembled and validated by the normal analysis path.
+    pub fn warm_volume(&self, volume: &spall_voxel::Volume, workers: usize) {
+        const BATCH: usize = 64;
+        let coords = volume.resident_brick_coords();
+        let batches = coords.len().div_ceil(BATCH);
+        let workers = workers.clamp(1, 16).min(batches.max(1));
+        // Workers pull the next batch from a shared counter, so a slow batch (a complex surface
+        // brick) never leaves the others idle, and the owner publishes results in arrival
+        // order. The cache is keyed by brick and revision, so publication order is not
+        // observable. The channel holds at most two batches per worker, which bounds the
+        // temporary labels held outside the cache.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel(workers * 2);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let (coords, next) = (&coords, &next);
+                scope.spawn(move || {
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(chunk) = coords.chunks(BATCH).nth(index) else {
+                            return;
+                        };
+                        let mut batch = Vec::new();
+                        for &coord in chunk {
+                            let snapshot = volume
+                                .snapshot_brick(coord)
+                                .expect("resident coordinate in immutable volume")
+                                .expect("resident coordinate has geometry");
+                            let _ = (snapshot.content_hash(), snapshot.solid_cells());
+                            let key = (coord.x, coord.y, coord.z);
+                            let revision = snapshot.revision();
+                            if self.get(volume.id(), key, revision).is_none() {
+                                batch.push((coord, revision, Arc::new(label_brick(&snapshot))));
+                            }
+                        }
+                        if tx.send(batch).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            for batch in rx {
+                for (coord, revision, labels) in batch {
+                    assert_eq!(
+                        volume.brick_revision(coord).ok().flatten(),
+                        Some(revision),
+                        "warm result must match the owning volume"
+                    );
+                    self.put(volume.id(), (coord.x, coord.y, coord.z), revision, labels);
+                }
+            }
+        });
+        self.retain_volume(volume.id(), |&(x, y, z)| {
+            volume
+                .brick_revision(spall_core::BrickCoord::new(x, y, z))
+                .ok()
+                .flatten()
+                .is_some()
+        });
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -436,6 +502,87 @@ impl LabelCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_parallel_warming_preserves_graphs_after_edits_and_eviction() {
+        use crate::{AnchorPlane, CancelToken, ResidencyMode, SupportGraph};
+        use spall_core::{BrickCoord, CellSizeCode, MaterialId};
+        use spall_voxel::{Brick, Volume};
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        // More than eight batches exercises bounded producer/owner handoffs.
+        for x in 0..513 {
+            volume
+                .insert_brick(
+                    BrickCoord::new(x, 0, 0),
+                    Brick::uniform(MaterialId(if x % 3 == 0 { 0 } else { 1 }), Revision(1)),
+                )
+                .unwrap();
+        }
+        let cells: Vec<_> = (0..CELLS_PER_BRICK)
+            .map(|i| {
+                if i % 32 == 16 {
+                    MaterialId::AIR
+                } else {
+                    MaterialId(u16::MAX)
+                }
+            })
+            .collect();
+        volume
+            .insert_brick(
+                BrickCoord::new(65, 0, 0),
+                Brick::restored(&cells, Revision(2), true),
+            )
+            .unwrap();
+        let original = volume.clone();
+        for workers in [1, 2, 8] {
+            let cache = LabelCache::new();
+            let mut live = original.clone();
+            for edited in [false, true] {
+                if edited {
+                    live.evict_brick(BrickCoord::new(4, 0, 0));
+                    live.insert_brick(
+                        BrickCoord::new(65, 0, 0),
+                        Brick::uniform(MaterialId(9), Revision(3)),
+                    )
+                    .unwrap();
+                }
+                cache.warm_volume(&live, workers);
+                assert_eq!(cache.len(), live.resident_brick_count());
+                for mode in [ResidencyMode::AllResident, ResidencyMode::Streamed] {
+                    let warm = SupportGraph::build_cached(
+                        &live,
+                        AnchorPlane::at(0),
+                        mode,
+                        &CancelToken::new(),
+                        &cache,
+                    )
+                    .unwrap();
+                    let cold =
+                        SupportGraph::build(&live, AnchorPlane::at(0), mode, &CancelToken::new())
+                            .unwrap();
+                    assert_eq!(warm.components(), cold.components());
+                    assert_eq!(
+                        warm.read_revisions().collect::<Vec<_>>(),
+                        cold.read_revisions().collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        warm.absent_dependencies().collect::<Vec<_>>(),
+                        cold.absent_dependencies().collect::<Vec<_>>()
+                    );
+                }
+            }
+            assert_eq!(
+                label_brick(
+                    &original
+                        .snapshot_brick(BrickCoord::new(65, 0, 0))
+                        .unwrap()
+                        .unwrap()
+                )
+                .count(),
+                2
+            );
+        }
+    }
+
     #[test]
     fn count_proven_labels_match_flood_fill_across_storage_and_cow_edits() {
         for unique in [3, 300, u16::MAX as usize] {

@@ -176,6 +176,14 @@ struct Args {
     /// matching every prior run's exact behavior.
     #[arg(long)]
     residency_budget_dense_bytes: Option<u64>,
+    /// Load spawn-area terrain first, then stream surrounding bricks as the player moves.
+    #[arg(long)]
+    stream_regions: bool,
+    /// With `--stream-regions`, receive the distant terrain digests after the baseline instead of
+    /// inside it. The client is ready once the spawn region and bodies arrive; transactions wait
+    /// for the catalogue and the world hash is not comparable until it completes.
+    #[arg(long, requires = "stream_regions")]
+    defer_catalogue: bool,
     /// **Testing only.** Gives this client runtime authority over its player
     /// and detached-body physics: it ignores server pose corrections, steps
     /// dynamic bodies locally, transfers player push impulses, and drives the
@@ -571,11 +579,27 @@ fn run_replication(args: Args) -> ExitCode {
             },
             ..TransportConfig::default()
         },
-        client_residency: (args.residency_budget_bricks > 0).then_some(
+        client_residency: (args.residency_budget_bricks > 0 || args.stream_regions).then_some(
             spall_client::ClientResidencyLimits {
-                budget_bricks: args.residency_budget_bricks,
-                interest_radius_bricks: args.residency_radius_bricks,
-                max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(u64::MAX),
+                stream_initial: args.stream_regions,
+                defer_catalogue: args.defer_catalogue,
+                budget_bricks: if args.stream_regions {
+                    16384
+                } else {
+                    args.residency_budget_bricks
+                },
+                interest_radius_bricks: if args.stream_regions {
+                    spall_protocol::segment::DEFAULT_REGION_RADIUS_BRICKS
+                } else {
+                    args.residency_radius_bricks
+                },
+                max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(
+                    if args.stream_regions {
+                        1024 * 1024 * 1024
+                    } else {
+                        u64::MAX
+                    },
+                ),
             },
         ),
         baseline_budget_bytes: u64::from(args.baseline_budget_mib) * 1024 * 1024,

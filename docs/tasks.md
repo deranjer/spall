@@ -1610,3 +1610,156 @@ MiB UDP receive-buffer diagnostic preserves default platform buffering/CUBIC.
 due-packet relay batching, versus prior 72.977 s. Single observations; no new
 full-world or G3/G4 acceptance. Next ENG-114: remaining pacing diagnosis, full-size
 reset convergence and integrated graph cost. See reports/ENG-114-commit-transfer.md.
+
+### ENG-129 - Editor Uncapped game launch checkbox
+
+Depends on ENG-126 and the existing sandbox client/xtask --uncapped option.
+Add an off-by-default Uncapped checkbox beside scene Run and generated-world
+Run in game. Both launch paths forward the current selection to the client;
+simulation ticks remain unchanged. Validate launch argument preservation,
+editor tests/build and refresh the portable distribution. Uncapped requests
+non-VSync presentation where supported; the FPS HUD measures actual throughput.
+Spawn-region-first startup is a separate join/streaming change, outside this
+assignment. Next unblocked loading/performance assignment remains ENG-114.
+
+### ENG-130 - Regional terrain startup and surrounding-region streaming
+
+User assignment following ENG-129; compatible with ENG-114/T17/T19 residency interfaces.
+Status: done. CPU checks, bounded startup measurements and packaged GPU smoke passed. Generated-world play negotiates a bounded
+spawn-neighborhood baseline and exact distant terrain digests. Bodies remain complete. Existing
+revision-validated repairs fetch geometry as interest moves; unknown local collision holds prediction.
+World resets atomically replace geometry and digests; legacy clients retain full baselines.
+Server generation and authoritative world storage remain whole-world. No G3/G5 workload downgrade.
+Evidence and exact checks: docs/reports/ENG-130-regional-startup.md.
+Next unblocked work: ENG-114, profile remaining authoritative generation/global catalogue startup cost.
+
+### ENG-114 authoritative startup and regional workload continuation (2026-10-06)
+
+Startup tracing isolates generation, collision, label/hash warming, baseline catalogue,
+encoding and client receive/install. Exact bounded local warming replaces a discarded
+startup global graph; source arrays are freed in bounded batches after all packed
+replacements are installed. In isolated 4096-cell seed-1 release observations, client
+readiness fell 29,692 to 18,612 ms with identical transfer/catalogue/final hash.
+Large regional stress exposed a source-patch resident/digest conflict; digest changes
+now stage with geometry before result-hash validation. Inline/bulk rejected-hash
+isolation and duplicate replay have regression coverage. Two full-size regional
+fixtures retain eight cuts, two resets and unchanged 16 MiB / 30 s impaired join
+bounds. Exact results and remaining gates: reports/ENG-114-startup-streaming.md.
+ENG-114 remains in progress; no larger acceptance gate is implied by startup gains.
+### ENG-114 regional replica convergence (2026-10-07)
+
+Per-process tracing (`SPALL_LOG_FILE`) found seven client-side causes of the full-size
+regional stress failure: unbounded reload requests overrunning the server's reliable
+backlog, evicted bricks treated as absent, partly-patched and already-patched
+transactions, held predecessors, a whole-volume hash on every repair request, and
+sparse server-tick observation. Each has a regression test. On the unchanged
+`eng114-regional-1024m-stress` fixture both clients now finish with the server's exact
+hash after two resets with zero rejections; the harness result is still failed because
+the mover's prediction criteria (0.75 m correction) are unmet. The impaired fixture's
+shaped client still misses its 30 s join and reset transfer. Evidence, measured vs
+target and remaining gates: reports/ENG-114-startup-streaming.md. ENG-114 remains in
+progress. Next: mover prediction under streaming, shaped-client transfer pacing,
+commit latency and reset cost.
+
+ENG-114 regional replica convergence, later 2026-10-07: the server writer no longer holds a
+client's motion datagrams behind serial bulk repair transfers (input `intended_tick` lag
+about 280 ticks to +-2; largest reconcile displacement 19.9 to 0.9 m), and the harness
+minimum-distance criterion counts an out-and-back mover's farthest point. The unchanged
+`eng114-regional-1024m-stress` fixture now reports passed (three consecutive runs). The
+impaired fixture still fails on the shaped client's 182 s join. Details and remaining
+gates: reports/ENG-114-startup-streaming.md.
+
+ENG-114 deferred terrain catalogue (2026-10-07, later): regional clients can receive the distant
+terrain digests after the baseline (wire tags 20 to 22, world version 5), so the shaped client's
+join no longer waits on a catalogue the link cannot carry in 30 s; world resets send only the
+digests that changed. `eng114-regional-1024m-impaired-deferred` passed twice (ready 24.6 s and
+22.6 s against the unchanged 30 s, 2.76 MB against 16 MiB, exact hashes, no rejections) and the
+original stress fixture and its deferred variant pass; the original impaired fixture still fails
+its 30 s join. Commit latency (p95 4 to 9 s), the 18 to 24 s reset stall and the eight-client,
+whole-foundation, soak and GPU gates remain open. Details: protocol.md and
+reports/ENG-114-startup-streaming.md.
+
+ENG-114 commit latency (2026-10-07, later): per-cut service time on the 196,608-brick world fell
+from about 1.0 s to about 0.5 s (staging 832 to 386 ms) by keeping the terrain's structure index
+warm across non-splitting commits (a clone instead of a rebuild, validated by a per-volume mutation
+stamp) and deriving the post-edit solid count from the touched bricks; the fixture's commit-latency
+p95 went from 5.7 s to 1.6 s (single runs). The 100 ms target is not met: whole-world graph
+reassembly (about 218 ms) and the whole-volume canonical hash (about 110 ms) remain per edit and
+need an incremental structure and hash. Details: reports/ENG-114-startup-streaming.md.
+
+ENG-114 commit latency, incremental graph and hash (2026-10-07, later still): per-cut work on the
+196,608-brick world is now about 135 ms (staging 80 ms, commit 54 ms; was about 1.0 s) because the
+support graph updates only the changed bricks and their neighbours and the canonical hash streams
+the unchanged byte layout. An ordinary cut takes about 210 ms admission to commit; the 100 ms
+target is not met. The fixture's single-brick p95 is NOT improved (2.7 s): its outliers are
+requests committed on the first ticks after the world reset, which still stalls the server for
+24 to 28 s. Next: attribute the post-reset tick, keep the index warm across splitting commits,
+shorten the reset. Details: reports/ENG-114-startup-streaming.md.
+
+ENG-114 (last): read validation takes an exact stamp fast path (commit.validate 20 ms to 0.002 ms);
+new per-request and per-tick logs show the fixture's slow ticks are (a) a burst of about eight
+serial edits every 60 ticks costing about 1.0 to 1.4 s of tick time because staging runs on the
+tick thread, and (b) the 20 to 29 s world reset, which runs before the tick. Single-brick p95 in
+the passing run was 1.39 s; the 100 ms target remains unmet. Next: stage off the tick thread or
+share structure instead of cloning; shorten the reset.
+
+ENG-114 (staging off the tick thread): a paced server now stages edits on a worker thread (opt-in
+`Simulation::enable_off_thread_staging`; headless runs stay inline; `SPALL_INLINE_STAGING=1` opts a
+paced server out). The recurring 1.0 to 1.4 s tick stalls under an edit burst are gone (0 ticks over
+500 ms outside startup and the two resets, two runs), single-brick p95 fell from 1.39 s to 0.53 to
+0.59 s, and the large collapse from 1.4 to 0.7 s. Per-edit latency is unchanged (about 160 to 230
+ms) so the 100 ms target is still unmet, and the 20 to 22 s reset is untouched. Commit order is
+strictly request order (the inline pipeline reorders conflicting edits). Details:
+reports/ENG-114-startup-streaming.md.
+
+ENG-114 (worked down the list): ordinary cuts now take 112 to 118 ms admission to commit and the
+single-brick p95 is 199 ms (was 1.4 s before off-thread staging), via an index prewarm on the
+worker, an index kept warm across splitting commits (the removal is applied by the next staging,
+checked against a fresh build by full token equality in debug builds), and a chunked
+copy-on-write brick store (volume clone 13 ms to 0.02 ms, lower peak memory). The 100 ms target
+is not met. The world reset was investigated (background build keeps the tick at ~59 Hz but
+exceeds the 8 GiB memory target and changes the scenario) and nothing shipped; it still stalls
+the server 25 to 30 s. Details: reports/ENG-114-startup-streaming.md.
+
+ENG-114 (resumable catalogue): a world reset that interrupts a client's catalogue now keeps the
+segments it verified (finer 128 KiB catalogue segments, a layout recorded per catalogue, the
+delta built against the delivered prefix and named in `CatalogueChunk.basis_chunks`). The
+impaired-deferred fixture, which had begun failing once the server stopped stalling, passes twice
+and re-sends essentially nothing (2.67 MB for the run against a 2.63 MB catalogue). Details:
+reports/ENG-114-startup-streaming.md and protocol.md.
+
+ENG-114 (per-edit latency): ordinary edits now take 65 to 88 ms admission to commit (from 112 to
+118 ms) by removing three worker-side O(world) costs (component-scan sort, read-token sort, warm
+index clone). Two cases in the fixture still exceed 100 ms (first cut 109 ms, cut behind a large
+collapse 128 ms); the commit's canonical hash (~16 ms) is now the largest remaining piece.
+
+ENG-114 (reset/startup): generation builds bricks compact from per-worker scratch buffers (14.6 s
+to 7.7 s, identical terrain digest) and terrain colliders are prepared in parallel and attached in
+canonical order (12.7 s to 3.0 s). Fixture resets now take 18 to 21 s (were 26 to 30 s). What is
+left is compute-bound generation (7.7 s) and allocation-bound label warming (about 5.5 s).
+
+ENG-114 (chunked hash): the canonical topology hash is now `spall.topology.v2`, a hash of
+per-chunk digests that a cache recomputes only for chunks whose stamps changed. The commit's hash
+fell from 16 to 20 ms to under 0.3 ms and ordinary edits take 47 to 55 ms. Protocol-visible:
+wire schema 4, `TOPOLOGY_HASH_VERSION` 2, v1 saves refused (not migrated). The shaped-link fixture
+`eng114-regional-1024m-impaired-deferred` currently fails because the faster server leaves its
+fixed-byte-budget link too little wall-clock in 7,200 ticks; it passes with 9,600 ticks. Decision
+needed. Details: reports/ENG-114-startup-streaming.md and protocol.md.
+
+ENG-114 (run drain): the server now keeps serving past `max_ticks` (up to `drain_timeout`, default
+300 s) while a regional client is still receiving a catalogue or essential records; the
+impaired-deferred fixture passes again unchanged (344 drain ticks). A timeout is reported in the
+summaries.
+
+ENG-114 (item 4): light soaks pass, including a 30-minute run through two world resets with eight
+regional clients (all converge, every scripted edit commits). Found and fixed on the way: silent
+loss of held transactions in the replica; the server's single input bridge dropping edits during a
+reset stall (repairs now have their own bridge, drops are counted); 22 to 57 Hz server tick (player
+collider exclusion, shared water frames). Harness: throttled-and-retried refusals no longer fail
+the admission check. Still open: G4 tick targets, reset stall length, post-reset memory, GPU gate.
+Details: reports/ENG-114-startup-streaming.md.
+
+ENG-114 (probe storm and shaped links): idle clients and the server were burning CPU on a control-probe
+feedback loop (25,000 records/s per client); fixed (one probe per 25 ms). World resets with eight
+clients: 38-62 s -> 14-16 s. The shaped-link fixtures eight-impaired and soak-light-impaired now carry a
+motion budget and pass. See reports/ENG-114-startup-streaming.md.

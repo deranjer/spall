@@ -39,6 +39,16 @@ impl Simulation {
             .as_ref()
             .map(|v| v.state.visual(&self.world.terrain().volume))
     }
+    /// What building the visual frame needs, detached from the simulation so the (milliseconds
+    /// long) work can run on another thread: the living state and the terrain, both cheap to
+    /// copy (the terrain shares its chunks).
+    pub fn vegetation_visual_input(
+        &self,
+    ) -> Option<(spall_ecology::living::LivingState, spall_voxel::Volume)> {
+        self.vegetation
+            .as_ref()
+            .map(|v| (v.state.clone(), self.world.terrain().volume.clone()))
+    }
     pub fn take_vegetation_journal(&mut self) -> Result<Option<Vec<u8>>, String> {
         let Some(v) = &mut self.vegetation else {
             return Ok(None);

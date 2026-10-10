@@ -6,7 +6,7 @@
 //! [`spall_jobs::JobToken`] is validated against the *live* world at commit
 //! time exactly like any other off-tick job result.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use glam::DQuat;
 use spall_core::{
@@ -21,7 +21,6 @@ use spall_physics::{
 };
 use spall_protocol::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
-    canonical_topology_hash,
 };
 use spall_structure::AnchorPlane;
 use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, EvictedBricks, Volume};
@@ -66,6 +65,44 @@ pub enum WorldError {
     WaterInitialization(String),
     #[error("vegetation initialization: {0}")]
     VegetationInitialization(String),
+}
+
+/// A terrain collider change: the revision it produced and the world box (min, max, metres) it
+/// touched, `None` meaning anywhere.
+type TerrainChange = (u64, Option<([f64; 3], [f64; 3])>);
+
+/// Most terrain collider changes remembered for window invalidation.
+const MAX_TERRAIN_CHANGES: usize = 4096;
+
+/// Whether every terrain collider change after `built_revision` up to `current_revision` is
+/// recorded in `changes` and lies outside the collision window centred at `centre` (world
+/// metres). A change that is unrecorded, or recorded as "anywhere", or older than the log
+/// reaches, answers `false`: the window must be rebuilt.
+fn changes_miss_window(
+    changes: &VecDeque<TerrainChange>,
+    floor: u64,
+    built_revision: u64,
+    current_revision: u64,
+    centre: [f64; 3],
+) -> bool {
+    if built_revision < floor || built_revision > current_revision {
+        return false;
+    }
+    let reach = f64::from(spall_physics::WINDOW_RADIUS_M) + 1.0;
+    let mut seen = 0u64;
+    for (revision, region) in changes.iter().filter(|(r, _)| *r > built_revision) {
+        let Some((lo, hi)) = region else {
+            return false;
+        };
+        let overlaps = (0..3).all(|a| lo[a] <= centre[a] + reach && hi[a] >= centre[a] - reach);
+        if overlaps {
+            return false;
+        }
+        debug_assert!(*revision <= current_revision);
+        seen += 1;
+    }
+    // Every revision in between must have been recorded; a bump made elsewhere is unknown.
+    seen == current_revision - built_revision
 }
 
 /// A detached body being reinstated from a persisted checkpoint record.
@@ -127,6 +164,15 @@ pub enum TerrainColliderMode {
     WholeTerrain,
 }
 
+/// One solid terrain brick's collider, built ahead of being attached to the solver.
+struct PreparedTerrainBrick {
+    coord: BrickCoord,
+    representation: spall_physics::Representation,
+    translation_m: [f32; 3],
+    collider: spall_physics::PreparedCollider,
+    revision: Revision,
+}
+
 /// Derived terrain collision for one resident brick. The authoritative volume
 /// and its logical digests remain the source of truth; this record only keeps
 /// the stable physics body needed to retire/reload collision without touching
@@ -139,7 +185,30 @@ struct TerrainBrickCollider {
 }
 
 /// The authoritative simulation world.
+/// A structure index remembered across commits; see [`SimWorld::warm_structure_index`].
+struct WarmStructure {
+    volume: VolumeId,
+    stamp: u64,
+    epoch: TopologyEpoch,
+    anchor: AnchorPlane,
+    index: std::sync::Arc<spall_structure::StructureIndex>,
+    /// When a commit that split a body left this index, the removal of the detached cells that
+    /// still has to be applied to it: `index` describes the volume right after the cut. The
+    /// next staging applies it on its own thread, so the commit pays nothing for it.
+    pending_removal: Option<spall_voxel::EditOutcome>,
+}
+
 pub struct SimWorld {
+    /// The terrain's structure index as the last non-splitting commit left it, valid only while
+    /// the terrain volume still carries the stamp it was recorded under (see
+    /// [`spall_voxel::Volume::state_stamp`]). Staging clones it instead of rebuilding the
+    /// whole-world index; any other mutation of the volume makes it stale.
+    warm_structure: Option<WarmStructure>,
+    /// Per-chunk digests of each volume's logical contents, so hashing after a small edit
+    /// recomputes only the chunks that changed (see [`refresh_logical_chunk_digests`]). Behind a
+    /// mutex because hashing is `&self`; valid by construction, since a digest is reused only
+    /// while the chunk's stamps are unchanged.
+    hash_caches: std::sync::Mutex<BTreeMap<u64, spall_protocol::ChunkDigestCache>>,
     registry: IdRegistry,
     materials: spall_core::MaterialManifest,
     anchor: AnchorPlane,
@@ -159,6 +228,16 @@ pub struct SimWorld {
     /// whole-terrain comparison run; residency still switches it to bricks
     /// before eviction so an evicted brick never retains collision.
     terrain_brick_colliders: Option<BTreeMap<BrickCoord, TerrainBrickCollider>>,
+    /// Recent terrain collider changes, newest last: `(revision after the change, the world box
+    /// it touched)`, `None` meaning "anywhere". A player's collision window is rebuilt only when
+    /// a change since it was built can reach it (see [`changes_miss_window`]).
+    terrain_changes: VecDeque<TerrainChange>,
+    /// Revision of the oldest change dropped from [`Self::terrain_changes`]; a window older than
+    /// this cannot be proved unaffected and is rebuilt.
+    terrain_changes_floor: u64,
+    /// Every terrain collider as a prebuilt exclusion for character queries; dropped whenever the
+    /// terrain colliders change and rebuilt on the next player step.
+    terrain_exclusion: Option<spall_physics::ColliderExclusion>,
     /// ENG-69 round 18: each live player's own bounded terrain-query window
     /// (`spall_physics::query_cache`'s own doc has the full design) — keyed
     /// the same as `players`, kept in sync with it by `advance_players`
@@ -290,6 +369,8 @@ impl SimWorld {
             registry,
             materials: setup.materials,
             anchor: setup.anchor,
+            warm_structure: None,
+            hash_caches: std::sync::Mutex::new(BTreeMap::new()),
             generation: Generation::START,
             topology_epoch: TopologyEpoch::START,
             terrain,
@@ -299,6 +380,9 @@ impl SimWorld {
             physics_origin,
             physics,
             terrain_brick_colliders: None,
+            terrain_changes: VecDeque::new(),
+            terrain_changes_floor: 0,
+            terrain_exclusion: None,
             query_caches: BTreeMap::new(),
             window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
@@ -404,25 +488,88 @@ impl SimWorld {
 
     /// Installs the per-brick terrain representation from the fully resident
     /// snapshot, at startup by default or before the first legacy-mode eviction.
+    /// Prepares the collider of every solid brick in `coords` (a run of the canonical order): the
+    /// plan, the full-resolution grid in the solver frame, and the built shape. Pure in the
+    /// terrain snapshot, so any number of these run at once.
+    fn prepare_terrain_colliders(
+        terrain: &Volume,
+        origin: PhysicsOrigin,
+        coords: &[BrickCoord],
+    ) -> Result<Vec<PreparedTerrainBrick>, WorldError> {
+        let cell_m = terrain.cell_size().metres() as f32;
+        let mut out = Vec::with_capacity(coords.len());
+        for &coord in coords {
+            let Some(plan) = Self::plan_terrain_brick(terrain, coord)? else {
+                continue;
+            };
+            // Validate the collider before anything is attached. Only the chosen
+            // representation is kept: the grid itself is rebuilt below at full resolution
+            // (a 32-cubed grid per solid brick must not be retained for the whole world).
+            origin
+                .localize_terrain_grid(plan.grid, f64::from(cell_m))
+                .ok_or(WorldError::PhysicsFrameOutOfRange)?;
+            let min = GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32);
+            let max = GlobalCell::new(min.x + 31, min.y + 31, min.z + 31);
+            let fine = OccupancyGrid::from_region(terrain, min, max)?;
+            let (grid, translation_m) = origin
+                .localize_terrain_grid(fine, f64::from(cell_m))
+                .ok_or(WorldError::PhysicsFrameOutOfRange)?;
+            out.push(PreparedTerrainBrick {
+                coord,
+                representation: plan.representation,
+                translation_m,
+                collider: spall_physics::PreparedCollider::new(&grid, cell_m, plan.representation),
+                revision: terrain
+                    .brick_revision(coord)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Revision::ZERO),
+            });
+        }
+        Ok(out)
+    }
+
     fn ensure_terrain_brick_colliders(&mut self) -> Result<(), WorldError> {
         if self.terrain_brick_colliders.is_some() {
             return Ok(());
         }
         let terrain = self.terrain.volume.clone();
-        let mut planned = Vec::new();
-        for coord in terrain.resident_brick_coords() {
-            let Some(plan) = Self::plan_terrain_brick(&terrain, coord)? else {
-                continue;
-            };
-            // Validate every collider before retiring the legacy representation,
-            // but retain only its policy, not a 32-cubed occupancy grid per
-            // solid brick. The immutable terrain snapshot can reproduce each
-            // grid during publication. Full-world grid staging otherwise costs
-            // several GiB even though physics consumes one grid at a time.
-            self.physics_origin
-                .localize_terrain_grid(plan.grid, f64::from(terrain.cell_size().metres() as f32))
-                .ok_or(WorldError::PhysicsFrameOutOfRange)?;
-            planned.push((coord, plan.representation));
+        let cell_m = terrain.cell_size().metres() as f32;
+
+        // Planning a brick's collider, extracting its grid and building its shape are pure
+        // functions of the immutable terrain snapshot, so every brick is prepared in parallel.
+        // Only attaching a prepared collider to the solver needs `&mut self`, and that happens
+        // below on one thread in canonical brick order, so ids and handles do not depend on
+        // how the work was divided.
+        let coords = terrain.resident_brick_coords();
+        let origin = self.physics_origin;
+        // Shape construction allocates heavily, so on a machine with simultaneous multithreading
+        // the allocator becomes the limit before the cores do, and the labelling that follows
+        // is slower after a wider build. Measured on 8 cores / 16 threads for the full 4096-cell
+        // world (build + labels): 1 worker 15.8 s, 8 workers 9.1 s, 12 workers 9.4 s; the build
+        // alone is 10.0 s, 4.7 s, 2.8 s, 2.5 s and 4.4 s for 1, 4, 8, 12 and 16 workers.
+        // Half the logical threads, at most 8, is the best end to end.
+        let threads = (std::thread::available_parallelism().map_or(1, |n| n.get()) / 2).clamp(1, 8);
+        let per_worker = coords.len().div_ceil(threads).max(1);
+        let mut chunks = Vec::new();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = coords
+                .chunks(per_worker)
+                .map(|chunk| {
+                    let terrain = &terrain;
+                    scope.spawn(move || Self::prepare_terrain_colliders(terrain, origin, chunk))
+                })
+                .collect();
+            for handle in handles {
+                // A panicked worker must fail the build, not yield a world with missing colliders.
+                chunks.push(handle.join().expect("terrain collider worker panicked"));
+            }
+        });
+        // Chunks are contiguous runs of the canonical order, so the first error in chunk order is
+        // the first error a serial pass would have hit.
+        let mut prepared = Vec::with_capacity(coords.len());
+        for chunk in chunks {
+            prepared.extend(chunk?);
         }
 
         // The legacy fixed body is no longer used after this one-way switch.
@@ -430,44 +577,49 @@ impl SimWorld {
         // active set (which also skews dormancy/physics-body accounting).
         self.physics.retire_body(self.terrain.phys);
         let mut colliders = BTreeMap::new();
-        let cell_m = terrain.cell_size().metres() as f32;
-        for (coord, representation) in planned {
-            let min = GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32);
-            let max = GlobalCell::new(min.x + 31, min.y + 31, min.z + 31);
-            // Identical snapshot/coordinates already passed extraction and
-            // localization above; no live mutation occurs between the passes.
-            let fine = OccupancyGrid::from_region(&terrain, min, max)?;
-            let (grid, translation_m) = self
-                .physics_origin
-                .localize_terrain_grid(fine, f64::from(cell_m))
-                .ok_or(WorldError::PhysicsFrameOutOfRange)?;
-            let phys = self.physics.add_body(BodySpec {
-                kind: PhysBodyKind::Fixed,
-                representation,
-                grid,
-                cell_m,
-                density_kg_m3: 1.0,
-                mass_properties: None,
-                translation_m,
-                linvel_m_s: [0.0; 3],
-            });
-            let revision = terrain
-                .brick_revision(coord)
-                .ok()
-                .flatten()
-                .unwrap_or(Revision::ZERO);
+        for brick in prepared {
+            let phys = self.physics.add_prepared_body(
+                spall_physics::PreparedBodySpec {
+                    kind: PhysBodyKind::Fixed,
+                    representation: brick.representation,
+                    cell_m,
+                    density_kg_m3: 1.0,
+                    mass_properties: None,
+                    translation_m: brick.translation_m,
+                    linvel_m_s: [0.0; 3],
+                },
+                brick.collider,
+            );
             colliders.insert(
-                coord,
+                brick.coord,
                 TerrainBrickCollider {
                     phys,
-                    built_revision: revision,
+                    built_revision: brick.revision,
                     has_collider: true,
                 },
             );
         }
         self.terrain_brick_colliders = Some(colliders);
-        self.terrain.collider_revision += 1;
+        self.note_terrain_collider_change(None);
         Ok(())
+    }
+
+    /// Bumps the terrain collider revision and records what it touched (`None`: anywhere).
+    fn note_terrain_collider_change(&mut self, region: Option<([f64; 3], [f64; 3])>) {
+        self.terrain.collider_revision += 1;
+        if region.is_none() {
+            // Bodies may have come or gone anywhere. An edit inside a brick leaves the set of
+            // terrain bodies alone (its collider keeps the same body id), so the cached
+            // exclusion stays valid; publishing a brick that had no body drops it below.
+            self.terrain_exclusion = None;
+        }
+        self.terrain_changes
+            .push_back((self.terrain.collider_revision, region));
+        while self.terrain_changes.len() > MAX_TERRAIN_CHANGES {
+            if let Some((revision, _)) = self.terrain_changes.pop_front() {
+                self.terrain_changes_floor = revision;
+            }
+        }
     }
 
     /// Publishes one brick's derived collider. A missing entry gets a fresh
@@ -543,7 +695,12 @@ impl SimWorld {
             .as_mut()
             .expect("terrain brick state initialized")
             .insert(coord, next);
-        self.terrain.collider_revision += 1;
+        if existing.is_none() {
+            self.terrain_exclusion = None;
+        }
+        let edge = f64::from(spall_core::BRICK_EDGE) * f64::from(cell_m);
+        let lo = [coord.x, coord.y, coord.z].map(|c| c as f64 * edge);
+        self.note_terrain_collider_change(Some((lo, lo.map(|v| v + edge))));
         Ok(())
     }
 
@@ -797,6 +954,84 @@ impl SimWorld {
         self.generation
     }
 
+    /// The warm structure index for `volume` if it was recorded for exactly the volume state
+    /// `stamp` under the current topology epoch and anchor.
+    pub fn warm_structure_index(
+        &self,
+        volume: VolumeId,
+        stamp: u64,
+    ) -> Option<std::sync::Arc<spall_structure::StructureIndex>> {
+        self.warm_structure
+            .as_ref()
+            .filter(|w| {
+                w.volume == volume
+                    && w.stamp == stamp
+                    && w.epoch == self.topology_epoch
+                    && w.anchor == self.anchor
+            })
+            .map(|w| w.index.clone())
+    }
+
+    /// Takes the warm index for `volume` in state `stamp` out of the world, with its pending
+    /// removal. The caller owns it outright, so staging can edit it in place instead of cloning
+    /// the whole-world index; nothing is warm again until a commit puts the edited one back.
+    pub(crate) fn take_warm_structure(
+        &mut self,
+        volume: VolumeId,
+        stamp: u64,
+    ) -> Option<(
+        std::sync::Arc<spall_structure::StructureIndex>,
+        Option<spall_voxel::EditOutcome>,
+    )> {
+        let matches = self.warm_structure.as_ref().is_some_and(|w| {
+            w.volume == volume
+                && w.stamp == stamp
+                && w.epoch == self.topology_epoch
+                && w.anchor == self.anchor
+        });
+        matches
+            .then(|| self.warm_structure.take())
+            .flatten()
+            .map(|w| (w.index, w.pending_removal))
+    }
+
+    /// The removal of detached cells still to be applied to [`Self::warm_structure_index`] for
+    /// the same `volume` and `stamp`, if a splitting commit left one.
+    pub fn warm_structure_removal(
+        &self,
+        volume: VolumeId,
+        stamp: u64,
+    ) -> Option<spall_voxel::EditOutcome> {
+        self.warm_structure
+            .as_ref()
+            .filter(|w| {
+                w.volume == volume
+                    && w.stamp == stamp
+                    && w.epoch == self.topology_epoch
+                    && w.anchor == self.anchor
+            })
+            .and_then(|w| w.pending_removal.clone())
+    }
+
+    /// Records `index` as describing `volume` in state `stamp` right now, once
+    /// `pending_removal` (if any) has been applied to it.
+    pub(crate) fn set_warm_structure(
+        &mut self,
+        volume: VolumeId,
+        stamp: u64,
+        index: std::sync::Arc<spall_structure::StructureIndex>,
+        pending_removal: Option<spall_voxel::EditOutcome>,
+    ) {
+        self.warm_structure = Some(WarmStructure {
+            volume,
+            stamp,
+            epoch: self.topology_epoch,
+            anchor: self.anchor,
+            index,
+            pending_removal,
+        });
+    }
+
     pub fn topology_epoch(&self) -> TopologyEpoch {
         self.topology_epoch
     }
@@ -985,6 +1220,7 @@ impl SimWorld {
         // edit invalidated the player — not the steady-state movement path
         // the window cache targets — and the real terrain is the simplest,
         // safest thing to resolve fresh solid-vs-player penetration against.
+        let depenetration_span = crate::prof::Span::start("players.depenetrate");
         {
             let physics = &self.physics;
             let physics_origin = self.physics_origin;
@@ -1012,6 +1248,8 @@ impl SimWorld {
                 }
             }
         }
+
+        drop(depenetration_span);
 
         // Drop any query-cache entries for players that are no longer live
         // (`remove_player` only drops the `Player`; the window's own
@@ -1071,9 +1309,25 @@ impl SimWorld {
             fresh: bool,
             rebuilt: bool,
         }
+        let windows_span = crate::prof::Span::start("players.windows");
         let mut windows: Vec<PlayerWindow> = Vec::with_capacity(self.players.len());
         for (&key, player) in &self.players {
             let cache = self.query_caches.entry(key).or_default();
+            // A terrain edit elsewhere on the map leaves this player's window exactly as it was:
+            // confirm it current instead of rebuilding it (the rebuild costs ~100 ms on a full
+            // world, and every edit used to cost every player one).
+            if cache.revision() != terrain_revision
+                && let Some(centre) = cache.window_centre_m()
+                && changes_miss_window(
+                    &self.terrain_changes,
+                    self.terrain_changes_floor,
+                    cache.revision(),
+                    terrain_revision,
+                    centre,
+                )
+            {
+                cache.acknowledge_revision(terrain_revision);
+            }
             let result = cache.ensure_covers_in_frame(
                 &mut self.physics,
                 &self.terrain.volume,
@@ -1084,6 +1338,11 @@ impl SimWorld {
             );
             let fresh = matches!(result, Ok((Some(_), _)));
             let rebuilt = matches!(result, Ok((_, Some(_))));
+            if let Ok((_, Some(cost))) = &result {
+                crate::prof::record("players.window.extraction", cost.extraction);
+                crate::prof::record("players.window.collider", cost.collider);
+                crate::prof::record("players.window.query_sync", cost.query_sync);
+            }
             windows.push(PlayerWindow {
                 key,
                 window_id: cache.window_body_id(),
@@ -1105,7 +1364,14 @@ impl SimWorld {
         // else's sweep. Ordinary dynamic bodies (debris, detached
         // structures) are *never* excluded either way: they stay fully
         // visible, exactly as before this round.
-        let terrain_ids = self.terrain_physics_bodies();
+        drop(windows_span);
+        let sweep_span = crate::prof::Span::start("players.sweep");
+        if self.terrain_exclusion.is_none() {
+            let ids = self.terrain_physics_bodies();
+            self.terrain_exclusion = Some(self.physics.exclusion_for(ids));
+        }
+        let terrain_exclusion = self.terrain_exclusion.as_ref().expect("built just above");
+        let no_exclusion = spall_physics::ColliderExclusion::default();
         let physics_origin = self.physics_origin;
         for (key, player) in &mut self.players {
             let my = windows.iter().find(|w| w.key == *key);
@@ -1120,11 +1386,14 @@ impl SimWorld {
                 self.window_stats.terrain_fallbacks += 1;
             }
             let mut exclude: Vec<PhysBodyId> = Vec::with_capacity(windows.len());
-            if my_fresh {
-                exclude.extend(terrain_ids.iter().copied());
-            } else if let Some(id) = my_window_id {
+            if !my_fresh && let Some(id) = my_window_id {
                 exclude.push(id);
             }
+            let base = if my_fresh {
+                terrain_exclusion
+            } else {
+                &no_exclusion
+            };
             exclude.extend(
                 windows
                     .iter()
@@ -1148,7 +1417,9 @@ impl SimWorld {
                     .to_local_f32(pos)
                     .expect("player stayed inside the owning physics frame")
                     .map(f64::from);
-                physics.sweep_character_pushing_excluding(params, local, desired, dt_s, &exclude)
+                physics.sweep_character_pushing_excluding_set(
+                    params, local, desired, dt_s, base, &exclude,
+                )
             });
 
             // Bounded-fixture safety net: a capsule that leaves the world (bad
@@ -1161,6 +1432,7 @@ impl SimWorld {
 
             player.age_input();
         }
+        drop(sweep_span);
     }
 
     /// A mutable reference to whichever body owns `volume` (terrain or detached).
@@ -1312,7 +1584,7 @@ impl SimWorld {
             for id in self.terrain_physics_bodies() {
                 self.physics.remove_collider(id);
             }
-            self.terrain.collider_revision += 1;
+            self.note_terrain_collider_change(None);
             return;
         }
         let Some(&entity) = self.volume_owner.get(&volume.get()) else {
@@ -1595,6 +1867,11 @@ impl SimWorld {
             .ok_or(WorldError::UnknownVolume(source))?;
         for bb in &bv.bricks {
             let cells: Vec<MaterialId> = match &bb.cells {
+                BaselineCells::Digest { .. } => {
+                    return Err(WorldError::ReplayPrecondition(
+                        "regional digest in authoritative geometry".into(),
+                    ));
+                }
                 BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
                 BaselineCells::Dense(raw) => raw.iter().copied().map(MaterialId).collect(),
             };
@@ -2099,25 +2376,85 @@ impl SimWorld {
         )
     }
 
+    /// The volume `volume` and the owner it is hashed under, if it exists in this world.
+    fn hashed_volume(&self, volume: VolumeId) -> Option<(&Volume, CanonicalOwner)> {
+        if volume == self.terrain.volume_id {
+            Some((&self.terrain.volume, CanonicalOwner::Terrain))
+        } else {
+            let body = self.body_by_volume(volume)?;
+            Some((
+                &body.volume,
+                CanonicalOwner::Body(body.entity.expect("detached body has an entity")),
+            ))
+        }
+    }
+
+    fn lock_hash_caches(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<u64, spall_protocol::ChunkDigestCache>> {
+        self.hash_caches
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Canonical topology hash of `volume` (the world's volume of that id, or a commit candidate
+    /// standing in for it) over its **logical** bricks (resident plus this world's retained
+    /// evicted digests). Reuses the cached digest of every chunk whose stamps are unchanged, so
+    /// a candidate that differs from the live volume in a few bricks costs a few chunks.
+    pub fn logical_volume_hash(
+        &self,
+        volume: &Volume,
+        owner: CanonicalOwner,
+    ) -> Result<Hash32, spall_voxel::DigestError> {
+        let mut caches = self.lock_hash_caches();
+        let cache = caches.entry(volume.id().get()).or_default();
+        logical_volume_topology_hash_cached(cache, volume, self.evicted(volume.id()), owner)
+    }
+
     /// Canonical topology hash of just `volume`.
     pub fn volume_hash(&self, volume: VolumeId) -> Option<Hash32> {
-        self.canonical_volume(volume)
-            .map(|cv| canonical_topology_hash(&[cv]))
+        let (v, owner) = self.hashed_volume(volume)?;
+        Some(
+            self.logical_volume_hash(v, owner)
+                .expect("logical volume: resident/evicted digest invariant holds"),
+        )
     }
 
     /// Canonical topology hash of the whole world (terrain + every body).
     pub fn world_hash(&self) -> Hash32 {
-        let mut volumes = vec![
-            self.canonical_volume(self.terrain.volume_id)
-                .expect("terrain volume always exists"),
-        ];
+        let mut volumes: Vec<(&Volume, CanonicalOwner)> =
+            vec![(&self.terrain.volume, CanonicalOwner::Terrain)];
         for body in self.bodies.values() {
-            volumes.push(
-                self.canonical_volume(body.volume_id)
-                    .expect("body volume exists"),
-            );
+            volumes.push((
+                &body.volume,
+                CanonicalOwner::Body(body.entity.expect("detached body has an entity")),
+            ));
         }
-        canonical_topology_hash(&volumes)
+        let mut caches = self.lock_hash_caches();
+        // A removed body's cache would otherwise live for the life of the world.
+        caches.retain(|id, _| volumes.iter().any(|(v, _)| v.id().get() == *id));
+        let mut chunked: Vec<(
+            spall_protocol::HashedVolume,
+            Vec<(spall_protocol::ChunkKey, Hash32)>,
+        )> = Vec::with_capacity(volumes.len());
+        for (volume, owner) in &volumes {
+            let cache = caches.entry(volume.id().get()).or_default();
+            refresh_logical_chunk_digests(cache, volume, self.evicted(volume.id()))
+                .expect("logical volume: resident/evicted digest invariant holds");
+            chunked.push((
+                spall_protocol::HashedVolume {
+                    volume_id: volume.id(),
+                    cell_size: volume.cell_size(),
+                    owner: *owner,
+                },
+                cache.chunks(),
+            ));
+        }
+        let borrowed: Vec<_> = chunked
+            .iter()
+            .map(|(volume, chunks)| (*volume, chunks.as_slice()))
+            .collect();
+        spall_protocol::topology_hash_from_chunks(&borrowed)
     }
 
     /// Total solid cells across terrain and every body — the conservation
@@ -2145,6 +2482,10 @@ impl WorldView for SimWorld {
 
     fn topology_epoch(&self) -> TopologyEpoch {
         self.topology_epoch
+    }
+
+    fn state_stamp(&self, volume: VolumeId) -> Option<u64> {
+        self.volume_ref(volume).map(Volume::state_stamp)
     }
 
     fn brick_status(&self, brick: BrickRef) -> BrickStatus {
@@ -2196,7 +2537,8 @@ pub fn canonical_volume_for(volume: &Volume, owner: CanonicalOwner) -> Canonical
 /// [`SimWorld::volume_hash`] returns once the volume is installed, so a commit
 /// candidate can compute its result hashes before publishing.
 pub fn volume_topology_hash_for(volume: &Volume, owner: CanonicalOwner) -> Hash32 {
-    canonical_topology_hash(&[canonical_volume_for(volume, owner)])
+    logical_volume_topology_hash(volume, &spall_voxel::EvictedBricks::new(), owner)
+        .expect("a volume with no retained digests has no resident/evicted conflict")
 }
 
 /// [`canonical_volume_for`] over the **logical** brick set (T23 / G3 row 7):
@@ -2228,6 +2570,101 @@ pub fn canonical_logical_volume_for(
     })
 }
 
+/// The digest of one hash chunk of a volume's logical contents: its resident bricks plus the
+/// retained evicted digests, each coordinate once, in canonical order. `None` if the chunk holds
+/// no brick at all.
+fn digest_logical_chunk(
+    volume: &Volume,
+    evicted: &spall_voxel::EvictedBricks,
+    chunk: spall_protocol::ChunkKey,
+) -> Result<Option<Hash32>, spall_voxel::DigestError> {
+    let mut records: Vec<(BrickCoord, Revision, spall_voxel::BrickHash)> = volume
+        .chunk_resident_bricks(chunk)
+        .map(|(coord, brick)| (coord, brick.revision(), brick.content_hash()))
+        .collect();
+    records.extend(
+        evicted
+            .chunk_digests(chunk)
+            .map(|(coord, digest)| (coord, digest.revision, digest.content_hash)),
+    );
+    if records.is_empty() {
+        return Ok(None);
+    }
+    records.sort_unstable_by_key(|(coord, _, _)| coord.sort_key());
+    // A coordinate that is both resident and retained appears twice, adjacent, once sorted.
+    if let Some(pair) = records.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(spall_voxel::DigestError::ResidentEvictedConflict(pair[0].0));
+    }
+    Ok(Some(spall_protocol::chunk_digest_single_layer(
+        chunk,
+        records
+            .iter()
+            .map(|(coord, revision, hash)| spall_protocol::SingleLayerBrick {
+                coord: *coord,
+                revision: *revision,
+                layer_kind: MATERIAL_LAYER_KIND,
+                layer_bytes: hash.as_bytes(),
+            }),
+    )))
+}
+
+/// Brings `cache` up to date with the logical contents of `volume` plus `evicted`: it recomputes
+/// the digest of exactly the chunks whose stamps differ from what the cache last saw, in either
+/// store, and forgets chunks that no longer exist. Nobody has to report what changed; the stamps
+/// are replaced by every mutation and shared by clones, so the cache is valid whichever copy of the
+/// volume it is asked about. On error (a brick both resident and retained) the cache is unchanged.
+pub fn refresh_logical_chunk_digests(
+    cache: &mut spall_protocol::ChunkDigestCache,
+    volume: &Volume,
+    evicted: &spall_voxel::EvictedBricks,
+) -> Result<(), spall_voxel::DigestError> {
+    let mut stamps: BTreeMap<spall_protocol::ChunkKey, (u64, u64)> = BTreeMap::new();
+    for (chunk, stamp) in volume.chunk_stamps() {
+        stamps.entry(chunk).or_default().0 = stamp;
+    }
+    for (chunk, stamp) in evicted.chunk_stamps() {
+        stamps.entry(chunk).or_default().1 = stamp;
+    }
+    cache.refresh(stamps, |chunk| digest_logical_chunk(volume, evicted, chunk))
+}
+
+/// [`logical_volume_topology_hash`] reusing `cache`; see [`refresh_logical_chunk_digests`].
+pub fn logical_volume_topology_hash_cached(
+    cache: &mut spall_protocol::ChunkDigestCache,
+    volume: &Volume,
+    evicted: &spall_voxel::EvictedBricks,
+    owner: CanonicalOwner,
+) -> Result<Hash32, spall_voxel::DigestError> {
+    refresh_logical_chunk_digests(cache, volume, evicted)?;
+    let chunks = cache.chunks();
+    Ok(spall_protocol::topology_hash_from_chunks(&[(
+        spall_protocol::HashedVolume {
+            volume_id: volume.id(),
+            cell_size: volume.cell_size(),
+            owner,
+        },
+        chunks.as_slice(),
+    )]))
+}
+
+/// The topology hash of the single volume [`canonical_logical_volume_for`] describes, computed
+/// from chunk digests without materialising that description. Equal to
+/// `canonical_topology_hash(&[canonical_logical_volume_for(..)?])` (see
+/// `chunked_logical_hash_equals_the_canonical_hash`). With no cache to reuse every chunk is
+/// computed; a world keeps a cache per volume for the repeated case.
+pub fn logical_volume_topology_hash(
+    volume: &Volume,
+    evicted: &spall_voxel::EvictedBricks,
+    owner: CanonicalOwner,
+) -> Result<Hash32, spall_voxel::DigestError> {
+    logical_volume_topology_hash_cached(
+        &mut spall_protocol::ChunkDigestCache::default(),
+        volume,
+        evicted,
+        owner,
+    )
+}
+
 /// Count of solid cells in a volume (walks every resident brick).
 pub fn solid_cells(volume: &Volume) -> u64 {
     let mut total = 0u64;
@@ -2253,6 +2690,101 @@ pub fn cell_size_of(volume: &Volume) -> CellSizeCode {
 #[cfg(test)]
 mod terrain_plan_tests {
     use super::*;
+    use spall_protocol::canonical_topology_hash;
+
+    #[test]
+    fn the_storage_chunk_and_the_hash_chunk_are_the_same_size() {
+        // The cache validates a hash chunk by the stamp of the storage chunk with the same key.
+        assert_eq!(spall_voxel::CHUNK_SHIFT, spall_protocol::HASH_CHUNK_SHIFT);
+        for coord in [
+            BrickCoord::new(0, 0, 0),
+            BrickCoord::new(-1, 7, -9),
+            BrickCoord::new(8, -8, 17),
+        ] {
+            assert_eq!(
+                spall_voxel::chunk_of((coord.x, coord.y, coord.z)),
+                spall_protocol::chunk_of(coord)
+            );
+        }
+    }
+
+    #[test]
+    fn terrain_colliders_are_attached_in_canonical_brick_order() {
+        // The colliders are prepared in parallel; what the solver sees must not depend on how
+        // the bricks were divided among workers. Bodies are numbered in attachment order, so
+        // that order has to be the canonical brick order.
+        // A floor of 24 x 24 solid bricks: far more than there are workers, so the work really is
+        // divided among them.
+        let id = VolumeId::new(1).unwrap();
+        let mut volume = Volume::new(id, CellSizeCode::Quarter);
+        for z in 0..24 {
+            for x in 0..24 {
+                volume
+                    .insert_brick(
+                        BrickCoord::new(x, 0, z),
+                        spall_voxel::Brick::uniform(crate::fixtures::STONE, Revision(1)),
+                    )
+                    .unwrap();
+            }
+        }
+        let mut setup = crate::fixtures::flat_terrain_setup();
+        setup.terrain = volume;
+        setup.terrain_collider_region = (GlobalCell::new(0, 0, 0), GlobalCell::new(31, 9, 31));
+        setup.physics.disable_ccd = true;
+        let world = SimWorld::new(setup).unwrap();
+        let colliders = world
+            .terrain_brick_colliders
+            .as_ref()
+            .expect("per-brick colliders are the default");
+        let mut by_brick: Vec<(BrickCoord, u32)> = colliders
+            .iter()
+            .map(|(coord, collider)| (*coord, collider.phys.index()))
+            .collect();
+        assert!(
+            by_brick.len() > 8,
+            "the scene must have several solid bricks"
+        );
+        by_brick.sort_by_key(|(coord, _)| coord.sort_key());
+        assert!(
+            by_brick.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            "bodies follow canonical brick order: {by_brick:?}"
+        );
+    }
+
+    #[test]
+    fn chunked_logical_hash_equals_the_canonical_hash() {
+        let mut sim = crate::Simulation::new(crate::SimulationConfig::new(
+            crate::fixtures::flat_terrain_setup(),
+        ))
+        .unwrap();
+        let world = sim.world_mut();
+        let terrain = world.terrain_volume_id();
+        // Retain some digests so both resident and evicted bricks are in the hash.
+        let coords: Vec<BrickCoord> = world
+            .volume_ref(terrain)
+            .unwrap()
+            .resident_brick_coords()
+            .into_iter()
+            .step_by(3)
+            .collect();
+        for coord in coords {
+            world.evict_brick(terrain, coord).unwrap();
+        }
+        let volume = world.volume_ref(terrain).unwrap();
+        let evicted = world.evicted(terrain);
+        assert!(!evicted.is_empty(), "the check needs retained digests too");
+        let general = canonical_topology_hash(&[canonical_logical_volume_for(
+            volume,
+            evicted,
+            CanonicalOwner::Terrain,
+        )
+        .unwrap()]);
+        assert_eq!(
+            logical_volume_topology_hash(volume, evicted, CanonicalOwner::Terrain).unwrap(),
+            general
+        );
+        assert_eq!(world.volume_hash(terrain), Some(general));
+    }
 
     #[test]
     fn solid_count_matches_cell_reference_after_edits_and_snapshot_forks() {
@@ -2394,6 +2926,52 @@ mod terrain_plan_tests {
         assert!(matches!(
             SimWorld::plan_terrain_brick(&volume, BrickCoord::new(i64::MAX, 0, 0)),
             Err(WorldError::BrickCoordinateOverflow(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod window_change_tests {
+    use super::*;
+
+    fn log(entries: &[TerrainChange]) -> VecDeque<TerrainChange> {
+        entries.iter().copied().collect()
+    }
+    const FAR: ([f64; 3], [f64; 3]) = ([100.0; 3], [108.0; 3]);
+    const NEAR: ([f64; 3], [f64; 3]) = ([0.0; 3], [8.0; 3]);
+
+    #[test]
+    fn only_changes_outside_the_window_leave_it_current() {
+        let centre = [2.0, 2.0, 2.0];
+        let far = log(&[(5, Some(FAR)), (6, Some(FAR))]);
+        assert!(changes_miss_window(&far, 0, 4, 6, centre));
+        let near = log(&[(5, Some(FAR)), (6, Some(NEAR))]);
+        assert!(
+            !changes_miss_window(&near, 0, 4, 6, centre),
+            "a near change rebuilds"
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_unrecorded_change_forces_a_rebuild() {
+        let centre = [2.0; 3];
+        // "Anywhere".
+        assert!(!changes_miss_window(&log(&[(5, None)]), 0, 4, 5, centre));
+        // Revision 6 was bumped without being recorded.
+        assert!(!changes_miss_window(
+            &log(&[(5, Some(FAR))]),
+            0,
+            4,
+            6,
+            centre
+        ));
+        // The log no longer reaches back to the window's build.
+        assert!(!changes_miss_window(
+            &log(&[(9, Some(FAR))]),
+            7,
+            4,
+            9,
+            centre
         ));
     }
 }

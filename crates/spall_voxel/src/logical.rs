@@ -16,7 +16,7 @@
 //! durable acknowledgement, and I/O stay in `spall_server`; canonical encoding
 //! and hashing stay in `spall_protocol`.
 
-use std::collections::BTreeMap;
+use crate::chunk_store::{ChunkKey, ChunkStore};
 
 use spall_core::{BrickCoord, CELLS_PER_BRICK, LocalCell, Revision};
 
@@ -142,7 +142,11 @@ pub enum DigestError {
 /// a full baseline or recovery replaces the whole namespace.
 #[derive(Debug, Default, Clone)]
 pub struct EvictedBricks {
-    digests: BTreeMap<BrickCoord, BrickDigest>,
+    digests: ChunkStore<BrickDigest>,
+}
+
+fn key_of(coord: BrickCoord) -> (i64, i64, i64) {
+    (coord.x, coord.y, coord.z)
 }
 
 impl EvictedBricks {
@@ -155,20 +159,41 @@ impl EvictedBricks {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.digests.is_empty()
+        self.digests.len() == 0
     }
 
     pub fn get(&self, coord: BrickCoord) -> Option<BrickDigest> {
-        self.digests.get(&coord).copied()
+        self.digests.get(&key_of(coord)).copied()
     }
 
     pub fn contains(&self, coord: BrickCoord) -> bool {
-        self.digests.contains_key(&coord)
+        self.digests.get(&key_of(coord)).is_some()
+    }
+
+    /// Every chunk that holds a retained digest, with its stamp (see
+    /// [`Volume::chunk_stamps`]). Cloning the set shares chunks, so a staging snapshot of a
+    /// large evicted set is cheap.
+    pub fn chunk_stamps(&self) -> impl Iterator<Item = (ChunkKey, u64)> + '_ {
+        self.digests.chunk_stamps()
+    }
+
+    /// The retained digests of one chunk, in no particular order.
+    pub fn chunk_digests(
+        &self,
+        chunk: ChunkKey,
+    ) -> impl Iterator<Item = (BrickCoord, BrickDigest)> + '_ {
+        self.digests
+            .chunk_entries(chunk)
+            .map(|(&(x, y, z), &digest)| (BrickCoord::new(x, y, z), digest))
     }
 
     /// Digests in canonical `(z, y, x)` order.
     pub fn iter(&self) -> impl Iterator<Item = (BrickCoord, BrickDigest)> + '_ {
-        let mut items: Vec<_> = self.digests.iter().map(|(&c, &d)| (c, d)).collect();
+        let mut items: Vec<_> = self
+            .digests
+            .iter()
+            .map(|(&(x, y, z), &d)| (BrickCoord::new(x, y, z), d))
+            .collect();
         items.sort_by_key(|(c, _)| c.sort_key());
         items.into_iter()
     }
@@ -190,7 +215,7 @@ impl EvictedBricks {
     /// The caller removes the live geometry only after this returns `Ok`, on the
     /// owning thread; a failure here leaves geometry available.
     pub fn record(&mut self, coord: BrickCoord, digest: BrickDigest) -> Result<(), DigestError> {
-        match self.digests.get(&coord) {
+        match self.digests.get(&key_of(coord)) {
             Some(existing) if *existing == digest => Ok(()),
             Some(existing) => Err(DigestError::Conflict {
                 coord,
@@ -200,7 +225,7 @@ impl EvictedBricks {
                 offered_hash: digest.content_hash,
             }),
             None => {
-                self.digests.insert(coord, digest);
+                self.digests.insert(key_of(coord), digest);
                 Ok(())
             }
         }
@@ -221,7 +246,7 @@ impl EvictedBricks {
     pub fn verify_reload(&self, volume: &Volume, coord: BrickCoord) -> Result<(), DigestError> {
         let retained = self
             .digests
-            .get(&coord)
+            .get(&key_of(coord))
             .ok_or(DigestError::NoRetained(coord))?;
         let reloaded = BrickDigest::capture(volume, coord)?;
         if reloaded.revision == retained.revision && reloaded.content_hash == retained.content_hash
@@ -244,7 +269,7 @@ impl EvictedBricks {
     pub fn verify_candidate(&self, coord: BrickCoord, brick: &Brick) -> Result<(), DigestError> {
         let retained = self
             .digests
-            .get(&coord)
+            .get(&key_of(coord))
             .ok_or(DigestError::NoRetained(coord))?;
         let reloaded = BrickDigest::capture_brick(brick);
         if reloaded.revision == retained.revision && reloaded.content_hash == retained.content_hash
@@ -265,7 +290,7 @@ impl EvictedBricks {
     /// installed. `Err(NoRetained)` if nothing was retained for `coord`.
     pub fn clear(&mut self, coord: BrickCoord) -> Result<BrickDigest, DigestError> {
         self.digests
-            .remove(&coord)
+            .remove(&key_of(coord))
             .ok_or(DigestError::NoRetained(coord))
     }
 
@@ -277,7 +302,7 @@ impl EvictedBricks {
     pub fn drop_resident(&mut self, volume: &Volume) -> usize {
         let before = self.digests.len();
         for coord in volume.resident_brick_coords() {
-            self.digests.remove(&coord);
+            self.digests.remove(&key_of(coord));
         }
         before - self.digests.len()
     }
@@ -290,18 +315,16 @@ impl EvictedBricks {
     ///
     /// [`record`]: Self::record
     pub fn supersede(&mut self, coord: BrickCoord, digest: BrickDigest) -> Result<(), DigestError> {
-        match self.digests.entry(coord) {
-            std::collections::btree_map::Entry::Occupied(mut e) => {
-                e.insert(digest);
-                Ok(())
-            }
-            std::collections::btree_map::Entry::Vacant(_) => Err(DigestError::NoRetained(coord)),
+        if self.digests.get(&key_of(coord)).is_none() {
+            return Err(DigestError::NoRetained(coord));
         }
+        self.digests.insert(key_of(coord), digest);
+        Ok(())
     }
 
     /// **Full baseline / recovery** lifecycle: drop the entire namespace.
     pub fn clear_all(&mut self) {
-        self.digests.clear();
+        self.digests = ChunkStore::default();
     }
 }
 
@@ -318,19 +341,13 @@ pub fn logical_bricks(
     let mut out: Vec<LogicalBrick> =
         Vec::with_capacity(volume.resident_brick_count() + evicted.len());
 
-    for coord in volume.resident_brick_coords() {
-        if evicted.contains(coord) {
-            return Err(DigestError::ResidentEvictedConflict(coord));
-        }
-        let snap = volume
-            .snapshot_brick(coord)?
-            .expect("coord came from resident_brick_coords");
+    volume.for_each_resident_brick(|coord, brick| {
         out.push(LogicalBrick {
             coord,
-            revision: snap.revision(),
-            content_hash: snap.content_hash(),
+            revision: brick.revision(),
+            content_hash: brick.content_hash(),
         });
-    }
+    });
 
     for (coord, digest) in evicted.iter() {
         out.push(LogicalBrick {
@@ -340,8 +357,40 @@ pub fn logical_bricks(
         });
     }
 
-    out.sort_by_key(|b| b.coord.sort_key());
+    // Keys are unique within each source, so a coordinate that is both resident and retained
+    // appears twice, adjacent, once sorted: the first such pair is the smallest conflicting
+    // coordinate in canonical order.
+    out.sort_unstable_by_key(|b| b.coord.sort_key());
+    if let Some(pair) = out.windows(2).find(|pair| pair[0].coord == pair[1].coord) {
+        return Err(DigestError::ResidentEvictedConflict(pair[0].coord));
+    }
     Ok(out)
+}
+
+/// Diagnostic: writes one line per logical brick, `x y z revision content-hash-hex`, in canonical
+/// order, so two replicas of the same volume can be compared brick by brick with a text diff
+/// when their volume hashes disagree.
+pub fn write_logical_brick_listing(
+    path: &std::path::Path,
+    volume: &Volume,
+    evicted: &EvictedBricks,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let bricks = logical_bricks(volume, evicted)
+        .map_err(|e| std::io::Error::other(format!("logical brick listing: {e}")))?;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for b in bricks {
+        write!(
+            out,
+            "{} {} {} {} ",
+            b.coord.x, b.coord.y, b.coord.z, b.revision.0
+        )?;
+        for byte in b.content_hash.as_bytes() {
+            write!(out, "{byte:02x}")?;
+        }
+        writeln!(out)?;
+    }
+    out.flush()
 }
 
 /// Whole-volume solid-cell count over the logical brick set: resident solid
@@ -349,16 +398,20 @@ pub fn logical_bricks(
 /// left-hand side that must be independent of cache placement.
 pub fn logical_solid_cells(volume: &Volume, evicted: &EvictedBricks) -> Result<u64, DigestError> {
     let mut total = evicted.total_solid_cells();
-    for coord in volume.resident_brick_coords() {
+    let mut conflict: Option<BrickCoord> = None;
+    volume.for_each_resident_brick(|coord, brick| {
         if evicted.contains(coord) {
-            return Err(DigestError::ResidentEvictedConflict(coord));
+            // Report the smallest conflicting coordinate in canonical order.
+            if conflict.is_none_or(|c| coord.sort_key() < c.sort_key()) {
+                conflict = Some(coord);
+            }
         }
-        let snap = volume
-            .snapshot_brick(coord)?
-            .expect("coord came from resident_brick_coords");
-        total += u64::from(snap.solid_cells());
+        total += u64::from(brick.solid_cells());
+    });
+    match conflict {
+        Some(coord) => Err(DigestError::ResidentEvictedConflict(coord)),
+        None => Ok(total),
     }
-    Ok(total)
 }
 
 #[cfg(test)]
@@ -533,6 +586,41 @@ mod tests {
         assert_eq!(
             logical_solid_cells(&v, &e).unwrap_err(),
             DigestError::ResidentEvictedConflict(c)
+        );
+    }
+
+    #[test]
+    fn several_conflicts_report_the_first_in_canonical_order() {
+        let v = scene();
+        let coords = v.resident_brick_coords();
+        assert!(coords.len() >= 3, "the scene needs several bricks");
+        let mut e = EvictedBricks::new();
+        // Retain the last and the middle bricks without evicting them; the smallest
+        // conflicting coordinate in canonical order is the middle one.
+        e.record_from(&v, coords[coords.len() - 1]).unwrap();
+        e.record_from(&v, coords[1]).unwrap();
+        assert_eq!(
+            logical_bricks(&v, &e).unwrap_err(),
+            DigestError::ResidentEvictedConflict(coords[1])
+        );
+        assert_eq!(
+            logical_solid_cells(&v, &e).unwrap_err(),
+            DigestError::ResidentEvictedConflict(coords[1])
+        );
+    }
+
+    #[test]
+    fn logical_bricks_are_canonically_ordered_with_each_coord_once() {
+        let mut v = scene();
+        let mut e = EvictedBricks::new();
+        let coords = v.resident_brick_coords();
+        e.record_from(&v, coords[0]).unwrap();
+        v.evict_brick(coords[0]);
+        let logical = logical_bricks(&v, &e).unwrap();
+        assert_eq!(
+            logical.iter().map(|b| b.coord).collect::<Vec<_>>(),
+            coords,
+            "resident and retained bricks interleave in (z, y, x) order, once each"
         );
     }
 

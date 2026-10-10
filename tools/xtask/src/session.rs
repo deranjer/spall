@@ -158,6 +158,13 @@ struct Scenario {
     worldgen_size: u32,
     #[serde(default = "default_worldgen_seed")]
     worldgen_seed: u64,
+    /// Explicit regional client baseline/residency; legacy scenarios stay full geometry.
+    #[serde(default)]
+    stream_regions: bool,
+    /// With `stream_regions`, clients receive the distant terrain digests after the baseline
+    /// instead of inside it (readiness then means spawn region and bodies installed).
+    #[serde(default)]
+    defer_catalogue: bool,
     /// Client 0 requests these resets; every client must install all of them.
     #[serde(default)]
     admin_reset_at: Vec<u64>,
@@ -410,6 +417,10 @@ struct JoinBudget {
     /// Which `late_join_clients` entry this budget is measured against.
     #[serde(default)]
     client: u64,
+    /// Further clients shaped by the same profile (each with its own independent link and
+    /// seed) and held to the same size and time ceilings, for multi-client impaired runs.
+    #[serde(default)]
+    also_clients: Vec<u64>,
     #[serde(default = "default_join_budget_bandwidth")]
     bandwidth_bytes_per_sec: u64,
     #[serde(default = "default_join_budget_rtt_ms")]
@@ -687,6 +698,28 @@ fn default_trailing_buffer() -> u64 {
     120
 }
 
+/// Most scripted cuts passed to a client as individual `--cut` arguments; more go through a
+/// `--cuts-file`.
+const MAX_INLINE_CUTS: usize = 64;
+
+/// `--cuts-file` entries for scripted cuts, in the JSON shape `sandbox-client` reads
+/// (`tick`, `cell`, `radius`, and `target` when it is a body).
+fn cuts_file_entries(cuts: &[CutSpec]) -> Vec<serde_json::Value> {
+    cuts.iter()
+        .map(|cut| {
+            let mut entry = serde_json::json!({
+                "tick": cut.at_tick,
+                "cell": cut.cell,
+                "radius": cut.radius,
+            });
+            if cut.target == CutTarget::Body {
+                entry["target"] = serde_json::json!("body");
+            }
+            entry
+        })
+        .collect()
+}
+
 /// One generated `--cuts-file` entry, in the JSON shape `sandbox-client`'s
 /// `--cuts-file` reads (`tick`/`cell`/`radius`/`target`, `target` optional).
 #[derive(Debug, Serialize)]
@@ -886,6 +919,12 @@ fn default_true() -> bool {
 struct ServerSummary {
     #[serde(default)]
     world_resets: u64,
+    /// Ticks run past the tick budget to let regional clients drain, and whether the drain limit
+    /// ended the run with one still receiving.
+    #[serde(default)]
+    drain_ticks: u64,
+    #[serde(default)]
+    drain_timed_out: bool,
     result: String,
     ticks_run: u64,
     transactions_committed: u64,
@@ -897,6 +936,22 @@ struct ServerSummary {
     actions_requested: u64,
     #[serde(default)]
     actions_rejected: u64,
+    /// Of `actions_rejected`, those refused as "throttled: retry shortly" (a burst of queued
+    /// actions after a slow tick). The client retries them, and the run must still commit every
+    /// scripted cut, so they are not by themselves a failure.
+    #[serde(default, rename = "inbound_actions_throttled")]
+    actions_throttled: u64,
+    /// Client actions dropped because the reader-to-sim bridge was full. Any is a failure.
+    #[serde(default)]
+    inbound_dropped_actions: u64,
+    /// Edits in flight at a world reset, answered with a retryable rejection (the client retries
+    /// them), so they are in `actions_rejected` without being a failure.
+    #[serde(default)]
+    actions_discarded_by_reset: u64,
+    /// The edit pipeline's admission counters; `queue_full_rejections` are "overloaded" refusals
+    /// the client retries with backoff (a burst after a long server stall fills the queue).
+    #[serde(default)]
+    intent_stats: IntentStatsSubset,
     #[serde(default)]
     actions_staged: u64,
     #[serde(default)]
@@ -1054,6 +1109,14 @@ struct ClientSummary {
     client_residency_evicted_transaction_gaps: u64,
     #[serde(default)]
     late_join_baseline_compressed_bytes: u64,
+    /// Deferred terrain catalogue: compressed bytes received, and milliseconds from
+    /// baseline install to completion (`0` = none deferred or not finished).
+    #[serde(default)]
+    catalogue_compressed_bytes: u64,
+    #[serde(default)]
+    catalogue_complete_ms: u64,
+    #[serde(default)]
+    catalogue_pending_at_end: bool,
     #[serde(default)]
     late_join_baseline_install_ms: u64,
     #[serde(default)]
@@ -1068,6 +1131,18 @@ struct ClientSummary {
     /// diagnostic only.
     #[serde(default)]
     action_reject_reasons: Vec<String>,
+}
+
+impl MovementRow {
+    /// Whether the player covered at least `min_m` metres. `distance_travelled_m`
+    /// is the net displacement from spawn, so a scripted out-and-back path ends
+    /// near zero; the farthest point reached is the travel that actually
+    /// happened and is never smaller.
+    fn travelled_at_least(&self, min_m: f64) -> bool {
+        self.distance_travelled_m
+            .max(self.max_distance_from_start_m)
+            >= min_m
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1091,6 +1166,11 @@ struct SessionSummary {
     clients: u64,
     loss_percent: u8,
     server_ticks_run: u64,
+    /// Ticks the server ran past its budget to let regional clients finish receiving, and whether
+    /// its drain limit ended the run with one still receiving (then a client's not converging is
+    /// a limit, not a verdict on the link).
+    drain_ticks: u64,
+    drain_timed_out: bool,
     transactions_committed: u64,
     /// Largest distinct-brick span of any detached body (server-authoritative).
     max_detached_body_brick_span: u64,
@@ -1276,6 +1356,9 @@ struct ClientRow {
     client_residency_evicted_transaction_gaps: u64,
     hash_matches_server: bool,
     late_join_baseline_compressed_bytes: u64,
+    catalogue_compressed_bytes: u64,
+    catalogue_complete_ms: u64,
+    catalogue_pending_at_end: bool,
     late_join_baseline_install_ms: u64,
     late_join_ready_ms: u64,
     late_join_ready_confirmed: bool,
@@ -1299,6 +1382,17 @@ struct JoinBudgetRow {
     measured_baseline_compressed_bytes: u64,
     measured_ready_ms: u64,
     ready_confirmed: bool,
+    /// The same measurements for each of `also_clients`.
+    also: Vec<JoinBudgetClientRow>,
+    within_budget: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct JoinBudgetClientRow {
+    client: u64,
+    measured_baseline_compressed_bytes: u64,
+    measured_ready_ms: u64,
+    ready_confirmed: bool,
     within_budget: bool,
 }
 
@@ -1315,6 +1409,7 @@ impl JoinBudgetRow {
             measured_baseline_compressed_bytes: 0,
             measured_ready_ms: 0,
             ready_confirmed: false,
+            also: Vec::new(),
             within_budget: true,
         }
     }
@@ -1329,13 +1424,22 @@ fn join_budget_requirements_met(scenario: &Scenario, clients: &[Option<ClientSum
     let Some(budget) = &scenario.join_budget else {
         return true;
     };
-    let Some(client) = clients.get(budget.client as usize).and_then(Option::as_ref) else {
-        return false;
-    };
+    std::iter::once(budget.client)
+        .chain(budget.also_clients.iter().copied())
+        .all(|index| {
+            clients
+                .get(index as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|client| client_within_join_budget(budget, client))
+        })
+}
+
+fn client_within_join_budget(budget: &JoinBudget, client: &ClientSummary) -> bool {
     client.result == "passed"
         && client.late_join_ready_confirmed
         && client.late_join_baseline_compressed_bytes > 0
-        && client.late_join_baseline_compressed_bytes <= budget.max_baseline_compressed_bytes
+        && client.late_join_baseline_compressed_bytes + client.catalogue_compressed_bytes
+            <= budget.max_baseline_compressed_bytes
         && client.late_join_ready_ms > 0
         && client.late_join_ready_ms <= budget.max_ready_ms
 }
@@ -1356,10 +1460,28 @@ fn join_budget_row(scenario: &Scenario, clients: &[Option<ClientSummary>]) -> Jo
         max_baseline_compressed_bytes: budget.max_baseline_compressed_bytes,
         max_ready_ms: budget.max_ready_ms,
         measured_baseline_compressed_bytes: client
-            .map(|c| c.late_join_baseline_compressed_bytes)
+            .map(|c| c.late_join_baseline_compressed_bytes + c.catalogue_compressed_bytes)
             .unwrap_or(0),
         measured_ready_ms: client.map(|c| c.late_join_ready_ms).unwrap_or(0),
         ready_confirmed: client.is_some_and(|c| c.late_join_ready_confirmed),
+        also: budget
+            .also_clients
+            .iter()
+            .map(|&index| {
+                let c = clients.get(index as usize).and_then(Option::as_ref);
+                JoinBudgetClientRow {
+                    client: index,
+                    measured_baseline_compressed_bytes: c
+                        .map(|c| {
+                            c.late_join_baseline_compressed_bytes + c.catalogue_compressed_bytes
+                        })
+                        .unwrap_or(0),
+                    measured_ready_ms: c.map(|c| c.late_join_ready_ms).unwrap_or(0),
+                    ready_confirmed: c.is_some_and(|c| c.late_join_ready_confirmed),
+                    within_budget: c.is_some_and(|c| client_within_join_budget(budget, c)),
+                }
+            })
+            .collect(),
         within_budget: join_budget_requirements_met(scenario, clients),
     }
 }
@@ -1445,6 +1567,31 @@ fn scripted_commit_receipts_match(
 }
 fn default_worldgen_seed() -> u64 {
     1
+}
+
+/// Whether the server admitted every scripted cut without losing or permanently refusing any.
+/// "Throttled: retry shortly" refusals are transient (the client retries them, and the commit
+/// receipts still have to show every cut), so they do not count; a dropped or otherwise rejected
+/// action does.
+fn admission_clean(scenario: &Scenario, server: &ServerSummary) -> bool {
+    let cuts = scenario.cuts.len() as u64;
+    server
+        .actions_rejected
+        .saturating_sub(server.actions_throttled)
+        .saturating_sub(server.actions_discarded_by_reset)
+        .saturating_sub(server.intent_stats.queue_full_rejections)
+        == 0
+        && server.inbound_dropped_actions == 0
+        && server.actions_queued_unresolved == 0
+        && server.actions_requested >= cuts
+        && server.actions_staged >= cuts
+}
+
+/// The part of the server's `intent_stats` the harness reads.
+#[derive(Debug, Default, Clone, Deserialize)]
+struct IntentStatsSubset {
+    #[serde(default)]
+    queue_full_rejections: u64,
 }
 
 fn reset_requirements_met(
@@ -1604,6 +1751,9 @@ mod requirement_tests {
             client_residency_admission_deferred_total: 0,
             client_residency_evicted_transaction_gaps: 0,
             late_join_baseline_compressed_bytes: 0,
+            catalogue_compressed_bytes: 0,
+            catalogue_complete_ms: 0,
+            catalogue_pending_at_end: false,
             late_join_baseline_install_ms: 0,
             late_join_ready_ms: 0,
             late_join_ready_confirmed: false,
@@ -1747,6 +1897,31 @@ mod requirement_tests {
             &server,
             &[Some(mover)]
         ));
+    }
+
+    #[test]
+    fn an_out_and_back_mover_counts_its_farthest_point_as_travel() {
+        let mut movement = MovementRow {
+            ticks: 100,
+            distance_travelled_m: 0.0,
+            max_distance_from_start_m: 0.0,
+            max_correction_m: 0.0,
+            ground_contact_ratio: 1.0,
+            hovered_after_floor_removal: false,
+            held_button_release_ok: true,
+        };
+        assert!(
+            !movement.travelled_at_least(2.0),
+            "a player that never moved"
+        );
+        movement.max_distance_from_start_m = 97.0;
+        assert!(movement.travelled_at_least(2.0), "out and back to spawn");
+        movement.max_distance_from_start_m = 1.0;
+        movement.distance_travelled_m = 3.0;
+        assert!(
+            movement.travelled_at_least(2.0),
+            "net displacement still counts"
+        );
     }
 
     /// ENG-30 row 7 increment 13: `min_pinned_bricks` / `min_admission_deferred`
@@ -2076,6 +2251,112 @@ mod requirement_tests {
     /// T23 / G3 row 11: `join_budget_requirements_met` / `join_budget_row` are
     /// pure functions over already-measured `ClientSummary` fields — this pins
     /// their pass/fail logic deterministically, with no network involved.
+    /// Every client named in `also_clients` is held to the same ceilings as the primary one,
+    /// and a missing summary for any of them fails closed.
+    #[test]
+    fn scripted_cuts_go_to_a_file_in_the_shape_the_client_reads() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{"server_ticks": 10, "cuts": [
+                {"at_tick": 5, "cell": [1, 2, 3], "radius": 4},
+                {"at_tick": 9, "cell": [-1, 0, 7], "radius": 2, "target": "body"}]}"#,
+        )
+        .unwrap();
+        let entries = cuts_file_entries(&scenario.cuts);
+        assert_eq!(
+            entries,
+            vec![
+                serde_json::json!({"tick": 5, "cell": [1, 2, 3], "radius": 4}),
+                serde_json::json!({"tick": 9, "cell": [-1, 0, 7], "radius": 2, "target": "body"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn throttled_retries_are_clean_but_dropped_or_refused_actions_are_not() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{"server_ticks": 10, "cuts": [
+                {"at_tick": 1, "cell": [0, 0, 0], "radius": 2},
+                {"at_tick": 2, "cell": [9, 0, 0], "radius": 2}]}"#,
+        )
+        .unwrap();
+        let mut server = ServerSummary {
+            actions_requested: 5,
+            actions_staged: 2,
+            actions_rejected: 3,
+            actions_throttled: 3,
+            ..ServerSummary::default()
+        };
+        assert!(
+            admission_clean(&scenario, &server),
+            "three throttled retries"
+        );
+        server.actions_rejected = 4;
+        assert!(
+            !admission_clean(&scenario, &server),
+            "one permanent refusal"
+        );
+        server.actions_rejected = 5;
+        server.actions_discarded_by_reset = 2;
+        assert!(
+            admission_clean(&scenario, &server),
+            "two edits in flight at a reset were answered with a retryable rejection"
+        );
+        server.actions_rejected = 8;
+        server.actions_discarded_by_reset = 2;
+        server.intent_stats.queue_full_rejections = 3;
+        assert!(
+            admission_clean(&scenario, &server),
+            "three more refusals because the pipeline queue was full are retryable too"
+        );
+        server.actions_rejected = 3;
+        server.actions_discarded_by_reset = 0;
+        server.intent_stats.queue_full_rejections = 0;
+        server.inbound_dropped_actions = 1;
+        assert!(!admission_clean(&scenario, &server), "a dropped action");
+        server.inbound_dropped_actions = 0;
+        server.actions_staged = 1;
+        assert!(!admission_clean(&scenario, &server), "a cut never staged");
+    }
+
+    #[test]
+    fn every_shaped_client_must_meet_the_join_budget() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "clients": 3,
+                "join_budget": {
+                    "client": 1,
+                    "also_clients": [2],
+                    "max_baseline_compressed_bytes": 1000,
+                    "max_ready_ms": 5000
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut ok = client(3);
+        ok.late_join_baseline_compressed_bytes = 900;
+        ok.late_join_ready_ms = 4000;
+        ok.late_join_ready_confirmed = true;
+        let clients = [Some(client(3)), Some(ok.clone()), Some(ok.clone())];
+        assert!(join_budget_requirements_met(&scenario, &clients));
+        let row = join_budget_row(&scenario, &clients);
+        assert_eq!(row.also.len(), 1);
+        assert!(row.also[0].within_budget && row.also[0].client == 2);
+
+        let mut slow = ok.clone();
+        slow.late_join_ready_ms = 5001;
+        let clients = [Some(client(3)), Some(ok.clone()), Some(slow)];
+        assert!(
+            !join_budget_requirements_met(&scenario, &clients),
+            "the second shaped client is over the time ceiling"
+        );
+        assert!(!join_budget_row(&scenario, &clients).also[0].within_budget);
+        assert!(!join_budget_requirements_met(
+            &scenario,
+            &[Some(client(3)), Some(ok), None]
+        ));
+    }
+
     #[test]
     fn join_budget_requirements_pass_only_within_the_configured_size_and_time_ceiling() {
         let scenario: Scenario = serde_json::from_str(
@@ -2466,14 +2747,22 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         let mut plans: Vec<PacketFaultPlan> = (0..clients)
             .map(|i| PacketFaultPlan::transparent(run.seed ^ (i + 1)))
             .collect();
-        let shaped = PacketFaultPlan {
-            delay: Duration::from_millis(budget.rtt_ms / 2),
-            jitter: Duration::from_millis(budget.jitter_ms),
-            loss_ratio: f64::from(budget.loss_percent) / 100.0,
-            ..PacketFaultPlan::shaped(budget.seed, budget.bandwidth_bytes_per_sec)
-        };
-        if let Some(slot) = plans.get_mut(budget.client as usize) {
-            *slot = shaped;
+        for (n, index) in std::iter::once(budget.client)
+            .chain(budget.also_clients.iter().copied())
+            .enumerate()
+        {
+            let shaped = PacketFaultPlan {
+                delay: Duration::from_millis(budget.rtt_ms / 2),
+                jitter: Duration::from_millis(budget.jitter_ms),
+                loss_ratio: f64::from(budget.loss_percent) / 100.0,
+                ..PacketFaultPlan::shaped(
+                    budget.seed.wrapping_add(n as u64),
+                    budget.bandwidth_bytes_per_sec,
+                )
+            };
+            if let Some(slot) = plans.get_mut(index as usize) {
+                *slot = shaped;
+            }
         }
         Some(ProxyFarm::spawn_with_plans(bound, plans)?)
     } else if let Some(re) = &scenario.retry_exhaustion {
@@ -2566,20 +2855,43 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 c.arg("--late-join");
             }
         }
+        if scenario.stream_regions {
+            c.arg("--stream-regions");
+            if scenario.defer_catalogue {
+                c.arg("--defer-catalogue");
+            }
+            if scenario.worldgen.is_none() && !scenario.late_join_clients.contains(&i) {
+                c.arg("--late-join");
+            }
+        }
         if i == 0 {
             for tick in &scenario.admin_reset_at {
                 c.args(["--admin-reset-at", &tick.to_string()]);
             }
         }
-        for cut in by_client.get(&i).into_iter().flatten() {
-            let mut spec = format!(
-                "{}:{},{},{}:{}",
-                cut.at_tick, cut.cell[0], cut.cell[1], cut.cell[2], cut.radius
-            );
-            if cut.target == CutTarget::Body {
-                spec.push_str(":body");
+        let scripted: &[CutSpec] = by_client.get(&i).map_or(&[], Vec::as_slice);
+        if scripted.len() > MAX_INLINE_CUTS {
+            // Thousands of `--cut` arguments overflow the process command line (Windows caps
+            // it near 32K characters); a long scripted stream goes through a file instead.
+            let path = output.join(format!("client{i}.scripted-cuts.json"));
+            let body = serde_json::to_vec(&cuts_file_entries(scripted))
+                .expect("scripted cuts are serializable");
+            fs::write(&path, body).map_err(|source| XtaskError::Output {
+                path: path.display().to_string(),
+                source,
+            })?;
+            c.args(["--cuts-file", &path.display().to_string()]);
+        } else {
+            for cut in scripted {
+                let mut spec = format!(
+                    "{}:{},{},{}:{}",
+                    cut.at_tick, cut.cell[0], cut.cell[1], cut.cell[2], cut.radius
+                );
+                if cut.target == CutTarget::Body {
+                    spec.push_str(":body");
+                }
+                c.args(["--cut", &spec]);
             }
-            c.args(["--cut", &spec]);
         }
         // T23 / G3 row 13: the generated sustained stream can run into the
         // thousands of entries per client — well past what fits as individual
@@ -2691,6 +3003,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     clients,
                     loss_percent: run.loss_percent,
                     server_ticks_run: 0,
+                    drain_ticks: 0,
+                    drain_timed_out: false,
                     transactions_committed: 0,
                     max_detached_body_brick_span: 0,
                     body_settled: false,
@@ -2765,7 +3079,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                                     || !m.hovered_after_floor_removal)
                                 && m.held_button_release_ok
                                 && m.max_correction_m <= scenario.movement.max_correction_m
-                                && m.distance_travelled_m >= scenario.movement.min_distance_m
+                                && m.travelled_at_least(scenario.movement.min_distance_m)
                                 && m.ground_contact_ratio
                                     >= scenario.movement.min_ground_contact_ratio
                         }
@@ -2805,6 +3119,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                         .client_residency_evicted_transaction_gaps,
                     hash_matches_server: hash_ok,
                     late_join_baseline_compressed_bytes: c.late_join_baseline_compressed_bytes,
+                    catalogue_compressed_bytes: c.catalogue_compressed_bytes,
+                    catalogue_complete_ms: c.catalogue_complete_ms,
+                    catalogue_pending_at_end: c.catalogue_pending_at_end,
                     late_join_baseline_install_ms: c.late_join_baseline_install_ms,
                     late_join_ready_ms: c.late_join_ready_ms,
                     late_join_ready_confirmed: c.late_join_ready_confirmed,
@@ -2832,6 +3149,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     client_residency_evicted_transaction_gaps: 0,
                     hash_matches_server: false,
                     late_join_baseline_compressed_bytes: 0,
+                    catalogue_compressed_bytes: 0,
+                    catalogue_complete_ms: 0,
+                    catalogue_pending_at_end: false,
                     late_join_baseline_install_ms: 0,
                     late_join_ready_ms: 0,
                     late_join_ready_confirmed: false,
@@ -2851,12 +3171,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     if !reset_requirements_met(&scenario, &server, &client_summaries) {
         requirements_met = false;
     }
-    if scenario.worldgen.is_some()
-        && (server.actions_rejected != 0
-            || server.actions_queued_unresolved != 0
-            || server.actions_requested < scenario.cuts.len() as u64
-            || server.actions_staged < scenario.cuts.len() as u64)
-    {
+    if scenario.worldgen.is_some() && !admission_clean(&scenario, &server) {
         requirements_met = false;
     }
     if scenario.worldgen.is_some()
@@ -3000,6 +3315,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             clients,
             loss_percent: run.loss_percent,
             server_ticks_run: server.ticks_run,
+            drain_ticks: server.drain_ticks,
+            drain_timed_out: server.drain_timed_out,
             transactions_committed: server.transactions_committed,
             max_detached_body_brick_span: server.max_detached_body_brick_span,
             body_settled,
@@ -3278,10 +3595,12 @@ fn finish(output: &Path, summary: SessionSummary) -> Result<(), XtaskError> {
         Ok(())
     } else {
         eprintln!(
-            "session FAILED: {} (agreed hash `{}`, all match = {})",
+            "session FAILED: {} (agreed hash `{}`, all match = {}, drain ticks = {}, drain timed out = {})",
             output.display(),
             summary.agreed_world_hash,
-            summary.all_hashes_match
+            summary.all_hashes_match,
+            summary.drain_ticks,
+            summary.drain_timed_out
         );
         Err(XtaskError::Cargo(vec!["session".into()], 1))
     }

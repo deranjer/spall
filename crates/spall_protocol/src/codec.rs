@@ -206,9 +206,9 @@ mod tests {
             journal_seq: JournalSeq(300),
         };
         let bytes = encode_control(&record).unwrap();
-        // header: schema=3 (bumped for retryable progression-capacity outcome),
+        // header: schema=4 (bumped for the chunked v2 topology hash),
         // tag=11 (DurableThrough); body: postcard varint of 300 = 0xAC 0x02
-        assert_eq!(bytes, [0x03, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
+        assert_eq!(bytes, [0x04, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
         let back: DurableThrough = decode_control(&bytes).unwrap();
         assert_eq!(back, record);
     }

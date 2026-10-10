@@ -28,6 +28,41 @@ use crate::canonical::Hash32;
 pub const BASELINE_SEGMENTED_WORLD_VERSION: u32 = 2;
 /// Streaming variant with a separately negotiated cumulative compressed limit.
 pub const BASELINE_STREAMED_WORLD_VERSION: u32 = 3;
+pub const BASELINE_REGIONAL_WORLD_VERSION: u32 = 4;
+/// Regional baseline whose distant digest catalogue follows as [`crate::CatalogueChunk`] records
+/// instead of travelling inside the baseline. The baseline itself carries only the spawn region
+/// and bodies, with no digests, so a client is ready as soon as it arrives.
+pub const BASELINE_DEFERRED_REGIONAL_WORLD_VERSION: u32 = 5;
+/// Chebyshev brick radius of the geometry a deferred baseline carries around the spawn. The
+/// client's wider interest region is filled by ordinary reloads once the catalogue names those
+/// bricks, so readiness depends on a small neighbourhood instead of the whole region.
+pub const DEFERRED_CORE_RADIUS_BRICKS: i64 = 2;
+pub const REGIONAL_SEGMENT_SCHEMA: u16 = 3;
+pub const DEFAULT_REGION_RADIUS_BRICKS: i64 = 10;
+pub const MAX_REGION_RADIUS_BRICKS: i64 = 16;
+/// Radius is explicitly negotiated, bounded to 1..=16; old servers fall back to full baselines.
+pub fn baseline_cap_regional(radius: i64) -> Hash32 {
+    Hash32::of(format!("spall.baseline.capability.regional.v4.radius.{radius}").as_bytes())
+}
+pub fn regional_radius(capability: Hash32) -> Option<i64> {
+    (1..=MAX_REGION_RADIUS_BRICKS).find(|&r| baseline_cap_regional(r) == capability)
+}
+/// A client that can also receive the digest catalogue after the baseline (world version 5)
+/// advertises this instead of [`baseline_cap_regional`]; servers that do not know it ignore it.
+pub fn baseline_cap_regional_deferred(radius: i64) -> Hash32 {
+    Hash32::of(format!("spall.baseline.capability.regional.deferred.v5.radius.{radius}").as_bytes())
+}
+pub fn regional_deferred_radius(capability: Hash32) -> Option<i64> {
+    (1..=MAX_REGION_RADIUS_BRICKS).find(|&r| baseline_cap_regional_deferred(r) == capability)
+}
+pub fn is_streamed_world(version: u32) -> bool {
+    matches!(
+        version,
+        BASELINE_STREAMED_WORLD_VERSION
+            | BASELINE_REGIONAL_WORLD_VERSION
+            | BASELINE_DEFERRED_REGIONAL_WORLD_VERSION
+    )
+}
 /// Cumulative compressed bytes, processed one segment at a time; no whole-payload decode.
 pub const MAX_STREAMED_BASELINE_COMPRESSED: usize = 256 * 1024 * 1024;
 /// Only clients advertising this capability may receive world version 3.
@@ -120,7 +155,7 @@ impl SegmentManifest {
     /// Structural checks that need no other context.
     pub fn validate(&self) -> Result<(), SegmentError> {
         let bad = |m: &str| Err(SegmentError::Manifest(m.to_string()));
-        if self.schema != SEGMENT_SCHEMA {
+        if self.schema != SEGMENT_SCHEMA && self.schema != REGIONAL_SEGMENT_SCHEMA {
             return bad("unsupported segment schema");
         }
         if self.segment_count == 0 || self.segment_count as usize > MAX_BASELINE_SEGMENTS {
@@ -180,6 +215,7 @@ pub fn brick_decoded_cost(cells: &BaselineCells) -> usize {
     match cells {
         BaselineCells::Dense(_) => DENSE_BRICK_DECODED_COST,
         BaselineCells::Uniform(_) => UNIFORM_BRICK_DECODED_COST,
+        BaselineCells::Digest { .. } => 128,
     }
 }
 
@@ -367,6 +403,14 @@ pub fn decode_segment(
         postcard::from_bytes(&raw).map_err(|e| SegmentError::Postcard(e.to_string()))?;
     for v in &segment.volumes {
         for b in &v.bricks {
+            if let BaselineCells::Digest { solid_cells, .. } = &b.cells
+                && (manifest.schema != REGIONAL_SEGMENT_SCHEMA
+                    || *solid_cells > CELLS_PER_BRICK as u32)
+            {
+                return Err(SegmentError::Manifest(
+                    "invalid or unnegotiated terrain digest".into(),
+                ));
+            }
             if let BaselineCells::Dense(c) = &b.cells
                 && c.len() != CELLS_PER_BRICK
             {
@@ -560,6 +604,64 @@ impl SequenceValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regional_digest_is_versioned_bounded_and_forbidden_in_legacy_blobs() {
+        let brick = BaselineBrick {
+            coord: [0, 0, 0],
+            revision: 3,
+            edited: true,
+            cells: BaselineCells::Digest {
+                content_hash: Hash32::of(b"terrain"),
+                solid_cells: 0,
+            },
+        };
+        let volume = crate::BaselineVolume {
+            volume_id: VolumeId::new(1).unwrap(),
+            cell_size_code: 0,
+            owner: BaselineOwner::Terrain,
+            bounds: None,
+            bricks: vec![brick.clone()],
+        };
+        assert!(volume.validate().is_err());
+        let mut seg = BaselineSegment {
+            index: 0,
+            volumes: vec![SegmentVolume {
+                volume_id: volume.volume_id,
+                header: Some(VolumeHeader {
+                    cell_size_code: 0,
+                    owner: BaselineOwner::Terrain,
+                    bounds: None,
+                }),
+                first_ordinal: 0,
+                bricks: vec![brick],
+                last: true,
+            }],
+        };
+        let mut manifest = SegmentManifest {
+            schema: SEGMENT_SCHEMA,
+            segment_count: 1,
+            volume_count: 1,
+            total_bricks: 1,
+            total_decoded_bytes: 128,
+            segment_decoded_cap: DEFAULT_SEGMENT_DECODED_BYTES as u32,
+        };
+        let frame = encode_segment_frame(&seg, DEFAULT_SEGMENT_DECODED_BYTES).unwrap();
+        assert!(decode_segment(&frame.bytes[5..], &manifest).is_err());
+        manifest.schema = REGIONAL_SEGMENT_SCHEMA;
+        assert_eq!(decode_segment(&frame.bytes[5..], &manifest).unwrap().0, seg);
+        seg.volumes[0].bricks[0].cells = BaselineCells::Digest {
+            content_hash: Hash32::ZERO,
+            solid_cells: CELLS_PER_BRICK as u32 + 1,
+        };
+        let frame = encode_segment_frame(&seg, DEFAULT_SEGMENT_DECODED_BYTES).unwrap();
+        assert!(decode_segment(&frame.bytes[5..], &manifest).is_err());
+        for r in 1..=MAX_REGION_RADIUS_BRICKS {
+            assert_eq!(regional_radius(baseline_cap_regional(r)), Some(r));
+        }
+        assert_eq!(regional_radius(baseline_cap_regional(0)), None);
+        assert_eq!(regional_radius(baseline_cap_streamed()), None);
+    }
 
     fn brick(i: i64, dense: bool) -> BaselineBrick {
         BaselineBrick {

@@ -22,6 +22,7 @@ pub mod accounting;
 pub mod brick;
 pub mod brush;
 pub mod builtin_assets;
+pub mod chunk_store;
 pub mod edit;
 pub mod fixtures;
 pub mod logical;
@@ -39,9 +40,11 @@ mod random_parity;
 
 pub use accounting::MemoryReport;
 pub use brick::{Brick, BrickHash, BrickSnapshot, DENSE_LAYER_BYTES, LayerKind};
+pub use chunk_store::{CHUNK_SHIFT, ChunkKey, chunk_of};
 pub use edit::{BrickRevisionRecord, CellEdit, EditError, EditOutcome, EditPlan};
 pub use logical::{
     BrickDigest, DigestError, EvictedBricks, LogicalBrick, logical_bricks, logical_solid_cells,
+    write_logical_brick_listing,
 };
 pub use query::{
     Face, MissReason, Ray, RayConfig, RayError, RayHit, RayOutcome, cast_ray, cast_ray_world,

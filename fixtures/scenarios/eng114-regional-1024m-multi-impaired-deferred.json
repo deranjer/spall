@@ -1,0 +1,145 @@
+{
+  "name": "eng114-regional-1024m-multi-impaired-deferred",
+  "description": "Same server workload, limits, world, resets and exact-hash requirement as eng114-regional-1024m-impaired-deferred (full 4096-cell seed-1 authoritative world, 7,200 ticks, eight distant radius-8 foundation cuts, resets at ticks 4,500 and 6,000, deferred catalogue, regional replicas), but with 4 clients: clients 1, 2 and 3 each sit behind their own independent link (8 MiB/s ceiling, 200 ms RTT, 20 ms jitter, 5 percent loss, production CUBIC) and each must meet the G3 16 MiB / 30 s join bounds; the cuts are spread round-robin over all clients and clients 0 run the outbound/return movement path. Every client must finish with the server's exact final hash. Not whole-foundation collapse, G4 population or soak acceptance.",
+  "release_profile": true,
+  "worldgen": "showcase",
+  "worldgen_size": 4096,
+  "worldgen_seed": 1,
+  "server_ticks": 7200,
+  "quiescence_ticks": 0,
+  "clients": 4,
+  "minimum_transactions": 8,
+  "cuts": [
+    {
+      "client": 0,
+      "at_tick": 3000,
+      "cell": [
+        1024,
+        16,
+        1024
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 3120,
+      "cell": [
+        3072,
+        16,
+        1024
+      ],
+      "radius": 8
+    },
+    {
+      "client": 2,
+      "at_tick": 3240,
+      "cell": [
+        1024,
+        16,
+        3072
+      ],
+      "radius": 8
+    },
+    {
+      "client": 3,
+      "at_tick": 3360,
+      "cell": [
+        3072,
+        16,
+        3072
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 6300,
+      "cell": [
+        2048,
+        16,
+        2048
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 6420,
+      "cell": [
+        2080,
+        16,
+        2048
+      ],
+      "radius": 8
+    },
+    {
+      "client": 2,
+      "at_tick": 6540,
+      "cell": [
+        2048,
+        16,
+        2080
+      ],
+      "radius": 8
+    },
+    {
+      "client": 3,
+      "at_tick": 6660,
+      "cell": [
+        2080,
+        16,
+        2080
+      ],
+      "radius": 8
+    }
+  ],
+  "admin_reset_at": [
+    4500,
+    6000
+  ],
+  "stream_regions": true,
+  "player_paths": [
+    {
+      "client": 0,
+      "legs": [
+        {
+          "movement": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "from": 20,
+          "to": 1220
+        },
+        {
+          "movement": [
+            -1.0,
+            0.0,
+            0.0
+          ],
+          "from": 1240,
+          "to": 2440
+        }
+      ]
+    }
+  ],
+  "residency_assertions": {
+    "min_evicted_transaction_gaps": 1,
+    "min_outbound_distance_m": 8.0,
+    "min_client_evictions": 1,
+    "client": 0,
+    "min_client_reloads_completed": 1
+  },
+  "join_budget": {
+    "bandwidth_bytes_per_sec": 8388608,
+    "client": 1,
+    "jitter_ms": 20,
+    "max_baseline_compressed_bytes": 16777216,
+    "max_ready_ms": 30000,
+    "loss_percent": 5,
+    "rtt_ms": 200,
+    "also_clients": [
+      2,
+      3
+    ]
+  },
+  "defer_catalogue": true
+}

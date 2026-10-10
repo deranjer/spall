@@ -14,13 +14,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use spall_core::{BrickCoord, Tick, VolumeId};
-use spall_jobs::{JobId, JobRequest, JobToken, Lane, Priority, Scheduler, SchedulerConfig};
+use spall_jobs::{
+    JobId, JobRequest, JobToken, Lane, Priority, Scheduler, SchedulerConfig, ThreadJobPool,
+};
 use spall_protocol::{ActionOutcome, ActionStatus, ControlSeq, RequestId};
 
 use crate::commit::{CommitError, CommitOutcome, Committed, commit};
 use crate::intent::{EditIntent, EditTarget, IntentError};
 use crate::journal::JournalSink;
-use crate::stage::{StageError, StageInput, StagedEdit, stage_edit};
+use crate::stage::{StageError, StageInput, StagedEdit, stage_edit, stage_edit_owned};
 use crate::world::SimWorld;
 
 /// A coarse identity for the region an edit contends over: the brush centre's
@@ -50,12 +52,75 @@ impl RegionKey {
 /// brush, an out-of-bounds edit).
 type StageResult = Result<StagedEdit, StageError>;
 
+/// A panic payload caught on the worker, which the owning thread re-raises rather than losing.
+type WorkerPanic = Box<dyn std::any::Any + Send>;
+
+/// The staging result, or the panic inside staging.
+type OffThreadResult = Result<StageResult, WorkerPanic>;
+
+/// What the worker hands back.
+enum WorkerOutput {
+    /// An edit was staged.
+    Staged(Box<OffThreadResult>),
+    /// The terrain's structure index was built ahead of the next edit, for the volume state
+    /// `stamp`.
+    Prewarmed {
+        volume: VolumeId,
+        stamp: u64,
+        built: Result<Option<std::sync::Arc<spall_structure::StructureIndex>>, WorkerPanic>,
+    },
+}
+
+/// The worker thread that stages edits off the tick thread (see
+/// [`EditPipeline::enable_off_thread_staging`]). Dropping it stops the thread; a job already
+/// running is allowed to finish.
+struct StagingWorker {
+    pool: Option<ThreadJobPool<WorkerOutput>>,
+}
+
+impl StagingWorker {
+    fn new() -> Self {
+        Self {
+            pool: Some(ThreadJobPool::new(SchedulerConfig::default(), 1)),
+        }
+    }
+
+    fn pool(&self) -> &ThreadJobPool<WorkerOutput> {
+        self.pool.as_ref().expect("the pool lives until drop")
+    }
+}
+
+impl Drop for StagingWorker {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            let _ = pool.shutdown();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct QueuedIntent {
     intent: EditIntent,
     volume_id: VolumeId,
     region: RegionKey,
     attempts: u32,
+    /// When the intent entered the queue.
+    queued_at: std::time::Instant,
+    /// When its staging job last started, and when the tick found the result.
+    job_started: Option<std::time::Instant>,
+    result_seen: Option<std::time::Instant>,
+}
+
+/// Where one committed edit's time went inside the pipeline, for the server's latency log.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EditTiming {
+    /// Entering the queue until the staging job last started.
+    pub queued: std::time::Duration,
+    /// The staging job starting until the tick picked up its result: staging itself plus the
+    /// wait for the next tick boundary.
+    pub staging: std::time::Duration,
+    /// Committing on the tick thread.
+    pub commit: std::time::Duration,
 }
 
 /// What one [`EditPipeline::run_tick`] did.
@@ -113,6 +178,15 @@ pub struct EditPipeline {
     /// Brick labels of the live terrain, memoized by revision so staging an
     /// edit relabels only the bricks it changed instead of the whole world.
     label_cache: spall_structure::LabelCache,
+    /// `Some` once staging has moved off the tick thread.
+    staging_worker: Option<StagingWorker>,
+    /// Where each recently committed edit's time went, until the server reads it.
+    timings: HashMap<u64, EditTiming>,
+    /// The worker job currently building the terrain's structure index ahead of an edit.
+    prewarm_job: Option<JobId>,
+    /// The terrain state a prewarm was last started for, so one that cannot finish (or whose
+    /// result is discarded) is not retried in a loop.
+    last_prewarm: Option<(VolumeId, u64, spall_jobs::TopologyEpoch)>,
 }
 
 impl EditPipeline {
@@ -129,34 +203,51 @@ impl EditPipeline {
             max_pending,
             serialize_threshold: serialize_threshold.max(1),
             label_cache: spall_structure::LabelCache::new(),
+            staging_worker: None,
+            timings: HashMap::new(),
+            prewarm_job: None,
+            last_prewarm: None,
         }
     }
 
-    /// Labels every terrain brick into the label cache now, so the first edit
-    /// of a large world does not pay for the whole-world labelling (about a
-    /// second at 12k bricks) the way every later one does not. Safe to skip: an
-    /// unwarmed cache fills on the first staging pass.
-    pub fn warm_labels(&self, world: &SimWorld) {
-        let _ = spall_structure::SupportGraph::build_cached(
-            &world.terrain().volume,
-            world.anchor(),
-            spall_structure::ResidencyMode::AllResident,
-            &spall_structure::CancelToken::new(),
-            &self.label_cache,
-        );
-        // Also remember every brick's hash and solid count, which each commit
-        // (and a client verifying it) reads for the whole volume.
-        let terrain = &world.terrain().volume;
-        for coord in terrain.resident_brick_coords() {
-            if let Ok(Some(snapshot)) = terrain.snapshot_brick(coord) {
-                let _ = (snapshot.content_hash(), snapshot.solid_cells());
-            }
+    /// Moves staging onto a worker thread. The tick thread then only snapshots the world,
+    /// installs a finished result, and commits it, so staging cost no longer lengthens a tick.
+    ///
+    /// One request is staged at a time, in request order, against the world as the previous
+    /// commit left it; a result whose world moved on is discarded and staged again. What is
+    /// committed, and in which order, is the same as inline staging, but *which tick* a commit
+    /// lands on now depends on how long staging took in wall-clock time, so this is for a
+    /// real-time server; headless and deterministic runs keep the inline default.
+    pub fn enable_off_thread_staging(&mut self) {
+        if self.staging_worker.is_none() {
+            self.staging_worker = Some(StagingWorker::new());
         }
+    }
+
+    /// Whether staging runs on a worker thread.
+    pub fn stages_off_thread(&self) -> bool {
+        self.staging_worker.is_some()
+    }
+
+    /// Labels every terrain brick into the label cache now, so the first edit
+    /// of a large world does not pay for cold local labelling and content hashes.
+    /// Global support assembly still runs on edits. Safe to skip: an unwarmed
+    /// cache fills on the first staging pass.
+    pub fn warm_labels(&self, world: &SimWorld) {
+        let _span = crate::prof::Span::start("startup.local_labels_and_hashes");
+        let workers = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
+        self.label_cache
+            .warm_volume(&world.terrain().volume, workers);
     }
 
     /// The committed [`Committed`] for `request_id`, if it has committed.
     pub fn committed(&self, request_id: RequestId) -> Option<&Committed> {
         self.committed.get(&request_id.0)
+    }
+
+    /// Takes the recorded pipeline timing of a committed request, if still held.
+    pub fn take_timing(&mut self, request_id: RequestId) -> Option<EditTiming> {
+        self.timings.remove(&request_id.0)
     }
 
     /// The current authoritative status for an admitted request.  A repeated
@@ -226,6 +317,9 @@ impl EditPipeline {
             volume_id,
             region,
             attempts: 0,
+            queued_at: std::time::Instant::now(),
+            job_started: None,
+            result_seen: None,
         });
         let status = crate::commit::queued_status(request);
         self.statuses.insert(request.0, status.clone());
@@ -240,6 +334,9 @@ impl EditPipeline {
         server_tick: Tick,
         next_control_seq: &mut u64,
     ) -> Result<TickReport, CommitError> {
+        if self.staging_worker.is_some() {
+            return Ok(self.run_tick_off_thread(world, journal, server_tick, next_control_seq));
+        }
         let mut report = TickReport::default();
         // A structural commit advances the global topology epoch.  Results
         // staged later in the same batch therefore fail the commit-time token
@@ -296,6 +393,38 @@ impl EditPipeline {
                     report.rejected.push((queued.intent.request_id, reason));
                     continue;
                 };
+                let input_stamp = snapshot.state_stamp();
+                // Stagings against one unchanged terrain share one whole-world index: the first
+                // builds it, the rest clone it (staging runs here, single-threaded, so nothing
+                // can change the volume in between).
+                let warm_index = (queued.volume_id == world.terrain_volume_id())
+                    .then(|| {
+                        world
+                            .warm_structure_index(queued.volume_id, input_stamp)
+                            .or_else(|| {
+                                let _span = crate::prof::Span::start("schedule.warm_index_build");
+                                let built = std::sync::Arc::new(
+                                    spall_structure::StructureIndex::build_cached(
+                                        &snapshot,
+                                        world.anchor(),
+                                        spall_structure::ResidencyMode::AllResident,
+                                        generation,
+                                        epoch,
+                                        &spall_structure::CancelToken::new(),
+                                        &self.label_cache,
+                                    )
+                                    .ok()?,
+                                );
+                                world.set_warm_structure(
+                                    queued.volume_id,
+                                    input_stamp,
+                                    built.clone(),
+                                    None,
+                                );
+                                Some(built)
+                            })
+                    })
+                    .flatten();
                 let input = StageInput::new(
                     &queued.intent,
                     queued.volume_id,
@@ -305,7 +434,9 @@ impl EditPipeline {
                     generation,
                     epoch,
                 )
-                .with_label_cache(self.label_cache.clone());
+                .with_label_cache(self.label_cache.clone())
+                .with_warm_index(warm_index)
+                .with_warm_removal(world.warm_structure_removal(queued.volume_id, input_stamp));
                 let request = JobRequest::new(
                     Lane::Edit,
                     Priority::NORMAL,
@@ -351,117 +482,18 @@ impl EditPipeline {
                 let Some(queued) = self.inflight.remove(&entry.id) else {
                     continue;
                 };
-                let request = queued.intent.request_id;
-                let region = queued.region;
-
-                let staged = match entry.output {
-                    Ok(staged) => staged,
-                    // T23 / G3 row 7, slice C: the edit needs an evicted brick's
-                    // cells. Reload it from the backing and re-stage next tick; if
-                    // no backing has it, reject with a bounded explicit failure.
-                    Err(StageError::EvictedGeometryRequired(bricks)) => {
-                        self.conflicts.remove(&region);
-                        match world.reload_bricks(queued.volume_id, bricks.iter().copied()) {
-                            Ok(true) => {
-                                report.retried.push(request);
-                                report
-                                    .reloaded_bricks
-                                    .extend(bricks.iter().map(|&b| (queued.volume_id, b)));
-                                reload_retries_next_tick.push_back(QueuedIntent {
-                                    attempts: queued.attempts + 1,
-                                    ..queued
-                                });
-                            }
-                            _ => {
-                                let reason =
-                                    format!("evicted geometry unavailable for reload: {bricks:?}");
-                                self.record_rejection(request, reason.clone());
-                                report.rejected.push((request, reason));
-                            }
-                        }
-                        continue;
-                    }
-                    Err(err) => {
-                        let reason = err.to_string();
-                        self.record_rejection(request, reason.clone());
-                        report.rejected.push((request, reason));
-                        self.conflicts.remove(&region);
-                        continue;
-                    }
-                };
-
-                if self.committed.contains_key(&request.0) {
-                    continue; // idempotent: already committed
-                }
-
-                // Defensive: a body-targeted commit rebuilds its collider, which needs the live
-                // physics body. `submit` reactivates a dormant target and dormancy skips targeted
-                // bodies, but never let a commit reach a dormant body (it would panic in the solver).
-                if let EditTarget::Body(entity) = queued.intent.target
-                    && world.body_is_dormant(entity)
-                {
-                    world.reactivate_body(entity);
-                }
-
-                let control_seq = ControlSeq(*next_control_seq);
-                match commit(world, journal, &staged, server_tick, control_seq) {
-                    Ok(CommitOutcome::Committed(done)) => {
-                        *next_control_seq += 1;
-                        self.conflicts.remove(&region);
-                        self.committed.insert(request.0, done.clone());
-                        self.statuses.insert(request.0, done.action_status(request));
-                        report.committed.push((request, done));
-                    }
-                    // T23 / G3 row 7, slice C: the collider rebuild needs an evicted
-                    // brick's cells. Reload from the backing and re-commit next
-                    // tick; reject if unavailable.
-                    Err(CommitError::EvictedGeometryRequired { volume, bricks }) => {
-                        self.conflicts.remove(&region);
-                        match world.reload_bricks(volume, bricks.iter().copied()) {
-                            Ok(true) => {
-                                report.retried.push(request);
-                                report
-                                    .reloaded_bricks
-                                    .extend(bricks.iter().map(|&b| (volume, b)));
-                                reload_retries_next_tick.push_back(QueuedIntent {
-                                    attempts: queued.attempts + 1,
-                                    ..queued
-                                });
-                            }
-                            _ => {
-                                let reason =
-                                    format!("evicted geometry unavailable for reload: {bricks:?}");
-                                self.record_rejection(request, reason.clone());
-                                report.rejected.push((request, reason));
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        // The commit candidate failed a fallible step (id exhaustion,
-                        // DTO validation, op-budget) and was discarded before any
-                        // live state changed (`ENG-54`). Reject the request
-                        // deterministically; the tick continues and every other
-                        // staged request still commits.
-                        self.conflicts.remove(&region);
-                        let reason = err.to_string();
-                        self.record_rejection(request, reason.clone());
-                        report.rejected.push((request, reason));
-                    }
-                    Ok(CommitOutcome::Stale(_reason)) => {
-                        let count = self.conflicts.entry(region).or_insert(0);
-                        *count += 1;
-                        if *count >= self.serialize_threshold && self.serialized.insert(region) {
-                            report.serialized_regions.push(region);
-                            serialized_regions_this_tick.insert(region);
-                        }
-                        report.retried.push(request);
-                        self.pending.push_back(QueuedIntent {
-                            attempts: queued.attempts + 1,
-                            ..queued
-                        });
-                        rebase_requested = true;
-                    }
-                }
+                rebase_requested |= self.finish_staged(
+                    world,
+                    journal,
+                    server_tick,
+                    next_control_seq,
+                    queued,
+                    entry.output,
+                    &mut report,
+                    &mut reload_retries_next_tick,
+                    &mut serialized_regions_this_tick,
+                    false,
+                );
             }
 
             // Only a commit-time stale result requests an in-tick rebase.  All
@@ -477,6 +509,365 @@ impl EditPipeline {
         self.pending.append(&mut reload_retries_next_tick);
         report.pending_after = self.pending.len();
         Ok(report)
+    }
+
+    /// One tick with staging on the worker thread: commit what has finished, then start the
+    /// next request against the world as it now stands.
+    fn run_tick_off_thread(
+        &mut self,
+        world: &mut SimWorld,
+        journal: &mut JournalSink,
+        server_tick: Tick,
+        next_control_seq: &mut u64,
+    ) -> TickReport {
+        let mut report = TickReport::default();
+        let mut reload_retries_next_tick = VecDeque::new();
+        let mut serialized_regions_this_tick = HashSet::new();
+
+        // 1. Take what the worker finished. Install re-checks the generation and topology
+        //    epoch; the staged edit's own token is re-checked again at commit.
+        let outcome = self
+            .staging_worker
+            .as_ref()
+            .expect("checked by the caller")
+            .pool()
+            .install(&*world);
+        for discarded in outcome.discarded {
+            if self.prewarm_job == Some(discarded.id) {
+                self.prewarm_job = None;
+            } else if let Some(queued) = self.inflight.remove(&discarded.id) {
+                report.discarded_stale.push(queued.intent.request_id);
+                self.pending.push_front(queued);
+            }
+        }
+        for entry in outcome.installed {
+            if self.prewarm_job == Some(entry.id) {
+                self.prewarm_job = None;
+                if let WorkerOutput::Prewarmed {
+                    volume,
+                    stamp,
+                    built,
+                } = entry.output
+                {
+                    match built {
+                        // Keep it only if the volume is still in the state it was built from.
+                        Ok(Some(index))
+                            if world.volume_ref(volume).map(|v| v.state_stamp()) == Some(stamp) =>
+                        {
+                            world.set_warm_structure(volume, stamp, index, None);
+                        }
+                        Ok(_) => {}
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    }
+                }
+                continue;
+            }
+            let Some(mut queued) = self.inflight.remove(&entry.id) else {
+                continue;
+            };
+            queued.result_seen = Some(std::time::Instant::now());
+            let output = match entry.output {
+                WorkerOutput::Staged(staged) => match *staged {
+                    Ok(output) => output,
+                    // A panic in staging is a bug: fail where it is visible, with its
+                    // message, not by silently losing the request.
+                    Err(payload) => std::panic::resume_unwind(payload),
+                },
+                WorkerOutput::Prewarmed { .. } => unreachable!("a prewarm result has no request"),
+            };
+            self.finish_staged(
+                world,
+                journal,
+                server_tick,
+                next_control_seq,
+                queued,
+                output,
+                &mut report,
+                &mut reload_retries_next_tick,
+                &mut serialized_regions_this_tick,
+                true,
+            );
+        }
+
+        // 2. Start the next request. It snapshots the world after the commits above, so it is
+        //    not stale on arrival unless something else changes the world in the meantime.
+        while self.inflight.is_empty() && self.prewarm_job.is_none() {
+            let Some(queued) = self.pending.pop_front() else {
+                break;
+            };
+            let Some(snapshot) = world.volume_ref(queued.volume_id).cloned() else {
+                let reason = "target volume vanished".to_string();
+                self.record_rejection(queued.intent.request_id, reason.clone());
+                report.rejected.push((queued.intent.request_id, reason));
+                continue;
+            };
+            let generation = world.generation();
+            let epoch = world.topology_epoch();
+            let stamp = snapshot.state_stamp();
+            // The worker takes the warm index and edits it in place; the commit hands the edited
+            // one back. If this staging is discarded the index is gone, so forget that a prewarm
+            // was tried for this state and let an idle tick build another.
+            let (warm_index, warm_removal) = match (queued.volume_id == world.terrain_volume_id())
+                .then(|| world.take_warm_structure(queued.volume_id, stamp))
+                .flatten()
+            {
+                Some((index, removal)) => {
+                    self.last_prewarm = None;
+                    (Some(index), removal)
+                }
+                None => (None, None),
+            };
+            let input = StageInput::new(
+                &queued.intent,
+                queued.volume_id,
+                snapshot,
+                world.evicted(queued.volume_id).clone(),
+                world.anchor(),
+                generation,
+                epoch,
+            )
+            .with_label_cache(self.label_cache.clone())
+            .with_warm_index(warm_index)
+            .with_warm_removal(warm_removal);
+            let request = JobRequest::new(
+                Lane::Edit,
+                Priority::NORMAL,
+                JobToken::new(generation, epoch),
+                move || {
+                    WorkerOutput::Staged(Box::new(std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| stage_edit_owned(input)),
+                    )))
+                },
+            );
+            let worker = self.staging_worker.as_ref().expect("checked by the caller");
+            match worker.pool().submit(request) {
+                Ok(handle) => {
+                    let mut queued = queued;
+                    queued.job_started = Some(std::time::Instant::now());
+                    self.inflight.insert(handle.id(), queued);
+                }
+                Err(_rejected) => {
+                    self.pending.push_front(queued);
+                    break;
+                }
+            }
+        }
+
+        // 3. With nothing waiting, build the terrain's structure index for its current state on
+        //    the worker, so the next edit finds it ready instead of building it itself (about
+        //    0.4 s on a large world). This covers the first edit after startup, after a world
+        //    reset, and after a commit that split a body, which leaves no index behind.
+        if self.inflight.is_empty() && self.pending.is_empty() && self.prewarm_job.is_none() {
+            self.start_prewarm(world);
+        }
+
+        self.pending.append(&mut reload_retries_next_tick);
+        report.pending_after = self.pending.len();
+        report
+    }
+
+    /// Starts building the terrain's structure index on the worker, unless it already has one
+    /// for the volume's current state or a build for this exact state was already tried.
+    fn start_prewarm(&mut self, world: &SimWorld) {
+        let volume = world.terrain_volume_id();
+        let Some(snapshot) = world.volume_ref(volume) else {
+            return;
+        };
+        let stamp = snapshot.state_stamp();
+        let epoch = world.topology_epoch();
+        if world.warm_structure_index(volume, stamp).is_some()
+            || self.last_prewarm == Some((volume, stamp, epoch))
+        {
+            return;
+        }
+        let snapshot = snapshot.clone();
+        let generation = world.generation();
+        let anchor = world.anchor();
+        let cache = self.label_cache.clone();
+        let request = JobRequest::new(
+            Lane::Edit,
+            Priority::NORMAL,
+            JobToken::new(generation, epoch),
+            move || {
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    spall_structure::StructureIndex::build_cached(
+                        &snapshot,
+                        anchor,
+                        spall_structure::ResidencyMode::AllResident,
+                        generation,
+                        epoch,
+                        &spall_structure::CancelToken::new(),
+                        &cache,
+                    )
+                    .ok()
+                    .map(std::sync::Arc::new)
+                }));
+                WorkerOutput::Prewarmed {
+                    volume,
+                    stamp,
+                    built,
+                }
+            },
+        );
+        let worker = self.staging_worker.as_ref().expect("off-thread staging");
+        if let Ok(handle) = worker.pool().submit(request) {
+            self.prewarm_job = Some(handle.id());
+            self.last_prewarm = Some((volume, stamp, epoch));
+        }
+    }
+
+    /// Handles one staged result for `queued`: commits it, or reloads, rejects or re-queues it.
+    /// Returns whether a commit-time stale result asks for an in-tick rebase. With
+    /// `requeue_stale_first` a stale intent goes to the front of the queue so request order
+    /// survives (the off-thread path stages one request at a time).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_staged(
+        &mut self,
+        world: &mut SimWorld,
+        journal: &mut JournalSink,
+        server_tick: Tick,
+        next_control_seq: &mut u64,
+        queued: QueuedIntent,
+        output: StageResult,
+        report: &mut TickReport,
+        reload_retries_next_tick: &mut VecDeque<QueuedIntent>,
+        serialized_regions_this_tick: &mut HashSet<RegionKey>,
+        requeue_stale_first: bool,
+    ) -> bool {
+        let mut rebase_requested = false;
+        let request = queued.intent.request_id;
+        let region = queued.region;
+
+        let staged = match output {
+            Ok(staged) => staged,
+            // T23 / G3 row 7, slice C: the edit needs an evicted brick's
+            // cells. Reload it from the backing and re-stage next tick; if
+            // no backing has it, reject with a bounded explicit failure.
+            Err(StageError::EvictedGeometryRequired(bricks)) => {
+                self.conflicts.remove(&region);
+                match world.reload_bricks(queued.volume_id, bricks.iter().copied()) {
+                    Ok(true) => {
+                        report.retried.push(request);
+                        report
+                            .reloaded_bricks
+                            .extend(bricks.iter().map(|&b| (queued.volume_id, b)));
+                        reload_retries_next_tick.push_back(QueuedIntent {
+                            attempts: queued.attempts + 1,
+                            ..queued
+                        });
+                    }
+                    _ => {
+                        let reason = format!("evicted geometry unavailable for reload: {bricks:?}");
+                        self.record_rejection(request, reason.clone());
+                        report.rejected.push((request, reason));
+                    }
+                }
+                return false;
+            }
+            Err(err) => {
+                let reason = err.to_string();
+                self.record_rejection(request, reason.clone());
+                report.rejected.push((request, reason));
+                self.conflicts.remove(&region);
+                return false;
+            }
+        };
+
+        if self.committed.contains_key(&request.0) {
+            return false; // idempotent: already committed
+        }
+
+        // Defensive: a body-targeted commit rebuilds its collider, which needs the live
+        // physics body. `submit` reactivates a dormant target and dormancy skips targeted
+        // bodies, but never let a commit reach a dormant body (it would panic in the solver).
+        if let EditTarget::Body(entity) = queued.intent.target
+            && world.body_is_dormant(entity)
+        {
+            world.reactivate_body(entity);
+        }
+
+        let control_seq = ControlSeq(*next_control_seq);
+        let commit_started = std::time::Instant::now();
+        match commit(world, journal, &staged, server_tick, control_seq) {
+            Ok(CommitOutcome::Committed(done)) => {
+                if self.timings.len() >= 4096 {
+                    self.timings.clear();
+                }
+                self.timings.insert(
+                    request.0,
+                    EditTiming {
+                        queued: queued
+                            .job_started
+                            .map_or_else(Default::default, |at| at - queued.queued_at),
+                        staging: queued
+                            .job_started
+                            .zip(queued.result_seen)
+                            .map_or_else(Default::default, |(started, seen)| seen - started),
+                        commit: commit_started.elapsed(),
+                    },
+                );
+                *next_control_seq += 1;
+                self.conflicts.remove(&region);
+                self.committed.insert(request.0, done.clone());
+                self.statuses.insert(request.0, done.action_status(request));
+                report.committed.push((request, done));
+            }
+            // T23 / G3 row 7, slice C: the collider rebuild needs an evicted
+            // brick's cells. Reload from the backing and re-commit next
+            // tick; reject if unavailable.
+            Err(CommitError::EvictedGeometryRequired { volume, bricks }) => {
+                self.conflicts.remove(&region);
+                match world.reload_bricks(volume, bricks.iter().copied()) {
+                    Ok(true) => {
+                        report.retried.push(request);
+                        report
+                            .reloaded_bricks
+                            .extend(bricks.iter().map(|&b| (volume, b)));
+                        reload_retries_next_tick.push_back(QueuedIntent {
+                            attempts: queued.attempts + 1,
+                            ..queued
+                        });
+                    }
+                    _ => {
+                        let reason = format!("evicted geometry unavailable for reload: {bricks:?}");
+                        self.record_rejection(request, reason.clone());
+                        report.rejected.push((request, reason));
+                    }
+                }
+            }
+            Err(err) => {
+                // The commit candidate failed a fallible step (id exhaustion,
+                // DTO validation, op-budget) and was discarded before any
+                // live state changed (`ENG-54`). Reject the request
+                // deterministically; the tick continues and every other
+                // staged request still commits.
+                self.conflicts.remove(&region);
+                let reason = err.to_string();
+                self.record_rejection(request, reason.clone());
+                report.rejected.push((request, reason));
+            }
+            Ok(CommitOutcome::Stale(_reason)) => {
+                let count = self.conflicts.entry(region).or_insert(0);
+                *count += 1;
+                if *count >= self.serialize_threshold && self.serialized.insert(region) {
+                    report.serialized_regions.push(region);
+                    serialized_regions_this_tick.insert(region);
+                }
+                report.retried.push(request);
+                let retry = QueuedIntent {
+                    attempts: queued.attempts + 1,
+                    ..queued
+                };
+                if requeue_stale_first {
+                    self.pending.push_front(retry);
+                } else {
+                    self.pending.push_back(retry);
+                }
+                rebase_requested = true;
+            }
+        }
+
+        rebase_requested
     }
 
     /// T23 / G3 row 7 (ENG-30 row 7 increment 13): the bounded brick footprint
@@ -501,7 +892,7 @@ impl EditPipeline {
         // (`docs/architecture.md`: "Meshing includes a one-cell halo ...").
         const HALO_BRICKS: i64 = 1;
         let mut out = HashSet::new();
-        for queued in &self.pending {
+        for queued in self.pending.iter().chain(self.inflight.values()) {
             if queued.volume_id != volume {
                 continue;
             }

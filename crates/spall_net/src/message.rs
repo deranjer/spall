@@ -44,6 +44,9 @@ pub enum WireRecord {
     VegetationSnapshot(spall_protocol::vegetation::VegetationSnapshot),
     AdminRequest(AdminRequest),
     AdminStatus(AdminStatus),
+    CatalogueChunk(spall_protocol::CatalogueChunk),
+    CatalogueAck(spall_protocol::CatalogueAck),
+    ControlProbe(spall_protocol::ControlProbe),
 }
 
 impl WireRecord {
@@ -67,6 +70,9 @@ impl WireRecord {
             Self::VegetationSnapshot(_) => WireTag::VegetationSnapshot,
             Self::AdminRequest(_) => WireTag::AdminRequest,
             Self::AdminStatus(_) => WireTag::AdminStatus,
+            Self::CatalogueChunk(_) => WireTag::CatalogueChunk,
+            Self::CatalogueAck(_) => WireTag::CatalogueAck,
+            Self::ControlProbe(_) => WireTag::ControlProbe,
         }
     }
 
@@ -91,6 +97,9 @@ impl WireRecord {
             Self::VegetationSnapshot(r) => encode_control(r),
             Self::AdminRequest(r) => encode_control(r),
             Self::AdminStatus(r) => encode_control(r),
+            Self::CatalogueChunk(r) => encode_control(r),
+            Self::CatalogueAck(r) => encode_control(r),
+            Self::ControlProbe(r) => encode_control(r),
         }
     }
 
@@ -124,6 +133,9 @@ impl WireRecord {
             WireTag::VegetationSnapshot => Self::VegetationSnapshot(decode_control(bytes)?),
             WireTag::AdminRequest => Self::AdminRequest(decode_control(bytes)?),
             WireTag::AdminStatus => Self::AdminStatus(decode_control(bytes)?),
+            WireTag::CatalogueChunk => Self::CatalogueChunk(decode_control(bytes)?),
+            WireTag::CatalogueAck => Self::CatalogueAck(decode_control(bytes)?),
+            WireTag::ControlProbe => Self::ControlProbe(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,

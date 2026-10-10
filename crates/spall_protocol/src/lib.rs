@@ -38,8 +38,10 @@ pub use baseline::{
     BaselineVolume, BaselineWorld,
 };
 pub use canonical::{
-    CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, CanonicalWriter, Hash32,
-    canonical_topology_hash, content_manifest_hash, content_manifest_hash_with_assets,
+    CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, CanonicalWriter,
+    ChunkDigestCache, ChunkKey, HASH_CHUNK_SHIFT, Hash32, HashedVolume, SingleLayerBrick,
+    TOPOLOGY_CHUNK_DOMAIN, canonical_topology_hash, chunk_digest, chunk_digest_single_layer,
+    chunk_of, content_manifest_hash, content_manifest_hash_with_assets, topology_hash_from_chunks,
 };
 pub use codec::{
     CodecError, decode_bulk, decode_control, decode_datagram, decode_topology, encode_bulk,
@@ -71,3 +73,9 @@ pub mod water_delta;
 pub use water_delta::{WaterDelta, WaterDeltaAssembler, water_deltas};
 
 pub mod vegetation;
+
+pub mod catalogue;
+pub use catalogue::{
+    CATALOGUE_CHUNK_BYTES, CATALOGUE_WINDOW_CHUNKS, CatalogueAck, CatalogueChunk, ControlProbe,
+    MAX_CATALOGUE_CHUNKS, chunk_catalogue,
+};

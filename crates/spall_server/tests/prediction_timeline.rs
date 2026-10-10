@@ -91,6 +91,7 @@ fn run_session(
         join_token: token,
         max_ticks: total_ticks + 600,
         quiescence_ticks: 0,
+        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
         min_clients: 1,
         max_clients: 1,
         startup_timeout: Duration::from_secs(20),

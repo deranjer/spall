@@ -17,6 +17,12 @@ for measured costs and limits.
 
 The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It creates versioned RON project/scene documents and canonical `.spvox` voxel assets, and never adds egui to the game runtime dependency graph. On Windows, `tools/package-portable.ps1` builds a portable editor + sandbox folder; use File > Generate World to choose a seed, world size, and starting season, preview the map, then launch it in the FPS-HUD-enabled sandbox.
 
+Generated-world play loads nearby terrain at startup and streams surrounding bricks as the player
+moves. Distant terrain retains exact revision/hash records; the authoritative server still generates
+the whole world. Check Uncapped before launching to measure rendering throughput without VSync where
+supported. See [regional startup evidence](docs/reports/ENG-130-regional-startup.md) for measured costs
+and remaining limits.
+
 Build a custom engine for one survival/building game: Minecraft/Vintage Story-style world interaction, detailed voxel materials and Teardown-inspired lighting, **full-world destruction and multiplayer from the foundation**. The game runtime keeps a direct-control interface; the separate editor is a leaf package and never enters the engine/runtime dependency graph. Command-line tools and automated scenarios are also required.
 
 User requirements are full-world destruction and multiplayer. The remaining numbers below are proposed engineering defaults, not confirmed product requirements or measured performance.

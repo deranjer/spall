@@ -12,7 +12,11 @@
 //!
 //! The run is bounded: it stops at `max_ticks`, or early once the edit pipeline
 //! has been idle for `quiescence_ticks` consecutive ticks after at least one
-//! commit, then tells every client goodbye and tears the endpoint down.
+//! commit, then tells every client goodbye and tears the endpoint down. When the tick
+//! budget is what ends it, the run first lets regional clients drain
+//! ([`ServeConfig::drain_timeout`]): it keeps serving while one is still receiving a
+//! catalogue, transactions or repair patches the server already owes it, so a
+//! slow link is judged on whether it converges, not on how fast the ticks ran.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -138,6 +142,28 @@ pub fn default_capture_workers() -> usize {
 /// rate-limited) so host memory stays flat under a flood.
 pub const INBOUND_CHANNEL_CAP: usize = 4096;
 
+/// Records a connection reader had to drop because the bridge to the sim loop was full, by
+/// kind. A dropped action is answered with a retryable rejection; the others rely on the
+/// client's own retry. Never silent: the counts are in the run summary.
+#[derive(Debug, Default)]
+pub(crate) struct InboundDrops {
+    actions: std::sync::atomic::AtomicU64,
+    repairs: std::sync::atomic::AtomicU64,
+    progression: std::sync::atomic::AtomicU64,
+    admin: std::sync::atomic::AtomicU64,
+}
+
+impl InboundDrops {
+    /// Counts one drop and returns the new total for that kind; logs the first of each kind and
+    /// every hundredth after it.
+    fn note(&self, counter: &std::sync::atomic::AtomicU64, kind: &'static str) {
+        let total = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if total == 1 || total.is_multiple_of(100) {
+            tracing::warn!(kind, total, "inbound bridge full; dropped a client record");
+        }
+    }
+}
+
 /// Most inbound bridge records the sim loop drains in a single tick. The
 /// remainder waits in the bounded channel for the next tick, so an ingress
 /// burst can never prevent the drain loop from ending.
@@ -160,6 +186,12 @@ pub const MAX_ACTIONS_PER_CLIENT_PER_TICK: u32 = 4;
 /// (`docs/protocol.md`: `RepairRequest` is "rate-limited"). Surplus is dropped;
 /// the replica re-requests, itself rate-limited (ENG-49).
 pub const MAX_REPAIRS_PER_CLIENT_PER_TICK: u32 = 8;
+
+/// Most repair patches queued for one client and not yet written. A client on a slow link that
+/// asks for more than its link can carry is not answered past this (its own request backoff
+/// asks again later) rather than being given a backlog that overflows `MAX_RELIABLE_BACKLOG`
+/// and ends its connection.
+pub const MAX_QUEUED_REPAIRS_PER_CLIENT: usize = 96;
 pub const MAX_PROGRESSION_PER_CLIENT_PER_TICK: u32 = 8;
 
 /// Most reliable messages (committed topology, `ActionStatus`, baseline
@@ -172,6 +204,16 @@ pub const MAX_RELIABLE_BACKLOG: usize = 2048;
 
 /// Byte ceiling on that same per-client reliable queue.
 pub const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long a regional client must have everything the server owes it, and have sent nothing,
+/// before a run that spent its tick budget is allowed to end. A client with transactions held for
+/// repairs asks again at most every four seconds (its request backoff tops out at eight times
+/// 30 ticks), and a request deferred by the per-client patch queue cap is only repeated then, so
+/// the grace has to outlast that, plus an impaired link's round trip.
+const DRAIN_GRACE: Duration = Duration::from_secs(6);
+
+/// Default for [`ServeConfig::drain_timeout`].
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// ENG-61: with [`ServeConfig::await_body_settle`], how many consecutive ticks
 /// every detached body's origin must hold still (< 1 mm/tick) — on top of being
@@ -516,6 +558,11 @@ pub struct ServeConfig {
     /// Stop early after the pipeline is idle this many consecutive ticks
     /// (once at least one transaction has committed). `0` disables early stop.
     pub quiescence_ticks: u64,
+    /// Once `max_ticks` is spent, keep serving for up to this long while a regional client is
+    /// still receiving what the server owes it (see the module docs). `0` ends the run at
+    /// `max_ticks` regardless. Hitting the limit is reported in the summary
+    /// (`drain_timed_out`), never silent.
+    pub drain_timeout: Duration,
     /// Wait for this many clients before the tick loop starts.
     pub min_clients: usize,
     /// Refuse connections past this many.
@@ -681,6 +728,7 @@ impl ServeConfig {
             join_token: token,
             max_ticks: 1_200,
             quiescence_ticks: 45,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             min_clients: 1,
             max_clients: 8,
             startup_timeout: Duration::from_secs(15),
@@ -768,18 +816,33 @@ pub struct ServeSummary {
     pub expired_actions_rejected: u64,
     /// T17: total baseline bulk payload bytes pushed this run.
     pub baseline_bytes_sent: u64,
+    /// Repair requests left unanswered because the client's patch queue was full (see
+    /// `MAX_QUEUED_REPAIRS_PER_CLIENT`); the client asks again after its backoff.
+    pub repairs_deferred_queue_full: u64,
     /// ENG-48: `ActionRequest`s bounced with a throttled rejection because their
     /// session exceeded [`MAX_ACTIONS_PER_CLIENT_PER_TICK`] this tick.
     pub inbound_actions_throttled: u64,
     /// ENG-48: `RepairRequest`s dropped because their session exceeded
     /// [`MAX_REPAIRS_PER_CLIENT_PER_TICK`] this tick.
     pub inbound_repairs_throttled: u64,
+    /// Records dropped because the reader-to-sim bridge was full (see `InboundDrops`).
+    pub inbound_dropped_actions: u64,
+    pub inbound_dropped_repairs: u64,
+    pub inbound_dropped_progression: u64,
+    pub inbound_dropped_admin: u64,
     /// Water update batches queued (historical field name); a batch may contain
     /// full-frame chunks or changed-brick deltas.
     pub water_keyframes_sent: u64,
     pub water_bytes_queued: u64,
     /// Admin world resets performed.
     pub world_resets: u64,
+    /// Edits accepted but not yet resolved when a world reset replaced the world; each was
+    /// answered with a retryable "overloaded: world reset" rejection.
+    pub actions_discarded_by_reset: u64,
+    /// Ticks run past `max_ticks` to let regional clients finish receiving what the server owed
+    /// them, and whether the drain limit ended the run with one still receiving.
+    pub drain_ticks: u64,
+    pub drain_timed_out: bool,
     /// T20: motion snapshots actually sent this run, summed over every client
     /// and batch. With `motion_interest` unset this is `batches * bodies *
     /// clients`; with it set, interest-culled and cadence-deferred snapshots are
@@ -1594,8 +1657,7 @@ impl OutboundQueue {
                 Ok(())
             }
             Outbound::Baseline(transfer)
-                if transfer.begin.world_version
-                    == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION =>
+                if spall_protocol::segment::is_streamed_world(transfer.begin.world_version) =>
             {
                 // One bounded streaming transfer has its own slot; counting its
                 // compressed bytes as control backlog would reject it before send.
@@ -1623,6 +1685,18 @@ impl OutboundQueue {
                     // Do not enqueue and do not discard the accepted backlog:
                     // the writer still flushes it, then the connection closes
                     // and the client re-baselines.
+                    let mut kinds = std::collections::BTreeMap::<&'static str, usize>::new();
+                    for queued in &self.reliable {
+                        *kinds.entry(outbound_kind(queued)).or_default() += 1;
+                    }
+                    tracing::warn!(
+                        ?kinds,
+                        queued_messages = self.reliable.len(),
+                        queued_bytes = self.reliable_bytes,
+                        incoming_bytes = add,
+                        message = outbound_kind(&reliable),
+                        "client reliable backlog bound exceeded"
+                    );
                     self.overflowed = true;
                     return Err(OutboundOverflow);
                 }
@@ -1631,6 +1705,62 @@ impl OutboundQueue {
                 Ok(())
             }
         }
+    }
+}
+
+/// One session's input-frame arrival over a logging window: how many frames
+/// arrived, how far ahead of (or behind) the server tick their `intended_tick`
+/// was, and how far the newest frame's sequence ran past the applied one.
+#[derive(Default)]
+struct InputArrivalWindow {
+    frames: u64,
+    min_lead_ticks: i64,
+    max_lead_ticks: i64,
+    max_seq_gap: u64,
+    newest_seq: u64,
+}
+
+impl InputArrivalWindow {
+    fn record(&mut self, seq: u64, lead_ticks: i64, acked: u64) {
+        if self.frames == 0 {
+            self.min_lead_ticks = lead_ticks;
+            self.max_lead_ticks = lead_ticks;
+        }
+        self.frames += 1;
+        self.min_lead_ticks = self.min_lead_ticks.min(lead_ticks);
+        self.max_lead_ticks = self.max_lead_ticks.max(lead_ticks);
+        self.max_seq_gap = self.max_seq_gap.max(seq.saturating_sub(acked));
+        self.newest_seq = self.newest_seq.max(seq);
+    }
+
+    fn report_and_reset(&mut self, session: u64, tick: u64) {
+        if self.frames > 0 {
+            tracing::info!(
+                session,
+                tick,
+                frames = self.frames,
+                min_lead_ticks = self.min_lead_ticks,
+                max_lead_ticks = self.max_lead_ticks,
+                max_seq_gap = self.max_seq_gap,
+                newest_seq = self.newest_seq,
+                "player input arrival"
+            );
+        }
+        *self = Self::default();
+    }
+}
+
+/// Short message-kind name for backlog diagnostics.
+fn outbound_kind(msg: &Outbound) -> &'static str {
+    match msg {
+        Outbound::Transaction(_) => "transaction",
+        Outbound::Status(_) => "action-status",
+        Outbound::Progression(_) => "progression",
+        Outbound::Admin(_) => "admin",
+        Outbound::Baseline(_) => "baseline",
+        Outbound::Water(_) => "water",
+        Outbound::Motion(_) => "motion",
+        Outbound::Shutdown(_) => "shutdown",
     }
 }
 
@@ -1692,7 +1822,107 @@ struct OutboundHandle {
 struct OutboundShared {
     queue: Mutex<OutboundQueue>,
     wake: Notify,
+    /// Water/vegetation messages queued or being sent but not yet written.
+    water_unsent: std::sync::atomic::AtomicUsize,
+    /// The writer is feeding this client its deferred terrain catalogue.
+    catalogue_streaming: std::sync::atomic::AtomicBool,
+    /// Credit the client has returned for the catalogue being fed:
+    /// `(transfer_id, chunks acknowledged)`.
+    catalogue_credit: Mutex<(u64, u32)>,
+    /// How far the newest full baseline's catalogue has got: `(transfer_id, state)`.
+    catalogue_progress: Mutex<(u64, CatalogueState)>,
+    /// The newest full baseline's catalogue layout, to resume it after a world reset:
+    /// `(transfer_id, layout)`; `None` when that baseline carried no catalogue.
+    catalogue_layout: Mutex<Option<(u64, Arc<baseline::CatalogueLayout>)>>,
+    /// Chunks of that catalogue the writer has written: `(transfer_id, chunks)`. The control
+    /// stream is ordered, so the client processes every one of them before any record queued
+    /// after them, such as a world reset's baseline.
+    catalogue_written: Mutex<(u64, u32)>,
+    /// Application bytes the connection has written, as last reported by the writer.
+    written_bytes: std::sync::atomic::AtomicU64,
+    /// The control-stream offset just past the last record a client needs to converge (anything
+    /// but water). Once a probe echo confirms this offset, the client has everything essential
+    /// the server has sent, however much water has been streamed since.
+    essential_written_bytes: std::sync::atomic::AtomicU64,
+    /// Round trips on the control stream, to see how much is queued ahead of a new record.
+    probes: Mutex<ControlProbes>,
 }
+
+/// Outstanding and recently answered [`spall_protocol::ControlProbe`]s of one connection.
+struct ControlProbes {
+    next_id: u64,
+    /// `(id, sent at, application bytes the connection had written when it was sent)`.
+    outstanding: VecDeque<(u64, std::time::Instant, u64)>,
+    last_delay: std::time::Duration,
+    /// Application bytes written by the time of the newest echoed probe: everything up to here
+    /// has reached the client, because the control stream is ordered.
+    confirmed_bytes: u64,
+    /// When the newest echo arrived and the bytes it confirmed, for the delivery-rate estimate.
+    last_echo: Option<(std::time::Instant, u64)>,
+    /// Smoothed bytes per second the link has delivered, from successive echoes.
+    delivery_rate: f64,
+}
+
+impl Default for ControlProbes {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            outstanding: VecDeque::new(),
+            last_delay: std::time::Duration::ZERO,
+            confirmed_bytes: 0,
+            last_echo: None,
+            // Generous until measured, so a healthy connection is never throttled at the start.
+            delivery_rate: 4.0 * 1024.0 * 1024.0,
+        }
+    }
+}
+
+/// Droppable traffic may run ahead of the client's last confirmed byte by this long at the
+/// measured delivery rate, within [`MIN_UNCONFIRMED_BYTES`]..=[`MAX_UNCONFIRMED_BYTES`].
+const UNCONFIRMED_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+const MIN_UNCONFIRMED_BYTES: f64 = 48.0 * 1024.0;
+const MAX_UNCONFIRMED_BYTES: f64 = 1024.0 * 1024.0;
+
+/// How often the writer probes the control stream's queueing delay.
+const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The least time between two control probes. An echo wakes the writer, which then sends the next
+/// probe, so on a slow link a chain of probes follows the queue closely (the congestion check
+/// reads the delay of the newest answers); on a fast link the echo comes back inside this gap and
+/// the chain ends, leaving the idle timer's [`PROBE_INTERVAL`]. With no gap at all every wake-up
+/// sent a probe and every echo caused another: tens of thousands of records a second per client.
+const PROBE_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Whether a control probe may be sent now: none yet, or the last one is [`PROBE_MIN_GAP`] old.
+fn probe_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|sent| now.saturating_duration_since(sent) >= PROBE_MIN_GAP)
+}
+/// Probes allowed in flight; more would only measure the same backlog again.
+const MAX_OUTSTANDING_PROBES: usize = 16;
+/// Control-stream queueing delay above which droppable traffic (water, vegetation, catalogue
+/// chunks) is held back. The delay of one record is the time the link needs for everything
+/// already queued, so this bounds what a new baseline or reset waits behind on any link speed.
+const CONTROL_CONGESTION_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Delivery of the catalogue that completes the newest full baseline sent to one client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogueState {
+    /// No full baseline has been sent.
+    None,
+    /// A baseline with a catalogue is queued or being sent; the chunks have not started.
+    Queued,
+    /// The chunks are going out.
+    Streaming,
+    /// Every chunk was written (the control stream is ordered, so the client has them before
+    /// anything written later), or the baseline needed none.
+    Complete,
+}
+
+/// Most unsent water/vegetation messages one client may have outstanding before the
+/// server stops producing more for it. Water is presentation-only and every keyframe
+/// supersedes the last, so a client behind a slow link should see the newest frame later,
+/// not an ever longer queue of stale ones that crowds out transactions and baselines.
+const MAX_UNSENT_WATER_MESSAGES: usize = 4;
 
 impl OutboundHandle {
     fn new() -> Self {
@@ -1700,6 +1930,15 @@ impl OutboundHandle {
             inner: Arc::new(OutboundShared {
                 queue: Mutex::new(OutboundQueue::default()),
                 wake: Notify::new(),
+                water_unsent: std::sync::atomic::AtomicUsize::new(0),
+                catalogue_streaming: std::sync::atomic::AtomicBool::new(false),
+                catalogue_credit: Mutex::new((0, 0)),
+                catalogue_progress: Mutex::new((0, CatalogueState::None)),
+                catalogue_layout: Mutex::new(None),
+                catalogue_written: Mutex::new((0, 0)),
+                written_bytes: std::sync::atomic::AtomicU64::new(0),
+                essential_written_bytes: std::sync::atomic::AtomicU64::new(0),
+                probes: Mutex::new(ControlProbes::default()),
             }),
         }
     }
@@ -1708,12 +1947,52 @@ impl OutboundHandle {
     /// the reliable backlog blew its bound and the caller must drop this client
     /// from the fan-out set (its writer is now draining-then-closing).
     fn push(&self, msg: Outbound) -> Result<(), OutboundOverflow> {
+        // A full baseline (not a one-brick repair or a split blob, which are version 1) resets
+        // what the client holds, so track how much of its catalogue is still to come.
+        if let Outbound::Baseline(transfer) = &msg
+            && transfer.begin.world_version
+                >= spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION
+        {
+            self.set_catalogue_progress(
+                transfer.begin.transfer_id.0,
+                if transfer.catalogue.is_some() {
+                    CatalogueState::Queued
+                } else {
+                    CatalogueState::Complete
+                },
+            );
+            *self
+                .inner
+                .catalogue_layout
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = transfer
+                .catalogue
+                .as_ref()
+                .map(|c| (transfer.begin.transfer_id.0, Arc::clone(&c.layout)));
+        }
+        if matches!(msg, Outbound::Water(_)) {
+            self.inner
+                .water_unsent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let res = {
             let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
             q.push(msg)
         };
         self.inner.wake.notify_one();
         res
+    }
+
+    /// How many baseline transfers (repair patches among them) are queued and unwritten.
+    fn queued_baselines(&self) -> usize {
+        self.inner
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reliable
+            .iter()
+            .filter(|msg| matches!(msg, Outbound::Baseline(_)))
+            .count()
     }
 
     /// Takes everything queued in one pass.
@@ -1729,6 +2008,273 @@ impl OutboundHandle {
             motion: q.motion.take(),
             overflowed: q.overflowed,
         }
+    }
+
+    /// Whether the server should hold back further water for this client: it
+    /// already has unsent water outstanding, or its catalogue is streaming and
+    /// should have the link to itself.
+    fn water_backlogged(&self) -> bool {
+        self.inner
+            .water_unsent
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= MAX_UNSENT_WATER_MESSAGES
+            || self
+                .inner
+                .catalogue_streaming
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || self.control_congested()
+    }
+
+    /// Whether records already written to the control stream are taking longer to arrive than
+    /// [`CONTROL_CONGESTION_DELAY`]: the oldest unanswered probe has waited that long, or the
+    /// last answered one did.
+    fn control_congested(&self) -> bool {
+        let probes = self.inner.probes.lock().unwrap_or_else(|e| e.into_inner());
+        let delay = probes
+            .outstanding
+            .front()
+            .map_or(probes.last_delay, |(_, sent, _)| sent.elapsed());
+        // Delay alone reacts only after the queue is already long when the producers outrun the
+        // link several times over, so also bound the bytes written past the last confirmed
+        // byte: about UNCONFIRMED_WINDOW of what the link has recently delivered.
+        let window = (probes.delivery_rate * UNCONFIRMED_WINDOW.as_secs_f64())
+            .clamp(MIN_UNCONFIRMED_BYTES, MAX_UNCONFIRMED_BYTES);
+        let written = self
+            .inner
+            .written_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let unconfirmed = written.saturating_sub(probes.confirmed_bytes) as f64;
+        delay > CONTROL_CONGESTION_DELAY || unconfirmed > window
+    }
+
+    /// The writer wrote a record a client needs to converge, ending at `bytes`.
+    fn note_essential(&self, bytes: u64) {
+        self.inner
+            .essential_written_bytes
+            .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this client is still to receive something the server already owes it and it needs
+    /// to converge: a catalogue not fully written, an essential record still queued, or one
+    /// written whose delivery no probe echo has confirmed yet. Water does not count: it is
+    /// presentation-only and replaced by every newer frame.
+    fn draining(&self) -> bool {
+        let catalogue_pending = matches!(
+            self.inner
+                .catalogue_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .1,
+            CatalogueState::Queued | CatalogueState::Streaming
+        );
+        let essential_queued = self
+            .inner
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reliable
+            .iter()
+            .any(|msg| !matches!(msg, Outbound::Water(_)));
+        let essential = self
+            .inner
+            .essential_written_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let confirmed = self
+            .inner
+            .probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .confirmed_bytes;
+        catalogue_pending || essential_queued || essential > confirmed
+    }
+
+    /// The writer reports the application bytes the connection has written so far.
+    fn note_written(&self, bytes: u64) {
+        self.inner
+            .written_bytes
+            .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reserves the next probe id. Only the newest [`MAX_OUTSTANDING_PROBES`] stay tracked: a
+    /// client that cannot echo yet (it is installing a baseline and skips records it does not
+    /// expect) leaves some unanswered, and a window that never slid would keep the stream
+    /// "congested" forever instead of recovering on the first echo that follows.
+    fn next_probe(&self) -> u64 {
+        let written = self
+            .inner
+            .written_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut probes = self.inner.probes.lock().unwrap_or_else(|e| e.into_inner());
+        while probes.outstanding.len() >= MAX_OUTSTANDING_PROBES {
+            probes.outstanding.pop_front();
+        }
+        let id = probes.next_id;
+        probes.next_id += 1;
+        probes
+            .outstanding
+            .push_back((id, std::time::Instant::now(), written));
+        id
+    }
+
+    /// The client echoed probe `id`: its delay is the stream's current queueing delay, and any
+    /// older probe it overtook is answered too (the stream is ordered).
+    fn probe_returned(&self, id: u64) {
+        {
+            let mut probes = self.inner.probes.lock().unwrap_or_else(|e| e.into_inner());
+            while let Some((front, sent, bytes)) = probes.outstanding.front().copied() {
+                if front > id {
+                    break;
+                }
+                probes.outstanding.pop_front();
+                if front == id {
+                    probes.last_delay = sent.elapsed();
+                    let now = std::time::Instant::now();
+                    if let Some((then, then_bytes)) = probes.last_echo {
+                        let dt = now.duration_since(then).as_secs_f64();
+                        // Only intervals that confirmed data carry a rate: an idle link
+                        // delivers nothing because nothing was sent, not because it is slow.
+                        if dt > 0.05 && bytes > then_bytes {
+                            let sample = (bytes - then_bytes) as f64 / dt;
+                            probes.delivery_rate = 0.7 * probes.delivery_rate + 0.3 * sample;
+                        }
+                    }
+                    probes.last_echo = Some((now, bytes));
+                    probes.confirmed_bytes = probes.confirmed_bytes.max(bytes);
+                }
+            }
+        }
+        self.inner.wake.notify_one();
+    }
+
+    /// The writer finished (or abandoned) one water message.
+    fn water_sent(&self) {
+        let _ = self.inner.water_unsent.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| Some(n.saturating_sub(1)),
+        );
+    }
+
+    /// Records the client's acknowledgement of catalogue chunk `index` of `transfer_id` and wakes
+    /// the writer, which may now send another chunk.
+    fn catalogue_ack(&self, transfer_id: u64, index: u32) {
+        {
+            let mut credit = self
+                .inner
+                .catalogue_credit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if credit.0 == transfer_id {
+                credit.1 = credit.1.max(index.saturating_add(1));
+            }
+        }
+        self.inner.wake.notify_one();
+    }
+
+    fn set_catalogue_progress(&self, transfer_id: u64, state: CatalogueState) {
+        *self
+            .inner
+            .catalogue_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (transfer_id, state);
+    }
+
+    /// Advances the catalogue of `transfer_id` unless a newer baseline has replaced it.
+    fn advance_catalogue_progress(&self, transfer_id: u64, state: CatalogueState) {
+        let mut progress = self
+            .inner
+            .catalogue_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if progress.0 == transfer_id {
+            progress.1 = state;
+        }
+    }
+
+    /// Whether the client holds the complete catalogue of the newest full baseline sent to it,
+    /// so a world reset may send only what changed.
+    fn catalogue_complete(&self) -> bool {
+        self.inner
+            .catalogue_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            == CatalogueState::Complete
+    }
+
+    /// Records that the writer has written the first `chunks` chunks of `transfer_id`'s catalogue.
+    fn set_catalogue_written(&self, transfer_id: u64, chunks: u32) {
+        *self
+            .inner
+            .catalogue_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (transfer_id, chunks);
+    }
+
+    /// The newest catalogue, if the client is partway through it: its layout and how many
+    /// chunks it is certain to have processed. `None` when it is complete, has not started, or
+    /// the layout belongs to a different baseline.
+    fn resumable_catalogue(&self) -> Option<(Arc<baseline::CatalogueLayout>, u32)> {
+        let (transfer, state) = *self
+            .inner
+            .catalogue_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state != CatalogueState::Streaming {
+            return None;
+        }
+        let layout = {
+            let guard = self
+                .inner
+                .catalogue_layout
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some((id, layout)) if *id == transfer => Arc::clone(layout),
+                _ => return None,
+            }
+        };
+        let (written_for, written) = *self
+            .inner
+            .catalogue_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (written_for == transfer && written > 0).then_some((layout, written))
+    }
+
+    /// Starts crediting a new catalogue: nothing acknowledged yet.
+    fn begin_catalogue(&self, transfer_id: u64) {
+        *self
+            .inner
+            .catalogue_credit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (transfer_id, 0);
+    }
+
+    fn catalogue_acked(&self, transfer_id: u64) -> u32 {
+        let credit = self
+            .inner
+            .catalogue_credit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if credit.0 == transfer_id { credit.1 } else { 0 }
+    }
+
+    fn set_catalogue_streaming(&self, streaming: bool) {
+        self.inner
+            .catalogue_streaming
+            .store(streaming, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Takes only the newest unsent motion batch, leaving reliable traffic
+    /// queued, so the writer can send it between slow reliable transfers.
+    fn take_motion(&self) -> Option<Arc<Vec<MotionSnapshot>>> {
+        self.inner
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .motion
+            .take()
     }
 
     /// Current queued reliable bytes (test-only introspection of the byte cap).
@@ -1853,6 +2399,11 @@ async fn serve_async(
     // version above.
     let egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
+    // Repair requests have their own bridge: a client that is waiting out a slow tick (a world
+    // reset) re-requests bricks by the thousand, and on the shared bridge that flood displaced
+    // its players' edits. Edits, input and joins are drained first.
+    let (repair_tx, mut repair_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
+    let inbound_drops = Arc::new(InboundDrops::default());
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
     let (accept_stop_tx, accept_stop_rx) = watch::channel(false);
@@ -1939,6 +2490,8 @@ async fn serve_async(
         let conns = conns.clone();
         let egress_closed = egress_closed.clone();
         let inbound_tx = inbound_tx.clone();
+        let repair_tx = repair_tx.clone();
+        let inbound_drops = inbound_drops.clone();
         let stop_rx = stop_rx.clone();
         let accept_stop_rx = accept_stop_rx.clone();
         let admission = AdmissionGate::new(config.max_clients);
@@ -1978,6 +2531,8 @@ async fn serve_async(
                 tokio::spawn(serve_conn(
                     conn,
                     inbound_tx.clone(),
+                    repair_tx.clone(),
+                    inbound_drops.clone(),
                     handle,
                     clients.clone(),
                     conns.clone(),
@@ -2063,6 +2618,7 @@ async fn serve_async(
     let committed_edit_worker = commit_handler.map(CommittedEditWorker::spawn);
 
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
+        let setup_started = std::time::Instant::now();
         // Open the world database (T16). If it already holds a checkpoint,
         // recover from it; otherwise start the built-in scene and publish an
         // initial checkpoint so recovery always has a floor.
@@ -2092,6 +2648,18 @@ async fn serve_async(
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
+        for (stage, elapsed) in spall_sim::prof::drain() {
+            tracing::info!(
+                stage,
+                elapsed_us = elapsed.as_micros() as u64,
+                "startup profile"
+            );
+        }
+        tracing::info!(
+            stage = "authoritative_setup",
+            elapsed_us = setup_started.elapsed().as_micros() as u64,
+            "startup profile"
+        );
         let progression_worker = progression_worker;
         let committed_edit_worker = committed_edit_worker;
         let outbox_worker = outbox_processor.map(OutboxWorker::spawn);
@@ -2227,7 +2795,45 @@ async fn serve_async(
         // rejection is never mistaken for success.
         let mut pending_gate_admin: HashMap<u64, (SessionId, RequestId)> = HashMap::new();
         let mut world_resets = 0u64;
-        for _ in 0..max_ticks {
+        let mut actions_discarded_by_reset = 0u64;
+        // A real-time server stages edits on a worker thread so a burst of cuts cannot hold
+        // the tick; an unpaced (headless, deterministic) run keeps the inline default.
+        // `SPALL_INLINE_STAGING` selects the inline path for comparison.
+        if paced && std::env::var_os("SPALL_INLINE_STAGING").is_none() {
+            sim.enable_off_thread_staging();
+            tracing::info!("edit staging runs off the tick thread");
+        }
+        // Diagnostic: per-session input arrival, logged every 300 ticks.
+        let mut input_windows: HashMap<u64, InputArrivalWindow> = HashMap::new();
+        // The tick budget grows one tick at a time while regional clients drain (see
+        // `ServeConfig::drain_timeout`); `iteration` counts ticks of this loop.
+        let mut tick_budget = max_ticks;
+        let mut vegetation_job: Option<std::sync::mpsc::Receiver<Result<Vec<WireRecord>, String>>> =
+            None;
+        // Phases at least this long are logged with the tick's other phases; lower it with
+        // `SPALL_SLOW_PHASE_MS` to see what the tail of the tick distribution is made of.
+        let slow_phase = Duration::from_millis(
+            std::env::var("SPALL_SLOW_PHASE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50),
+        );
+        let mut water_frames: HashMap<
+            spall_core::GlobalCell,
+            crate::water_replication::SharedFrame,
+        > = HashMap::new();
+        // Where the tick thread's time goes: before-tick (client input, admission), the
+        // simulation tick, and after (replication, persistence, residency), summed and worst.
+        let mut phase_totals = [Duration::ZERO; 3];
+        let mut phase_worst = [Duration::ZERO; 3];
+        let mut span_totals: HashMap<&'static str, (Duration, Duration)> = HashMap::new();
+        let mut iteration = 0u64;
+        let drain_timeout = config.drain_timeout;
+        let mut drain_started: Option<std::time::Instant> = None;
+        let mut drain_quiet_since: Option<std::time::Instant> = None;
+        let mut drain_timed_out = false;
+        while iteration < tick_budget {
+            iteration += 1;
             let started = std::time::Instant::now();
             // ENG-48: drain a bounded slice of what the clients have sent since
             // the last tick, with a per-session admission quota so one flooding
@@ -2253,7 +2859,7 @@ async fn serve_async(
             }
             let mut drained = 0usize;
             while drained < MAX_INBOUND_PER_TICK {
-                let Ok(msg) = inbound_rx.try_recv() else {
+                let Ok(msg) = inbound_rx.try_recv().or_else(|_| repair_rx.try_recv()) else {
                     break;
                 };
                 drained += 1;
@@ -2292,6 +2898,11 @@ async fn serve_async(
                             continue;
                         }
                         let entity = session_player_entity(session);
+                        input_windows.entry(session.raw()).or_default().record(
+                            frame.input_seq.0,
+                            frame.intended_tick.0 as i64 - sim.current_tick().0 as i64,
+                            sim.player_acked_input(entity).map_or(0, |a| a.0),
+                        );
                         // Recover unseen redundant copies through the same
                         // admission rule as the primary input below. A copy
                         // carries its own intended_tick, so recovering one
@@ -2504,17 +3115,48 @@ async fn serve_async(
                             },
                             None => {
                                 let started = std::time::Instant::now();
+                                // What deferred clients already hold of the world about to be
+                                // replaced, so their catalogue can be a delta.
+                                let catalogue_basis =
+                                    lj.capture_catalogue_basis(&sim, &clients_for_sim);
+                                let basis_ms = started.elapsed().as_millis() as u64;
+                                // The old world is not needed from here (the tick thread is busy
+                                // for the whole reset): start freeing it on a background thread
+                                // before the new one is built, so the two are not both resident
+                                // at full size. A one-brick placeholder stands in meanwhile.
+                                match Simulation::new(spall_sim::SimulationConfig::new(
+                                    spall_sim::fixtures::flat_terrain_setup(),
+                                )) {
+                                    Ok(placeholder) => {
+                                        if let Err(e) = sim.replace_world(placeholder) {
+                                            return SimResult::error(
+                                                format!("world reset failed: {e}"),
+                                                ticks_run,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        return SimResult::error(
+                                            format!("world reset failed: {e}"),
+                                            ticks_run,
+                                        );
+                                    }
+                                }
+                                sim.wait_for_retired();
+                                let freed_ms = started.elapsed().as_millis() as u64;
                                 let fresh = scene.simulation_with_materials(
                                     terrain_collider_mode,
                                     reset_materials.clone(),
                                     custom_world.as_ref(),
                                 );
+                                let built_ms = started.elapsed().as_millis() as u64;
                                 if let Err(e) = sim.replace_world(fresh) {
                                     return SimResult::error(
                                         format!("world reset failed: {e}"),
                                         ticks_run,
                                     );
                                 }
+                                let replaced_ms = started.elapsed().as_millis() as u64;
                                 let spawns = custom_world.as_ref().map_or_else(
                                     || scene.player_spawns(),
                                     CustomWorld::player_spawns,
@@ -2528,8 +3170,21 @@ async fn serve_async(
                                 }
                                 // Everything below described bodies or edits of the
                                 // replaced world.
+                                // An edit staged against the replaced world will never
+                                // commit (the new world has a new pipeline). Say so, so the
+                                // client retries it instead of waiting for a receipt that
+                                // cannot come.
+                                for (request, (session, _)) in submitted_by.drain() {
+                                    reject(
+                                        &clients_for_sim,
+                                        session,
+                                        request,
+                                        "overloaded: world reset, retry",
+                                    );
+                                    actions_discarded_by_reset += 1;
+                                    rejected_total += 1;
+                                }
                                 submitted_at.clear();
-                                submitted_by.clear();
                                 client_repl.clear();
                                 prev_body_y.clear();
                                 body_stable_ticks = 0;
@@ -2537,11 +3192,20 @@ async fn serve_async(
                                 if let Some(drops) = playground_drops.as_mut() {
                                     *drops = playground_drop_schedules(&sim);
                                 }
-                                match lj.reset_world(&sim, &clients_for_sim, &mut motion) {
+                                match lj.reset_world(
+                                    &sim,
+                                    &clients_for_sim,
+                                    &mut motion,
+                                    catalogue_basis.as_ref(),
+                                ) {
                                     Ok(clients) => {
                                         world_resets += 1;
                                         tracing::info!(
                                             clients,
+                                            freed_ms,
+                                            built_ms,
+                                            basis_ms,
+                                            replaced_ms,
                                             elapsed_ms = started.elapsed().as_millis() as u64,
                                             "admin world reset"
                                         );
@@ -2656,11 +3320,33 @@ async fn serve_async(
                     sim.set_player_input(input.entity, input.input, input.seq);
                 }
             }
+            let before_tick = started.elapsed();
             let report = match sim.tick() {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
             };
+            let sim_tick = started.elapsed() - before_tick;
             ticks_run += 1;
+            // Commit and staging phases measured on this tick (they accumulate thread-locally and
+            // would otherwise never be read at run time): report the slow ones.
+            let spans = spall_sim::prof::drain();
+            for (name, elapsed) in &spans {
+                let entry = span_totals.entry(*name).or_default();
+                entry.0 += *elapsed;
+                entry.1 = entry.1.max(*elapsed);
+            }
+            if spans.iter().any(|(_, elapsed)| *elapsed >= slow_phase) {
+                let phases: Vec<String> = spans
+                    .iter()
+                    .map(|(name, elapsed)| format!("{name}={:.1}ms", elapsed.as_secs_f64() * 1e3))
+                    .collect();
+                tracing::info!(tick = sim.current_tick().0, ?phases, "slow commit phases");
+            }
+            if ticks_run.is_multiple_of(300) {
+                for (session, window) in input_windows.iter_mut() {
+                    window.report_and_reset(*session, sim.current_tick().0);
+                }
+            }
             intent_stats.record_tick(
                 report.pending_after,
                 report.committed.len(),
@@ -2807,6 +3493,7 @@ async fn serve_async(
                 }
             }
 
+            let span_serve_commit_fanout = spall_sim::prof::Span::start("serve.commit_fanout");
             for (rid, committed) in &report.committed {
                 committed_total += 1;
                 if !committed.removed_materials.is_empty()
@@ -2849,6 +3536,7 @@ async fn serve_async(
                 // T17 increment 2: a giant split ships its geometry out of band
                 // as a `BaselineTransfer`, keyed to the transaction by
                 // `transfer_id` (= the split's `TransactionId` | high bit).
+                let fan_out_started = std::time::Instant::now();
                 let split_transfer = committed.bulk_baseline.as_ref().and_then(|world| {
                     let id = TransferId(
                         committed.transaction.get() | spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT,
@@ -2868,13 +3556,35 @@ async fn serve_async(
                     &sim,
                     &clients_for_sim,
                 );
+                let fan_out = fan_out_started.elapsed();
+                if fan_out >= Duration::from_millis(50) {
+                    tracing::info!(
+                        request = rid.0,
+                        fan_out_ms = fan_out.as_secs_f64() * 1_000.0,
+                        bulk_baseline = committed.bulk_baseline.is_some(),
+                        "slow commit fan-out (split transfer encoding and fan-out)"
+                    );
+                }
                 // T11a / ENG-62: bucket each commit's server-side latency
                 // (admission → commit) by whether it split and how much
                 // geometry detached.
                 if let Some(started_at) = submitted_at.remove(rid) {
                     let class =
                         commit_latency::classify(committed.bumped_epoch, &committed.topology);
-                    commit_latency.record(class, started_at.elapsed());
+                    let waited = started_at.elapsed();
+                    let timing = sim.take_edit_timing(*rid).unwrap_or_default();
+                    tracing::info!(
+                        request = rid.0,
+                        class = ?class,
+                        latency_ms = waited.as_secs_f64() * 1_000.0,
+                        queued_ms = timing.queued.as_secs_f64() * 1_000.0,
+                        staging_ms = timing.staging.as_secs_f64() * 1_000.0,
+                        commit_ms = timing.commit.as_secs_f64() * 1_000.0,
+                        fan_out_ms = fan_out.as_secs_f64() * 1_000.0,
+                        tick = sim.current_tick().0,
+                        "commit latency"
+                    );
+                    commit_latency.record(class, waited);
                 }
                 // Slice D: keep the durable backing current for the terrain
                 // bricks this edit changed, so a later reload gets this
@@ -2891,6 +3601,7 @@ async fn serve_async(
                     );
                 }
             }
+            drop(span_serve_commit_fanout);
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;
@@ -2913,6 +3624,7 @@ async fn serve_async(
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never
             // interest-filtered).
+            let span_serve_motion = spall_sim::prof::Span::start("serve.motion");
             let pose_batch: Option<Vec<MotionSnapshot>> = if motion.due(tick) {
                 let snaps = motion.snapshots(sim.world(), tick);
                 if !snaps.is_empty() {
@@ -2956,30 +3668,76 @@ async fn serve_async(
             } else {
                 None
             };
+            drop(span_serve_motion);
             for (session, req) in repairs {
                 lj.answer_repair(session, &req, &sim, &clients_for_sim);
             }
 
+            let span_serve_vegetation = spall_sim::prof::Span::start("serve.vegetation");
+            // Building, encoding and chunking the vegetation frame took about 11 ms once a
+            // second on the tick thread. A worker does it from a copy of the state and terrain;
+            // the next ticks send the result. A worker that dies is an error, never silence.
             if tick.get().is_multiple_of(60)
-                && let Some(frame) = sim.vegetation_visual()
+                && vegetation_job.is_none()
+                && let Some((state, terrain)) = sim.vegetation_visual_input()
             {
-                let encoded = match frame.encode() {
-                    Ok(bytes) => bytes,
-                    Err(e) => return SimResult::error(e, ticks_run),
-                };
-                let records: Vec<WireRecord> =
-                    match spall_protocol::vegetation::chunks(tick.get(), &encoded) {
-                        Ok(chunks) => chunks
-                            .into_iter()
-                            .map(WireRecord::VegetationSnapshot)
-                            .collect(),
-                        Err(e) => return SimResult::error(e, ticks_run),
-                    };
-                let records = Arc::new(records);
-                for session in lj.live_sessions().collect::<Vec<_>>() {
-                    send_to(&clients_for_sim, session, Outbound::Water(records.clone()));
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let frame_tick = tick.get();
+                match std::thread::Builder::new()
+                    .name("spall-vegetation-frame".into())
+                    .spawn(move || {
+                        let records = state
+                            .visual(&terrain)
+                            .encode()
+                            .and_then(|encoded| {
+                                spall_protocol::vegetation::chunks(frame_tick, &encoded)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .map(|chunks| {
+                                chunks
+                                    .into_iter()
+                                    .map(WireRecord::VegetationSnapshot)
+                                    .collect::<Vec<_>>()
+                            });
+                        let _ = done_tx.send(records);
+                    }) {
+                    Ok(_) => vegetation_job = Some(done_rx),
+                    Err(e) => {
+                        return SimResult::error(
+                            format!("vegetation frame worker could not start: {e}"),
+                            ticks_run,
+                        );
+                    }
                 }
             }
+            if let Some(done_rx) = &vegetation_job {
+                match done_rx.try_recv() {
+                    Ok(Ok(records)) => {
+                        vegetation_job = None;
+                        let records = Arc::new(records);
+                        for session in lj.live_sessions().collect::<Vec<_>>() {
+                            if water_backlogged(&clients_for_sim, session) {
+                                continue;
+                            }
+                            send_to(&clients_for_sim, session, Outbound::Water(records.clone()));
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        return SimResult::error(
+                            format!("vegetation frame encoding failed: {e}"),
+                            ticks_run,
+                        );
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return SimResult::error(
+                            "vegetation frame worker ended without a result".into(),
+                            ticks_run,
+                        );
+                    }
+                }
+            }
+            drop(span_serve_vegetation);
             // ENG-120: a grown region may have moved its origin; forget the
             // publisher state of origins that no longer exist.
             let live_origins: Vec<GlobalCell> =
@@ -2989,23 +3747,44 @@ async fn serve_async(
             }
             // Budget water independently per live session. Keyframes are
             // periodic repair; changed bricks reference the last queued frame.
+            let span_serve_water_fanout = spall_sim::prof::Span::start("serve.water_fanout");
             for water in sim.water_regions() {
                 let frame = water.frame();
-                let current = spall_protocol::WaterKeyframe {
-                    server_tick: sim.current_tick(),
-                    frame_seq: frame.seq,
-                    origin: frame.origin,
-                    dimensions: frame.dimensions,
-                    coarsen: frame.coarsen as u8,
-                    fractions: frame.fractions.clone(),
-                };
+                // One shared copy (and one full-keyframe encoding) per new frame, not one per
+                // client per tick.
+                let copy_span = spall_sim::prof::Span::start("water.frame_copy");
+                if water_frames
+                    .get(&frame.origin)
+                    .is_none_or(|shared| shared.frame().frame_seq != frame.seq)
+                {
+                    water_frames.insert(
+                        frame.origin,
+                        crate::water_replication::SharedFrame::new(Arc::new(
+                            spall_protocol::WaterKeyframe {
+                                server_tick: sim.current_tick(),
+                                frame_seq: frame.seq,
+                                origin: frame.origin,
+                                dimensions: frame.dimensions,
+                                coarsen: frame.coarsen as u8,
+                                fractions: frame.fractions.clone(),
+                            },
+                        )),
+                    );
+                }
+                drop(copy_span);
+                let current = &water_frames[&frame.origin];
                 for session in lj.live_sessions().collect::<Vec<_>>() {
+                    // A client that cannot keep up gets the newest frame later, not
+                    // every frame late; the publisher's state is untouched by a skip.
+                    if water_backlogged(&clients_for_sim, session) {
+                        continue;
+                    }
                     match water_sent
                         .entry(session.raw())
                         .or_default()
                         .entry(frame.origin)
                         .or_default()
-                        .poll(tick.get(), &current)
+                        .poll_shared(tick.get(), current)
                     {
                         Ok(records) if !records.is_empty() => {
                             water_keyframes_sent += 1;
@@ -3033,11 +3812,13 @@ async fn serve_async(
                     }
                 }
             }
+            drop(span_serve_water_fanout);
 
             // ENG-50: queue immutable records to the bounded off-thread writer.
             // The sim thread never blocks on the disk; when the backlog fills or
             // a durable write has failed, the run stops rather than silently
             // continuing an unsavable world (`docs/protocol.md` Persistence).
+            let span_serve_persist_submit = spall_sim::prof::Span::start("serve.persist_submit");
             if let Some(pipe) = pipeline.as_ref() {
                 let batch = match tick_journal_batch(
                     &mut sim,
@@ -3153,6 +3934,7 @@ async fn serve_async(
                     return SimResult::error(format!("persistence failed: {err}"), ticks_run);
                 }
             }
+            drop(span_serve_persist_submit);
 
             // Slice D: post-tick residency pass. Evicts terrain bricks outside
             // every player's interest box, reloads any back in interest. The
@@ -3166,6 +3948,7 @@ async fn serve_async(
             // preflight/consumer-lifetime reservation the frozen contract asks
             // for, on top of the reactive `EvictedGeometryRequired` protection
             // that already existed.
+            let span_serve_residency = spall_sim::prof::Span::start("serve.residency");
             if let Some(pass) = &mut residency {
                 pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
                 let pending_edit_bricks = sim.pending_edit_bricks(terrain_vid);
@@ -3176,6 +3959,7 @@ async fn serve_async(
                     .collect();
                 pass.run(sim.world_mut(), &player_feet, &pending_edit_bricks);
             }
+            drop(span_serve_residency);
 
             // G4 timing ends after all owning-thread work for this tick,
             // including replication, persistence submission, and residency,
@@ -3214,6 +3998,52 @@ async fn serve_async(
                 }
             }
 
+            // The tick budget is spent: if a regional client is still receiving what the server
+            // already owes it, or has just answered with something, serve one more tick.
+            if iteration >= tick_budget
+                && drain_timeout > Duration::ZERO
+                && let Some(draining) = lj.regional_clients_draining(&clients_for_sim)
+            {
+                let now = std::time::Instant::now();
+                let began = *drain_started.get_or_insert(now);
+                if draining || saw_client_work {
+                    drain_quiet_since = None;
+                } else {
+                    drain_quiet_since.get_or_insert(now);
+                }
+                if drain_quiet_since.is_some_and(|since| now.duration_since(since) >= DRAIN_GRACE) {
+                    tracing::info!(
+                        extra_ticks = iteration - max_ticks,
+                        waited_ms = now.duration_since(began).as_millis() as u64,
+                        "clients drained; ending the run"
+                    );
+                } else if now.duration_since(began) >= drain_timeout {
+                    drain_timed_out = true;
+                    tracing::warn!(
+                        extra_ticks = iteration - max_ticks,
+                        limit_ms = drain_timeout.as_millis() as u64,
+                        "drain limit reached with a client still receiving; ending the run"
+                    );
+                } else {
+                    tick_budget += 1;
+                }
+            }
+
+            let whole_tick = started.elapsed();
+            let after_tick = whole_tick.saturating_sub(before_tick + sim_tick);
+            for (slot, d) in [before_tick, sim_tick, after_tick].into_iter().enumerate() {
+                phase_totals[slot] += d;
+                phase_worst[slot] = phase_worst[slot].max(d);
+            }
+            if whole_tick >= Duration::from_millis(500) {
+                tracing::info!(
+                    tick = sim.current_tick().0,
+                    before_tick_ms = before_tick.as_secs_f64() * 1e3,
+                    sim_tick_ms = sim_tick.as_secs_f64() * 1e3,
+                    after_tick_ms = (whole_tick - before_tick - sim_tick).as_secs_f64() * 1e3,
+                    "slow server tick"
+                );
+            }
             if paced {
                 // Absolute deadlines, not `tick_dt - work`: a relative sleep
                 // drifted the server to ~58.8 Hz under Windows sleep overshoot.
@@ -3222,15 +4052,57 @@ async fn serve_async(
                     std::thread::sleep(rem);
                 }
                 if pacer.ticks().is_multiple_of(600) {
+                    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+                    let mut stages: Vec<(&str, f64, f64)> = span_totals
+                        .iter()
+                        .map(|(name, (total, worst))| (*name, ms(*total) / 600.0, ms(*worst)))
+                        .filter(|(_, mean, _)| *mean >= 0.2)
+                        .collect();
+                    stages.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let stages: Vec<String> = stages
+                        .iter()
+                        .map(|(name, mean, worst)| format!("{name}={mean:.2}/{worst:.1}ms"))
+                        .collect();
+                    span_totals.clear();
                     tracing::info!(
                         target: "spall_server::pacing",
+                        ?stages,
+                        before_mean_ms = ms(phase_totals[0]) / 600.0,
+                        sim_mean_ms = ms(phase_totals[1]) / 600.0,
+                        after_mean_ms = ms(phase_totals[2]) / 600.0,
+                        before_worst_ms = ms(phase_worst[0]),
+                        sim_worst_ms = ms(phase_worst[1]),
+                        after_worst_ms = ms(phase_worst[2]),
                         ticks = pacer.ticks(),
                         achieved_hz = pacer.achieved_hz(std::time::Instant::now()),
                         max_lag_ms = pacer.max_lag().as_secs_f64() * 1e3,
                         resyncs = pacer.resyncs(),
                         "tick pacing"
                     );
+                    phase_totals = [Duration::ZERO; 3];
+                    phase_worst = [Duration::ZERO; 3];
                 }
+            }
+        }
+
+        let drain_ticks = iteration.saturating_sub(max_ticks);
+
+        // Diagnostic: `SPALL_DUMP_LOGICAL_BRICKS=<prefix>` writes the authoritative terrain listing.
+        if let Ok(prefix) = std::env::var("SPALL_DUMP_LOGICAL_BRICKS") {
+            let world = sim.world();
+            let id = world.terrain_volume_id();
+            let written = world.volume_ref(id).map_or_else(
+                || Err(std::io::Error::other("no terrain volume")),
+                |volume| {
+                    spall_voxel::write_logical_brick_listing(
+                        std::path::Path::new(&format!("{prefix}.{}.txt", std::process::id())),
+                        volume,
+                        world.evicted(id),
+                    )
+                },
+            );
+            if let Err(error) = written {
+                tracing::error!(%error, "could not write the logical brick listing");
             }
         }
 
@@ -3386,11 +4258,15 @@ async fn serve_async(
             late_joins_failed: lj.failed,
             expired_actions_rejected: lj.expired_actions,
             baseline_bytes_sent: lj.baseline_bytes,
+            repairs_deferred_queue_full: lj.repairs_deferred,
             actions_throttled,
             repairs_throttled,
             water_keyframes_sent,
             water_bytes_queued,
             world_resets,
+            actions_discarded_by_reset,
+            drain_ticks,
+            drain_timed_out,
             motion_snapshots_sent: motion_egress.snapshots_sent,
             motion_snapshots_interest_culled: motion_egress.interest_culled,
             motion_snapshots_budget_deferred: motion_egress.budget_deferred,
@@ -3540,11 +4416,27 @@ async fn serve_async(
         late_joins_failed: sim_result.late_joins_failed,
         expired_actions_rejected: sim_result.expired_actions_rejected,
         baseline_bytes_sent: sim_result.baseline_bytes_sent,
+        repairs_deferred_queue_full: sim_result.repairs_deferred_queue_full,
         inbound_actions_throttled: sim_result.actions_throttled,
         inbound_repairs_throttled: sim_result.repairs_throttled,
+        inbound_dropped_actions: inbound_drops
+            .actions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        inbound_dropped_repairs: inbound_drops
+            .repairs
+            .load(std::sync::atomic::Ordering::Relaxed),
+        inbound_dropped_progression: inbound_drops
+            .progression
+            .load(std::sync::atomic::Ordering::Relaxed),
+        inbound_dropped_admin: inbound_drops
+            .admin
+            .load(std::sync::atomic::Ordering::Relaxed),
         water_keyframes_sent: sim_result.water_keyframes_sent,
         water_bytes_queued: sim_result.water_bytes_queued,
         world_resets: sim_result.world_resets,
+        actions_discarded_by_reset: sim_result.actions_discarded_by_reset,
+        drain_ticks: sim_result.drain_ticks,
+        drain_timed_out: sim_result.drain_timed_out,
         motion_snapshots_sent: sim_result.motion_snapshots_sent,
         motion_snapshots_interest_culled: sim_result.motion_snapshots_interest_culled,
         motion_snapshots_budget_deferred: sim_result.motion_snapshots_budget_deferred,
@@ -3746,11 +4638,15 @@ struct SimResult {
     late_joins_failed: u64,
     expired_actions_rejected: u64,
     baseline_bytes_sent: u64,
+    repairs_deferred_queue_full: u64,
     actions_throttled: u64,
     repairs_throttled: u64,
     water_keyframes_sent: u64,
     water_bytes_queued: u64,
     world_resets: u64,
+    actions_discarded_by_reset: u64,
+    drain_ticks: u64,
+    drain_timed_out: bool,
     motion_snapshots_sent: u64,
     motion_snapshots_interest_culled: u64,
     motion_snapshots_budget_deferred: u64,
@@ -3804,11 +4700,15 @@ impl SimResult {
             late_joins_failed: 0,
             expired_actions_rejected: 0,
             baseline_bytes_sent: 0,
+            repairs_deferred_queue_full: 0,
             actions_throttled: 0,
             repairs_throttled: 0,
             water_keyframes_sent: 0,
             water_bytes_queued: 0,
             world_resets: 0,
+            actions_discarded_by_reset: 0,
+            drain_ticks: 0,
+            drain_timed_out: false,
             motion_snapshots_sent: 0,
             motion_snapshots_interest_culled: 0,
             motion_snapshots_budget_deferred: 0,
@@ -3856,6 +4756,10 @@ enum Phase {
 struct ClientLink {
     session: SessionId,
     segmented: bool,
+    region_radius: Option<i64>,
+    /// The client negotiated the deferred catalogue: its regional baseline omits
+    /// the distant digests, which follow as chunks.
+    deferred: bool,
     phase: Phase,
 }
 
@@ -3938,6 +4842,8 @@ struct LateJoin {
     failed: u64,
     expired_actions: u64,
     baseline_bytes: u64,
+    /// Repair requests not answered because the client already had too many patches queued.
+    repairs_deferred: u64,
     /// T23 / G3 row 7, slice D: the residency pass's durable backing, so a
     /// late-join baseline / repair patch can fill a brick the server has
     /// evicted. `None` when residency is off.
@@ -3973,6 +4879,7 @@ impl LateJoin {
             failed: 0,
             expired_actions: 0,
             baseline_bytes: 0,
+            repairs_deferred: 0,
             backing: None,
             cached_baseline: None,
             pending_captures: HashMap::new(),
@@ -3982,6 +4889,41 @@ impl LateJoin {
 
     fn backing_ref(&self) -> Option<&dyn spall_sim::BrickBacking> {
         self.backing.as_deref()
+    }
+
+    /// The terrain catalogue of `sim`'s current world, if some deferred client holds all of it, so
+    /// a world reset about to replace that world can send those clients only what changed.
+    fn capture_catalogue_basis(
+        &self,
+        sim: &Simulation,
+        clients: &ClientMap,
+    ) -> Option<baseline::CatalogueBasis> {
+        let guard = clients.lock().unwrap_or_else(|e| e.into_inner());
+        self.links
+            .iter()
+            .any(|(raw, link)| {
+                link.deferred
+                    && guard
+                        .get(raw)
+                        .is_some_and(OutboundHandle::catalogue_complete)
+            })
+            .then(|| baseline::CatalogueBasis::capture(sim))
+    }
+
+    fn snapshot_for_session(
+        &self,
+        sim: &Simulation,
+        session: SessionId,
+    ) -> baseline::BaselineSnapshot {
+        let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+        match self.links.get(&session.raw()).and_then(|l| l.region_radius) {
+            Some(radius) => snapshot.with_region(
+                sim.player_state(session_player_entity(session))
+                    .map_or([0.0; 3], |p| p.position_m),
+                radius,
+            ),
+            None => snapshot,
+        }
     }
 
     fn on_joined(&mut self, session: SessionId) {
@@ -3994,6 +4936,8 @@ impl LateJoin {
             ClientLink {
                 session,
                 segmented: false,
+                region_radius: None,
+                deferred: false,
                 phase: Phase::Live,
             },
         );
@@ -4022,24 +4966,86 @@ impl LateJoin {
         sim: &Simulation,
         clients: &ClientMap,
         motion: &mut MotionPublisher,
+        catalogue_basis: Option<&baseline::CatalogueBasis>,
     ) -> Result<usize, baseline::BaselineError> {
         self.cached_baseline = None;
         self.pending_captures.clear();
-        let base_id = self.next_id();
-        let segmented = self.links.values().all(|link| link.segmented);
-        let transfer = baseline::transfer_from_snapshot_supported(
-            baseline::snapshot_world(sim, self.backing_ref()),
-            TransferId(base_id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT),
-            InterestEpoch(1),
-            segmented,
-        )?;
+        let phase_started = std::time::Instant::now();
+        let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+        let snapshot_ms = phase_started.elapsed().as_millis() as u64;
+        let mut full_transfers: HashMap<bool, baseline::BaselineTransfer> = HashMap::new();
+        let mut new_world_hash = None;
         let keyframe = Arc::new(motion.full_snapshots(sim.world(), sim.current_tick()));
         let sessions: Vec<SessionId> = self.sessions().collect();
         for session in &sessions {
             let id = self.next_id();
-            let transfer = transfer.reissue(TransferId(
-                id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT,
-            ));
+            let id = TransferId(id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT);
+            let link = &self.links[&session.raw()];
+            let transfer = if let Some(radius) = link.region_radius {
+                let center = sim
+                    .player_state(session_player_entity(*session))
+                    .map_or([0.0; 3], |p| p.position_m);
+                if link.deferred {
+                    // A client that holds the previous world's complete catalogue needs only
+                    // the bricks that differ. One still receiving it keeps what it has
+                    // already verified (the segments within the chunks it has processed) and
+                    // needs the rest; one that has received nothing needs everything.
+                    let handle = clients
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&session.raw())
+                        .cloned();
+                    let complete = handle
+                        .as_ref()
+                        .is_some_and(OutboundHandle::catalogue_complete);
+                    let partial = if complete {
+                        None
+                    } else {
+                        handle
+                            .as_ref()
+                            .and_then(OutboundHandle::resumable_catalogue)
+                            .map(|(layout, written)| (layout.held_after(written), written))
+                    };
+                    let reset = if complete {
+                        catalogue_basis.map(|basis| (basis, None))
+                    } else {
+                        partial
+                            .as_ref()
+                            .map(|(held, written)| (held, Some(*written)))
+                    }
+                    .map(|(basis, resumed)| {
+                        (
+                            basis,
+                            *new_world_hash.get_or_insert_with(|| sim.world().world_hash()),
+                            resumed,
+                        )
+                    });
+                    baseline::transfer_from_snapshot_deferred_resuming(
+                        snapshot.clone().with_region(center, radius),
+                        id,
+                        InterestEpoch(1),
+                        reset,
+                    )?
+                } else {
+                    baseline::transfer_from_snapshot_supported(
+                        snapshot.clone().with_region(center, radius),
+                        id,
+                        InterestEpoch(1),
+                        true,
+                    )?
+                }
+            } else if let Some(transfer) = full_transfers.get(&link.segmented) {
+                transfer.reissue(id)
+            } else {
+                let transfer = baseline::transfer_from_snapshot_supported(
+                    snapshot.clone(),
+                    id,
+                    InterestEpoch(1),
+                    link.segmented,
+                )?;
+                full_transfers.insert(link.segmented, transfer.clone());
+                transfer
+            };
             self.baseline_bytes += transfer.payload_bytes() as u64;
             send_to(clients, *session, Outbound::Baseline(Arc::new(transfer)));
             if !keyframe.is_empty() {
@@ -4049,6 +5055,12 @@ impl LateJoin {
                 link.phase = Phase::Live;
             }
         }
+        tracing::info!(
+            snapshot_ms,
+            transfers_ms = phase_started.elapsed().as_millis() as u64 - snapshot_ms,
+            sessions = sessions.len(),
+            "world reset baselines"
+        );
         Ok(sessions.len())
     }
 
@@ -4075,6 +5087,26 @@ impl LateJoin {
         self.links
             .values()
             .any(|link| matches!(link.phase, Phase::Joining { .. }))
+    }
+
+    /// Whether any regional client is still to receive something the server owes it. `None` when
+    /// no regional client is connected, in which case there is nothing to wait for.
+    fn regional_clients_draining(&self, clients: &ClientMap) -> Option<bool> {
+        let guard = clients.lock().unwrap_or_else(|e| e.into_inner());
+        let mut any = false;
+        let mut draining = false;
+        for (raw, link) in &self.links {
+            if link.region_radius.is_none() {
+                continue;
+            }
+            any = true;
+            if matches!(link.phase, Phase::Joining { .. })
+                || guard.get(raw).is_some_and(OutboundHandle::draining)
+            {
+                draining = true;
+            }
+        }
+        any.then_some(draining)
     }
 
     /// `true` if `session`'s generation has been superseded by a reconnect on
@@ -4112,12 +5144,23 @@ impl LateJoin {
         };
 
         if want_baseline {
-            let segmented =
-                ack.verified_manifest_hash == spall_protocol::segment::baseline_cap_streamed();
-            self.links.get_mut(&session.raw()).unwrap().segmented = segmented;
+            let deferred_radius =
+                spall_protocol::segment::regional_deferred_radius(ack.verified_manifest_hash);
+            let deferred = deferred_radius.is_some();
+            let region_radius =
+                spall_protocol::segment::regional_radius(ack.verified_manifest_hash)
+                    .or(deferred_radius);
+            let segmented = ack.verified_manifest_hash
+                == spall_protocol::segment::baseline_cap_streamed()
+                || region_radius.is_some();
+            let link = self.links.get_mut(&session.raw()).unwrap();
+            link.segmented = segmented;
+            link.region_radius = region_radius;
+            link.deferred = deferred;
             let id = self.next_id();
             match self.cached_baseline.as_ref().filter(|b| {
-                b.begin.journal_cursor == JournalSeq(sim.journal_cursor())
+                region_radius.is_none()
+                    && b.begin.journal_cursor == JournalSeq(sim.journal_cursor())
                     && (b.begin.world_version
                         == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION)
                         == segmented
@@ -4135,15 +5178,24 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
-                    let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+                    let snapshot = self.snapshot_for_session(sim, session);
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
                     self.capture_pool.spawn(move || {
-                        let _ = tx.send(baseline::transfer_from_snapshot_supported(
-                            snapshot,
-                            id,
-                            InterestEpoch(1),
-                            segmented,
-                        ));
+                        let _ = tx.send(if deferred {
+                            baseline::transfer_from_snapshot_deferred(
+                                snapshot,
+                                id,
+                                InterestEpoch(1),
+                                None,
+                            )
+                        } else {
+                            baseline::transfer_from_snapshot_supported(
+                                snapshot,
+                                id,
+                                InterestEpoch(1),
+                                segmented,
+                            )
+                        });
                     });
                     if let Some(link) = self.links.get_mut(&session.raw()) {
                         link.phase = Phase::Joining {
@@ -4250,9 +5302,35 @@ impl LateJoin {
                 continue;
             }
             self.retries += 1;
+            // A synchronous retry supersedes any older background capture for this session.
+            self.pending_captures.remove(&raw);
             let id = self.next_id();
             let segmented = self.links.get(&raw).is_some_and(|link| link.segmented);
-            match self.capture_for_format(sim, id, segmented) {
+            let regional = self
+                .links
+                .get(&raw)
+                .is_some_and(|l| l.region_radius.is_some());
+            let deferred = self.links.get(&raw).is_some_and(|l| l.deferred);
+            let transfer = if regional && deferred {
+                baseline::transfer_from_snapshot_deferred(
+                    self.snapshot_for_session(sim, session),
+                    id,
+                    InterestEpoch(1),
+                    None,
+                )
+                .ok()
+            } else if regional {
+                baseline::transfer_from_snapshot_supported(
+                    self.snapshot_for_session(sim, session),
+                    id,
+                    InterestEpoch(1),
+                    true,
+                )
+                .ok()
+            } else {
+                self.capture_for_format(sim, id, segmented)
+            };
+            match transfer {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&raw) {
@@ -4286,6 +5364,15 @@ impl LateJoin {
         sim: &Simulation,
         clients: &ClientMap,
     ) {
+        let queue_full = clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session.raw())
+            .is_some_and(|handle| handle.queued_baselines() >= MAX_QUEUED_REPAIRS_PER_CLIENT);
+        if queue_full {
+            self.repairs_deferred += 1;
+            return;
+        }
         let Some(world) = baseline::logical_brick_repair_patch(sim, req, self.backing_ref()) else {
             return;
         };
@@ -4344,7 +5431,13 @@ impl LateJoin {
             match result {
                 Ok(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
-                    self.cached_baseline = Some(Arc::new(transfer.reissue(id)));
+                    if !matches!(
+                        transfer.begin.world_version,
+                        spall_protocol::segment::BASELINE_REGIONAL_WORLD_VERSION
+                            | spall_protocol::segment::BASELINE_DEFERRED_REGIONAL_WORLD_VERSION
+                    ) {
+                        self.cached_baseline = Some(Arc::new(transfer.reissue(id)));
+                    }
                     if let Some(link) = self.links.get(&raw) {
                         send_to(
                             clients,
@@ -4982,6 +6075,16 @@ fn broadcast(clients: &ClientMap, msg: Outbound) {
     }
 }
 
+/// Whether water for `session` should be skipped this tick (see
+/// [`OutboundHandle::water_backlogged`]).
+fn water_backlogged(clients: &ClientMap, session: SessionId) -> bool {
+    clients
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&session.raw())
+        .is_some_and(OutboundHandle::water_backlogged)
+}
+
 fn send_to(clients: &ClientMap, session: SessionId, msg: Outbound) {
     let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.get(&session.raw())
@@ -5074,6 +6177,27 @@ fn replay_admitted_status(sim: &Simulation, request: RequestId) -> Option<Action
 /// Returns `false` if any leg fails (the writer loop then tears the connection
 /// down).
 async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
+    let started = std::time::Instant::now();
+    // A transfer that never finishes would otherwise leave no trace at all.
+    let (transfer_id, world_version) = (transfer.begin.transfer_id.0, transfer.begin.world_version);
+    let watchdog = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tracing::warn!(
+            transfer = transfer_id,
+            world_version,
+            "baseline transfer still in progress after 10 s; the writer is blocked behind it"
+        );
+    });
+    let result = send_baseline_phases(conn, transfer, started).await;
+    watchdog.abort();
+    result
+}
+
+async fn send_baseline_phases(
+    conn: &Connection,
+    transfer: &BaselineTransfer,
+    started: std::time::Instant,
+) -> bool {
     if conn
         .send_record(WireRecord::BaselineBegin(transfer.begin.clone()))
         .await
@@ -5081,21 +6205,67 @@ async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
     {
         return false;
     }
+    let world_version = transfer.begin.world_version;
+    let begun = started.elapsed();
     let mut bulk = match conn.open_bulk().await {
         Ok(b) => b,
         Err(_) => return false,
     };
+    let opened = started.elapsed();
     for part in transfer.parts.iter() {
         if bulk.send_part(part).await.is_err() {
             return false;
         }
     }
-    if bulk.finish_and_wait().await.is_err() {
+    let sent = started.elapsed();
+    // A one-brick repair patch or a split blob (world version 1) is sent mid-session on a live
+    // connection, which delivers it without our waiting: only the endpoint closing could lose
+    // it. Waiting for the peer's acknowledgement held the writer for a delayed-ack interval per
+    // patch (about 10 ms), which capped repair throughput at about 170 patches a second
+    // however fast the client applied them. Everything else (baselines, resets) still waits.
+    let finished_ok = if world_version == 1 {
+        bulk.finish().is_ok()
+    } else {
+        bulk.finish_and_wait().await.is_ok()
+    };
+    if !finished_ok {
         return false;
     }
-    conn.send_record(WireRecord::BaselineEnd(transfer.end))
+    let finished = started.elapsed();
+    let ended = conn
+        .send_record(WireRecord::BaselineEnd(transfer.end))
         .await
-        .is_ok()
+        .is_ok();
+    // The writer sends one transfer at a time, so a slow one holds up everything behind it.
+    if started.elapsed() > std::time::Duration::from_secs(5) {
+        tracing::info!(
+            transfer = transfer.begin.transfer_id.0,
+            world_version = transfer.begin.world_version,
+            bytes = transfer.payload_bytes(),
+            begin_ms = begun.as_millis() as u64,
+            open_bulk_ms = (opened - begun).as_millis() as u64,
+            parts_ms = (sent - opened).as_millis() as u64,
+            finish_ms = (finished - sent).as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "slow baseline transfer"
+        );
+    }
+    ended
+}
+
+/// Sends one motion batch as datagrams; `false` if the connection failed.
+async fn send_motion_batch(
+    conn: &Connection,
+    snaps: &[MotionSnapshot],
+    motion_seq: &mut u64,
+) -> bool {
+    for snap in snaps {
+        if conn.send_datagram(*motion_seq, snap).await.is_err() {
+            return false;
+        }
+        *motion_seq += 1;
+    }
+    true
 }
 
 async fn wait_true(mut rx: watch::Receiver<bool>) {
@@ -5115,6 +6285,8 @@ async fn wait_true(mut rx: watch::Receiver<bool>) {
 async fn serve_conn(
     conn: Arc<Connection>,
     inbound: mpsc::Sender<Inbound>,
+    repair_inbound: mpsc::Sender<Inbound>,
+    drops: Arc<InboundDrops>,
     handle: OutboundHandle,
     clients: ClientMap,
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
@@ -5136,6 +6308,7 @@ async fn serve_conn(
     let reader = {
         let conn = conn.clone();
         let inbound = inbound.clone();
+        let credit_handle = handle.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_record().await {
@@ -5146,19 +6319,42 @@ async fn serve_conn(
                     // stays far under the cap.
                     Ok(Some(WireRecord::ActionRequest(req))) => {
                         match inbound.try_send(Inbound::Action(session, req)) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(dropped)) => {
+                                drops.note(&drops.actions, "action");
+                                // Tell the client, so it retries instead of waiting forever for
+                                // an answer that will never come.
+                                if let Inbound::Action(_, req) = dropped {
+                                    let _ = credit_handle.push(Outbound::Status(Arc::new(
+                                        ActionStatus {
+                                            request_id: req.request_id,
+                                            outcome: ActionOutcome::Rejected {
+                                                reason:
+                                                    "overloaded: server input queue full, retry"
+                                                        .to_string(),
+                                            },
+                                        },
+                                    )));
+                                }
+                            }
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
                     Ok(Some(WireRecord::ProgressionRequest(req))) => {
                         match inbound.try_send(Inbound::Progression(session, req)) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                drops.note(&drops.progression, "progression");
+                            }
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
                     Ok(Some(WireRecord::RepairRequest(req))) => {
-                        match inbound.try_send(Inbound::Repair(session, req)) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                        match repair_inbound.try_send(Inbound::Repair(session, req)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                drops.note(&drops.repairs, "repair");
+                            }
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
@@ -5167,9 +6363,19 @@ async fn serve_conn(
                             break;
                         }
                     }
+                    Ok(Some(WireRecord::CatalogueAck(ack))) => {
+                        credit_handle.catalogue_ack(ack.transfer_id.0, ack.index);
+                    }
+                    Ok(Some(WireRecord::ControlProbe(probe))) if probe.echo => {
+                        credit_handle.probe_returned(probe.id);
+                    }
                     Ok(Some(WireRecord::AdminRequest(req))) => {
+                        tracing::info!(request = req.request_id.0, "admin request received");
                         match inbound.try_send(Inbound::Admin(session, req)) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                drops.note(&drops.admin, "admin");
+                            }
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
@@ -5204,14 +6410,58 @@ async fn serve_conn(
     };
 
     let mut motion_seq = 0u64;
+    // The deferred terrain catalogue still to send after the baseline, one
+    // bounded chunk at a time, only while nothing else is waiting.
+    let mut catalogue_feed: Option<(Arc<[spall_protocol::CatalogueChunk]>, usize)> = None;
+    let mut last_probe: Option<std::time::Instant> = None;
     'writer: loop {
         // Flush everything queued, in commit order, before parking.
         loop {
             let batch = handle.take();
             if batch.is_empty() && !batch.overflowed {
+                if let Some((chunks, next)) = catalogue_feed.as_mut() {
+                    // Credit-based window: never more than a few chunks beyond what the
+                    // client has processed, so the transport's send buffer cannot hide
+                    // minutes of catalogue ahead of the next baseline or reset.
+                    let transfer = chunks[*next].transfer_id.0;
+                    if (*next as u32).saturating_sub(handle.catalogue_acked(transfer))
+                        >= spall_protocol::CATALOGUE_WINDOW_CHUNKS
+                        || handle.control_congested()
+                    {
+                        break;
+                    }
+                    let chunk = chunks[*next].clone();
+                    if conn
+                        .send_record(WireRecord::CatalogueChunk(chunk))
+                        .await
+                        .is_err()
+                    {
+                        break 'writer;
+                    }
+                    handle.note_written(conn.stats().app_bytes_sent);
+                    handle.note_essential(conn.stats().app_bytes_sent);
+                    *next += 1;
+                    handle.set_catalogue_written(transfer, *next as u32);
+                    if *next >= chunks.len() {
+                        catalogue_feed = None;
+                        handle.set_catalogue_streaming(false);
+                        handle.advance_catalogue_progress(transfer, CatalogueState::Complete);
+                    }
+                    continue;
+                }
                 break;
             }
+            // Motion is lossy and latency-critical (a mover reconciles its
+            // prediction against it), while reliable transfers can each wait a
+            // round trip. Send motion first, and again after every reliable
+            // message, so a long run of bulk repairs cannot delay it.
+            if let Some(snaps) = batch.motion
+                && !send_motion_batch(&conn, &snaps, &mut motion_seq).await
+            {
+                break 'writer;
+            }
             for msg in batch.reliable {
+                let essential = !matches!(msg, Outbound::Water(_));
                 let ok = match msg {
                     Outbound::Transaction(tx) => {
                         let sent = conn
@@ -5241,7 +6491,29 @@ async fn serve_conn(
                         .send_record(WireRecord::AdminStatus((*status).clone()))
                         .await
                         .is_ok(),
-                    Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
+                    Outbound::Baseline(transfer) => {
+                        let sent = send_baseline(&conn, &transfer).await;
+                        // A deferred baseline is followed by its catalogue; a later one
+                        // (join retry or world reset) supersedes any catalogue still going.
+                        if sent
+                            && transfer.begin.world_version
+                                == spall_protocol::segment::BASELINE_DEFERRED_REGIONAL_WORLD_VERSION
+                        {
+                            catalogue_feed = transfer
+                                .catalogue
+                                .as_ref()
+                                .map(|catalogue| (Arc::clone(&catalogue.chunks), 0usize));
+                            if let Some(catalogue) = &transfer.catalogue {
+                                handle.begin_catalogue(catalogue.transfer_id.0);
+                                handle.advance_catalogue_progress(
+                                    catalogue.transfer_id.0,
+                                    CatalogueState::Streaming,
+                                );
+                            }
+                            handle.set_catalogue_streaming(catalogue_feed.is_some());
+                        }
+                        sent
+                    }
                     // Motion and water are never queued as reliable; ignore
                     // defensively.
                     Outbound::Motion(_) => true,
@@ -5253,6 +6525,7 @@ async fn serve_conn(
                                 break;
                             }
                         }
+                        handle.water_sent();
                         ok
                     }
                     Outbound::Shutdown(reason) => {
@@ -5260,16 +6533,17 @@ async fn serve_conn(
                         false
                     }
                 };
+                handle.note_written(conn.stats().app_bytes_sent);
+                if essential {
+                    handle.note_essential(conn.stats().app_bytes_sent);
+                }
                 if !ok {
                     break 'writer;
                 }
-            }
-            if let Some(snaps) = batch.motion {
-                for snap in snaps.iter() {
-                    if conn.send_datagram(motion_seq, snap).await.is_err() {
-                        break 'writer;
-                    }
-                    motion_seq += 1;
+                if let Some(snaps) = handle.take_motion()
+                    && !send_motion_batch(&conn, &snaps, &mut motion_seq).await
+                {
+                    break 'writer;
                 }
             }
 
@@ -5284,7 +6558,28 @@ async fn serve_conn(
         }
         tokio::select! {
             _ = handle.woken() => {}
+            _ = tokio::time::sleep(PROBE_INTERVAL) => {}
             _ = wait_true(stop.clone()) => break 'writer,
+        }
+        // Measure how long the control stream is taking to deliver what is queued. At most one
+        // probe per `PROBE_MIN_GAP`: an echo wakes this loop (`probe_returned`), so a probe sent
+        // on every wake-up made each probe's echo trigger the next probe, a storm of tens of
+        // thousands of records a second per idle client.
+        if !probe_due(last_probe, std::time::Instant::now()) {
+            continue;
+        }
+        last_probe = Some(std::time::Instant::now());
+        handle.note_written(conn.stats().app_bytes_sent);
+        let id = handle.next_probe();
+        if conn
+            .send_record(WireRecord::ControlProbe(spall_protocol::ControlProbe {
+                id,
+                echo: false,
+            }))
+            .await
+            .is_err()
+        {
+            break 'writer;
         }
     }
 
@@ -6227,6 +7522,156 @@ mod tests {
             h.push(empty_tx()).is_err(),
             "further reliable traffic stays refused; the client is being dropped"
         );
+    }
+
+    /// The control stream counts as congested while records written to it take longer than
+    /// the congestion delay to be echoed, and recovers on a fresh fast echo.
+    #[test]
+    fn a_control_probe_is_sent_at_most_once_per_minimum_gap() {
+        let t0 = std::time::Instant::now();
+        assert!(probe_due(None, t0), "the first probe is always due");
+        assert!(
+            !probe_due(Some(t0), t0 + PROBE_MIN_GAP / 2),
+            "a wake-up inside the gap (a loopback echo arriving) sends no probe"
+        );
+        assert!(probe_due(Some(t0), t0 + PROBE_MIN_GAP));
+    }
+
+    #[test]
+    fn the_control_stream_is_congested_while_probes_come_back_slowly() {
+        let h = OutboundHandle::new();
+        assert!(!h.control_congested(), "no probes yet");
+        let slow = h.next_probe();
+        assert!(!h.control_congested(), "a probe just sent has not waited");
+        {
+            let mut probes = h.inner.probes.lock().unwrap();
+            probes.outstanding.front_mut().unwrap().1 =
+                std::time::Instant::now() - 2 * CONTROL_CONGESTION_DELAY;
+        }
+        assert!(
+            h.control_congested(),
+            "an unanswered probe has waited too long"
+        );
+        h.probe_returned(slow);
+        assert!(
+            h.control_congested(),
+            "the last answered probe was slow, so the queue may not have drained yet"
+        );
+        let fresh = h.next_probe();
+        h.probe_returned(fresh);
+        assert!(!h.control_congested(), "a fast echo ends the congestion");
+        // A client that cannot echo yet leaves probes unanswered: the window slides, so the
+        // first echo after it starts answering ends the congestion.
+        for _ in 0..4 * MAX_OUTSTANDING_PROBES {
+            h.next_probe();
+        }
+        assert_eq!(
+            h.inner.probes.lock().unwrap().outstanding.len(),
+            MAX_OUTSTANDING_PROBES
+        );
+        let latest = h.next_probe();
+        h.probe_returned(latest);
+        assert!(!h.control_congested());
+        assert!(h.inner.probes.lock().unwrap().outstanding.is_empty());
+    }
+
+    /// Droppable traffic may run only a bounded number of bytes ahead of what the client has
+    /// confirmed; the bound follows the delivery rate the echoes measure, so a slow link keeps a
+    /// short queue and a fast one is not throttled.
+    #[test]
+    fn unconfirmed_bytes_are_bounded_by_the_measured_delivery_rate() {
+        let h = OutboundHandle::new();
+        assert!(!h.control_congested());
+        // Far more written than any window allows, and nothing confirmed.
+        h.note_written(10 * 1024 * 1024);
+        assert!(h.control_congested(), "written bytes outrun confirmation");
+        // An echo of a probe sent after those bytes confirms them.
+        let probe = h.next_probe();
+        h.probe_returned(probe);
+        assert!(!h.control_congested(), "everything written is confirmed");
+
+        // A slow link: the window shrinks to its floor.
+        h.inner.probes.lock().unwrap().delivery_rate = 30.0 * 1024.0;
+        let confirmed = h.inner.probes.lock().unwrap().confirmed_bytes;
+        h.note_written(confirmed + 40 * 1024);
+        assert!(!h.control_congested(), "inside the floor window");
+        h.note_written(confirmed + 60 * 1024);
+        assert!(
+            h.control_congested(),
+            "beyond what a slow link should queue"
+        );
+
+        // A fast link: the same backlog is nothing.
+        h.inner.probes.lock().unwrap().delivery_rate = 8.0 * 1024.0 * 1024.0;
+        assert!(!h.control_congested(), "a fast link may queue much more");
+    }
+
+    /// Catalogue credit follows the catalogue being fed: acknowledgements of a replaced
+    /// catalogue, or arriving before one is announced, grant nothing.
+    #[test]
+    fn catalogue_credit_follows_the_catalogue_being_fed() {
+        let h = OutboundHandle::new();
+        h.catalogue_ack(5, 0);
+        assert_eq!(h.catalogue_acked(5), 0, "no catalogue announced yet");
+        h.begin_catalogue(5);
+        assert_eq!(h.catalogue_acked(5), 0);
+        h.catalogue_ack(5, 0);
+        h.catalogue_ack(5, 2);
+        h.catalogue_ack(5, 1);
+        assert_eq!(h.catalogue_acked(5), 3, "credit never moves backwards");
+        h.catalogue_ack(4, 9);
+        assert_eq!(
+            h.catalogue_acked(5),
+            3,
+            "a stale catalogue's ack is ignored"
+        );
+        h.begin_catalogue(6);
+        assert_eq!(h.catalogue_acked(5), 0);
+        assert_eq!(
+            h.catalogue_acked(6),
+            0,
+            "a replacement starts without credit"
+        );
+    }
+
+    /// A client behind a slow link gets the newest water later instead of a growing queue of
+    /// stale frames, and none while its terrain catalogue owns the link.
+    #[test]
+    fn water_is_held_back_while_unsent_water_or_a_catalogue_is_outstanding() {
+        let h = OutboundHandle::new();
+        assert!(!h.water_backlogged());
+        for _ in 0..MAX_UNSENT_WATER_MESSAGES {
+            h.push(Outbound::Water(Arc::new(Vec::new()))).unwrap();
+        }
+        assert!(h.water_backlogged(), "enough unsent water is outstanding");
+        h.water_sent();
+        assert!(!h.water_backlogged(), "one message was written");
+        h.set_catalogue_streaming(true);
+        assert!(h.water_backlogged(), "the catalogue has the link");
+        h.set_catalogue_streaming(false);
+        assert!(!h.water_backlogged());
+        // The counter never underflows if the writer reports more than was queued.
+        for _ in 0..8 {
+            h.water_sent();
+        }
+        assert!(!h.water_backlogged());
+    }
+
+    /// A writer busy with slow reliable transfers must be able to pick up the
+    /// newest motion batch without taking (and reordering) the reliable queue.
+    #[test]
+    fn motion_can_be_taken_without_draining_the_reliable_queue() {
+        let h = OutboundHandle::new();
+        h.push(empty_tx()).unwrap();
+        h.push(Outbound::Motion(Arc::new(Vec::new()))).unwrap();
+        assert!(h.take_motion().is_some());
+        assert!(h.take_motion().is_none(), "motion is taken once");
+        // A newer batch replaces an unsent one.
+        h.push(Outbound::Motion(Arc::new(Vec::new()))).unwrap();
+        assert!(h.take_motion().is_some());
+        let batch = h.take();
+        assert_eq!(batch.reliable.len(), 1, "reliable traffic stays queued");
+        assert!(batch.motion.is_none());
     }
 
     /// Regression: the byte cap used to count every reliable byte ever queued on

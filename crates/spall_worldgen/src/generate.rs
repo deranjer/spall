@@ -157,8 +157,17 @@ fn pocket(spec: &WorldGenSpec, x: i64, y: i64, z: i64, subsoil: bool) -> Option<
     }
 }
 
-fn fill_dense(spec: &WorldGenSpec, fp: &Footprint, corners: Option<&CornerGrid>, y0: i64) -> Brick {
-    let mut cells = vec![MaterialId::AIR; CELLS_PER_BRICK];
+/// Fills `cells` (a worker's reused scratch buffer) for the brick at `y0` and builds it in its
+/// final compact form: uniform when every cell is equal, a palette otherwise.
+fn fill_dense(
+    spec: &WorldGenSpec,
+    fp: &Footprint,
+    corners: Option<&CornerGrid>,
+    y0: i64,
+    cells: &mut Vec<MaterialId>,
+) -> Brick {
+    cells.clear();
+    cells.resize(CELLS_PER_BRICK, MaterialId::AIR);
     for lz in 0..BRICK {
         for lx in 0..BRICK {
             let col = (lz * BRICK + lx) as usize;
@@ -195,7 +204,7 @@ fn fill_dense(spec: &WorldGenSpec, fp: &Footprint, corners: Option<&CornerGrid>,
             }
         }
     }
-    Brick::restored_unpacked(&cells, Revision::ZERO, false)
+    Brick::restored(cells, Revision::ZERO, false)
 }
 
 fn generate_column(
@@ -204,6 +213,7 @@ fn generate_column(
     caves: &CaveField,
     bx: i64,
     bz: i64,
+    scratch: &mut Vec<MaterialId>,
 ) -> Vec<(BrickCoord, Brick)> {
     let last = i64::from(spec.size_cells) / BRICK - 1;
     if bx == 0 || bz == 0 || bx == last || bz == last {
@@ -235,7 +245,7 @@ fn generate_column(
             if corners.is_none() && y1 <= fp.hmin - MAX_STACK {
                 Brick::uniform(base_material(spec, y0), Revision::ZERO)
             } else {
-                fill_dense(spec, &fp, corners.as_ref(), y0)
+                fill_dense(spec, &fp, corners.as_ref(), y0, scratch)
             }
         };
         out.push((BrickCoord::new(bx, by, bz), brick));
@@ -366,9 +376,29 @@ fn find_spawns(columns: &ColumnMap, caves: &CaveField) -> Vec<[f64; 3]> {
 
 /// Generates the whole arena. A pure function of the spec (and `GEN_VERSION`).
 pub fn generate(spec: &WorldGenSpec) -> Result<GeneratedWorld, GenError> {
+    generate_with_timings(spec).map(|(world, _)| world)
+}
+
+/// Diagnostic sidecar; these durations never enter generated, saved or replicated state.
+pub struct GenerationTimings {
+    pub columns: std::time::Duration,
+    pub fill: std::time::Duration,
+    pub packing: std::time::Duration,
+    pub compact: std::time::Duration,
+    pub insert: std::time::Duration,
+    pub source_release: std::time::Duration,
+    pub water_and_spawns: std::time::Duration,
+}
+
+pub fn generate_with_timings(
+    spec: &WorldGenSpec,
+) -> Result<(GeneratedWorld, GenerationTimings), GenError> {
+    let started = std::time::Instant::now();
     let columns = ColumnMap::compute(spec)?;
     validate_water_budget(&columns)?;
     let caves = CaveField::new(spec.seed, &columns);
+    let column_time = started.elapsed();
+    let started = std::time::Instant::now();
     let bricks_per_side = i64::from(spec.size_cells) / BRICK;
 
     let jobs: Vec<(i64, i64)> = (0..bricks_per_side)
@@ -385,9 +415,14 @@ pub fn generate(spec: &WorldGenSpec) -> Result<GeneratedWorld, GenError> {
             .map(|chunk| {
                 let (columns, caves) = (&columns, &caves);
                 scope.spawn(move || {
+                    // One full-width scratch buffer per worker, reused for every brick, so no
+                    // full-width array is ever kept or freed per brick.
+                    let mut scratch = Vec::with_capacity(CELLS_PER_BRICK);
                     chunk
                         .iter()
-                        .flat_map(|&(bx, bz)| generate_column(spec, columns, caves, bx, bz))
+                        .flat_map(|&(bx, bz)| {
+                            generate_column(spec, columns, caves, bx, bz, &mut scratch)
+                        })
                         .collect::<Vec<_>>()
                 })
             })
@@ -397,24 +432,19 @@ pub fn generate(spec: &WorldGenSpec) -> Result<GeneratedWorld, GenError> {
             built.push(handle.join().expect("worldgen worker panicked"));
         }
     });
+    let fill_time = started.elapsed();
+    let started = std::time::Instant::now();
 
     let mut terrain = Volume::new(spec.volume_id, CellSizeCode::Quarter);
-    // Retain the complete immutable source batch during packing. Releasing
-    // each full-width array between smaller allocations leaves holes that
-    // made later grid allocation hundreds of times slower on Windows.
-    // Release the batch together after all packed replacements are installed.
-    let generation_payload_guard: Vec<_> = built
-        .iter()
-        .flatten()
-        .map(|(_, brick)| brick.snapshot())
-        .collect();
-    for (coord, mut brick) in built.into_iter().flatten() {
-        // Compact on the owner after workers finish. Parallel palette/index
-        // allocation severely fragments the Windows heap at full-world scale.
-        brick.collapse();
+    // Bricks arrive already in their final compact form, built from per-worker scratch buffers,
+    // so there is no raw source array to retain through packing or to free afterwards.
+    let insert_started = std::time::Instant::now();
+    for (coord, brick) in built.into_iter().flatten() {
         terrain.insert_brick(coord, brick)?;
     }
-    drop(generation_payload_guard);
+    let insert_time = insert_started.elapsed();
+    let packing_time = started.elapsed();
+    let started = std::time::Instant::now();
 
     let water = water_plan(&columns);
     let cells = water.domain_cells();
@@ -430,19 +460,64 @@ pub fn generate(spec: &WorldGenSpec) -> Result<GeneratedWorld, GenError> {
         return Err(GenError::NoSpawn);
     }
     let edge = i64::from(spec.size_cells);
-    Ok(GeneratedWorld {
-        version: GEN_VERSION,
-        terrain,
-        region: (
-            GlobalCell::new(0, 0, 0),
-            GlobalCell::new(edge - 1, HEIGHT_CELLS - 1, edge - 1),
-        ),
-        water,
-        spawns,
-        anchor_y: 0,
-        columns,
-        cave_mouths,
-    })
+    Ok((
+        GeneratedWorld {
+            version: GEN_VERSION,
+            terrain,
+            region: (
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(edge - 1, HEIGHT_CELLS - 1, edge - 1),
+            ),
+            water,
+            spawns,
+            anchor_y: 0,
+            columns,
+            cave_mouths,
+        },
+        GenerationTimings {
+            columns: column_time,
+            fill: fill_time,
+            packing: packing_time,
+            // Retired stages: bricks are built compact and nothing is retained or released.
+            compact: std::time::Duration::ZERO,
+            insert: insert_time,
+            source_release: std::time::Duration::ZERO,
+            water_and_spawns: started.elapsed(),
+        },
+    ))
+}
+
+#[cfg(test)]
+mod timing_probe {
+    use super::*;
+    use crate::{Preset, WorldgenPalette};
+
+    /// Manual: full 4096-cell generation with each stage's time and a digest of the terrain, to
+    /// show a change to generation is exact and what it costs. Several GiB.
+    #[test]
+    #[ignore = "manual full-world generation timing; several GiB"]
+    fn full_world_generation_timings() {
+        let spec = WorldGenSpec::new(Preset::Showcase, 1, 4096, WorldgenPalette::sequential(1));
+        let started = std::time::Instant::now();
+        let (world, t) = generate_with_timings(&spec).unwrap();
+        let total = started.elapsed();
+        eprintln!(
+            "gen_probe total_ms={} columns_ms={} fill_ms={} packing_ms={} compact_ms={} insert_ms={} release_ms={} water_ms={}",
+            total.as_millis(),
+            t.columns.as_millis(),
+            t.fill.as_millis(),
+            t.packing.as_millis(),
+            t.compact.as_millis(),
+            t.insert.as_millis(),
+            t.source_release.as_millis(),
+            t.water_and_spawns.as_millis()
+        );
+        eprintln!(
+            "gen_probe digest={} bricks={}",
+            spall_voxel::fixtures::digest_hex(&world.terrain),
+            world.terrain.resident_brick_count()
+        );
+    }
 }
 
 #[cfg(test)]

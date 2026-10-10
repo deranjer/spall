@@ -1574,3 +1574,52 @@ Optional SPALL_TRANSFER_PROBE_RCVBUF requests 64 KiB..=4 MiB; omitted retains
 platform buffering. The 96 MiB BBR raw probes are bounded transport diagnostics,
 not full-world/G3 acceptance. Relay batching retains future deadlines, configured
 rate/loss and bounded queue limits. The graph optimization candidate was reverted.
+
+### ENG-130 regional startup checks
+
+`cargo test -p spall_server --test regional_baseline` exercises regional/full logical hash equality,
+reload/eviction/re-entry, edits to never-resident terrain, complete detached bodies, invalid interest,
+and a real QUIC traversal/distant-edit/reset scenario. `cargo test -p spall_client --test
+regional_staging` verifies atomic refusal of incomplete/invalid catalogues and forbidden body digests.
+Protocol and prediction unit tests cover schema isolation, count/radius bounds and collision holds
+before the capsule crosses into unknown geometry. Existing segmented join, residency and water
+replication scenarios remain required.
+
+`tools/measure-regional-startup.ps1 -WorldSizeCells 4096 -OutputDirectory <fresh-dir>` records bounded
+headless release startup, initial geometry/digest counts, working set, transfer bytes and final hash.
+Add `-FullBaseline` for the control. The supervisor owns/cleans only its launched processes and retains
+logs/summaries. This probe does not satisfy GPU, G3/G5 destruction, eight-player, impaired-network,
+or long-soak gates. See docs/reports/ENG-130-regional-startup.md for measured results and limitations.
+
+### ENG-114 startup profiling and full-size regional workloads
+
+Add `-ProfileStartup` to `tools/measure-regional-startup.ps1` for structured phase
+observations. Generation timings never enter durable or replicated state. Exact
+cold/warm graph parity after edit/eviction, source-patch staged digest hash validation,
+and worldgen golden digests cover the optimizations. Run the distinct full-world
+regional fixtures with `cargo xtask scenario --name eng114-regional-1024m-stress
+--timeout-ms 600000 --output <fresh-dir>` and `eng114-regional-1024m-impaired`.
+Both keep eight foundation cuts, two resets and two clients; the impaired case keeps
+G3's original 16 MiB / 30 s join bounds. See reports/ENG-114-startup-streaming.md
+for measured startup, bounded workload results, rejected candidates and open gates.
+
+### ENG-114 regional replica diagnostics
+
+Harness-spawned processes lose stderr and `RUST_LOG` defaults to errors only. Run the
+regional fixtures with `RUST_LOG=spall_client=info,spall_server=info,spall_net=info`
+and `SPALL_LOG_FILE=<dir>/proc` to keep one log per process (client control-reader and
+mover profiles, slow repair patches, rejected-transaction reasons, backlog overflow
+composition, admin request send/receive). `RUST_LOG=spall_client=debug` adds each
+transaction's ops and `before` brick states. A fixture passes only when every client
+reports zero rejected transactions, both resets, matching final hashes and the mover
+criteria; see reports/ENG-114-startup-streaming.md for the current measured state.
+
+ENG-114 deferred catalogue fixtures: `cargo xtask scenario --name eng114-regional-1024m-stress-deferred`
+and `eng114-regional-1024m-impaired-deferred` (see tools/measure-worldgen-stress.ps1). They add
+`defer_catalogue` to their originals without changing workload, limits or thresholds. The join
+budget's 30 s bound then measures readiness (baseline installed, first keyframe confirmed) and its
+16 MiB bound counts baseline plus catalogue bytes; every client must still finish on the server's
+exact hash, so an unfinished catalogue fails the run. Client summaries report
+`catalogue_complete_ms`, `catalogue_compressed_bytes`, `catalogue_pending_at_end` and the
+transactions still held at the end. The original `eng114-regional-1024m-impaired` still fails its
+30 s join by design of its transport profile; see reports/ENG-114-startup-streaming.md.

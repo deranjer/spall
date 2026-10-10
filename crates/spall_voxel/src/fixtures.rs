@@ -5,7 +5,7 @@
 //! no I/O — so [`digest`] gives a stable content hash that pins the fixture
 //! against accidental change. That digest is a **local regression check**, not
 //! the replicated topology hash (that is `spall_protocol`'s
-//! `spall.topology.v1`).
+//! `spall.topology.v2`).
 //!
 //! Fixture material ids are arbitrary small integers, not a real manifest:
 //! [`STONE`] and [`DIRT`]. Air is [`spall_core::MaterialId::AIR`].

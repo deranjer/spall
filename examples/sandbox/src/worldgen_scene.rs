@@ -117,12 +117,35 @@ pub fn generate_with_season(
     let preset = Preset::from_name(preset)
         .ok_or_else(|| WorldgenSceneError::UnknownPreset(preset.into()))?;
     let spec = WorldGenSpec::new(preset, seed, size_cells, crate::game::terrain_palette());
-    let mut world = spall_worldgen::generate(&spec)?;
+    let started = std::time::Instant::now();
+    let (mut world, timings) = spall_worldgen::generate_with_timings(&spec)?;
+    for (stage, elapsed) in [
+        ("worldgen.columns", timings.columns),
+        ("worldgen.fill", timings.fill),
+        ("worldgen.packing", timings.packing),
+        ("worldgen.compact", timings.compact),
+        ("worldgen.insert", timings.insert),
+        ("worldgen.source_release", timings.source_release),
+        ("worldgen.water_and_spawns", timings.water_and_spawns),
+    ] {
+        tracing::info!(
+            stage,
+            elapsed_us = elapsed.as_micros() as u64,
+            "startup profile"
+        );
+    }
+    tracing::info!(
+        stage = "terrain_generation",
+        elapsed_us = started.elapsed().as_micros() as u64,
+        size_cells,
+        "startup profile"
+    );
     let spawns = world
         .spawns
         .iter()
         .map(|p| p.map(|v| (v / 0.25).floor() as i64))
         .collect();
+    let started = std::time::Instant::now();
     let vegetation = spall_ecology::living::LivingState::generate(
         seed,
         &world.columns,
@@ -132,7 +155,18 @@ pub fn generate_with_season(
         season,
     )
     .map_err(WorldgenSceneError::Vegetation)?;
+    tracing::info!(
+        stage = "vegetation_generation",
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "startup profile"
+    );
+    let started = std::time::Instant::now();
     let water = water_setup(&world.water)?;
+    tracing::info!(
+        stage = "water_setup",
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "startup profile"
+    );
     Ok(GeneratedScene {
         world: Arc::new(world),
         water,

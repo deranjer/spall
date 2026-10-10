@@ -15,7 +15,7 @@ $samplerStart = [DateTime]::UtcNow
 $tracked = @{}
 $peaks = @{}
 $csvPath = Join-Path $runDirectory 'process-memory.csv'
-Set-Content -LiteralPath $csvPath -Value 'elapsed_ms,role,pid,working_set_bytes,peak_working_set_bytes,private_bytes'
+Set-Content -LiteralPath $csvPath -Value 'elapsed_ms,role,pid,working_set_bytes,peak_working_set_bytes,private_bytes,cpu_ms'
 $xtask = Start-Process -FilePath (Join-Path $workspace 'target/debug/xtask.exe') -WorkingDirectory $workspace -ArgumentList @('scenario','--name',$Scenario,'--timeout-ms',"$TimeoutMs",'--output',('"' + $runDirectory + '"')) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runDirectory 'harness.stdout.log') -RedirectStandardError (Join-Path $runDirectory 'harness.stderr.log')
 try {
     while (!$xtask.HasExited) {
@@ -38,7 +38,7 @@ try {
             if ($sampleProcess -and !$sampleProcess.HasExited) {
                 $peaks[$roleName] = [Math]::Max([long]$peaks[$roleName], $sampleProcess.PeakWorkingSet64)
                 $elapsed = [long]([DateTime]::UtcNow - $samplerStart).TotalMilliseconds
-                Add-Content -LiteralPath $csvPath -Value "$elapsed,$roleName,$($sampleProcess.Id),$($sampleProcess.WorkingSet64),$($sampleProcess.PeakWorkingSet64),$($sampleProcess.PrivateMemorySize64)"
+                Add-Content -LiteralPath $csvPath -Value "$elapsed,$roleName,$($sampleProcess.Id),$($sampleProcess.WorkingSet64),$($sampleProcess.PeakWorkingSet64),$($sampleProcess.PrivateMemorySize64),$([long]$sampleProcess.TotalProcessorTime.TotalMilliseconds)"
             }
         }
         if (([DateTime]::UtcNow - $samplerStart).TotalMilliseconds -gt $TimeoutMs + 120000) {

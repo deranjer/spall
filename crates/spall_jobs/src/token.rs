@@ -77,6 +77,10 @@ pub struct JobToken {
     /// Read dependencies, kept sorted by [`BrickRef::order_key`] with one entry
     /// per brick.
     reads: Vec<ReadDep>,
+    /// The whole-volume state the reads were taken from, when the producer knows it. While the
+    /// world still reports this exact stamp for that volume, nothing in it changed, so every
+    /// read is valid without comparing them one by one.
+    state_stamp: Option<(VolumeId, u64)>,
 }
 
 impl JobToken {
@@ -87,7 +91,20 @@ impl JobToken {
             generation,
             topology_epoch,
             reads: Vec::new(),
+            state_stamp: None,
         }
+    }
+
+    /// Records that every read was taken from `volume` in exactly the state `stamp` (see
+    /// [`WorldView::state_stamp`]). Only valid if all of this token's reads are of `volume`.
+    #[must_use]
+    pub fn with_state_stamp(mut self, volume: VolumeId, stamp: u64) -> Self {
+        debug_assert!(
+            self.reads.iter().all(|dep| dep.brick.volume == volume),
+            "a state stamp covers one volume's reads only"
+        );
+        self.state_stamp = Some((volume, stamp));
+        self
     }
 
     /// Records that the job read `volume`/`brick` at `revision`. A later call for
@@ -183,6 +200,22 @@ impl JobToken {
             };
         }
 
+        if let Some((volume, stamp)) = self.state_stamp
+            && world.state_stamp(volume) == Some(stamp)
+        {
+            // The volume is bit-for-bit the state the reads came from. Debug builds still
+            // run the full comparison, so every test checks the shortcut against it.
+            debug_assert_eq!(
+                self.check_reads(world),
+                Staleness::Fresh,
+                "an unchanged volume stamp must imply fresh reads"
+            );
+            return Staleness::Fresh;
+        }
+        self.check_reads(world)
+    }
+
+    fn check_reads<W: WorldView + ?Sized>(&self, world: &W) -> Staleness {
         for dep in &self.reads {
             let current = world.brick_status(dep.brick);
             let ok = match (dep.state, current) {
@@ -248,6 +281,12 @@ pub trait WorldView {
     fn topology_epoch(&self) -> TopologyEpoch;
     /// The current status of one brick.
     fn brick_status(&self, brick: BrickRef) -> BrickStatus;
+    /// An opaque stamp that changes whenever anything in `volume` changes, if the world keeps
+    /// one. Equal stamps (of the same volume) mean identical contents. The default reports
+    /// none, which only makes validation compare every read.
+    fn state_stamp(&self, _volume: VolumeId) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -300,9 +339,13 @@ mod tests {
         generation: Generation,
         epoch: TopologyEpoch,
         bricks: Vec<(BrickRef, BrickStatus)>,
+        stamp: Option<u64>,
     }
 
     impl WorldView for FixedWorld {
+        fn state_stamp(&self, _volume: VolumeId) -> Option<u64> {
+            self.stamp
+        }
         fn generation(&self) -> Generation {
             self.generation
         }
@@ -320,6 +363,67 @@ mod tests {
 
     fn vol(n: u64) -> VolumeId {
         VolumeId::new(n).unwrap()
+    }
+
+    fn stamped_world(stamp: Option<u64>, revision: u64) -> FixedWorld {
+        FixedWorld {
+            generation: Generation(1),
+            epoch: TopologyEpoch(0),
+            bricks: vec![(
+                BrickRef::new(vol(1), BrickCoord::new(0, 0, 0)),
+                BrickStatus::Resident(Revision(revision)),
+            )],
+            stamp,
+        }
+    }
+
+    fn stamped_token(stamp: u64) -> JobToken {
+        JobToken::new(Generation(1), TopologyEpoch(0))
+            .reading(vol(1), BrickCoord::new(0, 0, 0), Revision(3))
+            .with_state_stamp(vol(1), stamp)
+    }
+
+    #[test]
+    fn a_matching_state_stamp_is_fresh() {
+        assert_eq!(
+            stamped_token(7).check(&stamped_world(Some(7), 3)),
+            Staleness::Fresh
+        );
+    }
+
+    #[test]
+    fn a_changed_state_stamp_falls_back_to_comparing_every_read() {
+        // The stamp moved and the brick the job read changed with it: stale.
+        assert!(matches!(
+            stamped_token(7).check(&stamped_world(Some(8), 4)),
+            Staleness::BrickRevision { .. }
+        ));
+        // The stamp moved (something unrelated changed) but the job's brick did not: still fresh.
+        assert_eq!(
+            stamped_token(7).check(&stamped_world(Some(8), 3)),
+            Staleness::Fresh
+        );
+        // A world that keeps no stamps always compares.
+        assert!(matches!(
+            stamped_token(7).check(&stamped_world(None, 4)),
+            Staleness::BrickRevision { .. }
+        ));
+    }
+
+    #[test]
+    fn a_matching_stamp_does_not_excuse_a_stale_epoch_or_generation() {
+        let mut world = stamped_world(Some(7), 3);
+        world.epoch = TopologyEpoch(1);
+        assert!(matches!(
+            stamped_token(7).check(&world),
+            Staleness::TopologyEpoch { .. }
+        ));
+        let mut world = stamped_world(Some(7), 3);
+        world.generation = Generation(2);
+        assert!(matches!(
+            stamped_token(7).check(&world),
+            Staleness::Generation { .. }
+        ));
     }
 
     #[test]
@@ -343,6 +447,7 @@ mod tests {
             generation: Generation(3),
             epoch: TopologyEpoch(4),
             bricks: vec![(b, BrickStatus::Resident(Revision(7)))],
+            stamp: None,
         };
         let token = JobToken::new(Generation(3), TopologyEpoch(4)).reading(
             vol(1),
@@ -359,6 +464,7 @@ mod tests {
             generation: Generation(4),
             epoch: TopologyEpoch(0),
             bricks: vec![],
+            stamp: None,
         };
         let token = JobToken::new(Generation(3), TopologyEpoch(1)).reading(
             vol(1),
@@ -384,6 +490,7 @@ mod tests {
             generation: Generation(1),
             epoch: TopologyEpoch(0),
             bricks: vec![(b, BrickStatus::Absent)],
+            stamp: None,
         };
         assert!(token.is_fresh(&still_absent));
 
@@ -391,6 +498,7 @@ mod tests {
             generation: Generation(1),
             epoch: TopologyEpoch(0),
             bricks: vec![(b, BrickStatus::Resident(Revision(1)))],
+            stamp: None,
         };
         assert_eq!(
             token.check(&now_resident),
@@ -419,6 +527,7 @@ mod tests {
                 generation: Generation(1),
                 epoch: TopologyEpoch(0),
                 bricks: vec![(b, status)],
+                stamp: None,
             };
             assert!(!token.is_fresh(&world), "{status:?} should be stale");
         }

@@ -312,6 +312,9 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     }
     if needs_server_baseline {
         client_cmd.arg("--late-join");
+        if args.worldgen.is_some() {
+            client_cmd.arg("--stream-regions");
+        }
         if args.worldgen_size.is_some_and(|size| size >= 4096) {
             client_cmd.args(["--baseline-budget-mib", "8192"]);
         }

@@ -31,15 +31,10 @@ use spall_core::{
     VolumeId,
 };
 use spall_protocol::{
-    BaselineBrick, BaselineCells, BaselineVolume, CanonicalBrick, CanonicalLayer, CanonicalOwner,
-    CanonicalVolume, Hash32, MotionSnapshot, Record, RepairKey, RepairRequest, SequenceGate,
-    TopologyOp, TopologyTransaction, canonical_topology_hash,
+    BaselineBrick, BaselineCells, BaselineVolume, CanonicalOwner, Hash32, MotionSnapshot, Record,
+    RepairKey, RepairRequest, SequenceGate, TopologyOp, TopologyTransaction,
 };
 use spall_voxel::{Brick, BrickHash, EditPlan, Volume};
-
-/// Stable numeric layer code for the material layer (mirrors
-/// `spall_sim`'s canonical volume construction).
-const MATERIAL_LAYER_KIND: u16 = 0;
 
 /// Tunables for a [`ReplicaWorld`].
 #[derive(Debug, Clone, Copy)]
@@ -55,15 +50,18 @@ pub struct ReplicaConfig {
     /// Fixed server tick rate, for tick↔time conversion.
     pub server_tick_hz: f64,
     /// ENG-49: how many `before`-gapped transactions are held awaiting a repair
-    /// patch before the oldest is evicted (the server re-delivers it on the
-    /// control stream, or a fresher baseline supersedes it). Bounds retained
-    /// memory. `docs/protocol.md`: "Retain the previous consistent replica
+    /// patch. Past it the replica rejects (loudly) instead of evicting one: an evicted hold
+    /// is a committed transaction nobody would ever re-request. Bounds retained memory. `docs/protocol.md`: "Retain the previous consistent replica
     /// while dependencies [...] are pending."
     pub max_pending_repair_txns: usize,
     /// ENG-49: a brick repair key that has been requested is not re-requested
     /// for this many observed server ticks (`docs/protocol.md`: a `before` gap
     /// "raises a rate-limited `RepairRequest`").
     pub repair_request_cooldown_ticks: u64,
+    /// Most transactions held while a deferred terrain catalogue is still
+    /// arriving. Past it the replica rejects (loudly) instead of dropping one:
+    /// a transaction on terrain it cannot yet validate must never vanish.
+    pub max_catalogue_deferred_txns: usize,
 }
 
 impl Default for ReplicaConfig {
@@ -73,8 +71,9 @@ impl Default for ReplicaConfig {
             interpolation_delay_s: 0.1,
             max_extrapolation_s: 0.1,
             server_tick_hz: 60.0,
-            max_pending_repair_txns: 64,
+            max_pending_repair_txns: 4096,
             repair_request_cooldown_ticks: 30,
+            max_catalogue_deferred_txns: 4096,
         }
     }
 }
@@ -356,6 +355,14 @@ struct ReplicaBody {
 pub struct ReplicaWorld {
     config: ReplicaConfig,
     terrain_id: VolumeId,
+    /// Per-chunk digests of each volume's logical contents, reused while a chunk's stamps are
+    /// unchanged (see `spall_sim::world::refresh_logical_chunk_digests`). Behind a mutex
+    /// because hashing is `&self`. Also serves the candidate worlds that incoming transactions
+    /// are verified against: a candidate shares unchanged chunks, and their stamps, with the
+    /// live volume.
+    hash_caches: std::sync::Mutex<BTreeMap<u64, spall_protocol::ChunkDigestCache>>,
+    /// The same, for the terrain's resident-only hash ([`Self::terrain_resident_hash`]).
+    resident_hash_cache: std::sync::Mutex<spall_protocol::ChunkDigestCache>,
     /// Live, consistent volumes: terrain plus every replicated body volume.
     volumes: BTreeMap<u64, Volume>,
     owner: BTreeMap<u64, CanonicalOwner>,
@@ -386,7 +393,7 @@ pub struct ReplicaWorld {
     /// ENG-49: brick repair keys already asked about and not yet resolved →
     /// the `now_tick` the `RepairRequest` was emitted, so an identical gap
     /// inside `config.repair_request_cooldown_ticks` is not re-requested.
-    repair_requests_inflight: BTreeMap<(u64, i64, i64, i64), u64>,
+    repair_requests_inflight: BTreeMap<(u64, i64, i64, i64), (u64, u32)>,
     /// Highest server tick the client has observed on any record.
     now_tick: u64,
     /// Continuously advancing render time; see [`ReplicaWorld::render_tick`].
@@ -403,6 +410,12 @@ pub struct ReplicaWorld {
     /// eviction, or reload). Motion-only records and body-only edits leave it
     /// alone.
     terrain_generation: u64,
+    /// The baseline whose distant terrain catalogue has not finished arriving.
+    /// While set, `world_hash` cannot match the server and transactions wait in
+    /// `catalogue_deferred`: an edit on a brick whose digest is not yet known
+    /// would otherwise replay onto air.
+    catalogue_pending: Option<spall_protocol::TransferId>,
+    catalogue_deferred: Vec<TopologyTransaction>,
 }
 
 /// A baseline being built off to the side while its segments arrive (`docs/protocol.md` late-join
@@ -412,6 +425,7 @@ pub struct ReplicaWorld {
 /// first brick is staged.
 pub struct StagedBaseline {
     reuse: BTreeMap<u64, Volume>,
+    evicted: BTreeMap<u64, spall_voxel::EvictedBricks>,
     checkpoint_tick: u64,
     volumes: BTreeMap<u64, Volume>,
     owner: BTreeMap<u64, CanonicalOwner>,
@@ -427,6 +441,7 @@ impl StagedBaseline {
     pub fn new(checkpoint_tick: u64) -> Self {
         Self {
             reuse: BTreeMap::new(),
+            evicted: BTreeMap::new(),
             checkpoint_tick,
             volumes: BTreeMap::new(),
             owner: BTreeMap::new(),
@@ -527,6 +542,50 @@ impl StagedBaseline {
                 "brick for volume {vid}, which is not the open volume"
             ));
         }
+        if let spall_protocol::BaselineCells::Digest {
+            content_hash,
+            solid_cells,
+        } = bb.cells
+        {
+            let coord = BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]);
+            let volume = &self.volumes[&vid.get()];
+            if self.terrain_id != Some(vid)
+                || solid_cells > spall_core::CELLS_PER_BRICK as u32
+                || volume
+                    .bounds()
+                    .is_some_and(|bounds| !bounds.contains(coord))
+                || volume.brick_revision(coord).ok().flatten().is_some()
+                || self
+                    .evicted
+                    .get(&vid.get())
+                    .is_some_and(|e| e.contains(coord))
+            {
+                return Err("invalid, duplicate or non-terrain baseline digest".into());
+            }
+            self.evicted
+                .entry(vid.get())
+                .or_default()
+                .record(
+                    coord,
+                    spall_voxel::BrickDigest {
+                        revision: Revision(bb.revision),
+                        content_hash: BrickHash::from_bytes(content_hash.0),
+                        solid_cells,
+                        modified_air: bb.edited && solid_cells == 0,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            self.bricks += 1;
+            return Ok(());
+        }
+        let coord = BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]);
+        if self
+            .evicted
+            .get(&vid.get())
+            .is_some_and(|e| e.contains(coord))
+        {
+            return Err("baseline geometry overlaps a retained digest".into());
+        }
         let candidate = self.reuse.get(&vid.get()).and_then(|v| {
             v.snapshot_brick(BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]))
                 .ok()
@@ -601,6 +660,8 @@ impl ReplicaWorld {
         Self {
             config,
             terrain_id,
+            hash_caches: std::sync::Mutex::new(BTreeMap::new()),
+            resident_hash_cache: std::sync::Mutex::new(spall_protocol::ChunkDigestCache::default()),
             volumes,
             owner,
             bodies: BTreeMap::new(),
@@ -617,6 +678,8 @@ impl ReplicaWorld {
             render_clock: RenderClock::default(),
             evicted: BTreeMap::new(),
             terrain_generation: 1,
+            catalogue_pending: None,
+            catalogue_deferred: Vec::new(),
         }
     }
 
@@ -628,6 +691,8 @@ impl ReplicaWorld {
         Self {
             config,
             terrain_id: placeholder,
+            hash_caches: std::sync::Mutex::new(BTreeMap::new()),
+            resident_hash_cache: std::sync::Mutex::new(spall_protocol::ChunkDigestCache::default()),
             volumes: BTreeMap::new(),
             owner: BTreeMap::new(),
             bodies: BTreeMap::new(),
@@ -644,6 +709,8 @@ impl ReplicaWorld {
             render_clock: RenderClock::default(),
             evicted: BTreeMap::new(),
             terrain_generation: 0,
+            catalogue_pending: None,
+            catalogue_deferred: Vec::new(),
         }
     }
 
@@ -698,7 +765,12 @@ impl ReplicaWorld {
                     + (storage.dense_bricks + storage.uniform_bricks) as u64
                         * spall_protocol::segment::UNIFORM_BRICK_DECODED_COST as u64
             })
-            .sum()
+            .sum::<u64>()
+            + self
+                .evicted
+                .values()
+                .map(|e| e.len() as u64 * 128)
+                .sum::<u64>()
     }
 
     /// Installs a fully staged baseline atomically: the same swap `install_baseline_world`
@@ -726,10 +798,151 @@ impl ReplicaWorld {
         self.repair_requests_inflight = BTreeMap::new();
         // A full baseline replaces the whole logical state, digest namespace
         // included (G3-residency-hash.md lifecycle).
-        self.evicted = BTreeMap::new();
+        self.evicted = staged.evicted;
         self.now_tick = staged.checkpoint_tick;
+        // A replacement baseline supersedes any catalogue still arriving for the old one.
+        self.catalogue_pending = None;
+        self.catalogue_deferred.clear();
         self.bump_terrain_generation();
         Ok(())
+    }
+
+    /// Marks the baseline just installed as missing its distant terrain
+    /// catalogue, which will arrive as chunks tagged `transfer_id`. Until
+    /// [`Self::complete_catalogue`], transactions wait and `world_hash` is not
+    /// comparable with the server's.
+    pub fn expect_catalogue(&mut self, transfer_id: spall_protocol::TransferId) {
+        self.catalogue_pending = Some(transfer_id);
+    }
+
+    /// The baseline whose catalogue is still arriving, if any.
+    pub fn catalogue_pending(&self) -> Option<spall_protocol::TransferId> {
+        self.catalogue_pending
+    }
+
+    /// Transactions currently waiting for the catalogue (diagnostics).
+    pub fn catalogue_deferred_count(&self) -> usize {
+        self.catalogue_deferred.len()
+    }
+
+    /// The replica's complete logical terrain catalogue (resident and evicted bricks), for a
+    /// delta catalogue to build on after a world reset replaces this world. `None` while the
+    /// catalogue is still arriving: the catalogue is incomplete, so there is nothing to build on.
+    ///
+    /// Transactions held for repairs do not matter here. A brick one of them would have changed
+    /// has a digest the server's world has since moved away from, so the delta (which lists every
+    /// brick whose digest differs from the server's) overwrites it; the merged result is checked
+    /// against the new world's hash before anything replays.
+    pub fn logical_terrain_digests(
+        &self,
+    ) -> Option<BTreeMap<BrickCoord, spall_voxel::BrickDigest>> {
+        if self.catalogue_pending.is_some() || !self.catalogue_deferred.is_empty() {
+            return None;
+        }
+        let tid = self.terrain_id.get();
+        let terrain = self.volumes.get(&tid)?;
+        let mut digests = BTreeMap::new();
+        for coord in terrain.resident_brick_coords() {
+            let snap = terrain.snapshot_brick(coord).ok().flatten()?;
+            digests.insert(
+                coord,
+                spall_voxel::BrickDigest {
+                    revision: snap.revision(),
+                    content_hash: snap.content_hash(),
+                    solid_cells: snap.solid_cells(),
+                    modified_air: snap.is_modified_air(),
+                },
+            );
+        }
+        if let Some(evicted) = self.evicted.get(&tid) {
+            for (coord, digest) in evicted.iter() {
+                digests.insert(coord, digest);
+            }
+        }
+        Some(digests)
+    }
+
+    /// Merges a fully received catalogue and replays the transactions that
+    /// waited for it, in arrival order. A digest for a brick the replica already
+    /// holds (resident, or evicted since the baseline) is skipped: the replica's
+    /// own copy is at least as new. Returns the replay outcomes for forwarding.
+    pub fn complete_catalogue(
+        &mut self,
+        staged: StagedBaseline,
+    ) -> Result<Vec<(TransactionId, ApplyOutcome)>, String> {
+        self.merge_catalogue(staged, None, None)
+    }
+
+    /// [`Self::complete_catalogue`] for a delta: `staged` lists only the digests that differ from
+    /// `basis`, the catalogue this client held for the world the baseline replaced. The merged
+    /// replica must hash to `expected_world_hash`, the new world's hash at the baseline's tick,
+    /// or the catalogue is refused before any held transaction replays.
+    pub fn complete_delta_catalogue(
+        &mut self,
+        staged: StagedBaseline,
+        basis: BTreeMap<BrickCoord, spall_voxel::BrickDigest>,
+        expected_world_hash: Hash32,
+    ) -> Result<Vec<(TransactionId, ApplyOutcome)>, String> {
+        self.merge_catalogue(staged, Some(basis), Some(expected_world_hash))
+    }
+
+    fn merge_catalogue(
+        &mut self,
+        staged: StagedBaseline,
+        basis: Option<BTreeMap<BrickCoord, spall_voxel::BrickDigest>>,
+        expected_world_hash: Option<Hash32>,
+    ) -> Result<Vec<(TransactionId, ApplyOutcome)>, String> {
+        if self.catalogue_pending.is_none() {
+            return Err("no catalogue is pending".into());
+        }
+        if staged.terrain_id != Some(self.terrain_id) {
+            return Err("catalogue names a different terrain volume".into());
+        }
+        if let Some(open) = staged.open {
+            return Err(format!("catalogue volume {open} was left open"));
+        }
+        let tid = self.terrain_id.get();
+        let mut merged = basis.unwrap_or_default();
+        if let Some(digests) = staged.evicted.get(&tid) {
+            for (coord, digest) in digests.iter() {
+                merged.insert(coord, digest);
+            }
+        }
+        {
+            let terrain = self
+                .volumes
+                .get(&tid)
+                .ok_or("replica has no terrain volume")?;
+            let mut additions = Vec::with_capacity(merged.len());
+            for (coord, digest) in merged {
+                let known = terrain.brick_revision(coord).ok().flatten().is_some()
+                    || self.evicted.get(&tid).is_some_and(|e| e.contains(coord));
+                if !known {
+                    additions.push((coord, digest));
+                }
+            }
+            let evicted = self.evicted.entry(tid).or_default();
+            for (coord, digest) in additions {
+                evicted.record(coord, digest).map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(expected) = expected_world_hash {
+            let actual = self.world_hash();
+            if actual != expected {
+                return Err(
+                    "the merged catalogue does not reproduce the server's world hash".into(),
+                );
+            }
+        }
+        self.catalogue_pending = None;
+        self.bump_terrain_generation();
+        let deferred = std::mem::take(&mut self.catalogue_deferred);
+        let mut outcomes = Vec::with_capacity(deferred.len());
+        for tx in deferred {
+            let id = tx.transaction_id;
+            outcomes.push((id, self.apply_transaction(&tx)));
+        }
+        Ok(outcomes)
     }
 
     /// Merges a targeted baseline patch into the live replica — a hash repair
@@ -767,6 +980,7 @@ impl ReplicaWorld {
             let volume = staged.get_mut(&vid.get()).expect("just staged");
             for bb in &bv.bricks {
                 let cells: Vec<MaterialId> = match &bb.cells {
+                    BaselineCells::Digest { .. } => return Err("digest in geometry patch".into()),
                     BaselineCells::Uniform(id) => {
                         vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
                     }
@@ -844,6 +1058,12 @@ impl ReplicaWorld {
         out
     }
 
+    /// Whether transaction `id` is held awaiting a repair patch.
+    #[cfg(test)]
+    fn is_held(&self, id: TransactionId) -> bool {
+        self.pending_repair_txns.contains_key(&id.get())
+    }
+
     /// Transactions currently held awaiting a repair patch (diagnostics).
     pub fn pending_repair_txn_count(&self) -> usize {
         self.pending_repair_txns.len()
@@ -863,11 +1083,22 @@ impl ReplicaWorld {
             return Vec::new();
         };
         let tid = tx.transaction_id;
+        // The marker is held in this map itself, so it must not count as its own
+        // predecessor while it is retried.
         let outcome = self.apply_transaction(&tx);
         if !matches!(outcome, ApplyOutcome::AwaitingBulkSplit { .. }) {
             self.pending_bulk_split_txns.remove(&transfer_id);
         }
-        vec![(tid, outcome)]
+        let resolved = matches!(
+            outcome,
+            ApplyOutcome::Published { .. } | ApplyOutcome::Duplicate
+        );
+        let mut out = vec![(tid, outcome)];
+        if resolved {
+            // Transactions queued behind this split can proceed now.
+            out.extend(self.retry_pending_repair_txns());
+        }
+        out
     }
 
     /// Giant-split marker transactions currently held awaiting their bulk blob
@@ -907,22 +1138,52 @@ impl ReplicaWorld {
     /// The canonical topology hash of the whole replica — the value that must
     /// equal the server's `world_hash()` at quiescence.
     pub fn world_hash(&self) -> Hash32 {
-        let volumes: Vec<CanonicalVolume> = self
-            .volumes
-            .values()
-            .map(|v| canonical_logical_volume(v, self.evicted(v.id()), self.owner[&v.id().get()]))
+        let mut caches = self
+            .hash_caches
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // A removed body's cache would otherwise live as long as the replica.
+        caches.retain(|id, _| self.volumes.contains_key(id));
+        let mut chunked: Vec<(
+            spall_protocol::HashedVolume,
+            Vec<(spall_protocol::ChunkKey, Hash32)>,
+        )> = Vec::with_capacity(self.volumes.len());
+        for v in self.volumes.values() {
+            let cache = caches.entry(v.id().get()).or_default();
+            spall_sim::world::refresh_logical_chunk_digests(cache, v, self.evicted(v.id()))
+                .expect("logical volume: resident/evicted digest invariant holds");
+            chunked.push((
+                spall_protocol::HashedVolume {
+                    volume_id: v.id(),
+                    cell_size: v.cell_size(),
+                    owner: self.owner[&v.id().get()],
+                },
+                cache.chunks(),
+            ));
+        }
+        let borrowed: Vec<_> = chunked
+            .iter()
+            .map(|(volume, chunks)| (*volume, chunks.as_slice()))
             .collect();
-        canonical_topology_hash(&volumes)
+        spall_protocol::topology_hash_from_chunks(&borrowed)
     }
 
     /// The canonical hash of one volume.
     pub fn volume_hash(&self, volume: VolumeId) -> Option<Hash32> {
         let v = self.volumes.get(&volume.get())?;
-        Some(canonical_topology_hash(&[canonical_logical_volume(
-            v,
-            self.evicted(volume),
-            self.owner[&volume.get()],
-        )]))
+        let mut caches = self
+            .hash_caches
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Some(
+            spall_sim::world::logical_volume_topology_hash_cached(
+                caches.entry(volume.get()).or_default(),
+                v,
+                self.evicted(volume),
+                self.owner[&volume.get()],
+            )
+            .expect("logical volume: resident/evicted digest invariant holds"),
+        )
     }
 
     /// The terrain volume id.
@@ -941,6 +1202,15 @@ impl ReplicaWorld {
         self.now_tick
     }
 
+    /// Advances the observed server tick from a record that carries one but is
+    /// not otherwise applied here (e.g. a water frame). A client whose interest
+    /// sees few transactions or body snapshots would otherwise never let a
+    /// repair cooldown expire, so a request the server dropped under its
+    /// per-tick repair limit would never be re-sent.
+    pub fn observe_server_tick(&mut self, tick: u64) {
+        self.now_tick = self.now_tick.max(tick);
+    }
+
     /// Fractional server tick to hand [`Self::interpolated_pose`] for a frame
     /// drawn at `now`. Unlike [`Self::now_tick`] (which only moves when a
     /// snapshot lands, so sampling it makes bodies advance in snapshot-sized
@@ -954,6 +1224,16 @@ impl ReplicaWorld {
 
     /// The live terrain volume, for building a client-side collision world (T19
     /// prediction). `None` before a baseline is installed.
+    /// Diagnostic: writes the terrain's logical brick listing (see
+    /// `spall_voxel::write_logical_brick_listing`).
+    pub fn dump_terrain_listing(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let volume = self
+            .volumes
+            .get(&self.terrain_id.get())
+            .ok_or_else(|| std::io::Error::other("no terrain volume"))?;
+        spall_voxel::write_logical_brick_listing(path, volume, self.evicted(self.terrain_id))
+    }
+
     pub fn terrain_volume(&self) -> Option<&Volume> {
         self.volumes.get(&self.terrain_id.get())
     }
@@ -1039,9 +1319,19 @@ impl ReplicaWorld {
     pub fn terrain_resident_hash(&self) -> Option<Hash32> {
         let volume = self.volume(self.terrain_id)?;
         let owner = *self.owner.get(&self.terrain_id.get())?;
-        Some(canonical_topology_hash(&[canonical_resident_volume(
-            volume, owner,
-        )]))
+        let mut cache = self
+            .resident_hash_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Some(
+            spall_sim::world::logical_volume_topology_hash_cached(
+                &mut cache,
+                volume,
+                empty_evicted(),
+                owner,
+            )
+            .expect("a volume with no retained digests has no resident/evicted conflict"),
+        )
     }
 
     /// Whether a transaction id has already been applied.
@@ -1104,6 +1394,51 @@ impl ReplicaWorld {
             };
         }
 
+        // The distant terrain catalogue is still arriving: a transaction may
+        // touch a brick whose digest is not known yet, and its result hash covers
+        // the whole logical volume. Hold it, in order, for the catalogue.
+        if self.catalogue_pending.is_some() {
+            if self
+                .catalogue_deferred
+                .iter()
+                .any(|held| held.transaction_id == tx.transaction_id)
+            {
+                return ApplyOutcome::Duplicate;
+            }
+            if self.catalogue_deferred.len() >= self.config.max_catalogue_deferred_txns {
+                return ApplyOutcome::Rejected {
+                    reason: format!(
+                        "{} transactions are waiting for the terrain catalogue; the bound is {}",
+                        self.catalogue_deferred.len(),
+                        self.config.max_catalogue_deferred_txns
+                    ),
+                };
+            }
+            self.catalogue_deferred.push(tx.clone());
+            return ApplyOutcome::NeedsRepair(Vec::new());
+        }
+
+        // A declared result hash covers the whole volume, so it includes the
+        // effect of every earlier transaction on that volume. While one of those
+        // is still held for a repair or a bulk blob, this transaction cannot be
+        // validated or applied on its own: queue it behind its predecessors,
+        // which retry in id order.
+        if self.has_held_predecessor(tx) {
+            if let Err(reason) = self.retain_pending_repair_txn(tx.clone()) {
+                return ApplyOutcome::Rejected { reason };
+            }
+            // The transaction waits its turn to apply, but the bricks it needs are known now:
+            // ask for the evicted ones at once. Left to its turn, each held transaction cost a
+            // full repair round trip in series, so a client on a slow link followed about one
+            // distant edit a second however much bandwidth it had.
+            let fresh: Vec<RepairRequest> = self
+                .evicted_brick_requests(tx)
+                .into_iter()
+                .filter(|r| self.should_request_repair(&r.key))
+                .collect();
+            return ApplyOutcome::NeedsRepair(fresh);
+        }
+
         // T17 increment 2: a giant-split marker transaction carries no geometry
         // inline — its child volumes and source patch are in an out-of-band
         // `BaselineWorld` delivered on a bulk stream under `transfer_id`. Hold
@@ -1115,20 +1450,103 @@ impl ReplicaWorld {
             return ApplyOutcome::AwaitingBulkSplit { transfer_id };
         }
 
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let ops: Vec<&str> = tx
+                .ops
+                .iter()
+                .map(|op| match op {
+                    TopologyOp::IntegerBrush { .. } => "brush",
+                    TopologyOp::CellRun { .. } => "cells",
+                    TopologyOp::SplitOff { .. } => "split",
+                    TopologyOp::SplitOffBaseline { .. } => "split-baseline",
+                    TopologyOp::SourcePatchBaseline { .. } => "patch-baseline",
+                    TopologyOp::SplitOffBulkBaseline { .. } => "split-bulk",
+                    TopologyOp::SourcePatchBulkBaseline { .. } => "patch-bulk",
+                })
+                .collect();
+            let before: Vec<String> = tx
+                .before
+                .iter()
+                .map(|br| {
+                    let local = match self
+                        .volumes
+                        .get(&br.volume.get())
+                        .and_then(|v| v.brick_revision(br.coord).ok().flatten())
+                    {
+                        Some(rev) => format!("resident {rev:?}"),
+                        None => match self
+                            .evicted
+                            .get(&br.volume.get())
+                            .and_then(|e| e.get(br.coord))
+                        {
+                            Some(digest) => format!("digest {digest:?}"),
+                            None => "absent".into(),
+                        },
+                    };
+                    format!("{:?}@{:?} local={local}", br.coord, br.revision)
+                })
+                .collect();
+            tracing::debug!(
+                tx = tx.transaction_id.get(),
+                tick = tx.server_tick.get(),
+                ?ops,
+                ?before,
+                "applying topology transaction"
+            );
+        }
+
         // 1. Every `before` revision must match the live replica exactly. A
         //    `before` entry of `Revision::ZERO` means the brick was absent
         //    server-side, so an absent replica brick is a match.
+        // The hash fields of a brick `RepairRequest` are unused by the server
+        // (it answers from the key alone) and stay zero, like the residency
+        // pass's requests. Hashing the whole logical volume per request cost
+        // hundreds of milliseconds on a full-size world, on every retry.
         let mut repairs = Vec::new();
         let mut ahead = false;
         let mut exact = 0usize;
+        // Resident bricks whose revision matches `before` exactly.
+        let mut exact_resident = Vec::new();
         for br in &tx.before {
             let current = self
                 .volumes
                 .get(&br.volume.get())
                 .and_then(|v| v.brick_revision(br.coord).ok().flatten());
+            // A brick this replica has evicted is *not* absent: its geometry is
+            // needed to replay the edit even when its digest revision matches
+            // (an unedited terrain brick is `Revision::ZERO`, the same value an
+            // absent brick reports). Replaying onto a missing brick would carve
+            // air instead of the real cells, so it must be repaired first.
+            let evicted_digest = if current.is_none() {
+                self.evicted
+                    .get(&br.volume.get())
+                    .and_then(|e| e.get(br.coord))
+            } else {
+                None
+            };
+            if let Some(digest) = evicted_digest {
+                if digest.revision > br.revision {
+                    ahead = true;
+                } else {
+                    repairs.push(RepairRequest {
+                        key: RepairKey::Brick {
+                            volume: br.volume,
+                            coord: br.coord,
+                        },
+                        expected_revision: br.revision,
+                        current_revision: digest.revision,
+                        expected_hash: Hash32::ZERO,
+                        current_hash: Hash32::ZERO,
+                    });
+                }
+                continue;
+            }
             let have = current.unwrap_or(Revision::ZERO);
             if have == br.revision {
                 exact += 1;
+                if current.is_some() {
+                    exact_resident.push((br, have));
+                }
                 continue; // exact match (incl. absent == Revision::ZERO)
             }
             if have > br.revision {
@@ -1146,17 +1564,52 @@ impl ReplicaWorld {
                 expected_revision: br.revision,
                 current_revision: have,
                 expected_hash: Hash32::ZERO,
-                current_hash: self.volume_hash(br.volume).unwrap_or(Hash32::ZERO),
+                current_hash: Hash32::ZERO,
             });
         }
+        if ahead && repairs.is_empty() && !exact_resident.is_empty() {
+            // Mixed: a patch already moved some bricks to the server's current
+            // state, which already includes this transaction, while others
+            // still sit at `before`. Replaying the ops would re-apply them on
+            // top of the patched bricks, and the declared result can no longer
+            // be checked against a replica that is partly ahead. Bring the
+            // remaining bricks up to the server's state too; once every brick
+            // is ahead the transaction is recognised as already incorporated.
+            for (br, have) in exact_resident.drain(..) {
+                exact -= 1;
+                repairs.push(RepairRequest {
+                    key: RepairKey::Brick {
+                        volume: br.volume,
+                        coord: br.coord,
+                    },
+                    expected_revision: br.revision,
+                    current_revision: have,
+                    expected_hash: Hash32::ZERO,
+                    current_hash: Hash32::ZERO,
+                });
+            }
+        }
+        // Set when every brick is already past this transaction but it still
+        // creates body volumes: only those are replayed (see below).
+        let mut children_only = false;
         if ahead && exact == 0 && repairs.is_empty() {
             // Every brick this transaction references is *strictly past* it — a
             // later baseline / repair patch already incorporated the whole
-            // transaction. Record it applied and drop any pending hold so the
-            // replica does not loop re-requesting a repair it cannot use.
-            self.applied_tx.insert(tx.transaction_id.get());
-            self.pending_repair_txns.remove(&tx.transaction_id.get());
-            return ApplyOutcome::Duplicate;
+            // transaction's effect on existing volumes. A patch carries bricks,
+            // not the detached bodies the transaction created, so those volumes
+            // must still be built from the transaction's own ops.
+            let missing_children = split_child_ids(&tx.ops)
+                .into_iter()
+                .any(|child| !self.volumes.contains_key(&child));
+            if missing_children {
+                children_only = true;
+            } else {
+                // Record it applied and drop any pending hold so the replica
+                // does not loop re-requesting a repair it cannot use.
+                self.applied_tx.insert(tx.transaction_id.get());
+                self.pending_repair_txns.remove(&tx.transaction_id.get());
+                return ApplyOutcome::Duplicate;
+            }
         }
         if !repairs.is_empty() {
             // ENG-49: hold the whole transaction for retry once the gap is
@@ -1166,7 +1619,9 @@ impl ReplicaWorld {
             // `RepairRequest`s: a key already asked about within the cooldown is
             // not re-requested (`docs/protocol.md`: a `before` gap "raises a
             // rate-limited `RepairRequest`").
-            self.retain_pending_repair_txn(tx.clone());
+            if let Err(reason) = self.retain_pending_repair_txn(tx.clone()) {
+                return ApplyOutcome::Rejected { reason };
+            }
             let fresh: Vec<RepairRequest> = repairs
                 .into_iter()
                 .filter(|r| self.should_request_repair(&r.key))
@@ -1190,12 +1645,42 @@ impl ReplicaWorld {
             .iter()
             .find_map(|op| op.bulk_transfer_id())
             .and_then(|tid| self.bulk_split_worlds.get(&tid));
-        if let Err(reason) = replay_ops(&tx.ops, &mut candidate, &mut new_owner, cell_size, bulk) {
+        let child_ops;
+        let ops: &[TopologyOp] = if children_only {
+            child_ops = split_child_ops(&tx.ops);
+            &child_ops
+        } else {
+            &tx.ops
+        };
+        let newer_only = children_only.then_some(&self.evicted);
+        if let Err(reason) = replay_ops(
+            ops,
+            &mut candidate,
+            &mut new_owner,
+            cell_size,
+            bulk,
+            newer_only,
+        ) {
             return ApplyOutcome::Rejected { reason };
+        }
+        // Source baseline patches can restore distant geometry without naming
+        // every restored brick in `before`. Stage its superseded digest removal
+        // alongside geometry, before hashing, while leaving live state intact
+        // if any declared result fails validation.
+        let mut candidate_evicted = self.evicted.clone();
+        for (vid, ev) in &mut candidate_evicted {
+            if let Some(v) = candidate.get(vid) {
+                ev.drop_resident(v);
+            }
         }
 
         // 3. Every declared result hash must match the candidate.
         for vh in &tx.result_hashes {
+            // Existing volumes are already past this transaction, so only the
+            // volumes it created can be checked against its declared result.
+            if children_only && !new_owner.iter().any(|(v, _)| *v == vh.volume) {
+                continue;
+            }
             let owner = self.owner.get(&vh.volume.get()).copied().or_else(|| {
                 new_owner
                     .iter()
@@ -1215,35 +1700,90 @@ impl ReplicaWorld {
             // Over the logical brick set: an untouched brick this replica has
             // evicted still contributes its retained digest, so a server /
             // client cache-placement difference does not fail validation. The
-            // replay above never wrote an evicted brick (a `before` naming one
-            // takes the repair path first).
-            if canonical_topology_hash(&[canonical_logical_volume(
-                v,
-                self.evicted(vh.volume),
-                owner,
-            )]) != vh.hash
-            {
-                return ApplyOutcome::Rejected {
-                    reason: format!("result hash mismatch for volume {}", vh.volume),
-                };
+            // A source patch's restored geometry supersedes its staged digest.
+            let candidate_hash = {
+                let mut caches = self
+                    .hash_caches
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                spall_sim::world::logical_volume_topology_hash_cached(
+                    caches.entry(vh.volume.get()).or_default(),
+                    v,
+                    candidate_evicted
+                        .get(&vh.volume.get())
+                        .unwrap_or_else(|| empty_evicted()),
+                    owner,
+                )
+                .expect("logical volume: resident/evicted digest invariant holds")
+            };
+            if candidate_hash != vh.hash {
+                let detail = format!(
+                    "result hash mismatch for volume {} (tx {} tick {}: {} ops, {} before, {} evicted bricks in volume)",
+                    vh.volume,
+                    tx.transaction_id.get(),
+                    tx.server_tick.get(),
+                    tx.ops.len(),
+                    tx.before.len(),
+                    self.evicted.get(&vh.volume.get()).map_or(0, |e| e.len()),
+                );
+                // The declared hash covers the whole volume, so it also covers bricks this
+                // transaction did not touch. A repair patch may already have carried one of
+                // those to a later server state than this (older, held) transaction expects,
+                // and then no replay of this transaction can reproduce its hash. Dropping the
+                // transaction would lose its own edit for good: nothing re-fetches bricks that
+                // look current. Fetch the bricks it touched instead; the server answers with
+                // its current state, which already includes this transaction, and a retry then
+                // recognises the transaction as incorporated. Loud, bounded by the repair
+                // cooldown, and the end-of-run hash comparison remains the arbiter. (A stale
+                // cached digest is excluded by the randomized cached-versus-reference tests, not
+                // re-checked here: a from-scratch rehash per retry costs a whole-world hash.)
+                // Only for a volume the replica already held: a volume this transaction creates
+                // carries all of its own data, so a mismatch there is corruption, not state that a
+                // repair patch moved on.
+                if !tx.before.is_empty() && self.volumes.contains_key(&vh.volume.get()) {
+                    let requests: Vec<RepairRequest> = tx
+                        .before
+                        .iter()
+                        .map(|br| RepairRequest {
+                            key: RepairKey::Brick {
+                                volume: br.volume,
+                                coord: br.coord,
+                            },
+                            expected_revision: br.revision,
+                            current_revision: self
+                                .volumes
+                                .get(&br.volume.get())
+                                .and_then(|vol| vol.brick_revision(br.coord).ok().flatten())
+                                .unwrap_or(Revision::ZERO),
+                            expected_hash: Hash32::ZERO,
+                            current_hash: Hash32::ZERO,
+                        })
+                        .collect();
+                    if let Err(reason) = self.retain_pending_repair_txn(tx.clone()) {
+                        return ApplyOutcome::Rejected { reason };
+                    }
+                    let fresh: Vec<RepairRequest> = requests
+                        .into_iter()
+                        .filter(|r| self.should_request_repair(&r.key))
+                        .collect();
+                    if !fresh.is_empty() {
+                        tracing::warn!(
+                            reason = %detail,
+                            "result hash mismatch; repairing the transaction's bricks instead of dropping it"
+                        );
+                    }
+                    return ApplyOutcome::NeedsRepair(fresh);
+                }
+                return ApplyOutcome::Rejected { reason: detail };
             }
         }
 
         // 4. Commit the candidate. Nothing above mutated live state.
-        let terrain_touched = tx
-            .ops
+        let terrain_touched = ops
             .iter()
             .any(|op| topology_op_touches_volume(op, self.terrain_id));
         self.volumes = candidate;
-        // slice E: a committed op that wrote into a brick this replica had
-        // evicted (its `before` gap was healed by a repair patch just before
-        // this retry) makes that brick resident again — its retained digest is
-        // superseded by the committed geometry.
-        for (vid, ev) in self.evicted.iter_mut() {
-            if let Some(v) = self.volumes.get(vid) {
-                ev.drop_resident(v);
-            }
-        }
+        self.evicted = candidate_evicted;
         for (vid, entity) in &new_owner {
             self.owner.insert(vid.get(), CanonicalOwner::Body(*entity));
             self.volume_of_entity.insert(entity.get(), vid.get());
@@ -1445,14 +1985,66 @@ impl ReplicaWorld {
     /// `config.max_pending_repair_txns` the lowest-id (oldest) hold is evicted;
     /// the server re-delivers it on the control stream or a fresher baseline
     /// covers it.
-    fn retain_pending_repair_txn(&mut self, tx: TopologyTransaction) {
-        self.pending_repair_txns.insert(tx.transaction_id.get(), tx);
-        while self.pending_repair_txns.len() > self.config.max_pending_repair_txns {
-            let Some((&oldest, _)) = self.pending_repair_txns.iter().next() else {
-                break;
-            };
-            self.pending_repair_txns.remove(&oldest);
+    /// Whether an earlier transaction that declares a result for one of `tx`'s
+    /// volumes is still held awaiting a repair or a bulk blob.
+    /// Repair requests for the bricks `tx` references that this replica holds only as a retained
+    /// digest at a revision the transaction does not already supersede: their geometry is needed
+    /// to replay the edit whatever happens to earlier transactions.
+    fn evicted_brick_requests(&self, tx: &TopologyTransaction) -> Vec<RepairRequest> {
+        tx.before
+            .iter()
+            .filter_map(|br| {
+                let resident = self
+                    .volumes
+                    .get(&br.volume.get())
+                    .and_then(|v| v.brick_revision(br.coord).ok().flatten());
+                if resident.is_some() {
+                    return None;
+                }
+                let digest = self.evicted.get(&br.volume.get())?.get(br.coord)?;
+                (digest.revision <= br.revision).then_some(RepairRequest {
+                    key: RepairKey::Brick {
+                        volume: br.volume,
+                        coord: br.coord,
+                    },
+                    expected_revision: br.revision,
+                    current_revision: digest.revision,
+                    expected_hash: Hash32::ZERO,
+                    current_hash: Hash32::ZERO,
+                })
+            })
+            .collect()
+    }
+
+    fn has_held_predecessor(&self, tx: &TopologyTransaction) -> bool {
+        let id = tx.transaction_id.get();
+        let blocks = |held: &TopologyTransaction| {
+            held.transaction_id.get() < id
+                && held
+                    .result_hashes
+                    .iter()
+                    .any(|h| tx.result_hashes.iter().any(|t| t.volume == h.volume))
+        };
+        self.pending_repair_txns.values().any(blocks)
+            || self.pending_bulk_split_txns.values().any(blocks)
+    }
+
+    fn retain_pending_repair_txn(&mut self, tx: TopologyTransaction) -> Result<(), String> {
+        let id = tx.transaction_id.get();
+        if !self.pending_repair_txns.contains_key(&id)
+            && self.pending_repair_txns.len() >= self.config.max_pending_repair_txns
+        {
+            // Evicting the oldest hold would lose a committed transaction whose repair request
+            // may have been throttled, and nothing would ever re-request its bricks: the replica
+            // would end on a different state with no error. Refuse loudly instead.
+            return Err(format!(
+                "{} transactions are waiting for repair patches; the bound is {}",
+                self.pending_repair_txns.len(),
+                self.config.max_pending_repair_txns
+            ));
         }
+        self.pending_repair_txns.insert(id, tx);
+        Ok(())
     }
 
     /// ENG-49: `true` if a `RepairRequest` for `key` should be emitted now —
@@ -1463,14 +2055,23 @@ impl ReplicaWorld {
             return true;
         };
         let k = (volume.get(), coord.x, coord.y, coord.z);
-        let due = match self.repair_requests_inflight.get(&k) {
-            Some(&sent) => {
-                self.now_tick.saturating_sub(sent) >= self.config.repair_request_cooldown_ticks
+        // Each unanswered request doubles the wait before the next (up to eight times the
+        // base, four seconds at the server's tick rate, which the server's run-end grace covers): on a slow link a reply legitimately takes seconds, and re-asking every base
+        // interval filled the link with duplicate patches that delayed the replies further.
+        // `repeats` counts the times this key was already asked again.
+        let (due, repeats) = match self.repair_requests_inflight.get(&k) {
+            Some(&(sent, repeats)) => {
+                let wait = self.config.repair_request_cooldown_ticks << repeats.min(3);
+                (
+                    self.now_tick.saturating_sub(sent) >= wait,
+                    repeats.saturating_add(1),
+                )
             }
-            None => true,
+            None => (true, 0),
         };
         if due {
-            self.repair_requests_inflight.insert(k, self.now_tick);
+            self.repair_requests_inflight
+                .insert(k, (self.now_tick, repeats));
         }
         due
     }
@@ -1512,6 +2113,7 @@ fn replay_ops(
     new_owner: &mut Vec<(VolumeId, EntityId)>,
     cell_size: CellSizeCode,
     bulk: Option<&spall_protocol::baseline::BaselineWorld>,
+    newer_only: Option<&BTreeMap<u64, spall_voxel::EvictedBricks>>,
 ) -> Result<(), String> {
     // T17 increment 2: the out-of-band `BaselineVolume` for one volume of a
     // giant bulk split.
@@ -1604,16 +2206,51 @@ fn replay_ops(
                 flush(pending.take(), candidate, cell_size)?;
                 let bv = BaselineVolume::decode_compressed(blob)
                     .map_err(|e| format!("source patch baseline blob for volume {source}: {e}"))?;
-                patch_split_source(candidate, *source, &bv)?;
+                patch_split_source(candidate, *source, &bv, newer_only)?;
             }
             TopologyOp::SourcePatchBulkBaseline { source, .. } => {
                 flush(pending.take(), candidate, cell_size)?;
                 let bv = bulk_volume(*source)?;
-                patch_split_source(candidate, *source, bv)?;
+                patch_split_source(candidate, *source, bv, newer_only)?;
             }
         }
     }
     flush(pending.take(), candidate, cell_size)
+}
+
+/// The volumes a transaction's split ops create.
+fn split_child_ids(ops: &[TopologyOp]) -> Vec<u64> {
+    ops.iter()
+        .filter_map(|op| match op {
+            TopologyOp::SplitOff { child, .. }
+            | TopologyOp::SplitOffBaseline { child, .. }
+            | TopologyOp::SplitOffBulkBaseline { child, .. } => Some(child.get()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ops that build a transaction's new child volumes, plus the source-side
+/// baseline patches (applied only where newer): the split markers, the fill runs
+/// addressed to a child, and the patches that rewrite the source bricks beyond
+/// the transaction's `before` set. A child's cells come from the transaction
+/// itself, never from the source volume's current state. Inline brush and
+/// source-removal runs are left out: their bricks are in `before` and already
+/// past this transaction.
+fn split_child_ops(ops: &[TopologyOp]) -> Vec<TopologyOp> {
+    let children = split_child_ids(ops);
+    ops.iter()
+        .filter(|op| match op {
+            TopologyOp::SplitOff { .. }
+            | TopologyOp::SplitOffBaseline { .. }
+            | TopologyOp::SplitOffBulkBaseline { .. }
+            | TopologyOp::SourcePatchBaseline { .. }
+            | TopologyOp::SourcePatchBulkBaseline { .. } => true,
+            TopologyOp::CellRun { volume, .. } => children.contains(&volume.get()),
+            _ => false,
+        })
+        .cloned()
+        .collect()
 }
 
 /// Insert a split child `Volume` (rebuilt from a `BaselineVolume`) into the
@@ -1633,15 +2270,33 @@ fn install_split_child(
 
 /// Overwrite a split source's affected bricks in the candidate from a
 /// `BaselineVolume`.
+///
+/// With `newer_only`, a brick is replaced only when the patch's revision is
+/// newer than what the replica holds (resident, or retained as a digest). Used
+/// when an earlier repair patch already carried some bricks to the server's
+/// current state, which must not be rolled back.
 fn patch_split_source(
     candidate: &mut BTreeMap<u64, Volume>,
     source: VolumeId,
     bv: &BaselineVolume,
+    newer_only: Option<&BTreeMap<u64, spall_voxel::EvictedBricks>>,
 ) -> Result<(), String> {
     let volume = candidate
         .get_mut(&source.get())
         .ok_or_else(|| format!("source patch targets unknown volume {source}"))?;
     for bb in &bv.bricks {
+        let coord = BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]);
+        if let Some(evicted) = newer_only {
+            let held = volume.brick_revision(coord).ok().flatten().or_else(|| {
+                evicted
+                    .get(&source.get())
+                    .and_then(|e| e.get(coord))
+                    .map(|d| d.revision)
+            });
+            if held.is_some_and(|rev| rev >= Revision(bb.revision)) {
+                continue;
+            }
+        }
         volume
             .insert_brick(
                 BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
@@ -1728,6 +2383,9 @@ fn baseline_brick(bb: &BaselineBrick) -> Result<Brick, String> {
         ));
     }
     let cells: Vec<MaterialId> = match &bb.cells {
+        BaselineCells::Digest { .. } => {
+            return Err("digest requires staged regional baseline".into());
+        }
         BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
         BaselineCells::Dense(raw) => {
             if raw.len() != spall_core::CELLS_PER_BRICK {
@@ -1781,64 +2439,6 @@ fn volume_from_baseline_volume(bv: &BaselineVolume) -> Result<Volume, String> {
 fn empty_evicted() -> &'static spall_voxel::EvictedBricks {
     static EMPTY: std::sync::OnceLock<spall_voxel::EvictedBricks> = std::sync::OnceLock::new();
     EMPTY.get_or_init(spall_voxel::EvictedBricks::new)
-}
-
-/// The canonical `spall.topology.v1` record for `v` over its **logical** brick
-/// set: `v`'s resident bricks plus `evicted`'s retained digests, each key once,
-/// canonical `(z, y, x)` order. Byte-identical to a resident-only walk when
-/// `evicted` is empty, and to the pre-eviction full volume for any subset of
-/// clean bricks moved into it — so `world_hash` never moves when cache contents
-/// differ. Mirrors `spall_sim::canonical_logical_volume_for`.
-fn canonical_logical_volume(
-    v: &Volume,
-    evicted: &spall_voxel::EvictedBricks,
-    owner: CanonicalOwner,
-) -> CanonicalVolume {
-    let bricks = spall_voxel::logical_bricks(v, evicted)
-        .expect("logical volume: resident/evicted digest invariant holds")
-        .into_iter()
-        .map(|b| CanonicalBrick {
-            coord: b.coord,
-            revision: b.revision,
-            layers: vec![CanonicalLayer {
-                kind: MATERIAL_LAYER_KIND,
-                bytes: BrickHash::to_bytes(b.content_hash).to_vec(),
-            }],
-        })
-        .collect();
-    CanonicalVolume {
-        volume_id: v.id(),
-        cell_size: v.cell_size(),
-        owner,
-        bricks,
-    }
-}
-
-fn canonical_resident_volume(v: &Volume, owner: CanonicalOwner) -> CanonicalVolume {
-    let bricks = v
-        .resident_brick_coords()
-        .into_iter()
-        .filter_map(|coord| {
-            v.snapshot_brick(coord)
-                .ok()
-                .flatten()
-                .map(|snap| (coord, snap))
-        })
-        .map(|(coord, snap)| CanonicalBrick {
-            coord,
-            revision: snap.revision(),
-            layers: vec![CanonicalLayer {
-                kind: MATERIAL_LAYER_KIND,
-                bytes: BrickHash::to_bytes(snap.content_hash()).to_vec(),
-            }],
-        })
-        .collect();
-    CanonicalVolume {
-        volume_id: v.id(),
-        cell_size: v.cell_size(),
-        owner,
-        bricks,
-    }
 }
 
 fn solid_cells(v: &Volume) -> u64 {
@@ -2181,12 +2781,24 @@ mod tests {
                 }],
                 result_hashes: vec![],
             };
-            let _ = replica.apply_transaction(&tx);
+            let outcome = replica.apply_transaction(&tx);
+            if id <= 3 {
+                assert!(matches!(outcome, ApplyOutcome::NeedsRepair(_)));
+            } else {
+                assert!(
+                    matches!(outcome, ApplyOutcome::Rejected { .. }),
+                    "a transaction that cannot be held is refused, not silently dropped: {outcome:?}"
+                );
+            }
         }
         assert_eq!(
             replica.pending_repair_txn_count(),
             3,
             "the retained-transaction set never grows past its bound"
+        );
+        assert!(
+            (1..=3).all(|id| replica.is_held(TransactionId::new(id).unwrap())),
+            "the oldest holds are kept, not evicted"
         );
     }
 
@@ -2219,6 +2831,579 @@ mod tests {
         again.control_seq = spall_protocol::ControlSeq(2);
         assert_eq!(replica.apply_transaction(&again), ApplyOutcome::Duplicate);
         assert_eq!(replica.world_hash(), after_first);
+    }
+
+    #[test]
+    fn source_patch_stages_restored_digests_before_hash_validation() {
+        use spall_protocol::{BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume};
+        let volume_id = VolumeId::new(1).unwrap();
+        let coord = BrickCoord::new(41, 2, 1);
+        let mut volume = terrain();
+        volume
+            .insert_brick(
+                coord,
+                Brick::restored_uniform(MaterialId(2), Revision(3), false),
+            )
+            .unwrap();
+        for bulk in [false, true] {
+            let mut volume = volume.clone();
+            let mut replica = ReplicaWorld::from_baseline(volume.clone(), ReplicaConfig::default());
+            assert!(replica.evict_brick(volume_id, coord));
+            let before = replica.world_hash();
+            let generation = replica.terrain_generation();
+            volume
+                .insert_brick(
+                    coord,
+                    Brick::restored_uniform(MaterialId::AIR, Revision(4), true),
+                )
+                .unwrap();
+            let expected = ReplicaWorld::from_baseline(volume, ReplicaConfig::default());
+            let patch = BaselineVolume {
+                volume_id,
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner: BaselineOwner::Terrain,
+                bounds: None,
+                bricks: vec![BaselineBrick {
+                    coord: [41, 2, 1],
+                    revision: 4,
+                    edited: true,
+                    cells: BaselineCells::Uniform(MaterialId::AIR.0),
+                }],
+            };
+            let mut tx = TopologyTransaction {
+                transaction_id: TransactionId::new(77).unwrap(),
+                server_tick: Tick(4),
+                control_seq: spall_protocol::ControlSeq(1),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![],
+                after: vec![],
+                ops: vec![TopologyOp::SourcePatchBaseline {
+                    source: volume_id,
+                    blob: patch.encode_compressed(),
+                }],
+                result_hashes: vec![spall_protocol::VolumeHash {
+                    volume: volume_id,
+                    hash: Hash32::ZERO,
+                }],
+            };
+            if bulk {
+                tx.ops = vec![TopologyOp::SourcePatchBulkBaseline {
+                    source: volume_id,
+                    transfer_id: 88,
+                }];
+                replica.provide_bulk_split_world(
+                    88,
+                    spall_protocol::BaselineWorld {
+                        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+                        checkpoint_tick: 4,
+                        volumes: vec![patch],
+                    },
+                );
+            }
+            assert!(matches!(
+                replica.apply_transaction(&tx),
+                ApplyOutcome::Rejected { .. }
+            ));
+            assert_eq!(replica.world_hash(), before);
+            assert_eq!(replica.terrain_generation(), generation);
+            assert!(replica.evicted(volume_id).contains(coord));
+            assert!(
+                replica
+                    .volume(volume_id)
+                    .unwrap()
+                    .snapshot_brick(coord)
+                    .unwrap()
+                    .is_none()
+            );
+            tx.result_hashes[0].hash = expected.volume_hash(volume_id).unwrap();
+            assert!(matches!(
+                replica.apply_transaction(&tx),
+                ApplyOutcome::Published { .. }
+            ));
+            assert_eq!(replica.world_hash(), expected.world_hash());
+            assert!(!replica.evicted(volume_id).contains(coord));
+            assert!(replica.terrain_generation() > generation);
+            assert!(matches!(
+                replica.apply_transaction(&tx),
+                ApplyOutcome::Duplicate
+            ));
+        }
+    }
+
+    #[test]
+    fn an_evicted_unedited_brick_is_repaired_not_replayed_as_absent() {
+        // An unedited terrain brick is `Revision::ZERO` -- the value an absent
+        // brick reports -- so a digest-only brick whose revision equals the
+        // transaction's `before` must still be restored before replay.
+        let volume_id = VolumeId::new(1).unwrap();
+        let coord = BrickCoord::new(41, 2, 1);
+        let mut volume = terrain();
+        volume
+            .insert_brick(
+                coord,
+                Brick::restored_uniform(MaterialId(2), Revision(0), false),
+            )
+            .unwrap();
+        let mut replica = ReplicaWorld::from_baseline(volume, ReplicaConfig::default());
+        assert!(replica.evict_brick(volume_id, coord));
+        let before = replica.world_hash();
+        let cell = GlobalCell::new(41 * 32, 2 * 32, 32);
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(5).unwrap(),
+            server_tick: Tick(9),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![spall_protocol::BrickRevision {
+                volume: volume_id,
+                coord,
+                revision: Revision(0),
+            }],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: volume_id,
+                start: cell,
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        };
+        match replica.apply_transaction(&tx) {
+            ApplyOutcome::NeedsRepair(requests) => {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(
+                    requests[0].key,
+                    RepairKey::Brick {
+                        volume: volume_id,
+                        coord
+                    }
+                );
+            }
+            other => panic!("expected a repair request, got {other:?}"),
+        }
+        assert_eq!(replica.world_hash(), before);
+        assert!(replica.evicted(volume_id).contains(coord));
+
+        // The request is rate-limited, but a client that only learns the server
+        // tick from other records must still be able to ask again.
+        match replica.apply_transaction(&tx) {
+            ApplyOutcome::NeedsRepair(requests) => assert!(requests.is_empty()),
+            other => panic!("expected a held transaction, got {other:?}"),
+        }
+        replica.observe_server_tick(9 + ReplicaConfig::default().repair_request_cooldown_ticks);
+        match replica.apply_transaction(&tx) {
+            ApplyOutcome::NeedsRepair(requests) => assert_eq!(requests.len(), 1),
+            other => panic!("expected a repeated repair request, got {other:?}"),
+        }
+    }
+
+    /// A transaction held behind an earlier held one asks for its own evicted bricks at once
+    /// instead of waiting for its turn, so the repairs are in flight together.
+    #[test]
+    fn a_transaction_held_behind_another_requests_its_evicted_bricks_immediately() {
+        let volume_id = VolumeId::new(1).unwrap();
+        let (first, second) = (BrickCoord::new(41, 2, 1), BrickCoord::new(43, 2, 1));
+        let mut volume = terrain();
+        for coord in [first, second] {
+            volume
+                .insert_brick(
+                    coord,
+                    Brick::restored_uniform(MaterialId(2), Revision(0), false),
+                )
+                .unwrap();
+        }
+        let mut replica = ReplicaWorld::from_baseline(volume, ReplicaConfig::default());
+        assert!(replica.evict_brick(volume_id, first));
+        assert!(replica.evict_brick(volume_id, second));
+        let tx = |id: u64, coord: BrickCoord| TopologyTransaction {
+            transaction_id: TransactionId::new(id).unwrap(),
+            server_tick: Tick(id),
+            control_seq: spall_protocol::ControlSeq(id),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![spall_protocol::BrickRevision {
+                volume: volume_id,
+                coord,
+                revision: Revision(0),
+            }],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: volume_id,
+                start: GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32),
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![spall_protocol::VolumeHash {
+                volume: volume_id,
+                hash: Hash32::ZERO,
+            }],
+        };
+        let keys = |outcome: ApplyOutcome| match outcome {
+            ApplyOutcome::NeedsRepair(requests) => {
+                requests.into_iter().map(|r| r.key).collect::<Vec<_>>()
+            }
+            other => panic!("expected a repair request, got {other:?}"),
+        };
+        assert_eq!(
+            keys(replica.apply_transaction(&tx(1, first))),
+            vec![RepairKey::Brick {
+                volume: volume_id,
+                coord: first
+            }]
+        );
+        // Transaction 2 is held behind transaction 1 (same volume result), yet asks for its own
+        // brick now.
+        assert_eq!(
+            keys(replica.apply_transaction(&tx(2, second))),
+            vec![RepairKey::Brick {
+                volume: volume_id,
+                coord: second
+            }]
+        );
+        assert_eq!(replica.pending_repair_txn_count(), 2);
+        // Asking again inside the cooldown does not repeat the request.
+        assert!(keys(replica.apply_transaction(&tx(2, second))).is_empty());
+    }
+
+    /// A request nobody has answered is repeated at doubling intervals, not at a fixed one.
+    #[test]
+    fn an_unanswered_repair_request_backs_off_exponentially() {
+        let volume_id = VolumeId::new(1).unwrap();
+        let coord = BrickCoord::new(41, 2, 1);
+        let mut volume = terrain();
+        volume
+            .insert_brick(
+                coord,
+                Brick::restored_uniform(MaterialId(2), Revision(0), false),
+            )
+            .unwrap();
+        let mut replica = ReplicaWorld::from_baseline(volume, ReplicaConfig::default());
+        let key = RepairKey::Brick {
+            volume: volume_id,
+            coord,
+        };
+        let base = ReplicaConfig::default().repair_request_cooldown_ticks;
+        let mut tick = 100;
+        replica.observe_server_tick(tick);
+        assert!(
+            replica.should_request_repair(&key),
+            "the first request goes out"
+        );
+        // Waits of base, 2 x base, 4 x base, 8 x base, then 8 x base.
+        for factor in [1, 2, 4, 8, 8] {
+            tick += base * factor - 1;
+            replica.observe_server_tick(tick);
+            assert!(
+                !replica.should_request_repair(&key),
+                "still waiting at {factor} x base minus a tick"
+            );
+            tick += 1;
+            replica.observe_server_tick(tick);
+            assert!(
+                replica.should_request_repair(&key),
+                "due at {factor} x base"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partly_patched_transaction_repairs_the_rest_instead_of_replaying() {
+        use spall_protocol::{BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume};
+        let volume_id = VolumeId::new(1).unwrap();
+        let evicted_coord = BrickCoord::new(41, 2, 1);
+        let resident_coord = BrickCoord::new(42, 2, 1);
+        let mut volume = terrain();
+        for coord in [evicted_coord, resident_coord] {
+            volume
+                .insert_brick(
+                    coord,
+                    Brick::restored_uniform(MaterialId(2), Revision(0), false),
+                )
+                .unwrap();
+        }
+        let mut replica = ReplicaWorld::from_baseline(volume, ReplicaConfig::default());
+        assert!(replica.evict_brick(volume_id, evicted_coord));
+        let run = |coord: BrickCoord| TopologyOp::CellRun {
+            volume: volume_id,
+            start: GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32),
+            len: 1,
+            material: MaterialId::AIR,
+        };
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(9).unwrap(),
+            server_tick: Tick(12),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: [evicted_coord, resident_coord]
+                .into_iter()
+                .map(|coord| spall_protocol::BrickRevision {
+                    volume: volume_id,
+                    coord,
+                    revision: Revision(0),
+                })
+                .collect(),
+            after: vec![],
+            ops: vec![run(evicted_coord), run(resident_coord)],
+            result_hashes: vec![],
+        };
+        let patch = |coord: BrickCoord, revision: u64| spall_protocol::BaselineWorld {
+            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            checkpoint_tick: 12,
+            volumes: vec![BaselineVolume {
+                volume_id,
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner: BaselineOwner::Terrain,
+                bounds: None,
+                bricks: vec![BaselineBrick {
+                    coord: [coord.x, coord.y, coord.z],
+                    revision,
+                    edited: true,
+                    cells: BaselineCells::Uniform(MaterialId::AIR.0),
+                }],
+            }],
+        };
+        let repair_keys = |outcome: ApplyOutcome| match outcome {
+            ApplyOutcome::NeedsRepair(requests) => {
+                requests.into_iter().map(|r| r.key).collect::<Vec<_>>()
+            }
+            other => panic!("expected a repair request, got {other:?}"),
+        };
+
+        // The evicted brick is repaired first; it now holds the server's
+        // post-transaction state.
+        assert_eq!(
+            repair_keys(replica.apply_transaction(&tx)),
+            vec![RepairKey::Brick {
+                volume: volume_id,
+                coord: evicted_coord
+            }]
+        );
+        replica
+            .apply_baseline_patch(&patch(evicted_coord, 5))
+            .unwrap();
+
+        // Replaying now would write over the patched brick; the resident
+        // brick must be repaired instead and nothing may be applied.
+        let before = replica.world_hash();
+        assert_eq!(
+            repair_keys(replica.apply_transaction(&tx)),
+            vec![RepairKey::Brick {
+                volume: volume_id,
+                coord: resident_coord
+            }]
+        );
+        assert_eq!(replica.world_hash(), before);
+        assert!(!replica.has_applied(tx.transaction_id));
+
+        replica
+            .apply_baseline_patch(&patch(resident_coord, 6))
+            .unwrap();
+        assert_eq!(replica.apply_transaction(&tx), ApplyOutcome::Duplicate);
+        assert!(replica.has_applied(tx.transaction_id));
+    }
+
+    /// A held transaction whose volume hash covers a brick that a repair patch has already moved
+    /// to a later server state cannot be verified. It must not be dropped (its own edit would be
+    /// lost for good): the replica fetches the bricks it touched, after which the transaction is
+    /// recognised as incorporated and the replica equals the server.
+    #[test]
+    fn a_hash_mismatch_caused_by_a_patched_ahead_brick_repairs_instead_of_dropping() {
+        use spall_protocol::{BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume};
+        let volume_id = VolumeId::new(1).unwrap();
+        let (a, b) = (BrickCoord::new(0, 0, 0), BrickCoord::new(1, 0, 0));
+        let mut base = Volume::new(volume_id, CellSizeCode::Quarter);
+        for coord in [a, b] {
+            base.insert_brick(coord, Brick::uniform(MaterialId(1), Revision(1)))
+                .unwrap();
+        }
+        let patch = |coord: BrickCoord, revision: u64, material: MaterialId| {
+            spall_protocol::BaselineWorld {
+                schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+                checkpoint_tick: 12,
+                volumes: vec![BaselineVolume {
+                    volume_id,
+                    cell_size_code: CellSizeCode::Quarter.to_u8(),
+                    owner: BaselineOwner::Terrain,
+                    bounds: None,
+                    bricks: vec![BaselineBrick {
+                        coord: [coord.x, coord.y, coord.z],
+                        revision,
+                        edited: true,
+                        cells: BaselineCells::Uniform(material.0),
+                    }],
+                }],
+            }
+        };
+
+        // The server: transaction 1 digs brick `a` (revision 1 -> 2), then a later transaction
+        // changes brick `b`. Transaction 1 declares the volume hash from before the later one.
+        let tx = |declared: Hash32| TopologyTransaction {
+            transaction_id: TransactionId::new(1).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![spall_protocol::BrickRevision {
+                volume: volume_id,
+                coord: a,
+                revision: Revision(1),
+            }],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: volume_id,
+                start: GlobalCell::new(0, 0, 0),
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![spall_protocol::VolumeHash {
+                volume: volume_id,
+                hash: declared,
+            }],
+        };
+        // The declared hash: the server applies the same edit to its copy.
+        let mut reference = base.clone();
+        let mut plan = EditPlan::new(volume_id);
+        plan.set(GlobalCell::new(0, 0, 0), MaterialId::AIR);
+        reference.apply_edit(&plan).unwrap();
+        let declared = ReplicaWorld::from_baseline(reference.clone(), ReplicaConfig::default())
+            .volume_hash(volume_id)
+            .unwrap();
+
+        // The replica was patched ahead on brick `b` before it could process transaction 1.
+        let mut replica = ReplicaWorld::from_baseline(base, ReplicaConfig::default());
+        replica
+            .apply_baseline_patch(&patch(b, 7, MaterialId::AIR))
+            .unwrap();
+        let outcome = replica.apply_transaction(&tx(declared));
+        let ApplyOutcome::NeedsRepair(requests) = outcome else {
+            panic!("a mismatch caused by a patched-ahead brick must repair, got {outcome:?}");
+        };
+        assert_eq!(
+            requests.iter().map(|r| r.key).collect::<Vec<_>>(),
+            vec![RepairKey::Brick {
+                volume: volume_id,
+                coord: a
+            }]
+        );
+        assert_eq!(replica.pending_repair_txn_count(), 1);
+        assert!(!replica.has_applied(TransactionId::new(1).unwrap()));
+
+        // The server answers with brick `a` as it is now (dug, later revision).
+        replica
+            .apply_baseline_patch(&patch(a, 2, MaterialId::AIR))
+            .unwrap();
+        let retried = replica.retry_pending_repair_txns();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].1, ApplyOutcome::Duplicate);
+        assert_eq!(replica.pending_repair_txn_count(), 0);
+    }
+
+    #[test]
+    fn an_already_patched_split_still_creates_its_body_and_updates_only_stale_source_bricks() {
+        use spall_protocol::{BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume};
+        let volume_id = VolumeId::new(1).unwrap();
+        let child_id = VolumeId::new(2).unwrap();
+        let child_entity = EntityId::new(9).unwrap();
+        let named = BrickCoord::new(41, 2, 1);
+        let beyond = BrickCoord::new(42, 2, 1);
+        let mut volume = terrain();
+        for coord in [named, beyond] {
+            volume
+                .insert_brick(
+                    coord,
+                    Brick::restored_uniform(MaterialId(2), Revision(0), false),
+                )
+                .unwrap();
+        }
+        let mut replica = ReplicaWorld::from_baseline(volume, ReplicaConfig::default());
+        assert!(replica.evict_brick(volume_id, named));
+
+        let brick = |coord: BrickCoord, revision: u64, material: u16| BaselineBrick {
+            coord: [coord.x, coord.y, coord.z],
+            revision,
+            edited: true,
+            cells: BaselineCells::Uniform(material),
+        };
+        let volume_of =
+            |id: VolumeId, owner: BaselineOwner, bricks: Vec<BaselineBrick>| BaselineVolume {
+                volume_id: id,
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner,
+                bounds: None,
+                bricks,
+            };
+        // The transaction names only `named`, but its source patch also rewrites
+        // `beyond` and carries an older copy of `named`.
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(11).unwrap(),
+            server_tick: Tick(20),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![spall_protocol::BrickRevision {
+                volume: volume_id,
+                coord: named,
+                revision: Revision(0),
+            }],
+            after: vec![],
+            ops: vec![
+                TopologyOp::SplitOffBaseline {
+                    source: volume_id,
+                    child: child_id,
+                    child_entity,
+                    blob: volume_of(
+                        child_id,
+                        BaselineOwner::Body(child_entity),
+                        vec![brick(BrickCoord::new(0, 0, 0), 1, 2)],
+                    )
+                    .encode_compressed(),
+                },
+                TopologyOp::SourcePatchBaseline {
+                    source: volume_id,
+                    blob: volume_of(
+                        volume_id,
+                        BaselineOwner::Terrain,
+                        vec![brick(named, 5, 2), brick(beyond, 7, MaterialId::AIR.0)],
+                    )
+                    .encode_compressed(),
+                },
+            ],
+            result_hashes: vec![],
+        };
+        let patch = spall_protocol::BaselineWorld {
+            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            checkpoint_tick: 20,
+            volumes: vec![volume_of(
+                volume_id,
+                BaselineOwner::Terrain,
+                vec![brick(named, 9, MaterialId::AIR.0)],
+            )],
+        };
+
+        assert!(matches!(
+            replica.apply_transaction(&tx),
+            ApplyOutcome::NeedsRepair(_)
+        ));
+        // A later repair carries `named` past the transaction.
+        replica.apply_baseline_patch(&patch).unwrap();
+        match replica.apply_transaction(&tx) {
+            ApplyOutcome::Published { new_bodies, .. } => assert_eq!(new_bodies.len(), 1),
+            other => panic!("expected the body to be created, got {other:?}"),
+        }
+        let terrain = replica.volume(volume_id).unwrap();
+        assert_eq!(
+            terrain.brick_revision(named).unwrap(),
+            Some(Revision(9)),
+            "a brick already past the patch is not rolled back"
+        );
+        assert_eq!(
+            terrain.brick_revision(beyond).unwrap(),
+            Some(Revision(7)),
+            "a stale brick beyond `before` takes the patched state"
+        );
+        assert!(replica.volume(child_id).is_some());
     }
 
     #[test]

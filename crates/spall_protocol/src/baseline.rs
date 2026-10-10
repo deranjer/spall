@@ -40,6 +40,12 @@ pub enum BaselineCells {
     Uniform(u16),
     /// Exactly [`CELLS_PER_BRICK`] raw material ids in linear-index order.
     Dense(Vec<u16>),
+    /// Negotiated regional segment only: exact logical terrain, without geometry.
+    /// Forbidden in legacy worlds, repair patches, body volumes and durable split blobs.
+    Digest {
+        content_hash: crate::Hash32,
+        solid_cells: u32,
+    },
 }
 
 /// One persisted brick of a baseline volume.
@@ -174,6 +180,11 @@ impl BaselineVolume {
             return Err(BaselineDecodeError::EmptyVolume(self.volume_id.get()));
         }
         for b in &self.bricks {
+            if matches!(b.cells, BaselineCells::Digest { .. }) {
+                return Err(BaselineDecodeError::Postcard(
+                    "digest requires regional segments".into(),
+                ));
+            }
             if let BaselineCells::Dense(cells) = &b.cells
                 && cells.len() != CELLS_PER_BRICK
             {
@@ -187,6 +198,7 @@ impl BaselineVolume {
     /// validate a split baseline op blob against the world manifest.
     pub fn material_ids(&self) -> impl Iterator<Item = MaterialId> + '_ {
         self.bricks.iter().flat_map(|b| match &b.cells {
+            BaselineCells::Digest { .. } => Vec::new(),
             BaselineCells::Uniform(id) => vec![MaterialId(*id)],
             BaselineCells::Dense(ids) => {
                 let mut seen: Vec<u16> = ids.to_vec();

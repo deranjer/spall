@@ -517,7 +517,7 @@ impl Connection {
             TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
         })?;
         let mut reader = self.accept_bulk().await?;
-        if begin.world_version == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION {
+        if spall_protocol::segment::is_streamed_world(begin.world_version) {
             reader.assembled_cap = spall_protocol::segment::MAX_STREAMED_BASELINE_COMPRESSED
                 .min(begin.total_bytes as usize);
         }

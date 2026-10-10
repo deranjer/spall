@@ -296,12 +296,43 @@ enforces counts, ranges, and float finiteness; `TopologyTransaction` also has
 `BaselineEnd=8`, `BaselineAck=9`, `RepairRequest=10`, `DurableThrough=11`,
 `Handshake=12`. Discriminants are permanent; new families take new numbers.
 
-**Sort orders for the canonical topology hash.** Volumes ascending by
-`VolumeId`; bricks ascending by `(z, y, x)`; authoritative layers ascending by
-numeric layer `kind`. Owner is encoded as `0,u64=0` for terrain or `1,u64=EntityId`
-for a body. Domain-separated with the ASCII tag `spall.topology.v1`; the content
-manifest hash uses `spall.manifest.v1`. BLAKE3 over the resulting bytes is the
-result. Reordering the inputs does not change the digest.
+**The canonical topology hash (`spall.topology.v2`).** Sort orders: volumes ascending by
+`VolumeId`; bricks ascending by `(z, y, x)`; authoritative layers ascending by numeric layer
+`kind`. Owner is encoded as `0,u64=0` for terrain or `1,u64=EntityId` for a body. Reordering the
+inputs does not change the digest. All integers are little-endian; a "blob" is a `u32` length
+followed by the bytes, and a "seq" is a `u32` count; BLAKE3 is the hash, and every hash starts
+with its domain tag as a blob.
+
+*Chunks.* Bricks are grouped into chunks of 8 x 8 x 8 (`HASH_CHUNK_SHIFT = 3`): the chunk of a
+brick is its `(x, y, z)` shifted right by 3 on each axis, so negative coordinates floor. Chunks
+are ordered by `(z, y, x)` of the chunk key, like bricks.
+
+*Chunk digest* (domain `spall.topology.chunk.v2`): the chunk key as three `i64`; `seq` of the
+chunk's bricks; then each brick in `(z, y, x)` order as its `x, y, z` (`i64`), revision (`u64`),
+`seq` of layers and, per layer in `kind` order, `kind` (`u16`) and the layer bytes as a blob. A
+chunk with no brick has no digest and is omitted. For the material layer the layer bytes are the
+brick's 32-byte representation-independent content hash, and a volume's bricks are its **logical**
+set: resident bricks plus the digests of evicted ones, each coordinate once.
+
+*Topology hash* (domain `spall.topology.v2`): `seq` of volumes; per volume in id order, its id
+(`u64`), cell-size code (`u8`), owner, `seq` of its non-empty chunks, and per chunk in order the
+chunk key as three `i64` and the chunk digest as a 32-byte blob. BLAKE3 over those bytes is the
+result.
+
+*Why chunks.* A change to one brick alters only its chunk's digest, so an implementation can
+cache chunk digests and recompute only the chunks whose contents changed (a commit then hashes a
+few chunks rather than every brick of the world). The reference implementation validates a cached
+digest by the stamps of the storage chunks it was computed from (`spall_voxel`'s
+`Volume::chunk_stamps` and `EvictedBricks::chunk_stamps`), which are replaced by every mutation
+and shared by clones; a different cache is equally conformant as long as the digests are equal.
+
+*Versioning.* v1 hashed every brick in one stream under the tag `spall.topology.v1`. v2 changes
+every hash value, so it is not interchangeable: the wire schema moved to 4
+(`WIRE_SCHEMA_VERSION`, stamped in every record header, so a v1 peer cannot decode a single
+record) and saved worlds record `topology_hash_version = 2`. **A save written under v1 is
+refused on recovery** with an algorithm-version mismatch; its recorded checkpoint and journal
+hashes cannot be verified under v2 and the engine does not carry the v1 algorithm to migrate
+them. The content manifest hash is unchanged (`spall.manifest.v1`).
 
 **Brush fixed-point units.** Brush centre and radius are expressed in the
 target volume's local cell space with 8 fractional bits: `1` unit = `1/256`
@@ -503,3 +534,95 @@ not change any frame, streamed-baseline, staging or timeout admission limit.
 The encrypted UDP test relay drains at most 64 already-due packets per wake,
 in deadline/insertion order, without forwarding future packets early. Existing
 rate scheduling, fault probabilities and bounded queue admission remain intact.
+
+### ENG-130 regional startup baseline
+
+Opt-in regional clients advertise a radius-specific capability hash in the existing baseline request
+sentinel: `spall.baseline.capability.regional.v4.radius.{radius}`, radius 1..=16 bricks. Generated-world
+play requests radius 10. Servers that do not understand the capability retain their full-baseline
+fallback. World version 4 uses segment schema 3 and the version-3 streamed transport limits.
+Versions 1..3 and segment schema 2 retain complete geometry. Durable world/split formats do not change.
+
+Every logical terrain brick appears exactly once: real geometry in the spawn-centered Chebyshev box,
+otherwise `BaselineCells::Digest` with canonical content hash, solid-cell count, revision, and edited
+flag. This is a catalogue of the whole logical world, not a claim of resident distant geometry.
+Detached bodies always contain complete geometry and stable ownership. Digests are forbidden in
+legacy baseline blobs, repair geometry, authoritative replay, and durable split blobs. Receiver
+validation rejects unknown schema/version combinations, body digests, out-of-bounds coordinates,
+duplicates, geometry/digest overlaps, invalid counts, and incomplete manifests before atomic install.
+
+Movement uses existing bounded, revision-validated BrickBaselineRequest repair traffic to fetch
+nearby evicted bricks. Distant transactions retain existing gap/repair rules and exact logical hash
+convergence. A reset replaces the geometry and digest namespaces together and selects the same
+negotiated format independently for each client. A regional capture is never reused across players.
+
+### ENG-114 deferred terrain catalogue and control-stream flow control (2026-10-07)
+
+Additive wire records under envelope schema 3; matched client and server builds are required.
+
+* **Deferred regional baseline.** A client that advertises
+  `baseline_cap_regional_deferred(radius)` (instead of `baseline_cap_regional`) receives
+  `BaselineBegin.world_version == 5` (`BASELINE_DEFERRED_REGIONAL_WORLD_VERSION`). The baseline
+  carries every body and only the terrain within `DEFERRED_CORE_RADIUS_BRICKS` (2) of the player,
+  with no digests, so the client is ready as soon as it arrives. A world with nothing to defer is
+  sent as an ordinary complete baseline (world version 3), never as version 5.
+* **`CatalogueChunk` (tag 20).** The distant terrain digests follow as an ordinary segmented
+  payload (manifest, then segments, each hashed and bounded exactly like a baseline) split into
+  in-order chunks of at most 32 KiB on the reliable control stream. Chunks carry the baseline's
+  `transfer_id`, `index`/`count`, the payload's chained hash, `delta` and `expected_world_hash`.
+  The server writes a chunk only when nothing else is queued, so no record waits behind the whole
+  catalogue. The client feeds chunks to the same bounded `SegmentedReceiver`, verifies the chained
+  hash, and merges digests for bricks it does not already hold (a resident brick wins).
+* **Replica rules while a catalogue is pending.** Transactions are held in arrival order (bounded
+  by `max_catalogue_deferred_txns`; past it the replica rejects loudly rather than dropping) and
+  replay when the catalogue completes. `world_hash` is not comparable with the server's until then.
+  A chunk for a replaced baseline is ignored; a refused or unmergeable catalogue ends the client
+  with `baseline_transfer_failures`.
+* **`CatalogueAck` (tag 21).** The client acknowledges each chunk it has processed. The server
+  keeps at most `CATALOGUE_WINDOW_CHUNKS` (4) unacknowledged, so the transport's send buffer cannot
+  hide minutes of catalogue ahead of the next baseline.
+* **Delta catalogue for world resets.** When a client holds the complete catalogue of the world
+  being replaced (the server tracks delivery per connection), the reset's catalogue lists only the
+  bricks whose digest differs from the old world's and sets `delta`. The client merges them onto the
+  catalogue it held and must reproduce `expected_world_hash` (the new world's canonical hash at the
+  baseline tick) before any held transaction replays; otherwise the catalogue is refused. A reset
+  to a world lacking a brick the client holds uses the full catalogue. Held-for-repair
+  transactions do not block this: the bricks they would change already differ from the new world
+  and are overwritten by the delta.
+* **Resuming an interrupted catalogue.** A reset that arrives while the client is still receiving
+  its catalogue does not discard what it has verified. A catalogue is a segmented payload and a
+  segment is checked against the manifest and merged as soon as its last byte arrives, so the
+  client holds exactly the segments that end within the chunks it has processed. Catalogues use
+  small segments (`CATALOGUE_SEGMENT_DECODED_BYTES`, 128 KiB decoded, about 1,000 digests, one or
+  two chunks) so the unit of progress is small; the baseline's 4 MiB segments would make a large
+  world's catalogue two segments. The server records each catalogue's layout (the digests it
+  carries, where each segment ends, and the basis it was itself built on) and counts the chunks
+  its writer has written. Those are certain to have been processed by the client before the
+  reset's baseline, because the control stream is ordered, so the count is a lower bound that can
+  never overstate what the client holds. The reset's catalogue is a delta against the basis
+  *plus every segment that ends within those chunks*, and declares the count in
+  `CatalogueChunk.basis_chunks`. The client keeps the interrupted receiver's per-segment digests
+  and selects the same prefix (ignoring anything it received beyond the count), merges the delta
+  onto it, and must still reproduce `expected_world_hash`. A client that processed fewer chunks
+  than `basis_chunks`, or has no interrupted catalogue to resume, refuses the catalogue (a loud
+  failure, never a guess). An interrupted *delta* resumes from its own basis plus its completed
+  segments, so resets can chain. A client that has processed no chunk, or a world that lacks a
+  brick the client holds, gets a full catalogue (`delta = false`, `basis_chunks = None`).
+  `basis_chunks` may be set only on a delta.
+* **`ControlProbe` (tag 22).** The writer sends a probe whenever it wakes (queue activity, an echo,
+  or its 250 ms idle timer), but never two within 25 ms; the client echoes it in
+  order. Because the control stream is ordered, an echo confirms every byte written before the
+  probe. Droppable traffic (water, vegetation, catalogue chunks) is held back while the oldest
+  unanswered probe is older than 1.5 s or the bytes written past the last confirmed byte exceed
+  1.5 s of the measured delivery rate (clamped to 48 KiB..1 MiB). Only the newest 16 probes are
+  tracked, so a client that cannot echo yet (installing a baseline) never leaves the stream
+  congested permanently.
+* **Ordering and backpressure.** A batch's motion datagrams are sent first and again after every
+  reliable message, so a run of bulk repairs cannot delay them. A client with unsent water
+  outstanding (`MAX_UNSENT_WATER_MESSAGES`, 4), a streaming catalogue, or a congested control
+  stream is not given further water or vegetation frames; the publisher's state is untouched, so the
+  newest frame goes out later.
+
+Single-brick repair requests no longer fill `current_hash`/`expected_hash` (the server never read
+them), and a transaction whose result hash covers a volume with an earlier transaction still held
+for a repair or bulk blob waits behind it.
