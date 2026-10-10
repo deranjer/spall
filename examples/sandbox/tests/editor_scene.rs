@@ -33,13 +33,23 @@ fn authored_valley_water_is_server_state_not_solid_terrain() {
         assert_eq!(*fraction, 1.0);
         assert!(matches!(terrain.sample(*cell), Ok(Sample::Empty { .. })));
     }
+    // The authored water is also the column model's seed, in open terrain.
+    let column = scene
+        .column_water_setup()
+        .expect("scene seeds column water")
+        .clone();
+    assert_eq!(column.initial_cells.len(), water.initial_fractions.len());
+    let terrain = scene.world_setup().terrain;
+    for cell in &column.initial_cells {
+        assert!(matches!(terrain.sample(*cell), Ok(Sample::Empty { .. })));
+    }
     let custom = scene.into_custom_world();
     assert!(!custom.player_spawns().is_empty());
     assert!(
         !custom
-            .water_setup()
-            .expect("custom server world retains water setup")
-            .initial_fractions
+            .column_water_setup()
+            .expect("custom server world retains the column water setup")
+            .initial_cells
             .is_empty()
     );
 }
@@ -515,4 +525,21 @@ fn forest_world_stands_up_and_a_player_stays_on_the_lawn() {
         "player drifted off the lawn: {:?}",
         state.position_m
     );
+}
+
+/// ENG-167: the authored valley carries stacked-column water, and the scene
+/// ships it (not the dense domain) to a server.
+#[test]
+fn the_valley_ships_column_water_and_it_stands_up() {
+    let scene = editor_scene::load(valley()).expect("valley project loads");
+    let setup = scene
+        .column_water_setup()
+        .expect("valley has water")
+        .clone();
+    assert!(!setup.initial_cells.is_empty());
+    assert!(setup.y_lo.rem_euclid(32) == 0 && setup.y_hi.rem_euclid(32) == 0);
+    assert!(setup.y_lo < setup.y_hi);
+    let custom = scene.into_custom_world();
+    assert!(custom.column_water_setup().is_some());
+    assert!(custom.water_setup().is_none(), "production uses columns");
 }

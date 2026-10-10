@@ -47,7 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut world = ColumnWorld::with_terrain(
         Arc::new(VolumeTerrain::new(Terrain(scene.clone()), y_lo, y_hi)),
         ColumnConfig {
-            cfl: std::env::var("CFL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5),
+            cfl: std::env::var("CFL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5),
             ..ColumnConfig::default()
         },
     );

@@ -385,3 +385,39 @@ fn water_coarsening_is_the_finest_that_fits_the_fluid_cell_budget() {
         8
     );
 }
+
+/// ENG-167: the generated world's water runs as stacked columns. The plan's
+/// lakes seed at rest, the server pays nothing while they stay at rest, none
+/// of the plan is rejected, and a level surface really is level.
+#[test]
+fn generated_water_runs_as_columns_at_rest_with_no_rejected_cells() {
+    let scene = worldgen_scene::generate("showcase", 7, SMALL).expect("generate");
+    let setup = scene
+        .column_water_setup()
+        .expect("showcase has water")
+        .clone();
+    let planned = setup.initial_cells.len();
+    assert!(planned > 0);
+    let mut config = SimulationConfig::new(scene.world_setup());
+    config.column_water = Some(setup);
+    let mut sim = Simulation::new(config).expect("the generated world stands up");
+    let water = sim.column_water().expect("server owns the column water");
+    assert_eq!(
+        water.seed_report().rejected_cells,
+        0,
+        "every planned cell sits in open terrain"
+    );
+    let seeded = water.frame().volume_m3;
+    assert!((seeded - planned as f64 * 0.25f64.powi(3)).abs() < 1e-6);
+    let diff = water.world().max_wetted_head_difference();
+    assert!(
+        diff <= 0.1,
+        "generated lakes are level where they touch: head difference {diff}"
+    );
+    for _ in 0..120 {
+        let report = sim.tick().expect("tick");
+        let m = report.column_water.expect("reported each tick");
+        assert_eq!(m.active_regions, 0, "an idle lake costs nothing");
+        assert!((m.volume_m3 - seeded).abs() < 1e-6);
+    }
+}

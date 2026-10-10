@@ -19,6 +19,7 @@ use serde::Deserialize;
 use spall_core::{CellSizeCode, GlobalCell, MaterialId, VolumeId};
 use spall_fluid::DomainSpec;
 use spall_server::CustomWorld;
+use spall_sim::column_water::ColumnWaterSetup;
 use spall_sim::{WaterSetup, WorldSetup};
 use spall_structure::AnchorPlane;
 use spall_voxel::EditPlan;
@@ -186,6 +187,9 @@ pub struct LoadedScene {
     max: [i64; 3],
     pub player_spawns: Vec<[f64; 3]>,
     water: Option<WaterSetup>,
+    /// Stacked-column water (ENG-167): the production model. The dense
+    /// `water` setup above is retained for the legacy tests until W5.
+    column_water: Option<ColumnWaterSetup>,
     /// Cells marked `dam.gate`, still solid in `cells`; handed to
     /// [`spall_server::CustomWorld::with_dam_gate`] so an admin can open them.
     dam_gate_cells: Vec<GlobalCell>,
@@ -202,6 +206,10 @@ impl LoadedScene {
 
     pub fn water_setup(&self) -> Option<&WaterSetup> {
         self.water.as_ref()
+    }
+
+    pub fn column_water_setup(&self) -> Option<&ColumnWaterSetup> {
+        self.column_water.as_ref()
     }
 
     /// Cells marked `dam.gate`, closed (solid) in the scene's own terrain
@@ -252,10 +260,13 @@ impl LoadedScene {
     /// Packages the scene for [`spall_server::ServeConfig::custom_world`].
     pub fn into_custom_world(self) -> CustomWorld {
         let spawns = self.player_spawns.clone();
-        let water = self.water.clone();
+        let column_water = self.column_water.clone();
         let gate_cells = self.dam_gate_cells.clone();
         let scene = Arc::new(self);
-        let custom = CustomWorld::new_with_water(spawns, water, move || scene.world_setup());
+        let mut custom = CustomWorld::new(spawns, move || scene.world_setup());
+        if let Some(setup) = column_water {
+            custom = custom.with_column_water(setup);
+        }
         if gate_cells.is_empty() {
             custom
         } else {
@@ -387,6 +398,18 @@ pub fn load(path: &Path) -> Result<LoadedScene, EditorSceneError> {
     } else {
         marker_spawns(spawn_markers)
     };
+    let column_water = column_water_setup(
+        &water_cells,
+        &spring_cells,
+        &[
+            gated_spring_cells.clone(),
+            gated_spring_fast_cells.clone(),
+            gated_spring_max_cells.clone(),
+        ],
+        &drain_cells,
+        min,
+        max,
+    );
     let water = water_setup(
         &water_cells,
         spring_cells,
@@ -407,8 +430,32 @@ pub fn load(path: &Path) -> Result<LoadedScene, EditorSceneError> {
         max,
         player_spawns,
         water,
+        column_water,
         dam_gate_cells,
     })
+}
+
+/// The stacked-column water for a scene's authored water, springs and drains.
+/// There is no domain box: the height range is the scene's resident air
+/// envelope, snapped outward to whole bricks.
+fn column_water_setup(
+    water: &[GlobalCell],
+    springs: &[GlobalCell],
+    gated_springs: &[Vec<GlobalCell>; 3],
+    drains: &[GlobalCell],
+    min: [i64; 3],
+    max: [i64; 3],
+) -> Option<ColumnWaterSetup> {
+    if water.is_empty() && springs.is_empty() && gated_springs.iter().all(Vec::is_empty) {
+        return None;
+    }
+    let y_lo = (min[1] - AIR_BELOW).div_euclid(32) * 32;
+    let y_hi = (max[1] + AIR_ABOVE + 1 + 31).div_euclid(32) * 32;
+    let mut setup = ColumnWaterSetup::new(y_lo as i32, y_hi as i32, water.to_vec());
+    setup.sources = springs.to_vec();
+    setup.gated_sources = gated_springs.clone();
+    setup.sinks = drains.to_vec();
+    Some(setup)
 }
 
 /// Removes every cell of a sentinel material, returning their positions.

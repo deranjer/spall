@@ -12,6 +12,7 @@ use std::sync::Arc;
 use spall_core::GlobalCell;
 use spall_fluid::DomainSpec;
 use spall_server::CustomWorld;
+use spall_sim::column_water::ColumnWaterSetup;
 use spall_sim::{WaterSetup, WorldSetup};
 use spall_structure::AnchorPlane;
 use spall_worldgen::{
@@ -91,6 +92,9 @@ pub const DEFAULT_SIZE_CELLS: u32 = SHOWCASE_SIZE_CELLS;
 pub struct GeneratedScene {
     world: Arc<GeneratedWorld>,
     water: Option<WaterSetup>,
+    /// Stacked-column water (ENG-167): the production model. The dense
+    /// `water` setup is retained for the legacy tests until W5.
+    column_water: Option<ColumnWaterSetup>,
     vegetation: spall_ecology::living::LivingState,
 }
 
@@ -162,6 +166,7 @@ pub fn generate_with_season(
     );
     let started = std::time::Instant::now();
     let water = water_setup(&world.water)?;
+    let column_water = column_water_setup(&world.water, world.region);
     tracing::info!(
         stage = "water_setup",
         elapsed_us = started.elapsed().as_micros() as u64,
@@ -170,8 +175,26 @@ pub fn generate_with_season(
     Ok(GeneratedScene {
         world: Arc::new(world),
         water,
+        column_water,
         vegetation,
     })
+}
+
+/// The stacked-column water for a water plan: the plan's full cells seeded at
+/// rest over the world's whole height range. There is no domain box and no
+/// coarsening, so a one-voxel wall always blocks water.
+pub fn column_water_setup(
+    plan: &WaterPlan,
+    region: (GlobalCell, GlobalCell),
+) -> Option<ColumnWaterSetup> {
+    plan.bounds?;
+    let y_lo = region.0.y.div_euclid(32) * 32;
+    let y_hi = (region.1.y + 1 + 31).div_euclid(32) * 32;
+    Some(ColumnWaterSetup::new(
+        y_lo as i32,
+        y_hi as i32,
+        plan.cells.clone(),
+    ))
 }
 
 /// The server fluid region for a water plan: its bounding box plus margins,
@@ -215,6 +238,10 @@ impl GeneratedScene {
         self.water.as_ref()
     }
 
+    pub fn column_water_setup(&self) -> Option<&ColumnWaterSetup> {
+        self.column_water.as_ref()
+    }
+
     /// Player start positions in metres.
     pub fn player_spawns(&self) -> &[[f64; 3]] {
         &self.world.spawns
@@ -241,10 +268,14 @@ impl GeneratedScene {
     /// Packages the world for [`spall_server::ServeConfig::custom_world`].
     pub fn into_custom_world(self) -> CustomWorld {
         let spawns = self.world.spawns.clone();
-        let water = self.water.clone();
+        let column_water = self.column_water.clone();
         let vegetation = self.vegetation.clone();
         let scene = Arc::new(self);
-        CustomWorld::new_with_water(spawns, water, move || scene.world_setup())
-            .with_vegetation(vegetation)
+        let mut custom =
+            CustomWorld::new(spawns, move || scene.world_setup()).with_vegetation(vegetation);
+        if let Some(setup) = column_water {
+            custom = custom.with_column_water(setup);
+        }
+        custom
     }
 }

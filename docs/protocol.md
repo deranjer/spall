@@ -127,6 +127,41 @@ schema 2 and verifies recovery. Schema-1 saves did not persist water, so water
 cannot be reconstructed from their historical presentation. Older binaries
 reject the schema-2 version instead of silently dropping water.
 
+## Column water presentation and recovery (ENG-167)
+
+The stacked-column water (`docs/water-agent-handoff.md`) is the production
+model; the dense MAC `WaterState` above remains only until `grid_mac` is
+removed. It adds three contracts and no change to the save schema version.
+
+- **Canonical state.** `ColumnWaterState` (record schema 3) stores only wet
+  spans: per region `(rx, rz)`, each span as `(column 0..1023, floor y,
+  volume)` with volume an unsigned fixed-point integer in units of 2^-32 cell^3
+  (never float bytes), plus the fluid time, spring and drain totals, the
+  unplaced-volume ledger, source and sink cells and the gated rate. Span floors
+  and ceilings are not stored: they are derived from terrain, and restore
+  refuses a saved span that has no matching terrain span. Recovery is at rest.
+  The checkpoint carries it in an additive `checkpoint_column_water` row
+  (created if absent, BLAKE3-16/CRC integrity like the other rows; a save with
+  no column water has no row). The journal appends `ColumnWaterDelta` (a new
+  last variant, so older rows keep their discriminants): changed regions
+  replace the previous state wholesale and the scalars are absolute. A delta is
+  journaled in the same batch as any terrain commit that touched water, and
+  every 20 ticks while water moves; resting water journals nothing.
+- **Replication.** `ColumnWaterUpdate` is wire tag 23, record schema 1, on the
+  ordered water stream. A region's 1024 columns are split into eight windows of
+  128; an update carries one window as a baseline (`base_seq` 0, replaces the
+  window) or a delta (changed spans only, depth 0 meaning dry, valid on a
+  window at exactly `base_seq`). Payloads are zstd of 8-byte spans and are
+  bounded before decompression. Depth is quantized to 1/128 cell. A delta on
+  the wrong base is refused, not guessed. The server never publishes a span
+  that quantizes to depth 0. Each session is byte-budgeted like the other water
+  traffic, a late joiner starts from baselines of every wet region, and clients
+  never run the fluid. The wire schema number is unchanged: peers that predate
+  tag 23 reject it only when a server actually uses column water.
+- **Not yet done.** There is no spatial interest filter; every wet region goes
+  to every session. The client still adapts regions to dense frames for the old
+  water look until the span-surface renderer (W4).
+
 ## Exact geometry, approximate motion
 
 Use a hybrid representation for topology changes:
