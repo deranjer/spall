@@ -135,6 +135,8 @@ pub struct TickReport {
     /// the Rapier step.
     pub water: Option<crate::water::WaterTickMetrics>,
     pub water_regions: Vec<crate::water::WaterTickMetrics>,
+    /// Stacked-column water work (ENG-167), when installed.
+    pub column_water: Option<crate::column_water::ColumnWaterTickMetrics>,
     /// Requests that committed this tick, with their transaction summary.
     pub committed: Vec<(RequestId, Committed)>,
     /// Requests whose commit lost a conflict and were re-queued for recompute.

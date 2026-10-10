@@ -38,6 +38,7 @@
 pub mod backing;
 pub mod body;
 pub mod collider;
+pub mod column_water;
 pub mod commit;
 pub mod contact_damage;
 pub mod dormancy;

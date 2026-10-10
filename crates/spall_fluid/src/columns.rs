@@ -325,6 +325,10 @@ pub struct ColumnWorld {
     act_pipes: Vec<u32>,
     /// Near-full active spans for the current step.
     nodes: Vec<u32>,
+    /// Regions whose water changed since `take_dirty_regions`.
+    dirty: BTreeSet<RegionKey>,
+    /// Regions touched by this step's active lists (rebuilt with them).
+    touched: Vec<u32>,
     /// Largest wetted pipe area seen, for the substep limit.
     a_hint: f32,
     lists_dirty: bool,
@@ -424,6 +428,8 @@ impl ColumnWorld {
             act_spans: Vec::new(),
             act_pipes: Vec::new(),
             nodes: Vec::new(),
+            dirty: BTreeSet::new(),
+            touched: Vec::new(),
             a_hint: 0.25,
             lists_dirty: false,
         }
@@ -1257,12 +1263,136 @@ impl ColumnWorld {
         }
     }
 
+    /// Fills the span cell `cell` sits in up to the top of that cell, if it is
+    /// open (a spring). Returns the volume added, or `None` if the cell is not
+    /// open.
+    pub fn fill_cell(&mut self, cell: GlobalCell) -> Option<f64> {
+        let i = self.span_at(cell)?;
+        let want = (cell.y + 1 - i64::from(self.spans[i].y0)) as f64;
+        let added = (want - self.volume[i]).max(0.0);
+        if added > 0.0 {
+            self.volume[i] += added;
+            self.dirty.insert(region_of(cell.x, cell.z));
+            self.wake_column(cell.x, cell.z);
+        }
+        Some(added)
+    }
+
+    /// Removes the water that stands in `cell` (up to one cell^3) from its span
+    /// (a drain). Returns the volume removed, or `None` if the cell is not open.
+    pub fn drain_cell(&mut self, cell: GlobalCell) -> Option<f64> {
+        let i = self.span_at(cell)?;
+        let in_cell =
+            (self.volume[i] - (cell.y - i64::from(self.spans[i].y0)) as f64).clamp(0.0, 1.0);
+        if in_cell > 0.0 {
+            self.volume[i] -= in_cell;
+            self.dirty.insert(region_of(cell.x, cell.z));
+            self.wake_column(cell.x, cell.z);
+        }
+        Some(in_cell)
+    }
+
+    /// Regions whose water changed since the last call, in key order.
+    pub fn take_dirty_regions(&mut self) -> Vec<RegionKey> {
+        std::mem::take(&mut self.dirty).into_iter().collect()
+    }
+
+    /// Marks every allocated region as changed (a full baseline is wanted).
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty.extend(self.regions.iter().map(|r| r.key));
+    }
+
+    /// Allocated region keys in slot order.
+    pub fn region_keys(&self) -> Vec<RegionKey> {
+        self.regions.iter().map(|r| r.key).collect()
+    }
+
+    /// Water volume ledger of the world that is not inside any span: only the
+    /// unplaced remainder; spans hold the rest.
+    /// The wet spans of a region as `(local column, floor y, volume)`, keeping
+    /// only spans holding more than `min_volume`.
+    pub fn region_wet_spans(&self, key: RegionKey, min_volume: f64) -> Vec<(u16, i32, f64)> {
+        let Some(&slot) = self.slot_of.get(&key) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for c in 0..REGION_COLUMNS {
+            let ci = slot as usize * REGION_COLUMNS + c;
+            for i in self.col_start[ci] as usize..self.col_start[ci + 1] as usize {
+                if self.volume[i] > min_volume {
+                    out.push((c as u16, self.spans[i].y0, self.volume[i]));
+                }
+            }
+        }
+        out
+    }
+
+    /// Height of the span in `(key, column)` whose floor is `y0`, if any.
+    pub fn span_height(&self, key: RegionKey, column: u16, y0: i32) -> Option<i32> {
+        let slot = *self.slot_of.get(&key)? as usize;
+        let ci = slot * REGION_COLUMNS + usize::from(column);
+        (self.col_start[ci] as usize..self.col_start[ci + 1] as usize)
+            .find(|&i| self.spans[i].y0 == y0)
+            .map(|i| self.spans[i].y1 - y0)
+    }
+
+    /// Restores one span's volume by `(region, column, floor y)`; the region
+    /// must be allocated. Returns false if terrain has no such span (the
+    /// caller reports it; water is never silently dropped).
+    pub fn restore_span(&mut self, key: RegionKey, column: u16, y0: i32, volume: f64) -> bool {
+        let Some(&slot) = self.slot_of.get(&key) else {
+            return false;
+        };
+        let ci = slot as usize * REGION_COLUMNS + usize::from(column);
+        match (self.col_start[ci] as usize..self.col_start[ci + 1] as usize)
+            .find(|&i| self.spans[i].y0 == y0)
+        {
+            Some(i) => {
+                self.volume[i] = volume;
+                self.dirty.insert(key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Allocates the given regions without adding water (restore). Regions
+    /// that are not resident are skipped and returned.
+    pub fn allocate_regions(&mut self, keys: &[RegionKey]) -> Vec<RegionKey> {
+        self.allocate(keys, &BTreeSet::new());
+        keys.iter()
+            .copied()
+            .filter(|k| !self.slot_of.contains_key(k))
+            .collect()
+    }
+
+    /// Puts every region to sleep: restored or seeded water is at rest.
+    pub fn sleep_all(&mut self) {
+        for r in &mut self.regions {
+            r.active = false;
+            r.quiet_steps = self.config.sleep_steps;
+        }
+        self.lists_dirty = true;
+        self.ensure_rings();
+        for r in &mut self.regions {
+            r.active = false;
+        }
+        self.lists_dirty = true;
+    }
+
+    /// Adds volume to the unplaced ledger (restore).
+    pub fn add_unplaced(&mut self, volume: f64) {
+        self.unplaced += volume;
+    }
+
     // ---- stepping ------------------------------------------------------------
 
     fn rebuild_lists(&mut self) {
         let mut stamp = vec![false; self.spans.len()];
         self.act_spans.clear();
         self.act_pipes.clear();
+        self.touched.clear();
+        let mut touched = vec![false; self.regions.len()];
         for r in &self.regions {
             if r.active && !r.frozen {
                 for s in r.span_start..r.span_end {
@@ -1283,6 +1413,8 @@ impl ColumnWorld {
                     continue;
                 }
                 self.act_pipes.push(pi);
+                touched[p.ra as usize] = true;
+                touched[p.rb as usize] = true;
                 for s in [p.a, p.b] {
                     if !stamp[s as usize] {
                         stamp[s as usize] = true;
@@ -1291,6 +1423,14 @@ impl ColumnWorld {
                 }
             }
         }
+        for (slot, r) in self.regions.iter().enumerate() {
+            if r.active && !r.frozen {
+                touched[slot] = true;
+            }
+        }
+        self.touched = (0..self.regions.len() as u32)
+            .filter(|&s| touched[s as usize])
+            .collect();
         self.lists_dirty = false;
     }
 
@@ -1339,6 +1479,9 @@ impl ColumnWorld {
             metrics.substeps += 1;
         }
         metrics.skipped_s = remaining.max(0.0);
+        for &slot in &self.touched {
+            self.dirty.insert(self.regions[slot as usize].key);
+        }
         self.after_step(&mut metrics);
         metrics
     }

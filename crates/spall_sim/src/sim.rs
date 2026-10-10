@@ -69,6 +69,9 @@ pub struct SimulationConfig {
     /// Optional bounded, fully resident authoritative fluid region. `None`
     /// preserves non-fluid fixtures and existing worlds.
     pub water: Option<crate::water::WaterSetup>,
+    /// Stacked-column water (ENG-167). Independent of `water`; a world may
+    /// carry either, and the column model is the production target.
+    pub column_water: Option<crate::column_water::ColumnWaterSetup>,
     pub vegetation: Option<spall_ecology::living::LivingState>,
 }
 
@@ -85,6 +88,7 @@ impl SimulationConfig {
             max_pending_intents: Self::DEFAULT_MAX_PENDING_INTENTS,
             serialize_threshold: Self::DEFAULT_SERIALIZE_THRESHOLD,
             water: None,
+            column_water: None,
             vegetation: None,
         }
     }
@@ -124,6 +128,7 @@ pub struct Simulation {
     next_damage_seq: u64,
     water: Option<crate::water::AuthoritativeWater>,
     additional_water: Vec<crate::water::AuthoritativeWater>,
+    column_water: Option<crate::column_water::AuthoritativeColumnWater>,
     pub(crate) vegetation: Option<crate::vegetation::AuthoritativeVegetation>,
     /// The world a reset replaced, being freed on another thread (see [`Retiring`]).
     retiring: Retiring,
@@ -179,6 +184,7 @@ impl Simulation {
         physics_origin: PhysicsOrigin,
     ) -> Result<Self, crate::world::WorldError> {
         let water_setup = config.water;
+        let column_water_setup = config.column_water;
         let vegetation_setup = config.vegetation;
         let world_span = crate::prof::Span::start("startup.world_and_collision");
         let world = SimWorld::new_with_terrain_collider_mode_and_origin(
@@ -196,9 +202,22 @@ impl Simulation {
             next_control_seq: 1,
             next_damage_seq: 0,
             water: None,
+            column_water: None,
             vegetation: None,
             additional_water: Vec::new(),
         };
+        if let Some(setup) = column_water_setup {
+            let _span = crate::prof::Span::start("startup.column_water");
+            simulation.column_water = Some(
+                crate::column_water::AuthoritativeColumnWater::new(
+                    &simulation.world.terrain().volume,
+                    setup,
+                )
+                .map_err(|error| {
+                    crate::world::WorldError::WaterInitialization(error.to_string())
+                })?,
+            );
+        }
         if let Some(setup) = water_setup {
             let _span = crate::prof::Span::start("startup.water_boundary");
             simulation.water = Some(
@@ -238,6 +257,7 @@ impl Simulation {
             // Canonical fluid state is added to checkpoints in ENG-105
             // increment 3; recovered simulations do not claim water yet.
             water: None,
+            column_water: None,
             vegetation: None,
             additional_water: Vec::new(),
         };
@@ -263,6 +283,7 @@ impl Simulation {
             pipeline,
             water,
             additional_water,
+            column_water,
             vegetation,
             ..
         } = fresh;
@@ -281,6 +302,7 @@ impl Simulation {
         }
         let old_water = std::mem::replace(&mut self.water, water);
         let old_additional_water = std::mem::replace(&mut self.additional_water, additional_water);
+        let old_column_water = std::mem::replace(&mut self.column_water, column_water);
         let old_vegetation = std::mem::replace(&mut self.vegetation, vegetation);
         // The replaced world goes away off the tick thread.
         self.retiring.retire((
@@ -288,6 +310,7 @@ impl Simulation {
             old_pipeline,
             old_water,
             old_additional_water,
+            old_column_water,
             old_vegetation,
         ));
         Ok(())
@@ -321,6 +344,26 @@ impl Simulation {
     /// install a fluid region (or was restored before persistence support).
     pub fn water(&self) -> Option<&crate::water::AuthoritativeWater> {
         self.water.as_ref()
+    }
+
+    /// Read-only stacked-column water, when this world installed one.
+    pub fn column_water(&self) -> Option<&crate::column_water::AuthoritativeColumnWater> {
+        self.column_water.as_ref()
+    }
+
+    /// Installs recovered column water (checkpoint recovery). Replaces any
+    /// water this simulation started with.
+    pub fn restore_column_water(
+        &mut self,
+        state: &spall_protocol::column_water::ColumnWaterState,
+        config: spall_fluid::columns::ColumnConfig,
+    ) -> Result<(), crate::column_water::ColumnWaterError> {
+        self.column_water = Some(crate::column_water::AuthoritativeColumnWater::restore(
+            &self.world.terrain().volume,
+            state,
+            config,
+        )?);
+        Ok(())
     }
 
     pub fn water_regions(&self) -> impl Iterator<Item = &crate::water::AuthoritativeWater> {
@@ -508,6 +551,9 @@ impl Simulation {
     /// into range). A no-op — not an error — when this world has no water or
     /// the scene authored no gated spring.
     pub fn set_water_spring_rate(&self, rate: u8) {
+        if let Some(water) = &self.column_water {
+            water.set_gated_sources_rate(rate);
+        }
         if let Some(water) = &self.water {
             water.set_gated_sources_rate(rate);
         }
@@ -677,6 +723,24 @@ impl Simulation {
         self.grow_water_regions(&report);
         drop(grow_span);
         let water_span = crate::prof::Span::start("tick.water");
+        if let Some(water) = &mut self.column_water {
+            let reloaded: Vec<spall_core::BrickCoord> = report
+                .reloaded_bricks
+                .iter()
+                .filter(|(volume, _)| *volume == terrain_id)
+                .map(|(_, coord)| *coord)
+                .collect();
+            report.column_water = Some(
+                water
+                    .tick(
+                        &self.world.terrain().volume,
+                        &edited_terrain_bricks,
+                        &reloaded,
+                        f64::from(TICK_DT_S),
+                    )
+                    .map_err(|error| TickError::Water(error.to_string()))?,
+            );
+        }
         if let Some(water) = &mut self.water {
             let dirty = edited_terrain_bricks
                 .iter()
