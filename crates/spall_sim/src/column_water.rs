@@ -289,6 +289,9 @@ impl AuthoritativeColumnWater {
     }
 
     fn region_frame(&self, key: RegionKey) -> Option<RegionFrame> {
+        // A span too shallow to quantize above zero is not published: depth
+        // zero means dry on the wire, and a region of only such films would
+        // otherwise vanish on the client while the server still holds it.
         let spans: Vec<FrameSpan> = self
             .world
             .region_wet_spans(key, DRY_VOLUME)
@@ -306,6 +309,7 @@ impl AuthoritativeColumnWater {
                         .min(f64::from(u16::MAX)) as u16,
                 }
             })
+            .filter(|span| span.depth_q > 0)
             .collect();
         (!spans.is_empty()).then_some(RegionFrame { key, spans })
     }

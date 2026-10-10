@@ -52,6 +52,7 @@ pub enum WireTag {
     CatalogueChunk = 20,
     CatalogueAck = 21,
     ControlProbe = 22,
+    ColumnWaterUpdate = 23,
 }
 
 impl WireTag {
@@ -79,6 +80,7 @@ impl WireTag {
             20 => Self::CatalogueChunk,
             21 => Self::CatalogueAck,
             22 => Self::ControlProbe,
+            23 => Self::ColumnWaterUpdate,
             _ => return None,
         })
     }

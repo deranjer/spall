@@ -1826,6 +1826,7 @@ async fn run_async(
                 HashMap::<spall_core::GlobalCell, spall_protocol::WaterAssembler>::new();
             let mut water_deltas =
                 HashMap::<spall_core::GlobalCell, spall_protocol::WaterDeltaAssembler>::new();
+            let mut column_water = spall_protocol::ColumnWaterReplica::default();
             // Diagnostic: how the control reader spends its time, by record kind.
             let mut profile = ControlProfile::with_watch(control_watch);
             loop {
@@ -1836,6 +1837,7 @@ async fn run_async(
                     Ok(Some(WireRecord::VegetationSnapshot(_))) => "vegetation",
                     Ok(Some(WireRecord::WaterSnapshot(_))) => "water-snapshot",
                     Ok(Some(WireRecord::WaterDelta(_))) => "water-delta",
+                    Ok(Some(WireRecord::ColumnWaterUpdate(_))) => "column-water",
                     Ok(Some(WireRecord::TopologyTransaction(_))) => "transaction",
                     Ok(Some(WireRecord::BaselineBegin(_))) => "baseline-begin",
                     Ok(Some(WireRecord::BaselineEnd(_))) => "baseline-end",
@@ -1931,6 +1933,54 @@ async fn run_async(
                                 // bug, so say so.
                                 counters.water_errors.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("spall-client: dropped a water keyframe: {error}");
+                            }
+                        }
+                    }
+                    Ok(Some(WireRecord::ColumnWaterUpdate(update))) => {
+                        match column_water.apply(&update) {
+                            Ok(applied) => {
+                                let counter = if applied.baseline {
+                                    &counters.water_keyframes
+                                } else {
+                                    &counters.water_delta_frames
+                                };
+                                counter.fetch_add(1, Ordering::Relaxed);
+                                counters
+                                    .last_tick
+                                    .fetch_max(update.server_tick.get(), Ordering::Relaxed);
+                                let retried =
+                                    observe_tick_and_retry(&replica, update.server_tick.get());
+                                for (_, outcome) in retried {
+                                    forward_outcome(&conn, &counters, outcome).await;
+                                }
+                                counters
+                                    .water_frame_seq
+                                    .store(column_water.frame_seq, Ordering::Relaxed);
+                                counters
+                                    .water_regions
+                                    .store(column_water.region_count() as u64, Ordering::Relaxed);
+                                if let Some(session) = &interactive {
+                                    let spans = column_water.region_spans(applied.key);
+                                    session.upsert_water_region(
+                                        spall_core::GlobalCell::new(
+                                            i64::from(applied.key.0) * 32,
+                                            0,
+                                            i64::from(applied.key.1) * 32,
+                                        ),
+                                        crate::column_water_view::region_keyframe(
+                                            applied.key,
+                                            &spans,
+                                            update.server_tick,
+                                            column_water.frame_seq,
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                // Records are ordered, so a refused delta is a
+                                // server bug, not loss: say so.
+                                counters.water_errors.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("spall-client: rejected column water update: {error}");
                             }
                         }
                     }
@@ -2033,6 +2083,7 @@ async fn run_async(
                             Ok(()) => {
                                 water.clear();
                                 water_deltas.clear();
+                                column_water.clear();
                                 counters.world_resets.fetch_add(1, Ordering::Relaxed);
                                 if let Some(session) = &interactive {
                                     session.clear_water();

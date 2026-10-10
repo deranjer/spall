@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-pub const WATER_BYTES_PER_SECOND: usize = 128 * 1024;
-pub const WATER_BURST_BYTES: usize = 128 * 1024;
+pub(crate) const WATER_BYTES_PER_SECOND: usize = 128 * 1024;
+pub(crate) const WATER_BURST_BYTES: usize = 128 * 1024;
 const KEYFRAME_TICKS: u64 = 60;
 
 /// One water frame shared by every session's publisher. Its full-keyframe encoding (a whole

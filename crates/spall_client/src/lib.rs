@@ -2,6 +2,7 @@
 //! and transport wiring are added by later tasks.
 
 pub mod catalogue;
+pub mod column_water_view;
 pub mod day_night;
 pub mod ecology_demo;
 pub mod grid_fluid_demo;

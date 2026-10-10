@@ -427,6 +427,33 @@ impl InteractiveSession {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Sets or removes the replicated column-water frame of one region, keyed
+    /// by its x/z origin (the dense frame's y origin follows the lowest wet
+    /// floor and may change). Unlike [`Self::publish_water`] it has no region
+    /// cap or supersession: a world holds hundreds of regions.
+    pub fn upsert_water_region(
+        &self,
+        origin: spall_core::GlobalCell,
+        frame: Option<spall_protocol::WaterKeyframe>,
+    ) {
+        let mut regions = self.water_regions.lock().unwrap_or_else(|e| e.into_inner());
+        let at = regions
+            .iter()
+            .position(|f| f.origin.x == origin.x && f.origin.z == origin.z);
+        match (at, frame) {
+            (Some(i), Some(f)) => regions[i] = Arc::new(f),
+            (Some(i), None) => {
+                regions.remove(i);
+            }
+            (None, Some(f)) => regions.push(Arc::new(f)),
+            (None, None) => return,
+        }
+        regions.sort_by_key(|f| (f.origin.x, f.origin.y, f.origin.z));
+        *self.water.lock().unwrap_or_else(|e| e.into_inner()) = regions.first().cloned();
+        self.water_publications
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn clear_water(&self) {
         *self.vegetation.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.water_regions

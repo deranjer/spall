@@ -305,6 +305,7 @@ pub struct CustomWorld {
     build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
     water: Option<spall_sim::WaterSetup>,
     additional_water: Vec<spall_sim::WaterSetup>,
+    column_water: Option<spall_sim::column_water::ColumnWaterSetup>,
     dam_gate: Option<DamGate>,
     vegetation: Option<spall_ecology::living::LivingState>,
 }
@@ -338,6 +339,7 @@ impl CustomWorld {
             build: Arc::new(build),
             water,
             additional_water: Vec::new(),
+            column_water: None,
             dam_gate: None,
             vegetation: None,
         }
@@ -349,6 +351,17 @@ impl CustomWorld {
     pub fn with_dam_gate(mut self, gate: DamGate) -> Self {
         self.dam_gate = Some(gate);
         self
+    }
+
+    /// Installs stacked-column water (ENG-167), the production water model.
+    #[must_use]
+    pub fn with_column_water(mut self, setup: spall_sim::column_water::ColumnWaterSetup) -> Self {
+        self.column_water = Some(setup);
+        self
+    }
+
+    pub fn column_water_setup(&self) -> Option<&spall_sim::column_water::ColumnWaterSetup> {
+        self.column_water.as_ref()
     }
 
     pub fn with_additional_water(mut self, regions: Vec<spall_sim::WaterSetup>) -> Self {
@@ -505,6 +518,7 @@ impl Scene {
         let mut sim_config = SimulationConfig::new(setup);
         sim_config.terrain_collider_mode = mode;
         sim_config.water = custom.and_then(CustomWorld::water_setup).cloned();
+        sim_config.column_water = custom.and_then(|c| c.column_water.clone());
         sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if let Some(custom) = custom {
@@ -2782,6 +2796,10 @@ async fn serve_async(
             u64,
             HashMap<GlobalCell, crate::water_replication::WaterPublisher>,
         > = HashMap::new();
+        let mut column_water_sent: HashMap<
+            u64,
+            crate::column_water_replication::ColumnWaterPublisher,
+        > = HashMap::new();
         let mut water_keyframes_sent = 0u64;
         let mut water_bytes_queued = 0u64;
         let mut water_growths_seen = 0u64;
@@ -3082,6 +3100,7 @@ async fn serve_async(
                         lj.on_gone(session);
                         player_principals.remove(&session.raw());
                         water_sent.remove(&session.raw());
+                        column_water_sent.remove(&session.raw());
                     }
                 }
             }
@@ -3189,6 +3208,7 @@ async fn serve_async(
                                 prev_body_y.clear();
                                 body_stable_ticks = 0;
                                 water_sent.clear();
+                                column_water_sent.clear();
                                 if let Some(drops) = playground_drops.as_mut() {
                                     *drops = playground_drop_schedules(&sim);
                                 }
@@ -3229,10 +3249,13 @@ async fn serve_async(
                         }
                     }
                     spall_protocol::AdminCommand::SetWaterSpring { rate } => {
-                        let has_gated_spring = custom_world
-                            .as_ref()
-                            .and_then(CustomWorld::water_setup)
-                            .is_some_and(|w| w.gated_sources.iter().any(|tier| !tier.is_empty()));
+                        let has_gated_spring = custom_world.as_ref().is_some_and(|c| {
+                            c.water_setup().is_some_and(|w| {
+                                w.gated_sources.iter().any(|tier| !tier.is_empty())
+                            }) || c
+                                .column_water_setup()
+                                .is_some_and(|w| w.gated_sources.iter().any(|t| !t.is_empty()))
+                        });
                         if !admin_commands {
                             spall_protocol::AdminStatus {
                                 request_id: req.request_id,
@@ -3806,6 +3829,43 @@ async fn serve_async(
                         Err(e) => {
                             return SimResult::error(
                                 format!("water update encoding: {e}"),
+                                ticks_run,
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(column_water) = sim.column_water() {
+                let frame = column_water.frame();
+                for session in lj.live_sessions().collect::<Vec<_>>() {
+                    if water_backlogged(&clients_for_sim, session) {
+                        continue;
+                    }
+                    match column_water_sent.entry(session.raw()).or_default().poll(
+                        tick.get(),
+                        sim.current_tick(),
+                        &frame,
+                    ) {
+                        Ok(records) if !records.is_empty() => {
+                            water_keyframes_sent += 1;
+                            water_bytes_queued += records
+                                .iter()
+                                .map(|r| {
+                                    r.encode_framed().expect("publisher validated record").len()
+                                        as u64
+                                        + 32
+                                })
+                                .sum::<u64>();
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Water(Arc::new(records)),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            return SimResult::error(
+                                format!("column water update encoding: {e}"),
                                 ticks_run,
                             );
                         }

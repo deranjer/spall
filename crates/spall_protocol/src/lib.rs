@@ -23,6 +23,7 @@ pub mod baseline;
 pub mod canonical;
 pub mod codec;
 pub mod column_water;
+pub mod column_water_wire;
 pub mod component_water;
 pub mod handshake;
 pub mod input;
@@ -49,6 +50,7 @@ pub use codec::{
     encode_control, encode_datagram,
 };
 pub use column_water::{ColumnWaterDelta, ColumnWaterState};
+pub use column_water_wire::{ColumnWaterReplica, ColumnWaterUpdate};
 pub use handshake::{
     AlgorithmVersions, Handshake, Incompatibility, NegotiatedLimits, PROTOCOL_VERSION,
     check_compatible,

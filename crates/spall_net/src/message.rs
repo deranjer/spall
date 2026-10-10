@@ -47,6 +47,7 @@ pub enum WireRecord {
     CatalogueChunk(spall_protocol::CatalogueChunk),
     CatalogueAck(spall_protocol::CatalogueAck),
     ControlProbe(spall_protocol::ControlProbe),
+    ColumnWaterUpdate(spall_protocol::ColumnWaterUpdate),
 }
 
 impl WireRecord {
@@ -73,6 +74,7 @@ impl WireRecord {
             Self::CatalogueChunk(_) => WireTag::CatalogueChunk,
             Self::CatalogueAck(_) => WireTag::CatalogueAck,
             Self::ControlProbe(_) => WireTag::ControlProbe,
+            Self::ColumnWaterUpdate(_) => WireTag::ColumnWaterUpdate,
         }
     }
 
@@ -100,6 +102,7 @@ impl WireRecord {
             Self::CatalogueChunk(r) => encode_control(r),
             Self::CatalogueAck(r) => encode_control(r),
             Self::ControlProbe(r) => encode_control(r),
+            Self::ColumnWaterUpdate(r) => encode_control(r),
         }
     }
 
@@ -136,6 +139,7 @@ impl WireRecord {
             WireTag::CatalogueChunk => Self::CatalogueChunk(decode_control(bytes)?),
             WireTag::CatalogueAck => Self::CatalogueAck(decode_control(bytes)?),
             WireTag::ControlProbe => Self::ControlProbe(decode_control(bytes)?),
+            WireTag::ColumnWaterUpdate => Self::ColumnWaterUpdate(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,
