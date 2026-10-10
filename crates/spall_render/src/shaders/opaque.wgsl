@@ -348,22 +348,33 @@ fn sample_indirect(world_pos: vec3<f32>, normal: vec3<f32>, base: vec3<f32>) -> 
 const WATER_NONE: f32 = -1.0e8;
 // Per-metre absorption in linear RGB: red dies first, blue last.
 const WATER_ABSORB: vec3<f32> = vec3<f32>(0.45, 0.11, 0.05);
-// Fog distance snaps to this many metres (one voxel is 0.25 m) so the
-// falloff stays chunky instead of reading as smooth volumetric haze.
-const WATER_BAND_M: f32 = 0.25;
+// Water thinner than this (metres) is a film left on the ground, not water:
+// no fog, tint or caustics on the dry ground it sits on.
+const WATER_MIN_DEPTH_M: f32 = 0.04;
+// A surface lying on the bed of a pool sits exactly at the pool's bottom height;
+// compared without a margin, floating-point error decides per pixel whether it
+// is under water, which drew fog on and off in fine stripes.
+const WATER_BOTTOM_TOL_M: f32 = 0.03;
 
 // Size of the faint grain cells on the water surface (one voxel) and how strong
 // they are: 0.0 is glass, 0.2 is plainly checkered.
 const WATER_VOXEL_M: f32 = 0.25;
 const WATER_VOXEL_HINT: f32 = 0.22;
 
-// Top and bottom of the selected wet run, or WATER_NONE for a dry column.
+// Top and bottom of the selected wet run, or WATER_NONE for a dry column or
+// one holding only a film. The top is the smoothed surface where there is one
+// (the grid water look): the raw per-cell height jitters by hundredths of a
+// metre, which turned the fog below into per-cell speckle.
 fn water_bounds_at(xz: vec2<f32>) -> vec2<f32> {
     if globals.water_cam.w < 0.5 { return vec2<f32>(WATER_NONE); }
     let c = vec2<i32>(floor((xz - globals.water_field.xy) / globals.water_field.z));
     let dim = i32(globals.water_field.w);
     if any(c < vec2<i32>(0)) || any(c >= vec2<i32>(dim)) { return vec2<f32>(WATER_NONE); }
-    return textureLoad(water_field_tex, c, 0).rg;
+    let t = textureLoad(water_field_tex, c, 0);
+    if t.x - t.y < WATER_MIN_DEPTH_M { return vec2<f32>(WATER_NONE); }
+    var top = t.x;
+    if t.z > WATER_NONE * 0.5 { top = t.z; }
+    return vec2<f32>(top, t.y);
 }
 
 // Light scattered back toward the viewer by water at `depth` below the surface.
@@ -378,7 +389,7 @@ fn water_scatter(depth: f32) -> vec3<f32> {
 // Blends `lit` toward the water's scatter colour over the stretch of the view
 // ray that runs through water, from `enter` to `leave`.
 fn water_fog(lit: vec3<f32>, enter: vec3<f32>, leave: vec3<f32>, surface_y: f32) -> vec3<f32> {
-    let path = floor(length(leave - enter) / WATER_BAND_M + 0.5) * WATER_BAND_M;
+    let path = length(leave - enter);
     let t = exp(-WATER_ABSORB * path);
     let depth = surface_y - 0.5 * (enter.y + leave.y);
     return lit * t + water_scatter(depth) * (vec3<f32>(1.0) - t);
@@ -391,7 +402,7 @@ fn apply_water_view(lit: vec3<f32>, p: vec3<f32>, probe_xz: vec2<f32>) -> vec3<f
     let cam_in = globals.water_cam.x > 0.5;
     let bounds = water_bounds_at(probe_xz);
     // Dry spaces below a pool are not underwater, even at the same X/Z.
-    if p.y < bounds.y { return lit; }
+    if p.y < bounds.y - WATER_BOTTOM_TOL_M { return lit; }
     var s = bounds.x;
     if cam_in { s = globals.water_cam.y; }
     if s <= WATER_NONE { return lit; }
@@ -407,12 +418,11 @@ fn apply_water_view(lit: vec3<f32>, p: vec3<f32>, probe_xz: vec2<f32>) -> vec3<f
     return water_fog(lit, enter, leave, s);
 }
 
-// Drifting caustic veins (Worley F2-F1) sampled on a quarter-metre grid and
-// stepped at four frames a second, so the pattern is blocky like the world.
+// Drifting caustic veins (Worley F2-F1), continuous in space and time and
+// faded with distance so they never alias into speckle.
 fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
-    let time = floor(globals.water_cam.z * 4.0) * 0.25;
-    let q = (floor(p.xz * 4.0) + vec2<f32>(0.5)) * 0.25;
-    let g = q * 0.8 + vec2<f32>(time * 0.31, time * 0.19);
+    let time = globals.water_cam.z;
+    let g = p.xz * 0.8 + vec2<f32>(time * 0.31, time * 0.19);
     let cell = floor(g);
     let f = g - cell;
     var f1 = 8.0;
@@ -431,7 +441,8 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
         }
     }
     let vein = 1.0 - smoothstep(0.0, 0.22, f2 - f1);
-    let strength = exp(-0.12 * depth) * clamp(n.y, 0.0, 1.0);
+    let far = 1.0 - smoothstep(25.0, 70.0, length(p - globals.camera_pos.xyz));
+    let strength = exp(-0.12 * depth) * clamp(n.y, 0.0, 1.0) * far;
     return mix(1.0, 0.72 + 1.0 * vein, strength);
 }
 
@@ -500,7 +511,7 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
     let wet_bounds = water_bounds_at(probe_xz);
     let wet_h = wet_bounds.x;
     var sub_light = vec3<f32>(1.0);
-    if in.world_pos.y >= wet_bounds.y && in.world_pos.y < wet_h {
+    if in.world_pos.y >= wet_bounds.y - WATER_BOTTOM_TOL_M && in.world_pos.y < wet_h {
         let depth = wet_h - in.world_pos.y;
         let sun_path = depth / max(l.y, 0.3);
         direct = direct * exp(-WATER_ABSORB * sun_path) * water_caustics(in.world_pos, depth, n);

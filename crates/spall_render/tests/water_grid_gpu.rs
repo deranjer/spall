@@ -202,3 +202,125 @@ fn the_grid_surface_draws_calm_and_disturbed_water() {
     let busy = mean(&busy_bank, w / 3, 2 * w / 3, h / 2, 3 * h / 4);
     assert!(busy.iter().all(|c| *c > 5.0), "{busy:?}");
 }
+
+/// Height of a terraced lakebed: concentric 0.25 m steps shelving toward the
+/// shore, like the voxel terrain under a real lake.
+fn bed_height(ix: i32, iz: i32) -> f32 {
+    let (dx, dz) = ((ix - 24) as f32, (iz - 24) as f32);
+    let r = (dx * dx + dz * dz).sqrt();
+    (0.25 * (r / 5.0).floor()).min(1.5)
+}
+
+fn terraced_basin() -> Vec<CubeInstance> {
+    let id = CubeInstance::IDENTITY_ROTATION;
+    let mut cubes = vec![
+        CubeInstance::new([-0.5, 1.25, 6.0], 2, [1.0, 3.5, 14.0], id),
+        CubeInstance::new([12.5, 1.25, 6.0], 2, [1.0, 3.5, 14.0], id),
+        CubeInstance::new([6.0, 1.25, -0.5], 2, [14.0, 3.5, 1.0], id),
+        CubeInstance::new([6.0, 1.25, 12.5], 2, [14.0, 3.5, 1.0], id),
+    ];
+    for iz in 0..LAKE_CELLS {
+        for ix in 0..LAKE_CELLS {
+            let top = bed_height(ix, iz);
+            cubes.push(CubeInstance::new(
+                [
+                    (ix as f32 + 0.5) * CELL,
+                    top - 1.0,
+                    (iz as f32 + 0.5) * CELL,
+                ],
+                1,
+                [CELL, 2.0, CELL],
+                id,
+            ));
+        }
+    }
+    cubes
+}
+
+fn bed_field() -> WaterField {
+    let mut f = field(true, 0.0);
+    let off = (-ORIGIN / CELL) as i32;
+    // FILM=1 turns the right third of the bed into what a drained area leaves
+    // behind: a few millimetres of unmoving water on dry ground.
+    let film = std::env::var("FILM").is_ok();
+    for iz in 0..LAKE_CELLS {
+        for ix in 0..LAKE_CELLS {
+            let i = ((ix + off) + DIM as i32 * (iz + off)) as usize;
+            f.bottoms[i] = bed_height(ix, iz);
+            if film && ix >= 32 {
+                f.heights[i] = f.bottoms[i] + 0.004;
+                f.smooth[i] = f.heights[i];
+            }
+        }
+    }
+    f
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; writes review PNGs"]
+fn the_lakebed_seen_from_above() {
+    let Some(ctx) = RenderContext::headless().ok() else {
+        return;
+    };
+    let target = OffscreenTarget::new(&ctx.device, SIZE.0, SIZE.1);
+    let mut renderer = GameRenderer::new(
+        &ctx.device,
+        &ctx.queue,
+        COLOR_FORMAT,
+        &materials(),
+        SIZE,
+        None,
+    );
+    renderer.set_terrain(&ctx.device, &ctx.queue, &terraced_basin());
+    // WATER=off renders the bed alone, to tell terrain artifacts from water ones.
+    let water = std::env::var("WATER").map_or(true, |v| v != "off");
+    if water {
+        renderer.set_water_field(&ctx.device, &ctx.queue, Some(bed_field()));
+        renderer.set_water_grid_surface(true);
+    }
+    renderer.set_water_time(2.0);
+    let environment = EnvironmentPreset::Daylight.environment();
+    for (name, eye, at) in [
+        (
+            if water {
+                "bed-top.png"
+            } else {
+                "bed-dry-top.png"
+            },
+            Vec3::new(6.0, 12.0, 6.01),
+            Vec3::new(6.0, 0.0, 6.0),
+        ),
+        (
+            "bed-oblique.png",
+            Vec3::new(2.0, 7.0, -1.0),
+            Vec3::new(6.0, 0.5, 7.0),
+        ),
+    ] {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        renderer.render(
+            &ctx.device,
+            &ctx.queue,
+            &mut encoder,
+            target.color_view(),
+            &camera(eye, at),
+            &environment,
+            DebugView::Shaded,
+        );
+        target.copy_to_readback(&mut encoder);
+        ctx.queue.submit([encoder.finish()]);
+        let rgba = target.read_rgba(&ctx).expect("readback");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/runs/water-grid");
+        std::fs::create_dir_all(&dir).unwrap();
+        image::save_buffer(
+            dir.join(name),
+            &rgba,
+            SIZE.0,
+            SIZE.1,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+    }
+}
