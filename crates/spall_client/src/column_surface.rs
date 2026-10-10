@@ -26,14 +26,24 @@ use crate::predict::CELL_M;
 
 const EDGE: i32 = 32;
 const TILE_CELLS: usize = (EDGE * EDGE) as usize;
+/// Columns per replicated window, and windows per tile.
+const WINDOW_COLUMNS: usize = 128;
+const WINDOWS: usize = TILE_CELLS / WINDOW_COLUMNS;
 /// Wire depth units per cell.
 const DEPTH_SCALE: f32 = 128.0;
 /// Time constant of the surface following the server's heights.
 const EASE_S: f32 = 0.15;
 /// Time constant of agitation fading once the surface settles.
 const AGITATION_DECAY_S: f32 = 0.7;
-/// Surface speed (m/s) that counts as fully agitated.
+/// Surface speed (m/s) that counts as fully agitated, and the speed below
+/// which a surface is just settling or draining and shows no agitation at all.
 const AGITATION_FULL_M_S: f32 = 0.9;
+const AGITATION_FLOOR_M_S: f32 = 0.15;
+/// Shortest interval a speed is measured over (the server publishes at 15 Hz).
+const MIN_INTERVAL_S: f32 = 0.1;
+/// Water appearing in a column deeper than this is a jet or a front, not a
+/// shoreline creeping, and starts a little lively.
+const LIVELY_DEPTH_M: f32 = 0.3;
 /// A tile stops animating once every column is this close (m) to its target.
 const SETTLED_M: f32 = 0.0015;
 /// Smoothing kernel reach in cells and its binomial weights.
@@ -63,7 +73,8 @@ struct Tile {
     top: Vec<f32>,
     agitation: Vec<f32>,
     animating: bool,
-    last_update_s: f64,
+    /// When each 128-column window last changed, for measuring how fast it moves.
+    last_update_s: [f64; WINDOWS],
 }
 
 impl Tile {
@@ -74,7 +85,7 @@ impl Tile {
             top: vec![NO_WATER; TILE_CELLS],
             agitation: vec![0.0; TILE_CELLS],
             animating: false,
-            last_update_s: now,
+            last_update_s: [now; WINDOWS],
         }
     }
 }
@@ -207,22 +218,37 @@ impl ColumnSurface {
             }
         }
         let tile = self.tiles.entry(key).or_insert_with(|| Tile::empty(now));
-        let dt = ((now - tile.last_update_s) as f32).max(0.05);
-        tile.last_update_s = now;
+        // Speed is measured over the time since *these columns'* window last
+        // changed. Windows of one region arrive in the same instant, so a
+        // per-tile clock gave every window after the first a near-zero interval
+        // and made slow drains look like surges.
+        let windows = range.start / WINDOW_COLUMNS..=(range.end - 1) / WINDOW_COLUMNS;
+        let since = windows
+            .clone()
+            .map(|w| now - tile.last_update_s[w])
+            .fold(0.0f64, f64::max);
+        let dt = (since as f32).max(MIN_INTERVAL_S);
+        for w in windows {
+            tile.last_update_s[w] = now;
+        }
         for i in range {
             let (old, new) = (tile.target_top[i], target[i]);
             match (wet(old), wet(new)) {
                 (true, true) => {
                     // How fast the server surface just moved.
                     let speed = (new - old).abs() / dt;
-                    let a = (speed / AGITATION_FULL_M_S).clamp(0.0, 1.0);
+                    let a = ((speed - AGITATION_FLOOR_M_S)
+                        / (AGITATION_FULL_M_S - AGITATION_FLOOR_M_S))
+                        .clamp(0.0, 1.0);
                     tile.agitation[i] = tile.agitation[i].max(a);
                 }
                 (false, true) => {
                     // New water appears at its server height, a little lively
                     // (a spring, or a front arriving).
                     tile.top[i] = new;
-                    tile.agitation[i] = tile.agitation[i].max(0.35);
+                    if new - bottom[i] > LIVELY_DEPTH_M {
+                        tile.agitation[i] = tile.agitation[i].max(0.35);
+                    }
                 }
                 (true, false) => {
                     tile.top[i] = NO_WATER;
@@ -564,6 +590,56 @@ mod tests {
         }
         assert_eq!(s.field().agitation[cell(&s, 0, 0)], 0.0);
         assert_eq!(s.animating_tiles(), 0, "a settled surface costs nothing");
+    }
+
+    /// A region draining slowly, delivered window by window in the same instant
+    /// (as the network does), must not look agitated: this is what lit up
+    /// strips of the lake one after another.
+    #[test]
+    fn a_slow_drain_delivered_window_by_window_stays_calm() {
+        let mut s = surface();
+        let pool =
+            |depth_q: u16| -> Vec<WireSpan> { (0..1024u16).map(|c| span(c, 4, depth_q)).collect() };
+        s.set_region_at((0, 0), &pool(1280), 0.0);
+        let window = |depth_q: u16, w: u16| -> Vec<WireSpan> {
+            (w * 128..(w + 1) * 128)
+                .map(|c| span(c, 4, depth_q))
+                .collect()
+        };
+        // Every 0.25 s the surface falls 0.02 m (0.08 m/s): well under the floor.
+        let mut depth_q = 1280.0f32;
+        for step in 1..=20 {
+            depth_q -= 0.02 / CELL_M * 128.0;
+            let now = f64::from(step) * 0.25;
+            for w in 0..8u16 {
+                s.set_window_at((0, 0), w as u8, &window(depth_q as u16, w), now);
+            }
+            s.advance_to(now);
+        }
+        let worst = s.field().agitation.iter().fold(0.0f32, |m, &a| m.max(a));
+        assert!(worst < 0.05, "a slow drain showed agitation {worst}");
+    }
+
+    /// A real surge (a metre a second) does register, window by window.
+    #[test]
+    fn a_fast_surge_is_agitated_in_every_window() {
+        let mut s = surface();
+        let pool =
+            |depth_q: u16| -> Vec<WireSpan> { (0..1024u16).map(|c| span(c, 4, depth_q)).collect() };
+        s.set_region_at((0, 0), &pool(256), 0.0);
+        for w in 0..8u16 {
+            let spans: Vec<WireSpan> = (w * 128..(w + 1) * 128)
+                .map(|c| span(c, 4, 256 + 256))
+                .collect();
+            s.set_window_at((0, 0), w as u8, &spans, 0.5); // +0.5 m in 0.5 s
+        }
+        s.advance_to(0.5);
+        let f = s.field();
+        for w in 0..8usize {
+            let col = w * 128 + 5;
+            let a = f.agitation[cell(&s, (col % 32) as i64, (col / 32) as i64)];
+            assert!(a > 0.3, "window {w} agitation {a}");
+        }
     }
 
     #[test]
