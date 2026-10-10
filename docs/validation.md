@@ -1602,3 +1602,24 @@ regional fixtures with `cargo xtask scenario --name eng114-regional-1024m-stress
 Both keep eight foundation cuts, two resets and two clients; the impaired case keeps
 G3's original 16 MiB / 30 s join bounds. See reports/ENG-114-startup-streaming.md
 for measured startup, bounded workload results, rejected candidates and open gates.
+
+### ENG-114 regional replica diagnostics
+
+Harness-spawned processes lose stderr and `RUST_LOG` defaults to errors only. Run the
+regional fixtures with `RUST_LOG=spall_client=info,spall_server=info,spall_net=info`
+and `SPALL_LOG_FILE=<dir>/proc` to keep one log per process (client control-reader and
+mover profiles, slow repair patches, rejected-transaction reasons, backlog overflow
+composition, admin request send/receive). `RUST_LOG=spall_client=debug` adds each
+transaction's ops and `before` brick states. A fixture passes only when every client
+reports zero rejected transactions, both resets, matching final hashes and the mover
+criteria; see reports/ENG-114-startup-streaming.md for the current measured state.
+
+ENG-114 deferred catalogue fixtures: `cargo xtask scenario --name eng114-regional-1024m-stress-deferred`
+and `eng114-regional-1024m-impaired-deferred` (see tools/measure-worldgen-stress.ps1). They add
+`defer_catalogue` to their originals without changing workload, limits or thresholds. The join
+budget's 30 s bound then measures readiness (baseline installed, first keyframe confirmed) and its
+16 MiB bound counts baseline plus catalogue bytes; every client must still finish on the server's
+exact hash, so an unfinished catalogue fails the run. Client summaries report
+`catalogue_complete_ms`, `catalogue_compressed_bytes`, `catalogue_pending_at_end` and the
+transactions still held at the end. The original `eng114-regional-1024m-impaired` still fails its
+30 s join by design of its transport profile; see reports/ENG-114-startup-streaming.md.
