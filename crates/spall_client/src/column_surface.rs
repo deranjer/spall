@@ -49,11 +49,19 @@ const SETTLED_M: f32 = 0.0015;
 /// Smoothing kernel reach in cells and its binomial weights.
 const KERNEL_RADIUS: i32 = 2;
 const KERNEL: [f32; 5] = [1.0, 4.0, 6.0, 4.0, 1.0];
-/// Cells per side of the camera field: 128 m at a quarter metre.
-pub const FIELD_DIM: u32 = 512;
-/// The field recentres when the camera is closer than this many cells to its
-/// edge.
-const RECENTRE_MARGIN_CELLS: i64 = 96;
+/// View radius the field is sized for until told otherwise.
+pub const DEFAULT_VIEW_RADIUS_M: f32 = 96.0;
+/// Slack beyond the view on each side before the field recentres, in cells
+/// (a few regions, so it does not recentre every few steps).
+const RECENTRE_SLACK_CELLS: i64 = 128;
+
+/// Cells per side of the camera field for a view radius: the view on both
+/// sides of the camera plus the slack, in whole regions.
+pub fn field_dim_for_radius(radius_m: f32) -> u32 {
+    let radius_cells = (radius_m / CELL_M).ceil() as i64;
+    let dim = 2 * (radius_cells + RECENTRE_SLACK_CELLS);
+    (dim as u32).div_ceil(EDGE as u32) * EDGE as u32
+}
 
 /// A rectangle of field cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +105,10 @@ fn wet(h: f32) -> bool {
 /// Persistent replicated-water surface plus the camera field built from it.
 pub struct ColumnSurface {
     epoch: Instant,
+    /// Cells per side of the camera field, and how many cells of water the
+    /// camera must always have around it.
+    dim: u32,
+    view_cells: i64,
     tiles: HashMap<(i32, i32), Tile>,
     /// World cell at field cell (0, 0), and the CPU copy of the field.
     window_origin: Option<(i64, i64)>,
@@ -116,9 +128,15 @@ impl ColumnSurface {
     pub fn new() -> Self {
         Self {
             epoch: Instant::now(),
+            dim: field_dim_for_radius(DEFAULT_VIEW_RADIUS_M),
+            view_cells: (DEFAULT_VIEW_RADIUS_M / CELL_M).ceil() as i64,
             tiles: HashMap::new(),
             window_origin: None,
-            field: WaterField::new([0.0, 0.0], CELL_M, FIELD_DIM),
+            field: WaterField::new(
+                [0.0, 0.0],
+                CELL_M,
+                field_dim_for_radius(DEFAULT_VIEW_RADIUS_M),
+            ),
             dirty: Vec::new(),
             needs_full_upload: false,
             last_advance_s: 0.0,
@@ -133,6 +151,22 @@ impl ColumnSurface {
         self.tiles.len()
     }
 
+    /// Cells per side of the camera field.
+    pub fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    /// Sizes the field for a view radius. The field is rebuilt empty at the
+    /// next `recentre`; call this before water arrives (at startup).
+    pub fn set_view_radius_m(&mut self, radius_m: f32) {
+        self.dim = field_dim_for_radius(radius_m);
+        self.view_cells = (radius_m / CELL_M).ceil() as i64;
+        self.window_origin = None;
+        self.field = WaterField::new([0.0, 0.0], CELL_M, self.dim);
+        self.dirty.clear();
+        self.needs_full_upload = false;
+    }
+
     pub fn animating_tiles(&self) -> usize {
         self.tiles.values().filter(|t| t.animating).count()
     }
@@ -144,7 +178,7 @@ impl ColumnSurface {
 
     pub fn clear(&mut self) {
         self.tiles.clear();
-        self.field = WaterField::new(self.field.origin_xz, CELL_M, FIELD_DIM);
+        self.field = WaterField::new(self.field.origin_xz, CELL_M, self.dim);
         self.dirty.clear();
         self.needs_full_upload = self.window_origin.is_some();
     }
@@ -321,11 +355,12 @@ impl ColumnSurface {
     pub fn recentre(&mut self, center_m: [f64; 3]) -> bool {
         let cx = (center_m[0] / f64::from(CELL_M)).floor() as i64;
         let cz = (center_m[2] / f64::from(CELL_M)).floor() as i64;
-        let dim = i64::from(FIELD_DIM);
+        let dim = i64::from(self.dim);
         if let Some((ox, oz)) = self.window_origin {
-            let near_edge = |c: i64, o: i64| {
-                c - o < RECENTRE_MARGIN_CELLS || o + dim - c < RECENTRE_MARGIN_CELLS
-            };
+            // Recentre once the camera has less than a full view of field left
+            // on any side, so water is always drawn out to the view distance.
+            let margin = self.view_cells;
+            let near_edge = |c: i64, o: i64| c - o < margin || o + dim - c < margin;
             if !near_edge(cx, ox) && !near_edge(cz, oz) {
                 return false;
             }
@@ -339,7 +374,7 @@ impl ColumnSurface {
         self.field = WaterField::new(
             [origin.0 as f32 * CELL_M, origin.1 as f32 * CELL_M],
             CELL_M,
-            FIELD_DIM,
+            self.dim,
         );
         self.dirty.clear();
         let keys: Vec<_> = self.tiles.keys().copied().collect();
@@ -357,7 +392,7 @@ impl ColumnSurface {
     /// Field-cell rectangle a tile covers, clipped to the field.
     fn tile_rect(&self, key: (i32, i32), grow: i32) -> Option<Rect> {
         let (ox, oz) = self.window_origin?;
-        let dim = i64::from(FIELD_DIM);
+        let dim = i64::from(self.dim);
         let lo = |k: i32, o: i64| i64::from(k) * i64::from(EDGE) - o - i64::from(grow);
         let (x0, z0) = (lo(key.0, ox), lo(key.1, oz));
         let size = i64::from(EDGE) + 2 * i64::from(grow);
@@ -378,7 +413,7 @@ impl ColumnSurface {
             return;
         };
         let (ox, oz) = self.window_origin.expect("rect implies a window");
-        let dim = FIELD_DIM as usize;
+        let dim = self.dim as usize;
         let tile = self.tiles.get(&key);
         for fz in own.z0..own.z0 + own.h {
             for fx in own.x0..own.x0 + own.w {
@@ -410,7 +445,7 @@ impl ColumnSurface {
         let Some(rect) = self.tile_rect(key, KERNEL_RADIUS) else {
             return;
         };
-        let dim = FIELD_DIM as i64;
+        let dim = i64::from(self.dim);
         let (w, h) = (rect.w as usize, rect.h as usize);
         let r = i64::from(KERNEL_RADIUS);
         // Rows the vertical pass reaches: the rectangle plus the kernel radius.
@@ -497,7 +532,7 @@ mod tests {
     /// Field cell of world column `(x, z)` for the test window.
     fn cell(s: &ColumnSurface, x: i64, z: i64) -> usize {
         let (ox, oz) = s.window_origin.unwrap();
-        (x - ox + (z - oz) * i64::from(FIELD_DIM)) as usize
+        (x - ox + (z - oz) * i64::from(s.dim())) as usize
     }
 
     #[test]

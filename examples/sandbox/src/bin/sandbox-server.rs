@@ -97,6 +97,10 @@ struct Args {
     /// 32 from 128 to 4096. The default is 1024 (256 m).
     #[arg(long, default_value_t = sandbox::worldgen_scene::DEFAULT_SIZE_CELLS, requires = "worldgen")]
     worldgen_size: u32,
+    /// Spawn the player on solid ground beside the shore of the deepest lake
+    /// instead of at a generated meadow spawn.
+    #[arg(long, requires = "worldgen")]
+    spawn_at_lake: bool,
     /// Initial plant season; the saved plant clock advances every 15 minutes.
     #[arg(long, default_value = "summer", value_parser = ["spring", "summer", "autumn", "winter"], requires = "worldgen")]
     season: String,
@@ -448,6 +452,17 @@ fn run_serve(args: Args) -> ExitCode {
             spall_ecology::living::Season::parse(&args.season).unwrap(),
         ) {
             Ok(generated) => {
+                let generated = if args.spawn_at_lake {
+                    let moved = generated.with_lake_spawn();
+                    if moved.player_spawns() == moved.world().spawns.as_slice() {
+                        eprintln!(
+                            "sandbox-server: --spawn-at-lake: no lake shore found; using the generated spawns"
+                        );
+                    }
+                    moved
+                } else {
+                    generated
+                };
                 let world = generated.world();
                 tracing::info!(
                     preset = %preset,

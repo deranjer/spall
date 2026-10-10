@@ -95,6 +95,8 @@ pub struct GeneratedScene {
     /// Stacked-column water (ENG-167): the production model. The dense
     /// `water` setup is retained for the legacy tests until W5.
     column_water: Option<ColumnWaterSetup>,
+    /// Replaces the generated spawns (see [`Self::with_lake_spawn`]).
+    spawn_override: Option<[f64; 3]>,
     vegetation: spall_ecology::living::LivingState,
 }
 
@@ -176,6 +178,7 @@ pub fn generate_with_season(
         world: Arc::new(world),
         water,
         column_water,
+        spawn_override: None,
         vegetation,
     })
 }
@@ -244,7 +247,81 @@ impl GeneratedScene {
 
     /// Player start positions in metres.
     pub fn player_spawns(&self) -> &[[f64; 3]] {
-        &self.world.spawns
+        match &self.spawn_override {
+            Some(spawn) => std::slice::from_ref(spawn),
+            None => &self.world.spawns,
+        }
+    }
+
+    /// Spawns the player on solid ground beside the shore of the deepest lake
+    /// instead of at a generated meadow spawn. Unchanged if the world has no
+    /// lake or no suitable ground is found (see [`Self::lake_spawn`]).
+    #[must_use]
+    pub fn with_lake_spawn(mut self) -> Self {
+        self.spawn_override = self.lake_spawn();
+        self
+    }
+
+    /// A feet position (metres) a few cells inland from the shore of the
+    /// deepest lake: standing room on solid ground with headroom.
+    pub fn lake_spawn(&self) -> Option<[f64; 3]> {
+        use std::collections::{HashMap, HashSet};
+        let plan = &self.world.water;
+        let mut depth: HashMap<(i64, i64), i64> = HashMap::new();
+        for c in &plan.cells {
+            *depth.entry((c.x, c.z)).or_default() += 1;
+        }
+        // The deepest column (ties by position, so the result is stable).
+        let deep = depth
+            .iter()
+            .max_by_key(|((x, z), d)| (**d, std::cmp::Reverse((*x, *z))))
+            .map(|(&c, _)| c)?;
+        let wet: HashSet<(i64, i64)> = depth.keys().copied().collect();
+        const DIRS: [(i64, i64); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+        // Shore columns of that lake: wet with a dry neighbour, nearest first.
+        let wet_ref = &wet;
+        let mut shores: Vec<((i64, i64), (i64, i64))> = wet
+            .iter()
+            .flat_map(|&(x, z)| {
+                DIRS.iter()
+                    .filter(move |(dx, dz)| !wet_ref.contains(&(x + dx, z + dz)))
+                    .map(move |&dir| ((x, z), dir))
+            })
+            .collect();
+        let dist = |(x, z): (i64, i64)| (x - deep.0).pow(2) + (z - deep.1).pow(2);
+        shores.sort_by_key(|&(c, dir)| (dist(c), c, dir));
+        let (lo, hi) = self.world.region;
+        let terrain = &self.world.terrain;
+        for (shore, (dx, dz)) in shores.into_iter().take(400) {
+            // A few columns inland, on ground that is not water.
+            for inland in [4i64, 6, 8] {
+                let (x, z) = (shore.0 + dx * inland, shore.1 + dz * inland);
+                if wet.contains(&(x, z)) {
+                    continue;
+                }
+                // The first solid cell scanning down from the top of the world.
+                let ground = (lo.y..=hi.y).rev().find(|&y| {
+                    matches!(
+                        terrain.sample(GlobalCell::new(x, y, z)),
+                        Ok(spall_voxel::Sample::Filled(_))
+                    )
+                })?;
+                let clear = (1..=9).all(|up| {
+                    matches!(
+                        terrain.sample(GlobalCell::new(x, ground + up, z)),
+                        Ok(spall_voxel::Sample::Empty { .. })
+                    )
+                });
+                if clear {
+                    return Some([
+                        (x as f64 + 0.5) * 0.25,
+                        (ground + 1) as f64 * 0.25,
+                        (z as f64 + 0.5) * 0.25,
+                    ]);
+                }
+            }
+        }
+        None
     }
 
     /// Builds the terrain, materials and physics config. The terrain volume is
@@ -267,7 +344,7 @@ impl GeneratedScene {
 
     /// Packages the world for [`spall_server::ServeConfig::custom_world`].
     pub fn into_custom_world(self) -> CustomWorld {
-        let spawns = self.world.spawns.clone();
+        let spawns = self.player_spawns().to_vec();
         let column_water = self.column_water.clone();
         let vegetation = self.vegetation.clone();
         let scene = Arc::new(self);

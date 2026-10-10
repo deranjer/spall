@@ -421,3 +421,42 @@ fn generated_water_runs_as_columns_at_rest_with_no_rejected_cells() {
         assert!((m.volume_m3 - seeded).abs() < 1e-6);
     }
 }
+
+/// `--spawn-at-lake`: the player starts on solid ground with headroom, a few
+/// columns from the water of the deepest lake, not in it or inside terrain.
+#[test]
+fn the_lake_spawn_stands_on_dry_ground_beside_the_water() {
+    let scene = worldgen_scene::generate("showcase", 7, SMALL).expect("generate");
+    let spawn = scene.lake_spawn().expect("the showcase has a lake");
+    let cell = |v: f64| (v / 0.25).floor() as i64;
+    let (x, z) = (cell(spawn[0]), cell(spawn[2]));
+    let feet = cell(spawn[1] + 0.01);
+    let terrain = &scene.world().terrain;
+    assert!(matches!(
+        terrain.sample(GlobalCell::new(x, feet - 1, z)),
+        Ok(Sample::Filled(_))
+    ));
+    for up in 0..9 {
+        assert!(
+            matches!(
+                terrain.sample(GlobalCell::new(x, feet + up, z)),
+                Ok(Sample::Empty { .. })
+            ),
+            "no headroom {up} cells above the feet"
+        );
+    }
+    let water: BTreeSet<(i64, i64)> = scene
+        .world()
+        .water
+        .cells
+        .iter()
+        .map(|c| (c.x, c.z))
+        .collect();
+    assert!(!water.contains(&(x, z)), "the spawn is not on water");
+    let near = (-12..=12).any(|d: i64| water.contains(&(x + d, z)) || water.contains(&(x, z + d)));
+    assert!(near, "water within 3 m of the spawn");
+    let with = worldgen_scene::generate("showcase", 7, SMALL)
+        .unwrap()
+        .with_lake_spawn();
+    assert_eq!(with.player_spawns(), &[spawn]);
+}

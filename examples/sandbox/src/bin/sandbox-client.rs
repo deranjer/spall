@@ -179,6 +179,15 @@ struct Args {
     /// Load spawn-area terrain first, then stream surrounding bricks as the player moves.
     #[arg(long)]
     stream_regions: bool,
+    /// How far (metres) terrain and water are drawn around the player, 16 to
+    /// 120. With `--stream-regions` the streamed region grows to cover it, so a
+    /// longer distance also costs more join time, memory and GPU work.
+    #[arg(
+        long,
+        default_value_t = spall_client::window::DEFAULT_VIEW_DISTANCE_M,
+        value_parser = parse_view_distance
+    )]
+    view_distance: f32,
     /// With `--stream-regions`, receive the distant terrain digests after the baseline instead of
     /// inside it. The client is ready once the spawn region and bodies arrive; transactions wait
     /// for the catalogue and the world hash is not comparable until it completes.
@@ -589,7 +598,11 @@ fn run_replication(args: Args) -> ExitCode {
                     args.residency_budget_bricks
                 },
                 interest_radius_bricks: if args.stream_regions {
-                    spall_protocol::segment::DEFAULT_REGION_RADIUS_BRICKS
+                    // Bricks are 8 m: stream the view plus one brick of margin.
+                    ((args.view_distance / 8.0).ceil() as i64 + 1).clamp(
+                        spall_protocol::segment::DEFAULT_REGION_RADIUS_BRICKS,
+                        spall_protocol::segment::MAX_REGION_RADIUS_BRICKS,
+                    )
                 } else {
                     args.residency_radius_bricks
                 },
@@ -828,6 +841,7 @@ fn run_interactive(args: Args) -> ExitCode {
             shots,
             shots_dir: args.shots_dir.clone(),
             day_night_cycle: Some(args.environment.is_none()),
+            view_distance_m: Some(args.view_distance),
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -891,4 +905,19 @@ fn load_asset_manifest_hash(path: Option<&std::path::Path>) -> Result<Option<[u8
         .canonical_hash()
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn parse_view_distance(value: &str) -> Result<f32, String> {
+    let metres: f32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number of metres"))?;
+    let (lo, hi) = (
+        spall_client::window::MIN_VIEW_DISTANCE_M,
+        spall_client::window::MAX_VIEW_DISTANCE_M,
+    );
+    if metres.is_finite() && (lo..=hi).contains(&metres) {
+        Ok(metres)
+    } else {
+        Err(format!("view distance must be {lo} to {hi} metres"))
+    }
 }

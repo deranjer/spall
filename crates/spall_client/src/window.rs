@@ -60,7 +60,24 @@ use spall_core::MaterialManifest;
 /// the player was standing right in front of it — raised after user report.
 /// The brick walk in [`build_instances`] skips empty and buried space, so the
 /// window is tall enough for valley walls and a flying camera.
-const VIEW_RADIUS_M: f32 = 64.0;
+const DEFAULT_VIEW_RADIUS_M: f32 = crate::column_surface::DEFAULT_VIEW_RADIUS_M;
+/// The horizontal radius (metres) the terrain, and the water field, is
+/// drawn to. Set once at startup from `InteractiveOptions::view_distance_m`;
+/// the server-streamed region around the player has to be at least this big.
+static VIEW_RADIUS_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DEFAULT_VIEW_RADIUS_M.to_bits());
+
+fn view_radius_m() -> f32 {
+    f32::from_bits(VIEW_RADIUS_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Shortest and longest view distances (metres). The longest is what the
+/// regional streaming limit of 16 bricks can feed.
+pub const MIN_VIEW_DISTANCE_M: f32 = 16.0;
+pub const MAX_VIEW_DISTANCE_M: f32 = 120.0;
+
+/// The default view distance in metres.
+pub const DEFAULT_VIEW_DISTANCE_M: f32 = DEFAULT_VIEW_RADIUS_M;
 const VIEW_HEIGHT_UP_M: f32 = 32.0;
 /// Reaches the floor of a 96 m generated world from its highest peaks, so a
 /// flying camera keeps the ground in view. Buried rock is skipped cheaply.
@@ -132,6 +149,9 @@ pub struct InteractiveOptions {
     /// Whether to advance the world clock from authoritative server ticks.
     /// `None` uses the normal cycle-on default.
     pub day_night_cycle: Option<bool>,
+    /// How far (metres) terrain and water are drawn; `None` keeps the
+    /// default. Clamped to [`MIN_VIEW_DISTANCE_M`]..=[`MAX_VIEW_DISTANCE_M`].
+    pub view_distance_m: Option<f32>,
 }
 
 /// One step of a scripted screenshot tour (see [`parse_shots`]).
@@ -574,7 +594,7 @@ fn visible_terrain_bricks(volume: &Volume, center_m: [f64; 3]) -> Vec<BrickCoord
         (center_m[1] / cell_m).floor() as i64,
         (center_m[2] / cell_m).floor() as i64,
     );
-    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
+    let horiz = (view_radius_m() / CELL_M).ceil() as i64;
     let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
     let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
     let (min_brick, _) =
@@ -1397,6 +1417,15 @@ impl InteractiveApp {
         absent_is_open: bool,
     ) -> Result<Self, ClientError> {
         let emissive: Vec<bool> = render_materials.iter().map(|m| m.emissive > 0.0).collect();
+        if let Some(radius) = options.view_distance_m {
+            let radius = radius.clamp(MIN_VIEW_DISTANCE_M, MAX_VIEW_DISTANCE_M);
+            VIEW_RADIUS_BITS.store(radius.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+        session
+            .column_surface
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_view_radius_m(view_radius_m());
         let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open, emissive)?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         Ok(Self {
@@ -2580,7 +2609,7 @@ fn view_window(center_m: [f64; 3]) -> (GlobalCell, GlobalCell) {
         (center_m[1] / cell_m).floor() as i64,
         (center_m[2] / cell_m).floor() as i64,
     );
-    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
+    let horiz = (view_radius_m() / CELL_M).ceil() as i64;
     let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
     let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
     let edge = i64::from(spall_core::BRICK_EDGE);
@@ -3810,14 +3839,14 @@ fn merge_water_columns(columns: &[Instance], material: u32) -> Vec<Instance> {
 /// (the same extent [`build_instances`] draws); boxes outside it are dropped.
 fn clip_water_to_window(boxes: &[Instance], center_m: [f64; 3], out: &mut Vec<Instance>) {
     let below = [
-        f64::from(VIEW_RADIUS_M),
+        f64::from(view_radius_m()),
         f64::from(VIEW_HEIGHT_DOWN_M),
-        f64::from(VIEW_RADIUS_M),
+        f64::from(view_radius_m()),
     ];
     let above = [
-        f64::from(VIEW_RADIUS_M),
+        f64::from(view_radius_m()),
         f64::from(VIEW_HEIGHT_UP_M),
-        f64::from(VIEW_RADIUS_M),
+        f64::from(view_radius_m()),
     ];
     for b in boxes {
         let mut offset = b.offset;
@@ -4593,7 +4622,7 @@ pub(super) struct FrameTiming {
     /// result landed and `begin_frame` uploaded a fresh instance buffer —
     /// see `create_buffer_init` there. This reallocates and copies the
     /// *entire* buffer every time rather than reusing one; round 12
-    /// suspected this (a bigger buffer since `VIEW_RADIUS_M` went 10m ->
+    /// suspected this (a bigger buffer since `view_radius_m()` went 10m ->
     /// 48m) as the stall's cause, but round 13's data disproved it — this
     /// stayed under 0.2ms on every measured frame, stalled or not. Kept
     /// for visibility, not because it's still a live suspect.
@@ -5797,12 +5826,13 @@ mod perf_probe {
     #[test]
     fn water_is_clipped_to_the_terrain_window_and_dropped_beyond_it() {
         let mut columns = Vec::new();
-        for iz in 0..400 {
-            for ix in 0..400 {
+        // Larger than any view window, so a clipped lake is a fraction of it.
+        for iz in 0..800 {
+            for ix in 0..800 {
                 columns.push(water_column(ix, iz, 10.0, 0.5));
             }
         }
-        let lake = merge_water_columns(&columns, 0); // 200 m x 200 m
+        let lake = merge_water_columns(&columns, 0); // 400 m x 400 m
         let mut near = Vec::new();
         clip_water_to_window(&lake, [100.0, 10.0, 100.0], &mut near);
         assert!(!near.is_empty());
@@ -5811,7 +5841,7 @@ mod perf_probe {
                 let half = f64::from(if a == 1 {
                     VIEW_HEIGHT_UP_M
                 } else {
-                    VIEW_RADIUS_M
+                    view_radius_m()
                 });
                 assert!(f64::from(b.offset[a]) - f64::from(b.size[a]) * 0.5 >= c - half - 1e-3);
                 assert!(f64::from(b.offset[a]) + f64::from(b.size[a]) * 0.5 <= c + half + 1e-3);
