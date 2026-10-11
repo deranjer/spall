@@ -2535,6 +2535,19 @@ async fn run_async(
                                         let mut player =
                                             PredictedPlayer::new(p.params, st, snap.server_tick);
                                         player.client_authoritative = client_authoritative;
+                                        if let Some(session) = &interactive {
+                                            // Swim against the surface the window draws.
+                                            let session = session.clone();
+                                            player.set_water_surface(Some(Arc::new(
+                                                move |x, y, z| {
+                                                    session
+                                                        .column_surface
+                                                        .lock()
+                                                        .unwrap_or_else(|e| e.into_inner())
+                                                        .surface_at_m(x, y, z)
+                                                },
+                                            )));
+                                        }
                                         p.player = Some(player);
                                         p.script_origin_tick.get_or_insert(snap.server_tick.get());
                                     }

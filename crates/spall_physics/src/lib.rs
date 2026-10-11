@@ -32,7 +32,10 @@ pub mod region_set;
 pub mod report;
 pub mod world;
 
-pub use character::{CharacterMove, CharacterParams, CharacterState, PlayerInput, step_character};
+pub use character::{
+    CharacterMove, CharacterParams, CharacterState, PlayerInput, step_character,
+    step_character_in_water,
+};
 pub use collider::{
     ColliderBuild, MERGED_CUBOID_PRIMITIVE_BUDGET, Representation, build_collider,
     choose_representation,

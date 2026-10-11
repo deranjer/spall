@@ -183,6 +183,26 @@ impl ColumnSurface {
         self.needs_full_upload = self.window_origin.is_some();
     }
 
+    /// Height (metres) of the replicated water surface over the point, from the
+    /// server's heights (not the eased, displayed ones), or `None` where the
+    /// column is dry or the point lies below the water's floor. Movement
+    /// prediction uses this so the client swims against the surface the server
+    /// does. Open sky above the surface is assumed.
+    pub fn surface_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<f64> {
+        let cell = f64::from(CELL_M);
+        let (cx, cz) = ((x_m / cell).floor() as i64, (z_m / cell).floor() as i64);
+        let edge = i64::from(EDGE);
+        let tile = self
+            .tiles
+            .get(&(cx.div_euclid(edge) as i32, cz.div_euclid(edge) as i32))?;
+        let i = (cx.rem_euclid(edge) + cz.rem_euclid(edge) * edge) as usize;
+        let top = tile.target_top[i];
+        if !wet(top) || y_m < f64::from(tile.bottom[i]) - 0.5 * cell {
+            return None;
+        }
+        Some(f64::from(top))
+    }
+
     /// Sets one region from its replicated spans (all of its windows).
     pub fn set_region(&mut self, key: (i32, i32), spans: &[WireSpan]) {
         let now = self.now();
@@ -533,6 +553,20 @@ mod tests {
     fn cell(s: &ColumnSurface, x: i64, z: i64) -> usize {
         let (ox, oz) = s.window_origin.unwrap();
         (x - ox + (z - oz) * i64::from(s.dim())) as usize
+    }
+
+    #[test]
+    fn surface_query_returns_the_server_height_over_wet_columns_only() {
+        let mut s = surface();
+        // Column (3, 2): floor y 10 cells, 2.5 cells deep: top at 12.5 cells.
+        s.set_region_at((0, 0), &[span(3 + 32 * 2, 10, 320)], 0.0);
+        let cell_m = f64::from(CELL_M);
+        let (x, z) = (3.5 * cell_m, 2.5 * cell_m);
+        let top = s.surface_at_m(x, 11.0 * cell_m, z).expect("wet column");
+        assert!((top - 12.5 * cell_m).abs() < 1e-4, "top {top}");
+        assert!(s.surface_at_m(x, 5.0 * cell_m, z).is_none(), "below the floor");
+        assert!(s.surface_at_m(4.5 * cell_m, 11.0 * cell_m, z).is_none(), "dry neighbour");
+        assert!(s.surface_at_m(-3.0, 1.0, -3.0).is_none(), "no tile");
     }
 
     #[test]
