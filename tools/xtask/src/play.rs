@@ -46,9 +46,9 @@ pub struct PlayArgs {
     #[arg(long = "seed", default_value_t = 1, requires = "worldgen")]
     world_seed: u64,
     /// Arena edge in cells (0.25 m each) for `--worldgen`: a multiple of 32
-    /// from 128 to 4096. Defaults to the preset's 1024 (256 m).
-    #[arg(long, requires = "worldgen")]
-    worldgen_size: Option<u32>,
+    /// from 128 to 4096. Defaults to 4096 (1 km); use 1024 for quick iteration.
+    #[arg(long, default_value_t = 4096, requires = "worldgen")]
+    worldgen_size: u32,
     #[arg(long, default_value = "summer", value_parser = ["spring", "summer", "autumn", "winter"], requires = "worldgen")]
     season: String,
     /// With `--worldgen`: spawn on solid ground beside the shore of the
@@ -233,9 +233,7 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             if args.spawn_raft {
                 server_cmd.arg("--spawn-raft");
             }
-            if let Some(size) = args.worldgen_size {
-                server_cmd.args(["--worldgen-size", &size.to_string()]);
-            }
+            server_cmd.args(["--worldgen-size", &args.worldgen_size.to_string()]);
             &mut server_cmd
         }
         (None, None) => server_cmd.args(["--scene", &args.scene]),
@@ -336,7 +334,7 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         if args.worldgen.is_some() {
             client_cmd.arg("--stream-regions");
         }
-        if args.worldgen_size.is_some_and(|size| size >= 4096) {
+        if args.worldgen_size >= 4096 {
             client_cmd.args(["--baseline-budget-mib", "8192"]);
         }
     }

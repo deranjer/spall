@@ -21,10 +21,10 @@ pub mod spec;
 
 pub use columns::{Biome, ColumnMap, SNOW_LINE};
 pub use generate::{
-    GeneratedWorld, GenerationTimings, SPAWN_HEADROOM_CELLS, WATER_DOMAIN_BUDGET, WaterPlan,
-    generate, generate_with_timings,
+    GeneratedWorld, GenerationTimings, SPAWN_HEADROOM_CELLS, WATER_CELL_BUDGET,
+    WATER_REGION_BUDGET, WaterPlan, generate, generate_with_timings,
 };
 pub use spec::{
-    BORDER_CELLS, GEN_VERSION, GenError, HEIGHT_CELLS, Preset, SEA_LEVEL, SHOWCASE_SIZE_CELLS,
-    WALL_TOP, WorldGenSpec, WorldgenPalette,
+    BORDER_CELLS, GEN_VERSION, GenError, MAX_HEIGHT_BRICKS, Preset, SEA_LEVEL,
+    SHOWCASE_HEIGHT_BRICKS, SHOWCASE_SIZE_CELLS, WorldGenSpec, WorldgenPalette,
 };

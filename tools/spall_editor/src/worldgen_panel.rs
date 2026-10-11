@@ -9,7 +9,7 @@ use spall_worldgen::{Biome, ColumnMap, Preset, WorldGenSpec, WorldgenPalette};
 
 /// Arena edge choices in cells (0.25 m each).
 pub(crate) const SIZES: [u32; 4] = [512, 1024, 2048, 4096];
-pub(crate) const DEFAULT_SIZE: u32 = 1024;
+pub(crate) const DEFAULT_SIZE: u32 = 4096;
 pub(crate) const SEASONS: [&str; 4] = ["spring", "summer", "autumn", "winter"];
 
 /// A generated column map, ready to show.
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn size_choices_match_server_bounds_and_default_to_a_large_world() {
-        assert_eq!(DEFAULT_SIZE, 1024);
+        assert_eq!(DEFAULT_SIZE, 4096);
         assert_eq!(SIZES, [512, 1024, 2048, 4096]);
         assert!(
             SIZES

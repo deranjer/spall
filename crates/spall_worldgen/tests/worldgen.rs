@@ -99,7 +99,7 @@ fn every_arena_brick_is_resident_so_nothing_reads_unknown() {
     assert_eq!(w.terrain.resident_brick_count(), per_side * per_side * 12);
     let edge = i64::from(SMALL) - 1;
     for (x, z) in [(0, 0), (edge, 0), (0, edge), (edge, edge)] {
-        for y in [0, HEIGHT_CELLS - 1] {
+        for y in [0, spec(1, SMALL).height_cells() - 1] {
             filled(at(w, x, y, z));
         }
     }
@@ -115,7 +115,7 @@ fn columns_are_bedrock_then_rock_then_air() {
                 continue;
             }
             let h = i64::from(w.columns.height(x, z));
-            for y in (0..HEIGHT_CELLS).step_by(3) {
+            for y in (0..spec(1, SMALL).height_cells()).step_by(3) {
                 let m = filled(at(w, x, y, z));
                 if y > h {
                     assert_eq!(m, None, "solid above the surface at {x},{y},{z}");
@@ -218,7 +218,7 @@ fn full_arena_covers_every_biome_and_feature() {
         stats.max_height - SEA_LEVEL
     );
     assert!(
-        stats.max_height < HEIGHT_CELLS as i32 - 24,
+        stats.max_height < spec(1, SMALL).height_cells() as i32 - 24,
         "no air above the peaks"
     );
     assert!(stats.min_height <= SEA_LEVEL - 20, "lake is too shallow");
@@ -271,10 +271,8 @@ fn water_is_one_bounded_basin_that_fits_the_fluid_budget() {
         }
     }
     assert!(lo[0] < hi[0], "no water");
-    // The 2D box of the basin, at full water depth, stays inside the budget.
-    let deepest = i64::from(SEA_LEVEL - cols.min_max_height().0) + 6 + 4;
-    let cells = (hi[0] - lo[0] + 9) * (hi[1] - lo[1] + 9) * deepest;
-    assert!(cells as u64 <= WATER_DOMAIN_BUDGET, "domain {cells}");
+    // The wet regions, not the basin's bounding box, are what the budget counts.
+    spall_worldgen::generate::validate_water_budget(&cols).expect("inside the water budget");
 }
 
 #[test]
@@ -306,7 +304,8 @@ fn water_fills_basins_to_the_sea_level_and_never_enters_rock() {
             }
         }
     }
-    assert!(w.water.domain_cells() <= WATER_DOMAIN_BUDGET);
+    assert!(w.water.wet_regions() <= WATER_REGION_BUDGET);
+    assert!(w.water.cells.len() as u64 <= WATER_CELL_BUDGET);
 }
 
 #[test]
@@ -339,7 +338,11 @@ fn generation_reports_the_arena_region_and_anchor() {
     assert_eq!(w.region.0, GlobalCell::new(0, 0, 0));
     assert_eq!(
         w.region.1,
-        GlobalCell::new(i64::from(SMALL) - 1, HEIGHT_CELLS - 1, i64::from(SMALL) - 1)
+        GlobalCell::new(
+            i64::from(SMALL) - 1,
+            spec(1, SMALL).height_cells() - 1,
+            i64::from(SMALL) - 1
+        )
     );
     assert_eq!(w.version, GEN_VERSION);
 }
@@ -349,6 +352,7 @@ fn a_bedrock_wall_one_brick_thick_encloses_the_arena() {
     let w = small();
     let p = palette();
     let edge = i64::from(SMALL);
+    let wall_top = spec(1, SMALL).wall_top();
     for (x, z) in [
         (0, 100),
         (BORDER_CELLS - 1, 100),
@@ -359,7 +363,7 @@ fn a_bedrock_wall_one_brick_thick_encloses_the_arena() {
         (100, edge - 1),
         (100, edge - BORDER_CELLS),
     ] {
-        for y in [0, 100, 200, WALL_TOP] {
+        for y in [0, 100, 200, wall_top] {
             assert_eq!(
                 filled(at(w, x, y, z)),
                 Some(p.bedrock),
@@ -367,13 +371,13 @@ fn a_bedrock_wall_one_brick_thick_encloses_the_arena() {
             );
         }
         assert_eq!(
-            filled(at(w, x, WALL_TOP + 1, z)),
+            filled(at(w, x, wall_top + 1, z)),
             None,
             "open sky over the wall"
         );
     }
     // The wall is above every peak and never touches generated content.
-    assert!(WALL_TOP > i64::from(w.columns.min_max_height().1));
+    assert!(wall_top > i64::from(w.columns.min_max_height().1));
     let inner = BORDER_CELLS;
     assert_ne!(filled(at(w, inner, 40, 100)), Some(p.bedrock));
     for s in &w.spawns {

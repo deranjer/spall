@@ -29,8 +29,11 @@ pub enum WorldgenSceneError {
     Vegetation(String),
 }
 
-/// The default arena edge in cells (256 m).
-pub const DEFAULT_SIZE_CELLS: u32 = SHOWCASE_SIZE_CELLS;
+/// The default arena edge in cells (1 km). Needs regional streaming and several
+/// GiB of server memory; CI and quick iteration use [`CI_SIZE_CELLS`].
+pub const DEFAULT_SIZE_CELLS: u32 = 4096;
+/// The arena edge CPU CI fixtures and fast iteration use (256 m).
+pub const CI_SIZE_CELLS: u32 = SHOWCASE_SIZE_CELLS;
 
 /// A generated world, ready to package for the server.
 /// Where the player stands beside a lake.

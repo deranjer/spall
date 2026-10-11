@@ -94,7 +94,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["scene", "editor_scene"])]
     worldgen: Option<String>,
     /// Arena edge of a `--worldgen` world in cells (0.25 m each): a multiple of
-    /// 32 from 128 to 4096. The default is 1024 (256 m).
+    /// 32 from 128 to 4096. The default is 4096 (1 km).
     #[arg(long, default_value_t = sandbox::worldgen_scene::DEFAULT_SIZE_CELLS, requires = "worldgen")]
     worldgen_size: u32,
     /// Spawn the player on solid ground beside the shore of the deepest lake

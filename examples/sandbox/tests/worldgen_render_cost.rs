@@ -22,8 +22,8 @@ const VIEWS: [(&str, [f64; 3]); 5] = [
 #[test]
 #[ignore]
 fn measure_terrain_rebuild_on_the_showcase() {
-    let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
-        .expect("generate");
+    let scene =
+        worldgen_scene::generate("showcase", 1, worldgen_scene::CI_SIZE_CELLS).expect("generate");
     let volume = &scene.world().terrain;
     for (name, center) in VIEWS {
         let start = Instant::now();
@@ -72,8 +72,8 @@ fn measure_terrain_rebuild_on_the_showcase() {
 #[test]
 #[ignore]
 fn measure_client_physics_window_and_sky() {
-    let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
-        .expect("generate");
+    let scene =
+        worldgen_scene::generate("showcase", 1, worldgen_scene::CI_SIZE_CELLS).expect("generate");
     let volume = &scene.world().terrain;
     for (name, feet) in [
         ("spawn", [128.1, 41.5, 128.1]),
@@ -101,8 +101,8 @@ fn measure_client_physics_window_and_sky() {
 #[test]
 #[ignore]
 fn measure_rebuild_while_walking() {
-    let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
-        .expect("generate");
+    let scene =
+        worldgen_scene::generate("showcase", 1, worldgen_scene::CI_SIZE_CELLS).expect("generate");
     let volume = &scene.world().terrain;
     let mut cache = spall_client::window::TerrainInstanceCache::new();
     let start = [60.0, 41.5, 128.0];

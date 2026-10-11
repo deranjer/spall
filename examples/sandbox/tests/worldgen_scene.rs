@@ -158,8 +158,8 @@ fn a_player_at_a_generated_spawn_stands_on_the_ground_with_water_running() {
 #[ignore]
 fn measure_full_arena_stand_up() {
     let t = Instant::now();
-    let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
-        .expect("generate");
+    let scene =
+        worldgen_scene::generate("showcase", 1, worldgen_scene::CI_SIZE_CELLS).expect("generate");
     println!("generate + water plan: {:?}", t.elapsed());
     println!("{:?}", scene.world().terrain.memory_report());
     let spawn = scene.player_spawns()[0];
@@ -193,7 +193,7 @@ fn measure_cut_latency_on_the_full_arena() {
     use spall_sim::{EditIntent, EditTarget};
 
     for with_water in [false, true] {
-        let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
+        let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::CI_SIZE_CELLS)
             .expect("generate");
         let spawn = scene.player_spawns()[0];
         let (x, z) = (

@@ -3,10 +3,7 @@
 use crate::caves::{CaveField, CornerGrid, MOUTH_RADIUS};
 use crate::columns::{Biome, ColumnMap, Stack};
 use crate::noise::fbm3;
-use crate::spec::{
-    BORDER_CELLS, BRICK, GEN_VERSION, GenError, HEIGHT_BRICKS, HEIGHT_CELLS, SEA_LEVEL, WALL_TOP,
-    WorldGenSpec,
-};
+use crate::spec::{BORDER_CELLS, BRICK, GEN_VERSION, GenError, SEA_LEVEL, WorldGenSpec};
 use spall_core::{BrickCoord, CELLS_PER_BRICK, CellSizeCode, GlobalCell, MaterialId, Revision};
 use spall_voxel::brick::Brick;
 use spall_voxel::volume::Volume;
@@ -23,13 +20,14 @@ const S_POCKET_B: u64 = 0x82;
 /// Rock bands by height: bedrock below, deep stone up to, then stone.
 const BEDROCK_TOP: i64 = BRICK;
 const DEEP_TOP: i64 = 3 * BRICK;
-/// Open space and dry land the water domain needs around it, in cells (the
-/// sandbox fluid domain adds these margins).
-const WATER_MARGIN_XZ: i64 = 4;
-const WATER_MARGIN_ABOVE: i64 = 4;
-const WATER_MARGIN_BELOW: i64 = 2;
-/// Voxel cells a fluid domain may span before coarsening.
-pub const WATER_DOMAIN_BUDGET: u64 = 64 * 1024 * 1024;
+/// Edge of a column-water region in cells (mirrors `spall_fluid`'s `REGION_EDGE`).
+const WATER_REGION_EDGE: i64 = 32;
+/// Most 32x32 column regions that may hold water. The column model is sparse by
+/// region, so cost follows the wet regions, not the bounding box of the water:
+/// 4096 regions is a quarter of a 1 km world.
+pub const WATER_REGION_BUDGET: u64 = 4096;
+/// Most water cells a plan may list (each is listed in `WaterPlan::cells`).
+pub const WATER_CELL_BUDGET: u64 = 64 * 1024 * 1024;
 /// Clear cells above a spawn surface (2.25 m for the player capsule).
 pub const SPAWN_HEADROOM_CELLS: i64 = 9;
 const MAX_SPAWNS: usize = 4;
@@ -47,16 +45,16 @@ pub struct WaterPlan {
 }
 
 impl WaterPlan {
-    /// Voxel cells of the fluid domain: the water box plus the margins the
-    /// sandbox gives a scene's domain.
-    pub fn domain_cells(&self) -> u64 {
-        let Some((lo, hi)) = self.bounds else {
-            return 0;
-        };
-        let dx = (hi.x - lo.x + 1 + 2 * WATER_MARGIN_XZ) as u64;
-        let dz = (hi.z - lo.z + 1 + 2 * WATER_MARGIN_XZ) as u64;
-        let dy = (hi.y - lo.y + 1 + WATER_MARGIN_ABOVE + WATER_MARGIN_BELOW) as u64;
-        dx * dy * dz
+    /// Distinct 32x32 column regions holding at least one water cell.
+    pub fn wet_regions(&self) -> u64 {
+        let mut regions = std::collections::BTreeSet::new();
+        for c in &self.cells {
+            regions.insert((
+                c.x.div_euclid(WATER_REGION_EDGE),
+                c.z.div_euclid(WATER_REGION_EDGE),
+            ));
+        }
+        regions.len() as u64
     }
 }
 
@@ -218,9 +216,9 @@ fn generate_column(
     let last = i64::from(spec.size_cells) / BRICK - 1;
     if bx == 0 || bz == 0 || bx == last || bz == last {
         // The arena wall: solid bedrock up to `WALL_TOP`, open sky above.
-        return (0..HEIGHT_BRICKS)
+        return (0..spec.height_bricks)
             .map(|by| {
-                let material = if by * BRICK <= WALL_TOP {
+                let material = if by * BRICK <= spec.wall_top() {
                     spec.palette.bedrock
                 } else {
                     MaterialId::AIR
@@ -233,8 +231,8 @@ fn generate_column(
             .collect();
     }
     let fp = footprint(spec, columns, bx, bz);
-    let mut out = Vec::with_capacity(HEIGHT_BRICKS as usize);
-    for by in 0..HEIGHT_BRICKS {
+    let mut out = Vec::with_capacity(spec.height_bricks as usize);
+    for by in 0..spec.height_bricks {
         let (y0, y1) = (by * BRICK, by * BRICK + BRICK - 1);
         let brick = if y0 > fp.hmax {
             Brick::uniform(MaterialId::AIR, Revision::ZERO)
@@ -284,41 +282,49 @@ fn water_plan(columns: &ColumnMap) -> WaterPlan {
     }
 }
 
-/// Checks the existing water capacity before allocating terrain or water cells.
-/// This uses the same wet columns, sea level and margins as the full water plan.
-pub fn validate_water_budget(columns: &ColumnMap) -> Result<(), GenError> {
-    let mut lo = [i64::MAX; 3];
-    let mut hi = [i64::MIN; 3];
-    let mut wet = false;
-    for z in 0..i64::from(columns.size()) {
-        for x in 0..i64::from(columns.size()) {
+/// Wet columns and the regions they fall in, counted from the column map the
+/// way [`water_plan`] fills it, without allocating any water cell.
+fn wet_extent(columns: &ColumnMap) -> (u64, u64) {
+    let size = i64::from(columns.size());
+    let mut regions = std::collections::BTreeSet::new();
+    let mut cells = 0u64;
+    for z in 0..size {
+        for x in 0..size {
             let h = i64::from(columns.height(x, z));
             if !columns.is_water(x, z) || h >= i64::from(SEA_LEVEL) {
                 continue;
             }
-            wet = true;
-            lo = [lo[0].min(x), lo[1].min(h + 1), lo[2].min(z)];
-            hi = [hi[0].max(x), i64::from(SEA_LEVEL), hi[2].max(z)];
+            cells += (i64::from(SEA_LEVEL) - h) as u64;
+            regions.insert((
+                x.div_euclid(WATER_REGION_EDGE),
+                z.div_euclid(WATER_REGION_EDGE),
+            ));
         }
     }
-    let plan = WaterPlan {
-        bounds: wet.then(|| {
-            (
-                GlobalCell::new(lo[0], lo[1], lo[2]),
-                GlobalCell::new(hi[0], hi[1], hi[2]),
-            )
-        }),
-        ..WaterPlan::default()
-    };
-    let cells = plan.domain_cells();
-    if cells > WATER_DOMAIN_BUDGET {
-        Err(GenError::WaterBudget {
-            cells,
-            budget: WATER_DOMAIN_BUDGET,
-        })
-    } else {
-        Ok(())
+    (regions.len() as u64, cells)
+}
+
+fn check_water_budget(regions: u64, cells: u64) -> Result<(), GenError> {
+    for (what, measured, budget) in [
+        ("regions", regions, WATER_REGION_BUDGET),
+        ("cells", cells, WATER_CELL_BUDGET),
+    ] {
+        if measured > budget {
+            return Err(GenError::WaterBudget {
+                what,
+                measured,
+                budget,
+            });
+        }
     }
+    Ok(())
+}
+
+/// Checks the water capacity before allocating terrain or water cells: wet
+/// 32x32 regions and listed water cells, not the water's bounding box.
+pub fn validate_water_budget(columns: &ColumnMap) -> Result<(), GenError> {
+    let (regions, cells) = wet_extent(columns);
+    check_water_budget(regions, cells)
 }
 
 /// Dry meadow spots with a flat 5x5 footprint, clear of cave mouth tunnels.
@@ -447,13 +453,7 @@ pub fn generate_with_timings(
     let started = std::time::Instant::now();
 
     let water = water_plan(&columns);
-    let cells = water.domain_cells();
-    if cells > WATER_DOMAIN_BUDGET {
-        return Err(GenError::WaterBudget {
-            cells,
-            budget: WATER_DOMAIN_BUDGET,
-        });
-    }
+    check_water_budget(water.wet_regions(), water.cells.len() as u64)?;
     let cave_mouths = caves.mouth_sites();
     let spawns = find_spawns(&columns, &caves);
     if spawns.is_empty() {
@@ -466,7 +466,7 @@ pub fn generate_with_timings(
             terrain,
             region: (
                 GlobalCell::new(0, 0, 0),
-                GlobalCell::new(edge - 1, HEIGHT_CELLS - 1, edge - 1),
+                GlobalCell::new(edge - 1, spec.height_cells() - 1, edge - 1),
             ),
             water,
             spawns,
@@ -493,30 +493,36 @@ mod timing_probe {
     use crate::{Preset, WorldgenPalette};
 
     /// Manual: full 4096-cell generation with each stage's time and a digest of the terrain, to
-    /// show a change to generation is exact and what it costs. Several GiB.
+    /// show a change to generation is exact and what it costs. Runs the showcase layout at its
+    /// own 12-brick height and at the 16-brick height 1 km presets use, to measure what the extra
+    /// (mostly uniform air) bricks cost. Several GiB.
     #[test]
     #[ignore = "manual full-world generation timing; several GiB"]
     fn full_world_generation_timings() {
-        let spec = WorldGenSpec::new(Preset::Showcase, 1, 4096, WorldgenPalette::sequential(1));
-        let started = std::time::Instant::now();
-        let (world, t) = generate_with_timings(&spec).unwrap();
-        let total = started.elapsed();
-        eprintln!(
-            "gen_probe total_ms={} columns_ms={} fill_ms={} packing_ms={} compact_ms={} insert_ms={} release_ms={} water_ms={}",
-            total.as_millis(),
-            t.columns.as_millis(),
-            t.fill.as_millis(),
-            t.packing.as_millis(),
-            t.compact.as_millis(),
-            t.insert.as_millis(),
-            t.source_release.as_millis(),
-            t.water_and_spawns.as_millis()
-        );
-        eprintln!(
-            "gen_probe digest={} bricks={}",
-            spall_voxel::fixtures::digest_hex(&world.terrain),
-            world.terrain.resident_brick_count()
-        );
+        for height in [12, 16] {
+            let spec = WorldGenSpec::new(Preset::Showcase, 1, 4096, WorldgenPalette::sequential(1))
+                .with_height_bricks(height);
+            let started = std::time::Instant::now();
+            let (world, t) = generate_with_timings(&spec).unwrap();
+            let total = started.elapsed();
+            eprintln!(
+                "gen_probe height_bricks={height} total_ms={} columns_ms={} fill_ms={} packing_ms={} insert_ms={} water_ms={}",
+                total.as_millis(),
+                t.columns.as_millis(),
+                t.fill.as_millis(),
+                t.packing.as_millis(),
+                t.insert.as_millis(),
+                t.water_and_spawns.as_millis()
+            );
+            eprintln!(
+                "gen_probe height_bricks={height} digest={} bricks={} memory={:?} wet_regions={} wet_cells={}",
+                spall_voxel::fixtures::digest_hex(&world.terrain),
+                world.terrain.resident_brick_count(),
+                world.terrain.memory_report(),
+                world.water.wet_regions(),
+                world.water.cells.len()
+            );
+        }
     }
 }
 
@@ -535,28 +541,39 @@ mod capacity_tests {
                 WorldgenPalette::sequential(1),
             ))
             .unwrap();
-            let cells = water_plan(&columns).domain_cells();
-            match validate_water_budget(&columns) {
-                Ok(()) => assert!(cells <= WATER_DOMAIN_BUDGET),
-                Err(GenError::WaterBudget {
-                    cells: measured,
-                    budget,
-                }) => {
-                    assert_eq!(measured, cells);
-                    assert_eq!(budget, WATER_DOMAIN_BUDGET);
-                    assert!(cells > budget);
-                }
-                Err(error) => panic!("unexpected capacity error: {error}"),
-            }
+            let plan = water_plan(&columns);
+            assert_eq!(
+                wet_extent(&columns),
+                (plan.wet_regions(), plan.cells.len() as u64),
+                "seed {seed}"
+            );
+            validate_water_budget(&columns).unwrap();
         }
     }
 
     #[test]
+    fn budget_failures_name_what_was_exceeded() {
+        assert!(check_water_budget(WATER_REGION_BUDGET, WATER_CELL_BUDGET).is_ok());
+        assert!(matches!(
+            check_water_budget(WATER_REGION_BUDGET + 1, 0),
+            Err(GenError::WaterBudget {
+                what: "regions",
+                ..
+            })
+        ));
+        assert!(matches!(
+            check_water_budget(0, WATER_CELL_BUDGET + 1),
+            Err(GenError::WaterBudget { what: "cells", .. })
+        ));
+    }
+
+    #[test]
     #[ignore = "large-world capacity regression; computes a 4096-cell column map only"]
-    fn large_world_column_capacity_fits_without_changing_water_bounds() {
+    fn large_world_water_fits_the_region_budget() {
         let spec = WorldGenSpec::new(Preset::Showcase, 1, 4096, WorldgenPalette::sequential(1));
         let columns = ColumnMap::compute(&spec).unwrap();
         validate_water_budget(&columns).unwrap();
-        assert_eq!(water_plan(&columns).domain_cells(), 47_421_308);
+        let (regions, cells) = wet_extent(&columns);
+        eprintln!("capacity: wet_regions={regions} wet_cells={cells}");
     }
 }
