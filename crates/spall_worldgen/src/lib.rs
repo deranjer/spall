@@ -15,7 +15,11 @@
 pub mod caves;
 pub mod columns;
 pub mod debug;
+pub mod erosion;
 pub mod generate;
+pub mod hydrology;
+pub mod landform;
+pub mod landscape;
 pub mod noise;
 pub mod spec;
 
