@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use spall_protocol::{
     ActionRequest, ActionStatus, AdminRequest, AdminStatus, BaselineAck, BaselineBegin,
     BaselineEnd, BaselinePart, CodecError, DurableThrough, Handshake, ProgressionRequest,
-    ProgressionResponse, RepairRequest, TopologyTransaction, WaterSnapshot, WireTag,
-    decode_control, encode_control,
+    ProgressionResponse, RepairRequest, TopologyTransaction, WireTag, decode_control,
+    encode_control,
 };
 
 use crate::message::private::Sealed;
@@ -39,8 +39,6 @@ pub enum WireRecord {
     Handshake(Handshake),
     ProgressionRequest(ProgressionRequest),
     ProgressionResponse(ProgressionResponse),
-    WaterSnapshot(WaterSnapshot),
-    WaterDelta(spall_protocol::WaterDelta),
     VegetationSnapshot(spall_protocol::vegetation::VegetationSnapshot),
     AdminRequest(AdminRequest),
     AdminStatus(AdminStatus),
@@ -66,8 +64,6 @@ impl WireRecord {
             Self::Handshake(_) => WireTag::Handshake,
             Self::ProgressionRequest(_) => WireTag::ProgressionRequest,
             Self::ProgressionResponse(_) => WireTag::ProgressionResponse,
-            Self::WaterSnapshot(_) => WireTag::WaterSnapshot,
-            Self::WaterDelta(_) => WireTag::WaterDelta,
             Self::VegetationSnapshot(_) => WireTag::VegetationSnapshot,
             Self::AdminRequest(_) => WireTag::AdminRequest,
             Self::AdminStatus(_) => WireTag::AdminStatus,
@@ -94,8 +90,6 @@ impl WireRecord {
             Self::Handshake(r) => encode_control(r),
             Self::ProgressionRequest(r) => encode_control(r),
             Self::ProgressionResponse(r) => encode_control(r),
-            Self::WaterSnapshot(r) => encode_control(r),
-            Self::WaterDelta(r) => encode_control(r),
             Self::VegetationSnapshot(r) => encode_control(r),
             Self::AdminRequest(r) => encode_control(r),
             Self::AdminStatus(r) => encode_control(r),
@@ -131,8 +125,6 @@ impl WireRecord {
             WireTag::Handshake => Self::Handshake(decode_control(bytes)?),
             WireTag::ProgressionRequest => Self::ProgressionRequest(decode_control(bytes)?),
             WireTag::ProgressionResponse => Self::ProgressionResponse(decode_control(bytes)?),
-            WireTag::WaterSnapshot => Self::WaterSnapshot(decode_control(bytes)?),
-            WireTag::WaterDelta => Self::WaterDelta(decode_control(bytes)?),
             WireTag::VegetationSnapshot => Self::VegetationSnapshot(decode_control(bytes)?),
             WireTag::AdminRequest => Self::AdminRequest(decode_control(bytes)?),
             WireTag::AdminStatus => Self::AdminStatus(decode_control(bytes)?),

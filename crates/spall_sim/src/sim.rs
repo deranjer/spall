@@ -882,9 +882,9 @@ impl Simulation {
                 transaction_world_box(&committed.topology, terrain, cell_m)
             })
             .collect();
-        let water = self.column_water.as_ref().map(|w| w.world());
+        let water = self.column_water.as_ref();
         self.world.advance_players(TICK_DT_S, &boxes, &|x, y, z| {
-            water.and_then(|w| w.surface_at_m(x, y, z))
+            water.and_then(|w| w.water_sample_at_m(x, y, z))
         });
         if std::env::var_os("SPALL_DEBUG_PLAYER").is_some() {
             for p in self.world.players() {

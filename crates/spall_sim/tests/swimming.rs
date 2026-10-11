@@ -19,6 +19,11 @@ const SURFACE_M: f64 = 3.0;
 
 /// 16 m x 8 m x 4 m basin with 2.5 m of water over a 0.5 m floor.
 fn pool_sim() -> Simulation {
+    pool_sim_with(|_| {})
+}
+
+/// The pool with `tune` applied to its water setup (springs and drains).
+fn pool_sim_with(tune: impl FnOnce(&mut ColumnWaterSetup)) -> Simulation {
     let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
     for bx in 0..2 {
         terrain
@@ -48,7 +53,9 @@ fn pool_sim() -> Simulation {
     world.terrain_collider_region = (GlobalCell::new(0, 0, 0), GlobalCell::new(63, 31, 15));
     world.anchor = AnchorPlane::at(0);
     let mut config = SimulationConfig::new(world);
-    config.column_water = Some(ColumnWaterSetup::new(0, 32, water));
+    let mut setup = ColumnWaterSetup::new(0, 32, water);
+    tune(&mut setup);
+    config.column_water = Some(setup);
     Simulation::new(config).unwrap()
 }
 
@@ -157,4 +164,46 @@ fn a_swimmer_can_leap_from_the_water_onto_a_raft() {
         raft_at[0],
         raft_at[0] + 4.0
     );
+}
+
+/// A current carries a player treading water downstream, as it does a raft; the
+/// same player in still water stays put.
+#[test]
+fn a_current_carries_an_idle_swimmer_downstream() {
+    let drift = |current: bool| {
+        let mut sim = if current {
+            pool_sim_with(|setup| {
+                for z in 1..15 {
+                    for y in 2..12 {
+                        setup.sources.push(GlobalCell::new(2, y, z));
+                        setup.sinks.push(GlobalCell::new(61, y, z));
+                    }
+                }
+            })
+        } else {
+            pool_sim()
+        };
+        let player = player_entity_for(0);
+        sim.add_player(player, [8.0, 4.5, 2.0]);
+        let mut seq = 0u64;
+        // Settle onto the surface first, then let go of the controls.
+        for tick in 0..(60 * 10) {
+            seq += 1;
+            assert!(sim.set_player_input(player, swim_east(0.0, false), InputSeq(seq)));
+            sim.tick().unwrap();
+            if tick == 59 {
+                assert!(sim.player_state(player).unwrap().position_m[1] < 4.0);
+            }
+        }
+        let end = sim.player_state(player).unwrap();
+        end.position_m[0] - 8.0
+    };
+    let still_x = drift(false);
+    let river_x = drift(true);
+    println!("still moved {still_x:.2} m, river moved {river_x:.2} m");
+    assert!(
+        still_x.abs() < 0.3,
+        "still water holds the swimmer: {still_x}"
+    );
+    assert!(river_x > 1.5, "the current carries the swimmer: {river_x}");
 }

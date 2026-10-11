@@ -199,14 +199,6 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
                     break;
                 }
             };
-            if let JournalPayload::WaterState(states) = &decoded
-                && let Err(error) = spall_protocol::water::validate_water_states(states)
-            {
-                corruption.push(CorruptionReport::new(format!(
-                    "journal seq {seq} invalid water: {error}"
-                )));
-                break;
-            }
             journal.push(JournalRecord {
                 seq,
                 tick,
@@ -287,7 +279,6 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
 
     Ok(Checkpoint {
         vegetation: load_vegetation(conn, tick)?,
-        water: load_water(conn, tick)?,
         column_water: load_column_water(conn, tick)?,
         tick: tick as u64,
         journal_cursor: journal_cursor as u64,
@@ -296,37 +287,6 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
         bodies,
         bricks,
     })
-}
-
-fn load_water(conn: &Connection, tick: i64) -> Result<Vec<spall_protocol::WaterState>, StoreError> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'checkpoint_water')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !exists {
-        return Err(StoreError::Corrupt(
-            "schema 2 is missing the water checkpoint table".into(),
-        ));
-    }
-    let row: Option<(Vec<u8>, Vec<u8>)> = conn
-        .query_row(
-            "SELECT state, crc FROM checkpoint_water WHERE tick = ? AND length(state) <= ?",
-            rusqlite::params![tick, dto::MAX_STORED_WATER_BYTES as i64],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let (blob, crc) =
-        row.ok_or_else(|| StoreError::Corrupt("missing water checkpoint row".into()))?;
-    if crc.as_slice() != crc16(&blob) {
-        return Err(StoreError::Corrupt(
-            "water checkpoint checksum mismatch".into(),
-        ));
-    }
-    let water: Vec<spall_protocol::WaterState> = dto::decode(&blob)?;
-    spall_protocol::water::validate_water_states(&water)
-        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-    Ok(water)
 }
 
 fn load_column_water(
@@ -339,7 +299,9 @@ fn load_column_water(
         |r| r.get(0),
     )?;
     if !exists {
-        return Ok(None);
+        return Err(StoreError::Corrupt(
+            "missing the column water checkpoint table".into(),
+        ));
     }
     let row: Option<(Vec<u8>, Vec<u8>)> = conn
         .query_row(
@@ -348,19 +310,20 @@ fn load_column_water(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((blob, crc)) = row else {
-        return Ok(None);
-    };
+    let (blob, crc) =
+        row.ok_or_else(|| StoreError::Corrupt("missing column water checkpoint row".into()))?;
     if crc.as_slice() != crc16(&blob) {
         return Err(StoreError::Corrupt(
             "column water checkpoint checksum mismatch".into(),
         ));
     }
-    let state: spall_protocol::ColumnWaterState = dto::decode(&blob)?;
-    state
-        .validate()
-        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-    Ok(Some(state))
+    let state: Option<spall_protocol::ColumnWaterState> = dto::decode(&blob)?;
+    if let Some(state) = &state {
+        state
+            .validate()
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    }
+    Ok(state)
 }
 
 fn load_vegetation(conn: &Connection, tick: i64) -> Result<Vec<u8>, StoreError> {

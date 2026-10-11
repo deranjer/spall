@@ -595,7 +595,6 @@ mod tests {
                 topology_hash_version: 1,
             },
             bodies: vec![],
-            water: Vec::new(),
             column_water: None,
             bricks: vec![],
         }

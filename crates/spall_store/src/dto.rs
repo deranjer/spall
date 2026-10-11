@@ -24,17 +24,15 @@ use spall_protocol::{
 /// without modification (`docs/protocol.md`: "Unknown newer schemas are
 /// rejected without modifying the database").
 ///
-/// Schema 2 adds atomic canonical water rows. Schema 1 is migrated into a new
-/// database with `cargo xtask migrate-water-save`; the source stays intact.
-pub const STORE_SCHEMA_VERSION: u32 = 2;
+/// Schema 3 drops the grid-water checkpoint row and journal record (ENG-169);
+/// the stacked-column water has its own row. Older saves are rejected.
+pub const STORE_SCHEMA_VERSION: u32 = 3;
 
 /// Largest accepted stored brick payload, compressed. `docs/protocol.md` caps a
 /// material-only brick record at 256 KiB decompressed for 64 KiB of real
 /// payload; the compressed frame is always smaller, and this bounds a hostile
 /// or corrupt row before allocation.
 pub const MAX_STORED_BRICK_BYTES: usize = 256 * 1024;
-/// Exact bits, bounded source lists and at most four million cells in a group.
-pub const MAX_STORED_WATER_BYTES: usize = 128 * 1024 * 1024;
 /// Largest stored stacked-column water checkpoint (ENG-167).
 pub const MAX_STORED_COLUMN_WATER_BYTES: usize = 512 * 1024 * 1024;
 
@@ -155,8 +153,6 @@ pub struct StoredBrick {
 pub struct Checkpoint {
     /// Versioned ecology bytes; absent in older schema-2 checkpoints.
     pub vegetation: Vec<u8>,
-    /// Independently versioned water state in an auxiliary checkpoint row.
-    pub water: Vec<spall_protocol::WaterState>,
     /// Stacked-column water (schema 3 DTO) in its own additive checkpoint row.
     pub column_water: Option<spall_protocol::ColumnWaterState>,
     pub tick: u64,
@@ -222,8 +218,6 @@ pub enum JournalPayload {
         /// `BaselineWorld::encode_compressed()` bytes (zstd).
         baseline: Vec<u8>,
     },
-    /// Exact canonical water state after the topology records at this tick.
-    WaterState(Vec<spall_protocol::WaterState>),
     /// Appended: canonical vegetation after this tick's topology commits.
     VegetationState(Vec<u8>),
     VegetationClock {
@@ -457,7 +451,6 @@ mod tests {
                 topology_hash_version: 1,
             },
             bodies: vec![],
-            water: Vec::new(),
             bricks: vec![StoredBrick {
                 volume_id: 1,
                 coord: [-1, 0, 2],

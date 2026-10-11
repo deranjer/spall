@@ -76,6 +76,8 @@ pub struct Rect {
 struct Tile {
     /// Server heights (metres) per column, NO_WATER if dry.
     target_top: Vec<f32>,
+    /// Quantized water velocity `[x, z]` of the surface span in each column.
+    flow: Vec<[i8; 2]>,
     bottom: Vec<f32>,
     /// Displayed heights, easing toward `target_top`.
     top: Vec<f32>,
@@ -89,6 +91,7 @@ impl Tile {
     fn empty(now: f64) -> Self {
         Self {
             target_top: vec![NO_WATER; TILE_CELLS],
+            flow: vec![[0; 2]; TILE_CELLS],
             bottom: vec![NO_WATER; TILE_CELLS],
             top: vec![NO_WATER; TILE_CELLS],
             agitation: vec![0.0; TILE_CELLS],
@@ -189,6 +192,12 @@ impl ColumnSurface {
     /// prediction uses this so the client swims against the surface the server
     /// does. Open sky above the surface is assumed.
     pub fn surface_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<f64> {
+        self.sample_at_m(x_m, y_m, z_m).map(|w| w.surface_y)
+    }
+
+    /// [`Self::surface_at_m`] with the replicated current: the water as a
+    /// character in it feels it.
+    pub fn sample_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<spall_physics::WaterSample> {
         let cell = f64::from(CELL_M);
         let (cx, cz) = ((x_m / cell).floor() as i64, (z_m / cell).floor() as i64);
         let edge = i64::from(EDGE);
@@ -200,7 +209,10 @@ impl ColumnSurface {
         if !wet(top) || y_m < f64::from(tile.bottom[i]) - 0.5 * cell {
             return None;
         }
-        Some(f64::from(top))
+        Some(spall_physics::WaterSample {
+            surface_y: f64::from(top),
+            flow_m_s: spall_protocol::column_water_wire::dequantize_flow(tile.flow[i]),
+        })
     }
 
     /// Sets one region from its replicated spans (all of its windows).
@@ -251,13 +263,18 @@ impl ColumnSurface {
         spans: &[WireSpan],
         now: f64,
     ) {
-        let (mut target, mut bottom) = match self.tiles.get(&key) {
-            Some(t) => (t.target_top.clone(), t.bottom.clone()),
-            None => (vec![NO_WATER; TILE_CELLS], vec![NO_WATER; TILE_CELLS]),
+        let (mut target, mut bottom, mut flow) = match self.tiles.get(&key) {
+            Some(t) => (t.target_top.clone(), t.bottom.clone(), t.flow.clone()),
+            None => (
+                vec![NO_WATER; TILE_CELLS],
+                vec![NO_WATER; TILE_CELLS],
+                vec![[0; 2]; TILE_CELLS],
+            ),
         };
         for i in range.clone() {
             target[i] = NO_WATER;
             bottom[i] = NO_WATER;
+            flow[i] = [0; 2];
         }
         for s in spans {
             let i = usize::from(s.column);
@@ -269,6 +286,7 @@ impl ColumnSurface {
             if top > target[i] {
                 target[i] = top;
                 bottom[i] = s.floor_y as f32 * CELL_M;
+                flow[i] = s.flow;
             }
         }
         let tile = self.tiles.entry(key).or_insert_with(|| Tile::empty(now));
@@ -313,6 +331,7 @@ impl ColumnSurface {
         }
         tile.target_top = target;
         tile.bottom = bottom;
+        tile.flow = flow;
         // The tile is now animating, so the next `advance` recomposes and
         // reports it; doing it here as well would smooth every tile twice.
         tile.animating = true;
@@ -539,6 +558,7 @@ mod tests {
             column,
             floor_y,
             depth_q,
+            flow: [0; 2],
         }
     }
 
@@ -573,6 +593,24 @@ mod tests {
             "dry neighbour"
         );
         assert!(s.surface_at_m(-3.0, 1.0, -3.0).is_none(), "no tile");
+    }
+
+    #[test]
+    fn the_sample_carries_the_replicated_current() {
+        use spall_protocol::column_water_wire::quantize_flow;
+        let mut s = surface();
+        let running = WireSpan {
+            flow: quantize_flow([1.5, -0.5]),
+            ..span(3 + 32 * 2, 10, 320)
+        };
+        s.set_region_at((0, 0), &[running, span(4 + 32 * 2, 10, 320)], 0.0);
+        let cell_m = f64::from(CELL_M);
+        let at = |col: f64| {
+            s.sample_at_m(col * cell_m, 11.0 * cell_m, 2.5 * cell_m)
+                .unwrap()
+        };
+        assert_eq!(at(3.5).flow_m_s, [1.5, -0.5]);
+        assert_eq!(at(4.5).flow_m_s, [0.0, 0.0], "still neighbour");
     }
 
     #[test]

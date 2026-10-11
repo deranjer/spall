@@ -24,7 +24,6 @@ pub mod canonical;
 pub mod codec;
 pub mod column_water;
 pub mod column_water_wire;
-pub mod component_water;
 pub mod handshake;
 pub mod input;
 pub mod limits;
@@ -69,12 +68,7 @@ pub use session::{
     GenerationExhausted, PlayerId, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,
     StaleSession, StreamKind, StreamSeq,
 };
-pub use water::{
-    AdminCommand, AdminRequest, AdminStatus, WaterAssembler, WaterCodecError, WaterKeyframe,
-    WaterSnapshot, WaterState, encode_water_keyframe,
-};
-pub mod water_delta;
-pub use water_delta::{WaterDelta, WaterDeltaAssembler, water_deltas};
+pub use water::{AdminCommand, AdminRequest, AdminStatus, WaterCodecError};
 
 pub mod vegetation;
 

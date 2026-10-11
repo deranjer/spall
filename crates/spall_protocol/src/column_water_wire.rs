@@ -23,14 +23,37 @@ pub const WINDOWS_PER_REGION: u8 = 8;
 pub const MAX_UPDATE_SPANS: usize = 8192;
 /// Compressed payload bytes one update may carry (fits a control record).
 pub const MAX_UPDATE_PAYLOAD: usize = 48 * 1024;
-const SPAN_BYTES: usize = 8;
+const SPAN_BYTES: usize = 10;
 
-/// One wet span as replicated: depth in 1/128 cell, 0 meaning dry (delta only).
+/// Resolution of the replicated water velocity, m/s per unit. An `i8` per axis
+/// then spans about +-7.9 m/s, finer than any pixel of drift and coarse enough
+/// that water at rest quantizes to exactly zero.
+pub const FLOW_UNIT_M_S: f32 = 1.0 / 16.0;
+
+/// Quantizes a horizontal water velocity `[x, z]` (m/s) for the wire.
+pub fn quantize_flow(flow_m_s: [f32; 2]) -> [i8; 2] {
+    flow_m_s.map(|v| {
+        if v.is_finite() {
+            (v / FLOW_UNIT_M_S).round().clamp(-127.0, 127.0) as i8
+        } else {
+            0
+        }
+    })
+}
+
+/// The velocity a quantized flow stands for, m/s.
+pub fn dequantize_flow(flow: [i8; 2]) -> [f32; 2] {
+    flow.map(|q| f32::from(q) * FLOW_UNIT_M_S)
+}
+
+/// One wet span as replicated: depth in 1/128 cell, 0 meaning dry (delta only),
+/// and the quantized horizontal velocity of its water.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireSpan {
     pub column: u16,
     pub floor_y: i32,
     pub depth_q: u16,
+    pub flow: [i8; 2],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,13 +66,14 @@ pub struct ColumnWaterUpdate {
     pub rx: i32,
     pub rz: i32,
     pub window: u8,
-    /// zstd of the spans, each `column u16 | floor_y i32 | depth_q u16` little-endian.
+    /// zstd of the spans, each `column u16 | floor_y i32 | depth_q u16 | flow_x i8 |
+    /// flow_z i8` little-endian.
     pub payload: Vec<u8>,
 }
 
 impl Record for ColumnWaterUpdate {
     const TAG: WireTag = WireTag::ColumnWaterUpdate;
-    const SCHEMA_VERSION: u16 = 1;
+    const SCHEMA_VERSION: u16 = 2;
     fn validate(&self) -> Result<(), RecordError> {
         if self.window >= WINDOWS_PER_REGION
             || self.frame_seq == 0
@@ -101,6 +125,7 @@ pub fn encode_update(
         raw.extend_from_slice(&s.column.to_le_bytes());
         raw.extend_from_slice(&s.floor_y.to_le_bytes());
         raw.extend_from_slice(&s.depth_q.to_le_bytes());
+        raw.extend_from_slice(&s.flow.map(|q| q as u8));
     }
     // Level 1: encoded on the tick thread, and these payloads are tiny.
     let payload = zstd::stream::encode_all(raw.as_slice(), 1)
@@ -136,6 +161,7 @@ pub fn decode_spans(update: &ColumnWaterUpdate) -> Result<Vec<WireSpan>, ColumnW
             column: u16::from_le_bytes([c[0], c[1]]),
             floor_y: i32::from_le_bytes([c[2], c[3], c[4], c[5]]),
             depth_q: u16::from_le_bytes([c[6], c[7]]),
+            flow: [c[8] as i8, c[9] as i8],
         })
         .collect();
     if let Some(bad) = spans.iter().find(|s| window_of(s.column) != update.window) {
@@ -147,7 +173,7 @@ pub fn decode_spans(update: &ColumnWaterUpdate) -> Result<Vec<WireSpan>, ColumnW
 #[derive(Debug, Clone, Default)]
 struct WindowState {
     seq: Option<u64>,
-    spans: BTreeMap<(u16, i32), u16>,
+    spans: BTreeMap<(u16, i32), (u16, [i8; 2])>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -185,7 +211,7 @@ impl ColumnWaterReplica {
             window.spans = spans
                 .into_iter()
                 .filter(|s| s.depth_q > 0)
-                .map(|s| ((s.column, s.floor_y), s.depth_q))
+                .map(|s| ((s.column, s.floor_y), (s.depth_q, s.flow)))
                 .collect();
             self.baselines += 1;
         } else {
@@ -203,22 +229,20 @@ impl ColumnWaterReplica {
                 if s.depth_q == 0 {
                     window.spans.remove(&(s.column, s.floor_y));
                 } else {
-                    window.spans.insert((s.column, s.floor_y), s.depth_q);
+                    window
+                        .spans
+                        .insert((s.column, s.floor_y), (s.depth_q, s.flow));
                 }
             }
             self.deltas += 1;
         }
         window.seq = Some(update.frame_seq);
         self.frame_seq = self.frame_seq.max(update.frame_seq);
+        // An all-dry region keeps its window sequences (a few bytes): the
+        // server may still send deltas on windows other than the one that just
+        // emptied it, and each must find the base it was built on. Dry regions
+        // are not counted or listed.
         let region_empty = region.windows.iter().all(|w| w.spans.is_empty());
-        if region_empty {
-            // An all-dry region needs no storage; its window sequences stay so
-            // a later delta is still refused if it skipped a baseline.
-            let all_known = region.windows.iter().all(|w| w.seq.is_some());
-            if all_known {
-                self.regions.remove(&key);
-            }
-        }
         Ok(Applied {
             key,
             baseline,
@@ -237,10 +261,11 @@ impl ColumnWaterReplica {
             .flat_map(|w| {
                 w.spans
                     .iter()
-                    .map(|(&(column, floor_y), &depth_q)| WireSpan {
+                    .map(|(&(column, floor_y), &(depth_q, flow))| WireSpan {
                         column,
                         floor_y,
                         depth_q,
+                        flow,
                     })
             })
             .collect();
@@ -259,22 +284,29 @@ impl ColumnWaterReplica {
             .map(|w| {
                 w.spans
                     .iter()
-                    .map(|(&(column, floor_y), &depth_q)| WireSpan {
+                    .map(|(&(column, floor_y), &(depth_q, flow))| WireSpan {
                         column,
                         floor_y,
                         depth_q,
+                        flow,
                     })
                     .collect()
             })
             .unwrap_or_default()
     }
 
+    /// Regions that hold water.
     pub fn region_keys(&self) -> Vec<(i32, i32)> {
-        self.regions.keys().copied().collect()
+        self.regions
+            .iter()
+            .filter(|(_, r)| !r.windows.iter().all(|w| w.spans.is_empty()))
+            .map(|(k, _)| *k)
+            .collect()
     }
 
+    /// Number of regions that hold water.
     pub fn region_count(&self) -> usize {
-        self.regions.len()
+        self.region_keys().len()
     }
 
     pub fn clear(&mut self) {
@@ -299,7 +331,26 @@ mod tests {
             column,
             floor_y,
             depth_q,
+            flow: [0; 2],
         }
+    }
+
+    #[test]
+    fn flow_quantizes_to_zero_at_rest_and_round_trips_through_the_record() {
+        assert_eq!(quantize_flow([0.02, -0.03]), [0, 0]);
+        assert_eq!(quantize_flow([1.5, -2.0]), [24, -32]);
+        assert_eq!(quantize_flow([100.0, -100.0]), [127, -127]);
+        assert_eq!(quantize_flow([f32::NAN, f32::INFINITY]), [0, 0]);
+        let moving = WireSpan {
+            flow: quantize_flow([1.5, -2.0]),
+            ..span(3, 7, 300)
+        };
+        let update = encode_update(Tick(1), 2, 0, (0, 0), 0, &[moving]).unwrap();
+        let mut replica = ColumnWaterReplica::default();
+        replica.apply(&update).unwrap();
+        let got = replica.region_spans((0, 0));
+        assert_eq!(got, vec![moving]);
+        assert_eq!(dequantize_flow(got[0].flow), [1.5, -2.0]);
     }
 
     #[test]
@@ -374,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn an_emptied_region_is_dropped_once_every_window_is_known() {
+    fn an_emptied_region_stops_counting_but_keeps_its_delta_bases() {
         let mut replica = ColumnWaterReplica::default();
         for w in 0..WINDOWS_PER_REGION {
             let spans = if w == 0 {
@@ -391,5 +442,12 @@ mod tests {
             .apply(&encode_update(Tick(0), 2, 1, (0, 0), 0, &[span(0, 0, 0)]).unwrap())
             .unwrap();
         assert_eq!(replica.region_count(), 0);
+        assert!(replica.region_keys().is_empty());
+        // The server may go on to send a delta on another window, built on the
+        // baseline it sent earlier: it must still apply.
+        replica
+            .apply(&encode_update(Tick(0), 3, 1, (0, 0), 3, &[span(400, 0, 5)]).unwrap())
+            .unwrap();
+        assert_eq!(replica.region_count(), 1);
     }
 }

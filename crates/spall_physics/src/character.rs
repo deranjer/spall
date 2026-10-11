@@ -73,6 +73,11 @@ pub mod tuning {
     pub const FLOAT_PULL_MAX_M_S: f32 = 1.5;
     /// Wading slows walking by up to this fraction as the water deepens.
     pub const WADE_SLOWDOWN: f32 = 0.3;
+    /// Fraction of the current's speed that shoves a wader standing on the bed,
+    /// at knee depth or deeper.
+    pub const WADE_PUSH: f32 = 0.6;
+    /// Fastest current the kernel will apply, m/s per axis.
+    pub const MAX_CURRENT_M_S: f32 = 8.0;
 }
 
 /// Capsule dimensions for one player, metres. The capsule is upright (its axis
@@ -185,17 +190,36 @@ pub fn step_character(
     step_character_in_water(state, input, dt_s, None, sweep)
 }
 
-/// [`step_character`] with water: `water_surface_y` is the height (metres) of the
-/// water surface in the column the capsule stands in, or `None` where there is no
-/// water. Server and client must pass the same value for the same position. Water
-/// deeper than [`tuning::SWIM_ENTER_DEPTH_M`] over the feet makes the capsule swim
+/// The water around a character: where its surface is and how fast it runs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaterSample {
+    /// Height (metres) of the water surface in the column the capsule stands in.
+    pub surface_y: f64,
+    /// Horizontal velocity `[x, z]` of that water, m/s.
+    pub flow_m_s: [f32; 2],
+}
+
+impl WaterSample {
+    /// Standing water at `surface_y`.
+    pub fn still(surface_y: f64) -> Self {
+        Self {
+            surface_y,
+            flow_m_s: [0.0; 2],
+        }
+    }
+}
+
+/// [`step_character`] with water: `water` is the surface and current in the
+/// column the capsule stands in, or `None` where there is no water. Server and
+/// client must pass the same value for the same position. A current carries a
+/// swimmer (who swims relative to the water) and shoves a wader. Water deeper than [`tuning::SWIM_ENTER_DEPTH_M`] over the feet makes the capsule swim
 /// (look-direction movement, treading at [`tuning::FLOAT_DEPTH_M`], jump to rise
 /// and to leap out of the water); shallower water only slows walking.
 pub fn step_character_in_water(
     mut state: CharacterState,
     input: PlayerInput,
     dt_s: f32,
-    water_surface_y: Option<f64>,
+    water: Option<WaterSample>,
     mut sweep: impl FnMut([f64; 3], [f32; 3]) -> CharacterMove,
 ) -> CharacterState {
     let input = input.sanitized();
@@ -218,12 +242,21 @@ pub fn step_character_in_water(
     }
     // How far the water stands over the feet; negative above it. Not finite
     // water (a bad query) counts as dry.
-    let depth_m = water_surface_y
-        .map(|surface| (surface - state.position_m[1]) as f32)
+    let depth_m = water
+        .map(|w| (w.surface_y - state.position_m[1]) as f32)
         .filter(|d| d.is_finite())
         .unwrap_or(f32::NEG_INFINITY);
+    let flow = water.map_or([0.0; 2], |w| {
+        w.flow_m_s.map(|v| {
+            if v.is_finite() {
+                v.clamp(-tuning::MAX_CURRENT_M_S, tuning::MAX_CURRENT_M_S)
+            } else {
+                0.0
+            }
+        })
+    });
     if depth_m >= tuning::SWIM_ENTER_DEPTH_M {
-        return swim_step(state, input, dt, depth_m, wish, &mut sweep);
+        return swim_step(state, input, dt, depth_m, wish, flow, &mut sweep);
     }
     // Wading: deeper water slows the walk, smoothly, so crossing a shoreline
     // has no step in speed.
@@ -233,9 +266,16 @@ pub fn step_character_in_water(
     } else {
         1.0
     };
+    // A current shoves a wader in proportion to how much of them it reaches.
+    let push = if depth_m > 0.0 {
+        let t = (depth_m / tuning::SWIM_ENTER_DEPTH_M).clamp(0.0, 1.0);
+        tuning::WADE_PUSH * t * t * (3.0 - 2.0 * t)
+    } else {
+        0.0
+    };
     let wish_horiz = [
-        wish[0] * tuning::WALK_SPEED_M_S * wade,
-        wish[1] * tuning::WALK_SPEED_M_S * wade,
+        wish[0] * tuning::WALK_SPEED_M_S * wade + flow[0] * push,
+        wish[1] * tuning::WALK_SPEED_M_S * wade + flow[1] * push,
     ];
 
     // Ground input chooses horizontal velocity. Once airborne, preserve the
@@ -291,6 +331,7 @@ fn swim_step(
     dt: f32,
     depth_m: f32,
     wish: [f32; 2],
+    flow: [f32; 2],
     sweep: &mut impl FnMut([f64; 3], [f32; 3]) -> CharacterMove,
 ) -> CharacterState {
     let jump_now = input.wants_jump();
@@ -331,10 +372,11 @@ fn swim_step(
                 target_y = target_y.max(tuning::SWIM_UP_M_S);
             }
         }
+        // The swimmer swims relative to the water, which itself runs.
         let target = [
-            wish[0] * tuning::SWIM_SPEED_M_S,
+            wish[0] * tuning::SWIM_SPEED_M_S + flow[0],
             target_y,
-            wish[1] * tuning::SWIM_SPEED_M_S,
+            wish[1] * tuning::SWIM_SPEED_M_S + flow[1],
         ];
         if target_y >= tuning::WATER_EXIT_JUMP_M_S - 1e-3 {
             // The leap takes its speed at once and keeps the horizontal speed.
@@ -1184,11 +1226,16 @@ mod tests {
         ticks: usize,
     ) -> CharacterState {
         for _ in 0..ticks {
-            state =
-                step_character_in_water(state, input, DT, Some(surface), |_, d| CharacterMove {
+            state = step_character_in_water(
+                state,
+                input,
+                DT,
+                Some(WaterSample::still(surface)),
+                |_, d| CharacterMove {
                     translation_m: d,
                     grounded: false,
-                });
+                },
+            );
         }
         state
     }
@@ -1248,10 +1295,16 @@ mod tests {
         let mut apex = f64::MIN;
         for tick in 0..90 {
             let input = look(1.0, 0.0, tick == 0);
-            state = step_character_in_water(state, input, DT, Some(10.0), |_, d| CharacterMove {
-                translation_m: d,
-                grounded: false,
-            });
+            state = step_character_in_water(
+                state,
+                input,
+                DT,
+                Some(WaterSample::still(10.0)),
+                |_, d| CharacterMove {
+                    translation_m: d,
+                    grounded: false,
+                },
+            );
             apex = apex.max(state.position_m[1]);
         }
         assert!(
@@ -1284,10 +1337,16 @@ mod tests {
             ..CharacterState::at([0.0, 0.0, 0.0])
         };
         let step = |surface: Option<f64>| {
-            step_character_in_water(on_ground, walk, DT, surface, |_, d| CharacterMove {
-                translation_m: d,
-                grounded: true,
-            })
+            step_character_in_water(
+                on_ground,
+                walk,
+                DT,
+                surface.map(WaterSample::still),
+                |_, d| CharacterMove {
+                    translation_m: d,
+                    grounded: true,
+                },
+            )
         };
         let dry = step(None);
         let knee = step(Some(0.5));
@@ -1302,5 +1361,85 @@ mod tests {
             grounded: true,
         });
         assert_eq!(plain, dry);
+    }
+
+    fn in_current(
+        mut state: CharacterState,
+        input: PlayerInput,
+        flow: [f32; 2],
+        ticks: usize,
+    ) -> CharacterState {
+        let water = WaterSample {
+            surface_y: 10.0,
+            flow_m_s: flow,
+        };
+        for _ in 0..ticks {
+            state = step_character_in_water(state, input, DT, Some(water), |_, d| CharacterMove {
+                translation_m: d,
+                grounded: false,
+            });
+        }
+        state
+    }
+
+    #[test]
+    fn a_current_carries_an_idle_swimmer_and_slows_one_swimming_against_it() {
+        let start = CharacterState::at([0.0, 10.0 - f64::from(tuning::FLOAT_DEPTH_M), 0.0]);
+        // Idle: the swimmer drifts to the water's own speed (+x at 1.5 m/s).
+        let drifted = in_current(start, look(0.0, 0.0, false), [1.5, 0.0], 180);
+        assert!(
+            (drifted.velocity_m_s[0] - 1.5).abs() < 0.05,
+            "drifts at the current's speed: {}",
+            drifted.velocity_m_s[0]
+        );
+        assert!(
+            drifted.position_m[0] > 3.5,
+            "carried {} m",
+            drifted.position_m[0]
+        );
+        // Swimming upstream (-z is forward at yaw 0; current runs -z too, so
+        // flip it): net speed is swim speed minus the current.
+        let against = in_current(start, look(1.0, 0.0, false), [0.0, 1.5], 120);
+        let net = -against.velocity_m_s[2];
+        assert!(
+            (net - (tuning::SWIM_SPEED_M_S - 1.5)).abs() < 0.1,
+            "net upstream speed {net}"
+        );
+        // The same water at rest changes nothing.
+        let still = in_current(start, look(0.0, 0.0, false), [0.0, 0.0], 120);
+        assert!(still.position_m[0].abs() < 1e-3 && still.position_m[2].abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_current_shoves_a_wader_but_not_one_on_dry_ground() {
+        let idle = PlayerInput {
+            movement: [0.0; 3],
+            view_dir: [0.0, 0.0, -1.0],
+            buttons: 0,
+        };
+        let on_ground = CharacterState {
+            grounded: true,
+            ..CharacterState::at([0.0, 9.0, 0.0])
+        };
+        let step = |water: Option<WaterSample>| {
+            step_character_in_water(on_ground, idle, DT, water, |_, d| CharacterMove {
+                translation_m: d,
+                grounded: true,
+            })
+        };
+        // Knee deep (surface 0.6 m over the feet): pushed along the current.
+        let wet = step(Some(WaterSample {
+            surface_y: 9.6,
+            flow_m_s: [2.0, 0.0],
+        }));
+        assert!(wet.velocity_m_s[0] > 0.5, "pushed {}", wet.velocity_m_s[0]);
+        // Dry ground has no water sample, so nothing pushes.
+        assert_eq!(step(None).velocity_m_s[0], 0.0);
+        // Only a film over the feet barely moves them.
+        let film = step(Some(WaterSample {
+            surface_y: 9.02,
+            flow_m_s: [2.0, 0.0],
+        }));
+        assert!(film.velocity_m_s[0] < 0.1, "film {}", film.velocity_m_s[0]);
     }
 }

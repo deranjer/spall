@@ -18,10 +18,12 @@ use spall_core::{BrickCoord, GlobalCell};
 use spall_fluid::columns::{
     CELL_SIZE_M, ColumnConfig, ColumnStepMetrics, ColumnWorld, RegionKey, VolumeTerrain,
 };
+use spall_physics::WaterSample;
 use spall_protocol::column_water::{
     COLUMN_WATER_VERSION, ColumnRegionRecord, ColumnSpanRecord, ColumnWaterDelta, ColumnWaterState,
     volume_from_fixed, volume_to_fixed,
 };
+use spall_protocol::column_water_wire::{dequantize_flow, quantize_flow};
 use spall_voxel::Volume;
 
 /// Fixed fluid step (20 Hz), decoupled from the server tick.
@@ -81,6 +83,9 @@ pub struct FrameSpan {
     pub floor_y: i32,
     /// Depth in 1/128 cell, capped at the u16 range (about 511 cells).
     pub depth_q: u16,
+    /// Horizontal velocity of the water `[x, z]`, quantized (see
+    /// [`spall_protocol::column_water_wire::quantize_flow`]).
+    pub flow: [i8; 2],
 }
 
 /// All wet spans of one region.
@@ -260,6 +265,18 @@ impl AuthoritativeColumnWater {
         self.seed
     }
 
+    /// The water at a point as characters feel it: surface height and current,
+    /// the current quantized exactly as it is replicated so a client predicting
+    /// from the replica agrees with the server to the wire's resolution.
+    pub fn water_sample_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<WaterSample> {
+        let surface_y = self.world.surface_at_m(x_m, y_m, z_m)?;
+        let flow = self.world.flow_at_m(x_m, y_m, z_m).unwrap_or([0.0; 2]);
+        Some(WaterSample {
+            surface_y,
+            flow_m_s: dequantize_flow(quantize_flow(flow)),
+        })
+    }
+
     pub fn world(&self) -> &ColumnWorld {
         &self.world
     }
@@ -294,9 +311,9 @@ impl AuthoritativeColumnWater {
         // otherwise vanish on the client while the server still holds it.
         let spans: Vec<FrameSpan> = self
             .world
-            .region_wet_spans(key, DRY_VOLUME)
+            .region_wet_spans_with_flow(key, DRY_VOLUME)
             .into_iter()
-            .map(|(column, floor_y, volume)| {
+            .map(|(column, floor_y, volume, flow)| {
                 let height = self
                     .world
                     .span_height(key, column, floor_y)
@@ -307,6 +324,7 @@ impl AuthoritativeColumnWater {
                     depth_q: (volume.min(height) * FRAME_DEPTH_SCALE)
                         .round()
                         .min(f64::from(u16::MAX)) as u16,
+                    flow: quantize_flow(flow),
                 }
             })
             .filter(|span| span.depth_q > 0)

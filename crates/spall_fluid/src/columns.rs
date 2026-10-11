@@ -607,7 +607,11 @@ impl ColumnWorld {
     /// pipes), a face against a wall or a dry neighbour counting as still, so
     /// water running past a floating body pushes it and standing water does not.
     pub fn flow_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<[f32; 2]> {
-        let i = self.wet_span_at_m(x_m, y_m, z_m)?;
+        Some(self.span_flow(self.wet_span_at_m(x_m, y_m, z_m)?))
+    }
+
+    /// [`Self::flow_at_m`] for span `i`.
+    fn span_flow(&self, i: usize) -> [f32; 2] {
         let film = self.config.min_film_depth;
         let column_of = |span: u32| {
             let ci = self.col_start.partition_point(|&c| c <= span) - 1;
@@ -639,7 +643,7 @@ impl ColumnWorld {
             let through = |(q, area): (f32, f32)| if area > 0.0 { q / area } else { 0.0 };
             0.5 * (through(faces[axis][0]) + through(faces[axis][1])) * CELL_SIZE_M as f32
         };
-        Some([speed(0), speed(1)])
+        [speed(0), speed(1)]
     }
 
     /// The spans of one column, bottom to top; empty if solid or unallocated.
@@ -1642,6 +1646,33 @@ impl ColumnWorld {
             for i in self.col_start[ci] as usize..self.col_start[ci + 1] as usize {
                 if self.volume[i] > min_volume {
                     out.push((c as u16, self.spans[i].y0, self.volume[i]));
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Self::region_wet_spans`] with the horizontal water velocity `[x, z]`
+    /// (m/s) of each span, as [`Self::flow_at_m`] reports it.
+    pub fn region_wet_spans_with_flow(
+        &self,
+        key: RegionKey,
+        min_volume: f64,
+    ) -> Vec<(u16, i32, f64, [f32; 2])> {
+        let Some(&slot) = self.slot_of.get(&key) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for c in 0..REGION_COLUMNS {
+            let ci = slot as usize * REGION_COLUMNS + c;
+            for i in self.col_start[ci] as usize..self.col_start[ci + 1] as usize {
+                if self.volume[i] > min_volume {
+                    out.push((
+                        c as u16,
+                        self.spans[i].y0,
+                        self.volume[i],
+                        self.span_flow(i),
+                    ));
                 }
             }
         }

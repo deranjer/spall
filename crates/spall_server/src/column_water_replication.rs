@@ -87,23 +87,24 @@ fn window_spans(frame: &RegionFrame, window: u8) -> Vec<WireSpan> {
             column: s.column,
             floor_y: s.floor_y,
             depth_q: s.depth_q,
+            flow: s.flow,
         })
         .collect()
 }
 
 /// Spans of `new` that differ from `old`, with removals as depth 0.
 fn delta_spans(old: &[WireSpan], new: &[WireSpan]) -> Vec<WireSpan> {
-    let old_map: HashMap<(u16, i32), u16> = old
+    let old_map: HashMap<(u16, i32), (u16, [i8; 2])> = old
         .iter()
-        .map(|s| ((s.column, s.floor_y), s.depth_q))
+        .map(|s| ((s.column, s.floor_y), (s.depth_q, s.flow)))
         .collect();
-    let new_map: HashMap<(u16, i32), u16> = new
+    let new_map: HashMap<(u16, i32), (u16, [i8; 2])> = new
         .iter()
-        .map(|s| ((s.column, s.floor_y), s.depth_q))
+        .map(|s| ((s.column, s.floor_y), (s.depth_q, s.flow)))
         .collect();
     let mut out: Vec<WireSpan> = new
         .iter()
-        .filter(|s| old_map.get(&(s.column, s.floor_y)) != Some(&s.depth_q))
+        .filter(|s| old_map.get(&(s.column, s.floor_y)) != Some(&(s.depth_q, s.flow)))
         .copied()
         .collect();
     out.extend(
@@ -253,6 +254,7 @@ mod tests {
                     column,
                     floor_y,
                     depth_q,
+                    flow: [0; 2],
                 })
                 .collect(),
         })
@@ -365,6 +367,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(5, 40), (6, 2)]
         );
+    }
+
+    /// A change of current alone, with the depth unchanged, still reaches the
+    /// client: predicted swimmers need the new velocity.
+    #[test]
+    fn a_change_of_current_alone_is_replicated() {
+        let steady = |flow: [i8; 2]| {
+            Arc::new(RegionFrame {
+                key: (0, 0),
+                spans: vec![FrameSpan {
+                    column: 3,
+                    floor_y: 5,
+                    depth_q: 640,
+                    flow,
+                }],
+            })
+        };
+        let mut publisher = ColumnWaterPublisher::default();
+        let mut replica = ColumnWaterReplica::default();
+        deliver(
+            &mut publisher,
+            &mut replica,
+            0,
+            &frame(1, vec![steady([0, 0])]),
+        );
+        assert_eq!(replica.region_spans((0, 0))[0].flow, [0, 0]);
+        deliver(
+            &mut publisher,
+            &mut replica,
+            4,
+            &frame(2, vec![steady([24, -8])]),
+        );
+        assert_eq!(replica.region_spans((0, 0))[0].flow, [24, -8]);
+        assert!(replica.deltas > 0 || replica.baselines > 1);
     }
 
     #[test]

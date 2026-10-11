@@ -26,13 +26,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandKind {
-    /// Copy a schema-1 world database to schema 2 with water save support.
-    MigrateWaterSave {
-        #[arg(long)]
-        source: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
     /// Format, lint, build, and run CPU tests sequentially.
     Check,
     /// Build sandbox binaries and supervise one bounded GPU-free server.
@@ -179,9 +172,6 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), XtaskError> {
     match cli.command {
         CommandKind::Check => check(),
-        CommandKind::MigrateWaterSave { source, output } => {
-            spall_store::migrate_v1_water(source, output).map_err(XtaskError::from)
-        }
         CommandKind::Smoke(args) => smoke(args),
         CommandKind::NetCheck(args) => netcheck::run(args, unique_output),
         CommandKind::Session(args) => session::run_session(args, || unique_run_dir("session")),

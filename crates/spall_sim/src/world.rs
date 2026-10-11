@@ -1219,7 +1219,7 @@ impl SimWorld {
         &mut self,
         dt_s: f32,
         invalidation_boxes: &[([f64; 3], [f64; 3])],
-        water_surface: &dyn Fn(f64, f64, f64) -> Option<f64>,
+        water_at: &dyn Fn(f64, f64, f64) -> Option<spall_physics::WaterSample>,
     ) {
         // Depenetration pass (unchanged from before ENG-69 round 18): still
         // sweeps against the real, always-current whole-terrain collider
@@ -1420,15 +1420,15 @@ impl SimWorld {
                 continue;
             }
             let physics = &mut self.physics;
-            // The water surface over the feet decides whether the capsule
+            // The water over the feet (surface and current) decides whether the capsule
             // swims; the client predicts with the same value (see predict.rs).
-            let surface = water_surface(
+            let water = water_at(
                 player.state.position_m[0],
                 player.state.position_m[1] + 0.05,
                 player.state.position_m[2],
             );
             player.state =
-                step_character_in_water(player.state, input, dt_s, surface, |pos, desired| {
+                step_character_in_water(player.state, input, dt_s, water, |pos, desired| {
                     let local = physics_origin
                         .to_local_f32(pos)
                         .expect("player stayed inside the owning physics frame")

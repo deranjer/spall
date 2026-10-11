@@ -1177,6 +1177,11 @@ struct CorrectionStats {
 struct ClientConnection {
     transport: Arc<Connection>,
     records: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<spall_net::Result<Option<WireRecord>>>>,
+    /// Water updates that arrived while a baseline was being received. Water
+    /// is sent as soon as the server counts this client live, and its deltas
+    /// chain on each other, so dropping one leaves a hole no later update
+    /// repairs; the control reader replays these first.
+    deferred: std::sync::Mutex<std::collections::VecDeque<WireRecord>>,
     pump: tokio::task::JoinHandle<()>,
 }
 impl ClientConnection {
@@ -1198,11 +1203,31 @@ impl ClientConnection {
         Self {
             transport,
             records: tokio::sync::Mutex::new(recv),
+            deferred: std::sync::Mutex::new(std::collections::VecDeque::new()),
             pump,
         }
     }
     async fn recv_record(&self) -> spall_net::Result<Option<WireRecord>> {
         self.records.lock().await.recv().await.unwrap_or(Ok(None))
+    }
+    /// Keeps a record a baseline wait loop has no use for but later readers do.
+    fn defer(&self, record: WireRecord) {
+        self.deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(record);
+    }
+    /// The next record for the control reader: deferred ones first, in order.
+    async fn next_record(&self) -> spall_net::Result<Option<WireRecord>> {
+        let deferred = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        match deferred {
+            Some(record) => Ok(Some(record)),
+            None => self.recv_record().await,
+        }
     }
 }
 impl std::ops::Deref for ClientConnection {
@@ -1246,6 +1271,7 @@ async fn receive_baseline_body(conn: &ClientConnection) -> Option<BaselineWorld>
                 }
                 return Some(world);
             }
+            Ok(Some(record @ WireRecord::ColumnWaterUpdate(_))) => conn.defer(record),
             Ok(Some(_)) => continue,
             Ok(None) | Err(_) => return None,
         }
@@ -1358,6 +1384,7 @@ async fn receive_full_baseline(
         loop {
             match conn.recv_record().await.map_err(|e| e.to_string())? {
                 Some(WireRecord::BaselineEnd(end)) => return Ok::<_, String>(end),
+                Some(record @ WireRecord::ColumnWaterUpdate(_)) => conn.defer(record),
                 Some(_) => continue,
                 None => return Err("connection closed before baseline end".into()),
             }
@@ -1490,6 +1517,7 @@ async fn perform_late_join(
     let begin = loop {
         match conn.recv_record().await {
             Ok(Some(WireRecord::BaselineBegin(b))) => break b,
+            Ok(Some(record @ WireRecord::ColumnWaterUpdate(_))) => conn.defer(record),
             Ok(Some(_)) => continue,
             Ok(None) => {
                 return Err(ClientNetError::Baseline(format!(
@@ -1821,13 +1849,17 @@ async fn run_async(
         let catalogue_slot = catalogue_slot.clone();
         tokio::spawn(async move {
             let mut vegetation_floor = 0_u64;
+            // Water sent before a world reset can still be in flight when the
+            // reset baseline installs; it belongs to the old world and its
+            // deltas have no base in the new one.
+            let mut column_water_floor = 0_u64;
             let mut vegetation = spall_protocol::vegetation::VegetationAssembler::default();
             let mut column_water = spall_protocol::ColumnWaterReplica::default();
             // Diagnostic: how the control reader spends its time, by record kind.
             let mut profile = ControlProfile::with_watch(control_watch);
             loop {
                 profile.finish_record();
-                let received = conn.recv_record().await;
+                let received = conn.next_record().await;
 
                 profile.begin_record(match &received {
                     Ok(Some(WireRecord::VegetationSnapshot(_))) => "vegetation",
@@ -1869,6 +1901,9 @@ async fn run_async(
                         }
                     }
                     Ok(Some(WireRecord::ColumnWaterUpdate(update))) => {
+                        if update.server_tick.get() < column_water_floor {
+                            continue;
+                        }
                         match column_water.apply(&update) {
                             Ok(applied) => {
                                 let counter = if applied.baseline {
@@ -1963,6 +1998,7 @@ async fn run_async(
                         {
                             Ok(world) => {
                                 vegetation_floor = begin.checkpoint_tick.get();
+                                column_water_floor = begin.checkpoint_tick.get();
                                 vegetation =
                                     spall_protocol::vegetation::VegetationAssembler::default();
                                 let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
@@ -2448,7 +2484,7 @@ async fn run_async(
                                                         .column_surface
                                                         .lock()
                                                         .unwrap_or_else(|e| e.into_inner())
-                                                        .surface_at_m(x, y, z)
+                                                        .sample_at_m(x, y, z)
                                                 },
                                             )));
                                         }

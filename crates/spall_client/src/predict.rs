@@ -1135,14 +1135,15 @@ struct Record {
     predicted_after: CharacterState,
 }
 
-/// Height (metres) of the water surface at a world point, if there is water.
-pub type WaterSurfaceFn = std::sync::Arc<dyn Fn(f64, f64, f64) -> Option<f64> + Send + Sync>;
+/// The water (surface and current) at a world point, if there is any.
+pub type WaterSampleFn =
+    std::sync::Arc<dyn Fn(f64, f64, f64) -> Option<spall_physics::WaterSample> + Send + Sync>;
 
 /// The local player's predicted state plus the history needed to reconcile it.
 pub struct PredictedPlayer {
     /// Replicated water surface the character swims against; `None` before any
     /// water has arrived. Must answer like the server's own query.
-    water_surface: Option<WaterSurfaceFn>,
+    water_surface: Option<WaterSampleFn>,
     /// Cumulative applied correction vector for presentation only. Authority,
     /// replay, collision and raw correction telemetry remain unchanged.
     pub presentation_correction_total: [f64; 3],
@@ -1268,14 +1269,14 @@ impl PredictedPlayer {
     }
 
     /// Gives the predictor the water surface to swim against (see
-    /// [`WaterSurfaceFn`]); until set, the character walks as on dry land.
-    pub fn set_water_surface(&mut self, water: Option<WaterSurfaceFn>) {
+    /// [`WaterSampleFn`]); until set, the character walks as on dry land.
+    pub fn set_water_surface(&mut self, water: Option<WaterSampleFn>) {
         self.water_surface = water;
     }
 
     /// The surface the kernel sees for a character standing at `state`: the same
     /// probe height the server uses (`SimWorld::advance_players`).
-    fn water_at(&self, state: &CharacterState) -> Option<f64> {
+    fn water_at(&self, state: &CharacterState) -> Option<spall_physics::WaterSample> {
         let water = self.water_surface.as_ref()?;
         let [x, y, z] = state.position_m;
         water(x, y + 0.05, z)

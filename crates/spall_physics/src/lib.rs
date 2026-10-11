@@ -33,7 +33,7 @@ pub mod report;
 pub mod world;
 
 pub use character::{
-    CharacterMove, CharacterParams, CharacterState, PlayerInput, step_character,
+    CharacterMove, CharacterParams, CharacterState, PlayerInput, WaterSample, step_character,
     step_character_in_water,
 };
 pub use collider::{
