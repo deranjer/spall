@@ -539,6 +539,7 @@ impl Simulation {
             let world = water.world();
             report.buoyancy = Some(self.world.apply_buoyancy(
                 &|x, y, z| world.surface_at_m(x, y, z),
+                &|x, y, z| world.flow_at_m(x, y, z),
                 f64::from(TICK_DT_S),
                 &mut self.buoyancy_cache,
             ));

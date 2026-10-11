@@ -4,9 +4,11 @@
 //! centres of its solid cells. A sample below the water surface in its column
 //! counts as displacing its cell's volume; the displaced volume gives an upward
 //! impulse `rho * g * V * dt` at the centre of the submerged volume (so a raft
-//! with its load off-centre tilts), and the submerged fraction damps the body's
-//! linear and angular velocity. Water is not pushed by bodies: this is a
-//! one-way coupling, as the design notes allow for this rewrite.
+//! with its load off-centre tilts), and the submerged fraction relaxes the
+//! body's velocity toward the water's: horizontal velocity toward the current
+//! at the submerged centroid (so running water carries a raft downstream),
+//! vertical and angular velocity toward rest. Water is not pushed by bodies:
+//! this is a one-way coupling, as the design notes allow for this rewrite.
 //!
 //! A body only displaces water with its *solid* cells. A sealed hull has to be
 //! solid to float; a thin open shell displaces little and sinks, which is the
@@ -86,10 +88,13 @@ fn build_samples(body: &super::Body) -> Option<Samples> {
 
 impl SimWorld {
     /// Applies buoyancy and drag for one tick of `dt_s`. `surface` answers
-    /// "height (m) of the water surface in the span holding this point, if any".
+    /// "height (m) of the water surface in the span holding this point, if any";
+    /// `flow` answers "horizontal water velocity `[x, z]` in m/s at this point,
+    /// if there is water".
     pub fn apply_buoyancy(
         &mut self,
         surface: &dyn Fn(f64, f64, f64) -> Option<f64>,
+        flow: &dyn Fn(f64, f64, f64) -> Option<[f32; 2]>,
         dt_s: f64,
         cache: &mut BuoyancyCache,
     ) -> BuoyancyReport {
@@ -138,6 +143,7 @@ impl SimWorld {
                 continue;
             }
             let point = centroid / sub;
+            let world_point = point;
             let phys = body.phys;
             let submerged_fraction = (sub / samples.total_m3).clamp(0.0, 1.0);
             report.bodies_in_water += 1;
@@ -146,14 +152,17 @@ impl SimWorld {
                 continue;
             };
             // Drag first: it reads the solver's velocity, and the impulse below
-            // changes it.
+            // changes it. The body relaxes toward the water's own velocity, so a
+            // current carries it and still water slows it.
             let st = self.physics.body_state(phys);
             let lin = (-LINEAR_DRAG_PER_S * submerged_fraction * dt_s).exp() as f32;
             let ang = (-ANGULAR_DRAG_PER_S * submerged_fraction * dt_s).exp() as f32;
+            let [wx, wz] = flow(world_point.x, world_point.y, world_point.z).unwrap_or([0.0; 2]);
+            let v = st.linvel_m_s;
             self.physics.set_body_velocity(
                 phys,
-                st.linvel_m_s.map(|v| v * lin),
-                st.angvel_rad_s.map(|v| v * ang),
+                [wx + (v[0] - wx) * lin, v[1] * lin, wz + (v[2] - wz) * lin],
+                st.angvel_rad_s.map(|w| w * ang),
             );
             let impulse = (WATER_DENSITY_KG_M3 * GRAVITY_M_S2 * sub * dt_s) as f32;
             self.physics

@@ -13,6 +13,11 @@ const STONE: MaterialId = MaterialId(1);
 
 /// 16 m x 8 m x 4 m basin with 2.5 m of water over a 0.5 m floor.
 fn pool_sim() -> Simulation {
+    pool_sim_with(|_| {})
+}
+
+/// The basin, with `tune` applied to its water setup (springs, drains).
+fn pool_sim_with(tune: impl FnOnce(&mut ColumnWaterSetup)) -> Simulation {
     let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
     for bx in 0..2 {
         terrain
@@ -42,7 +47,9 @@ fn pool_sim() -> Simulation {
     world.terrain_collider_region = (GlobalCell::new(0, 0, 0), GlobalCell::new(63, 31, 15));
     world.anchor = AnchorPlane::at(0);
     let mut config = SimulationConfig::new(world);
-    config.column_water = Some(ColumnWaterSetup::new(0, 32, water));
+    let mut setup = ColumnWaterSetup::new(0, 32, water);
+    tune(&mut setup);
+    config.column_water = Some(setup);
     Simulation::new(config).unwrap()
 }
 
@@ -188,5 +195,58 @@ fn an_off_centre_load_tilts_the_raft() {
     assert!(
         worst > 3.0,
         "a heavy block on one end must tilt the raft: {worst} deg"
+    );
+}
+
+fn x_of(sim: &Simulation, id: spall_core::EntityId) -> f64 {
+    sim.world()
+        .bodies()
+        .find(|b| b.entity == Some(id))
+        .expect("body exists")
+        .pose
+        .translation_m[0]
+}
+
+/// Running water carries a floating raft with it; the same raft in still water
+/// stays where it was put. A spring across the west end and a drain across the
+/// east end drive a steady current down the basin.
+#[test]
+fn a_current_carries_a_floating_raft_downstream_and_still_water_does_not() {
+    let raft_at = |sim: &mut Simulation| {
+        spawn_box_body(
+            sim.world_mut(),
+            [16, 2, 12],
+            WOOD,
+            700.0,
+            BodyPose::new(DQuat::IDENTITY, [7.0, 3.0, 0.5]),
+        )
+        .unwrap()
+    };
+    let mut still = pool_sim();
+    let still_raft = raft_at(&mut still);
+    let mut river = pool_sim_with(|setup| {
+        for z in 1..15 {
+            for y in 2..12 {
+                setup.sources.push(GlobalCell::new(2, y, z));
+                setup.sinks.push(GlobalCell::new(61, y, z));
+            }
+        }
+    });
+    let river_raft = raft_at(&mut river);
+    let start = x_of(&river, river_raft);
+    for _ in 0..(60 * 12) {
+        still.tick().unwrap();
+        river.tick().unwrap();
+    }
+    let still_moved = (x_of(&still, still_raft) - start).abs();
+    let river_moved = x_of(&river, river_raft) - start;
+    println!("still moved {still_moved:.2} m, river moved {river_moved:.2} m");
+    assert!(
+        still_moved < 0.3,
+        "still water holds the raft: {still_moved}"
+    );
+    assert!(
+        river_moved > 2.0,
+        "the current carries the raft downstream: {river_moved}"
     );
 }

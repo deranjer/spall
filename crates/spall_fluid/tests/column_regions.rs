@@ -341,3 +341,40 @@ fn refreshing_a_region_keeps_pipes_and_flow_equal_to_a_full_rebuild() {
         assert!((world.total_volume() - before).abs() < 1.0e-9 * before);
     }
 }
+
+/// Water released into an empty channel runs down it: the velocity of the
+/// water mid-channel points the way it flows, along the channel only, and
+/// standing water at rest has none.
+#[test]
+fn flow_at_a_point_follows_the_water_and_is_zero_at_rest() {
+    // A channel 5 columns wide along +x, walled on both long sides and the ends.
+    let terrain = Flat::new(|x, _y, z| {
+        let wall_z = z == 9 || z == 15;
+        (wall_z && (9..=60).contains(&x)) || ((x == 9 || x == 60) && (9..=15).contains(&z))
+    });
+    let mut world = ColumnWorld::with_terrain(terrain, ColumnConfig::default());
+    // Water banked against the west end, 6 cells deep.
+    world.seed_cells(&pool_cells(10, 16, 10, 15, 6));
+    world.wake_all();
+    run(&mut world, 1.0);
+    let (x_m, z_m) = (20.0 * 0.25, 12.5 * 0.25);
+    let at = |w: &ColumnWorld, x: f64| w.flow_at_m(x, 0.75, z_m);
+    let moving = world
+        .flow_at_m(x_m + 0.125, 0.75, z_m)
+        .or_else(|| (14..40).find_map(|c| at(&world, f64::from(c) * 0.25 + 0.125)))
+        .expect("the released water has reached the channel");
+    assert!(moving[0] > 0.2, "water runs down the channel: {moving:?}");
+    assert!(
+        moving[1].abs() < 0.1 * moving[0],
+        "and not across it: {moving:?}"
+    );
+
+    // At rest nothing moves, and dry points have no flow.
+    run_until_asleep(&mut world, 600.0);
+    for c in 10..60 {
+        if let Some(v) = at(&world, f64::from(c) * 0.25 + 0.125) {
+            assert!(v[0].abs() < 0.02 && v[1].abs() < 0.02, "column {c}: {v:?}");
+        }
+    }
+    assert!(world.flow_at_m(100.0, 0.75, 100.0).is_none());
+}

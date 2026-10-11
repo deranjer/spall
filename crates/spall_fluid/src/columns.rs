@@ -579,6 +579,14 @@ impl ColumnWorld {
     /// outside any span, or that span holds no water. A span that is full has
     /// its ceiling as its surface. Used to float bodies.
     pub fn surface_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<f64> {
+        let i = self.wet_span_at_m(x_m, y_m, z_m)?;
+        let depth = self.volume[i].min(self.spans[i].capacity());
+        Some((f64::from(self.spans[i].y0) + depth) * CELL_SIZE_M)
+    }
+
+    /// Index of the span holding the point if it carries water (deeper than a
+    /// film).
+    fn wet_span_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<usize> {
         let (cx, cz) = (
             (x_m / CELL_SIZE_M).floor() as i64,
             (z_m / CELL_SIZE_M).floor() as i64,
@@ -587,11 +595,51 @@ impl ColumnWorld {
         for i in self.column_range(cx, cz)? {
             let s = self.spans[i];
             if y_cell >= f64::from(s.y0) - 0.5 && y_cell < f64::from(s.y1) {
-                let depth = self.volume[i].min(s.capacity());
-                return (depth > 0.02).then(|| (f64::from(s.y0) + depth) * CELL_SIZE_M);
+                return (self.volume[i].min(s.capacity()) > 0.02).then_some(i);
             }
         }
         None
+    }
+
+    /// Horizontal velocity `[x, z]` in m/s of the water in the span holding the
+    /// point, or `None` where there is no water. It is the mean of the speeds
+    /// through the span's two faces on each axis (`flow / wetted area` of its
+    /// pipes), a face against a wall or a dry neighbour counting as still, so
+    /// water running past a floating body pushes it and standing water does not.
+    pub fn flow_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<[f32; 2]> {
+        let i = self.wet_span_at_m(x_m, y_m, z_m)?;
+        let film = self.config.min_film_depth;
+        let column_of = |span: u32| {
+            let ci = self.col_start.partition_point(|&c| c <= span) - 1;
+            column_xz(self.regions[ci / REGION_COLUMNS].key, ci % REGION_COLUMNS)
+        };
+        let home = column_of(i as u32);
+        // [axis][side]: summed flow and wetted area through each face.
+        let mut faces = [[(0.0f32, 0.0f32); 2]; 2];
+        for &entry in &self.adj[self.adj_start[i] as usize..self.adj_start[i + 1] as usize] {
+            let pi = (entry >> 1) as usize;
+            let p = &self.pipes[pi];
+            let area = Self::wetted_area(
+                p,
+                self.effective_head(p.a as usize),
+                self.effective_head(p.b as usize),
+            );
+            if area < film {
+                continue;
+            }
+            // `a` looks towards +x or +z: this span is on the low side of the
+            // pipe when it is `a`, so the pipe's face is its +axis face.
+            let other = column_of(if entry & 1 == 1 { p.b } else { p.a });
+            let axis = usize::from(other.0 == home.0);
+            let side = usize::from(entry & 1 == 1);
+            faces[axis][side].0 += self.q[pi];
+            faces[axis][side].1 += area;
+        }
+        let speed = |axis: usize| {
+            let through = |(q, area): (f32, f32)| if area > 0.0 { q / area } else { 0.0 };
+            0.5 * (through(faces[axis][0]) + through(faces[axis][1])) * CELL_SIZE_M as f32
+        };
+        Some([speed(0), speed(1)])
     }
 
     /// The spans of one column, bottom to top; empty if solid or unallocated.
