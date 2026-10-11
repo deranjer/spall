@@ -67,6 +67,15 @@ pub struct ColumnWaterSetup {
     pub gated_sources: [Vec<GlobalCell>; 3],
     /// Drains: cells emptied after every fluid step.
     pub sinks: Vec<GlobalCell>,
+    /// The gated-spring rate the water starts at (0 refills no gated spring).
+    /// Restored worlds take the saved rate instead.
+    pub gated_rate: u8,
+    /// Fluid seconds to run before the water is first published: wakes every
+    /// region and steps the solver with the springs and drains running, so
+    /// rivers start near their running state, not frozen at the planned levels.
+    /// A fixed amount of simulated time, never wall time: the result is
+    /// deterministic. 0 starts at rest.
+    pub prewarm_s: f64,
 }
 
 impl ColumnWaterSetup {
@@ -80,6 +89,8 @@ impl ColumnWaterSetup {
             sources: Vec::new(),
             gated_sources: [Vec::new(), Vec::new(), Vec::new()],
             sinks: Vec::new(),
+            gated_rate: 0,
+            prewarm_s: 0.0,
         }
     }
 }
@@ -152,6 +163,8 @@ pub struct ColumnWaterTickMetrics {
     pub steps: u32,
     pub step: Option<ColumnStepMetrics>,
     pub active_regions: usize,
+    /// Regions frozen as steady: flowing, balanced, not stepped.
+    pub steady_regions: usize,
     pub allocated_regions: usize,
     pub volume_m3: f64,
     /// Volume held above span capacity, and unplaced, in m^3.
@@ -203,6 +216,7 @@ struct Published {
     overfill_m3: f64,
     unplaced_m3: f64,
     active_regions: usize,
+    steady_regions: usize,
     allocated_regions: usize,
     skipped_s: f64,
     /// A worker that panicked, so the tick can fail loudly.
@@ -236,9 +250,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// [`Self::start_worker`] moves it to its own thread: the tick then only
 /// hands over the fluid time owed and reads the last published frame, so a
 /// slow step (a busy machine, a big lake) delays the water, never the tick.
+/// What the start-up prewarm did (see [`ColumnWaterSetup::prewarm_s`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrewarmReport {
+    /// Solver slices run.
+    pub slices: u32,
+    /// Fluid seconds simulated.
+    pub fluid_s: f64,
+    /// Wall time it took.
+    pub elapsed: Duration,
+    /// Regions awake at the end, and frozen as steady.
+    pub active_regions: usize,
+    pub steady_regions: usize,
+}
+
 pub struct AuthoritativeColumnWater {
     shared: Arc<Shared>,
     seed: ColumnSeedReport,
+    prewarm: Option<PrewarmReport>,
     worker: Option<std::thread::JoinHandle<()>>,
     journal_wait_ticks: u32,
 }
@@ -258,6 +287,7 @@ impl std::ops::Deref for WorldGuard<'_> {
 /// stretch of time, which is three times as many (shorter) steps.
 fn sliced(mut config: ColumnConfig) -> ColumnConfig {
     config.sleep_steps = config.sleep_steps.saturating_mul(COLUMN_SLICES);
+    config.steady_steps = config.steady_steps.saturating_mul(COLUMN_SLICES);
     config
 }
 
@@ -481,6 +511,7 @@ impl Shared {
         }
         let (volume_m3, overfill_m3, unplaced_m3) = core.totals.unwrap_or_default();
         let active_regions = core.world.active_region_count();
+        let steady_regions = core.world.steady_region_count();
         let allocated_regions = core.world.region_count();
         let skipped_s = core.skipped_s;
         drop(core);
@@ -498,6 +529,7 @@ impl Shared {
         published.overfill_m3 = overfill_m3;
         published.unplaced_m3 = unplaced_m3;
         published.active_regions = active_regions;
+        published.steady_regions = steady_regions;
         published.allocated_regions = allocated_regions;
         published.skipped_s = skipped_s;
     }
@@ -553,9 +585,44 @@ impl AuthoritativeColumnWater {
             seeded_m3: world.total_volume_m3(),
             rejected_cells: rejected.len() + rejected_levels.len(),
         };
+        let (prewarm_s, gated_rate) = (setup.prewarm_s, setup.gated_rate);
         let mut water = Self::assemble(setup, world, seed);
+        water.set_gated_sources_rate(gated_rate);
+        if prewarm_s > 0.0 {
+            water.prewarm = Some(water.run_prewarm(prewarm_s));
+        }
         water.publish_all();
         Ok(water)
+    }
+
+    /// What the start-up prewarm did, if one ran.
+    pub fn prewarm_report(&self) -> Option<PrewarmReport> {
+        self.prewarm
+    }
+
+    /// Runs `seconds` of fluid time with every region awake and the springs and
+    /// drains exchanging as they do in play. Returns the slices run.
+    fn run_prewarm(&self, seconds: f64) -> PrewarmReport {
+        let started = Instant::now();
+        let mut core = lock(&self.shared.core);
+        core.world.wake_all();
+        let slices = (seconds / SLICE_DT_S).round() as u32;
+        for _ in 0..slices {
+            core.world.step(SLICE_DT_S);
+            core.fluid_time_s += SLICE_DT_S;
+            core.slice += 1;
+            if core.slice == COLUMN_SLICES {
+                core.slice = 0;
+                self.shared.exchange(&mut core);
+            }
+        }
+        PrewarmReport {
+            slices,
+            fluid_s: f64::from(slices) * SLICE_DT_S,
+            elapsed: started.elapsed(),
+            active_regions: core.world.active_region_count(),
+            steady_regions: core.world.steady_region_count(),
+        }
     }
 
     fn assemble(setup: ColumnWaterSetup, world: ColumnWorld, seed: ColumnSeedReport) -> Self {
@@ -600,6 +667,7 @@ impl AuthoritativeColumnWater {
                 overfill_m3: 0.0,
                 unplaced_m3: 0.0,
                 active_regions: 0,
+                steady_regions: 0,
                 allocated_regions: 0,
                 skipped_s: 0.0,
                 failure: None,
@@ -608,6 +676,7 @@ impl AuthoritativeColumnWater {
         Self {
             shared: Arc::new(shared),
             seed,
+            prewarm: None,
             worker: None,
             journal_wait_ticks: 0,
         }
@@ -767,6 +836,7 @@ impl AuthoritativeColumnWater {
         metrics.overfill_m3 = published.overfill_m3;
         metrics.unplaced_m3 = published.unplaced_m3;
         metrics.active_regions = published.active_regions;
+        metrics.steady_regions = published.steady_regions;
         metrics.allocated_regions = published.allocated_regions;
         metrics.skipped_s = published.skipped_s;
         metrics.frame_seq = published.frame.seq;

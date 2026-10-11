@@ -155,7 +155,11 @@ pub fn column_water_setup(
             )
         })
         .collect();
-    setup.sources = plan.springs.clone();
+    // Springs are gated: they refill their cell to full whatever the channel
+    // carries, with no discharge limit, so left on they fill a landlocked basin
+    // faster than its sinks drain (about 75 m3/s measured on seed 1 at 1024
+    // cells). They start off; `--live-rivers` turns them on.
+    setup.gated_sources[0] = plan.springs.clone();
     setup.sinks = plan.sinks.clone();
     Some(setup)
 }
@@ -179,6 +183,16 @@ impl GeneratedScene {
             Some(spawn) => std::slice::from_ref(spawn),
             None => &self.world.spawns,
         }
+    }
+
+    /// Turns the springs on, so the rivers run (see [`column_water_setup`]).
+    /// Experimental: springs have no discharge limit yet.
+    #[must_use]
+    pub fn with_live_rivers(mut self) -> Self {
+        if let Some(setup) = &mut self.column_water {
+            setup.gated_rate = 1;
+        }
+        self
     }
 
     /// Spawns the player on solid ground beside the shore of the deepest lake

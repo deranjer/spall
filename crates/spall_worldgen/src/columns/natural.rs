@@ -17,6 +17,15 @@ const S_DITHER_M: u64 = 0x6e03;
 const S_PATCH: u64 = 0x6e04;
 
 const CELLS: f64 = SAMPLE_CELLS as f64;
+
+/// Whether river channels are planned full of water. Water standing in a
+/// channel on a slope is not at rest: if it is woken it runs downhill within
+/// seconds and pools in the valley floors (ENG-188: with the springs off, about
+/// 21k columns went wet off the plan and 1,000 m3 moved on a 1024-cell world).
+/// With the water asleep, which is how it starts, it is a still river; live
+/// rivers are opt-in (`--live-rivers`) until springs have a discharge limit.
+/// `false` carves the channels empty and leaves the springs to fill them.
+const FILL_RIVER_CHANNELS: bool = true;
 const CELL_STEP: i64 = SAMPLE_CELLS;
 
 /// Chamfer (3-4) distance in samples from every `true` sample.
@@ -119,6 +128,7 @@ fn build_coarse(scape: &Landscape) -> Coarse {
         }
     }
 
+    let mut channel = vec![false; n * n];
     // River channels: a parabolic cross-section cut into the ground, filled
     // with water below the banks.
     for i in 0..n * n {
@@ -152,8 +162,11 @@ fn build_coarse(scape: &Landscape) -> Coarse {
                 if profile < ground[j] {
                     ground[j] = profile;
                 }
-                if profile < water && surface[j] < water {
-                    surface[j] = water;
+                if profile < water {
+                    channel[j] = true;
+                    if FILL_RIVER_CHANNELS && surface[j] < water {
+                        surface[j] = water;
+                    }
                 }
             }
         }
@@ -161,7 +174,9 @@ fn build_coarse(scape: &Landscape) -> Coarse {
 
     let sea: Vec<bool> = h.outlet.iter().map(|&o| o == OUTLET_SEA).collect();
     // Fresh water: every sample under a river, lake or channel, not the sea.
-    let fresh: Vec<bool> = (0..n * n).map(|i| surface[i] > 0.0 && !sea[i]).collect();
+    let fresh: Vec<bool> = (0..n * n)
+        .map(|i| (surface[i] > 0.0 && !sea[i]) || channel[i])
+        .collect();
     let fresh_distance = distance_samples(&fresh, n);
     let climate = climate::compute(
         scape.seed,
@@ -386,16 +401,80 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
             cell_above_water(&map, x, z)
         })
         .collect();
-    map.sinks = scape
-        .landform
-        .basins
-        .iter()
-        .filter_map(|b| {
-            let (x, z) = center(b.x + hydro.n * b.z);
-            cell_above_water(&map, x, z)
-        })
-        .collect();
+    map.sinks = water_sinks(&map, &scape, map.springs.len());
     Ok(map)
+}
+
+/// One drain cell empties at most one cell^3 of the water standing in it per
+/// exchange, so a patch of them just above the water surface holds the level:
+/// whatever the springs add above it leaves. The patch is sized for the springs' inflow
+/// with headroom; a drain whose water is below its cell takes nothing.
+const SINK_CELLS_PER_SPRING: f64 = 1.2;
+const MIN_SINK_CELLS: usize = 16;
+
+/// Where water leaves the world: the terminal lake of a landlocked map, or the
+/// open sea of a coastal one (so river mouths never raise the sea).
+fn water_sinks(map: &ColumnMap, scape: &Landscape, springs: usize) -> Vec<[i64; 3]> {
+    let wanted = ((springs as f64 * SINK_CELLS_PER_SPRING).ceil() as usize).max(MIN_SINK_CELLS);
+    let size = i64::from(map.size());
+    let border = crate::spec::BORDER_CELLS;
+    // The cell just above the surface: empty at the planned level, so the drain
+    // only takes what rises above it and the water stays at its planned height.
+    let top_cell = |x: i64, z: i64| -> Option<[i64; 3]> {
+        // Deep enough that the column is wet water, not a film.
+        (map.is_water(x, z) && map.water_surface(x, z) - map.height(x, z) >= 2)
+            .then(|| [x, i64::from(map.water_surface(x, z)) + 1, z])
+    };
+    let mut sinks = Vec::new();
+    if scape.landform.is_coastal() {
+        let edges = scape
+            .landform
+            .sea_edges
+            .iter()
+            .filter(|&&e| e)
+            .count()
+            .max(1);
+        let per_edge = wanted.div_ceil(edges);
+        let inset = border + 4;
+        for edge in (0..scape.landform.sea_edges.len()).filter(|&e| scape.landform.sea_edges[e]) {
+            // Walk the edge just inside the wall, keeping evenly spaced wet columns.
+            let mut line: Vec<[i64; 3]> = Vec::new();
+            for t in inset..size - inset {
+                let (x, z) = match edge {
+                    0 => (t, inset),
+                    1 => (t, size - 1 - inset),
+                    2 => (inset, t),
+                    _ => (size - 1 - inset, t),
+                };
+                line.extend(top_cell(x, z));
+            }
+            let step = (line.len() / per_edge.max(1)).max(1);
+            sinks.extend(line.into_iter().step_by(step).take(per_edge));
+        }
+    } else {
+        let hydro = &scape.hydrology;
+        for basin in &scape.landform.basins {
+            let (cx, cz) = (
+                (basin.x as i64) * CELL_STEP + 2,
+                (basin.z as i64) * CELL_STEP + 2,
+            );
+            let _ = hydro;
+            // The wet columns nearest the basin's centre, nearest first.
+            let reach = 48;
+            let mut near: Vec<(i64, [i64; 3])> = Vec::new();
+            for dz in -reach..=reach {
+                for dx in -reach..=reach {
+                    if let Some(cell) = top_cell(cx + dx, cz + dz) {
+                        near.push((dx * dx + dz * dz, cell));
+                    }
+                }
+            }
+            near.sort_by_key(|&(d, cell)| (d, cell[2], cell[0]));
+            let share = wanted.div_ceil(scape.landform.basins.len());
+            sinks.extend(near.into_iter().take(share).map(|(_, cell)| cell));
+        }
+    }
+    sinks
 }
 
 impl ColumnMap {

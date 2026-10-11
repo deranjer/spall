@@ -446,8 +446,9 @@ fn the_natural_preset_generates_a_playable_world_with_springs() {
         .column_water_setup()
         .expect("natural worlds have water");
     assert_eq!(water.initial_levels.len(), world.water.columns.len());
-    assert_eq!(water.sources.len(), world.water.springs.len());
-    assert!(!water.sources.is_empty(), "rivers start at springs");
+    assert_eq!(water.gated_sources[0].len(), world.water.springs.len());
+    assert!(!world.water.springs.is_empty(), "rivers start at springs");
+    assert_eq!(water.gated_rate, 0, "the springs start off");
     let mut config = SimulationConfig::new(scene.world_setup());
     config.column_water = Some(water.clone());
     let sim = Simulation::new(config).expect("the generated world stands up");

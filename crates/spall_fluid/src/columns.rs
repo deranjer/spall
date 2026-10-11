@@ -59,6 +59,34 @@ pub struct ColumnConfig {
     pub sleep_flow: f32,
     /// Consecutive quiet steps before a region sleeps.
     pub sleep_steps: u32,
+    /// EXPERIMENTAL, off by default (0). A flowing region freezes as a steady
+    /// region when no span's volume moved by more than `steady_volume` over a
+    /// window of this many steps. It is then
+    /// not stepped, and every pipe holds its flow *averaged over the window*:
+    /// that average is balanced by construction, and the river keeps its mean
+    /// currents (a river sloshes around them). 0 disables steady sleep.
+    pub steady_steps: u32,
+    /// Largest change of any span's volume over the window, cells^3.
+    pub steady_volume: f64,
+    /// A span's volume must drift slower than `steady_drift_abs +
+    /// steady_drift_rel * throughput` over the window (cells^3/s, throughput
+    /// being half the sum of the mean flows through it). A river keeps its
+    /// volumes while a lot of water passes; a pool that is still equalising
+    /// changes by about what flows, and must not freeze.
+    pub steady_drift_abs: f32,
+    pub steady_drift_rel: f32,
+    /// The averaged flows must leave no span unbalanced by more than this
+    /// (|inflow - outflow|, cells^3/s).
+    pub steady_net: f32,
+    /// A steady region wakes when a span on its boundary has gained or lost more
+    /// than this many cells^3 since it froze (its neighbour is changing), or
+    /// when a boundary flow leaves the band it moved in during the window, which
+    /// is `steady_wake_abs + steady_wake_rel * |mean| + steady_wake_sigmas` times
+    /// the flow's standard deviation over the window (a sudden change).
+    pub steady_wake_volume: f64,
+    pub steady_wake_abs: f32,
+    pub steady_wake_rel: f32,
+    pub steady_wake_sigmas: f32,
 }
 
 impl Default for ColumnConfig {
@@ -76,6 +104,15 @@ impl Default for ColumnConfig {
             max_substeps: 64,
             sleep_flow: 1.0e-3,
             sleep_steps: 20,
+            steady_steps: 0,
+            steady_volume: 0.2,
+            steady_drift_abs: 2.0e-5,
+            steady_drift_rel: 0.05,
+            steady_net: 0.05,
+            steady_wake_volume: 0.6,
+            steady_wake_abs: 0.02,
+            steady_wake_rel: 0.1,
+            steady_wake_sigmas: 6.0,
         }
     }
 }
@@ -252,6 +289,21 @@ struct Region {
     /// Neighbours have been allocated (or found non-resident).
     ring_done: bool,
     frozen: bool,
+    /// Flowing but balanced: not stepped, flows and volumes held (see
+    /// [`ColumnConfig::steady_steps`]).
+    steady: bool,
+    steady_steps: u32,
+    /// Simulated seconds in the current window.
+    steady_time: f32,
+    /// Span volumes when the current steady window began, or when the region
+    /// froze (empty: no window yet).
+    steady_snap: Vec<f64>,
+    /// Sum over the window of each of `pipes`' flows, and of their squares.
+    steady_qsum: Vec<f32>,
+    steady_qsq: Vec<f32>,
+    /// Boundary pipes with their mean flow and the band it moved in over the
+    /// window, sorted by pipe.
+    steady_ref: Vec<(u32, f32, f32)>,
 }
 
 /// Read-only description of one span for tests and diagnostics.
@@ -281,6 +333,9 @@ pub struct ColumnStepMetrics {
     pub active_pipes: usize,
     pub regions_slept: usize,
     pub regions_woken: usize,
+    /// Regions that froze as steady this step, and how many are steady now.
+    pub regions_steadied: usize,
+    pub steady_regions: usize,
     /// Largest |q| / wetted area over the active pipes at the end, m/s.
     pub peak_speed_m_s: f32,
     pub max_abs_flow: f32,
@@ -329,6 +384,10 @@ pub struct ColumnWorld {
     unplaced: f64,
     act_spans: Vec<u32>,
     act_pipes: Vec<u32>,
+    /// Whether each pipe is in `act_pipes`. A span at the edge of a steady region
+    /// also touches that region's frozen pipes, whose flow must not move water
+    /// because their other end is not stepped.
+    live: Vec<bool>,
     /// Near-full active spans for the current step.
     nodes: Vec<u32>,
     /// Regions whose water changed since `take_dirty_regions`.
@@ -433,6 +492,7 @@ impl ColumnWorld {
             unplaced: 0.0,
             act_spans: Vec::new(),
             act_pipes: Vec::new(),
+            live: Vec::new(),
             nodes: Vec::new(),
             dirty: BTreeSet::new(),
             touched: Vec::new(),
@@ -518,7 +578,8 @@ impl ColumnWorld {
                 .iter()
                 .map(|r| r.pipes.len() * 4)
                 .sum::<usize>()
-            + (self.act_spans.len() + self.act_pipes.len()) * 4;
+            + (self.act_spans.len() + self.act_pipes.len()) * 4
+            + self.live.len();
         MemoryReport {
             regions: self.regions.len(),
             columns: self.regions.len() * REGION_COLUMNS,
@@ -747,6 +808,13 @@ impl ColumnWorld {
                     quiet_steps: 0,
                     ring_done: false,
                     frozen: false,
+                    steady: false,
+                    steady_steps: 0,
+                    steady_time: 0.0,
+                    steady_snap: Vec::new(),
+                    steady_qsum: Vec::new(),
+                    steady_qsq: Vec::new(),
+                    steady_ref: Vec::new(),
                 },
             };
             region.pipes = Vec::new();
@@ -1233,6 +1301,13 @@ impl ColumnWorld {
                 quiet_steps: 0,
                 ring_done: false,
                 frozen: false,
+                steady: false,
+                steady_steps: 0,
+                steady_time: 0.0,
+                steady_snap: Vec::new(),
+                steady_qsum: Vec::new(),
+                steady_qsq: Vec::new(),
+                steady_ref: Vec::new(),
             });
         }
         self.col_start.push(self.spans.len() as u32);
@@ -1278,9 +1353,15 @@ impl ColumnWorld {
     fn wake_slot(&mut self, s: usize) -> bool {
         let r = &mut self.regions[s];
         r.quiet_steps = 0;
+        r.steady_steps = 0;
+        r.steady_snap.clear();
+        r.steady_qsum.clear();
+        r.steady_qsq.clear();
         if r.frozen || r.active {
             return false;
         }
+        r.steady = false;
+        r.steady_ref.clear();
         r.active = true;
         self.lists_dirty = true;
         true
@@ -1764,6 +1845,11 @@ impl ColumnWorld {
     pub fn sleep_all(&mut self) {
         for r in &mut self.regions {
             r.active = false;
+            r.steady = false;
+            r.steady_snap.clear();
+            r.steady_qsum.clear();
+            r.steady_qsq.clear();
+            r.steady_ref.clear();
             r.quiet_steps = self.config.sleep_steps;
         }
         self.lists_dirty = true;
@@ -1784,6 +1870,13 @@ impl ColumnWorld {
     fn rebuild_lists(&mut self) {
         let mut stamp = vec![false; self.spans.len()];
         self.act_spans.clear();
+        if self.live.len() == self.pipes.len() {
+            for &pi in &self.act_pipes {
+                self.live[pi as usize] = false;
+            }
+        } else {
+            self.live = vec![false; self.pipes.len()];
+        }
         self.act_pipes.clear();
         self.touched.clear();
         let mut touched = vec![false; self.regions.len()];
@@ -1807,6 +1900,7 @@ impl ColumnWorld {
                     continue;
                 }
                 self.act_pipes.push(pi);
+                self.live[pi as usize] = true;
                 touched[p.ra as usize] = true;
                 touched[p.rb as usize] = true;
                 for s in [p.a, p.b] {
@@ -1876,12 +1970,53 @@ impl ColumnWorld {
         for &slot in &self.touched {
             self.dirty.insert(self.regions[slot as usize].key);
         }
-        self.after_step(&mut metrics);
+        let advanced_s = dt as f32 - metrics.skipped_s;
+        self.after_step(&mut metrics, advanced_s);
+        metrics.steady_regions = self.steady_region_count();
         metrics
     }
 
+    /// Regions frozen as steady: flowing, balanced, and not stepped.
+    pub fn steady_region_count(&self) -> usize {
+        self.regions.iter().filter(|r| r.steady).count()
+    }
+
+    /// Keys of the regions frozen as steady.
+    pub fn steady_region_keys(&self) -> Vec<RegionKey> {
+        self.regions
+            .iter()
+            .filter(|r| r.steady)
+            .map(|r| r.key)
+            .collect()
+    }
+
+    /// Per region, the largest |inflow - outflow| of any span, cells^3/s: how
+    /// far from balanced it is. A source or sink span is never balanced.
+    pub fn net_flow_imbalance(&self) -> Vec<(RegionKey, f32)> {
+        self.regions
+            .iter()
+            .map(|r| {
+                let worst = (r.span_start..r.span_end)
+                    .map(|i| {
+                        let i = i as usize;
+                        let (a, b) = (self.adj_start[i] as usize, self.adj_start[i + 1] as usize);
+                        let net: f32 = self.adj[a..b]
+                            .iter()
+                            .map(|&entry| {
+                                let flow = self.q[(entry >> 1) as usize];
+                                if entry & 1 == 1 { -flow } else { flow }
+                            })
+                            .sum();
+                        net.abs()
+                    })
+                    .fold(0.0, f32::max);
+                (r.key, worst)
+            })
+            .collect()
+    }
+
     /// Quiet tracking, sleeping, waking and ring allocation.
-    fn after_step(&mut self, metrics: &mut ColumnStepMetrics) {
+    fn after_step(&mut self, metrics: &mut ColumnStepMetrics, advanced_s: f32) {
         let cfg = self.config;
         let n = self.regions.len();
         struct Acc {
@@ -1909,9 +2044,29 @@ impl ColumnWorld {
                 }
                 if qa > cfg.sleep_flow {
                     for r in [p.ra, p.rb] {
-                        if !regions[r as usize].active {
+                        let reg = &regions[r as usize];
+                        if !reg.active && !reg.steady {
                             acc.wake.insert(r);
                         }
+                    }
+                }
+                // A steady region wakes at once if a boundary flow jumps from its
+                // held value (the slower drift of a neighbour is caught by volume).
+                for r in [p.ra, p.rb] {
+                    let reg = &regions[r as usize];
+                    if !reg.steady {
+                        continue;
+                    }
+                    let moved = match reg.steady_ref.binary_search_by_key(&pi, |e| e.0) {
+                        Ok(k) => {
+                            let (_, held, band) = reg.steady_ref[k];
+                            (q[pi as usize] - held).abs() > band
+                        }
+                        // A pipe that did not exist when the region froze.
+                        Err(_) => true,
+                    };
+                    if moved {
+                        acc.wake.insert(r);
                     }
                 }
                 acc
@@ -1928,12 +2083,169 @@ impl ColumnWorld {
         let wake: Vec<usize> = acc.wake.into_iter().map(|r| r as usize).collect();
         metrics.max_abs_flow = max_q.iter().fold(0.0, |m, q| m.max(*q));
         metrics.peak_speed_m_s = acc.peak * CELL_SIZE_M as f32;
+        // Steady flow: a region that keeps carrying water but whose span volumes
+        // have not moved over a window stops being stepped, holding its mean flows.
+        if cfg.steady_steps > 0 {
+            for (s, r) in self.regions.iter_mut().enumerate() {
+                if r.steady {
+                    continue;
+                }
+                if !(r.active && !r.frozen && max_q[s] >= cfg.sleep_flow) {
+                    r.steady_snap.clear();
+                    r.steady_qsum.clear();
+                    r.steady_qsq.clear();
+                    r.steady_steps = 0;
+                    continue;
+                }
+                if r.steady_snap.is_empty() {
+                    r.steady_snap =
+                        self.volume[r.span_start as usize..r.span_end as usize].to_vec();
+                    r.steady_qsum = vec![0.0; r.pipes.len()];
+                    r.steady_qsq = vec![0.0; r.pipes.len()];
+                    r.steady_steps = 0;
+                    r.steady_time = 0.0;
+                }
+                r.steady_steps += 1;
+                r.steady_time += advanced_s;
+                for ((sum, sq), &pi) in r
+                    .steady_qsum
+                    .iter_mut()
+                    .zip(r.steady_qsq.iter_mut())
+                    .zip(&r.pipes)
+                {
+                    let flow = self.q[pi as usize];
+                    *sum += flow;
+                    *sq += flow * flow;
+                }
+            }
+            let due: Vec<usize> = (0..n)
+                .filter(|&s| self.regions[s].steady_steps >= cfg.steady_steps)
+                .collect();
+            let (pipes, q, volume) = (&self.pipes, &self.q, &self.volume);
+            let verdicts: Vec<(usize, Option<Vec<f32>>)> = due
+                .par_iter()
+                .map(|&s| {
+                    let r = &self.regions[s];
+                    let (lo, hi) = (r.span_start as usize, r.span_end as usize);
+                    let held = r
+                        .steady_snap
+                        .iter()
+                        .zip(&volume[lo..hi])
+                        .all(|(a, b)| (a - b).abs() <= cfg.steady_volume);
+                    if !held || r.steady_time <= 0.0 {
+                        return (s, None);
+                    }
+                    let samples = r.steady_steps as f32;
+                    let mean: Vec<f32> = r.steady_qsum.iter().map(|sum| sum / samples).collect();
+                    // Net and throughput of every span under the mean flows.
+                    let mut net = vec![0.0f32; hi - lo];
+                    let mut through = vec![0.0f32; hi - lo];
+                    for (&pi, &m) in r.pipes.iter().zip(&mean) {
+                        let p = pipes[pi as usize];
+                        if (lo..hi).contains(&(p.a as usize)) {
+                            net[p.a as usize - lo] -= m;
+                            through[p.a as usize - lo] += 0.5 * m.abs();
+                        }
+                        if (lo..hi).contains(&(p.b as usize)) {
+                            net[p.b as usize - lo] += m;
+                            through[p.b as usize - lo] += 0.5 * m.abs();
+                        }
+                    }
+                    let balanced = net.iter().all(|n| n.abs() <= cfg.steady_net);
+                    // Volumes held while water passes: drift well below the throughput.
+                    let steady = r.steady_snap.iter().zip(&volume[lo..hi]).zip(&through).all(
+                        |((a, b), through)| {
+                            let drift = (a - b).abs() as f32 / r.steady_time;
+                            drift <= cfg.steady_drift_abs + cfg.steady_drift_rel * through
+                        },
+                    );
+                    let _ = q;
+                    (s, (balanced && steady).then_some(mean))
+                })
+                .collect();
+            for (s, verdict) in verdicts {
+                let Some(mean) = verdict else {
+                    // Start a fresh window from where the water is now.
+                    let r = &mut self.regions[s];
+                    r.steady_snap.clear();
+                    r.steady_qsum.clear();
+                    r.steady_qsq.clear();
+                    r.steady_steps = 0;
+                    continue;
+                };
+                let pipe_ids = self.regions[s].pipes.clone();
+                let samples = self.regions[s].steady_steps as f32;
+                let mut held: Vec<(u32, f32, f32)> = Vec::new();
+                for (k, (&pi, &m)) in pipe_ids.iter().zip(&mean).enumerate() {
+                    let p = self.pipes[pi as usize];
+                    // Interior flows are held at their window mean (they are not
+                    // stepped again); a boundary pipe keeps its live flow, which
+                    // the next step continues from.
+                    if p.ra == p.rb {
+                        self.q[pi as usize] = m;
+                    } else {
+                        let variance = (self.regions[s].steady_qsq[k] / samples - m * m).max(0.0);
+                        let band = cfg.steady_wake_abs
+                            + cfg.steady_wake_rel * m.abs()
+                            + cfg.steady_wake_sigmas * variance.sqrt();
+                        held.push((pi, m, band));
+                    }
+                }
+                held.sort_by_key(|e| e.0);
+                let (lo, hi) = (
+                    self.regions[s].span_start as usize,
+                    self.regions[s].span_end as usize,
+                );
+                let r = &mut self.regions[s];
+                r.steady = true;
+                r.active = false;
+                r.steady_steps = 0;
+                r.steady_snap = self.volume[lo..hi].to_vec();
+                r.steady_qsum = Vec::new();
+                r.steady_qsq = Vec::new();
+                r.steady_ref = held;
+                metrics.regions_steadied += 1;
+                self.lists_dirty = true;
+            }
+        }
+        // A steady region whose boundary spans have filled or emptied beyond
+        // tolerance has a changing neighbour: it wakes and flows again.
+        {
+            let mut wake_drift = Vec::new();
+            for (s, r) in self.regions.iter().enumerate() {
+                if !r.steady {
+                    continue;
+                }
+                let lo = r.span_start as usize;
+                let drifted = r.steady_ref.iter().any(|&(pi, _, _)| {
+                    let p = self.pipes[pi as usize];
+                    [p.a as usize, p.b as usize]
+                        .into_iter()
+                        .filter(|i| (lo..r.span_end as usize).contains(i))
+                        .any(|i| {
+                            (self.volume[i] - r.steady_snap[i - lo]).abs() > cfg.steady_wake_volume
+                        })
+                });
+                if drifted {
+                    wake_drift.push(s);
+                }
+            }
+            for s in wake_drift {
+                if self.wake_slot(s) {
+                    metrics.regions_woken += 1;
+                }
+            }
+        }
         let mut slept = Vec::new();
         for (s, r) in self.regions.iter_mut().enumerate() {
             if !r.active || r.frozen {
                 continue;
             }
             if max_q[s] < cfg.sleep_flow {
+                r.steady_steps = 0;
+                r.steady_snap.clear();
+                r.steady_qsum.clear();
+                r.steady_qsq.clear();
                 r.quiet_steps += 1;
                 if r.quiet_steps >= cfg.sleep_steps {
                     r.active = false;
@@ -2063,7 +2375,7 @@ impl ColumnWorld {
 
         // Outflow limit: a donor never gives more than it holds.
         let (adj_start, adj, volume) = (&self.adj_start, &self.adj, &self.volume);
-        let q = &self.q;
+        let (q, live) = (&self.q, &self.live);
         let scale_ptr = Shared(self.scale.as_mut_ptr());
         self.act_spans.par_iter().for_each(|&i| {
             let i = i as usize;
@@ -2071,7 +2383,11 @@ impl ColumnWorld {
             let out: f64 = adj[s..e]
                 .iter()
                 .map(|&entry| {
-                    let flow = f64::from(q[(entry >> 1) as usize]);
+                    let pi = (entry >> 1) as usize;
+                    if !live[pi] {
+                        return 0.0;
+                    }
+                    let flow = f64::from(q[pi]);
                     (if entry & 1 == 1 { flow } else { -flow }).max(0.0)
                 })
                 .sum::<f64>()
@@ -2100,7 +2416,7 @@ impl ColumnWorld {
 
         // Apply all volume changes at once (Jacobi): each span reads the final
         // flows of its pipes and writes only its own volume.
-        let q = &self.q;
+        let (q, live) = (&self.q, &self.live);
         let vol_ptr = Shared(self.volume.as_mut_ptr());
         self.act_spans.par_iter().for_each(|&i| {
             let i = i as usize;
@@ -2108,7 +2424,11 @@ impl ColumnWorld {
             let delta = adj[s..e]
                 .iter()
                 .map(|&entry| {
-                    let flow = f64::from(q[(entry >> 1) as usize]);
+                    let pi = (entry >> 1) as usize;
+                    if !live[pi] {
+                        return 0.0;
+                    }
+                    let flow = f64::from(q[pi]);
                     if entry & 1 == 1 { -flow } else { flow }
                 })
                 .sum::<f64>()
