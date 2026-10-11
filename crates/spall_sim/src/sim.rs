@@ -68,6 +68,9 @@ pub struct SimulationConfig {
     pub serialize_threshold: u32,
     /// Stacked-column water (ENG-167). `None` preserves non-fluid fixtures.
     pub column_water: Option<crate::column_water::ColumnWaterSetup>,
+    /// Step the column water on its own thread (a server's choice; tests and
+    /// tools keep the deterministic inline step).
+    pub column_water_worker: bool,
     pub vegetation: Option<spall_ecology::living::LivingState>,
 }
 
@@ -84,6 +87,7 @@ impl SimulationConfig {
             max_pending_intents: Self::DEFAULT_MAX_PENDING_INTENTS,
             serialize_threshold: Self::DEFAULT_SERIALIZE_THRESHOLD,
             column_water: None,
+            column_water_worker: false,
             vegetation: None,
         }
     }
@@ -122,6 +126,8 @@ pub struct Simulation {
     next_control_seq: u64,
     next_damage_seq: u64,
     column_water: Option<crate::column_water::AuthoritativeColumnWater>,
+    /// Whether the column water steps on its own thread.
+    column_water_worker: bool,
     /// Sample points of each body for buoyancy, rebuilt when a body changes.
     buoyancy_cache: crate::world::BuoyancyCache,
     pub(crate) vegetation: Option<crate::vegetation::AuthoritativeVegetation>,
@@ -179,6 +185,7 @@ impl Simulation {
         physics_origin: PhysicsOrigin,
     ) -> Result<Self, crate::world::WorldError> {
         let column_water_setup = config.column_water;
+        let column_water_worker = config.column_water_worker;
         let vegetation_setup = config.vegetation;
         let world_span = crate::prof::Span::start("startup.world_and_collision");
         let world = SimWorld::new_with_terrain_collider_mode_and_origin(
@@ -196,6 +203,7 @@ impl Simulation {
             next_control_seq: 1,
             next_damage_seq: 0,
             column_water: None,
+            column_water_worker: false,
             buoyancy_cache: Default::default(),
             vegetation: None,
         };
@@ -210,6 +218,7 @@ impl Simulation {
                     crate::world::WorldError::WaterInitialization(error.to_string())
                 })?,
             );
+            simulation.set_column_water_worker(column_water_worker);
         }
         simulation.pipeline.warm_labels(&simulation.world);
         if let Some(state) = vegetation_setup {
@@ -240,6 +249,7 @@ impl Simulation {
             next_damage_seq: 0,
             // Column water is installed after recovery by the caller.
             column_water: None,
+            column_water_worker: false,
             buoyancy_cache: Default::default(),
             vegetation: None,
         };
@@ -281,6 +291,11 @@ impl Simulation {
             self.pipeline.enable_off_thread_staging();
         }
         let old_column_water = std::mem::replace(&mut self.column_water, column_water);
+        if self.column_water_worker
+            && let Some(water) = &mut self.column_water
+        {
+            water.start_worker();
+        }
         let old_vegetation = std::mem::replace(&mut self.vegetation, vegetation);
         // The replaced world goes away off the tick thread.
         self.retiring
@@ -324,12 +339,26 @@ impl Simulation {
         state: &spall_protocol::column_water::ColumnWaterState,
         config: spall_fluid::columns::ColumnConfig,
     ) -> Result<(), crate::column_water::ColumnWaterError> {
-        self.column_water = Some(crate::column_water::AuthoritativeColumnWater::restore(
+        let mut water = crate::column_water::AuthoritativeColumnWater::restore(
             &self.world.terrain().volume,
             state,
             config,
-        )?);
+        )?;
+        if self.column_water_worker {
+            water.start_worker();
+        }
+        self.column_water = Some(water);
         Ok(())
+    }
+
+    /// Runs the column water's fluid step on its own thread (see
+    /// [`crate::column_water::AuthoritativeColumnWater::start_worker`]) for
+    /// this water and any installed later by a restore or world reset.
+    pub fn set_column_water_worker(&mut self, on: bool) {
+        self.column_water_worker = on;
+        if on && let Some(water) = &mut self.column_water {
+            water.start_worker();
+        }
     }
 
     /// The column-water delta owed to this tick's journal batch, if any.
@@ -536,10 +565,13 @@ impl Simulation {
         // Bodies float: buoyancy and drag from the column water, before the
         // physics step that integrates them.
         if let Some(water) = &self.column_water {
-            let world = water.world();
+            // From the published frame, so a fluid step running on its worker
+            // never makes the tick wait.
+            let frame = water.frame();
+            let sampler = frame.sampler();
             report.buoyancy = Some(self.world.apply_buoyancy(
-                &|x, y, z| world.surface_at_m(x, y, z),
-                &|x, y, z| world.flow_at_m(x, y, z),
+                &|x, y, z| sampler.sample_at_m(x, y, z).map(|w| w.surface_y),
+                &|x, y, z| sampler.sample_at_m(x, y, z).map(|w| w.flow_m_s),
                 f64::from(TICK_DT_S),
                 &mut self.buoyancy_cache,
             ));
@@ -882,9 +914,10 @@ impl Simulation {
                 transaction_world_box(&committed.topology, terrain, cell_m)
             })
             .collect();
-        let water = self.column_water.as_ref();
+        let frame = self.column_water.as_ref().map(|w| w.frame());
+        let sampler = frame.as_ref().map(|f| f.sampler());
         self.world.advance_players(TICK_DT_S, &boxes, &|x, y, z| {
-            water.and_then(|w| w.water_sample_at_m(x, y, z))
+            sampler.as_ref().and_then(|s| s.sample_at_m(x, y, z))
         });
         if std::env::var_os("SPALL_DEBUG_PLAYER").is_some() {
             for p in self.world.players() {

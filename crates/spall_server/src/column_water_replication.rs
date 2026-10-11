@@ -311,6 +311,7 @@ mod tests {
                     column,
                     floor_y,
                     depth_q,
+                    ceiling_y: floor_y + 64,
                     flow: [0; 2],
                 })
                 .collect(),
@@ -437,6 +438,7 @@ mod tests {
                     column: 3,
                     floor_y: 5,
                     depth_q: 640,
+                    ceiling_y: 69,
                     flow,
                 }],
             })

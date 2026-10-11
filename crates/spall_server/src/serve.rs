@@ -516,6 +516,8 @@ impl Scene {
         let mut sim_config = SimulationConfig::new(setup);
         sim_config.terrain_collider_mode = mode;
         sim_config.column_water = custom.and_then(|c| c.column_water.clone());
+        // A server's tick must not wait for a lake: the fluid step has its own thread.
+        sim_config.column_water_worker = true;
         sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if let Some(custom) = custom {
@@ -5567,7 +5569,7 @@ fn setup_persistence_with_game_content(
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
     let (sim, journalled_through, checkpoints_published) = match writer.recover() {
         Ok(recovery) => {
-            let (sim, seq) = persist::restore_with_terrain_collider_mode(
+            let (mut sim, seq) = persist::restore_with_terrain_collider_mode(
                 &recovery,
                 cfg,
                 persist::RecoveryChoice::RequireClean,
@@ -5577,6 +5579,7 @@ fn setup_persistence_with_game_content(
                 terrain_collider_mode,
             )
             .map_err(|e| e.to_string())?;
+            sim.set_column_water_worker(true);
             (sim, seq, 0)
         }
         // A genuinely new/empty database: seed it with the built-in scene.

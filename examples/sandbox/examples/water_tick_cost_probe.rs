@@ -31,6 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut config = SimulationConfig::new(scene.world_setup());
     config.column_water = Some(setup);
+    // WORKER=1 steps the water on its own thread, as the server does.
+    config.column_water_worker = std::env::var("WORKER").is_ok();
     // VEG=1 runs the world's vegetation too, as the real server does.
     if std::env::var("VEG").is_ok() {
         config.vegetation = Some(scene.vegetation().clone());
