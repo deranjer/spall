@@ -212,10 +212,10 @@ impl HydroParams {
     pub fn for_grid(n: usize, sea_level: i32) -> Self {
         let area = (n * n) as u32;
         Self {
-            river_threshold: (area / 256).max(400),
-            min_lake_area: (area / 4096).max(48),
+            river_threshold: (area / 40).max(1500),
+            min_lake_area: (area / 1000).max(150),
             max_lake_area: (area / 100).max(2000),
-            min_lake_depth: 2 * FP,
+            min_lake_depth: 4 * FP,
             min_spring_height: sea_level + 40 * FP,
             waterfall_drop: 4 * FP,
         }

@@ -218,3 +218,30 @@ fn dump_natural_maps() {
         );
     }
 }
+
+/// Manual: springs, sinks and total discharge of a generated map.
+#[test]
+#[ignore = "manual diagnostic"]
+fn diag_springs() {
+    let size: u32 = std::env::var("NATURAL_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
+    let seed: u64 = std::env::var("NATURAL_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let cols = columns(seed, size);
+    let flows: Vec<f64> = cols.springs().iter().map(|(_, f)| f64::from(*f)).collect();
+    let total: f64 = flows.iter().sum();
+    let max = flows.iter().cloned().fold(0.0, f64::max);
+    eprintln!(
+        "seed {seed} size {size}: {} springs, {} sinks, total {:.1} cells3/s ({:.2} m3/s), largest {:.1} cells3/s ({:.3} m3/s)",
+        flows.len(),
+        cols.sinks().len(),
+        total,
+        total / 64.0,
+        max,
+        max / 64.0
+    );
+}
