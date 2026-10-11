@@ -6,3 +6,6 @@
 
 # Local MCP / tool config (may contain secrets)
 .codex/
+
+# Packaged builds
+/dist/
