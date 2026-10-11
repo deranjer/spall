@@ -47,6 +47,14 @@ const DRY_VOLUME: f64 = 1.0e-6;
 
 pub use spall_fluid::columns::{ColumnConfig as ColumnSolverConfig, MemoryReport};
 
+/// A spring with a fixed discharge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Discharge {
+    pub cell: GlobalCell,
+    /// Cells^3 of water added per second.
+    pub flow_cells3_s: f64,
+}
+
 /// Initial water and exchange cells for an authoritative column world.
 #[derive(Debug, Clone)]
 pub struct ColumnWaterSetup {
@@ -67,6 +75,10 @@ pub struct ColumnWaterSetup {
     pub gated_sources: [Vec<GlobalCell>; 3],
     /// Drains: cells emptied after every fluid step.
     pub sinks: Vec<GlobalCell>,
+    /// Springs with a fixed discharge: the span holding each cell gains its flow
+    /// every solver slice, whatever the channel carries away. Unlike `sources`
+    /// they cannot flood a basin faster than their stated rate.
+    pub discharges: Vec<Discharge>,
     /// The gated-spring rate the water starts at (0 refills no gated spring).
     /// Restored worlds take the saved rate instead.
     pub gated_rate: u8,
@@ -89,6 +101,7 @@ impl ColumnWaterSetup {
             sources: Vec::new(),
             gated_sources: [Vec::new(), Vec::new(), Vec::new()],
             sinks: Vec::new(),
+            discharges: Vec::new(),
             gated_rate: 0,
             prewarm_s: 0.0,
         }
@@ -303,9 +316,20 @@ fn check_setup(setup: &ColumnWaterSetup) -> Result<(), ColumnWaterError> {
         .iter()
         .chain(setup.gated_sources.iter().flatten())
         .chain(&setup.sinks)
+        .chain(setup.discharges.iter().map(|d| &d.cell))
         .any(|c| !in_range(c))
     {
         return bad("source or sink outside the height range");
+    }
+    if setup
+        .discharges
+        .iter()
+        .any(|d| !d.flow_cells3_s.is_finite() || d.flow_cells3_s < 0.0)
+    {
+        return bad("discharge must be finite and non-negative");
+    }
+    if setup.discharges.len() > spall_protocol::water::MAX_WATER_SOURCE_CELLS {
+        return bad("too many discharge springs");
     }
     if setup
         .sources
@@ -420,6 +444,17 @@ impl Shared {
         self.gated_rate.load(Ordering::Relaxed)
     }
 
+    /// Adds one slice of every discharge spring's flow. A spring in a column
+    /// with no open span at its cell adds nothing (the terrain was dug away).
+    fn discharge(&self, core: &mut Core) {
+        for d in &self.setup.discharges {
+            let volume = d.flow_cells3_s * SLICE_DT_S;
+            if core.world.add_flow(d.cell, volume).is_ok() {
+                core.added_cells3 += volume;
+            }
+        }
+    }
+
     /// Applies springs and drains after a fluid step.
     fn exchange(&self, core: &mut Core) {
         let rate = usize::from(self.gated_rate());
@@ -458,6 +493,7 @@ impl Shared {
             last_step = Some(core.world.step(SLICE_DT_S));
             drop(step_span);
             core.fluid_time_s += SLICE_DT_S;
+            self.discharge(&mut core);
             core.slice += 1;
             if core.slice == COLUMN_SLICES {
                 core.slice = 0;
@@ -578,6 +614,7 @@ impl AuthoritativeColumnWater {
             .iter()
             .chain(setup.gated_sources.iter().flatten())
             .chain(&setup.sinks)
+            .chain(setup.discharges.iter().map(|d| &d.cell))
             .map(|c| spall_fluid::columns::region_of(c.x, c.z))
             .collect();
         world.allocate_regions(&exchange_keys.into_iter().collect::<Vec<_>>());
@@ -610,6 +647,7 @@ impl AuthoritativeColumnWater {
         for _ in 0..slices {
             core.world.step(SLICE_DT_S);
             core.fluid_time_s += SLICE_DT_S;
+            self.shared.discharge(&mut core);
             core.slice += 1;
             if core.slice == COLUMN_SLICES {
                 core.slice = 0;
@@ -920,6 +958,14 @@ impl AuthoritativeColumnWater {
             gated_sources: setup.gated_sources.each_ref().map(|v| coords(v)),
             sinks: coords(&setup.sinks),
             gated_rate: self.shared.gated_rate(),
+            discharges: setup
+                .discharges
+                .iter()
+                .map(|d| spall_protocol::column_water::DischargeRecord {
+                    cell: [d.cell.x, d.cell.y, d.cell.z],
+                    flow_fixed: spall_protocol::column_water::discharge_to_fixed(d.flow_cells3_s),
+                })
+                .collect(),
         }
     }
 
@@ -945,6 +991,14 @@ impl AuthoritativeColumnWater {
         setup.sources = cells(&state.sources);
         setup.gated_sources = state.gated_sources.each_ref().map(|v| cells(v));
         setup.sinks = cells(&state.sinks);
+        setup.discharges = state
+            .discharges
+            .iter()
+            .map(|d| Discharge {
+                cell: GlobalCell::new(d.cell[0], d.cell[1], d.cell[2]),
+                flow_cells3_s: spall_protocol::column_water::discharge_from_fixed(d.flow_fixed),
+            })
+            .collect();
         check_setup(&setup)?;
         let mut world = ColumnWorld::with_terrain(terrain_source(terrain, &setup), sliced(config));
         let keys: Vec<RegionKey> = state.regions.iter().map(|r| (r.rx, r.rz)).collect();
@@ -953,6 +1007,7 @@ impl AuthoritativeColumnWater {
             .iter()
             .chain(setup.gated_sources.iter().flatten())
             .chain(&setup.sinks)
+            .chain(setup.discharges.iter().map(|d| &d.cell))
             .map(|c| spall_fluid::columns::region_of(c.x, c.z))
             .collect();
         let mut keys = keys;

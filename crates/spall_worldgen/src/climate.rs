@@ -109,7 +109,7 @@ pub fn compute(seed: u64, input: &ClimateInput) -> Climate {
                     if input.fresh[i] {
                         q += (0.9 - q) * 0.02;
                     }
-                    q += (0.55 - q) * 0.004;
+                    q += (0.5 - q) * 0.0015;
                 }
                 humidity[i] = q;
                 prev = h;
@@ -127,7 +127,7 @@ pub fn compute(seed: u64, input: &ClimateInput) -> Climate {
             let near_water = 1.0 - smooth01(0.0, 14.0, input.fresh_distance[idx]);
             let noise = fbm2(seed ^ S_MOIST_NOISE, u * 8.0, v * 8.0, 3) * 0.08;
             moisture[idx] =
-                (0.12 + 0.7 * humidity[idx] + 6.0 * rain[idx] + 0.3 * near_water + noise)
+                (0.04 + 0.75 * humidity[idx] + 6.0 * rain[idx] + 0.3 * near_water + noise)
                     .clamp(0.0, 1.0);
         }
     }

@@ -138,7 +138,7 @@ pub struct ColumnMap {
     natural: bool,
     /// Water exchange cells the generator places: river heads and the sinks
     /// of landlocked maps. Empty for the showcase.
-    springs: Vec<[i64; 3]>,
+    springs: Vec<([i64; 3], f32)>,
     sinks: Vec<[i64; 3]>,
 }
 
@@ -395,8 +395,9 @@ impl ColumnMap {
         self.river_dist[self.idx(x, z)]
     }
 
-    /// River heads: cells to refill with water every step.
-    pub fn springs(&self) -> &[[i64; 3]] {
+    /// River heads: the cell each spring adds water to, and its discharge in
+    /// cells^3/s (the catchment it carries times the runoff).
+    pub fn springs(&self) -> &[([i64; 3], f32)] {
         &self.springs
     }
 

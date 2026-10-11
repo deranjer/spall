@@ -1,4 +1,5 @@
-//! Canonical state of the stacked-column water (ENG-167, schema 3).
+//! Canonical state of the stacked-column water (ENG-167; schema 4 adds
+//! discharge springs, ENG-188).
 //!
 //! Only wet spans are stored, each keyed by its region, its column inside the
 //! region and the global y of its floor, so restore can check every one
@@ -10,8 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::water::{MAX_WATER_SOURCE_CELLS, WaterCodecError};
 
-/// Schema number of this record. 1 and 2 are the dense MAC `WaterState`.
-pub const COLUMN_WATER_VERSION: u16 = 3;
+/// Schema number of this record. 1 and 2 are the dense MAC `WaterState`; 3 had
+/// no discharge springs and is rejected (older saves are not migrated).
+pub const COLUMN_WATER_VERSION: u16 = 4;
+/// Fixed-point scale of a discharge: stored flow = round(cells^3/s * 2^16).
+pub const DISCHARGE_FIXED_ONE: u32 = 1 << 16;
 /// Fixed-point scale: stored volume = round(cells^3 * 2^32).
 pub const VOLUME_FIXED_ONE: u64 = 1 << 32;
 /// Regions one state may carry (a 4096-cell world has 16,384 regions).
@@ -27,6 +31,25 @@ pub fn volume_to_fixed(cells3: f64) -> u64 {
 
 pub fn volume_from_fixed(fixed: u64) -> f64 {
     fixed as f64 / VOLUME_FIXED_ONE as f64
+}
+
+/// A spring with a fixed discharge: the span holding `cell` gains `flow` cells^3
+/// of water per second, whatever the channel carries away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DischargeRecord {
+    pub cell: [i64; 3],
+    /// Cells^3 per second in units of 2^-16 (never float bytes).
+    pub flow_fixed: u32,
+}
+
+pub fn discharge_to_fixed(cells3_per_s: f64) -> u32 {
+    (cells3_per_s * f64::from(DISCHARGE_FIXED_ONE))
+        .round()
+        .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+pub fn discharge_from_fixed(fixed: u32) -> f64 {
+    f64::from(fixed) / f64::from(DISCHARGE_FIXED_ONE)
 }
 
 /// One wet span.
@@ -67,6 +90,8 @@ pub struct ColumnWaterState {
     pub gated_sources: [Vec<[i64; 3]>; 3],
     pub sinks: Vec<[i64; 3]>,
     pub gated_rate: u8,
+    /// Springs with a fixed discharge.
+    pub discharges: Vec<DischargeRecord>,
 }
 
 impl ColumnWaterState {
@@ -131,6 +156,9 @@ impl ColumnWaterState {
                 return Err(bad("source list"));
             }
         }
+        if self.discharges.len() > MAX_WATER_SOURCE_CELLS {
+            return Err(bad("discharge list"));
+        }
         Ok(())
     }
 }
@@ -169,6 +197,7 @@ impl ColumnWaterDelta {
             gated_sources: [Vec::new(), Vec::new(), Vec::new()],
             sinks: Vec::new(),
             gated_rate: self.gated_rate,
+            discharges: Vec::new(),
         };
         shell.validate_inner(true)
     }
@@ -245,6 +274,7 @@ mod tests {
             gated_sources: [Vec::new(), Vec::new(), Vec::new()],
             sinks: Vec::new(),
             gated_rate: 0,
+            discharges: Vec::new(),
         }
     }
 

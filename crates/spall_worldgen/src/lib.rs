@@ -22,12 +22,13 @@ pub mod hydrology;
 pub mod landform;
 pub mod landscape;
 pub mod noise;
+pub mod rivers;
 pub mod spec;
 
 pub use columns::{Biome, ColumnMap, SNOW_LINE};
 pub use generate::{
-    GeneratedWorld, GenerationTimings, SPAWN_HEADROOM_CELLS, WATER_REGION_BUDGET, WaterPlan,
-    WetColumn, generate, generate_with_timings,
+    GeneratedWorld, GenerationTimings, SPAWN_HEADROOM_CELLS, Spring, WATER_REGION_BUDGET,
+    WaterPlan, WetColumn, generate, generate_with_timings,
 };
 pub use spec::{
     BORDER_CELLS, GEN_VERSION, GenError, MAX_HEIGHT_BRICKS, NATURAL_GEN_VERSION, Preset, SEA_LEVEL,

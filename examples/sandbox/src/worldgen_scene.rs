@@ -12,7 +12,7 @@ use std::sync::Arc;
 use spall_core::GlobalCell;
 use spall_server::CustomWorld;
 use spall_sim::WorldSetup;
-use spall_sim::column_water::ColumnWaterSetup;
+use spall_sim::column_water::{ColumnWaterSetup, Discharge};
 use spall_structure::AnchorPlane;
 use spall_worldgen::{
     GenError, GeneratedWorld, Preset, SHOWCASE_SIZE_CELLS, WaterPlan, WorldGenSpec,
@@ -28,6 +28,9 @@ pub enum WorldgenSceneError {
     #[error("vegetation: {0}")]
     Vegetation(String),
 }
+
+/// A pipe quieter than this (cells^3/s) lets its region sleep.
+pub const WORLDGEN_SLEEP_FLOW: f32 = 0.1;
 
 /// The default arena edge in cells (1 km). Needs regional streaming and several
 /// GiB of server memory; CI and quick iteration use [`CI_SIZE_CELLS`].
@@ -155,12 +158,24 @@ pub fn column_water_setup(
             )
         })
         .collect();
-    // Springs are gated: they refill their cell to full whatever the channel
-    // carries, with no discharge limit, so left on they fill a landlocked basin
-    // faster than its sinks drain (about 75 m3/s measured on seed 1 at 1024
-    // cells). They start off; `--live-rivers` turns them on.
-    setup.gated_sources[0] = plan.springs.clone();
+    // Springs are fixed discharges (cells^3/s from the catchment each carries),
+    // not refill-to-full cells: a refilling spring takes whatever the channel
+    // lets through, about 1.3 m3/s each measured, and floods a basin.
+    setup.discharges = plan
+        .springs
+        .iter()
+        .map(|s| Discharge {
+            cell: s.cell,
+            flow_cells3_s: f64::from(s.flow_cells3_s),
+        })
+        .collect();
     setup.sinks = plan.sinks.clone();
+    // Rivers creep for a long time (about 0.1 m/s on a 1% slope), and at the
+    // solver's default sensitivity every region they touch stays awake. A pipe
+    // moving under 0.1 cells^3/s (6 mL/s) does not need stepping: with this,
+    // measured on a 1024-cell world, the active regions fall from 272 to 143
+    // in five minutes and keep falling.
+    setup.config.sleep_flow = WORLDGEN_SLEEP_FLOW;
     Some(setup)
 }
 
@@ -183,16 +198,6 @@ impl GeneratedScene {
             Some(spawn) => std::slice::from_ref(spawn),
             None => &self.world.spawns,
         }
-    }
-
-    /// Turns the springs on, so the rivers run (see [`column_water_setup`]).
-    /// Experimental: springs have no discharge limit yet.
-    #[must_use]
-    pub fn with_live_rivers(mut self) -> Self {
-        if let Some(setup) = &mut self.column_water {
-            setup.gated_rate = 1;
-        }
-        self
     }
 
     /// Spawns the player on solid ground beside the shore of the deepest lake

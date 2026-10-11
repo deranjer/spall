@@ -446,9 +446,12 @@ fn the_natural_preset_generates_a_playable_world_with_springs() {
         .column_water_setup()
         .expect("natural worlds have water");
     assert_eq!(water.initial_levels.len(), world.water.columns.len());
-    assert_eq!(water.gated_sources[0].len(), world.water.springs.len());
+    assert_eq!(water.discharges.len(), world.water.springs.len());
     assert!(!world.water.springs.is_empty(), "rivers start at springs");
-    assert_eq!(water.gated_rate, 0, "the springs start off");
+    for (d, s) in water.discharges.iter().zip(&world.water.springs) {
+        assert_eq!(d.cell, s.cell);
+        assert!(d.flow_cells3_s > 0.0, "a spring with no flow");
+    }
     let mut config = SimulationConfig::new(scene.world_setup());
     config.column_water = Some(water.clone());
     let sim = Simulation::new(config).expect("the generated world stands up");
@@ -634,4 +637,17 @@ fn the_lake_floaters_float_or_sink_as_their_density_says() {
         "stone at {} vs surface {surface}",
         pose(5).translation_m[1]
     );
+}
+
+/// Worldgen sizes rivers with the solver's own constants, which it cannot
+/// import (it may not depend on the fluid crate): they must stay equal.
+#[test]
+fn river_sizing_uses_the_solvers_constants() {
+    use spall_sim::column_water::{COLUMN_STEP_DT_S, ColumnSolverConfig};
+    use spall_worldgen::rivers;
+    let solver = ColumnSolverConfig::default();
+    assert!((rivers::GRAVITY_CELLS_S2 - f64::from(solver.gravity)).abs() < 1e-4);
+    assert!((rivers::DAMPING_PER_S - f64::from(solver.damping_per_s)).abs() < 1e-6);
+    // A drain cell empties one cell^3 per exchange, one exchange per solver step.
+    assert!((rivers::SINK_CELL_CAPACITY_CELLS3_S - 1.0 / COLUMN_STEP_DT_S).abs() < 1e-9);
 }

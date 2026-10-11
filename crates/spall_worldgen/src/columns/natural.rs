@@ -8,6 +8,7 @@ use crate::hydrology::{FP, NONE, OUTLET_SEA};
 use crate::landform::MAX_TERRAIN;
 use crate::landscape::{Landscape, SAMPLE_CELLS};
 use crate::noise::{fbm2, smoothstep, value2};
+use crate::rivers;
 use crate::spec::{GenError, SEA_LEVEL, WorldGenSpec, WorldgenPalette};
 
 // Noise streams. Changing one changes the world: bump the preset's version.
@@ -140,7 +141,23 @@ fn build_coarse(scape: &Landscape) -> Coarse {
         let half_width = 1.0 + area / 45.0;
         let bed = f64::from(h.bed[i]) / f64::from(FP);
         let floor = bed - depth;
-        let water = bed - 0.3 * depth;
+        // The depth this river runs at while carrying what its catchment sheds,
+        // on the slope of its bed (a drop over `SAMPLE_CELLS` cells, or a
+        // diagonal of them).
+        let r = h.receiver[i] as usize;
+        let step = if i % n != r % n && i / n != r / n {
+            std::f64::consts::SQRT_2
+        } else {
+            1.0
+        };
+        let slope = (bed - f64::from(h.bed[r]) / f64::from(FP)).max(0.0) / (step * CELLS);
+        let flowing = rivers::uniform_flow_depth(
+            rivers::discharge(u64::from(h.area[i])),
+            slope,
+            depth,
+            half_width * CELLS,
+        );
+        let water = floor + flowing;
         let (cx, cz) = ((i % n) as i64, (i / n) as i64);
         let reach = half_width.ceil() as i64;
         for dz in -reach..=reach {
@@ -238,7 +255,10 @@ fn classify(t: f64, m: f64, h: i32, gradient: f64, submerged: bool, river_dist: 
             Biome::BorealForest
         };
     }
-    if m < 0.16 {
+    // Warmer land dries out at a higher wetness: hot and dry is desert, cool and
+    // dry is steppe.
+    let dry = 0.16 + 0.012 * (t - 9.0).max(0.0);
+    if m < dry {
         Biome::Desert
     } else if m < 0.32 {
         Biome::Steppe
@@ -394,14 +414,16 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
         )
     };
     map.springs = hydro
-        .springs
+        .heads
         .iter()
-        .filter_map(|&i| {
+        .filter_map(|&(i, samples)| {
             let (x, z) = center(i as usize);
-            cell_above_water(&map, x, z)
+            let flow = rivers::discharge(samples) as f32;
+            cell_above_water(&map, x, z).map(|cell| (cell, flow))
         })
         .collect();
-    map.sinks = water_sinks(&map, &scape, map.springs.len());
+    let total_flow: f64 = map.springs.iter().map(|(_, f)| f64::from(*f)).sum();
+    map.sinks = water_sinks(&map, &scape, total_flow);
     Ok(map)
 }
 
@@ -409,13 +431,15 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
 /// exchange, so a patch of them just above the water surface holds the level:
 /// whatever the springs add above it leaves. The patch is sized for the springs' inflow
 /// with headroom; a drain whose water is below its cell takes nothing.
-const SINK_CELLS_PER_SPRING: f64 = 1.2;
+const SINK_HEADROOM: f64 = 1.5;
 const MIN_SINK_CELLS: usize = 16;
 
 /// Where water leaves the world: the terminal lake of a landlocked map, or the
 /// open sea of a coastal one (so river mouths never raise the sea).
-fn water_sinks(map: &ColumnMap, scape: &Landscape, springs: usize) -> Vec<[i64; 3]> {
-    let wanted = ((springs as f64 * SINK_CELLS_PER_SPRING).ceil() as usize).max(MIN_SINK_CELLS);
+fn water_sinks(map: &ColumnMap, scape: &Landscape, total_flow: f64) -> Vec<[i64; 3]> {
+    let wanted = ((SINK_HEADROOM * total_flow / rivers::SINK_CELL_CAPACITY_CELLS3_S).ceil()
+        as usize)
+        .max(MIN_SINK_CELLS);
     let size = i64::from(map.size());
     let border = crate::spec::BORDER_CELLS;
     // The cell just above the surface: empty at the planned level, so the drain

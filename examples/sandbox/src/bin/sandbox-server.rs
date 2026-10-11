@@ -101,10 +101,6 @@ struct Args {
     /// instead of at a generated meadow spawn.
     #[arg(long, requires = "worldgen")]
     spawn_at_lake: bool,
-    /// Turn the rivers' springs on so they run. Experimental: a spring has no
-    /// discharge limit yet, so a landlocked basin fills faster than it drains.
-    #[arg(long, requires = "worldgen")]
-    live_rivers: bool,
     /// Float a raft and some test objects (light crates, a log, a stone block
     /// that sinks) on the deepest lake, a few metres out from `--spawn-at-lake`.
     #[arg(long, requires = "worldgen")]
@@ -460,11 +456,6 @@ fn run_serve(args: Args) -> ExitCode {
             spall_ecology::living::Season::parse(&args.season).unwrap(),
         ) {
             Ok(generated) => {
-                let generated = if args.live_rivers {
-                    generated.with_live_rivers()
-                } else {
-                    generated
-                };
                 let generated = if args.spawn_at_lake {
                     let moved = generated.with_lake_spawn();
                     if moved.player_spawns() == moved.world().spawns.as_slice() {

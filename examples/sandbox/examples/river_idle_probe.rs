@@ -27,16 +27,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seconds: u32 = a.get(3).map_or(Ok(120), |s| s.parse())?;
     let scene = worldgen_scene::generate(preset, seed, size)?;
     let mut setup = scene.column_water_setup().ok_or("dry world")?.clone();
-    if std::env::var("STEADY").is_ok_and(|v| v == "0") {
-        setup.config.steady_steps = 0;
+    // STEADY=1 turns steady-flow sleep on (it is off by default), STEADY=0 off.
+    if let Ok(v) = std::env::var("STEADY") {
+        setup.config.steady_steps = if v == "0" { 0 } else { 40 };
     }
     if std::env::var("NOSPRINGS").is_ok() {
         setup.sources.clear();
         setup.gated_sources[0].clear();
+        setup.discharges.clear();
     }
     // LIVE=1 turns the (gated) springs on, as `--live-rivers` does.
     if std::env::var("LIVE").is_ok() {
         setup.gated_rate = 1;
+    }
+    if let Some(flow) = std::env::var("SLEEPFLOW").ok().and_then(|v| v.parse().ok()) {
+        setup.config.sleep_flow = flow;
     }
     if let Some(seconds) = std::env::var("PREWARM").ok().and_then(|v| v.parse().ok()) {
         setup.prewarm_s = seconds;
@@ -44,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{preset} seed {seed} size {size}: {} wet columns, {} springs, {} sinks",
         setup.initial_levels.len(),
-        setup.gated_sources[0].len() + setup.sources.len(),
+        setup.discharges.len() + setup.sources.len(),
         setup.sinks.len()
     );
     let planned: std::collections::HashMap<(i64, i64), (i64, i64)> = scene

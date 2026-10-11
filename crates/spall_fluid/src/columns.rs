@@ -295,6 +295,11 @@ struct Region {
     steady_steps: u32,
     /// Simulated seconds in the current window.
     steady_time: f32,
+    /// What the live boundary pipes moved into (+) or out of (-) this region
+    /// while it was frozen. Its boundary spans are fixed reservoirs, so the
+    /// exchange is held here instead of changing their volume; it is applied
+    /// when the region wakes and counts in [`ColumnWorld::total_volume`].
+    steady_ledger: f64,
     /// Span volumes when the current steady window began, or when the region
     /// froze (empty: no window yet).
     steady_snap: Vec<f64>,
@@ -388,6 +393,12 @@ pub struct ColumnWorld {
     /// also touches that region's frozen pipes, whose flow must not move water
     /// because their other end is not stepped.
     live: Vec<bool>,
+    /// Whether each span belongs to a steady region, and the ranges flagged so
+    /// they can be cleared without touching the whole vector.
+    steady_span: Vec<bool>,
+    steady_flagged: Vec<(u32, u32)>,
+    /// Spans of steady regions that live pipes touch, with their region.
+    steady_boundary: Vec<(u32, u32)>,
     /// Near-full active spans for the current step.
     nodes: Vec<u32>,
     /// Regions whose water changed since `take_dirty_regions`.
@@ -493,6 +504,9 @@ impl ColumnWorld {
             act_spans: Vec::new(),
             act_pipes: Vec::new(),
             live: Vec::new(),
+            steady_span: Vec::new(),
+            steady_flagged: Vec::new(),
+            steady_boundary: Vec::new(),
             nodes: Vec::new(),
             dirty: BTreeSet::new(),
             touched: Vec::new(),
@@ -811,6 +825,7 @@ impl ColumnWorld {
                     steady: false,
                     steady_steps: 0,
                     steady_time: 0.0,
+                    steady_ledger: 0.0,
                     steady_snap: Vec::new(),
                     steady_qsum: Vec::new(),
                     steady_qsq: Vec::new(),
@@ -1304,6 +1319,7 @@ impl ColumnWorld {
                 steady: false,
                 steady_steps: 0,
                 steady_time: 0.0,
+                steady_ledger: 0.0,
                 steady_snap: Vec::new(),
                 steady_qsum: Vec::new(),
                 steady_qsq: Vec::new(),
@@ -1360,11 +1376,40 @@ impl ColumnWorld {
         if r.frozen || r.active {
             return false;
         }
+        let was_steady = r.steady;
         r.steady = false;
         r.steady_ref.clear();
         r.active = true;
+        if was_steady {
+            self.settle_ledger(s);
+        }
         self.lists_dirty = true;
         true
+    }
+
+    /// Puts a woken region's ledger into its fullest span: in a steady state the
+    /// water that entered and left net to about zero, so what is left is small.
+    fn settle_ledger(&mut self, slot: usize) {
+        let r = &mut self.regions[slot];
+        let ledger = std::mem::take(&mut r.steady_ledger);
+        if ledger == 0.0 {
+            return;
+        }
+        let (lo, hi) = (r.span_start as usize, r.span_end as usize);
+        let mut best = lo;
+        for i in lo..hi {
+            if self.volume[i] > self.volume[best] {
+                best = i;
+            }
+        }
+        let after = self.volume[best] + ledger;
+        if after >= 0.0 {
+            self.volume[best] = after;
+        } else {
+            // Not enough water in the region to give: the rest was never there.
+            self.volume[best] = 0.0;
+            self.unplaced += after;
+        }
     }
 
     fn wake_slot_and_neighbours(&mut self, s: usize) {
@@ -1511,6 +1556,24 @@ impl ColumnWorld {
         }
     }
 
+    /// Adds a spring's flow to the span containing `cell`. In a steady region
+    /// the flow joins the region's ledger instead and wakes nothing: the
+    /// spring's water is part of the steady balance.
+    pub fn add_flow(&mut self, cell: GlobalCell, volume: f64) -> Result<(), ColumnError> {
+        if !volume.is_finite() || volume < 0.0 {
+            return Err(ColumnError::InvalidAmount);
+        }
+        let slot = self.slot_of.get(&region_of(cell.x, cell.z)).copied();
+        if let Some(slot) = slot
+            && self.regions[slot as usize].steady
+        {
+            self.span_at(cell).ok_or(ColumnError::NotOpen(cell))?;
+            self.regions[slot as usize].steady_ledger += volume;
+            return Ok(());
+        }
+        self.add_water(cell, volume)
+    }
+
     /// Adds water to the span containing `cell` (a source) and wakes its region.
     pub fn add_water(&mut self, cell: GlobalCell, volume: f64) -> Result<(), ColumnError> {
         if !volume.is_finite() || volume < 0.0 {
@@ -1620,7 +1683,8 @@ impl ColumnWorld {
 
     /// Total water including overfill and the unplaced ledger, cells^3.
     pub fn total_volume(&self) -> f64 {
-        chunked_sum(&self.volume, |_, v| *v) + self.unplaced
+        let ledgers: f64 = self.regions.iter().map(|r| r.steady_ledger).sum();
+        chunked_sum(&self.volume, |_, v| *v) + self.unplaced + ledgers
     }
 
     pub fn total_volume_m3(&self) -> f64 {
@@ -1879,6 +1943,21 @@ impl ColumnWorld {
         }
         self.act_pipes.clear();
         self.touched.clear();
+        if self.steady_span.len() == self.spans.len() {
+            for &(a, b) in &self.steady_flagged {
+                self.steady_span[a as usize..b as usize].fill(false);
+            }
+        } else {
+            self.steady_span = vec![false; self.spans.len()];
+        }
+        self.steady_flagged.clear();
+        for r in &self.regions {
+            if r.steady {
+                self.steady_span[r.span_start as usize..r.span_end as usize].fill(true);
+                self.steady_flagged.push((r.span_start, r.span_end));
+            }
+        }
+        self.steady_boundary.clear();
         let mut touched = vec![false; self.regions.len()];
         for r in &self.regions {
             if r.active && !r.frozen {
@@ -1903,6 +1982,11 @@ impl ColumnWorld {
                 self.live[pi as usize] = true;
                 touched[p.ra as usize] = true;
                 touched[p.rb as usize] = true;
+                for (s, region) in [(p.a, p.ra), (p.b, p.rb)] {
+                    if self.regions[region as usize].steady {
+                        self.steady_boundary.push((s, region));
+                    }
+                }
                 for s in [p.a, p.b] {
                     if !stamp[s as usize] {
                         stamp[s as usize] = true;
@@ -1919,6 +2003,8 @@ impl ColumnWorld {
         self.touched = (0..self.regions.len() as u32)
             .filter(|&s| touched[s as usize])
             .collect();
+        self.steady_boundary.sort_unstable();
+        self.steady_boundary.dedup();
         self.lists_dirty = false;
     }
 
@@ -2198,6 +2284,7 @@ impl ColumnWorld {
                 );
                 let r = &mut self.regions[s];
                 r.steady = true;
+                r.steady_ledger = 0.0;
                 r.active = false;
                 r.steady_steps = 0;
                 r.steady_snap = self.volume[lo..hi].to_vec();
@@ -2208,29 +2295,17 @@ impl ColumnWorld {
                 self.lists_dirty = true;
             }
         }
-        // A steady region whose boundary spans have filled or emptied beyond
-        // tolerance has a changing neighbour: it wakes and flows again.
+        // A steady region whose exchange with its neighbours has stopped
+        // netting to zero is not steady any more: it wakes and flows again.
         {
-            let mut wake_drift = Vec::new();
-            for (s, r) in self.regions.iter().enumerate() {
-                if !r.steady {
-                    continue;
-                }
-                let lo = r.span_start as usize;
-                let drifted = r.steady_ref.iter().any(|&(pi, _, _)| {
-                    let p = self.pipes[pi as usize];
-                    [p.a as usize, p.b as usize]
-                        .into_iter()
-                        .filter(|i| (lo..r.span_end as usize).contains(i))
-                        .any(|i| {
-                            (self.volume[i] - r.steady_snap[i - lo]).abs() > cfg.steady_wake_volume
-                        })
-                });
-                if drifted {
-                    wake_drift.push(s);
-                }
-            }
-            for s in wake_drift {
+            let wake: Vec<usize> = self
+                .regions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.steady && r.steady_ledger.abs() > cfg.steady_wake_volume)
+                .map(|(s, _)| s)
+                .collect();
+            for s in wake {
                 if self.wake_slot(s) {
                     metrics.regions_woken += 1;
                 }
@@ -2416,10 +2491,14 @@ impl ColumnWorld {
 
         // Apply all volume changes at once (Jacobi): each span reads the final
         // flows of its pipes and writes only its own volume.
-        let (q, live) = (&self.q, &self.live);
+        let (q, live, steady_span) = (&self.q, &self.live, &self.steady_span);
         let vol_ptr = Shared(self.volume.as_mut_ptr());
         self.act_spans.par_iter().for_each(|&i| {
             let i = i as usize;
+            // A steady region's spans are fixed reservoirs: see `steady_ledger`.
+            if steady_span[i] {
+                return;
+            }
             let (s, e) = (adj_start[i] as usize, adj_start[i + 1] as usize);
             let delta = adj[s..e]
                 .iter()
@@ -2437,6 +2516,34 @@ impl ColumnWorld {
             // not read through any other path in this pass.
             unsafe { vol_ptr.write(i, (vol_ptr.read(i) + delta).max(0.0)) }
         });
+        // What the live boundary pipes moved across a steady region's edge goes
+        // to its ledger, so the exchange is still counted exactly.
+        if !self.steady_boundary.is_empty() {
+            let deltas: Vec<(u32, f64)> = self
+                .steady_boundary
+                .iter()
+                .map(|&(span, region)| {
+                    let i = span as usize;
+                    let (s, e) = (self.adj_start[i] as usize, self.adj_start[i + 1] as usize);
+                    let delta: f64 = self.adj[s..e]
+                        .iter()
+                        .map(|&entry| {
+                            let pi = (entry >> 1) as usize;
+                            if !self.live[pi] {
+                                return 0.0;
+                            }
+                            let flow = f64::from(self.q[pi]);
+                            if entry & 1 == 1 { -flow } else { flow }
+                        })
+                        .sum::<f64>()
+                        * f64::from(dt);
+                    (region, delta)
+                })
+                .collect();
+            for (region, delta) in deltas {
+                self.regions[region as usize].steady_ledger += delta;
+            }
+        }
         dt
     }
 }

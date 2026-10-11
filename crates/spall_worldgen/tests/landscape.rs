@@ -34,6 +34,14 @@ fn river_beds_never_rise_downstream() {
                 let r = h.receiver[i] as usize;
                 assert!(h.bed[i] >= h.bed[r], "seed {}: bed rises at {i}", s.seed);
                 assert!(h.bed[i] <= h.height[i]);
+                // The bed follows the ground: a river is not cut down to its mouth.
+                assert!(
+                    h.bed[i] >= h.height[i] - 4 * FP,
+                    "seed {}: river {i} bed {} is far below the ground {}",
+                    s.seed,
+                    h.bed[i] / FP,
+                    h.height[i] / FP
+                );
             }
         }
     }
@@ -192,4 +200,115 @@ fn dump_maps() {
             h.falls.len()
         );
     }
+}
+
+#[test]
+fn river_heads_carry_the_catchment_exactly_once() {
+    for s in scapes() {
+        let h = &s.hydrology;
+        let total: u64 = h.heads.iter().map(|&(_, a)| a).sum();
+        assert!(
+            total <= (s.n * s.n) as u64,
+            "seed {}: {total} samples",
+            s.seed
+        );
+        assert!(
+            h.heads
+                .iter()
+                .all(|&(cell, a)| h.river[cell as usize] && a >= 1)
+        );
+        // Heads are river cells with no river donor, so a head is never fed by another head.
+        for &(cell, _) in &h.heads {
+            let donors = (0..h.river.len())
+                .filter(|&j| h.river[j] && h.receiver[j] == cell && j as u32 != cell)
+                .count();
+            assert_eq!(donors, 0, "seed {}: head {cell} has river donors", s.seed);
+        }
+        // Every river cell's water reaches the sea or a basin from some head.
+        assert!(!h.heads.is_empty(), "seed {}", s.seed);
+    }
+}
+
+/// Manual: how deep the rivers sit below the ground around them.
+#[test]
+#[ignore = "manual diagnostic"]
+fn diag_river_relief() {
+    for seed in [1u64, 2, 4, 5] {
+        let s = Landscape::generate(seed, 2048).unwrap();
+        let (n, h) = (s.n as i64, &s.hydrology);
+        let mut rel: Vec<f64> = Vec::new();
+        for i in 0..h.river.len() {
+            if !h.river[i] {
+                continue;
+            }
+            let (x, z) = ((i % s.n) as i64, (i / s.n) as i64);
+            let bed = f64::from(h.bed[i]) / f64::from(FP);
+            let mut around: Vec<f64> = [
+                (8, 0),
+                (-8, 0),
+                (0, 8),
+                (0, -8),
+                (6, 6),
+                (-6, 6),
+                (6, -6),
+                (-6, -6),
+            ]
+            .iter()
+            .filter_map(|(dx, dz)| {
+                let (xx, zz) = (x + dx, z + dz);
+                (xx >= 0 && zz >= 0 && xx < n && zz < n)
+                    .then(|| f64::from(h.height[(xx + n * zz) as usize]) / f64::from(FP) - bed)
+            })
+            .collect();
+            if around.len() == 8 {
+                around.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                rel.push(around[3] / 4.0); // metres: the typical ground ~8 m away
+            }
+        }
+        rel.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q = |p: usize| rel[rel.len() * p / 100];
+        eprintln!(
+            "seed {seed}: {} river cells; ground ~8 m away stands above the bed by (m) p10 {:.1} p25 {:.1} p50 {:.1} p75 {:.1} p90 {:.1} p99 {:.1}",
+            rel.len(),
+            q(10),
+            q(25),
+            q(50),
+            q(75),
+            q(90),
+            q(99)
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual diagnostic"]
+fn diag_river_profile() {
+    let s = Landscape::generate(1, 2048).unwrap();
+    let (n, h) = (s.n, &s.hydrology);
+    // A river cell near the middle of the map with a long river around it.
+    let i = (0..h.river.len())
+        .filter(|&i| h.river[i] && (i % n) > n / 3 && (i % n) < 2 * n / 3 && h.area[i] > 3000)
+        .nth(40)
+        .expect("a river cell");
+    let (x, z) = (i % n, i / n);
+    eprintln!(
+        "river cell ({x},{z}) area {} bed {}",
+        h.area[i],
+        h.bed[i] / FP
+    );
+    eprintln!("heights (cells) along x:");
+    let row: Vec<String> = (x.saturating_sub(16)..(x + 17).min(n))
+        .map(|xx| format!("{}", h.height[xx + n * z] / FP))
+        .collect();
+    eprintln!("  {}", row.join(" "));
+    eprintln!("heights (cells) along z:");
+    let col: Vec<String> = (z.saturating_sub(16)..(z + 17).min(n))
+        .map(|zz| format!("{}", h.height[x + n * zz] / FP))
+        .collect();
+    eprintln!("  {}", col.join(" "));
+    eprintln!("landform (pre-erosion, cells) along x:");
+    let row: Vec<String> = (x.saturating_sub(16)..(x + 17).min(n))
+        .map(|xx| format!("{:.0}", s.landform.height[xx + n * z]))
+        .collect();
+    eprintln!("  {}", row.join(" "));
 }

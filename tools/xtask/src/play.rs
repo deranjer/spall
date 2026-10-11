@@ -55,10 +55,6 @@ pub struct PlayArgs {
     /// deepest lake instead of at a meadow spawn.
     #[arg(long, requires = "worldgen")]
     spawn_at_lake: bool,
-    /// With `--worldgen`: turn the rivers' springs on so they run
-    /// (experimental: springs have no discharge limit yet).
-    #[arg(long, requires = "worldgen")]
-    live_rivers: bool,
     /// With `--worldgen`: float a raft and test objects on the deepest lake
     /// (use with `--spawn-at-lake` to start on the shore beside them).
     #[arg(long, requires = "worldgen")]
@@ -236,9 +232,6 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             }
             if args.spawn_raft {
                 server_cmd.arg("--spawn-raft");
-            }
-            if args.live_rivers {
-                server_cmd.arg("--live-rivers");
             }
             server_cmd.args(["--worldgen-size", &args.worldgen_size.to_string()]);
             &mut server_cmd

@@ -259,6 +259,11 @@ pub struct Hydrology {
     pub bed: Vec<i32>,
     /// River heads above the minimum height that feed a channel.
     pub springs: Vec<u32>,
+    /// Every river head (a spring, or the outflow of a lake) with the catchment
+    /// it carries, in samples: the lateral inflow of every river cell along its
+    /// main stem, so the heads of a river network together carry its whole
+    /// catchment. Sorted by cell.
+    pub heads: Vec<(u32, u64)>,
     /// River cells whose step to the receiver drops at least the waterfall drop.
     pub falls: Vec<u32>,
     pub outlet: Vec<u8>,
@@ -377,13 +382,58 @@ impl Hydrology {
         }
         let river: Vec<bool> = (0..total).map(|i| candidate(i) && fed[i]).collect();
 
-        // Bed: the minimum of the ground and everything downstream.
+        // Where each river's water enters. A river head carries the rain that
+        // falls on the ground draining to its stem: walking donors first, every
+        // cell's own sample and whatever its non-river donors bring down (hill
+        // slopes, lakes) joins the head of its river stem; water that already
+        // reached a river is not counted again further down (a river through a
+        // lake would otherwise be credited twice). The stem is the river donor
+        // that drains the most.
+        let mut main_donor = vec![NONE; total];
+        for j in 0..total {
+            let r = flood.receiver[j] as usize;
+            if r != j && river[j] && river[r] {
+                let m = main_donor[r];
+                if m == NONE || area[j] > area[m as usize] {
+                    main_donor[r] = j as u32;
+                }
+            }
+        }
+        let mut leaf = vec![NONE; total];
+        let mut unattributed = vec![1u64; total];
+        let mut head_area: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        for &i in flood.order.iter().rev() {
+            let i = i as usize;
+            let pass = if river[i] {
+                leaf[i] = if main_donor[i] == NONE {
+                    i as u32
+                } else {
+                    leaf[main_donor[i] as usize]
+                };
+                *head_area.entry(leaf[i]).or_default() += unattributed[i];
+                0
+            } else {
+                unattributed[i]
+            };
+            let r = flood.receiver[i] as usize;
+            if r != i {
+                unattributed[r] += pass;
+            }
+        }
+        let heads: Vec<(u32, u64)> = head_area.into_iter().collect();
+
+        // Bed: the ground, never lower downstream than upstream. Receivers come
+        // first in the flood order, so `max(ground, bed downstream)` keeps the
+        // bed on the ground wherever the ground falls, and holds it level where
+        // the ground rises again. (Taking the minimum here instead sets every
+        // river cell's bed to the lowest ground anywhere below it: rivers cut
+        // down to their mouth's level, a ravine along their whole length.)
         let mut bed = height.clone();
         for &i in &flood.order {
             let i = i as usize;
             let r = flood.receiver[i] as usize;
             if r != i {
-                bed[i] = bed[i].min(bed[r]);
+                bed[i] = height[i].max(bed[r]);
             }
         }
         let falls = (0..total)
@@ -405,6 +455,7 @@ impl Hydrology {
             river,
             bed,
             springs,
+            heads,
             falls,
             outlet: outlet.to_vec(),
         }

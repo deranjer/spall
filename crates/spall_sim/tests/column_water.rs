@@ -289,3 +289,52 @@ fn gated_spring_only_runs_while_switched_on() {
     }
     assert!(sim.column_water().unwrap().frame().volume_m3 > 0.0);
 }
+
+#[test]
+fn a_discharge_spring_adds_exactly_its_rate_and_survives_a_save() {
+    use spall_sim::column_water::Discharge;
+    let rate = 12.0; // cells^3 per second
+    let mut setup = ColumnWaterSetup::new(0, 32, Vec::new());
+    setup.discharges = vec![Discharge {
+        cell: GlobalCell::new(5, 2, 7),
+        flow_cells3_s: rate,
+    }];
+    let mut sim = simulation(setup);
+    let seconds = 20.0;
+    for _ in 0..(seconds * 20.0) as u32 {
+        sim.tick().unwrap();
+    }
+    let water = sim.column_water().unwrap();
+    let frame = water.frame();
+    // The stated rate, not a refill-to-full: the fluid time that has run times the rate.
+    let expected_m3 = frame.fluid_time_s * rate * 0.25f64.powi(3);
+    assert!(
+        (frame.spring_added_m3 - expected_m3).abs() < 1e-6 * expected_m3.max(1.0),
+        "added {} vs {expected_m3}",
+        frame.spring_added_m3
+    );
+    assert!(
+        (frame.volume_m3 - frame.spring_added_m3).abs() < 1e-6,
+        "nothing is lost or made"
+    );
+
+    // The spring is part of the saved state and comes back with the same rate.
+    let state = water.canonical_state();
+    assert_eq!(
+        state.version,
+        spall_protocol::column_water::COLUMN_WATER_VERSION
+    );
+    assert_eq!(state.discharges.len(), 1);
+    let restored = AuthoritativeColumnWater::restore(
+        &sim.world().terrain().volume,
+        &state,
+        water.setup().config,
+    )
+    .unwrap();
+    assert_eq!(restored.setup().discharges, water.setup().discharges);
+
+    // A save from before discharge springs (schema 3) is refused, not migrated.
+    let mut old = state.clone();
+    old.version = 3;
+    assert!(old.validate().is_err());
+}

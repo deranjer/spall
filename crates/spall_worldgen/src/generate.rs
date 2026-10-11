@@ -39,6 +39,14 @@ pub struct WetColumn {
     pub top: i32,
 }
 
+/// A river head: the cell it adds water to and how much per second.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Spring {
+    pub cell: GlobalCell,
+    /// Cells^3 per second (see [`crate::rivers`]).
+    pub flow_cells3_s: f32,
+}
+
 /// Initial water, per column: the fluid solver is handed this, never voxel
 /// materials. Springs and sinks are explicit exchange cells, not hidden ones.
 #[derive(Debug, Clone, Default)]
@@ -49,8 +57,8 @@ pub struct WaterPlan {
     pub columns: Vec<WetColumn>,
     /// Inclusive cell box around the water, or `None` for a dry world.
     pub bounds: Option<(GlobalCell, GlobalCell)>,
-    /// Cells refilled to full water every step: river heads.
-    pub springs: Vec<GlobalCell>,
+    /// River heads, each with a fixed discharge.
+    pub springs: Vec<Spring>,
     /// Cells emptied every step: where a landlocked map's water ends.
     pub sinks: Vec<GlobalCell>,
 }
@@ -355,7 +363,14 @@ fn water_plan(columns: &ColumnMap) -> WaterPlan {
         surface_y: i64::from(SEA_LEVEL),
         columns: wet,
         bounds,
-        springs: columns.springs().iter().map(cell).collect(),
+        springs: columns
+            .springs()
+            .iter()
+            .map(|(p, flow)| Spring {
+                cell: cell(p),
+                flow_cells3_s: *flow,
+            })
+            .collect(),
         sinks: columns.sinks().iter().map(cell).collect(),
     }
 }
