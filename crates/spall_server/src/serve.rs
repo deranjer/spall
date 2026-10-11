@@ -3991,6 +3991,15 @@ async fn serve_async(
                 phase_totals[slot] += d;
                 phase_worst[slot] = phase_worst[slot].max(d);
             }
+            // The replication and persistence spans of this tick are recorded
+            // after the simulation's were drained; fold them in.
+            let after_spans = spall_sim::prof::drain();
+            for (name, elapsed) in &after_spans {
+                let entry = span_totals.entry(*name).or_default();
+                entry.0 += *elapsed;
+                entry.1 = entry.1.max(*elapsed);
+            }
+            last_tick_spans.extend(after_spans);
             // A tick over three frames long is a visible stall for every client:
             // say so on stderr (at most once a second) with where the time went.
             if whole_tick >= Duration::from_millis(50)

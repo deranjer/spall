@@ -61,6 +61,7 @@ impl WaterInterest {
 pub struct ColumnWaterPublisher {
     sent: HashMap<RegionKey, SentRegion>,
     pending: VecDeque<WireRecord>,
+    scan: Option<Scan>,
     credit: f64,
     last_tick: u64,
     pub bytes_queued: u64,
@@ -71,6 +72,7 @@ impl Default for ColumnWaterPublisher {
         Self {
             sent: HashMap::new(),
             pending: VecDeque::new(),
+            scan: None,
             credit: WATER_BURST_BYTES as f64,
             last_tick: 0,
             bytes_queued: 0,
@@ -130,9 +132,10 @@ impl ColumnWaterPublisher {
             + tick.saturating_sub(self.last_tick) as f64 * WATER_BYTES_PER_SECOND as f64 / 60.0)
             .min(WATER_BURST_BYTES as f64);
         self.last_tick = tick;
-        if self.pending.is_empty() && tick.is_multiple_of(4) {
-            self.queue_changes(server_tick, frame, interest)?;
+        if self.scan.is_none() && self.pending.is_empty() && tick.is_multiple_of(4) {
+            self.scan = Some(self.plan_scan(server_tick, frame, interest));
         }
+        self.run_scan(ENCODE_BUDGET)?;
         let mut batch = Vec::new();
         while let Some(record) = self.pending.front() {
             let size = record.encode_framed().map_err(|e| e.to_string())?.len() + 32;
@@ -146,19 +149,21 @@ impl ColumnWaterPublisher {
         Ok(batch)
     }
 
-    fn queue_changes(
+    /// Works out which regions need an update or a drop, nearest the player
+    /// first. Cheap: no encoding happens here.
+    fn plan_scan(
         &mut self,
         server_tick: Tick,
         frame: &ColumnWaterFrame,
         interest: Option<WaterInterest>,
-    ) -> Result<(), String> {
-        let seq = frame.seq;
+    ) -> Scan {
         // Within interest to take a region up, or to keep one already sent.
         let wanted = |key: RegionKey, known: bool| {
             interest.is_none_or(|i| {
                 i.distance(key) <= i.radius + if known { INTEREST_SLACK } else { 0 }
             })
         };
+        let mut work = Vec::new();
         for (&key, new) in frame.regions.iter() {
             if !wanted(key, self.sent.contains_key(&key)) {
                 continue;
@@ -170,73 +175,125 @@ impl ColumnWaterPublisher {
                 }
                 continue;
             }
-            let mut window_seq = state.map_or([0; WINDOWS_PER_REGION as usize], |s| s.window_seq);
-            for window in 0..WINDOWS_PER_REGION {
-                let new_spans = window_spans(new, window);
-                let old_spans = state.map_or_else(Vec::new, |s| window_spans(&s.frame, window));
-                if new_spans == old_spans && window_seq[usize::from(window)] != 0 {
-                    continue;
-                }
-                if new_spans.is_empty() && old_spans.is_empty() && state.is_none() {
-                    // Nothing wet here and nothing ever sent: the client
-                    // starts a window empty. Still mark it known so a later
-                    // delta has a base.
-                }
-                let base = window_seq[usize::from(window)];
-                let baseline = encode_update(server_tick, seq, 0, key, window, &new_spans)
-                    .map_err(|e| e.to_string())?;
-                let record = if base == 0 {
-                    baseline
-                } else {
-                    let delta = encode_update(
-                        server_tick,
-                        seq,
-                        base,
-                        key,
-                        window,
-                        &delta_spans(&old_spans, &new_spans),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    if delta.payload.len() < baseline.payload.len() {
-                        delta
-                    } else {
-                        baseline
-                    }
-                };
-                window_seq[usize::from(window)] = seq;
-                self.pending
-                    .push_back(WireRecord::ColumnWaterUpdate(record));
-            }
-            self.sent.insert(
-                key,
-                SentRegion {
-                    frame: Arc::clone(new),
-                    window_seq,
-                },
-            );
+            work.push(Work::Update(key, Arc::clone(new)));
         }
-        // Regions that dried up: empty baselines for every window that held water.
-        let gone: Vec<RegionKey> = self
-            .sent
-            .keys()
-            .filter(|k| !frame.regions.contains_key(k) || !wanted(**k, true))
-            .copied()
-            .collect();
-        for key in gone {
-            let state = self.sent.remove(&key).expect("key came from the map");
-            for window in 0..WINDOWS_PER_REGION {
-                if window_spans(&state.frame, window).is_empty() {
-                    continue;
-                }
-                let record = encode_update(server_tick, seq, 0, key, window, &[])
-                    .map_err(|e| e.to_string())?;
-                self.pending
-                    .push_back(WireRecord::ColumnWaterUpdate(record));
+        // Regions that dried up (or left interest): empty baselines.
+        work.extend(
+            self.sent
+                .keys()
+                .filter(|k| !frame.regions.contains_key(k) || !wanted(**k, true))
+                .map(|&k| Work::Drop(k)),
+        );
+        let near = |w: &Work| {
+            let key = match w {
+                Work::Update(k, _) | Work::Drop(k) => *k,
+            };
+            interest.map_or(0, |i| i.distance(key))
+        };
+        work.sort_by_key(near);
+        Scan {
+            work: work.into(),
+            server_tick,
+            seq: frame.seq,
+        }
+    }
+
+    /// Encodes queued work until `budget` is spent (at least one item). A big
+    /// lake moving means hundreds of regions to encode; doing all of them in
+    /// one tick stalled the server for over 100 ms, so they are spread over
+    /// the following ticks, nearest regions first.
+    fn run_scan(&mut self, budget: std::time::Duration) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let Some(mut scan) = self.scan.take() else {
+            return Ok(());
+        };
+        let (server_tick, seq) = (scan.server_tick, scan.seq);
+        while let Some(item) = scan.work.pop_front() {
+            match item {
+                Work::Update(key, new) => self.queue_region(server_tick, seq, key, &new)?,
+                Work::Drop(key) => self.queue_drop(server_tick, seq, key)?,
             }
+            if started.elapsed() >= budget {
+                break;
+            }
+        }
+        if !scan.work.is_empty() {
+            self.scan = Some(scan);
+        }
+        Ok(())
+    }
+
+    fn queue_region(
+        &mut self,
+        server_tick: Tick,
+        seq: u64,
+        key: RegionKey,
+        new: &Arc<RegionFrame>,
+    ) -> Result<(), String> {
+        let state = self.sent.get(&key);
+        let mut window_seq = state.map_or([0; WINDOWS_PER_REGION as usize], |s| s.window_seq);
+        for window in 0..WINDOWS_PER_REGION {
+            let new_spans = window_spans(new, window);
+            let old_spans = state.map_or_else(Vec::new, |s| window_spans(&s.frame, window));
+            if new_spans == old_spans && window_seq[usize::from(window)] != 0 {
+                continue;
+            }
+            let base = window_seq[usize::from(window)];
+            // A delta when it carries well under all the spans, else the
+            // whole window; only one of them is encoded.
+            let delta = (base != 0)
+                .then(|| delta_spans(&old_spans, &new_spans))
+                .filter(|delta| delta.len() * 2 <= new_spans.len());
+            let record = match delta {
+                Some(delta) => encode_update(server_tick, seq, base, key, window, &delta),
+                None => encode_update(server_tick, seq, 0, key, window, &new_spans),
+            }
+            .map_err(|e| e.to_string())?;
+            window_seq[usize::from(window)] = seq;
+            self.pending
+                .push_back(WireRecord::ColumnWaterUpdate(record));
+        }
+        self.sent.insert(
+            key,
+            SentRegion {
+                frame: Arc::clone(new),
+                window_seq,
+            },
+        );
+        Ok(())
+    }
+
+    fn queue_drop(&mut self, server_tick: Tick, seq: u64, key: RegionKey) -> Result<(), String> {
+        let Some(state) = self.sent.remove(&key) else {
+            return Ok(());
+        };
+        for window in 0..WINDOWS_PER_REGION {
+            if window_spans(&state.frame, window).is_empty() {
+                continue;
+            }
+            let record =
+                encode_update(server_tick, seq, 0, key, window, &[]).map_err(|e| e.to_string())?;
+            self.pending
+                .push_back(WireRecord::ColumnWaterUpdate(record));
         }
         Ok(())
     }
 }
+
+enum Work {
+    Update(RegionKey, Arc<RegionFrame>),
+    Drop(RegionKey),
+}
+
+/// A planned pass over the regions that changed, worked off a few at a time.
+struct Scan {
+    work: VecDeque<Work>,
+    server_tick: Tick,
+    seq: u64,
+}
+
+/// Longest one session's water encoding may take in one tick.
+const ENCODE_BUDGET: std::time::Duration = std::time::Duration::from_micros(1500);
 
 #[cfg(test)]
 mod tests {
@@ -494,6 +551,44 @@ mod tests {
         // 7 away: beyond radius + slack, dropped with an empty baseline.
         let dropped = publisher.poll(12, Tick(12), &f2, Some(at(-2))).unwrap();
         assert_eq!(dropped.len(), 1);
+    }
+
+    /// What a moving lake costs the tick: 200 regions of 1024 spans change
+    /// every step. Prints the worst single `poll`, which is what one tick pays.
+    /// `cargo test -p spall_server --release --lib publisher_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn publisher_cost_with_a_big_moving_lake() {
+        let lake = |phase: u16| {
+            let regions: Vec<Arc<RegionFrame>> = (0..200)
+                .map(|rx| {
+                    let spans: Vec<(u16, i32, u16)> = (0..1024u16)
+                        .map(|c| (c, 3, 600 + (c.wrapping_mul(7) + phase * 13) % 40))
+                        .collect();
+                    region(rx, &spans)
+                })
+                .collect();
+            regions
+        };
+        let mut publisher = ColumnWaterPublisher::default();
+        let mut replica = ColumnWaterReplica::default();
+        let mut worst = std::time::Duration::ZERO;
+        let mut total = std::time::Duration::ZERO;
+        for tick in 0..600u64 {
+            let f = frame(tick / 3 + 1, lake((tick / 3) as u16 % 5));
+            let started = std::time::Instant::now();
+            let records = publisher.poll(tick, Tick(tick), &f, None).unwrap();
+            let took = started.elapsed();
+            worst = worst.max(took);
+            total += took;
+            for record in records {
+                let WireRecord::ColumnWaterUpdate(update) = record else {
+                    unreachable!()
+                };
+                replica.apply(&update).unwrap();
+            }
+        }
+        println!("worst poll {worst:?}, mean {:?}", total / 600);
     }
 
     #[test]
