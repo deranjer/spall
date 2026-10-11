@@ -447,6 +447,35 @@ impl ColumnWorld {
         self.spans.len()
     }
 
+    /// Whether the stored pipes (as a set) and per-region pipe lists equal a
+    /// from-scratch build over the current spans. For tests of incremental
+    /// pipe maintenance.
+    #[doc(hidden)]
+    pub fn pipes_match_full_rebuild(&self) -> bool {
+        let fresh: Vec<Pipe> = (0..self.regions.len())
+            .flat_map(|slot| self.pipes_from(slot, |_| true))
+            .collect();
+        let key = |p: &Pipe| (p.a, p.b, p.lo, p.hi, p.ra, p.rb);
+        let (mut fresh_keys, mut have_keys): (Vec<_>, Vec<_>) = (
+            fresh.iter().map(key).collect(),
+            self.pipes.iter().map(key).collect(),
+        );
+        fresh_keys.sort_unstable();
+        have_keys.sort_unstable();
+        if fresh_keys != have_keys {
+            return false;
+        }
+        let mut lists = vec![Vec::new(); self.regions.len()];
+        for (i, p) in self.pipes.iter().enumerate() {
+            lists[p.ra as usize].push(i as u32);
+            if p.rb != p.ra {
+                lists[p.rb as usize].push(i as u32);
+            }
+        }
+        self.q.len() == self.pipes.len()
+            && self.regions.iter().zip(&lists).all(|(r, l)| &r.pipes == l)
+    }
+
     pub fn pipe_count(&self) -> usize {
         self.pipes.len()
     }
@@ -637,16 +666,6 @@ impl ColumnWorld {
             }
             v
         };
-        let mut old_flow: HashMap<(u64, u64), f32> = HashMap::new();
-        if old_q.iter().any(|q| *q != 0.0) {
-            let keys_old = key_of_spans(&old_regions, &old_col, &old_spans);
-            for (p, q) in old_pipes.iter().zip(&old_q) {
-                if *q != 0.0 {
-                    old_flow.insert((keys_old[p.a as usize], keys_old[p.b as usize]), *q);
-                }
-            }
-        }
-
         let mut report = RemapReport::default();
         let mut pending: Vec<(i64, i64, f64, f64)> = Vec::new();
         let mut regions: Vec<Region> = Vec::with_capacity(keys.len());
@@ -774,14 +793,44 @@ impl ColumnWorld {
             }
         }
 
-        // Rebuild pipes and keep the flow of every pipe that still exists.
-        self.build_pipes();
-        self.q = vec![0.0; self.pipes.len()];
-        if !old_flow.is_empty() {
-            let keys_now = key_of_spans(&self.regions, &self.col_start, &self.spans);
-            for (i, p) in self.pipes.iter().enumerate() {
-                if let Some(q) = old_flow.get(&(keys_now[p.a as usize], keys_now[p.b as usize])) {
-                    self.q[i] = *q;
+        // Rebuild pipes and keep the flow of every pipe that still exists. Only
+        // regions whose terrain changed, and the owners of pipes running into
+        // them, are rebuilt; every other pipe is carried over with its indices
+        // shifted to the new span and slot layout.
+        let touched: BTreeSet<RegionKey> = fresh
+            .keys()
+            .copied()
+            .chain(frozen_now.iter().copied())
+            .collect();
+        let carried = self.carry_pipes(
+            &touched,
+            &old_regions,
+            &old_slot,
+            &old_col,
+            &old_spans,
+            &old_pipes,
+            &old_q,
+        );
+        if !carried {
+            let mut old_flow: HashMap<(u64, u64), f32> = HashMap::new();
+            if old_q.iter().any(|q| *q != 0.0) {
+                let keys_old = key_of_spans(&old_regions, &old_col, &old_spans);
+                for (p, q) in old_pipes.iter().zip(&old_q) {
+                    if *q != 0.0 {
+                        old_flow.insert((keys_old[p.a as usize], keys_old[p.b as usize]), *q);
+                    }
+                }
+            }
+
+            self.build_pipes();
+            self.q = vec![0.0; self.pipes.len()];
+            if !old_flow.is_empty() {
+                let keys_now = key_of_spans(&self.regions, &self.col_start, &self.spans);
+                for (i, p) in self.pipes.iter().enumerate() {
+                    if let Some(q) = old_flow.get(&(keys_now[p.a as usize], keys_now[p.b as usize]))
+                    {
+                        self.q[i] = *q;
+                    }
                 }
             }
         }
@@ -859,6 +908,11 @@ impl ColumnWorld {
             .map(|slot| this.pipes_from(slot, |_| true))
             .collect();
         self.pipes = per_region.into_iter().flatten().collect();
+        self.finish_pipes();
+    }
+
+    /// Fills each region's pipe list and the span adjacency from `self.pipes`.
+    fn finish_pipes(&mut self) {
         for r in &mut self.regions {
             r.pipes.clear();
         }
@@ -869,6 +923,201 @@ impl ColumnWorld {
             }
         }
         self.rebuild_adjacency();
+    }
+
+    /// Rebuilds `pipes` and `q` after the span layout was reassembled, reusing
+    /// the old pipes of every region that is untouched (`touched` holds the
+    /// regions with new terrain or a changed frozen flag). A pipe belongs to
+    /// the region at its `a` end, which looks towards +x and +z, so the owners
+    /// to rebuild are the touched regions and their -x and -z neighbours.
+    /// Returns false, changing nothing, if the old pipes are not grouped by
+    /// owner (they are not after appended regions); the caller then rebuilds
+    /// everything.
+    #[allow(clippy::too_many_arguments)]
+    fn carry_pipes(
+        &mut self,
+        touched: &BTreeSet<RegionKey>,
+        old_regions: &[Region],
+        old_slot: &HashMap<RegionKey, u32>,
+        old_col: &[u32],
+        old_spans: &[Span],
+        old_pipes: &[Pipe],
+        old_q: &[f32],
+    ) -> bool {
+        if old_q.len() != old_pipes.len() {
+            return false;
+        }
+        // Old pipes by owner. They are grouped by owner unless regions were
+        // appended since the last full build; then a counting sort groups them.
+        let grouped = !old_pipes.windows(2).any(|w| w[0].ra > w[1].ra);
+        let mut starts = vec![0usize; old_regions.len() + 1];
+        for p in old_pipes {
+            starts[p.ra as usize + 1] += 1;
+        }
+        for i in 0..old_regions.len() {
+            starts[i + 1] += starts[i];
+        }
+        let order: Vec<u32> = if grouped {
+            Vec::new()
+        } else {
+            let mut cursor = starts.clone();
+            let mut order = vec![0u32; old_pipes.len()];
+            for (i, p) in old_pipes.iter().enumerate() {
+                order[cursor[p.ra as usize]] = i as u32;
+                cursor[p.ra as usize] += 1;
+            }
+            order
+        };
+        let new_of_old: Vec<u32> = old_regions
+            .iter()
+            .map(|r| self.slot_of.get(&r.key).copied().unwrap_or(u32::MAX))
+            .collect();
+        let delta: Vec<i64> = old_regions
+            .iter()
+            .zip(&new_of_old)
+            .map(|(r, &n)| {
+                if n == u32::MAX {
+                    0
+                } else {
+                    i64::from(self.regions[n as usize].span_start) - i64::from(r.span_start)
+                }
+            })
+            .collect();
+        let owner_dirty: Vec<bool> = self
+            .regions
+            .iter()
+            .map(|r| {
+                let (kx, kz) = r.key;
+                touched.contains(&r.key)
+                    || touched.contains(&(kx + 1, kz))
+                    || touched.contains(&(kx, kz + 1))
+            })
+            .collect();
+        // The span a pipe end sits in, by column position and floor.
+        let key_in = |regions: &[Region], col: &[u32], spans: &[Span], idx: u32| {
+            let ci = col.partition_point(|&c| c <= idx) - 1;
+            let (x, z) = column_xz(regions[ci / REGION_COLUMNS].key, ci % REGION_COLUMNS);
+            span_key(x, z, spans[idx as usize].y0)
+        };
+        // Flow of the pipes about to be rebuilt, by the spans they join.
+        let mut old_flow: HashMap<(u64, u64), f32> = HashMap::new();
+        for (so, r) in old_regions.iter().enumerate() {
+            let rebuilt = self
+                .slot_of
+                .get(&r.key)
+                .is_none_or(|&n| owner_dirty[n as usize]);
+            if !rebuilt {
+                continue;
+            }
+            let range = starts[so]..starts[so + 1];
+            let ids: Vec<usize> = if grouped {
+                range.collect()
+            } else {
+                order[range].iter().map(|&i| i as usize).collect()
+            };
+            for pi in ids {
+                if old_q[pi] != 0.0 {
+                    let p = old_pipes[pi];
+                    old_flow.insert(
+                        (
+                            key_in(old_regions, old_col, old_spans, p.a),
+                            key_in(old_regions, old_col, old_spans, p.b),
+                        ),
+                        old_q[pi],
+                    );
+                }
+            }
+        }
+        let this = &*self;
+        // Pipes (with their flow) of the owners being rebuilt.
+        let rebuilt: Vec<Option<(Vec<Pipe>, Vec<f32>)>> = (0..this.regions.len())
+            .into_par_iter()
+            .map(|slot| {
+                if !owner_dirty[slot] {
+                    return None;
+                }
+                let pipes = this.pipes_from(slot, |_| true);
+                let q = if old_flow.is_empty() {
+                    vec![0.0; pipes.len()]
+                } else {
+                    pipes
+                        .iter()
+                        .map(|p| {
+                            let k = (
+                                key_in(&this.regions, &this.col_start, &this.spans, p.a),
+                                key_in(&this.regions, &this.col_start, &this.spans, p.b),
+                            );
+                            old_flow.get(&k).copied().unwrap_or(0.0)
+                        })
+                        .collect()
+                };
+                Some((pipes, q))
+            })
+            .collect();
+        let lens: Vec<usize> = (0..this.regions.len())
+            .map(|slot| match &rebuilt[slot] {
+                Some((pipes, _)) => pipes.len(),
+                None => {
+                    let so = old_slot[&this.regions[slot].key] as usize;
+                    starts[so + 1] - starts[so]
+                }
+            })
+            .collect();
+        let total: usize = lens.iter().sum();
+        let blank = Pipe {
+            a: 0,
+            b: 0,
+            lo: 0,
+            hi: 0,
+            ra: 0,
+            rb: 0,
+        };
+        let mut pipes = vec![blank; total];
+        let mut q = vec![0.0f32; total];
+        // One disjoint output slice per owner, filled in parallel.
+        let mut slices: Vec<(&mut [Pipe], &mut [f32])> = Vec::with_capacity(lens.len());
+        let (mut rest_p, mut rest_q) = (pipes.as_mut_slice(), q.as_mut_slice());
+        for &len in &lens {
+            let (hp, tp) = rest_p.split_at_mut(len);
+            let (hq, tq) = rest_q.split_at_mut(len);
+            slices.push((hp, hq));
+            (rest_p, rest_q) = (tp, tq);
+        }
+        let carry = |p: &Pipe| Pipe {
+            a: (i64::from(p.a) + delta[p.ra as usize]) as u32,
+            b: (i64::from(p.b) + delta[p.rb as usize]) as u32,
+            lo: p.lo,
+            hi: p.hi,
+            ra: new_of_old[p.ra as usize],
+            rb: new_of_old[p.rb as usize],
+        };
+        slices
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(slot, (out_p, out_q))| {
+                if let Some((fresh_p, fresh_q)) = &rebuilt[slot] {
+                    out_p.copy_from_slice(fresh_p);
+                    out_q.copy_from_slice(fresh_q);
+                    return;
+                }
+                let so = old_slot[&this.regions[slot].key] as usize;
+                let range = starts[so]..starts[so + 1];
+                if grouped {
+                    for (k, i) in range.enumerate() {
+                        out_p[k] = carry(&old_pipes[i]);
+                        out_q[k] = old_q[i];
+                    }
+                } else {
+                    for (k, &i) in order[range].iter().enumerate() {
+                        out_p[k] = carry(&old_pipes[i as usize]);
+                        out_q[k] = old_q[i as usize];
+                    }
+                }
+            });
+        self.pipes = pipes;
+        self.q = q;
+        self.finish_pipes();
+        true
     }
 
     /// Span-to-pipe adjacency in compressed rows, ordered by pipe index.

@@ -296,3 +296,48 @@ fn sparse_stepping_is_bit_identical_across_thread_counts() {
         assert_eq!(pool.install(scenario), reference, "{n} threads diverged");
     }
 }
+
+/// A terrain edit in one region rebuilds only the pipes it touches, yet the
+/// result is the pipe set a full rebuild would give, the flow of every
+/// surviving pipe is kept, and water is conserved. Also after regions were
+/// appended, which leaves the old pipes ungrouped by owner.
+#[test]
+fn refreshing_a_region_keeps_pipes_and_flow_equal_to_a_full_rebuild() {
+    for appended in [false, true] {
+        let wall = Arc::new(Mutex::new(false));
+        let w2 = wall.clone();
+        let terrain = Flat::new(move |x, y, z| {
+            // A dam across the pool at x = 40 that an edit lowers, so spans in
+            // region (1, 0) change shape.
+            let dam =
+                x == 40 && (2..=30).contains(&z) && y < if *w2.lock().unwrap() { 3 } else { 6 };
+            dam || (x == 5 || x == 120) && (2..=30).contains(&z)
+        });
+        let mut world = ColumnWorld::with_terrain(terrain, ColumnConfig::default());
+        world.seed_cells(&pool_cells(6, 40, 3, 30, 5));
+        if appended {
+            // Regions added after the first build are appended, not interleaved.
+            world.allocate_rect(70, 0, 110, 31);
+        }
+        world.wake_all();
+        run(&mut world, 3.0);
+        assert!(world.max_abs_flow() > 0.0, "water is moving");
+        assert!(world.pipes_match_full_rebuild());
+        let before = world.total_volume();
+
+        *wall.lock().unwrap() = true;
+        world.refresh_regions(&[(1, 0)]);
+        assert!(
+            world.pipes_match_full_rebuild(),
+            "appended={appended}: incremental pipes differ from a full rebuild"
+        );
+        assert!(
+            world.max_abs_flow() > 0.0,
+            "appended={appended}: flow survived the refresh"
+        );
+        assert!((world.total_volume() - before).abs() < 1.0e-9 * before);
+        run(&mut world, 3.0);
+        assert!(world.pipes_match_full_rebuild());
+        assert!((world.total_volume() - before).abs() < 1.0e-9 * before);
+    }
+}
