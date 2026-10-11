@@ -25,6 +25,35 @@ struct SentRegion {
     window_seq: [u64; WINDOWS_PER_REGION as usize],
 }
 
+/// The part of the world a session needs water for: the regions within
+/// `radius` regions (Chebyshev) of the one holding its player. A region is
+/// taken up inside `radius` and dropped only beyond `radius + INTEREST_SLACK`,
+/// so a player pacing along the edge does not make a region flap in and out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaterInterest {
+    pub centre: RegionKey,
+    pub radius: i32,
+}
+
+/// Regions of hysteresis beyond the interest radius before water is dropped.
+pub const INTEREST_SLACK: i32 = 2;
+
+impl WaterInterest {
+    /// The interest around a player at `position_m` (metres). A region is 32
+    /// columns of 0.25 m, so 8 m.
+    pub fn around(position_m: [f64; 3], radius_regions: i32) -> Self {
+        let region = |v: f64| (v / 8.0).floor() as i32;
+        Self {
+            centre: (region(position_m[0]), region(position_m[2])),
+            radius: radius_regions,
+        }
+    }
+
+    fn distance(&self, key: RegionKey) -> i32 {
+        (key.0 - self.centre.0).abs().max((key.1 - self.centre.1).abs())
+    }
+}
+
 pub struct ColumnWaterPublisher {
     sent: HashMap<RegionKey, SentRegion>,
     pending: VecDeque<WireRecord>,
@@ -90,13 +119,14 @@ impl ColumnWaterPublisher {
         tick: u64,
         server_tick: Tick,
         frame: &ColumnWaterFrame,
+        interest: Option<WaterInterest>,
     ) -> Result<Vec<WireRecord>, String> {
         self.credit = (self.credit
             + tick.saturating_sub(self.last_tick) as f64 * WATER_BYTES_PER_SECOND as f64 / 60.0)
             .min(WATER_BURST_BYTES as f64);
         self.last_tick = tick;
         if self.pending.is_empty() && tick.is_multiple_of(4) {
-            self.queue_changes(server_tick, frame)?;
+            self.queue_changes(server_tick, frame, interest)?;
         }
         let mut batch = Vec::new();
         while let Some(record) = self.pending.front() {
@@ -111,9 +141,23 @@ impl ColumnWaterPublisher {
         Ok(batch)
     }
 
-    fn queue_changes(&mut self, server_tick: Tick, frame: &ColumnWaterFrame) -> Result<(), String> {
+    fn queue_changes(
+        &mut self,
+        server_tick: Tick,
+        frame: &ColumnWaterFrame,
+        interest: Option<WaterInterest>,
+    ) -> Result<(), String> {
         let seq = frame.seq;
+        // Within interest to take a region up, or to keep one already sent.
+        let wanted = |key: RegionKey, known: bool| {
+            interest.is_none_or(|i| {
+                i.distance(key) <= i.radius + if known { INTEREST_SLACK } else { 0 }
+            })
+        };
         for (&key, new) in frame.regions.iter() {
+            if !wanted(key, self.sent.contains_key(&key)) {
+                continue;
+            }
             let state = self.sent.get(&key);
             if state.is_some_and(|s| Arc::ptr_eq(&s.frame, new) || *s.frame == **new) {
                 if let Some(s) = self.sent.get_mut(&key) {
@@ -170,7 +214,7 @@ impl ColumnWaterPublisher {
         let gone: Vec<RegionKey> = self
             .sent
             .keys()
-            .filter(|k| !frame.regions.contains_key(k))
+            .filter(|k| !frame.regions.contains_key(k) || !wanted(**k, true))
             .copied()
             .collect();
         for key in gone {
@@ -234,7 +278,7 @@ mod tests {
         frame: &ColumnWaterFrame,
     ) -> usize {
         let mut n = 0;
-        for record in publisher.poll(tick, Tick(tick), frame).unwrap() {
+        for record in publisher.poll(tick, Tick(tick), frame, None).unwrap() {
             let WireRecord::ColumnWaterUpdate(update) = record else {
                 panic!("water records only")
             };
@@ -317,6 +361,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(5, 40), (6, 2)]
         );
+    }
+
+    #[test]
+    fn a_session_is_sent_only_the_water_near_its_player() {
+        let near = region(0, &[(3, 5, 640)]);
+        let far = region(30, &[(3, 5, 640)]);
+        let f = frame(1, vec![near, far]);
+        let mut publisher = ColumnWaterPublisher::default();
+        let mut replica = ColumnWaterReplica::default();
+        let interest = |x_m: f64| Some(WaterInterest::around([x_m, 0.0, 4.0], 4));
+        let mut run = |publisher: &mut ColumnWaterPublisher,
+                       replica: &mut ColumnWaterReplica,
+                       tick: u64,
+                       f: &ColumnWaterFrame,
+                       at: Option<WaterInterest>| {
+            for record in publisher.poll(tick, Tick(tick), f, at).unwrap() {
+                let WireRecord::ColumnWaterUpdate(update) = record else {
+                    panic!("water records only")
+                };
+                replica.apply(&update).unwrap();
+            }
+        };
+        run(&mut publisher, &mut replica, 0, &f, interest(4.0));
+        assert_eq!(replica.region_spans((0, 0)).len(), 1);
+        assert!(replica.region_spans((30, 0)).is_empty(), "far water is not sent");
+
+        // Walking over: the far region is taken up with a baseline, and the
+        // region left behind is dropped once beyond the slack, not before.
+        let f2 = frame(2, f.regions.values().cloned().collect());
+        run(&mut publisher, &mut replica, 4, &f2, interest(30.0 * 8.0 + 4.0));
+        assert_eq!(replica.region_spans((30, 0)).len(), 1, "now in range");
+        assert!(replica.region_spans((0, 0)).is_empty(), "left behind, dropped");
+
+        // Back at the edge of the old region's slack the region is not retaken
+        // until it is within the radius itself.
+        run(&mut publisher, &mut replica, 8, &f2, interest(4.0 * 8.0 + 4.0 + 8.0 * 4.0));
+        run(&mut publisher, &mut replica, 12, &f2, interest(4.0));
+        assert_eq!(replica.region_spans((0, 0)).len(), 1, "back in range");
+    }
+
+    /// A region inside the slack ring stays: no drop and no resend while the
+    /// player hovers at the boundary.
+    #[test]
+    fn interest_has_hysteresis_at_its_edge() {
+        let f = frame(1, vec![region(5, &[(3, 5, 640)])]);
+        let mut publisher = ColumnWaterPublisher::default();
+        let at = |region_x: i32| WaterInterest {
+            centre: (region_x, 0),
+            radius: 4,
+        };
+        // Region 5 is 5 away from 0: outside the radius of 4, never sent.
+        assert!(publisher.poll(0, Tick(0), &f, Some(at(0))).unwrap().is_empty());
+        // From region 1 it is 4 away: taken up.
+        assert!(!publisher.poll(4, Tick(4), &f, Some(at(1))).unwrap().is_empty());
+        // Drifting out to 6 away, inside radius + slack: kept, nothing sent.
+        let f2 = frame(2, vec![region(5, &[(3, 5, 640)])]);
+        assert!(publisher.poll(8, Tick(8), &f2, Some(at(-1))).unwrap().is_empty());
+        // 7 away: beyond radius + slack, dropped with an empty baseline.
+        let dropped = publisher.poll(12, Tick(12), &f2, Some(at(-2))).unwrap();
+        assert_eq!(dropped.len(), 1);
     }
 
     #[test]

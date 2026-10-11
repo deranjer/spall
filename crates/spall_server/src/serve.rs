@@ -3870,10 +3870,12 @@ async fn serve_async(
                     if water_backlogged(&clients_for_sim, session) {
                         continue;
                     }
+                    let interest = lj.water_interest(&sim, session);
                     match column_water_sent.entry(session.raw()).or_default().poll(
                         tick.get(),
                         sim.current_tick(),
                         &frame,
+                        interest,
                     ) {
                         Ok(records) if !records.is_empty() => {
                             water_keyframes_sent += 1;
@@ -4997,6 +4999,23 @@ impl LateJoin {
                         .is_some_and(OutboundHandle::catalogue_complete)
             })
             .then(|| baseline::CatalogueBasis::capture(sim))
+    }
+
+    /// The water a session needs: for a regional client, the regions around its
+    /// player, one more than the terrain radius it streams (so the edge of the
+    /// view has water); everything for other clients and for sessions without
+    /// a player yet.
+    fn water_interest(
+        &self,
+        sim: &Simulation,
+        session: SessionId,
+    ) -> Option<crate::column_water_replication::WaterInterest> {
+        let radius = self.links.get(&session.raw())?.region_radius?;
+        let player = sim.player_state(session_player_entity(session))?;
+        Some(crate::column_water_replication::WaterInterest::around(
+            player.position_m,
+            radius as i32 + 1,
+        ))
     }
 
     fn snapshot_for_session(
