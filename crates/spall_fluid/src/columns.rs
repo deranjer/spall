@@ -236,6 +236,8 @@ struct Pipe {
     /// Region slots of the two ends.
     ra: u32,
     rb: u32,
+    /// 0 when `b` is the +x neighbour of `a`, 1 for +z.
+    axis: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -455,7 +457,7 @@ impl ColumnWorld {
         let fresh: Vec<Pipe> = (0..self.regions.len())
             .flat_map(|slot| self.pipes_from(slot, |_| true))
             .collect();
-        let key = |p: &Pipe| (p.a, p.b, p.lo, p.hi, p.ra, p.rb);
+        let key = |p: &Pipe| (p.a, p.b, p.lo, p.hi, p.ra, p.rb, p.axis);
         let (mut fresh_keys, mut have_keys): (Vec<_>, Vec<_>) = (
             fresh.iter().map(key).collect(),
             self.pipes.iter().map(key).collect(),
@@ -613,14 +615,17 @@ impl ColumnWorld {
     /// [`Self::flow_at_m`] for span `i`.
     fn span_flow(&self, i: usize) -> [f32; 2] {
         let film = self.config.min_film_depth;
-        let column_of = |span: u32| {
-            let ci = self.col_start.partition_point(|&c| c <= span) - 1;
-            column_xz(self.regions[ci / REGION_COLUMNS].key, ci % REGION_COLUMNS)
-        };
-        let home = column_of(i as u32);
+        let entries = &self.adj[self.adj_start[i] as usize..self.adj_start[i + 1] as usize];
+        // Still water (most of any region) has no flow through any face.
+        if entries
+            .iter()
+            .all(|&entry| self.q[(entry >> 1) as usize] == 0.0)
+        {
+            return [0.0; 2];
+        }
         // [axis][side]: summed flow and wetted area through each face.
         let mut faces = [[(0.0f32, 0.0f32); 2]; 2];
-        for &entry in &self.adj[self.adj_start[i] as usize..self.adj_start[i + 1] as usize] {
+        for &entry in entries {
             let pi = (entry >> 1) as usize;
             let p = &self.pipes[pi];
             let area = Self::wetted_area(
@@ -633,8 +638,7 @@ impl ColumnWorld {
             }
             // `a` looks towards +x or +z: this span is on the low side of the
             // pipe when it is `a`, so the pipe's face is its +axis face.
-            let other = column_of(if entry & 1 == 1 { p.b } else { p.a });
-            let axis = usize::from(other.0 == home.0);
+            let axis = usize::from(p.axis);
             let side = usize::from(entry & 1 == 1);
             faces[axis][side].0 += self.q[pi];
             faces[axis][side].1 += area;
@@ -916,7 +920,7 @@ impl ColumnWorld {
                     i64::from(key.1) * REGION_EDGE + lz,
                 );
                 let ca = slot * REGION_COLUMNS + (lx + REGION_EDGE * lz) as usize;
-                for (ox, oz) in [(1i64, 0i64), (0, 1)] {
+                for (axis, (ox, oz)) in [(1i64, 0i64), (0, 1)].into_iter().enumerate() {
                     let nb = region_of(x + ox, z + oz);
                     let Some(&ns) = self.slot_of.get(&nb) else {
                         continue;
@@ -940,6 +944,7 @@ impl ColumnWorld {
                                     hi,
                                     ra: slot as u32,
                                     rb: ns,
+                                    axis: axis as u8,
                                 });
                             }
                         }
@@ -1123,6 +1128,7 @@ impl ColumnWorld {
             hi: 0,
             ra: 0,
             rb: 0,
+            axis: 0,
         };
         let mut pipes = vec![blank; total];
         let mut q = vec![0.0f32; total];
@@ -1142,6 +1148,7 @@ impl ColumnWorld {
             hi: p.hi,
             ra: new_of_old[p.ra as usize],
             rb: new_of_old[p.rb as usize],
+            axis: p.axis,
         };
         slices
             .par_iter_mut()
@@ -1500,7 +1507,7 @@ impl ColumnWorld {
 
     /// Total water including overfill and the unplaced ledger, cells^3.
     pub fn total_volume(&self) -> f64 {
-        self.volume.iter().sum::<f64>() + self.unplaced
+        chunked_sum(&self.volume, |_, v| *v) + self.unplaced
     }
 
     pub fn total_volume_m3(&self) -> f64 {
@@ -1520,9 +1527,9 @@ impl ColumnWorld {
 
     /// Water volume above its span's capacity across the world, cells^3.
     pub fn overfill_volume(&self) -> f64 {
-        (0..self.volume.len())
-            .map(|i| (self.volume[i] - self.spans[i].capacity()).max(0.0))
-            .sum()
+        chunked_sum(&self.volume, |i, v| {
+            (*v - self.spans[i].capacity()).max(0.0)
+        })
     }
 
     fn effective_heads(&self) -> Vec<f32> {
@@ -1652,13 +1659,14 @@ impl ColumnWorld {
         out
     }
 
-    /// [`Self::region_wet_spans`] with the horizontal water velocity `[x, z]`
-    /// (m/s) of each span, as [`Self::flow_at_m`] reports it.
+    /// [`Self::region_wet_spans`] with each span's height in cells and the
+    /// horizontal velocity `[x, z]` (m/s) of its water, as [`Self::flow_at_m`]
+    /// reports it: `(column, floor y, volume, height, flow)`.
     pub fn region_wet_spans_with_flow(
         &self,
         key: RegionKey,
         min_volume: f64,
-    ) -> Vec<(u16, i32, f64, [f32; 2])> {
+    ) -> Vec<(u16, i32, f64, i32, [f32; 2])> {
         let Some(&slot) = self.slot_of.get(&key) else {
             return Vec::new();
         };
@@ -1667,10 +1675,12 @@ impl ColumnWorld {
             let ci = slot as usize * REGION_COLUMNS + c;
             for i in self.col_start[ci] as usize..self.col_start[ci + 1] as usize {
                 if self.volume[i] > min_volume {
+                    let span = self.spans[i];
                     out.push((
                         c as u16,
-                        self.spans[i].y0,
+                        span.y0,
                         self.volume[i],
+                        span.y1 - span.y0,
                         self.span_flow(i),
                     ));
                 }
@@ -2077,6 +2087,26 @@ impl ColumnWorld {
         });
         dt
     }
+}
+
+/// Sum of `f(index, element)` over a slice, in parallel over fixed 64 Ki-element
+/// chunks that are then added in order, so the result does not depend on the
+/// number of threads. A world has hundreds of thousands of spans and these
+/// totals ran every tick.
+fn chunked_sum<T: Sync>(items: &[T], f: impl Fn(usize, &T) -> f64 + Sync) -> f64 {
+    const CHUNK: usize = 1 << 16;
+    let parts: Vec<f64> = items
+        .par_chunks(CHUNK)
+        .enumerate()
+        .map(|(c, chunk)| {
+            chunk
+                .iter()
+                .enumerate()
+                .map(|(i, item)| f(c * CHUNK + i, item))
+                .sum::<f64>()
+        })
+        .collect();
+    parts.into_iter().sum()
 }
 
 /// A raw pointer that rayon tasks may share when each task touches its own

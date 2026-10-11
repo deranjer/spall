@@ -28,6 +28,13 @@ use spall_voxel::Volume;
 
 /// Fixed fluid step (20 Hz), decoupled from the server tick.
 pub const COLUMN_STEP_DT_S: f64 = 0.05;
+/// Slices a fluid step is cut into, one per server tick (so each is 1/60 s).
+/// Running a whole 50 ms step on every third tick put its full cost (12 to
+/// 30 ms once a big lake is moving) into one tick, past the 16.7 ms budget;
+/// a slice is a third of the work, every tick. Springs and drains still act
+/// once per step, after its last slice, so their strength is unchanged.
+pub const COLUMN_SLICES: u32 = 3;
+const SLICE_DT_S: f64 = COLUMN_STEP_DT_S / COLUMN_SLICES as f64;
 /// Fluid steps run in one server tick at most; more time is reported skipped.
 const MAX_STEPS_PER_TICK: u32 = 2;
 /// Depth in presentation frames is quantized to 1/128 cell.
@@ -165,11 +172,22 @@ pub struct AuthoritativeColumnWater {
     added_cells3: f64,
     removed_cells3: f64,
     carry_s: f64,
+    /// Slices of the current step already run (0..`COLUMN_SLICES`).
+    slice: u32,
+    /// Volume, overfill and unplaced totals (m^3) as of the last refresh.
+    totals: Option<(f64, f64, f64)>,
     skipped_s: f64,
     /// Regions changed since the last journal delta.
     journal_dirty: BTreeSet<RegionKey>,
     journal_wait_ticks: u32,
     journal_edit_pending: bool,
+}
+
+/// The solver config for stepping in slices: a region sleeps after the same
+/// stretch of time, which is three times as many (shorter) steps.
+fn sliced(mut config: ColumnConfig) -> ColumnConfig {
+    config.sleep_steps = config.sleep_steps.saturating_mul(COLUMN_SLICES);
+    config
 }
 
 fn check_setup(setup: &ColumnWaterSetup) -> Result<(), ColumnWaterError> {
@@ -212,7 +230,8 @@ fn terrain_source(terrain: &Volume, setup: &ColumnWaterSetup) -> Arc<VolumeTerra
 impl AuthoritativeColumnWater {
     pub fn new(terrain: &Volume, setup: ColumnWaterSetup) -> Result<Self, ColumnWaterError> {
         check_setup(&setup)?;
-        let mut world = ColumnWorld::with_terrain(terrain_source(terrain, &setup), setup.config);
+        let mut world =
+            ColumnWorld::with_terrain(terrain_source(terrain, &setup), sliced(setup.config));
         let rejected = world.seed_cells(&setup.initial_cells);
         // Springs and drains need their regions allocated even in a dry world.
         let exchange_keys: BTreeSet<RegionKey> = setup
@@ -254,6 +273,8 @@ impl AuthoritativeColumnWater {
             added_cells3: 0.0,
             removed_cells3: 0.0,
             carry_s: 0.0,
+            slice: 0,
+            totals: None,
             skipped_s: 0.0,
             journal_dirty: BTreeSet::new(),
             journal_wait_ticks: 0,
@@ -313,11 +334,8 @@ impl AuthoritativeColumnWater {
             .world
             .region_wet_spans_with_flow(key, DRY_VOLUME)
             .into_iter()
-            .map(|(column, floor_y, volume, flow)| {
-                let height = self
-                    .world
-                    .span_height(key, column, floor_y)
-                    .map_or(volume, f64::from);
+            .map(|(column, floor_y, volume, height, flow)| {
+                let height = f64::from(height);
                 FrameSpan {
                     column,
                     floor_y,
@@ -337,8 +355,14 @@ impl AuthoritativeColumnWater {
     fn rebuild_frames_for(&mut self, keys: Option<Vec<RegionKey>>) -> usize {
         let keys = keys.unwrap_or_else(|| self.world.region_keys());
         let mut changed = Vec::new();
-        for key in keys {
-            let new = self.region_frame(key);
+        let span_rf = crate::prof::Span::start("water.frames.regions");
+        // Each region's frame reads the world only; build them in parallel.
+        use rayon::prelude::*;
+        let built: Vec<(RegionKey, Option<RegionFrame>)> = keys
+            .par_iter()
+            .map(|&key| (key, self.region_frame(key)))
+            .collect();
+        for (key, new) in built {
             let old = self.regions.get(&key);
             if new.as_ref() != old.map(|r| r.as_ref()) {
                 match new {
@@ -348,6 +372,7 @@ impl AuthoritativeColumnWater {
                 changed.push(key);
             }
         }
+        drop(span_rf);
         let first = self.frame.regions.is_empty() && self.frame.changed.is_empty() && self.seq == 1;
         if changed.is_empty() && !first {
             return 0;
@@ -428,30 +453,60 @@ impl AuthoritativeColumnWater {
 
         self.carry_s += dt_s;
         let started = Instant::now();
-        while self.carry_s + 1e-9 >= COLUMN_STEP_DT_S && metrics.steps < MAX_STEPS_PER_TICK {
-            self.carry_s -= COLUMN_STEP_DT_S;
-            let step = self.world.step(COLUMN_STEP_DT_S);
-            self.exchange();
-            self.fluid_time_s += COLUMN_STEP_DT_S;
+        while self.carry_s + 1e-9 >= SLICE_DT_S
+            && metrics.steps < MAX_STEPS_PER_TICK * COLUMN_SLICES
+        {
+            self.carry_s -= SLICE_DT_S;
+            let step_span = crate::prof::Span::start("water.step");
+            let step = self.world.step(SLICE_DT_S);
+            drop(step_span);
+            self.fluid_time_s += SLICE_DT_S;
+            self.slice += 1;
+            if self.slice == COLUMN_SLICES {
+                self.slice = 0;
+                let _exchange = crate::prof::Span::start("water.exchange");
+                self.exchange();
+            }
             metrics.steps += 1;
             metrics.step = Some(step);
         }
         // More than the cap owed: report the debt instead of running a burst.
-        if self.carry_s + 1e-9 >= COLUMN_STEP_DT_S {
-            let owed = (self.carry_s / COLUMN_STEP_DT_S).floor() * COLUMN_STEP_DT_S;
+        if self.carry_s + 1e-9 >= SLICE_DT_S {
+            let owed = (self.carry_s / SLICE_DT_S).floor() * SLICE_DT_S;
             self.carry_s -= owed;
             self.skipped_s += owed;
         }
         metrics.stepped = metrics.steps > 0;
         metrics.step_duration = started.elapsed();
-        let dirty = self.world.take_dirty_regions();
-        self.journal_dirty.extend(dirty.iter().copied());
         self.journal_edit_pending |= !edited_keys.is_empty() || !reloaded_keys.is_empty();
-        metrics.changed_regions = self.rebuild_frames_for(Some(dirty));
-        let cell3 = CELL_SIZE_M.powi(3);
-        metrics.volume_m3 = self.world.total_volume() * cell3;
-        metrics.overfill_m3 = self.world.overfill_volume() * cell3;
-        metrics.unplaced_m3 = self.world.unplaced_volume() * cell3;
+        // Frames (depths and currents of every region that moved) are built
+        // once per step, not per slice: the publisher sends at most every
+        // fourth tick, and building a frame costs about as much as a slice.
+        if self.slice == 0 || self.journal_edit_pending {
+            let _frames = crate::prof::Span::start("water.frames");
+            let dirty = self.world.take_dirty_regions();
+            self.journal_dirty.extend(dirty.iter().copied());
+            metrics.changed_regions = self.rebuild_frames_for(Some(dirty));
+        }
+        // Totals walk every span in the world, so they are refreshed when a
+        // step completes (or terrain changed), not on every slice or idle tick.
+        if self.totals.is_none()
+            || metrics.steps > 0 && self.slice == 0
+            || self.journal_edit_pending
+        {
+            let _totals = crate::prof::Span::start("water.totals");
+            let cell3 = CELL_SIZE_M.powi(3);
+            self.totals = Some((
+                self.world.total_volume() * cell3,
+                self.world.overfill_volume() * cell3,
+                self.world.unplaced_volume() * cell3,
+            ));
+        }
+        let (volume_m3, overfill_m3, unplaced_m3) = self.totals.unwrap_or_default();
+        metrics.volume_m3 = volume_m3;
+        metrics.overfill_m3 = overfill_m3;
+        metrics.unplaced_m3 = unplaced_m3;
+        let _counts = crate::prof::Span::start("water.counts");
         metrics.active_regions = self.world.active_region_count();
         metrics.allocated_regions = self.world.region_count();
         metrics.skipped_s = self.skipped_s;
@@ -560,7 +615,7 @@ impl AuthoritativeColumnWater {
         setup.gated_sources = state.gated_sources.each_ref().map(|v| cells(v));
         setup.sinks = cells(&state.sinks);
         check_setup(&setup)?;
-        let mut world = ColumnWorld::with_terrain(terrain_source(terrain, &setup), config);
+        let mut world = ColumnWorld::with_terrain(terrain_source(terrain, &setup), sliced(config));
         let keys: Vec<RegionKey> = state.regions.iter().map(|r| (r.rx, r.rz)).collect();
         let exchange_keys: BTreeSet<RegionKey> = setup
             .sources

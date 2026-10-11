@@ -31,6 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut config = SimulationConfig::new(scene.world_setup());
     config.column_water = Some(setup);
+    // VEG=1 runs the world's vegetation too, as the real server does.
+    if std::env::var("VEG").is_ok() {
+        config.vegetation = Some(scene.vegetation().clone());
+    }
     let mut sim = Simulation::new(config)?;
     let plan = &scene.world().water;
     let wet: std::collections::HashSet<(i64, i64)> =
@@ -70,6 +74,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pct(&mut rest.clone(), 0.99),
         pct(&mut rest, 1.0)
     );
+    if let Ok(secs) = std::env::var("IDLE") {
+        let secs: u32 = secs.parse()?;
+        for tick in 0..secs * 60 {
+            let r = sim.tick()?;
+            if tick % 600 == 0 {
+                let m = r.column_water.unwrap();
+                println!(
+                    "idle t={:>4}s active regions {:>3} step {:.1} ms",
+                    tick / 60,
+                    m.active_regions,
+                    m.step_duration.as_secs_f64() * 1e3
+                );
+            }
+        }
+        return Ok(());
+    }
     sim.submit(EditIntent {
         request_id: RequestId(1),
         actor: EntityId::new(1).unwrap(),
@@ -81,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let phases = [(0u32, 5u32), (5, 20), (20, seconds)];
     let mut rows: Vec<(f64, f64, u32, usize)> = Vec::new(); // tick ms, step ms, steps, active
     let mut max_skipped = 0.0f64;
+    let mut by_stage: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
     for tick in 0..seconds * 60 {
         if tick == 120 {
             // A second edit, once everything is warm: what an edit costs in steady state.
@@ -106,13 +127,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let total = t.elapsed().as_secs_f64() * 1e3;
         let m = r.column_water.unwrap();
         max_skipped = max_skipped.max(m.skipped_s);
+        let spans = spall_sim::prof::drain();
+        for (name, d) in &spans {
+            *by_stage.entry(*name).or_insert(0.0) += d.as_secs_f64() * 1e3;
+        }
         if total > 16.7 {
+            let mut top: Vec<_> = spans
+                .iter()
+                .filter(|(_, d)| d.as_secs_f64() * 1e3 > 3.0)
+                .collect();
+            top.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+            let top: Vec<String> = top
+                .iter()
+                .take(4)
+                .map(|(n, d)| format!("{n} {:.0} ms", d.as_secs_f64() * 1e3))
+                .collect();
             println!(
-                "  slow tick: {total:.1} ms (terrain refresh {:.1} ms, fluid {:.1} ms, remapped {} columns, relocated {:.1} m3)",
+                "  slow tick {total:.1} ms [{}] (terrain refresh {:.1} ms, fluid {:.1} ms, remapped {} columns)",
+                top.join(", "),
                 m.boundary_refresh.as_secs_f64() * 1e3,
                 m.step_duration.as_secs_f64() * 1e3,
                 m.columns_remapped,
-                m.relocated_m3
             );
         }
         rows.push((
@@ -142,6 +177,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice.iter().map(|r| r.3).min().unwrap(),
             slice.iter().map(|r| r.3).max().unwrap(),
         );
+    }
+    let mut stages: Vec<_> = by_stage.into_iter().collect();
+    stages.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let n = f64::from(seconds * 60);
+    for (name, total) in stages.iter().take(8) {
+        println!("  mean per tick: {name} {:.2} ms", total / n);
     }
     println!("max skipped fluid time: {max_skipped:.2} s");
     Ok(())

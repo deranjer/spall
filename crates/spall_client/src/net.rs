@@ -2476,16 +2476,16 @@ async fn run_async(
                                             PredictedPlayer::new(p.params, st, snap.server_tick);
                                         player.client_authoritative = client_authoritative;
                                         if let Some(session) = &interactive {
-                                            // Swim against the surface the window draws.
-                                            let session = session.clone();
+                                            // Swim against the water the server replicated. The
+                                            // predictor samples it through its own handle: the
+                                            // window's surface is locked for whole frames.
+                                            let water = session
+                                                .column_surface
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .query();
                                             player.set_water_surface(Some(Arc::new(
-                                                move |x, y, z| {
-                                                    session
-                                                        .column_surface
-                                                        .lock()
-                                                        .unwrap_or_else(|e| e.into_inner())
-                                                        .sample_at_m(x, y, z)
-                                                },
+                                                move |x, y, z| water.sample_at_m(x, y, z),
                                             )));
                                         }
                                         p.player = Some(player);

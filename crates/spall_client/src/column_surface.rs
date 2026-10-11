@@ -101,6 +101,67 @@ impl Tile {
     }
 }
 
+/// One region's server heights, bottoms and currents, as prediction reads them.
+struct QueryTile {
+    top: Vec<f32>,
+    bottom: Vec<f32>,
+    flow: Vec<[i8; 2]>,
+}
+
+/// The replicated water as movement prediction needs it: the server's own
+/// heights (not the eased, drawn ones) and currents per column. It lives behind
+/// its own lock because the predictor samples it every tick and again for each
+/// replayed input on every reconcile, while the render thread holds the
+/// [`ColumnSurface`] for the whole of each frame's easing and smoothing; sharing
+/// one lock made the prediction tick wait on rendering and fall behind.
+#[derive(Default)]
+pub struct WaterQuery {
+    tiles: HashMap<(i32, i32), QueryTile>,
+}
+
+/// A [`WaterQuery`] shared between the network thread (writer) and the
+/// predictor (reader).
+#[derive(Clone, Default)]
+pub struct SharedWaterQuery(std::sync::Arc<std::sync::RwLock<WaterQuery>>);
+
+impl SharedWaterQuery {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, WaterQuery> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, WaterQuery> {
+        self.0.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// See [`WaterQuery::sample_at_m`].
+    pub fn sample_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<spall_physics::WaterSample> {
+        self.read().sample_at_m(x_m, y_m, z_m)
+    }
+}
+
+impl WaterQuery {
+    /// The water at a point as a character in it feels it: the replicated
+    /// surface and current, or `None` where the column is dry or the point lies
+    /// below the water's floor. Open sky above the surface is assumed.
+    pub fn sample_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<spall_physics::WaterSample> {
+        let cell = f64::from(CELL_M);
+        let (cx, cz) = ((x_m / cell).floor() as i64, (z_m / cell).floor() as i64);
+        let edge = i64::from(EDGE);
+        let tile = self
+            .tiles
+            .get(&(cx.div_euclid(edge) as i32, cz.div_euclid(edge) as i32))?;
+        let i = (cx.rem_euclid(edge) + cz.rem_euclid(edge) * edge) as usize;
+        let top = tile.top[i];
+        if !wet(top) || y_m < f64::from(tile.bottom[i]) - 0.5 * cell {
+            return None;
+        }
+        Some(spall_physics::WaterSample {
+            surface_y: f64::from(top),
+            flow_m_s: spall_protocol::column_water_wire::dequantize_flow(tile.flow[i]),
+        })
+    }
+}
+
 fn wet(h: f32) -> bool {
     h > NO_WATER * 0.5
 }
@@ -119,6 +180,10 @@ pub struct ColumnSurface {
     dirty: Vec<Rect>,
     needs_full_upload: bool,
     last_advance_s: f64,
+    /// The server's heights and currents for movement prediction, behind its
+    /// own lock so the render thread's long hold of this struct never stalls
+    /// the prediction tick (see [`WaterQuery`]).
+    query: SharedWaterQuery,
 }
 
 impl Default for ColumnSurface {
@@ -143,7 +208,13 @@ impl ColumnSurface {
             dirty: Vec::new(),
             needs_full_upload: false,
             last_advance_s: 0.0,
+            query: SharedWaterQuery::default(),
         }
+    }
+
+    /// The handle movement prediction samples the water through.
+    pub fn query(&self) -> SharedWaterQuery {
+        SharedWaterQuery::clone(&self.query)
     }
 
     fn now(&self) -> f64 {
@@ -181,6 +252,7 @@ impl ColumnSurface {
 
     pub fn clear(&mut self) {
         self.tiles.clear();
+        self.query.write().tiles.clear();
         self.field = WaterField::new(self.field.origin_xz, CELL_M, self.dim);
         self.dirty.clear();
         self.needs_full_upload = self.window_origin.is_some();
@@ -198,21 +270,7 @@ impl ColumnSurface {
     /// [`Self::surface_at_m`] with the replicated current: the water as a
     /// character in it feels it.
     pub fn sample_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<spall_physics::WaterSample> {
-        let cell = f64::from(CELL_M);
-        let (cx, cz) = ((x_m / cell).floor() as i64, (z_m / cell).floor() as i64);
-        let edge = i64::from(EDGE);
-        let tile = self
-            .tiles
-            .get(&(cx.div_euclid(edge) as i32, cz.div_euclid(edge) as i32))?;
-        let i = (cx.rem_euclid(edge) + cz.rem_euclid(edge) * edge) as usize;
-        let top = tile.target_top[i];
-        if !wet(top) || y_m < f64::from(tile.bottom[i]) - 0.5 * cell {
-            return None;
-        }
-        Some(spall_physics::WaterSample {
-            surface_y: f64::from(top),
-            flow_m_s: spall_protocol::column_water_wire::dequantize_flow(tile.flow[i]),
-        })
+        self.query.read().sample_at_m(x_m, y_m, z_m)
     }
 
     /// Sets one region from its replicated spans (all of its windows).
@@ -223,6 +281,7 @@ impl ColumnSurface {
 
     pub fn set_region_at(&mut self, key: (i32, i32), spans: &[WireSpan], now: f64) {
         if spans.is_empty() {
+            self.query.write().tiles.remove(&key);
             if self.tiles.remove(&key).is_some() {
                 self.recompose_tile_region(key);
             }
@@ -249,6 +308,7 @@ impl ColumnSurface {
 
     /// Drops a region that holds no water at all.
     pub fn remove_region(&mut self, key: (i32, i32)) {
+        self.query.write().tiles.remove(&key);
         if self.tiles.remove(&key).is_some() {
             self.recompose_tile_region(key);
         }
@@ -329,6 +389,14 @@ impl ColumnSurface {
                 (false, false) => {}
             }
         }
+        self.query.write().tiles.insert(
+            key,
+            QueryTile {
+                top: target.clone(),
+                bottom: bottom.clone(),
+                flow: flow.clone(),
+            },
+        );
         tile.target_top = target;
         tile.bottom = bottom;
         tile.flow = flow;
@@ -593,6 +661,50 @@ mod tests {
             "dry neighbour"
         );
         assert!(s.surface_at_m(-3.0, 1.0, -3.0).is_none(), "no tile");
+    }
+
+    #[test]
+    fn prediction_samples_the_water_while_the_surface_is_held() {
+        use std::sync::Mutex;
+        let mut s = surface();
+        s.set_region_at((0, 0), &[span(3 + 32 * 2, 10, 320)], 0.0);
+        let query = s.query();
+        // The render thread holds the whole surface for a frame; the
+        // predictor's handle must not wait for it.
+        let held = Mutex::new(s);
+        let _frame = held.lock().unwrap();
+        let cell_m = f64::from(CELL_M);
+        let sample = query.sample_at_m(3.5 * cell_m, 11.0 * cell_m, 2.5 * cell_m);
+        assert!((sample.expect("wet").surface_y - 12.5 * cell_m).abs() < 1e-4);
+        assert!(query.sample_at_m(100.0, 11.0, 100.0).is_none());
+    }
+
+    /// Prints what one frame's easing costs while a lake drains: the time the
+    /// render thread holds the surface. `cargo test -p spall_client --release
+    /// --lib easing_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn easing_cost_of_a_draining_lake() {
+        let mut s = surface();
+        let spans: Vec<WireSpan> = (0..1024).map(|c| span(c, 10, 640)).collect();
+        for rx in -3..4 {
+            for rz in -3..4 {
+                s.set_region_at((rx, rz), &spans, 0.0);
+            }
+        }
+        let shallower: Vec<WireSpan> = (0..1024).map(|c| span(c, 10, 600)).collect();
+        for rx in -3..4 {
+            for rz in -3..4 {
+                s.set_region_at((rx, rz), &shallower, 0.1);
+            }
+        }
+        let t = std::time::Instant::now();
+        let rects = s.advance_to(0.2);
+        println!(
+            "advance over 49 animating regions: {:?}, {} rects",
+            t.elapsed(),
+            rects.len()
+        );
     }
 
     #[test]
