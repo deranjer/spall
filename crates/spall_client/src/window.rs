@@ -4431,13 +4431,16 @@ impl VegetationWorker {
             .name("spall-client-foliage".into())
             .spawn(move || {
                 for (id, frame, eye, ready) in requests {
+                    // Leaves draw as far as the terrain and trunks do, so a tree
+                    // never stands bare at a distance and then sprouts as you near.
+                    let foliage_radius_m = view_radius_m();
                     let mut frame = (*frame).clone();
                     frame.plants.retain(|p| {
                         let tree = frame.species.iter().any(|s| s.id == p.species && s.tree);
                         foliage_support_ready(p, tree, &ready)
                     });
                     let instances = frame
-                        .parts(eye, 48.)
+                        .parts(eye, foliage_radius_m)
                         .into_iter()
                         .map(|p| {
                             Instance::new(

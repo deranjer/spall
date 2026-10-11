@@ -564,8 +564,14 @@ mod tests {
         let (x, z) = (3.5 * cell_m, 2.5 * cell_m);
         let top = s.surface_at_m(x, 11.0 * cell_m, z).expect("wet column");
         assert!((top - 12.5 * cell_m).abs() < 1e-4, "top {top}");
-        assert!(s.surface_at_m(x, 5.0 * cell_m, z).is_none(), "below the floor");
-        assert!(s.surface_at_m(4.5 * cell_m, 11.0 * cell_m, z).is_none(), "dry neighbour");
+        assert!(
+            s.surface_at_m(x, 5.0 * cell_m, z).is_none(),
+            "below the floor"
+        );
+        assert!(
+            s.surface_at_m(4.5 * cell_m, 11.0 * cell_m, z).is_none(),
+            "dry neighbour"
+        );
         assert!(s.surface_at_m(-3.0, 1.0, -3.0).is_none(), "no tile");
     }
 
