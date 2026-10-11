@@ -44,14 +44,14 @@ pub enum WireTag {
     Handshake = 12,
     ProgressionRequest = 13,
     ProgressionResponse = 14,
-    WaterSnapshot = 15,
+    // 15 and 18 were the grid-water records, removed in ENG-169; not reused.
     AdminRequest = 16,
     AdminStatus = 17,
-    WaterDelta = 18,
     VegetationSnapshot = 19,
     CatalogueChunk = 20,
     CatalogueAck = 21,
     ControlProbe = 22,
+    ColumnWaterUpdate = 23,
 }
 
 impl WireTag {
@@ -71,14 +71,13 @@ impl WireTag {
             12 => Self::Handshake,
             13 => Self::ProgressionRequest,
             14 => Self::ProgressionResponse,
-            15 => Self::WaterSnapshot,
             16 => Self::AdminRequest,
             17 => Self::AdminStatus,
-            18 => Self::WaterDelta,
             19 => Self::VegetationSnapshot,
             20 => Self::CatalogueChunk,
             21 => Self::CatalogueAck,
             22 => Self::ControlProbe,
+            23 => Self::ColumnWaterUpdate,
             _ => return None,
         })
     }

@@ -60,7 +60,24 @@ use spall_core::MaterialManifest;
 /// the player was standing right in front of it — raised after user report.
 /// The brick walk in [`build_instances`] skips empty and buried space, so the
 /// window is tall enough for valley walls and a flying camera.
-const VIEW_RADIUS_M: f32 = 64.0;
+const DEFAULT_VIEW_RADIUS_M: f32 = crate::column_surface::DEFAULT_VIEW_RADIUS_M;
+/// The horizontal radius (metres) the terrain, and the water field, is
+/// drawn to. Set once at startup from `InteractiveOptions::view_distance_m`;
+/// the server-streamed region around the player has to be at least this big.
+static VIEW_RADIUS_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DEFAULT_VIEW_RADIUS_M.to_bits());
+
+fn view_radius_m() -> f32 {
+    f32::from_bits(VIEW_RADIUS_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Shortest and longest view distances (metres). The longest is what the
+/// regional streaming limit of 16 bricks can feed.
+pub const MIN_VIEW_DISTANCE_M: f32 = 16.0;
+pub const MAX_VIEW_DISTANCE_M: f32 = 120.0;
+
+/// The default view distance in metres.
+pub const DEFAULT_VIEW_DISTANCE_M: f32 = DEFAULT_VIEW_RADIUS_M;
 const VIEW_HEIGHT_UP_M: f32 = 32.0;
 /// Reaches the floor of a 96 m generated world from its highest peaks, so a
 /// flying camera keeps the ground in view. Buried rock is skipped cheaply.
@@ -132,6 +149,9 @@ pub struct InteractiveOptions {
     /// Whether to advance the world clock from authoritative server ticks.
     /// `None` uses the normal cycle-on default.
     pub day_night_cycle: Option<bool>,
+    /// How far (metres) terrain and water are drawn; `None` keeps the
+    /// default. Clamped to [`MIN_VIEW_DISTANCE_M`]..=[`MAX_VIEW_DISTANCE_M`].
+    pub view_distance_m: Option<f32>,
 }
 
 /// One step of a scripted screenshot tour (see [`parse_shots`]).
@@ -476,10 +496,6 @@ struct InteractiveApp {
     hammer_target: Option<(GlobalCell, MaterialId)>,
     /// Material names by id, for the crosshair label.
     material_names: std::collections::BTreeMap<u16, String>,
-    /// ENG-105: `(frame_seq, server_tick)` of the water keyframe on the GPU.
-    water_key: Option<(u64, u64)>,
-    /// Terrain window centre the water look was last built for.
-    water_built_window: Option<[f64; 3]>,
     /// An admin command was sent and its `AdminStatus` has not arrived.
     admin_request_pending: bool,
     /// `InteractiveSession::world_resets` last acted on.
@@ -578,7 +594,7 @@ fn visible_terrain_bricks(volume: &Volume, center_m: [f64; 3]) -> Vec<BrickCoord
         (center_m[1] / cell_m).floor() as i64,
         (center_m[2] / cell_m).floor() as i64,
     );
-    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
+    let horiz = (view_radius_m() / CELL_M).ceil() as i64;
     let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
     let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
     let (min_brick, _) =
@@ -1401,6 +1417,15 @@ impl InteractiveApp {
         absent_is_open: bool,
     ) -> Result<Self, ClientError> {
         let emissive: Vec<bool> = render_materials.iter().map(|m| m.emissive > 0.0).collect();
+        if let Some(radius) = options.view_distance_m {
+            let radius = radius.clamp(MIN_VIEW_DISTANCE_M, MAX_VIEW_DISTANCE_M);
+            VIEW_RADIUS_BITS.store(radius.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+        session
+            .column_surface
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_view_radius_m(view_radius_m());
         let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open, emissive)?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         Ok(Self {
@@ -1454,8 +1479,6 @@ impl InteractiveApp {
             emitter_instances: Vec::new(),
             hammer_target: None,
             material_names: std::collections::BTreeMap::new(),
-            water_key: None,
-            water_built_window: None,
             admin_request_pending: false,
             seen_world_resets: 0,
             result: Ok(()),
@@ -1976,39 +1999,10 @@ impl ApplicationHandler for InteractiveApp {
                 // re-posed (into their own reused buffer) every frame.
                 let terrain_updates = std::mem::take(&mut self.pending_mesh_updates);
                 let terrain_removed = std::mem::take(&mut self.pending_mesh_removed);
-                // ENG-105: rebuild water columns only when a new keyframe
-                // (or a different domain after a reset) has arrived.
-                let water_generation = self
-                    .session
-                    .water_publications
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let water_key = (
-                    water_generation,
-                    self.session
-                        .world_resets
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
-                // The water look is clipped to the terrain window, so it is
-                // rebuilt when the window moves as well.
+                // ENG-168: the water is a persistent height field around the
+                // terrain window; only changed rectangles are recomposed and
+                // uploaded, never a mesh rebuilt per publication.
                 let water_window = self.last_built_pos;
-                let water_update = if self.water_key != Some(water_key)
-                    || self.water_built_window != water_window
-                {
-                    self.water_key = Some(water_key);
-                    self.water_built_window = water_window;
-                    let frames = self
-                        .session
-                        .water_regions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    // No terrain yet: nothing to anchor water to.
-                    Some(water_window.map(|center| {
-                        crate::water_look::build_water_look(&frames, center, VIEW_RADIUS_M, 0)
-                    }))
-                } else {
-                    None
-                };
                 let mut menu_actions = AdminMenuActions::default();
                 let Some(renderer) = &mut self.renderer else {
                     return;
@@ -2024,9 +2018,7 @@ impl ApplicationHandler for InteractiveApp {
                     self.fail(event_loop, ClientError::Render(error.to_string()));
                     return;
                 }
-                if let Some(look) = water_update {
-                    renderer.set_water_look(look);
-                }
+                renderer.sync_water_surface(&self.session.column_surface, water_window);
                 renderer.vegetation_frame = self
                     .session
                     .vegetation
@@ -2617,7 +2609,7 @@ fn view_window(center_m: [f64; 3]) -> (GlobalCell, GlobalCell) {
         (center_m[1] / cell_m).floor() as i64,
         (center_m[2] / cell_m).floor() as i64,
     );
-    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
+    let horiz = (view_radius_m() / CELL_M).ceil() as i64;
     let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
     let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
     let edge = i64::from(spall_core::BRICK_EDGE);
@@ -3847,14 +3839,14 @@ fn merge_water_columns(columns: &[Instance], material: u32) -> Vec<Instance> {
 /// (the same extent [`build_instances`] draws); boxes outside it are dropped.
 fn clip_water_to_window(boxes: &[Instance], center_m: [f64; 3], out: &mut Vec<Instance>) {
     let below = [
-        f64::from(VIEW_RADIUS_M),
+        f64::from(view_radius_m()),
         f64::from(VIEW_HEIGHT_DOWN_M),
-        f64::from(VIEW_RADIUS_M),
+        f64::from(view_radius_m()),
     ];
     let above = [
-        f64::from(VIEW_RADIUS_M),
+        f64::from(view_radius_m()),
         f64::from(VIEW_HEIGHT_UP_M),
-        f64::from(VIEW_RADIUS_M),
+        f64::from(view_radius_m()),
     ];
     for b in boxes {
         let mut offset = b.offset;
@@ -3900,29 +3892,14 @@ fn admin_menu_view(
         (true, None) => Some("Waiting for the server...".to_owned()),
         (false, None) => None,
     };
-    let water = session
-        .water
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|frame| {
-            let cell_m = f64::from(CELL_M) * f64::from(frame.coarsen);
-            let volume: f64 = frame
-                .fractions
-                .iter()
-                .map(|f| f64::from(*f) / 255.0)
-                .sum::<f64>()
-                * cell_m.powi(3);
-            format!(
-                "Water: {:.0} m³ in a {}×{}×{} grid of {:.2} m cells, server frame {}",
-                volume,
-                frame.dimensions[0],
-                frame.dimensions[1],
-                frame.dimensions[2],
-                cell_m,
-                frame.frame_seq
-            )
-        });
+    let water = {
+        let regions = session
+            .column_surface
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .region_count();
+        (regions > 0).then(|| format!("Water: {regions} regions replicated"))
+    };
     AdminMenuView {
         flying,
         admin_status,
@@ -4439,13 +4416,16 @@ impl VegetationWorker {
             .name("spall-client-foliage".into())
             .spawn(move || {
                 for (id, frame, eye, ready) in requests {
+                    // Leaves draw as far as the terrain and trunks do, so a tree
+                    // never stands bare at a distance and then sprouts as you near.
+                    let foliage_radius_m = view_radius_m();
                     let mut frame = (*frame).clone();
                     frame.plants.retain(|p| {
                         let tree = frame.species.iter().any(|s| s.id == p.species && s.tree);
                         foliage_support_ready(p, tree, &ready)
                     });
                     let instances = frame
-                        .parts(eye, 48.)
+                        .parts(eye, foliage_radius_m)
                         .into_iter()
                         .map(|p| {
                             Instance::new(
@@ -4495,6 +4475,8 @@ pub(super) struct WorldRenderer {
     debug_water_instances: Vec<Instance>,
     /// Clock for the water's animated caustics.
     water_epoch: Instant,
+    /// The grid water surface is installed and drawing.
+    water_grid_on: bool,
     /// `F4` cycles this through the renderer's debug views.
     debug_view: DebugView,
     /// The last camera basis the window built (`InteractiveApp` computes eye
@@ -4628,7 +4610,7 @@ pub(super) struct FrameTiming {
     /// result landed and `begin_frame` uploaded a fresh instance buffer —
     /// see `create_buffer_init` there. This reallocates and copies the
     /// *entire* buffer every time rather than reusing one; round 12
-    /// suspected this (a bigger buffer since `VIEW_RADIUS_M` went 10m ->
+    /// suspected this (a bigger buffer since `view_radius_m()` went 10m ->
     /// 48m) as the stall's cause, but round 13's data disproved it — this
     /// stayed under 0.2ms on every measured frame, stalled or not. Kept
     /// for visibility, not because it's still a live suspect.
@@ -4697,23 +4679,42 @@ pub(super) enum AcquireOutcome {
 impl WorldRenderer {
     /// Installs (or, with `None`, clears) the smoothed water surface and the
     /// height field behind the underwater look.
-    pub(super) fn set_water_look(&mut self, look: Option<crate::water_look::WaterLook>) {
-        match look {
-            Some(look) => {
-                self.scene.set_water_surface(
-                    &self.device,
-                    &self.queue,
-                    &look.vertices,
-                    &look.indices,
-                );
-                self.scene
-                    .set_water_field(&self.device, &self.queue, Some(look.field));
-            }
-            None => {
-                self.scene
-                    .set_water_surface(&self.device, &self.queue, &[], &[]);
-                self.scene.set_water_field(&self.device, &self.queue, None);
-            }
+    /// Brings the GPU water field up to date with the replicated surface:
+    /// recentres it on the terrain window, eases the heights, and uploads the
+    /// whole field only when it was replaced and otherwise just the rectangles
+    /// that changed. With no terrain window yet there is nothing to anchor
+    /// water to.
+    pub(super) fn sync_water_surface(
+        &mut self,
+        surface: &std::sync::Mutex<crate::column_surface::ColumnSurface>,
+        window: Option<[f64; 3]>,
+    ) {
+        let Some(center) = window else {
+            return;
+        };
+        let mut surface = surface.lock().unwrap_or_else(|e| e.into_inner());
+        surface.recentre(center);
+        let rects = surface.advance();
+        if surface.take_full_upload() || !self.water_grid_on {
+            // The grid surface replaces the old mesh sheet.
+            self.scene
+                .set_water_surface(&self.device, &self.queue, &[], &[]);
+            self.scene
+                .set_water_field(&self.device, &self.queue, Some(surface.field().clone()));
+            self.scene.set_water_grid_surface(true);
+            self.water_grid_on = true;
+            return;
+        }
+        for rect in rects {
+            let texels = surface.texels(rect);
+            self.scene.update_water_field_rect(
+                &self.queue,
+                rect.x0,
+                rect.z0,
+                rect.w,
+                rect.h,
+                &texels,
+            );
         }
     }
 
@@ -4867,6 +4868,7 @@ impl WorldRenderer {
             water_window: None,
             debug_water_instances: Vec::new(),
             water_epoch: Instant::now(),
+            water_grid_on: false,
             debug_view: DebugView::Shaded,
             aspect,
             yakui,
@@ -5116,6 +5118,7 @@ impl WorldRenderer {
     /// Draws and presents an already-acquired frame. `cam` is `None` before
     /// the local player has an authoritative pose yet (still connecting), in
     /// which case this just clears the screen.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn finish_frame(
         &mut self,
         acquired: AcquiredFrame,
@@ -5792,12 +5795,13 @@ mod perf_probe {
     #[test]
     fn water_is_clipped_to_the_terrain_window_and_dropped_beyond_it() {
         let mut columns = Vec::new();
-        for iz in 0..400 {
-            for ix in 0..400 {
+        // Larger than any view window, so a clipped lake is a fraction of it.
+        for iz in 0..800 {
+            for ix in 0..800 {
                 columns.push(water_column(ix, iz, 10.0, 0.5));
             }
         }
-        let lake = merge_water_columns(&columns, 0); // 200 m x 200 m
+        let lake = merge_water_columns(&columns, 0); // 400 m x 400 m
         let mut near = Vec::new();
         clip_water_to_window(&lake, [100.0, 10.0, 100.0], &mut near);
         assert!(!near.is_empty());
@@ -5806,7 +5810,7 @@ mod perf_probe {
                 let half = f64::from(if a == 1 {
                     VIEW_HEIGHT_UP_M
                 } else {
-                    VIEW_RADIUS_M
+                    view_radius_m()
                 });
                 assert!(f64::from(b.offset[a]) - f64::from(b.size[a]) * 0.5 >= c - half - 1e-3);
                 assert!(f64::from(b.offset[a]) + f64::from(b.size[a]) * 0.5 <= c + half + 1e-3);

@@ -1177,6 +1177,11 @@ struct CorrectionStats {
 struct ClientConnection {
     transport: Arc<Connection>,
     records: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<spall_net::Result<Option<WireRecord>>>>,
+    /// Water updates that arrived while a baseline was being received. Water
+    /// is sent as soon as the server counts this client live, and its deltas
+    /// chain on each other, so dropping one leaves a hole no later update
+    /// repairs; the control reader replays these first.
+    deferred: std::sync::Mutex<std::collections::VecDeque<WireRecord>>,
     pump: tokio::task::JoinHandle<()>,
 }
 impl ClientConnection {
@@ -1198,11 +1203,31 @@ impl ClientConnection {
         Self {
             transport,
             records: tokio::sync::Mutex::new(recv),
+            deferred: std::sync::Mutex::new(std::collections::VecDeque::new()),
             pump,
         }
     }
     async fn recv_record(&self) -> spall_net::Result<Option<WireRecord>> {
         self.records.lock().await.recv().await.unwrap_or(Ok(None))
+    }
+    /// Keeps a record a baseline wait loop has no use for but later readers do.
+    fn defer(&self, record: WireRecord) {
+        self.deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(record);
+    }
+    /// The next record for the control reader: deferred ones first, in order.
+    async fn next_record(&self) -> spall_net::Result<Option<WireRecord>> {
+        let deferred = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        match deferred {
+            Some(record) => Ok(Some(record)),
+            None => self.recv_record().await,
+        }
     }
 }
 impl std::ops::Deref for ClientConnection {
@@ -1246,6 +1271,7 @@ async fn receive_baseline_body(conn: &ClientConnection) -> Option<BaselineWorld>
                 }
                 return Some(world);
             }
+            Ok(Some(record @ WireRecord::ColumnWaterUpdate(_))) => conn.defer(record),
             Ok(Some(_)) => continue,
             Ok(None) | Err(_) => return None,
         }
@@ -1358,6 +1384,7 @@ async fn receive_full_baseline(
         loop {
             match conn.recv_record().await.map_err(|e| e.to_string())? {
                 Some(WireRecord::BaselineEnd(end)) => return Ok::<_, String>(end),
+                Some(record @ WireRecord::ColumnWaterUpdate(_)) => conn.defer(record),
                 Some(_) => continue,
                 None => return Err("connection closed before baseline end".into()),
             }
@@ -1490,6 +1517,7 @@ async fn perform_late_join(
     let begin = loop {
         match conn.recv_record().await {
             Ok(Some(WireRecord::BaselineBegin(b))) => break b,
+            Ok(Some(record @ WireRecord::ColumnWaterUpdate(_))) => conn.defer(record),
             Ok(Some(_)) => continue,
             Ok(None) => {
                 return Err(ClientNetError::Baseline(format!(
@@ -1821,21 +1849,21 @@ async fn run_async(
         let catalogue_slot = catalogue_slot.clone();
         tokio::spawn(async move {
             let mut vegetation_floor = 0_u64;
+            // Water sent before a world reset can still be in flight when the
+            // reset baseline installs; it belongs to the old world and its
+            // deltas have no base in the new one.
+            let mut column_water_floor = 0_u64;
             let mut vegetation = spall_protocol::vegetation::VegetationAssembler::default();
-            let mut water =
-                HashMap::<spall_core::GlobalCell, spall_protocol::WaterAssembler>::new();
-            let mut water_deltas =
-                HashMap::<spall_core::GlobalCell, spall_protocol::WaterDeltaAssembler>::new();
+            let mut column_water = spall_protocol::ColumnWaterReplica::default();
             // Diagnostic: how the control reader spends its time, by record kind.
             let mut profile = ControlProfile::with_watch(control_watch);
             loop {
                 profile.finish_record();
-                let received = conn.recv_record().await;
+                let received = conn.next_record().await;
 
                 profile.begin_record(match &received {
                     Ok(Some(WireRecord::VegetationSnapshot(_))) => "vegetation",
-                    Ok(Some(WireRecord::WaterSnapshot(_))) => "water-snapshot",
-                    Ok(Some(WireRecord::WaterDelta(_))) => "water-delta",
+                    Ok(Some(WireRecord::ColumnWaterUpdate(_))) => "column-water",
                     Ok(Some(WireRecord::TopologyTransaction(_))) => "transaction",
                     Ok(Some(WireRecord::BaselineBegin(_))) => "baseline-begin",
                     Ok(Some(WireRecord::BaselineEnd(_))) => "baseline-end",
@@ -1872,94 +1900,56 @@ async fn run_async(
                             }
                         }
                     }
-                    Ok(Some(WireRecord::WaterSnapshot(chunk))) => {
-                        match if water.len() >= 8 && !water.contains_key(&chunk.origin) {
-                            Err(spall_protocol::WaterCodecError::InvalidChunk(
-                                "water region limit".into(),
-                            ))
-                        } else {
-                            water.entry(chunk.origin).or_default().push(chunk)
-                        } {
-                            Ok(Some(frame)) => {
-                                // A region that grew may have moved its origin
-                                // (ENG-120): drop any other region this frame
-                                // overlaps, or its stale water would stay drawn.
-                                let superseded: Vec<_> = water_deltas
-                                    .iter()
-                                    .filter(|(origin, assembler)| {
-                                        **origin != frame.origin
-                                            && assembler.current().is_some_and(|old| {
-                                                frame.overlaps(old.origin, old.dimensions)
-                                            })
-                                    })
-                                    .map(|(origin, _)| *origin)
-                                    .collect();
-                                for origin in &superseded {
-                                    water_deltas.remove(origin);
-                                    water.remove(origin);
-                                }
-                                water_deltas
-                                    .entry(frame.origin)
-                                    .or_default()
-                                    .install(frame.clone());
-                                counters
-                                    .water_regions
-                                    .store(water_deltas.len() as u64, Ordering::Relaxed);
-                                counters.water_keyframes.fetch_add(1, Ordering::Relaxed);
-                                // Water frames are broadcast at a steady rate, so a
-                                // client whose interest sees few body snapshots
-                                // still learns the server tick from them.
+                    Ok(Some(WireRecord::ColumnWaterUpdate(update))) => {
+                        if update.server_tick.get() < column_water_floor {
+                            continue;
+                        }
+                        match column_water.apply(&update) {
+                            Ok(applied) => {
+                                let counter = if applied.baseline {
+                                    &counters.water_keyframes
+                                } else {
+                                    &counters.water_delta_frames
+                                };
+                                counter.fetch_add(1, Ordering::Relaxed);
                                 counters
                                     .last_tick
-                                    .fetch_max(frame.server_tick.get(), Ordering::Relaxed);
+                                    .fetch_max(update.server_tick.get(), Ordering::Relaxed);
                                 let retried =
-                                    observe_tick_and_retry(&replica, frame.server_tick.get());
+                                    observe_tick_and_retry(&replica, update.server_tick.get());
                                 for (_, outcome) in retried {
                                     forward_outcome(&conn, &counters, outcome).await;
                                 }
                                 counters
                                     .water_frame_seq
-                                    .store(frame.frame_seq, Ordering::Relaxed);
+                                    .store(column_water.frame_seq, Ordering::Relaxed);
+                                counters
+                                    .water_regions
+                                    .store(column_water.region_count() as u64, Ordering::Relaxed);
                                 if let Some(session) = &interactive {
-                                    session.publish_water(frame);
+                                    let mut surface = session
+                                        .column_surface
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if applied.region_empty
+                                        && column_water.region_spans(applied.key).is_empty()
+                                    {
+                                        surface.remove_region(applied.key);
+                                    } else {
+                                        let spans =
+                                            column_water.window_spans(applied.key, update.window);
+                                        surface.set_window(applied.key, update.window, &spans);
+                                    }
                                 }
                             }
-                            Ok(None) => {}
                             Err(error) => {
-                                // Presentation only: the next keyframe repairs it,
-                                // but a malformed frame from our own server is a
-                                // bug, so say so.
+                                // Records are ordered, so a refused delta is a
+                                // server bug, not loss: say so.
                                 counters.water_errors.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("spall-client: dropped a water keyframe: {error}");
+                                eprintln!("spall-client: rejected column water update: {error}");
                             }
                         }
                     }
-                    Ok(Some(WireRecord::WaterDelta(delta))) => match water_deltas
-                        .get_mut(&delta.origin)
-                        .map_or(Ok(None), |a| a.push(delta))
-                    {
-                        Ok(Some(frame)) => {
-                            counters.water_delta_frames.fetch_add(1, Ordering::Relaxed);
-                            counters
-                                .last_tick
-                                .fetch_max(frame.server_tick.get(), Ordering::Relaxed);
-                            let retried = observe_tick_and_retry(&replica, frame.server_tick.get());
-                            for (_, outcome) in retried {
-                                forward_outcome(&conn, &counters, outcome).await;
-                            }
-                            counters
-                                .water_frame_seq
-                                .store(frame.frame_seq, Ordering::Relaxed);
-                            if let Some(session) = &interactive {
-                                session.publish_water(frame);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            counters.water_errors.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("spall-client: rejected water delta: {error}");
-                        }
-                    },
                     Ok(Some(WireRecord::AdminStatus(status))) => {
                         eprintln!(
                             "spall-client: admin request {} {}: {}",
@@ -2008,6 +1998,7 @@ async fn run_async(
                         {
                             Ok(world) => {
                                 vegetation_floor = begin.checkpoint_tick.get();
+                                column_water_floor = begin.checkpoint_tick.get();
                                 vegetation =
                                     spall_protocol::vegetation::VegetationAssembler::default();
                                 let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
@@ -2031,8 +2022,7 @@ async fn run_async(
                         };
                         match installed {
                             Ok(()) => {
-                                water.clear();
-                                water_deltas.clear();
+                                column_water.clear();
                                 counters.world_resets.fetch_add(1, Ordering::Relaxed);
                                 if let Some(session) = &interactive {
                                     session.clear_water();
@@ -2485,6 +2475,19 @@ async fn run_async(
                                         let mut player =
                                             PredictedPlayer::new(p.params, st, snap.server_tick);
                                         player.client_authoritative = client_authoritative;
+                                        if let Some(session) = &interactive {
+                                            // Swim against the water the server replicated. The
+                                            // predictor samples it through its own handle: the
+                                            // window's surface is locked for whole frames.
+                                            let water = session
+                                                .column_surface
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .query();
+                                            player.set_water_surface(Some(Arc::new(
+                                                move |x, y, z| water.sample_at_m(x, y, z),
+                                            )));
+                                        }
                                         p.player = Some(player);
                                         p.script_origin_tick.get_or_insert(snap.server_tick.get());
                                     }

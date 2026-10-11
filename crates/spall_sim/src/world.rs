@@ -17,13 +17,16 @@ use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
     BodyId as PhysBodyId, BodyKind as PhysBodyKind, BodySpec, CharacterParams, CharacterQueryCache,
     OccupancyGrid, PhysicsConfig, PhysicsOrigin, PhysicsWorld, Representation,
-    analytic_mass_properties, step_character,
+    analytic_mass_properties, step_character_in_water,
 };
 use spall_protocol::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
 };
 use spall_structure::AnchorPlane;
 use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, EvictedBricks, Volume};
+
+mod buoyancy;
+pub use buoyancy::{BuoyancyCache, BuoyancyReport, WATER_DENSITY_KG_M3};
 
 use crate::body::{Body, BodyKind, BodyPose};
 use crate::collider::{ColliderPlan, plan_collider};
@@ -1212,7 +1215,12 @@ impl SimWorld {
     /// bumped and is depenetrated before the normal step, so the authoritative
     /// capsule is never left inside new solid or hovering over removed floor and
     /// the client knows to rebuild prediction from the next snapshot.
-    pub fn advance_players(&mut self, dt_s: f32, invalidation_boxes: &[([f64; 3], [f64; 3])]) {
+    pub fn advance_players(
+        &mut self,
+        dt_s: f32,
+        invalidation_boxes: &[([f64; 3], [f64; 3])],
+        water_at: &dyn Fn(f64, f64, f64) -> Option<spall_physics::WaterSample>,
+    ) {
         // Depenetration pass (unchanged from before ENG-69 round 18): still
         // sweeps against the real, always-current whole-terrain collider
         // directly, not through any player's own window. This is a rare,
@@ -1412,15 +1420,23 @@ impl SimWorld {
                 continue;
             }
             let physics = &mut self.physics;
-            player.state = step_character(player.state, input, dt_s, |pos, desired| {
-                let local = physics_origin
-                    .to_local_f32(pos)
-                    .expect("player stayed inside the owning physics frame")
-                    .map(f64::from);
-                physics.sweep_character_pushing_excluding_set(
-                    params, local, desired, dt_s, base, &exclude,
-                )
-            });
+            // The water over the feet (surface and current) decides whether the capsule
+            // swims; the client predicts with the same value (see predict.rs).
+            let water = water_at(
+                player.state.position_m[0],
+                player.state.position_m[1] + 0.05,
+                player.state.position_m[2],
+            );
+            player.state =
+                step_character_in_water(player.state, input, dt_s, water, |pos, desired| {
+                    let local = physics_origin
+                        .to_local_f32(pos)
+                        .expect("player stayed inside the owning physics frame")
+                        .map(f64::from);
+                    physics.sweep_character_pushing_excluding_set(
+                        params, local, desired, dt_s, base, &exclude,
+                    )
+                });
 
             // Bounded-fixture safety net: a capsule that leaves the world (bad
             // input math, a floor pulled out from under it with nothing below)

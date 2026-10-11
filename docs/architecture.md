@@ -27,6 +27,22 @@ xtask          -> spall_store                   process/scenario/build orchestra
 
 spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The graph edge is refined from `spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol` (T08): staging is submitted to a `spall_jobs::Scheduler` and re-validated through a `JobToken` like any other off-tick result, and every commit emits a `spall_protocol::TopologyTransaction`. Both new targets are foundation crates (`-> spall_core`); no cycle is introduced. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
 
+**Water direction (2026-10-10): stacked columns with virtual pipes.** The
+`grid_mac` MAC/VOF solver described below was retired (ENG-169, 2026-10-11) and
+its code removed; git history keeps it. Its replacement is the column model in
+`spall_fluid::columns`: one column per
+terrain cell (0.25 m), each split into vertical open spans holding a depth;
+4-neighbour spans whose open intervals overlap are joined by persistent
+virtual-pipe flows that give momentum, exact hydrostatic rest and exact volume
+conservation. Storage is sparse per 32 x 32 column region with sleep/wake, so
+cost follows moving water rather than world size. Navier-Stokes accuracy,
+vortices and sealed-air pressure are dropped. Design, work items W0-W5
+(ENG-164..ENG-169) and acceptance tests: `docs/water-agent-handoff.md`. The
+column model is the only water in the engine. The ENG-103/105/122 text below
+describes the removed grid solver and is kept as a record. The reproducible
+failing baseline is `docs/reports/ENG-164.md`; the removal is
+`docs/reports/ENG-169.md`.
+
 ENG-103 introduces `spall_fluid -> spall_core, spall_voxel` as a CPU-only
 water crate. Its dense two-phase MAC/PLIC solver uses variable-density
 pressure projection, multigrid preconditioning and isothermal sealed air.
@@ -93,8 +109,8 @@ checkpointed and journaled atomically with the terrain/pose batch. Restart
 preserves these amounts and resets velocities, pressure, sleep and caches to
 rest. See [`docs/reports/ENG-105.md`](reports/ENG-105.md).
 
-ENG-104's explicit `sandbox-client --grid-fluid-demo` is a local experimental
-viewer; its independently advanced fixture is separate from network authority.
+ENG-104's `sandbox-client --grid-fluid-demo` viewer was removed with the grid
+solver (ENG-169).
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only

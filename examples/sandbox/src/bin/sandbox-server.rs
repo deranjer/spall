@@ -97,6 +97,14 @@ struct Args {
     /// 32 from 128 to 4096. The default is 1024 (256 m).
     #[arg(long, default_value_t = sandbox::worldgen_scene::DEFAULT_SIZE_CELLS, requires = "worldgen")]
     worldgen_size: u32,
+    /// Spawn the player on solid ground beside the shore of the deepest lake
+    /// instead of at a generated meadow spawn.
+    #[arg(long, requires = "worldgen")]
+    spawn_at_lake: bool,
+    /// Float a raft and some test objects (light crates, a log, a stone block
+    /// that sinks) on the deepest lake, a few metres out from `--spawn-at-lake`.
+    #[arg(long, requires = "worldgen")]
+    spawn_raft: bool,
     /// Initial plant season; the saved plant clock advances every 15 minutes.
     #[arg(long, default_value = "summer", value_parser = ["spring", "summer", "autumn", "winter"], requires = "worldgen")]
     season: String,
@@ -448,6 +456,17 @@ fn run_serve(args: Args) -> ExitCode {
             spall_ecology::living::Season::parse(&args.season).unwrap(),
         ) {
             Ok(generated) => {
+                let generated = if args.spawn_at_lake {
+                    let moved = generated.with_lake_spawn();
+                    if moved.player_spawns() == moved.world().spawns.as_slice() {
+                        eprintln!(
+                            "sandbox-server: --spawn-at-lake: no lake shore found; using the generated spawns"
+                        );
+                    }
+                    moved
+                } else {
+                    generated
+                };
                 let world = generated.world();
                 tracing::info!(
                     preset = %preset,
@@ -461,7 +480,27 @@ fn run_serve(args: Args) -> ExitCode {
                     generate_ms = started.elapsed().as_millis() as u64,
                     "generated world"
                 );
-                custom_world = Some(generated.into_custom_world());
+                let floaters = if args.spawn_raft {
+                    let floaters = generated.lake_floaters();
+                    if floaters.is_empty() {
+                        eprintln!(
+                            "sandbox-server: --spawn-raft: no clear deep water found; nothing spawned"
+                        );
+                    }
+                    if let Some(raft) = floaters.first() {
+                        eprintln!(
+                            "sandbox-server: --spawn-raft: {} floating objects; raft corner at ({:.1}, {:.1}, {:.1}) m",
+                            floaters.len(),
+                            raft.position_m[0],
+                            raft.position_m[1],
+                            raft.position_m[2]
+                        );
+                    }
+                    floaters
+                } else {
+                    Vec::new()
+                };
+                custom_world = Some(generated.into_custom_world().with_initial_bodies(floaters));
                 Scene::Custom
             }
             Err(error) => {

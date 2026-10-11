@@ -263,10 +263,6 @@ impl Writer {
                     "INSERT INTO journal (seq, tick, payload, crc) VALUES (?, ?, ?, ?)",
                 )?;
                 for r in records {
-                    if let dto::JournalPayload::WaterState(states) = &r.payload {
-                        spall_protocol::water::validate_water_states(states)
-                            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-                    }
                     let body = dto::encode(&r.payload)?;
                     let crc = crc16(&body);
                     stmt.execute(params![r.seq as i64, r.tick as i64, &body, &crc])?;
@@ -386,12 +382,17 @@ impl Writer {
             ));
         }
         let meta_blob = dto::encode(&checkpoint.meta)?;
-        spall_protocol::water::validate_water_states(&checkpoint.water)
-            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        let water_blob = dto::encode(&checkpoint.water)?;
-        if water_blob.len() > dto::MAX_STORED_WATER_BYTES {
+        // Always a row, holding `None` for a dry world, so a missing row is
+        // corruption and never a silently dry restore.
+        if let Some(state) = &checkpoint.column_water {
+            state
+                .validate()
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        }
+        let column_blob = dto::encode(&checkpoint.column_water)?;
+        if column_blob.len() > dto::MAX_STORED_COLUMN_WATER_BYTES {
             return Err(StoreError::Corrupt(
-                "water checkpoint exceeds byte limit".into(),
+                "column water checkpoint exceeds byte limit".into(),
             ));
         }
         let now_ms = unix_millis();
@@ -420,18 +421,18 @@ impl Writer {
             )?;
             // A re-published tick starts clean.
             tx.execute(
-                "DELETE FROM checkpoint_water WHERE tick = ?",
+                "DELETE FROM checkpoint_column_water WHERE tick = ?",
                 params![checkpoint.tick as i64],
             )?;
             tx.execute(
-                "INSERT INTO checkpoint_water (tick, state, crc) VALUES (?, ?, ?)",
+                "INSERT INTO checkpoint_column_water (tick, state, crc) VALUES (?, ?, ?)",
                 params![
                     checkpoint.tick as i64,
-                    &water_blob,
-                    crc16(&water_blob).as_slice()
+                    &column_blob,
+                    crc16(&column_blob).as_slice()
                 ],
             )?;
-            payload_bytes += water_blob.len() as u64;
+            payload_bytes += column_blob.len() as u64;
             tx.execute(
                 "INSERT OR REPLACE INTO checkpoint_vegetation (tick,state,crc) VALUES (?,?,?)",
                 params![

@@ -105,7 +105,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         world_hash: [tick as u8; 32],
         meta: m,
         bodies: vec![],
-        water: Vec::new(),
+        column_water: None,
         bricks: vec![StoredBrick {
             volume_id: 1,
             coord: [0, 0, 0],

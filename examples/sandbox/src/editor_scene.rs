@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use spall_core::{CellSizeCode, GlobalCell, MaterialId, VolumeId};
-use spall_fluid::DomainSpec;
 use spall_server::CustomWorld;
-use spall_sim::{WaterSetup, WorldSetup};
+use spall_sim::WorldSetup;
+use spall_sim::column_water::ColumnWaterSetup;
 use spall_structure::AnchorPlane;
 use spall_voxel::EditPlan;
 use thiserror::Error;
@@ -64,20 +64,6 @@ const WATER_BASIN_MATERIAL: MaterialId = MaterialId(u16::MAX - 5);
 /// or refill them at runtime — see
 /// [`spall_protocol::AdminCommand::SetDamGate`].
 const DAM_GATE_MARKER_MATERIAL: MaterialId = MaterialId(u16::MAX - 6);
-/// Voxel cells in the fluid domain before coarsening.
-pub(crate) const MAX_SCENE_WATER_CELLS: usize = 4_000_000;
-/// Scene water is solved on 0.5 m cells (2³ voxels): a valley-sized domain at
-/// voxel resolution is far over the solver's per-tick budget.
-pub(crate) const WATER_COARSEN: u32 = 2;
-/// Fixed fluid step on the server's water worker (20 Hz): a valley domain
-/// costs ~15-20 ms per step on 16 threads, and this leaves the host room to
-/// run the server tick and a local client beside it.
-pub(crate) const WATER_STEP_S: f64 = 1.0 / 20.0;
-/// Open space kept around authored water inside the fluid domain, in voxels:
-/// sideways room to spread, and air above the highest surface.
-pub(crate) const WATER_MARGIN_XZ: i64 = 4;
-pub(crate) const WATER_MARGIN_ABOVE: i64 = 4;
-pub(crate) const WATER_MARGIN_BELOW: i64 = 2;
 const RUNTIME_CELL_M: f32 = 0.25;
 /// Editor translations are stored in metres.
 const MAX_PLAYER_SPAWNS: usize = 4;
@@ -185,7 +171,8 @@ pub struct LoadedScene {
     min: [i64; 3],
     max: [i64; 3],
     pub player_spawns: Vec<[f64; 3]>,
-    water: Option<WaterSetup>,
+    /// Stacked-column water (ENG-167).
+    column_water: Option<ColumnWaterSetup>,
     /// Cells marked `dam.gate`, still solid in `cells`; handed to
     /// [`spall_server::CustomWorld::with_dam_gate`] so an admin can open them.
     dam_gate_cells: Vec<GlobalCell>,
@@ -200,8 +187,8 @@ impl LoadedScene {
         (self.min, self.max)
     }
 
-    pub fn water_setup(&self) -> Option<&WaterSetup> {
-        self.water.as_ref()
+    pub fn column_water_setup(&self) -> Option<&ColumnWaterSetup> {
+        self.column_water.as_ref()
     }
 
     /// Cells marked `dam.gate`, closed (solid) in the scene's own terrain
@@ -252,10 +239,13 @@ impl LoadedScene {
     /// Packages the scene for [`spall_server::ServeConfig::custom_world`].
     pub fn into_custom_world(self) -> CustomWorld {
         let spawns = self.player_spawns.clone();
-        let water = self.water.clone();
+        let column_water = self.column_water.clone();
         let gate_cells = self.dam_gate_cells.clone();
         let scene = Arc::new(self);
-        let custom = CustomWorld::new_with_water(spawns, water, move || scene.world_setup());
+        let mut custom = CustomWorld::new(spawns, move || scene.world_setup());
+        if let Some(setup) = column_water {
+            custom = custom.with_column_water(setup);
+        }
         if gate_cells.is_empty() {
             custom
         } else {
@@ -387,28 +377,49 @@ pub fn load(path: &Path) -> Result<LoadedScene, EditorSceneError> {
     } else {
         marker_spawns(spawn_markers)
     };
-    let water = water_setup(
+    let column_water = column_water_setup(
         &water_cells,
-        spring_cells,
-        [
-            gated_spring_cells,
-            gated_spring_fast_cells,
-            gated_spring_max_cells,
+        &spring_cells,
+        &[
+            gated_spring_cells.clone(),
+            gated_spring_fast_cells.clone(),
+            gated_spring_max_cells.clone(),
         ],
-        drain_cells,
-        &basin_cells,
-        &dam_gate_cells,
+        &drain_cells,
         min,
         max,
-    )?;
+    );
     Ok(LoadedScene {
         cells,
         min,
         max,
         player_spawns,
-        water,
+        column_water,
         dam_gate_cells,
     })
+}
+
+/// The stacked-column water for a scene's authored water, springs and drains.
+/// There is no domain box: the height range is the scene's resident air
+/// envelope, snapped outward to whole bricks.
+fn column_water_setup(
+    water: &[GlobalCell],
+    springs: &[GlobalCell],
+    gated_springs: &[Vec<GlobalCell>; 3],
+    drains: &[GlobalCell],
+    min: [i64; 3],
+    max: [i64; 3],
+) -> Option<ColumnWaterSetup> {
+    if water.is_empty() && springs.is_empty() && gated_springs.iter().all(Vec::is_empty) {
+        return None;
+    }
+    let y_lo = (min[1] - AIR_BELOW).div_euclid(32) * 32;
+    let y_hi = (max[1] + AIR_ABOVE + 1 + 31).div_euclid(32) * 32;
+    let mut setup = ColumnWaterSetup::new(y_lo as i32, y_hi as i32, water.to_vec());
+    setup.sources = springs.to_vec();
+    setup.gated_sources = gated_springs.clone();
+    setup.sinks = drains.to_vec();
+    Some(setup)
 }
 
 /// Removes every cell of a sentinel material, returning their positions.
@@ -424,72 +435,6 @@ fn take_marked(
         .collect();
     cells.retain(|_, material| *material != marker);
     marked
-}
-
-/// The server fluid region for a scene's authored water: the bounding box of
-/// its water, springs, drains, and basin hints plus margins, kept inside the
-/// resident air envelope and snapped outward to whole 0.5 m fluid cells.
-#[allow(clippy::too_many_arguments)]
-fn water_setup(
-    water: &[GlobalCell],
-    springs: Vec<GlobalCell>,
-    gated_springs: [Vec<GlobalCell>; 3],
-    drains: Vec<GlobalCell>,
-    basin: &[GlobalCell],
-    // A `dam.gate` marker's cells never carry water themselves (they start
-    // solid), but the domain still needs to cover them with the usual
-    // margins: an admin-opened gate must always fall well inside the fluid
-    // domain, not near-miss its edge because the gate's placement and this
-    // domain's bounding box were computed independently.
-    gate: &[GlobalCell],
-    min: [i64; 3],
-    max: [i64; 3],
-) -> Result<Option<WaterSetup>, EditorSceneError> {
-    if water.is_empty() && springs.is_empty() && gated_springs.iter().all(Vec::is_empty) {
-        return Ok(None);
-    }
-    let all = || {
-        water
-            .iter()
-            .chain(&springs)
-            .chain(gated_springs.iter().flatten())
-            .chain(&drains)
-            .chain(basin)
-            .chain(gate)
-    };
-    let lo_of = |axis: fn(&GlobalCell) -> i64| all().map(axis).min().expect("non-empty");
-    let hi_of = |axis: fn(&GlobalCell) -> i64| all().map(axis).max().expect("non-empty");
-    let c = i64::from(WATER_COARSEN);
-    let snap_down = |v: i64| v.div_euclid(c) * c;
-    let snap_up = |v: i64| (v + c).div_euclid(c) * c; // exclusive end
-    let lo = [
-        snap_down((lo_of(|p| p.x) - WATER_MARGIN_XZ).max(min[0] - AIR_MARGIN_XZ)),
-        snap_down((lo_of(|p| p.y) - WATER_MARGIN_BELOW).max(min[1] - AIR_BELOW)),
-        snap_down((lo_of(|p| p.z) - WATER_MARGIN_XZ).max(min[2] - AIR_MARGIN_XZ)),
-    ];
-    let hi = [
-        snap_up((hi_of(|p| p.x) + WATER_MARGIN_XZ).min(max[0] + AIR_MARGIN_XZ - c)),
-        snap_up((hi_of(|p| p.y) + WATER_MARGIN_ABOVE).min(max[1] + AIR_ABOVE - c)),
-        snap_up((hi_of(|p| p.z) + WATER_MARGIN_XZ).min(max[2] + AIR_MARGIN_XZ - c)),
-    ];
-    let domain_error = |message: String| EditorSceneError::Asset {
-        asset: "water domain".into(),
-        message,
-    };
-    let dimensions = [0, 1, 2].map(|a| (hi[a] - lo[a]) as u32);
-    let domain = DomainSpec::new(
-        GlobalCell::new(lo[0], lo[1], lo[2]),
-        dimensions,
-        MAX_SCENE_WATER_CELLS,
-    )
-    .map_err(|error| domain_error(error.to_string()))?;
-    let mut setup = WaterSetup::new(domain, water.iter().map(|cell| (*cell, 1.0)).collect())
-        .with_coarsening(WATER_COARSEN)
-        .on_worker(WATER_STEP_S);
-    setup.sources = springs;
-    setup.gated_sources = gated_springs;
-    setup.sinks = drains;
-    Ok(Some(setup))
 }
 
 fn load_asset(

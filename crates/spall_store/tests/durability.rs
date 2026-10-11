@@ -21,45 +21,6 @@ use spall_store::{
 
 // --- tiny scratch-dir helper ------------------------------------------------
 
-#[test]
-fn schema_one_water_migration_copies_and_verifies_without_editing_source() {
-    let scratch = Scratch::new("water-migration");
-    let source = scratch.db();
-    let destination = scratch.dir.join("migrated.db");
-    let cp = checkpoint(0, 0);
-    let mut writer = Writer::open(&source).unwrap();
-    writer.publish_checkpoint(&cp).unwrap();
-    drop(writer);
-    // A historical schema-1 fixture: identical body/brick/meta field layouts,
-    // no authoritative-water table and the original version stamp.
-    let conn = rusqlite::Connection::open(&source).unwrap();
-    let mut old_meta = cp.meta.clone();
-    old_meta.store_schema_version = 1;
-    let blob = postcard::to_allocvec(&old_meta).unwrap();
-    conn.execute("UPDATE checkpoints SET meta = ?", [&blob])
-        .unwrap();
-    conn.execute("UPDATE world SET meta = ?", [&blob]).unwrap();
-    conn.execute_batch("DROP TABLE checkpoint_water; PRAGMA user_version = 1;")
-        .unwrap();
-    drop(conn);
-    let original = std::fs::read(&source).unwrap();
-    spall_store::migrate_v1_water(&source, &destination).unwrap();
-    assert_eq!(std::fs::read(&source).unwrap(), original);
-    let recovered = recover(&destination).unwrap();
-    assert_eq!(recovered.checkpoint.world_hash, cp.world_hash);
-    assert_eq!(recovered.checkpoint.bricks, cp.bricks);
-    assert!(recovered.checkpoint.water.is_empty());
-    assert_eq!(
-        recovered.checkpoint.meta.store_schema_version,
-        STORE_SCHEMA_VERSION
-    );
-    assert!(spall_store::migrate_v1_water(&source, &destination).is_err());
-    assert!(matches!(
-        Writer::open(&source),
-        Err(StoreError::SchemaTooOld { .. })
-    ));
-}
-
 struct Scratch {
     dir: PathBuf,
 }
@@ -146,7 +107,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         world_hash: [tick as u8; 32],
         meta: m,
         bodies: vec![],
-        water: Vec::new(),
+        column_water: None,
         bricks: vec![
             StoredBrick {
                 volume_id: 1,
@@ -812,16 +773,43 @@ fn full_journal_prune_then_reopen_then_edit_never_reuses_sequences() {
 }
 
 #[test]
-fn missing_or_corrupt_water_checkpoint_never_restores_a_silent_dry_world() {
+fn missing_or_corrupt_column_water_checkpoint_never_restores_a_silent_dry_world() {
     for (tag, sql) in [
-        ("missing_water", "DELETE FROM checkpoint_water"),
-        ("corrupt_water", "UPDATE checkpoint_water SET state = X'01'"),
-        ("missing_water_table", "DROP TABLE checkpoint_water"),
+        ("missing_water", "DELETE FROM checkpoint_column_water"),
+        (
+            "corrupt_water",
+            "UPDATE checkpoint_column_water SET state = X'01'",
+        ),
+        ("missing_water_table", "DROP TABLE checkpoint_column_water"),
     ] {
         let scratch = Scratch::new(tag);
         {
             let mut writer = Writer::open(scratch.db()).unwrap();
-            writer.publish_checkpoint(&checkpoint(100, 0)).unwrap();
+            let mut cp = checkpoint(100, 0);
+            cp.column_water = Some(spall_protocol::ColumnWaterState {
+                version: spall_protocol::column_water::COLUMN_WATER_VERSION,
+                y_lo: 0,
+                y_hi: 32,
+                frame_seq: 1,
+                fluid_time_fixed: 0,
+                spring_added_fixed: 0,
+                drain_removed_fixed: 0,
+                unplaced_fixed: 0,
+                regions: vec![spall_protocol::column_water::ColumnRegionRecord {
+                    rx: 0,
+                    rz: 0,
+                    spans: vec![spall_protocol::column_water::ColumnSpanRecord {
+                        column: 5,
+                        floor_y: 1,
+                        volume: 1 << 32,
+                    }],
+                }],
+                sources: vec![],
+                gated_sources: [vec![], vec![], vec![]],
+                sinks: vec![],
+                gated_rate: 0,
+            });
+            writer.publish_checkpoint(&cp).unwrap();
         }
         let conn = rusqlite::Connection::open(scratch.db()).unwrap();
         conn.execute_batch(sql).unwrap();

@@ -22,7 +22,7 @@ pub use spall_physics::WindowStats;
 use spall_physics::{
     BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterQueryCache,
     CharacterState, OccupancyGrid, PhysicsConfig, PhysicsWorld, Representation,
-    analytic_mass_properties, step_character,
+    analytic_mass_properties, step_character_in_water,
 };
 use spall_protocol::InputSeq;
 use spall_voxel::{Sample, Volume};
@@ -1135,8 +1135,15 @@ struct Record {
     predicted_after: CharacterState,
 }
 
+/// The water (surface and current) at a world point, if there is any.
+pub type WaterSampleFn =
+    std::sync::Arc<dyn Fn(f64, f64, f64) -> Option<spall_physics::WaterSample> + Send + Sync>;
+
 /// The local player's predicted state plus the history needed to reconcile it.
 pub struct PredictedPlayer {
+    /// Replicated water surface the character swims against; `None` before any
+    /// water has arrived. Must answer like the server's own query.
+    water_surface: Option<WaterSampleFn>,
     /// Cumulative applied correction vector for presentation only. Authority,
     /// replay, collision and raw correction telemetry remain unchanged.
     pub presentation_correction_total: [f64; 3],
@@ -1231,6 +1238,7 @@ impl PredictedPlayer {
     /// mis-selected record and the current tick).
     pub fn new(params: CharacterParams, spawn: CharacterState, spawn_tick: Tick) -> Self {
         Self {
+            water_surface: None,
             presentation_correction_total: [0.; 3],
             params,
             predicted: spawn,
@@ -1258,6 +1266,20 @@ impl PredictedPlayer {
             max_reconcile_displacement_m: 0.0,
             reconcile_displacements_over_1cm: 0,
         }
+    }
+
+    /// Gives the predictor the water surface to swim against (see
+    /// [`WaterSampleFn`]); until set, the character walks as on dry land.
+    pub fn set_water_surface(&mut self, water: Option<WaterSampleFn>) {
+        self.water_surface = water;
+    }
+
+    /// The surface the kernel sees for a character standing at `state`: the same
+    /// probe height the server uses (`SimWorld::advance_players`).
+    fn water_at(&self, state: &CharacterState) -> Option<spall_physics::WaterSample> {
+        let water = self.water_surface.as_ref()?;
+        let [x, y, z] = state.position_m;
+        water(x, y + 0.05, z)
     }
 
     pub fn predicted(&self) -> CharacterState {
@@ -1289,7 +1311,8 @@ impl PredictedPlayer {
         dt_s: f32,
     ) -> CharacterState {
         let params = self.params;
-        self.predicted = step_character(self.predicted, input, dt_s, |p, d| {
+        let surface = self.water_at(&self.predicted);
+        self.predicted = step_character_in_water(self.predicted, input, dt_s, surface, |p, d| {
             phys.sweep(volume, params, p, d, dt_s)
         });
         self.history.push_back(Record {
@@ -1471,13 +1494,18 @@ impl PredictedPlayer {
         self.next_tick = Tick(server_tick.0 + 1 + self.history.len() as u64);
 
         let params = self.params;
+        let water = self.water_surface.clone();
         let mut state = authoritative;
         for (i, rec) in self.history.iter_mut().enumerate() {
             if let Some(bodies) = bodies {
                 phys.sync_bodies_at(bodies, Some((server_tick.0 + 1 + i as u64) as f64));
             }
             let dt = rec.dt;
-            state = step_character(state, rec.input, dt, |p, d| {
+            let surface = water.as_ref().and_then(|w| {
+                let [x, y, z] = state.position_m;
+                w(x, y + 0.05, z)
+            });
+            state = step_character_in_water(state, rec.input, dt, surface, |p, d| {
                 phys.sweep(volume, params, p, d, dt)
             });
             rec.predicted_after = state;

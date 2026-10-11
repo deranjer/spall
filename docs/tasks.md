@@ -1763,3 +1763,27 @@ ENG-114 (probe storm and shaped links): idle clients and the server were burning
 feedback loop (25,000 records/s per client); fixed (one probe per 25 ms). World resets with eight
 clients: 38-62 s -> 14-16 s. The shaped-link fixtures eight-impaired and soak-light-impaired now carry a
 motion budget and pass. See reports/ENG-114-startup-streaming.md.
+
+### ENG-164..ENG-169 - Water rewrite: stacked columns with virtual pipes
+
+Decision 2026-10-10 (user): replace the `grid_mac` MAC/VOF water with a column/span
+virtual-pipe model in `spall_fluid::columns`; `grid_mac` stays live until W3 passes and is
+removed in W5. Priorities, in order: no major visible failures, simple physics that scales
+to massive worlds, acceptable performance. Design, acceptance tests and non-goals:
+`docs/water-agent-handoff.md`. Each ticket is blocked by the previous one.
+
+| Work item | Ticket | Depends on |
+|---|---|---|
+| W0 decision, docs and failing baseline fixture | ENG-164 | none |
+| W1 column solver, standalone | ENG-165 | ENG-164 |
+| W2 regions, sleep and threading | ENG-166 | ENG-165 |
+| W3 production swap | ENG-167 | ENG-166 |
+| W4 rendering | ENG-168 | ENG-167 |
+| W5 removal | ENG-169 | ENG-168 |
+
+Supersedes ENG-120, ENG-121, ENG-123, ENG-124, ENG-125 (canceled). W0 evidence:
+`docs/reports/ENG-164.md`.
+
+ENG-169 (W5, 2026-10-11): the grid water solver and its demos, probes and tests are removed; the column
+water is the only water. Wire/storage types for grid water stay (decode only); a checkpoint still holding
+grid water now fails recovery loudly. `cargo xtask check` passes. See reports/ENG-169.md.

@@ -221,6 +221,9 @@ pub struct GameRenderer {
     /// The smoothed water surface sheet, drawn alpha-blended after the opaque
     /// scene.
     water_surface: DynamicMesh,
+    /// Draw the water field as a smooth grid surface (see
+    /// [`Self::set_water_grid_surface`]).
+    water_grid: bool,
     /// Camera-local sky occupancy + visibility; `None` keeps the legacy
     /// unconditional hemispheric ambient.
     sky: Option<SkyVisibility>,
@@ -338,6 +341,7 @@ impl GameRenderer {
             vegetation: InstanceSet::new(),
             transparent: InstanceSet::new(),
             water_surface: DynamicMesh::new(device),
+            water_grid: false,
             sky: None,
             timer: timestamp_period_ns.map(|period| PassTimer::new(device, period)),
             timed_slot: None,
@@ -573,6 +577,28 @@ impl GameRenderer {
         field: Option<crate::water::WaterField>,
     ) {
         self.pipeline.set_water_field(device, queue, field);
+    }
+
+    /// Turns the smooth grid surface on or off. When on, the installed water
+    /// field is drawn as a displaced grid (nothing is uploaded per frame but
+    /// changed field rectangles), and the mesh sheet should be empty.
+    pub fn set_water_grid_surface(&mut self, on: bool) {
+        self.water_grid = on;
+    }
+
+    /// Replaces a rectangle of the installed water field; see
+    /// [`ScenePipeline::update_water_field_rect`].
+    pub fn update_water_field_rect(
+        &mut self,
+        queue: &wgpu::Queue,
+        x0: u32,
+        z0: u32,
+        w: u32,
+        h: u32,
+        texels: &[[f32; 4]],
+    ) {
+        self.pipeline
+            .update_water_field_rect(queue, x0, z0, w, h, texels);
     }
 
     /// Water animation clock in seconds (caustics).
@@ -862,7 +888,15 @@ impl GameRenderer {
                 &[&self.terrain, &self.bodies, &self.vegetation, &self.overlay],
             );
         }
-        if self.transparent.count() > 0 || self.water_surface.index_count > 0 {
+        let water_grid_cells = if self.water_grid {
+            self.pipeline.water_field_dim()
+        } else {
+            0
+        };
+        if self.transparent.count() > 0
+            || self.water_surface.index_count > 0
+            || water_grid_cells > 0
+        {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("spall-game-transparent-cube-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -907,6 +941,10 @@ impl GameRenderer {
                     wgpu::IndexFormat::Uint32,
                 );
                 pass.draw_indexed(0..self.water_surface.index_count, 0, 0..1);
+            }
+            if water_grid_cells > 0 {
+                pass.set_pipeline(self.pipeline.water_grid());
+                pass.draw(0..water_grid_cells * water_grid_cells * 6, 0..1);
             }
         }
         {

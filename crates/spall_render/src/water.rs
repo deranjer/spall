@@ -23,6 +23,14 @@ pub struct WaterField {
     pub heights: Vec<f32>,
     /// Bottom of the selected wet run, X fastest; dry cells use NO_WATER.
     pub bottoms: Vec<f32>,
+    /// Spatially smoothed surface height at each cell centre. It is also
+    /// defined for dry cells a couple of cells from water, so the grid surface
+    /// has a continuous edge to fade out on; NO_WATER further away. Only the
+    /// grid surface reads it ([`Self::texel_rect`] channel `b`).
+    pub smooth: Vec<f32>,
+    /// How disturbed the water is, 0 (still) to 1 (surging). Drives ripples
+    /// and foam; presentation only. Channel `a`.
+    pub agitation: Vec<f32>,
 }
 
 impl WaterField {
@@ -35,7 +43,28 @@ impl WaterField {
             dim,
             heights: vec![NO_WATER; dim as usize * dim as usize],
             bottoms: vec![NO_WATER; dim as usize * dim as usize],
+            smooth: vec![NO_WATER; dim as usize * dim as usize],
+            agitation: vec![0.0; dim as usize * dim as usize],
         }
+    }
+
+    /// The `(top, bottom, smooth, agitation)` texels of a rectangle of cells,
+    /// row by row, as the GPU texture stores them.
+    pub fn texel_rect(&self, x0: u32, z0: u32, w: u32, h: u32) -> Vec<[f32; 4]> {
+        let dim = self.dim as usize;
+        let mut out = Vec::with_capacity(w as usize * h as usize);
+        for z in z0 as usize..(z0 + h) as usize {
+            for x in x0 as usize..(x0 + w) as usize {
+                let i = x + dim * z;
+                out.push([
+                    self.heights[i],
+                    self.bottoms[i],
+                    self.smooth[i],
+                    self.agitation[i],
+                ]);
+            }
+        }
+        out
     }
 
     fn index(&self, ix: i64, iz: i64) -> Option<usize> {

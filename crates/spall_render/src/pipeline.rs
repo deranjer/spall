@@ -186,6 +186,7 @@ pub struct ScenePipeline {
     opaque_terrain: wgpu::RenderPipeline,
     transparent_cube: wgpu::RenderPipeline,
     water_surface: wgpu::RenderPipeline,
+    water_grid: wgpu::RenderPipeline,
     shadow_cube: wgpu::RenderPipeline,
     tone_map: wgpu::RenderPipeline,
     scene_layout: wgpu::BindGroupLayout,
@@ -286,10 +287,11 @@ impl ScenePipeline {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
-                // Water surface heights, read with `textureLoad` only.
+                // Water surface heights, read with `textureLoad` only (by the
+                // grid surface's vertex stage as well as every fragment stage).
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -373,6 +375,13 @@ impl ScenePipeline {
             sky.display_layout(),
         );
         let water_surface = create_water_surface_pipeline(
+            device,
+            &opaque_shader,
+            &scene_layout,
+            indirect.display_layout(),
+            sky.display_layout(),
+        );
+        let water_grid = create_water_grid_pipeline(
             device,
             &opaque_shader,
             &scene_layout,
@@ -485,6 +494,7 @@ impl ScenePipeline {
             opaque_terrain,
             transparent_cube,
             water_surface,
+            water_grid,
             shadow_cube,
             tone_map,
             scene_layout,
@@ -836,19 +846,14 @@ impl ScenePipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rg32Float,
+                format: wgpu::TextureFormat::Rgba32Float,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
             state.gpu = Some((texture, view));
         }
-        let bounds: Vec<[f32; 2]> = field
-            .heights
-            .iter()
-            .zip(&field.bottoms)
-            .map(|(&top, &bottom)| [top, bottom])
-            .collect();
+        let bounds = field.texel_rect(0, 0, field.dim, field.dim);
         if let Some((texture, _)) = &state.gpu {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -860,13 +865,86 @@ impl ScenePipeline {
                 bytemuck::cast_slice(&bounds),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(field.dim * 8),
+                    bytes_per_row: Some(field.dim * 16),
                     rows_per_image: Some(field.dim),
                 },
                 size,
             );
         }
         state.field = Some(field);
+    }
+
+    /// Replaces a rectangle of the water field on the GPU and in the
+    /// renderer's copy (which answers "is the camera under water"). `texels`
+    /// are `(top, bottom, smooth, agitation)` row by row, `w * h` of them. A
+    /// rectangle outside the installed field is ignored.
+    pub fn update_water_field_rect(
+        &self,
+        queue: &wgpu::Queue,
+        x0: u32,
+        z0: u32,
+        w: u32,
+        h: u32,
+        texels: &[[f32; 4]],
+    ) {
+        let mut guard = self.water.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
+        let (Some(field), Some((texture, _))) = (state.field.as_mut(), state.gpu.as_ref()) else {
+            return;
+        };
+        if w == 0
+            || h == 0
+            || texels.len() != w as usize * h as usize
+            || x0.checked_add(w).is_none_or(|e| e > field.dim)
+            || z0.checked_add(h).is_none_or(|e| e > field.dim)
+        {
+            return;
+        }
+        let dim = field.dim as usize;
+        for (row, line) in texels.chunks_exact(w as usize).enumerate() {
+            for (col, t) in line.iter().enumerate() {
+                let i = (x0 as usize + col) + dim * (z0 as usize + row);
+                field.heights[i] = t[0];
+                field.bottoms[i] = t[1];
+                field.smooth[i] = t[2];
+                field.agitation[i] = t[3];
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: x0, y: z0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 16),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Cells per side of the installed water field, 0 if none.
+    pub fn water_field_dim(&self) -> u32 {
+        self.water
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .field
+            .as_ref()
+            .map_or(0, |f| f.dim)
+    }
+
+    /// Alpha-blended water grid surface (no vertex buffers: the vertex stage
+    /// builds the grid from the water field).
+    pub fn water_grid(&self) -> &wgpu::RenderPipeline {
+        &self.water_grid
     }
 
     /// Animation clock for caustics, in seconds.
@@ -1100,6 +1178,55 @@ fn create_water_surface_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_water"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_water_grid_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    indirect_layout: &wgpu::BindGroupLayout,
+    sky_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("spall-water-grid-layout"),
+        bind_group_layouts: &[Some(layout), Some(indirect_layout), Some(sky_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("spall-water-grid-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_water"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        // Seen from above and from below (the Snell's-window ceiling).
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..opaque_primitive()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_water_grid"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: HDR_FORMAT,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),

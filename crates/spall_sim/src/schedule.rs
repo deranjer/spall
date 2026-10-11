@@ -130,11 +130,10 @@ pub struct TickReport {
     /// updated body poses. This is populated by `Simulation::tick` so server
     /// telemetry can report the physics portion without timing a replica.
     pub physics_duration: std::time::Duration,
-    /// Authoritative fluid work, when this simulation has an installed water
-    /// region. The fluid step runs after committed terrain edits and before
-    /// the Rapier step.
-    pub water: Option<crate::water::WaterTickMetrics>,
-    pub water_regions: Vec<crate::water::WaterTickMetrics>,
+    /// Stacked-column water work (ENG-167), when installed.
+    pub column_water: Option<crate::column_water::ColumnWaterTickMetrics>,
+    /// Buoyancy applied to bodies in the column water this tick.
+    pub buoyancy: Option<crate::world::BuoyancyReport>,
     /// Requests that committed this tick, with their transaction summary.
     pub committed: Vec<(RequestId, Committed)>,
     /// Requests whose commit lost a conflict and were re-queued for recompute.

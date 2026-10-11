@@ -13,41 +13,14 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
     about = "Spall sandbox render-window / replication client"
 )]
 struct Args {
-    /// Open the local ENG-122 water comparison, paused with freely displaced air.
-    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo", "ecology_demo", "ecology_capture"])]
-    phase_fluid_demo: bool,
-    /// Start the comparison with conservative momentum.
-    #[arg(long, requires = "phase_fluid_demo")]
-    phase_fluid_demo_momentum: bool,
-    /// Select the experimental incompressible-air comparison instead of water only.
-    #[arg(long, requires = "phase_fluid_demo")]
-    phase_fluid_demo_two_phase_air: bool,
-    /// Use the experimental compressible air case (may reject a step).
-    #[arg(long, requires = "phase_fluid_demo")]
-    phase_fluid_demo_compressible_air: bool,
-    #[arg(long, requires = "phase_fluid_demo")]
-    phase_fluid_demo_autoplay: bool,
-    /// Save the comparison window through the real renderer.
-    #[arg(long, requires = "phase_fluid_demo")]
-    phase_fluid_demo_capture: Option<PathBuf>,
     /// Opt into Quinn's experimental BBR congestion controller for validation.
     #[arg(long)]
     experimental_bbr: bool,
-    /// Open the canal/dam viewer with gameplay water policy and appearance.
-    /// This local simulation is separate from the authoritative game tick.
-    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive"])]
-    grid_fluid_demo: bool,
-    /// Capture the canal demo through the gameplay renderer.
-    #[arg(long, requires = "grid_fluid_demo")]
-    grid_fluid_demo_capture: Option<PathBuf>,
-    /// Start with the canal above a dry room and a visual wall cutaway.
-    #[arg(long, requires = "grid_fluid_demo")]
-    grid_fluid_demo_room: bool,
     /// Open the client-local interactive ecology growth showcase.
-    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo"])]
+    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive"])]
     ecology_demo: bool,
     /// Save a bounded sequence from the ecology showcase through the real renderer.
-    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo", "ecology_demo"])]
+    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "ecology_demo"])]
     ecology_capture: Option<PathBuf>,
     /// T00 offline render host (no transport).
     #[arg(long)]
@@ -179,6 +152,15 @@ struct Args {
     /// Load spawn-area terrain first, then stream surrounding bricks as the player moves.
     #[arg(long)]
     stream_regions: bool,
+    /// How far (metres) terrain and water are drawn around the player, 16 to
+    /// 120. With `--stream-regions` the streamed region grows to cover it, so a
+    /// longer distance also costs more join time, memory and GPU work.
+    #[arg(
+        long,
+        default_value_t = spall_client::window::DEFAULT_VIEW_DISTANCE_M,
+        value_parser = parse_view_distance
+    )]
+    view_distance: f32,
     /// With `--stream-regions`, receive the distant terrain digests after the baseline instead of
     /// inside it. The client is ready once the spawn region and bodies arrive; transactions wait
     /// for the catalogue and the world hash is not comparable until it completes.
@@ -360,47 +342,6 @@ fn parse_cut(s: &str) -> Result<Cut, String> {
 fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
-
-    if args.phase_fluid_demo {
-        return match spall_client::run_phase_fluid_demo_window(
-            spall_client::PhaseFluidDemoOptions {
-                conservative_momentum: args.phase_fluid_demo_momentum,
-                compressible_air: args.phase_fluid_demo_compressible_air,
-                two_phase_air: args.phase_fluid_demo_two_phase_air,
-                autoplay: args.phase_fluid_demo_autoplay,
-                max_frames: args.frames,
-                capture: args.phase_fluid_demo_capture,
-            },
-        ) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error @ spall_client::ClientError::Gpu(_)) => {
-                eprintln!("sandbox-client: {error}");
-                ExitCode::from(3)
-            }
-            Err(error) => {
-                eprintln!("sandbox-client: {error}");
-                ExitCode::from(1)
-            }
-        };
-    }
-
-    if args.grid_fluid_demo {
-        return match spall_client::run_grid_fluid_demo_window(
-            args.frames,
-            args.grid_fluid_demo_capture,
-            args.grid_fluid_demo_room,
-        ) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error @ spall_client::ClientError::Gpu(_)) => {
-                eprintln!("sandbox-client: {error}");
-                ExitCode::from(3)
-            }
-            Err(error) => {
-                eprintln!("sandbox-client: {error}");
-                ExitCode::from(1)
-            }
-        };
-    }
 
     if let Some(output) = &args.ecology_capture {
         return match spall_client::ecology_demo::capture_ecology_demo(
@@ -589,7 +530,11 @@ fn run_replication(args: Args) -> ExitCode {
                     args.residency_budget_bricks
                 },
                 interest_radius_bricks: if args.stream_regions {
-                    spall_protocol::segment::DEFAULT_REGION_RADIUS_BRICKS
+                    // Bricks are 8 m: stream the view plus one brick of margin.
+                    ((args.view_distance / 8.0).ceil() as i64 + 1).clamp(
+                        spall_protocol::segment::DEFAULT_REGION_RADIUS_BRICKS,
+                        spall_protocol::segment::MAX_REGION_RADIUS_BRICKS,
+                    )
                 } else {
                     args.residency_radius_bricks
                 },
@@ -828,6 +773,7 @@ fn run_interactive(args: Args) -> ExitCode {
             shots,
             shots_dir: args.shots_dir.clone(),
             day_night_cycle: Some(args.environment.is_none()),
+            view_distance_m: Some(args.view_distance),
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -891,4 +837,19 @@ fn load_asset_manifest_hash(path: Option<&std::path::Path>) -> Result<Option<[u8
         .canonical_hash()
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn parse_view_distance(value: &str) -> Result<f32, String> {
+    let metres: f32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number of metres"))?;
+    let (lo, hi) = (
+        spall_client::window::MIN_VIEW_DISTANCE_M,
+        spall_client::window::MAX_VIEW_DISTANCE_M,
+    );
+    if metres.is_finite() && (lo..=hi).contains(&metres) {
+        Ok(metres)
+    } else {
+        Err(format!("view distance must be {lo} to {hi} metres"))
+    }
 }

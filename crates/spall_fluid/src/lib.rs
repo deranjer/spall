@@ -1,19 +1,9 @@
-//! CPU fluid state and voxel-boundary snapshots for Spall.
-//!
-//! Water is stored independently from voxel materials. This crate provides
-//! bounded domain construction, strict boundary capture, water accounting,
-//! and the two-phase MAC/VOF grid solver selected by ENG-103 (`grid_mac`).
-//! Rapier coupling, persistence, and network replication are not yet
-//! integrated (ENG-105).
+//! CPU water for Spall: the stacked-column virtual-pipe solver ([`columns`])
+//! and the bounded voxel-boundary snapshots it can be built from
+//! ([`DomainSpec`], [`SolidBoundary`]). The grid MAC/VOF solver and the
+//! phase/component experiments were removed in ENG-169; git history keeps them.
 
-pub mod component_fluid;
-pub mod cut_cell;
-pub mod fixtures;
-pub mod grid_mac;
-pub mod phase_fixtures;
-pub mod phase_graph;
-pub mod phase_pressure;
-pub mod phase_water;
+pub mod columns;
 
 use spall_core::{GlobalCell, MaterialId};
 use spall_voxel::{AccessError, Residency, Sample, Volume};
@@ -124,10 +114,6 @@ pub enum DomainError {
     CellLimitExceeded { requested: usize, limit: usize },
     #[error("fluid domain coordinates overflow global cell space")]
     CoordinateOverflow,
-    #[error("water amount must be finite and within 0..=1")]
-    InvalidWaterAmount,
-    #[error("cannot add water to a solid voxel at {0:?}")]
-    WaterInSolid(GlobalCell),
     #[error("cell {0:?} is outside the fluid domain")]
     OutsideDomain(GlobalCell),
     #[error("fluid domain dimensions must be multiples of the coarsening factor {factor}")]
@@ -347,71 +333,6 @@ pub enum BoundaryError {
     },
 }
 
-/// Bounded water amounts stored separately from solid occupancy.
-///
-/// Amounts are fractions of one fluid cell's volume. Transport deliberately
-/// is not provided yet; edits to solid geometry require recapturing the
-/// boundary before later stepping can be added safely.
-#[derive(Debug, Clone)]
-pub struct WaterState {
-    boundary: SolidBoundary,
-    amounts: Vec<f64>,
-}
-
-impl WaterState {
-    pub fn new(boundary: SolidBoundary) -> Self {
-        let amounts = vec![0.0; boundary.spec.cell_count];
-        Self { boundary, amounts }
-    }
-
-    pub fn add_water(&mut self, cell: GlobalCell, amount: f64) -> Result<(), DomainError> {
-        if !amount.is_finite() || !(0.0..=1.0).contains(&amount) {
-            return Err(DomainError::InvalidWaterAmount);
-        }
-        let index = self
-            .boundary
-            .spec
-            .index_of(cell)
-            .ok_or(DomainError::OutsideDomain(cell))?;
-        if self.boundary.solid[index] && amount > 0.0 {
-            return Err(DomainError::WaterInSolid(cell));
-        }
-        let updated = self.amounts[index] + amount;
-        if updated > 1.0 {
-            return Err(DomainError::InvalidWaterAmount);
-        }
-        self.amounts[index] = updated;
-        Ok(())
-    }
-
-    pub fn amount_at(&self, cell: GlobalCell) -> Option<f64> {
-        self.boundary
-            .spec
-            .index_of(cell)
-            .map(|index| self.amounts[index])
-    }
-
-    /// Total water volume measured in fluid-cell volumes.
-    pub fn total_water(&self) -> f64 {
-        self.amounts.iter().sum()
-    }
-
-    pub fn occupied_water_cells(&self) -> usize {
-        self.amounts.iter().filter(|amount| **amount > 0.0).count()
-    }
-
-    /// Approximate retained bytes for the domain arrays, excluding allocator
-    /// metadata and the caller-owned source voxel volume.
-    pub fn allocated_bytes(&self) -> usize {
-        self.amounts.capacity() * size_of::<f64>()
-            + self.boundary.solid.capacity() * size_of::<bool>()
-    }
-
-    pub fn boundary(&self) -> &SolidBoundary {
-        &self.boundary
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,32 +454,6 @@ mod tests {
                 cell: GlobalCell::new(0, 0, 0),
                 residency: Residency::Absent,
             }
-        );
-    }
-
-    #[test]
-    fn water_accounting_is_independent_and_refuses_solids_or_overfill() {
-        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [2, 1, 1], 8).unwrap();
-        let mut volume = air_volume_for(spec);
-        set_solid(&mut volume, GlobalCell::new(1, 0, 0), MaterialId(2));
-        let boundary = SolidBoundary::capture(&volume, spec).unwrap();
-        let mut water = WaterState::new(boundary);
-        water.add_water(GlobalCell::new(0, 0, 0), 0.25).unwrap();
-        water.add_water(GlobalCell::new(0, 0, 0), 0.5).unwrap();
-
-        assert_eq!(water.total_water(), 0.75);
-        assert_eq!(water.occupied_water_cells(), 1);
-        assert_eq!(
-            water.allocated_bytes(),
-            2 * (size_of::<f64>() + size_of::<bool>())
-        );
-        assert_eq!(
-            water.add_water(GlobalCell::new(1, 0, 0), 0.1),
-            Err(DomainError::WaterInSolid(GlobalCell::new(1, 0, 0)))
-        );
-        assert_eq!(
-            water.add_water(GlobalCell::new(0, 0, 0), 0.3),
-            Err(DomainError::InvalidWaterAmount)
         );
     }
 

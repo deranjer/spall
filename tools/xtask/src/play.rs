@@ -51,6 +51,14 @@ pub struct PlayArgs {
     worldgen_size: Option<u32>,
     #[arg(long, default_value = "summer", value_parser = ["spring", "summer", "autumn", "winter"], requires = "worldgen")]
     season: String,
+    /// With `--worldgen`: spawn on solid ground beside the shore of the
+    /// deepest lake instead of at a meadow spawn.
+    #[arg(long, requires = "worldgen")]
+    spawn_at_lake: bool,
+    /// With `--worldgen`: float a raft and test objects on the deepest lake
+    /// (use with `--spawn-at-lake` to start on the shore beside them).
+    #[arg(long, requires = "worldgen")]
+    spawn_raft: bool,
     /// Lighting environment for the window: studio, daylight, overcast,
     /// sunset or night. Defaults to the environment saved in the
     /// `--editor-scene` file, else daylight.
@@ -59,6 +67,10 @@ pub struct PlayArgs {
     /// Disable display vsync for a local rendering-throughput measurement.
     #[arg(long)]
     uncapped: bool,
+    /// How far (metres) terrain and water are drawn, 16 to 120 (default 96).
+    /// Forwarded to the client, which also widens its streamed region.
+    #[arg(long)]
+    view_distance: Option<f32>,
     /// Scripted screenshot tour forwarded to the client (see
     /// `sandbox-client --shots`); the session ends after the last shot.
     #[arg(long)]
@@ -215,6 +227,12 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
                 .args(["--worldgen", preset])
                 .args(["--seed", &args.world_seed.to_string()]);
             server_cmd.args(["--season", &args.season]);
+            if args.spawn_at_lake {
+                server_cmd.arg("--spawn-at-lake");
+            }
+            if args.spawn_raft {
+                server_cmd.arg("--spawn-raft");
+            }
             if let Some(size) = args.worldgen_size {
                 server_cmd.args(["--worldgen-size", &size.to_string()]);
             }
@@ -301,6 +319,9 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     }
     if args.uncapped {
         client_cmd.arg("--uncapped");
+    }
+    if let Some(metres) = args.view_distance {
+        client_cmd.args(["--view-distance", &metres.to_string()]);
     }
     if let Some(shots) = &args.shots {
         client_cmd.args(["--shots", shots]);

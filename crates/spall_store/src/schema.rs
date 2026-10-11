@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_vegetation (
     state BLOB NOT NULL,
     crc BLOB NOT NULL
 );
-CREATE TABLE checkpoint_water (
+CREATE TABLE checkpoint_column_water (
     tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
     state BLOB NOT NULL,
     crc BLOB NOT NULL
@@ -98,16 +98,6 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
             Ok(())
         }
         v if v == STORE_SCHEMA_VERSION => {
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'checkpoint_water')",
-                [],
-                |r| r.get(0),
-            )?;
-            if !exists {
-                return Err(StoreError::Corrupt(
-                    "schema 2 is missing the water checkpoint table".into(),
-                ));
-            }
             let has_vegetation: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_vegetation')",
                 [],

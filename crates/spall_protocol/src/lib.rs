@@ -22,7 +22,8 @@
 pub mod baseline;
 pub mod canonical;
 pub mod codec;
-pub mod component_water;
+pub mod column_water;
+pub mod column_water_wire;
 pub mod handshake;
 pub mod input;
 pub mod limits;
@@ -47,6 +48,8 @@ pub use codec::{
     CodecError, decode_bulk, decode_control, decode_datagram, decode_topology, encode_bulk,
     encode_control, encode_datagram,
 };
+pub use column_water::{ColumnWaterDelta, ColumnWaterState};
+pub use column_water_wire::{ColumnWaterReplica, ColumnWaterUpdate};
 pub use handshake::{
     AlgorithmVersions, Handshake, Incompatibility, NegotiatedLimits, PROTOCOL_VERSION,
     check_compatible,
@@ -65,12 +68,7 @@ pub use session::{
     GenerationExhausted, PlayerId, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,
     StaleSession, StreamKind, StreamSeq,
 };
-pub use water::{
-    AdminCommand, AdminRequest, AdminStatus, WaterAssembler, WaterCodecError, WaterKeyframe,
-    WaterSnapshot, WaterState, encode_water_keyframe,
-};
-pub mod water_delta;
-pub use water_delta::{WaterDelta, WaterDeltaAssembler, water_deltas};
+pub use water::{AdminCommand, AdminRequest, AdminStatus, WaterCodecError};
 
 pub mod vegetation;
 

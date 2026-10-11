@@ -55,6 +55,9 @@ demo. Details and replacement criteria: `docs/reports/ENG-122.md`.
 
 ## Gameplay-water canal viewer (2026-10-05)
 
+> Removed in ENG-169 (2026-10-11) with the grid solver: `--grid-fluid-demo` and
+> its flags no longer exist. The text below is the historical record.
+
 The existing `--grid-fluid-demo` now uses the gameplay water policy: original
 velocity sampling, multigrid pressure, conservative water transport and freely
 displaced air. It draws the shared smoothed water surface and underwater look
@@ -84,6 +87,9 @@ not receive false underwater tint. This resolved fixture does not validate
 coarse large-world thin floors. Final checks/captures: reports/ENG-122.md.
 
 ## ENG-122 windowed water comparison
+
+> Removed in ENG-169 (2026-10-11): `--phase-fluid-demo` and its flags no longer
+> exist. The text below is the historical record.
 
 Run from the ENG-122 checkout:
 

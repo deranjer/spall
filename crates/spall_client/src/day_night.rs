@@ -39,6 +39,7 @@ pub fn state_at_tick(server_tick: u64) -> DayNightState {
     }
 }
 
+#[allow(clippy::field_reassign_with_default)]
 pub fn environment_at_tick(server_tick: u64) -> (Environment, DayNightState) {
     let state = state_at_tick(server_tick);
     let sun_angle = state.day_fraction * TAU;
