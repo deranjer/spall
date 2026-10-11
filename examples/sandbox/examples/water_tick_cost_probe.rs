@@ -143,7 +143,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|(n, d)| format!("{n} {:.0} ms", d.as_secs_f64() * 1e3))
                 .collect();
             println!(
-                "  slow tick {total:.1} ms [{}] (terrain refresh {:.1} ms, fluid {:.1} ms, remapped {} columns)",
+                "  slow tick at {:.1}s {total:.1} ms [{}] (terrain refresh {:.1} ms, fluid {:.1} ms, remapped {} columns)",
+                rows.len() as f64 / 60.0,
                 top.join(", "),
                 m.boundary_refresh.as_secs_f64() * 1e3,
                 m.step_duration.as_secs_f64() * 1e3,

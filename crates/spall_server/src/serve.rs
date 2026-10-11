@@ -2834,6 +2834,8 @@ async fn serve_async(
         );
         // Where the tick thread's time goes: before-tick (client input, admission), the
         // simulation tick, and after (replication, persistence, residency), summed and worst.
+        let mut last_slow_report: Option<std::time::Instant> = None;
+        let mut last_tick_spans: Vec<(&'static str, Duration)> = Vec::new();
         let mut phase_totals = [Duration::ZERO; 3];
         let mut phase_worst = [Duration::ZERO; 3];
         let mut span_totals: HashMap<&'static str, (Duration, Duration)> = HashMap::new();
@@ -3340,6 +3342,7 @@ async fn serve_async(
             // Commit and staging phases measured on this tick (they accumulate thread-locally and
             // would otherwise never be read at run time): report the slow ones.
             let spans = spall_sim::prof::drain();
+            last_tick_spans.clone_from(&spans);
             for (name, elapsed) in &spans {
                 let entry = span_totals.entry(*name).or_default();
                 entry.0 += *elapsed;
@@ -3987,6 +3990,33 @@ async fn serve_async(
             for (slot, d) in [before_tick, sim_tick, after_tick].into_iter().enumerate() {
                 phase_totals[slot] += d;
                 phase_worst[slot] = phase_worst[slot].max(d);
+            }
+            // A tick over three frames long is a visible stall for every client:
+            // say so on stderr (at most once a second) with where the time went.
+            if whole_tick >= Duration::from_millis(50)
+                && last_slow_report.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+            {
+                last_slow_report = Some(std::time::Instant::now());
+                let mut top: Vec<(&str, f64)> = last_tick_spans
+                    .iter()
+                    .map(|(name, d)| (*name, d.as_secs_f64() * 1e3))
+                    .filter(|(_, ms)| *ms >= 5.0)
+                    .collect();
+                top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let top: Vec<String> = top
+                    .iter()
+                    .take(5)
+                    .map(|(name, ms)| format!("{name} {ms:.0} ms"))
+                    .collect();
+                eprintln!(
+                    "sandbox-server: slow tick {} | {:.0} ms total = before {:.0} + sim {:.0} + after {:.0} | {}",
+                    sim.current_tick().0,
+                    whole_tick.as_secs_f64() * 1e3,
+                    before_tick.as_secs_f64() * 1e3,
+                    sim_tick.as_secs_f64() * 1e3,
+                    after_tick.as_secs_f64() * 1e3,
+                    top.join(", ")
+                );
             }
             if whole_tick >= Duration::from_millis(500) {
                 tracing::info!(
