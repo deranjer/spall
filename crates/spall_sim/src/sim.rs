@@ -24,7 +24,7 @@ use crate::contact_damage::{ContactDamagePlan, ContactDamagePolicy, ContactEvent
 use crate::dormancy::{ActiveRegion, BodyDormancyInput, DormancyPlan, DormancyPolicy};
 use crate::intent::{EditIntent, EditKind, EditTarget, IntentError};
 use crate::journal::JournalSink;
-use crate::player::{transaction_world_box, transaction_world_boxes};
+use crate::player::transaction_world_box;
 use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, TerrainColliderMode, WorldSetup};
 use spall_voxel::Sample;
@@ -66,11 +66,7 @@ pub struct SimulationConfig {
     /// Consecutive commit conflicts on one region before it is routed through
     /// the serial queue.
     pub serialize_threshold: u32,
-    /// Optional bounded, fully resident authoritative fluid region. `None`
-    /// preserves non-fluid fixtures and existing worlds.
-    pub water: Option<crate::water::WaterSetup>,
-    /// Stacked-column water (ENG-167). Independent of `water`; a world may
-    /// carry either, and the column model is the production target.
+    /// Stacked-column water (ENG-167). `None` preserves non-fluid fixtures.
     pub column_water: Option<crate::column_water::ColumnWaterSetup>,
     pub vegetation: Option<spall_ecology::living::LivingState>,
 }
@@ -87,7 +83,6 @@ impl SimulationConfig {
             terrain_collider_mode: TerrainColliderMode::PerBrick,
             max_pending_intents: Self::DEFAULT_MAX_PENDING_INTENTS,
             serialize_threshold: Self::DEFAULT_SERIALIZE_THRESHOLD,
-            water: None,
             column_water: None,
             vegetation: None,
         }
@@ -126,8 +121,6 @@ pub struct Simulation {
     pub(crate) tick: Tick,
     next_control_seq: u64,
     next_damage_seq: u64,
-    water: Option<crate::water::AuthoritativeWater>,
-    additional_water: Vec<crate::water::AuthoritativeWater>,
     column_water: Option<crate::column_water::AuthoritativeColumnWater>,
     /// Sample points of each body for buoyancy, rebuilt when a body changes.
     buoyancy_cache: crate::world::BuoyancyCache,
@@ -185,7 +178,6 @@ impl Simulation {
         config: SimulationConfig,
         physics_origin: PhysicsOrigin,
     ) -> Result<Self, crate::world::WorldError> {
-        let water_setup = config.water;
         let column_water_setup = config.column_water;
         let vegetation_setup = config.vegetation;
         let world_span = crate::prof::Span::start("startup.world_and_collision");
@@ -203,11 +195,9 @@ impl Simulation {
             tick: Tick::ZERO,
             next_control_seq: 1,
             next_damage_seq: 0,
-            water: None,
             column_water: None,
             buoyancy_cache: Default::default(),
             vegetation: None,
-            additional_water: Vec::new(),
         };
         if let Some(setup) = column_water_setup {
             let _span = crate::prof::Span::start("startup.column_water");
@@ -219,15 +209,6 @@ impl Simulation {
                 .map_err(|error| {
                     crate::world::WorldError::WaterInitialization(error.to_string())
                 })?,
-            );
-        }
-        if let Some(setup) = water_setup {
-            let _span = crate::prof::Span::start("startup.water_boundary");
-            simulation.water = Some(
-                crate::water::AuthoritativeWater::new(&simulation.world.terrain().volume, setup)
-                    .map_err(|error| {
-                        crate::world::WorldError::WaterInitialization(error.to_string())
-                    })?,
             );
         }
         simulation.pipeline.warm_labels(&simulation.world);
@@ -257,13 +238,10 @@ impl Simulation {
             tick,
             next_control_seq: 1,
             next_damage_seq: 0,
-            // Canonical fluid state is added to checkpoints in ENG-105
-            // increment 3; recovered simulations do not claim water yet.
-            water: None,
+            // Column water is installed after recovery by the caller.
             column_water: None,
             buoyancy_cache: Default::default(),
             vegetation: None,
-            additional_water: Vec::new(),
         };
         simulation.pipeline.warm_labels(&simulation.world);
         simulation
@@ -285,8 +263,6 @@ impl Simulation {
         let Simulation {
             mut world,
             pipeline,
-            water,
-            additional_water,
             column_water,
             vegetation,
             ..
@@ -304,19 +280,11 @@ impl Simulation {
         if off_thread {
             self.pipeline.enable_off_thread_staging();
         }
-        let old_water = std::mem::replace(&mut self.water, water);
-        let old_additional_water = std::mem::replace(&mut self.additional_water, additional_water);
         let old_column_water = std::mem::replace(&mut self.column_water, column_water);
         let old_vegetation = std::mem::replace(&mut self.vegetation, vegetation);
         // The replaced world goes away off the tick thread.
-        self.retiring.retire((
-            old_world,
-            old_pipeline,
-            old_water,
-            old_additional_water,
-            old_column_water,
-            old_vegetation,
-        ));
+        self.retiring
+            .retire((old_world, old_pipeline, old_column_water, old_vegetation));
         Ok(())
     }
 
@@ -342,12 +310,6 @@ impl Simulation {
     /// Whether edits are staged on a worker thread.
     pub fn stages_off_thread(&self) -> bool {
         self.pipeline.stages_off_thread()
-    }
-
-    /// Read-only authoritative fluid state, absent when this world did not
-    /// install a fluid region (or was restored before persistence support).
-    pub fn water(&self) -> Option<&crate::water::AuthoritativeWater> {
-        self.water.as_ref()
     }
 
     /// Read-only stacked-column water, when this world installed one.
@@ -377,185 +339,6 @@ impl Simulation {
         self.column_water.as_mut()?.take_journal_delta()
     }
 
-    pub fn water_regions(&self) -> impl Iterator<Item = &crate::water::AuthoritativeWater> {
-        self.water.iter().chain(self.additional_water.iter())
-    }
-
-    pub fn add_water_region(
-        &mut self,
-        setup: crate::water::WaterSetup,
-    ) -> Result<(), crate::water::WaterError> {
-        self.validate_water_region(setup.domain)?;
-        let count = setup.domain.dimensions().iter().try_fold(1usize, |n, d| {
-            n.checked_mul((*d / setup.coarsen.max(1)) as usize)
-        });
-        let existing: usize = self
-            .water_regions()
-            .map(|w| w.frame().fractions.len())
-            .sum();
-        if count.is_none_or(|n| n.saturating_add(existing) > spall_protocol::water::MAX_WATER_CELLS)
-        {
-            return Err(crate::water::WaterError::Boundary(
-                "aggregate water cell limit exceeded".into(),
-            ));
-        }
-        let water = crate::water::AuthoritativeWater::new(&self.world.terrain().volume, setup)?;
-        if self.water.is_none() {
-            self.water = Some(water);
-        } else {
-            self.additional_water.push(water);
-        }
-        Ok(())
-    }
-
-    /// ENG-120: grows each region whose [`crate::WaterGrowth`] policy asks for
-    /// it, after this tick's terrain commits and before the water step. The
-    /// replacement is built from the owner's committed state; a refusal (cap,
-    /// overlap, residency, world edge) or build failure leaves the region as it
-    /// was and is counted, never fatal to the tick.
-    fn grow_water_regions(&mut self, report: &TickReport) {
-        if self.water.is_none() && self.additional_water.is_empty() {
-            return;
-        }
-        let terrain_id = self.world.terrain_volume_id();
-        let cell_m = self.world.terrain().cell_size().metres();
-        let boxes: Vec<crate::CellBox> = report
-            .committed
-            .iter()
-            .flat_map(|(_, c)| transaction_world_boxes(&c.topology, terrain_id, cell_m))
-            .map(|(lo, hi)| {
-                (
-                    lo.map(|v| (v / cell_m).floor() as i64),
-                    hi.map(|v| (v / cell_m).ceil() as i64 - 1),
-                )
-            })
-            .collect();
-        if boxes.is_empty() {
-            return;
-        }
-        let mut domains: Vec<spall_fluid::DomainSpec> =
-            self.water_regions().map(|w| w.domain()).collect();
-        let terrain = &self.world.terrain().volume;
-        for (index, water) in self
-            .water
-            .iter_mut()
-            .chain(self.additional_water.iter_mut())
-            .enumerate()
-        {
-            let others: Vec<_> = domains
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != index)
-                .map(|(_, d)| *d)
-                .collect();
-            match water.plan_growth(terrain, &boxes, &others) {
-                crate::GrowthPlan::NotNeeded => {}
-                crate::GrowthPlan::Refused(_) => water.note_growth_refused(),
-                crate::GrowthPlan::Grow(domain) => match water.grown(terrain, domain) {
-                    Ok(grown) => {
-                        domains[index] = grown.domain();
-                        *water = grown;
-                    }
-                    Err(_) => water.note_growth_refused(),
-                },
-            }
-        }
-    }
-
-    /// Sets the growth policy of every region (see [`crate::WaterGrowth`]).
-    /// Recovery does not persist it: the owning scene reapplies it.
-    pub fn set_water_growth(&mut self, growth: Option<crate::WaterGrowth>) {
-        for water in self
-            .water
-            .iter_mut()
-            .chain(self.additional_water.iter_mut())
-        {
-            water.set_growth(growth);
-        }
-    }
-
-    fn validate_water_region(
-        &self,
-        domain: spall_fluid::DomainSpec,
-    ) -> Result<(), crate::water::WaterError> {
-        if self.water_regions().count() >= 8 {
-            return Err(crate::water::WaterError::Boundary(
-                "at most eight water regions".into(),
-            ));
-        }
-        let bounds = |d: spall_fluid::DomainSpec| {
-            let p = d.origin();
-            let size = d.dimensions();
-            (
-                [p.x, p.y, p.z],
-                [
-                    p.x + i64::from(size[0]) - 1,
-                    p.y + i64::from(size[1]) - 1,
-                    p.z + i64::from(size[2]) - 1,
-                ],
-            )
-        };
-        let (lo, hi) = bounds(domain);
-        for water in self.water_regions() {
-            let (other_lo, other_hi) = bounds(water.domain());
-            if (0..3).all(|i| lo[i] <= other_hi[i] && other_lo[i] <= hi[i]) {
-                return Err(crate::water::WaterError::Boundary(
-                    "overlapping water regions require a joint pressure domain".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn restore_water_regions(
-        &mut self,
-        states: &[spall_protocol::WaterState],
-    ) -> Result<(), crate::water::WaterError> {
-        spall_protocol::water::validate_water_states(states)
-            .map_err(|e| crate::water::WaterError::Boundary(e.to_string()))?;
-        let mut restored = Vec::new();
-        for state in states {
-            restored.push(crate::water::AuthoritativeWater::restore(
-                &self.world.terrain().volume,
-                state,
-            )?);
-        }
-        if restored.len() > 8 {
-            return Err(crate::water::WaterError::Boundary(
-                "too many saved water regions".into(),
-            ));
-        }
-        for (i, water) in restored.iter().enumerate() {
-            let p = water.domain().origin();
-            let d = water.domain().dimensions();
-            for other in &restored[..i] {
-                let q = other.domain().origin();
-                let e = other.domain().dimensions();
-                if [
-                    (p.x, q.x, d[0], e[0]),
-                    (p.y, q.y, d[1], e[1]),
-                    (p.z, q.z, d[2], e[2]),
-                ]
-                .iter()
-                .all(|(a, b, da, db)| {
-                    i128::from(*a) < i128::from(*b) + i128::from(*db)
-                        && i128::from(*b) < i128::from(*a) + i128::from(*da)
-                }) {
-                    return Err(crate::water::WaterError::Boundary(
-                        "saved water regions overlap".into(),
-                    ));
-                }
-            }
-        }
-        self.water = if restored.is_empty() {
-            None
-        } else {
-            Some(restored.remove(0))
-        };
-        self.additional_water = restored;
-        Ok(())
-    }
-
     /// Sets this world's scene-authored gated spring(s) to `rate` (an admin
     /// control, e.g. "fill the reservoir"): `0` is off, `1..=3` selects an
     /// increasingly large authored footprint, i.e. a faster fill (clamped
@@ -565,15 +348,12 @@ impl Simulation {
         if let Some(water) = &self.column_water {
             water.set_gated_sources_rate(rate);
         }
-        if let Some(water) = &self.water {
-            water.set_gated_sources_rate(rate);
-        }
     }
 
     /// The gated spring's current rate (`0` is off), `None` when this world
     /// has no water.
     pub fn water_spring_rate(&self) -> Option<u8> {
-        self.water.as_ref().map(|w| w.gated_sources_rate())
+        self.column_water.as_ref().map(|w| w.gated_sources_rate())
     }
 
     /// Opens (cuts to air) or closes (refills with `closed_material`) a
@@ -730,9 +510,6 @@ impl Simulation {
                     .map(|b| b.coord)
             })
             .collect();
-        let grow_span = crate::prof::Span::start("tick.grow_water_regions");
-        self.grow_water_regions(&report);
-        drop(grow_span);
         let water_span = crate::prof::Span::start("tick.water");
         if let Some(water) = &mut self.column_water {
             let reloaded: Vec<spall_core::BrickCoord> = report
@@ -750,26 +527,6 @@ impl Simulation {
                         f64::from(TICK_DT_S),
                     )
                     .map_err(|error| TickError::Water(error.to_string()))?,
-            );
-        }
-        if let Some(water) = &mut self.water {
-            let dirty = edited_terrain_bricks
-                .iter()
-                .any(|&b| water.boundary_touched_by(b));
-            report.water = Some(
-                water
-                    .tick(&self.world.terrain().volume, dirty, f64::from(TICK_DT_S))
-                    .map_err(|error| TickError::Water(error.to_string()))?,
-            );
-        }
-        for water in &mut self.additional_water {
-            let dirty = edited_terrain_bricks
-                .iter()
-                .any(|&b| water.boundary_touched_by(b));
-            report.water_regions.push(
-                water
-                    .tick(&self.world.terrain().volume, dirty, f64::from(TICK_DT_S))
-                    .map_err(|e| TickError::Water(e.to_string()))?,
             );
         }
         drop(water_span);

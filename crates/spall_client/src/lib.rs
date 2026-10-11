@@ -5,22 +5,18 @@ pub mod catalogue;
 pub mod column_surface;
 pub mod day_night;
 pub mod ecology_demo;
-pub mod grid_fluid_demo;
 pub mod interactive;
 pub mod net;
-pub mod phase_fluid_demo;
 pub mod predict;
 pub mod replica;
 pub mod residency;
 pub mod segmented;
 pub mod sky;
 pub mod tick_accumulator;
-pub mod water_look;
 pub mod window;
 
 pub use catalogue::CatalogueReceiver;
 pub use ecology_demo::{EcologyDemoSetup, run_ecology_demo_window};
-pub use grid_fluid_demo::run_grid_fluid_demo_window;
 pub use interactive::{InteractiveSession, InteractiveView, LiveInput};
 pub use net::{
     BaselineScene, ClientNetConfig, ClientNetError, ClientResidencyLimits, ClientSummary,
@@ -28,7 +24,6 @@ pub use net::{
     run_replication_client, run_replication_client_with_game_content,
     run_replication_client_with_manifest, run_replication_client_with_progression, tool_request,
 };
-pub use phase_fluid_demo::{PhaseFluidDemoOptions, run_phase_fluid_demo_window};
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 pub use residency::{ClientResidency, ClientResidencyPass, MAX_RELOAD_REQUESTS_PER_STEP};

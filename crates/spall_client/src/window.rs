@@ -3892,29 +3892,14 @@ fn admin_menu_view(
         (true, None) => Some("Waiting for the server...".to_owned()),
         (false, None) => None,
     };
-    let water = session
-        .water
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|frame| {
-            let cell_m = f64::from(CELL_M) * f64::from(frame.coarsen);
-            let volume: f64 = frame
-                .fractions
-                .iter()
-                .map(|f| f64::from(*f) / 255.0)
-                .sum::<f64>()
-                * cell_m.powi(3);
-            format!(
-                "Water: {:.0} m³ in a {}×{}×{} grid of {:.2} m cells, server frame {}",
-                volume,
-                frame.dimensions[0],
-                frame.dimensions[1],
-                frame.dimensions[2],
-                cell_m,
-                frame.frame_seq
-            )
-        });
+    let water = {
+        let regions = session
+            .column_surface
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .region_count();
+        (regions > 0).then(|| format!("Water: {regions} regions replicated"))
+    };
     AdminMenuView {
         flying,
         admin_status,
@@ -4733,26 +4718,6 @@ impl WorldRenderer {
         }
     }
 
-    pub(super) fn set_water_look(&mut self, look: Option<crate::water_look::WaterLook>) {
-        match look {
-            Some(look) => {
-                self.scene.set_water_surface(
-                    &self.device,
-                    &self.queue,
-                    &look.vertices,
-                    &look.indices,
-                );
-                self.scene
-                    .set_water_field(&self.device, &self.queue, Some(look.field));
-            }
-            None => {
-                self.scene
-                    .set_water_surface(&self.device, &self.queue, &[], &[]);
-                self.scene.set_water_field(&self.device, &self.queue, None);
-            }
-        }
-    }
-
     pub(super) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
         self.crosshair = view;
     }
@@ -5153,6 +5118,7 @@ impl WorldRenderer {
     /// Draws and presents an already-acquired frame. `cam` is `None` before
     /// the local player has an authoritative pose yet (still connecting), in
     /// which case this just clears the screen.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn finish_frame(
         &mut self,
         acquired: AcquiredFrame,

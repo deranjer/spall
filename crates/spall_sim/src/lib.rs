@@ -55,7 +55,6 @@ pub mod schedule;
 pub mod sim;
 pub mod stage;
 pub mod transfer;
-pub mod water;
 pub mod world;
 
 /// Re-exported so game/example code names one `RequestId` type, not a copy.
@@ -99,11 +98,6 @@ pub use sim::{
 };
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit, warm_index_reuses};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
-pub use water::{
-    AuthoritativeWater, CellBox, GrowthPlan, GrowthRefusal, MAX_GATED_SOURCE_RATE, WaterError,
-    WaterExecution, WaterFrame, WaterGrowth, WaterSeedReport, WaterSetup, WaterSkipReasons,
-    WaterTickMetrics,
-};
 pub use world::{RestoredBody, SimWorld, WorldError};
 pub use world::{
     WorldSetup, canonical_logical_volume_for, canonical_volume_for, solid_cells,

@@ -15,7 +15,9 @@ use spall_net::WireRecord;
 use spall_protocol::column_water_wire::{WINDOWS_PER_REGION, WireSpan, encode_update, window_of};
 use spall_sim::column_water::{ColumnWaterFrame, RegionFrame};
 
-use crate::water_replication::{WATER_BURST_BYTES, WATER_BYTES_PER_SECOND};
+/// Egress allowed to one session for water, and the burst it may spend at once.
+pub(crate) const WATER_BYTES_PER_SECOND: usize = 128 * 1024;
+pub(crate) const WATER_BURST_BYTES: usize = 128 * 1024;
 
 type RegionKey = (i32, i32);
 
@@ -50,7 +52,9 @@ impl WaterInterest {
     }
 
     fn distance(&self, key: RegionKey) -> i32 {
-        (key.0 - self.centre.0).abs().max((key.1 - self.centre.1).abs())
+        (key.0 - self.centre.0)
+            .abs()
+            .max((key.1 - self.centre.1).abs())
     }
 }
 
@@ -371,11 +375,11 @@ mod tests {
         let mut publisher = ColumnWaterPublisher::default();
         let mut replica = ColumnWaterReplica::default();
         let interest = |x_m: f64| Some(WaterInterest::around([x_m, 0.0, 4.0], 4));
-        let mut run = |publisher: &mut ColumnWaterPublisher,
-                       replica: &mut ColumnWaterReplica,
-                       tick: u64,
-                       f: &ColumnWaterFrame,
-                       at: Option<WaterInterest>| {
+        let run = |publisher: &mut ColumnWaterPublisher,
+                   replica: &mut ColumnWaterReplica,
+                   tick: u64,
+                   f: &ColumnWaterFrame,
+                   at: Option<WaterInterest>| {
             for record in publisher.poll(tick, Tick(tick), f, at).unwrap() {
                 let WireRecord::ColumnWaterUpdate(update) = record else {
                     panic!("water records only")
@@ -385,18 +389,36 @@ mod tests {
         };
         run(&mut publisher, &mut replica, 0, &f, interest(4.0));
         assert_eq!(replica.region_spans((0, 0)).len(), 1);
-        assert!(replica.region_spans((30, 0)).is_empty(), "far water is not sent");
+        assert!(
+            replica.region_spans((30, 0)).is_empty(),
+            "far water is not sent"
+        );
 
         // Walking over: the far region is taken up with a baseline, and the
         // region left behind is dropped once beyond the slack, not before.
         let f2 = frame(2, f.regions.values().cloned().collect());
-        run(&mut publisher, &mut replica, 4, &f2, interest(30.0 * 8.0 + 4.0));
+        run(
+            &mut publisher,
+            &mut replica,
+            4,
+            &f2,
+            interest(30.0 * 8.0 + 4.0),
+        );
         assert_eq!(replica.region_spans((30, 0)).len(), 1, "now in range");
-        assert!(replica.region_spans((0, 0)).is_empty(), "left behind, dropped");
+        assert!(
+            replica.region_spans((0, 0)).is_empty(),
+            "left behind, dropped"
+        );
 
         // Back at the edge of the old region's slack the region is not retaken
         // until it is within the radius itself.
-        run(&mut publisher, &mut replica, 8, &f2, interest(4.0 * 8.0 + 4.0 + 8.0 * 4.0));
+        run(
+            &mut publisher,
+            &mut replica,
+            8,
+            &f2,
+            interest(4.0 * 8.0 + 4.0 + 8.0 * 4.0),
+        );
         run(&mut publisher, &mut replica, 12, &f2, interest(4.0));
         assert_eq!(replica.region_spans((0, 0)).len(), 1, "back in range");
     }
@@ -412,12 +434,27 @@ mod tests {
             radius: 4,
         };
         // Region 5 is 5 away from 0: outside the radius of 4, never sent.
-        assert!(publisher.poll(0, Tick(0), &f, Some(at(0))).unwrap().is_empty());
+        assert!(
+            publisher
+                .poll(0, Tick(0), &f, Some(at(0)))
+                .unwrap()
+                .is_empty()
+        );
         // From region 1 it is 4 away: taken up.
-        assert!(!publisher.poll(4, Tick(4), &f, Some(at(1))).unwrap().is_empty());
+        assert!(
+            !publisher
+                .poll(4, Tick(4), &f, Some(at(1)))
+                .unwrap()
+                .is_empty()
+        );
         // Drifting out to 6 away, inside radius + slack: kept, nothing sent.
         let f2 = frame(2, vec![region(5, &[(3, 5, 640)])]);
-        assert!(publisher.poll(8, Tick(8), &f2, Some(at(-1))).unwrap().is_empty());
+        assert!(
+            publisher
+                .poll(8, Tick(8), &f2, Some(at(-1)))
+                .unwrap()
+                .is_empty()
+        );
         // 7 away: beyond radius + slack, dropped with an empty baseline.
         let dropped = publisher.poll(12, Tick(12), &f2, Some(at(-2))).unwrap();
         assert_eq!(dropped.len(), 1);

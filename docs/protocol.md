@@ -130,8 +130,12 @@ reject the schema-2 version instead of silently dropping water.
 ## Column water presentation and recovery (ENG-167)
 
 The stacked-column water (`docs/water-agent-handoff.md`) is the production
-model; the dense MAC `WaterState` above remains only until `grid_mac` is
-removed. It adds three contracts and no change to the save schema version.
+model. The dense MAC `WaterState` above is no longer produced: `grid_mac` was
+removed in ENG-169. Its wire and storage types (`WaterSnapshot`, `WaterDelta`,
+the checkpoint `water` field, the `WaterState` journal payload) remain defined
+so old data can be read, but the server writes none, the client ignores the
+records, and recovering a checkpoint that still holds grid water fails with an
+explicit error rather than loading a world with its water silently gone. It adds three contracts and no change to the save schema version.
 
 - **Canonical state.** `ColumnWaterState` (record schema 3) stores only wet
   spans: per region `(rx, rz)`, each span as `(column 0..1023, floor y,

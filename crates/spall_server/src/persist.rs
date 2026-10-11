@@ -230,7 +230,8 @@ pub(crate) fn capture_with_terrain_bricks(
             .transpose()
             .map_err(|_| PersistError::BadField("vegetation capture"))?
             .unwrap_or_default(),
-        water: sim.water_regions().map(|w| w.canonical_state()).collect(),
+        // Grid water is gone (ENG-169); only column water is saved.
+        water: Vec::new(),
         column_water: sim.column_water().map(|w| w.canonical_state()),
         tick: sim.current_tick().get(),
         journal_cursor,
@@ -683,8 +684,13 @@ pub fn restore_with_terrain_collider_mode(
     }
     sim.restore_vegetation(&vegetation_state)
         .map_err(|_| PersistError::BadField("vegetation recovery"))?;
-    sim.restore_water_regions(&water_state)
-        .map_err(|_| PersistError::BadField("water recovery"))?;
+    if !water_state.is_empty() {
+        // Saved by a build that still had the grid water solver. It cannot be
+        // restored; fail rather than load a world with its water silently gone.
+        return Err(PersistError::BadField(
+            "checkpoint holds legacy grid water, which is no longer supported",
+        ));
+    }
     if let Some(state) = &column_water_state {
         sim.restore_column_water(
             state,

@@ -1822,10 +1822,6 @@ async fn run_async(
         tokio::spawn(async move {
             let mut vegetation_floor = 0_u64;
             let mut vegetation = spall_protocol::vegetation::VegetationAssembler::default();
-            let mut water =
-                HashMap::<spall_core::GlobalCell, spall_protocol::WaterAssembler>::new();
-            let mut water_deltas =
-                HashMap::<spall_core::GlobalCell, spall_protocol::WaterDeltaAssembler>::new();
             let mut column_water = spall_protocol::ColumnWaterReplica::default();
             // Diagnostic: how the control reader spends its time, by record kind.
             let mut profile = ControlProfile::with_watch(control_watch);
@@ -1835,8 +1831,6 @@ async fn run_async(
 
                 profile.begin_record(match &received {
                     Ok(Some(WireRecord::VegetationSnapshot(_))) => "vegetation",
-                    Ok(Some(WireRecord::WaterSnapshot(_))) => "water-snapshot",
-                    Ok(Some(WireRecord::WaterDelta(_))) => "water-delta",
                     Ok(Some(WireRecord::ColumnWaterUpdate(_))) => "column-water",
                     Ok(Some(WireRecord::TopologyTransaction(_))) => "transaction",
                     Ok(Some(WireRecord::BaselineBegin(_))) => "baseline-begin",
@@ -1871,68 +1865,6 @@ async fn run_async(
                             Ok(None) => {}
                             Err(error) => {
                                 eprintln!("spall-client: rejected vegetation frame: {error}")
-                            }
-                        }
-                    }
-                    Ok(Some(WireRecord::WaterSnapshot(chunk))) => {
-                        match if water.len() >= 8 && !water.contains_key(&chunk.origin) {
-                            Err(spall_protocol::WaterCodecError::InvalidChunk(
-                                "water region limit".into(),
-                            ))
-                        } else {
-                            water.entry(chunk.origin).or_default().push(chunk)
-                        } {
-                            Ok(Some(frame)) => {
-                                // A region that grew may have moved its origin
-                                // (ENG-120): drop any other region this frame
-                                // overlaps, or its stale water would stay drawn.
-                                let superseded: Vec<_> = water_deltas
-                                    .iter()
-                                    .filter(|(origin, assembler)| {
-                                        **origin != frame.origin
-                                            && assembler.current().is_some_and(|old| {
-                                                frame.overlaps(old.origin, old.dimensions)
-                                            })
-                                    })
-                                    .map(|(origin, _)| *origin)
-                                    .collect();
-                                for origin in &superseded {
-                                    water_deltas.remove(origin);
-                                    water.remove(origin);
-                                }
-                                water_deltas
-                                    .entry(frame.origin)
-                                    .or_default()
-                                    .install(frame.clone());
-                                counters
-                                    .water_regions
-                                    .store(water_deltas.len() as u64, Ordering::Relaxed);
-                                counters.water_keyframes.fetch_add(1, Ordering::Relaxed);
-                                // Water frames are broadcast at a steady rate, so a
-                                // client whose interest sees few body snapshots
-                                // still learns the server tick from them.
-                                counters
-                                    .last_tick
-                                    .fetch_max(frame.server_tick.get(), Ordering::Relaxed);
-                                let retried =
-                                    observe_tick_and_retry(&replica, frame.server_tick.get());
-                                for (_, outcome) in retried {
-                                    forward_outcome(&conn, &counters, outcome).await;
-                                }
-                                counters
-                                    .water_frame_seq
-                                    .store(frame.frame_seq, Ordering::Relaxed);
-                                if let Some(session) = &interactive {
-                                    session.publish_water(frame);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                // Presentation only: the next keyframe repairs it,
-                                // but a malformed frame from our own server is a
-                                // bug, so say so.
-                                counters.water_errors.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("spall-client: dropped a water keyframe: {error}");
                             }
                         }
                     }
@@ -1983,32 +1915,6 @@ async fn run_async(
                             }
                         }
                     }
-                    Ok(Some(WireRecord::WaterDelta(delta))) => match water_deltas
-                        .get_mut(&delta.origin)
-                        .map_or(Ok(None), |a| a.push(delta))
-                    {
-                        Ok(Some(frame)) => {
-                            counters.water_delta_frames.fetch_add(1, Ordering::Relaxed);
-                            counters
-                                .last_tick
-                                .fetch_max(frame.server_tick.get(), Ordering::Relaxed);
-                            let retried = observe_tick_and_retry(&replica, frame.server_tick.get());
-                            for (_, outcome) in retried {
-                                forward_outcome(&conn, &counters, outcome).await;
-                            }
-                            counters
-                                .water_frame_seq
-                                .store(frame.frame_seq, Ordering::Relaxed);
-                            if let Some(session) = &interactive {
-                                session.publish_water(frame);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            counters.water_errors.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("spall-client: rejected water delta: {error}");
-                        }
-                    },
                     Ok(Some(WireRecord::AdminStatus(status))) => {
                         eprintln!(
                             "spall-client: admin request {} {}: {}",
@@ -2080,8 +1986,6 @@ async fn run_async(
                         };
                         match installed {
                             Ok(()) => {
-                                water.clear();
-                                water_deltas.clear();
                                 column_water.clear();
                                 counters.world_resets.fetch_add(1, Ordering::Relaxed);
                                 if let Some(session) = &interactive {

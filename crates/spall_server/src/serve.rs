@@ -303,8 +303,6 @@ pub enum Scene {
 pub struct CustomWorld {
     player_spawns: Vec<[f64; 3]>,
     build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
-    water: Option<spall_sim::WaterSetup>,
-    additional_water: Vec<spall_sim::WaterSetup>,
     column_water: Option<spall_sim::column_water::ColumnWaterSetup>,
     initial_bodies: Vec<InitialBody>,
     dam_gate: Option<DamGate>,
@@ -337,20 +335,9 @@ impl CustomWorld {
         player_spawns: Vec<[f64; 3]>,
         build: impl Fn() -> spall_sim::WorldSetup + Send + Sync + 'static,
     ) -> Self {
-        Self::new_with_water(player_spawns, None, build)
-    }
-
-    /// Creates a custom scene with an optional server-owned initial fluid state.
-    pub fn new_with_water(
-        player_spawns: Vec<[f64; 3]>,
-        water: Option<spall_sim::WaterSetup>,
-        build: impl Fn() -> spall_sim::WorldSetup + Send + Sync + 'static,
-    ) -> Self {
         Self {
             player_spawns,
             build: Arc::new(build),
-            water,
-            additional_water: Vec::new(),
             column_water: None,
             initial_bodies: Vec::new(),
             dam_gate: None,
@@ -384,11 +371,6 @@ impl CustomWorld {
         self.column_water.as_ref()
     }
 
-    pub fn with_additional_water(mut self, regions: Vec<spall_sim::WaterSetup>) -> Self {
-        self.additional_water = regions;
-        self
-    }
-
     pub fn with_vegetation(mut self, vegetation: spall_ecology::living::LivingState) -> Self {
         self.vegetation = Some(vegetation);
         self
@@ -396,10 +378,6 @@ impl CustomWorld {
 
     pub fn player_spawns(&self) -> &[[f64; 3]] {
         &self.player_spawns
-    }
-
-    pub fn water_setup(&self) -> Option<&spall_sim::WaterSetup> {
-        self.water.as_ref()
     }
 
     pub fn dam_gate(&self) -> Option<&DamGate> {
@@ -537,7 +515,6 @@ impl Scene {
         setup.physics.disable_ccd = true;
         let mut sim_config = SimulationConfig::new(setup);
         sim_config.terrain_collider_mode = mode;
-        sim_config.water = custom.and_then(CustomWorld::water_setup).cloned();
         sim_config.column_water = custom.and_then(|c| c.column_water.clone());
         sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
@@ -550,10 +527,6 @@ impl Scene {
                     body.density_kg_m3,
                     spall_sim::BodyPose::new(glam::DQuat::IDENTITY, body.position_m),
                 );
-            }
-            for setup in &custom.additional_water {
-                sim.add_water_region(setup.clone())
-                    .expect("custom water domains must be disjoint and resident");
             }
         }
         if matches!(self, Scene::G4Workload) {
@@ -2819,20 +2792,14 @@ async fn serve_async(
 
         let mut pacer = crate::pacing::TickPacer::new(tick_dt, std::time::Instant::now());
         let mut pending_player_inputs = PlayerInputSchedule::default();
-        // ENG-105: the water frame each session was last sent, so a session
-        // that becomes live later still receives the current frame.
-        let mut water_sent: HashMap<
-            u64,
-            HashMap<GlobalCell, crate::water_replication::WaterPublisher>,
-        > = HashMap::new();
+        // The water each session was last sent, so a session that becomes
+        // live later still receives the current frame.
         let mut column_water_sent: HashMap<
             u64,
             crate::column_water_replication::ColumnWaterPublisher,
         > = HashMap::new();
         let mut water_keyframes_sent = 0u64;
         let mut water_bytes_queued = 0u64;
-        let mut water_growths_seen = 0u64;
-        let mut water_growth_refused_seen = 0u64;
         let mut pending_admin: Vec<(SessionId, spall_protocol::AdminRequest)> = Vec::new();
         // A dam-gate edit only reports `Queued` immediately; its real
         // outcome (committed, or rejected — e.g. the terrain-size "giant
@@ -2865,10 +2832,6 @@ async fn serve_async(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
         );
-        let mut water_frames: HashMap<
-            spall_core::GlobalCell,
-            crate::water_replication::SharedFrame,
-        > = HashMap::new();
         // Where the tick thread's time goes: before-tick (client input, admission), the
         // simulation tick, and after (replication, persistence, residency), summed and worst.
         let mut phase_totals = [Duration::ZERO; 3];
@@ -3128,7 +3091,6 @@ async fn serve_async(
                         pending_player_inputs.remove_session(session);
                         lj.on_gone(session);
                         player_principals.remove(&session.raw());
-                        water_sent.remove(&session.raw());
                         column_water_sent.remove(&session.raw());
                     }
                 }
@@ -3236,7 +3198,6 @@ async fn serve_async(
                                 client_repl.clear();
                                 prev_body_y.clear();
                                 body_stable_ticks = 0;
-                                water_sent.clear();
                                 column_water_sent.clear();
                                 if let Some(drops) = playground_drops.as_mut() {
                                     *drops = playground_drop_schedules(&sim);
@@ -3279,10 +3240,7 @@ async fn serve_async(
                     }
                     spall_protocol::AdminCommand::SetWaterSpring { rate } => {
                         let has_gated_spring = custom_world.as_ref().is_some_and(|c| {
-                            c.water_setup().is_some_and(|w| {
-                                w.gated_sources.iter().any(|tier| !tier.is_empty())
-                            }) || c
-                                .column_water_setup()
+                            c.column_water_setup()
                                 .is_some_and(|w| w.gated_sources.iter().any(|t| !t.is_empty()))
                         });
                         if !admin_commands {
@@ -3297,13 +3255,13 @@ async fn serve_async(
                                 accepted: false,
                                 message: "this scene authored no gated water spring".into(),
                             }
-                        } else if rate > spall_sim::MAX_GATED_SOURCE_RATE {
+                        } else if rate > spall_sim::column_water::MAX_GATED_SOURCE_RATE {
                             spall_protocol::AdminStatus {
                                 request_id: req.request_id,
                                 accepted: false,
                                 message: format!(
                                     "water spring rate must be 0..={}",
-                                    spall_sim::MAX_GATED_SOURCE_RATE
+                                    spall_sim::column_water::MAX_GATED_SOURCE_RATE
                                 ),
                             }
                         } else {
@@ -3443,57 +3401,34 @@ async fn serve_async(
                     }
                 }
             }
-            // ENG-120: say when an authored fluid domain grows or growth is refused.
-            {
-                let (growths, refused) = report
-                    .water
-                    .iter()
-                    .chain(report.water_regions.iter())
-                    .fold((0u64, 0u64), |(g, r), m| {
-                        (g + m.domain_growths, r + m.growth_refused)
-                    });
-                if growths != water_growths_seen || refused != water_growth_refused_seen {
-                    let domain = sim.water().map(|w| {
-                        let d = w.domain();
-                        (d.origin(), d.dimensions())
-                    });
-                    tracing::info!(growths, refused, ?domain, "water domain growth");
-                    eprintln!(
-                        "sandbox-server: water domain growths {growths}, refused {refused}, first region {domain:?}"
-                    );
-                    water_growths_seen = growths;
-                    water_growth_refused_seen = refused;
-                }
-            }
             // ENG-105: a periodic water line, so an operator can see whether
-            // the fluid worker keeps up with real time.
+            // the fluid step keeps up with real time.
             if tick.get() % WATER_STATUS_INTERVAL_TICKS == 0
-                && let (Some(water), Some(metrics)) = (sim.water(), report.water.as_ref())
+                && let (Some(water), Some(metrics)) =
+                    (sim.column_water(), report.column_water.as_ref())
             {
                 let frame = water.frame();
                 tracing::info!(
                     frame = frame.seq,
                     fluid_time_s = frame.fluid_time_s,
-                    skipped_steps = metrics.skipped_ticks,
-                    skipped_s = metrics.skipped_duration.as_secs_f64(),
+                    skipped_s = metrics.skipped_s,
                     last_step_ms = metrics.step_duration.as_secs_f64() * 1e3,
+                    active_regions = metrics.active_regions,
                     volume_m3 = frame.volume_m3,
                     springs_m3 = frame.spring_added_m3,
                     drains_m3 = frame.drain_removed_m3,
-                    outflow_m3 = frame.open_outflow_m3,
                     "water status"
                 );
                 eprintln!(
-                    "sandbox-server: water frame {} | fluid {:.1} s | skipped {} steps ({:.1} s) | last step {:.1} ms | {:.0} m³ (+{:.0} springs, -{:.0} drains, -{:.0} spilled)",
+                    "sandbox-server: water frame {} | fluid {:.1} s | skipped {:.1} s | last step {:.1} ms | {} active regions | {:.0} m³ (+{:.0} springs, -{:.0} drains)",
                     frame.seq,
                     frame.fluid_time_s,
-                    metrics.skipped_ticks,
-                    metrics.skipped_duration.as_secs_f64(),
+                    metrics.skipped_s,
                     metrics.step_duration.as_secs_f64() * 1e3,
+                    metrics.active_regions,
                     frame.volume_m3,
                     frame.spring_added_m3,
                     frame.drain_removed_m3,
-                    frame.open_outflow_m3,
                 );
             }
 
@@ -3790,80 +3725,7 @@ async fn serve_async(
                 }
             }
             drop(span_serve_vegetation);
-            // ENG-120: a grown region may have moved its origin; forget the
-            // publisher state of origins that no longer exist.
-            let live_origins: Vec<GlobalCell> =
-                sim.water_regions().map(|w| w.domain().origin()).collect();
-            for per_session in water_sent.values_mut() {
-                per_session.retain(|origin, _| live_origins.contains(origin));
-            }
-            // Budget water independently per live session. Keyframes are
-            // periodic repair; changed bricks reference the last queued frame.
             let span_serve_water_fanout = spall_sim::prof::Span::start("serve.water_fanout");
-            for water in sim.water_regions() {
-                let frame = water.frame();
-                // One shared copy (and one full-keyframe encoding) per new frame, not one per
-                // client per tick.
-                let copy_span = spall_sim::prof::Span::start("water.frame_copy");
-                if water_frames
-                    .get(&frame.origin)
-                    .is_none_or(|shared| shared.frame().frame_seq != frame.seq)
-                {
-                    water_frames.insert(
-                        frame.origin,
-                        crate::water_replication::SharedFrame::new(Arc::new(
-                            spall_protocol::WaterKeyframe {
-                                server_tick: sim.current_tick(),
-                                frame_seq: frame.seq,
-                                origin: frame.origin,
-                                dimensions: frame.dimensions,
-                                coarsen: frame.coarsen as u8,
-                                fractions: frame.fractions.clone(),
-                            },
-                        )),
-                    );
-                }
-                drop(copy_span);
-                let current = &water_frames[&frame.origin];
-                for session in lj.live_sessions().collect::<Vec<_>>() {
-                    // A client that cannot keep up gets the newest frame later, not
-                    // every frame late; the publisher's state is untouched by a skip.
-                    if water_backlogged(&clients_for_sim, session) {
-                        continue;
-                    }
-                    match water_sent
-                        .entry(session.raw())
-                        .or_default()
-                        .entry(frame.origin)
-                        .or_default()
-                        .poll_shared(tick.get(), current)
-                    {
-                        Ok(records) if !records.is_empty() => {
-                            water_keyframes_sent += 1;
-                            water_bytes_queued += records
-                                .iter()
-                                .map(|r| {
-                                    r.encode_framed().expect("publisher validated record").len()
-                                        as u64
-                                        + 32
-                                })
-                                .sum::<u64>();
-                            send_to(
-                                &clients_for_sim,
-                                session,
-                                Outbound::Water(Arc::new(records)),
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            return SimResult::error(
-                                format!("water update encoding: {e}"),
-                                ticks_run,
-                            );
-                        }
-                    }
-                }
-            }
             if let Some(column_water) = sim.column_water() {
                 let frame = column_water.frame();
                 for session in lj.live_sessions().collect::<Vec<_>>() {
@@ -5676,11 +5538,6 @@ fn setup_persistence_with_game_content(
                 terrain_collider_mode,
             )
             .map_err(|e| e.to_string())?;
-            let mut sim = sim;
-            // Domain growth is scene configuration, not saved state.
-            if let Some(setup) = custom_world.and_then(CustomWorld::water_setup) {
-                sim.set_water_growth(setup.growth);
-            }
             (sim, seq, 0)
         }
         // A genuinely new/empty database: seed it with the built-in scene.
@@ -5756,16 +5613,6 @@ fn tick_journal_batch(
     }
     if let Some(last) = batch.last() {
         *journalled_through = last.seq;
-    }
-    if sim.water().is_some() {
-        let state = sim.water_regions().map(|w| w.canonical_state()).collect();
-        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
-        batch.push(spall_store::JournalRecord {
-            seq: seq.0,
-            tick,
-            payload: spall_store::JournalPayload::WaterState(state),
-        });
-        *journalled_through = seq.0;
     }
     if let Some(delta) = sim.take_column_water_journal() {
         let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;

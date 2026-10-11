@@ -1783,3 +1783,7 @@ to massive worlds, acceptable performance. Design, acceptance tests and non-goal
 
 Supersedes ENG-120, ENG-121, ENG-123, ENG-124, ENG-125 (canceled). W0 evidence:
 `docs/reports/ENG-164.md`.
+
+ENG-169 (W5, 2026-10-11): the grid water solver and its demos, probes and tests are removed; the column
+water is the only water. Wire/storage types for grid water stay (decode only); a checkpoint still holding
+grid water now fails recovery loudly. `cargo xtask check` passes. See reports/ENG-169.md.

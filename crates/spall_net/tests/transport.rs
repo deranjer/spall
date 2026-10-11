@@ -53,14 +53,16 @@ async fn impaired_bulk_transfer_profile() {
     };
     let identity = DevIdentity::generate().unwrap();
     let token = JoinToken::generate().unwrap();
-    let mut cfg = TransportConfig::default();
-    cfg.udp_receive_buffer_bytes = std::env::var("SPALL_TRANSFER_PROBE_RCVBUF")
-        .ok()
-        .map(|value| {
-            value
-                .parse()
-                .expect("diagnostic UDP buffer must be an integer")
-        });
+    let mut cfg = TransportConfig {
+        udp_receive_buffer_bytes: std::env::var("SPALL_TRANSFER_PROBE_RCVBUF")
+            .ok()
+            .map(|value| {
+                value
+                    .parse()
+                    .expect("diagnostic UDP buffer must be an integer")
+            }),
+        ..TransportConfig::default()
+    };
     let controller =
         std::env::var("SPALL_TRANSFER_PROBE_CONTROLLER").unwrap_or_else(|_| "cubic".into());
     if controller == "bbr" {

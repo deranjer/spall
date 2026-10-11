@@ -24,21 +24,12 @@ fn valley() -> &'static Path {
 #[test]
 fn authored_valley_water_is_server_state_not_solid_terrain() {
     let scene = editor_scene::load(valley()).expect("valley project loads");
-    let water = scene
-        .water_setup()
-        .expect("scene seeds authoritative water");
-    assert!(!water.initial_fractions.is_empty());
-    let terrain = scene.world_setup().terrain;
-    for (cell, fraction) in &water.initial_fractions {
-        assert_eq!(*fraction, 1.0);
-        assert!(matches!(terrain.sample(*cell), Ok(Sample::Empty { .. })));
-    }
     // The authored water is also the column model's seed, in open terrain.
     let column = scene
         .column_water_setup()
         .expect("scene seeds column water")
         .clone();
-    assert_eq!(column.initial_cells.len(), water.initial_fractions.len());
+    assert!(!column.initial_cells.is_empty());
     let terrain = scene.world_setup().terrain;
     for cell in &column.initial_cells {
         assert!(matches!(terrain.sample(*cell), Ok(Sample::Empty { .. })));
@@ -61,7 +52,7 @@ fn authored_valley_water_is_server_state_not_solid_terrain() {
 #[test]
 fn valley_has_a_tiered_gated_spring_and_a_closed_solid_gate() {
     let scene = editor_scene::load(valley()).expect("valley project loads");
-    let water = scene.water_setup().expect("valley has water");
+    let water = scene.column_water_setup().expect("valley has water");
     let sizes: Vec<usize> = water.gated_sources.iter().map(Vec::len).collect();
     assert!(
         sizes.iter().all(|&n| n > 0),
@@ -224,44 +215,34 @@ fn dam_gate_opens_and_closes_through_the_normal_edit_pipeline() {
 fn open_dam_gate_clears_a_passage_in_the_fluid_solvers_own_boundary() {
     let scene = editor_scene::load(valley()).expect("valley project loads");
     let gate_cells = scene.dam_gate_cells().to_vec();
-    let water = scene.water_setup().expect("valley has water").clone();
-    let domain = water.domain;
-
-    let mut sim = spall_sim::Simulation::new(spall_sim::SimulationConfig::new(scene.world_setup()))
-        .expect("the valley stands up as a server world");
+    let mut config = spall_sim::SimulationConfig::new(scene.world_setup());
+    config.column_water = scene.column_water_setup().cloned();
+    let mut sim =
+        spall_sim::Simulation::new(config).expect("the valley stands up as a server world");
     sim.set_dam_gate(&gate_cells, true, sandbox::game::materials::STONE)
         .expect("opening the gate submits cleanly");
     for _ in 0..8 {
         sim.tick().expect("tick");
     }
 
-    let fine = spall_fluid::SolidBoundary::capture(&sim.world().terrain().volume, domain)
-        .expect("every gate cell is inside the resident air envelope, well inside the domain");
-    let coarse = fine
-        .coarsened(water.coarsen)
-        .expect("the domain is a multiple of the coarsening factor");
-    let c = i64::from(water.coarsen);
-    let open_fluid_cells: std::collections::BTreeSet<(i64, i64, i64)> = gate_cells
+    let world = sim.column_water().expect("valley has column water").world();
+    let open = gate_cells
         .iter()
-        .filter_map(|cell| {
-            let fluid = GlobalCell::new(
-                domain.origin().x + (cell.x - domain.origin().x).div_euclid(c),
-                domain.origin().y + (cell.y - domain.origin().y).div_euclid(c),
-                domain.origin().z + (cell.z - domain.origin().z).div_euclid(c),
-            );
-            (coarse.is_solid(fluid) == Some(false)).then_some((fluid.x, fluid.y, fluid.z))
+        .filter(|cell| {
+            world
+                .spans_in_column(cell.x, cell.z)
+                .iter()
+                .any(|span| span.floor_y <= cell.y && cell.y < span.ceiling_y)
         })
-        .collect();
+        .count();
     eprintln!(
-        "gate voxel cells: {}, distinct open fluid cells at the gate: {}",
-        gate_cells.len(),
-        open_fluid_cells.len()
+        "gate cells: {}, open to the water: {open}",
+        gate_cells.len()
     );
     assert!(
-        open_fluid_cells.len() >= 4,
-        "the fluid solver must see a real, multi-cell-wide passage through \
-         the gate, not a sliver at its clipped edge: only {} open fluid cells",
-        open_fluid_cells.len()
+        open >= gate_cells.len() / 2,
+        "the water must see a real passage through the gate, not a sliver:          only {open} of {} gate cells are open",
+        gate_cells.len()
     );
 }
 
@@ -278,17 +259,10 @@ fn open_dam_gate_clears_a_passage_in_the_fluid_solvers_own_boundary() {
 fn water_actually_flows_through_an_open_gate_more_than_a_closed_one() {
     let scene = editor_scene::load(valley()).expect("valley project loads");
     let gate_cells = scene.dam_gate_cells().to_vec();
-    let mut water_setup = scene.water_setup().expect("valley has water").clone();
-    water_setup.execution = spall_sim::WaterExecution::Inline;
-    let domain = water_setup.domain;
-    let c = i64::from(water_setup.coarsen);
-    let to_fluid = |cell: GlobalCell| {
-        GlobalCell::new(
-            domain.origin().x + (cell.x - domain.origin().x).div_euclid(c),
-            domain.origin().y + (cell.y - domain.origin().y).div_euclid(c),
-            domain.origin().z + (cell.z - domain.origin().z).div_euclid(c),
-        )
-    };
+    let water_setup = scene
+        .column_water_setup()
+        .expect("valley has water")
+        .clone();
 
     // The gate's own bounding box, in voxels: x/y span the opening, and its
     // z-span covers the wall's thickness (plus the sphere's overshoot past
@@ -299,147 +273,79 @@ fn water_actually_flows_through_an_open_gate_more_than_a_closed_one() {
         hi = GlobalCell::new(hi.x.max(cell.x), hi.y.max(cell.y), hi.z.max(cell.z));
     }
     let north_face_z = lo.z + 4; // back off the sphere's overshoot onto the wall proper
-    let south_face_z = hi.z - 4;
 
-    // Downstream-of-gate fluid cells: just south of the wall's south face,
-    // same x/y footprint as the gate.
-    let downstream_fluid: Vec<GlobalCell> = (lo.x..=hi.x)
-        .flat_map(|x| (lo.y..=hi.y).map(move |y| (x, y)))
-        .map(|(x, y)| to_fluid(GlobalCell::new(x, y, south_face_z + 4)))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    assert!(
-        !downstream_fluid.is_empty(),
-        "gate spans the wall's z-thickness"
-    );
+    // Downstream-of-gate columns: just south of the wall's south face, same x
+    // footprint as the gate.
 
     let run = |open: bool| -> f64 {
+        // The water is seeded against the closed gate. Seeded water starts
+        // asleep, so the gate edit is what wakes it: the same tick the real
+        // pipeline would hand the water its committed bricks.
+        let closed = scene.world_setup().terrain;
+        // Seed a reservoir pocket pressed against the wall's north (upstream)
+        // face, a stand-in for "the reservoir has filled up to here" without
+        // simulating the spring for real minutes. Widened a few metres past
+        // the gate's x-span and sampled against the actual terrain.
+        let mut setup = water_setup.clone();
+        setup.sources.clear();
+        setup.gated_sources = Default::default();
+        setup.sinks.clear();
+        setup.initial_cells = (lo.x - 16..=hi.x + 16)
+            .flat_map(|x| (lo.y..=hi.y).map(move |y| (x, y)))
+            .flat_map(|(x, y)| (north_face_z - 16..north_face_z).map(move |z| (x, y, z)))
+            .filter_map(|(x, y, z)| {
+                let cell = GlobalCell::new(x, y, z);
+                matches!(closed.sample(cell), Ok(Sample::Empty { .. })).then_some(cell)
+            })
+            .collect();
+        assert!(
+            !setup.initial_cells.is_empty(),
+            "no open cell found to seed near the gate's upstream face"
+        );
+        let mut water = spall_sim::column_water::AuthoritativeColumnWater::new(&closed, setup)
+            .expect("water builds");
         let mut terrain = scene.world_setup().terrain;
         if open {
             // Cut the gate's authored cells directly (not through the edit
-            // pipeline — this test is only about the fluid solver's reaction
-            // to a cut, not about staging/committing it; that path is
-            // already covered by `dam_gate_opens_and_closes_...`).
+            // pipeline: this test is only about the water's reaction to a cut,
+            // not staging/committing it; that is covered by
+            // `dam_gate_opens_and_closes_...`).
             let mut edit = spall_voxel::EditPlan::new(terrain.id());
             for &cell in &gate_cells {
                 edit.set(cell, spall_core::MaterialId::AIR);
             }
             terrain.apply_edit(&edit).expect("open the gate directly");
         }
-        // Seed a reservoir pocket pressed right against the wall's north
-        // (upstream) face — a stand-in for "the reservoir has filled up to
-        // here", without spending real simulated minutes on the spring.
-        // Widened a few metres past the gate's own x-span and sampled
-        // against the actual terrain (not assumed open) because the lake's
-        // authored ellipse narrows sharply right at the dam and need not
-        // line up exactly with the gate's x position.
-        let in_domain = |cell: GlobalCell| {
-            let o = domain.origin();
-            let d = domain.dimensions();
-            (o.x..o.x + i64::from(d[0])).contains(&cell.x)
-                && (o.y..o.y + i64::from(d[1])).contains(&cell.y)
-                && (o.z..o.z + i64::from(d[2])).contains(&cell.z)
-        };
-        let mut setup = water_setup.clone();
-        setup.initial_fractions = (lo.x - 16..=hi.x + 16)
-            .flat_map(|x| (lo.y..=hi.y).map(move |y| (x, y)))
-            .flat_map(|(x, y)| (north_face_z - 16..north_face_z).map(move |z| (x, y, z)))
-            .filter_map(|(x, y, z)| {
-                let cell = GlobalCell::new(x, y, z);
-                (in_domain(cell) && matches!(terrain.sample(cell), Ok(Sample::Empty { .. })))
-                    .then_some((cell, 1.0))
-            })
-            .collect();
-        assert!(
-            !setup.initial_fractions.is_empty(),
-            "no open cell found to seed near the gate's upstream face"
-        );
-        let mut water = spall_sim::AuthoritativeWater::new(&terrain, setup).expect("water builds");
-        for _ in 0..150 {
-            water.tick(&terrain, false, 1.0 / 20.0).expect("tick");
-        }
-        let grid = water.grid().expect("inline execution keeps the grid");
-        downstream_fluid
+        // Both runs hand the water the gate's bricks, so both wake it; only
+        // the open one has actually changed.
+        let bricks: Vec<spall_core::BrickCoord> = gate_cells
             .iter()
-            .filter_map(|&cell| grid.fraction_at(cell))
+            .map(|cell| cell.split().0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        water
+            .tick(&terrain, &bricks, &[], 1.0 / 20.0)
+            .expect("tick");
+        for _ in 0..150 {
+            water.tick(&terrain, &[], &[], 1.0 / 20.0).expect("tick");
+        }
+        // Everything that got past the wall, anywhere downstream of it.
+        (lo.x - 16..=hi.x + 16)
+            .flat_map(|x| (hi.z + 1..hi.z + 60).map(move |z| (x, z)))
+            .map(|(x, z)| water.world().column_volume(x, z))
             .sum()
     };
 
     let closed_downstream: f64 = run(false);
     let open_downstream: f64 = run(true);
     eprintln!(
-        "downstream fraction sum: closed {closed_downstream:.3}, open {open_downstream:.3} \
-         across {} monitored cells",
-        downstream_fluid.len()
+        "water past the wall (cell volumes): closed {closed_downstream:.3}, open {open_downstream:.3}"
     );
     assert!(
         open_downstream > closed_downstream + 0.5,
         "opening the gate must measurably wet the downstream side more than \
          leaving it closed: closed {closed_downstream:.3} vs open {open_downstream:.3}"
-    );
-}
-
-/// The valley's water fits the server budget: a bounded 0.5 m domain on the
-/// water worker, with springs and a drain, spawned on dry land, and its seed
-/// water all placed (none lost to coarsening).
-#[test]
-fn valley_water_region_is_bounded_and_seeds_fully() {
-    let scene = editor_scene::load(valley()).expect("valley project loads");
-    let water = scene.water_setup().expect("valley has water").clone();
-    assert_eq!(water.coarsen, 2);
-    assert!(matches!(
-        water.execution,
-        spall_sim::WaterExecution::Worker { .. }
-    ));
-    assert!(
-        !water.sources.is_empty(),
-        "springs keep the streams running"
-    );
-    assert!(!water.sinks.is_empty(), "the outlet creek drains");
-    let fluid_cells = water.domain.cell_count() / 8;
-    eprintln!(
-        "valley: {} solid voxels, water domain {:?} at {:?} = {fluid_cells} fluid cells, {} seed voxels, spawns {:?}",
-        scene.solid_cell_count(),
-        water.domain.dimensions(),
-        water.domain.origin(),
-        water.initial_fractions.len(),
-        scene.player_spawns,
-    );
-    assert!(fluid_cells <= 60_000, "domain over budget: {fluid_cells}");
-
-    // The server builds exactly this world at startup and on every reset.
-    let started = std::time::Instant::now();
-    spall_sim::Simulation::new(spall_sim::SimulationConfig::new(scene.world_setup()))
-        .expect("the valley stands up as a server world");
-    eprintln!("valley simulation built in {:?}", started.elapsed());
-
-    let terrain = scene.world_setup().terrain;
-    for spawn in &scene.player_spawns {
-        let cell = GlobalCell::new(
-            (spawn[0] / 0.25).floor() as i64,
-            (spawn[1] / 0.25).round() as i64,
-            (spawn[2] / 0.25).floor() as i64,
-        );
-        let below = GlobalCell::new(cell.x, cell.y - 1, cell.z);
-        assert!(matches!(terrain.sample(cell), Ok(Sample::Empty { .. })));
-        assert!(matches!(terrain.sample(below), Ok(Sample::Filled(_))));
-    }
-
-    let mut inline = water.clone();
-    inline.execution = spall_sim::WaterExecution::Inline;
-    let mut region = spall_sim::AuthoritativeWater::new(&terrain, inline).unwrap();
-    let seed = region.seed_report();
-    eprintln!("seed {seed:?}");
-    assert!(seed.dropped_in_solid_m3 < 1.0e-9, "{seed:?}");
-    let started = std::time::Instant::now();
-    for _ in 0..10 {
-        region.tick(&terrain, false, 1.0 / 20.0).unwrap();
-    }
-    eprintln!(
-        "10 valley water steps at 20 Hz: {:?} each, frame {:?}",
-        started.elapsed() / 10,
-        region.frame().volume_m3
     );
 }
 
@@ -541,5 +447,4 @@ fn the_valley_ships_column_water_and_it_stands_up() {
     assert!(setup.y_lo < setup.y_hi);
     let custom = scene.into_custom_world();
     assert!(custom.column_water_setup().is_some());
-    assert!(custom.water_setup().is_none(), "production uses columns");
 }

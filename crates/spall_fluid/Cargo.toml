@@ -12,7 +12,3 @@ thiserror.workspace = true
 
 [features]
 allocation-diagnostics = []
-
-[[bin]]
-name = "grid-fluid-scenario"
-path = "src/bin/grid_fluid_scenario.rs"

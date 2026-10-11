@@ -185,7 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .iter()
                         .filter(|sp| sp.depth > 0.02)
                         .map(|sp| (sp.floor_y, sp.floor_y as f64 + sp.depth))
-                        .last();
+                        .next_back();
                     match top {
                         Some((f, t)) => line.push_str(&format!(" {f}/{t:.1}")),
                         None => line.push_str(" dry"),

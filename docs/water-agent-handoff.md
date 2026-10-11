@@ -267,6 +267,9 @@ open (`crates/spall_render/src/water.rs`, `crates/spall_client/src/water_look.rs
 
 ### W5: removal
 
+Done 2026-10-11 (ENG-169): see `docs/reports/ENG-169.md`, including what was
+deliberately left in place (protocol and store wire types).
+
 Delete `grid_mac` (and `grid_mac/`), `component_fluid`, `phase_graph`,
 `phase_pressure`, `phase_water`, `phase_fixtures`, `cut_cell`, the
 `grid_fluid_scenario` binary, the `--grid-fluid-demo` and phase-demo client
