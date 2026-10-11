@@ -13,6 +13,7 @@
 //! [`WorldgenPalette`].
 
 pub mod caves;
+pub mod climate;
 pub mod columns;
 pub mod debug;
 pub mod erosion;
@@ -29,6 +30,6 @@ pub use generate::{
     WATER_REGION_BUDGET, WaterPlan, generate, generate_with_timings,
 };
 pub use spec::{
-    BORDER_CELLS, GEN_VERSION, GenError, MAX_HEIGHT_BRICKS, Preset, SEA_LEVEL,
+    BORDER_CELLS, GEN_VERSION, GenError, MAX_HEIGHT_BRICKS, NATURAL_GEN_VERSION, Preset, SEA_LEVEL,
     SHOWCASE_HEIGHT_BRICKS, SHOWCASE_SIZE_CELLS, WorldGenSpec, WorldgenPalette,
 };

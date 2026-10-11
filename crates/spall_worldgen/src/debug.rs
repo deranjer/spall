@@ -12,6 +12,14 @@ pub fn biome_color(biome: Biome) -> [u8; 3] {
         Biome::Alpine => [140, 140, 148],
         Biome::Swamp => [84, 100, 58],
         Biome::Desert => [214, 190, 120],
+        Biome::Ocean => [30, 70, 150],
+        Biome::Beach => [226, 210, 150],
+        Biome::Riparian => [70, 150, 96],
+        Biome::TemperateForest => [52, 120, 56],
+        Biome::BorealForest => [58, 96, 78],
+        Biome::Scree => [128, 120, 112],
+        Biome::Snow => [240, 244, 250],
+        Biome::Steppe => [170, 164, 96],
     }
 }
 
@@ -24,7 +32,7 @@ pub fn top_down_rgba(columns: &ColumnMap) -> Vec<u8> {
         for x in 0..size {
             let h = columns.height(x, z);
             let rgb = if columns.is_water(x, z) {
-                let depth = f64::from(SEA_LEVEL - h).min(30.0) / 30.0;
+                let depth = f64::from(columns.water_surface(x, z) - h).min(30.0) / 30.0;
                 [
                     (60.0 - 40.0 * depth) as u8,
                     (130.0 - 60.0 * depth) as u8,
@@ -33,7 +41,7 @@ pub fn top_down_rgba(columns: &ColumnMap) -> Vec<u8> {
             } else {
                 let base = biome_color(columns.biome(x, z));
                 let shade = 0.65 + 0.5 * (f64::from(h - SEA_LEVEL) / 220.0).min(1.0);
-                let base = if h > crate::columns::SNOW_LINE {
+                let base = if !columns.is_natural() && h > crate::columns::SNOW_LINE {
                     [240, 244, 250]
                 } else {
                     base
@@ -52,8 +60,8 @@ pub fn top_down_rgba(columns: &ColumnMap) -> Vec<u8> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnStats {
-    /// Share of columns per biome, in [`Biome::ALL`] order (sums to 1).
-    pub biome_share: [f64; 4],
+    /// Share of columns per biome, indexed by stored biome number (sums to 1).
+    pub biome_share: [f64; 12],
     /// Share of columns covered by water.
     pub water_share: f64,
     pub min_height: i32,
@@ -63,7 +71,7 @@ pub struct ColumnStats {
 pub fn column_stats(columns: &ColumnMap) -> ColumnStats {
     let size = i64::from(columns.size());
     let total = (size * size) as f64;
-    let mut counts = [0u64; 4];
+    let mut counts = [0u64; 12];
     let mut water = 0u64;
     for z in 0..size {
         for x in 0..size {

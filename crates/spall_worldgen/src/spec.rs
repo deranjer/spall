@@ -3,10 +3,15 @@
 use spall_core::{MaterialId, VolumeId};
 use thiserror::Error;
 
-/// Bumped whenever the same `(spec, seed)` would produce different voxels.
-/// A saved world must never be regenerated over with a different version:
-/// modified bricks (including all-air tombstones) win over generated ones.
+/// Generation version of [`Preset::Showcase`]. Bumped whenever the same
+/// `(spec, seed)` would produce different voxels. A saved world must never be
+/// regenerated over with a different version: modified bricks (including
+/// all-air tombstones) win over generated ones. Versions are per preset
+/// ([`Preset::gen_version`]) so adding a preset never invalidates saves of
+/// another.
 pub const GEN_VERSION: u32 = 3;
+/// Generation version of [`Preset::Natural`].
+pub const NATURAL_GEN_VERSION: u32 = 4;
 
 /// Edge of a brick in cells (mirrors `spall_core::BRICK_EDGE`).
 pub const BRICK: i64 = 32;
@@ -33,12 +38,24 @@ pub enum Preset {
     /// A bounded arena with every feature (mountains, hills, swamp basin with
     /// lake and river, desert, caves) placed so each is a short walk apart.
     Showcase,
+    /// A world whose layout follows cause and effect: ranges, erosion, rivers
+    /// and lakes from hydrology, biomes from climate. 128 m tall.
+    Natural,
 }
 
 impl Preset {
     pub fn name(self) -> &'static str {
         match self {
             Preset::Showcase => "showcase",
+            Preset::Natural => "natural",
+        }
+    }
+
+    /// The generation version stamped on worlds of this preset.
+    pub fn gen_version(self) -> u32 {
+        match self {
+            Preset::Showcase => GEN_VERSION,
+            Preset::Natural => NATURAL_GEN_VERSION,
         }
     }
 
@@ -47,6 +64,7 @@ impl Preset {
     pub fn height_bricks(self) -> i64 {
         match self {
             Preset::Showcase => SHOWCASE_HEIGHT_BRICKS,
+            Preset::Natural => MAX_HEIGHT_BRICKS,
         }
     }
 

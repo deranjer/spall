@@ -3,7 +3,7 @@
 use crate::caves::{CaveField, CornerGrid, MOUTH_RADIUS};
 use crate::columns::{Biome, ColumnMap, Stack};
 use crate::noise::fbm3;
-use crate::spec::{BORDER_CELLS, BRICK, GEN_VERSION, GenError, SEA_LEVEL, WorldGenSpec};
+use crate::spec::{BORDER_CELLS, BRICK, GenError, SEA_LEVEL, WorldGenSpec};
 use spall_core::{BrickCoord, CELLS_PER_BRICK, CellSizeCode, GlobalCell, MaterialId, Revision};
 use spall_voxel::brick::Brick;
 use spall_voxel::volume::Volume;
@@ -262,11 +262,12 @@ fn water_plan(columns: &ColumnMap) -> WaterPlan {
                 continue;
             }
             let h = i64::from(columns.height(x, z));
-            for y in h + 1..=i64::from(SEA_LEVEL) {
+            let top = i64::from(columns.water_surface(x, z));
+            for y in h + 1..=top {
                 cells.push(GlobalCell::new(x, y, z));
             }
             lo = [lo[0].min(x), lo[1].min(h + 1), lo[2].min(z)];
-            hi = [hi[0].max(x), hi[1].max(i64::from(SEA_LEVEL)), hi[2].max(z)];
+            hi = [hi[0].max(x), hi[1].max(top), hi[2].max(z)];
         }
     }
     let bounds = (!cells.is_empty()).then(|| {
@@ -290,11 +291,11 @@ fn wet_extent(columns: &ColumnMap) -> (u64, u64) {
     let mut cells = 0u64;
     for z in 0..size {
         for x in 0..size {
-            let h = i64::from(columns.height(x, z));
-            if !columns.is_water(x, z) || h >= i64::from(SEA_LEVEL) {
+            if !columns.is_water(x, z) {
                 continue;
             }
-            cells += (i64::from(SEA_LEVEL) - h) as u64;
+            let h = i64::from(columns.height(x, z));
+            cells += (i64::from(columns.water_surface(x, z)) - h) as u64;
             regions.insert((
                 x.div_euclid(WATER_REGION_EDGE),
                 z.div_euclid(WATER_REGION_EDGE),
@@ -348,8 +349,10 @@ fn find_spawns(columns: &ColumnMap, caves: &CaveField) -> Vec<[f64; 3]> {
                     let h = columns.height(x, z);
                     let flat = (-2..=2).all(|oz| {
                         (-2..=2).all(|ox| {
-                            columns.biome(x + ox, z + oz) == Biome::Meadow
-                                && columns.lowland(x + ox, z + oz) == 0
+                            matches!(
+                                columns.biome(x + ox, z + oz),
+                                Biome::Meadow | Biome::TemperateForest | Biome::Steppe
+                            ) && columns.lowland(x + ox, z + oz) == 0
                                 && (columns.height(x + ox, z + oz) - h).abs() <= 1
                         })
                     });
@@ -462,7 +465,7 @@ pub fn generate_with_timings(
     let edge = i64::from(spec.size_cells);
     Ok((
         GeneratedWorld {
-            version: GEN_VERSION,
+            version: spec.preset.gen_version(),
             terrain,
             region: (
                 GlobalCell::new(0, 0, 0),
@@ -499,14 +502,25 @@ mod timing_probe {
     #[test]
     #[ignore = "manual full-world generation timing; several GiB"]
     fn full_world_generation_timings() {
-        for height in [12, 16] {
-            let spec = WorldGenSpec::new(Preset::Showcase, 1, 4096, WorldgenPalette::sequential(1))
+        for (preset, height) in [
+            (Preset::Showcase, 12),
+            (Preset::Showcase, 16),
+            (Preset::Natural, 16),
+        ] {
+            let spec = WorldGenSpec::new(preset, 1, 4096, WorldgenPalette::sequential(1))
                 .with_height_bricks(height);
+            let name = preset.name();
             let started = std::time::Instant::now();
-            let (world, t) = generate_with_timings(&spec).unwrap();
+            let (world, t) = match generate_with_timings(&spec) {
+                Ok(done) => done,
+                Err(error) => {
+                    eprintln!("gen_probe {name} height_bricks={height} FAILED: {error}");
+                    continue;
+                }
+            };
             let total = started.elapsed();
             eprintln!(
-                "gen_probe height_bricks={height} total_ms={} columns_ms={} fill_ms={} packing_ms={} insert_ms={} water_ms={}",
+                "gen_probe {name} height_bricks={height} total_ms={} columns_ms={} fill_ms={} packing_ms={} insert_ms={} water_ms={}",
                 total.as_millis(),
                 t.columns.as_millis(),
                 t.fill.as_millis(),
@@ -515,7 +529,7 @@ mod timing_probe {
                 t.water_and_spawns.as_millis()
             );
             eprintln!(
-                "gen_probe height_bricks={height} digest={} bricks={} memory={:?} wet_regions={} wet_cells={}",
+                "gen_probe {name} height_bricks={height} digest={} bricks={} memory={:?} wet_regions={} wet_cells={}",
                 spall_voxel::fixtures::digest_hex(&world.terrain),
                 world.terrain.resident_brick_count(),
                 world.terrain.memory_report(),

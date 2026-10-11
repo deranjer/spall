@@ -153,12 +153,7 @@ fn cell(p: [i64; 3]) -> GlobalCell {
     GlobalCell::new(p[0], p[1], p[2])
 }
 fn moisture(columns: &ColumnMap, x: i64, z: i64) -> u8 {
-    match columns.biome(x, z) {
-        Biome::Meadow => 120,
-        Biome::Alpine => 85,
-        Biome::Swamp => 210,
-        Biome::Desert => 25,
-    }
+    columns.moisture(x, z)
 }
 
 impl LivingState {
@@ -252,7 +247,11 @@ impl LivingState {
         let Ok(Sample::Filled(soil)) = terrain.sample(GlobalCell::new(x, y - 1, z)) else {
             return false;
         };
-        if !s.accepts(columns.biome(x, z), moisture(columns, x, z), soil.0) {
+        if !s.accepts(
+            columns.biome(x, z).vegetation_class(),
+            moisture(columns, x, z),
+            soil.0,
+        ) {
             return false;
         }
         (0..if s.tree { i64::from(s.height) + 8 } else { 4 }).all(|dy| {
@@ -453,7 +452,7 @@ impl LivingState {
                 Ok(Sample::Unknown(_)) => continue,
                 Ok(Sample::Filled(m))
                     if s.accepts(
-                        columns.biome(p.root[0], p.root[2]),
+                        columns.biome(p.root[0], p.root[2]).vegetation_class(),
                         moisture(columns, p.root[0], p.root[2]),
                         m.0,
                     ) => {}

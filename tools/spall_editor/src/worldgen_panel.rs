@@ -116,6 +116,14 @@ pub(crate) fn legend(stats: &ColumnStats) -> Vec<(&'static str, [u8; 3], f64)> {
                 Biome::Alpine => "Alpine mountains",
                 Biome::Swamp => "Swamp",
                 Biome::Desert => "Desert",
+                Biome::Ocean => "Ocean",
+                Biome::Beach => "Beach",
+                Biome::Riparian => "Riverbank",
+                Biome::TemperateForest => "Temperate forest",
+                Biome::BorealForest => "Boreal forest",
+                Biome::Scree => "Scree",
+                Biome::Snow => "Snow",
+                Biome::Steppe => "Steppe",
             };
             (name, biome_color(b), stats.biome_share[b as usize])
         })
