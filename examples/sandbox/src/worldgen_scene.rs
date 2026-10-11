@@ -21,7 +21,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum WorldgenSceneError {
-    #[error("unknown --worldgen preset `{0}` (expected: showcase)")]
+    #[error("unknown --worldgen preset `{0}` (expected: showcase, natural)")]
     UnknownPreset(String),
     #[error("world generation failed: {0}")]
     Generate(#[from] GenError),
@@ -131,9 +131,10 @@ pub fn generate_with_season(
     })
 }
 
-/// The stacked-column water for a water plan: the plan's full cells seeded at
-/// rest over the world's whole height range. There is no domain box and no
-/// coarsening, so a one-voxel wall always blocks water.
+/// The stacked-column water for a water plan: each wet column seeded at rest
+/// to its own surface, over the world's whole height range, plus the plan's
+/// springs (refilled every step) and sinks (emptied every step). There is no
+/// domain box and no coarsening, so a one-voxel wall always blocks water.
 pub fn column_water_setup(
     plan: &WaterPlan,
     region: (GlobalCell, GlobalCell),
@@ -141,11 +142,22 @@ pub fn column_water_setup(
     plan.bounds?;
     let y_lo = region.0.y.div_euclid(32) * 32;
     let y_hi = (region.1.y + 1 + 31).div_euclid(32) * 32;
-    Some(ColumnWaterSetup::new(
-        y_lo as i32,
-        y_hi as i32,
-        plan.cells.clone(),
-    ))
+    let mut setup = ColumnWaterSetup::new(y_lo as i32, y_hi as i32, Vec::new());
+    setup.initial_levels = plan
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                i64::from(c.x),
+                i64::from(c.z),
+                i64::from(c.bed),
+                i64::from(c.top),
+            )
+        })
+        .collect();
+    setup.sources = plan.springs.clone();
+    setup.sinks = plan.sinks.clone();
+    Some(setup)
 }
 
 impl GeneratedScene {
@@ -189,8 +201,8 @@ impl GeneratedScene {
         use std::collections::{HashMap, HashSet};
         let plan = &self.world.water;
         let mut depth: HashMap<(i64, i64), i64> = HashMap::new();
-        for c in &plan.cells {
-            *depth.entry((c.x, c.z)).or_default() += 1;
+        for c in &plan.columns {
+            depth.insert((i64::from(c.x), i64::from(c.z)), i64::from(c.top - c.bed));
         }
         // The deepest column (ties by position, so the result is stable).
         let deep = depth
@@ -259,8 +271,8 @@ impl GeneratedScene {
         };
         let plan = &self.world.water;
         let mut depth: HashMap<(i64, i64), i64> = HashMap::new();
-        for c in &plan.cells {
-            *depth.entry((c.x, c.z)).or_default() += 1;
+        for c in &plan.columns {
+            depth.insert((i64::from(c.x), i64::from(c.z)), i64::from(c.top - c.bed));
         }
         let surface_m = (plan.surface_y + 1) as f64 * 0.25;
         // Open water at least 1 m deep over the whole stretch the objects use

@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "y range {y_lo}..{y_hi}, water surface y={}, plan cells {}",
         plan.surface_y,
-        plan.cells.len()
+        plan.cell_count()
     );
 
     let mut world = ColumnWorld::with_terrain(
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let t = Instant::now();
-    let rejected = world.seed_cells(&plan.cells);
+    let rejected = world.seed_cells(&plan.cells().collect::<Vec<_>>());
     println!(
         "seed {:.2}s: regions {} rejected {} volume {:.1} m3",
         t.elapsed().as_secs_f64(),

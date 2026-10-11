@@ -89,7 +89,7 @@ fn generated_worlds_hold_water_only_in_air_and_keep_a_dry_spawn() {
     for seed in [1, 2, 5] {
         let w = generate(&spec(seed, SIZE)).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(w.version, 4);
-        for c in w.water.cells.iter().step_by(37) {
+        for c in w.water.cells().step_by(37) {
             assert_eq!(
                 filled(&w, c.x, c.y, c.z),
                 None,

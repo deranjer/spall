@@ -25,7 +25,7 @@ fn measure_showcase() {
     println!("{m:?} bricks {}", w.terrain.resident_brick_count());
     println!(
         "water cells {} bounds {:?} wet regions {}",
-        w.water.cells.len(),
+        w.water.cell_count(),
         w.water.bounds,
         w.water.wet_regions()
     );

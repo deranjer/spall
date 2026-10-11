@@ -30,7 +30,7 @@ const OCEAN_FLOOR: f64 = 45.0;
 const RIM_HEIGHT: f64 = 28.0;
 const RIM_WIDTH: f64 = 0.10;
 /// Normalized distance from a sea edge where the shore sits.
-const SHORE_WIDTH: f64 = 0.30;
+const SHORE_WIDTH: f64 = 0.16;
 /// Regional tilt toward the sea (or a terminal basin) across the whole map, in
 /// cells: broad bowls cannot form when everything leans downhill.
 const TILT: f64 = 60.0;

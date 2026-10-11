@@ -136,6 +136,10 @@ pub struct ColumnMap {
     /// showcase, whose water is everything below [`SEA_LEVEL`].
     water_surface: Vec<u16>,
     natural: bool,
+    /// Water exchange cells the generator places: river heads and the sinks
+    /// of landlocked maps. Empty for the showcase.
+    springs: Vec<[i64; 3]>,
+    sinks: Vec<[i64; 3]>,
 }
 
 struct Layout {
@@ -318,6 +322,8 @@ impl ColumnMap {
             river_dist: vec![255; n * n],
             water_surface: Vec::new(),
             natural: false,
+            springs: Vec::new(),
+            sinks: Vec::new(),
         })
     }
 
@@ -387,6 +393,16 @@ impl ColumnMap {
     /// Cells to the nearest river or lake, clamped to 255.
     pub fn river_dist(&self, x: i64, z: i64) -> u8 {
         self.river_dist[self.idx(x, z)]
+    }
+
+    /// River heads: cells to refill with water every step.
+    pub fn springs(&self) -> &[[i64; 3]] {
+        &self.springs
+    }
+
+    /// Where landlocked water ends: cells to empty every step.
+    pub fn sinks(&self) -> &[[i64; 3]] {
+        &self.sinks
     }
 
     /// Whether this map was made by the natural pipeline.

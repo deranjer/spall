@@ -17,6 +17,7 @@ const S_DITHER_M: u64 = 0x6e03;
 const S_PATCH: u64 = 0x6e04;
 
 const CELLS: f64 = SAMPLE_CELLS as f64;
+const CELL_STEP: i64 = SAMPLE_CELLS;
 
 /// Chamfer (3-4) distance in samples from every `true` sample.
 fn distance_samples(mask: &[bool], n: usize) -> Vec<f64> {
@@ -313,6 +314,8 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
         river_dist,
         water_surface,
         natural: true,
+        springs: Vec::new(),
+        sinks: Vec::new(),
     };
 
     // Biomes need neighbouring heights, so they come second.
@@ -357,6 +360,41 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
     });
     map.biomes = biomes;
     map.lowland = lowland;
+
+    // Exchange cells: a spring refills the water cell at a river head; a
+    // terminal basin drains at the surface of its lake.
+    let cell_above_water = |map: &ColumnMap, x: i64, z: i64| -> Option<[i64; 3]> {
+        if map.in_border(x, z) {
+            return None;
+        }
+        let ground = i64::from(map.height(x, z));
+        let top = i64::from(map.water_surface(x, z));
+        Some([x, top.max(ground + 1), z])
+    };
+    let hydro = &scape.hydrology;
+    let center = |i: usize| {
+        (
+            (i % hydro.n) as i64 * CELL_STEP + 2,
+            (i / hydro.n) as i64 * CELL_STEP + 2,
+        )
+    };
+    map.springs = hydro
+        .springs
+        .iter()
+        .filter_map(|&i| {
+            let (x, z) = center(i as usize);
+            cell_above_water(&map, x, z)
+        })
+        .collect();
+    map.sinks = scape
+        .landform
+        .basins
+        .iter()
+        .filter_map(|b| {
+            let (x, z) = center(b.x + hydro.n * b.z);
+            cell_above_water(&map, x, z)
+        })
+        .collect();
     Ok(map)
 }
 

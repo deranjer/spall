@@ -57,6 +57,9 @@ pub struct ColumnWaterSetup {
     pub config: ColumnConfig,
     /// Full water cells seeded at rest (e.g. a worldgen water plan).
     pub initial_cells: Vec<GlobalCell>,
+    /// Water seeded at rest per column as `(x, z, bed, top)`: the span above
+    /// terrain surface `bed` fills to cell `top`. Compact for big lakes and seas.
+    pub initial_levels: Vec<(i64, i64, i64, i64)>,
     /// Springs: cells refilled to full after every fluid step.
     pub sources: Vec<GlobalCell>,
     /// Gated springs by rate (index 0 is rate 1); only the current rate's
@@ -73,6 +76,7 @@ impl ColumnWaterSetup {
             y_hi,
             config: ColumnConfig::default(),
             initial_cells,
+            initial_levels: Vec::new(),
             sources: Vec::new(),
             gated_sources: [Vec::new(), Vec::new(), Vec::new()],
             sinks: Vec::new(),
@@ -535,6 +539,7 @@ impl AuthoritativeColumnWater {
         let mut world =
             ColumnWorld::with_terrain(terrain_source(terrain, &setup), sliced(setup.config));
         let rejected = world.seed_cells(&setup.initial_cells);
+        let rejected_levels = world.seed_levels(&setup.initial_levels);
         // Springs and drains need their regions allocated even in a dry world.
         let exchange_keys: BTreeSet<RegionKey> = setup
             .sources
@@ -545,8 +550,8 @@ impl AuthoritativeColumnWater {
             .collect();
         world.allocate_regions(&exchange_keys.into_iter().collect::<Vec<_>>());
         let seed = ColumnSeedReport {
-            seeded_m3: (setup.initial_cells.len() - rejected.len()) as f64 * CELL_SIZE_M.powi(3),
-            rejected_cells: rejected.len(),
+            seeded_m3: world.total_volume_m3(),
+            rejected_cells: rejected.len() + rejected_levels.len(),
         };
         let mut water = Self::assemble(setup, world, seed);
         water.publish_all();

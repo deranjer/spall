@@ -39,8 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut sim = Simulation::new(config)?;
     let plan = &scene.world().water;
-    let wet: std::collections::HashSet<(i64, i64)> =
-        plan.cells.iter().map(|c| (c.x, c.z)).collect();
+    let wet: std::collections::HashSet<(i64, i64)> = plan.cells().map(|c| (c.x, c.z)).collect();
     let shore = wet
         .iter()
         .copied()

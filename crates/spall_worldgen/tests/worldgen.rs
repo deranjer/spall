@@ -279,20 +279,19 @@ fn water_is_one_bounded_basin_that_fits_the_fluid_budget() {
 fn water_fills_basins_to_the_sea_level_and_never_enters_rock() {
     let w = small();
     assert!(
-        !w.water.cells.is_empty(),
+        w.water.cell_count() > 0,
         "showcase has water at {SMALL} cells"
     );
     assert_eq!(w.water.surface_y, i64::from(SEA_LEVEL));
     let (lo, hi) = w.water.bounds.expect("bounds");
-    for c in &w.water.cells {
+    for c in w.water.cells() {
         assert_eq!(filled(at(w, c.x, c.y, c.z)), None, "water in rock at {c:?}");
         assert!(c.y <= i64::from(SEA_LEVEL));
         assert!((lo.x..=hi.x).contains(&c.x) && (lo.y..=hi.y).contains(&c.y));
         assert!((lo.z..=hi.z).contains(&c.z));
     }
     // Each wet column is a solid bed, then water all the way to the surface.
-    let wet: std::collections::BTreeSet<_> =
-        w.water.cells.iter().map(|c| (c.x, c.y, c.z)).collect();
+    let wet: std::collections::BTreeSet<_> = w.water.cells().map(|c| (c.x, c.y, c.z)).collect();
     let sea = i64::from(SEA_LEVEL);
     for z in 0..i64::from(SMALL) {
         for x in 0..i64::from(SMALL) {
@@ -305,7 +304,6 @@ fn water_fills_basins_to_the_sea_level_and_never_enters_rock() {
         }
     }
     assert!(w.water.wet_regions() <= WATER_REGION_BUDGET);
-    assert!(w.water.cells.len() as u64 <= WATER_CELL_BUDGET);
 }
 
 #[test]

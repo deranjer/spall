@@ -71,6 +71,7 @@ impl Preset {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "showcase" => Some(Preset::Showcase),
+            "natural" => Some(Preset::Natural),
             _ => None,
         }
     }

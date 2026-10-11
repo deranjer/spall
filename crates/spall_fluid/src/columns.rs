@@ -1473,6 +1473,38 @@ impl ColumnWorld {
         rejected
     }
 
+    /// Seeds water at rest from per-column levels, `(x, z, bed, top)`: the span
+    /// that starts just above the terrain surface `bed` fills up to and
+    /// including cell `top`. Spans below it (caves under a lake) stay dry.
+    /// Allocates the regions and leaves every region asleep. Columns with no
+    /// open span above their bed are returned, not dropped silently.
+    pub fn seed_levels(&mut self, columns: &[(i64, i64, i64, i64)]) -> Vec<(i64, i64, i64, i64)> {
+        let keys: BTreeSet<RegionKey> = columns.iter().map(|c| region_of(c.0, c.1)).collect();
+        let keys: Vec<_> = keys.into_iter().collect();
+        self.allocate(&keys, &BTreeSet::new());
+        let mut rejected = Vec::new();
+        for &(x, z, bed, top) in columns {
+            match self.span_at(GlobalCell::new(x, bed + 1, z)) {
+                Some(i) => {
+                    let s = self.spans[i];
+                    self.volume[i] =
+                        (((top + 1) as f64) - f64::from(s.y0)).clamp(0.0, s.capacity());
+                }
+                None => rejected.push((x, z, bed, top)),
+            }
+        }
+        for r in &mut self.regions {
+            r.active = false;
+            r.quiet_steps = r.quiet_steps.max(self.config.sleep_steps);
+        }
+        self.ensure_rings();
+        for r in &mut self.regions {
+            r.active = false;
+        }
+        self.lists_dirty = true;
+        rejected
+    }
+
     /// Allocates the neighbours of every region that holds water, so water can
     /// always flow into an allocated region.
     fn ensure_rings(&mut self) {
