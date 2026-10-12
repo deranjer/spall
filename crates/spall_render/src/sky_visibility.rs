@@ -885,8 +885,13 @@ impl SkyVisibility {
             return;
         }
         state.bounce_environment = Some(*environment);
+        // Sliced like an occupancy change, not done in one frame: the sun moves
+        // past the 2 degree threshold every few seconds, and relighting the
+        // whole volume at once cost 20-40 ms of GPU time in a single frame (a
+        // visible hitch on a mid-range card). Spread over the sweep's frames
+        // the same work is a few milliseconds each, and a sun that has moved
+        // two degrees is not a change the eye can catch mid-sweep.
         state.pending.bounce_only = true;
-        state.pending.full = true;
         state.note_change();
     }
 

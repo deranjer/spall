@@ -1918,6 +1918,7 @@ impl ApplicationHandler for InteractiveApp {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
+                let handler_started = now;
                 self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);
 
@@ -2306,6 +2307,19 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 };
                 self.hud.record_frame(&timing);
+                if frame_trace() {
+                    let total = handler_started.elapsed().as_secs_f32() * 1000.0;
+                    if total > 20.0 {
+                        eprintln!(
+                            "spall-frame-trace: handler {total:.1} ms = render {:.1} (acquire {:.1}, submit {:.1}, present {:.1}) + other {:.1}",
+                            timing.total_ms,
+                            timing.acquire_ms,
+                            timing.submit_ms,
+                            timing.present_ms,
+                            total - timing.total_ms
+                        );
+                    }
+                }
                 if menu_actions.toggle_flight {
                     self.toggle_flight();
                 }
@@ -4474,6 +4488,18 @@ fn cover_surface(
 
 /// What a cover rebuild depends on; while it is unchanged the last result
 /// stands, so the once-a-second vegetation frame does not redo the carpet.
+/// Set `SPALL_FRAME_TRACE=1` to log frames whose handler took over 20 ms and where.
+fn frame_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPALL_FRAME_TRACE").is_some())
+}
+
+/// Set `SPALL_VEGETATION_TRACE=1` to log each foliage rebuild and upload.
+fn vegetation_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPALL_VEGETATION_TRACE").is_some())
+}
+
 type CoverKey = (i64, i64, u8, u64, usize, u64, usize, u64);
 
 /// How long the client holds back cover in a column whose surface changed
@@ -4524,6 +4550,7 @@ impl VegetationWorker {
                     None;
                 let mut seen: SeenSurfaces = SeenSurfaces::new();
                 for (id, frame, eye, ready, terrain) in requests {
+                    let job_started = Instant::now();
                     // Leaves draw as far as the terrain and trunks do, so a tree
                     // never stands bare at a distance and then sprouts as you near.
                     let foliage_radius_m = view_radius_m();
@@ -4535,7 +4562,9 @@ impl VegetationWorker {
                     // The ground cover: its own budget, thinning with distance,
                     // computed from the climate raster and the terrain here.
                     let mut cover_parts = Vec::new();
-                    if let Some(volume) = terrain.as_ref().filter(|_| !frame.cover.is_empty()) {
+                    if let Some(volume) = terrain.as_ref().filter(|_| {
+                        !frame.cover.is_empty() && std::env::var_os("SPALL_NO_COVER").is_none()
+                    }) {
                         if grid.as_ref().map(|(f, _)| f) != Some(&frame.field) {
                             grid = frame.field.expand().ok().map(|g| (frame.field.clone(), g));
                         }
@@ -4635,6 +4664,13 @@ impl VegetationWorker {
                         })
                         .collect();
                     let compact = spall_render::compact_vegetation_instances(instances);
+                    if vegetation_trace() {
+                        eprintln!(
+                            "spall-vegetation-trace: job {id} built {} instances in {:.1} ms",
+                            compact.len(),
+                            job_started.elapsed().as_secs_f32() * 1000.0
+                        );
+                    }
                     if results.send((id, compact)).is_err() {
                         return;
                     }
@@ -5362,8 +5398,16 @@ impl WorldRenderer {
         while let Ok((id, instances)) = self.vegetation_worker.rx.try_recv() {
             if self.vegetation_job == Some(id) {
                 self.vegetation_job = None;
+                let upload_started = Instant::now();
                 self.scene
                     .set_vegetation(&self.device, &self.queue, &instances);
+                if vegetation_trace() {
+                    eprintln!(
+                        "spall-vegetation-trace: upload of {} instances took {:.2} ms",
+                        instances.len(),
+                        upload_started.elapsed().as_secs_f32() * 1000.0
+                    );
+                }
             }
         }
         if let Some((eye, _)) = cam {
@@ -5374,7 +5418,10 @@ impl WorldRenderer {
                     (eye.z / 4.).floor() as i64,
                     self.scene.terrain_geometry_generation(),
                 );
-                if self.vegetation_job.is_none() && self.vegetation_key != Some(key) {
+                if self.vegetation_job.is_none()
+                    && self.vegetation_key != Some(key)
+                    && std::env::var_os("SPALL_NO_FOLIAGE").is_none()
+                {
                     self.vegetation_seq = self.vegetation_seq.wrapping_add(1);
                     let id = self.vegetation_seq;
                     if self
