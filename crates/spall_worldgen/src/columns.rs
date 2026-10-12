@@ -5,7 +5,10 @@
 //! are cells; `u = x / size`, `v = z / size` are the preset's normalized
 //! layout coordinates, so one layout scales to any arena size.
 
+mod gallery;
 mod natural;
+
+pub use gallery::{GalleryPatch, patches as gallery_patches};
 
 use crate::noise::{fbm2, ridged2, smoothstep};
 use crate::spec::{BORDER_CELLS, GenError, Preset, SEA_LEVEL, WorldGenSpec, WorldgenPalette};
@@ -143,6 +146,8 @@ pub struct ColumnMap {
     /// Biomes (bit `1 << biome`) that the climate did not produce in enough
     /// quantity and the generator painted in. Natural worlds only.
     repaired: u16,
+    /// The gallery preset: one pad per biome (see [`gallery_patches`]).
+    gallery: bool,
 }
 
 struct Layout {
@@ -256,6 +261,7 @@ impl ColumnMap {
         match spec.preset {
             Preset::Showcase => Self::compute_showcase(spec),
             Preset::Natural => natural::compute(spec),
+            Preset::Gallery => gallery::compute(spec),
         }
     }
 
@@ -328,6 +334,7 @@ impl ColumnMap {
             springs: Vec::new(),
             sinks: Vec::new(),
             repaired: 0,
+            gallery: false,
         })
     }
 
@@ -397,6 +404,11 @@ impl ColumnMap {
     /// Ground temperature in degrees Celsius.
     pub fn temperature_c(&self, x: i64, z: i64) -> f64 {
         f64::from(self.temperature[self.idx(x, z)]) / 3.1875 - 30.0
+    }
+
+    /// Whether this is the gallery preset's map.
+    pub fn is_gallery(&self) -> bool {
+        self.gallery
     }
 
     /// The biomes the generator had to paint in because the climate left them

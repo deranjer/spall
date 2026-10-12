@@ -205,10 +205,10 @@ pub fn ground_cover(
     }
     let s = &set[fits[(key >> 8) as usize % n]];
     // Wetter ground carries more cover and taller cover: a species' density
-    // is for average wetness, dry ground gets under half of it and the wettest
-    // gets more. (Wetter ground also admits more species: see their ranges.)
+    // is for the wettest ground; average ground gets under half of it and
+    // desert about a fifth. (Wetter ground also admits more species: see their ranges.)
     let wet = f32::from(moisture) / 255.0;
-    let gate = (f32::from(s.density) * (0.35 + 1.0 * wet)).min(255.0);
+    let gate = (f32::from(s.density) * (0.12 + 0.55 * wet + 0.25 * wet * wet)).min(255.0);
     if ((key >> 24) & 255) as f32 >= gate {
         return None;
     }
@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(first, again);
         // Roughly the species' density, and not a constant pattern.
         let tufts = first.iter().flatten().count();
-        assert!((60..140).contains(&tufts), "{tufts} tufts of 200 cells");
+        assert!((25..80).contains(&tufts), "{tufts} tufts of 200 cells");
         let other_seed = (0..200)
             .map(|i| {
                 ground_cover(
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(all(1, 120, 15, Biome::Ocean), 0, "no cover at sea");
         assert_eq!(all(1, 120, 15, Biome::Snow), 0, "no cover on snow");
         // The desert bunchgrass takes the desert class on sand and nothing else.
-        assert!(all(3, 30, 25, Biome::Desert) > 150);
+        assert!(all(3, 30, 25, Biome::Desert) > 40);
     }
 
     #[test]

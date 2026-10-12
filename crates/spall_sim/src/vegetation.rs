@@ -58,10 +58,10 @@ impl Simulation {
         state.validate()?;
         // The columns the world was generated from: its own preset, not
         // always the showcase (a natural world's climate differs).
-        let preset = if state.preset == 1 {
-            Preset::Natural
-        } else {
-            Preset::Showcase
+        let preset = match state.preset {
+            1 => Preset::Natural,
+            2 => Preset::Gallery,
+            _ => Preset::Showcase,
         };
         let spec = WorldGenSpec::new(
             preset,

@@ -322,9 +322,17 @@ impl LivingState {
             cover: Vec::new(),
             field: CoverField::default(),
             cleared: Vec::new(),
-            preset: u8::from(columns.is_natural()),
+            preset: if columns.is_gallery() {
+                2
+            } else {
+                u8::from(columns.is_natural())
+            },
         };
         state.validate()?;
+        if columns.is_gallery() {
+            state.place_gallery(columns, terrain)?;
+            return Ok(state);
+        }
         let stride = (i64::from(state.size) / 128).max(4);
         let mut candidates = Vec::new();
         for z in (33..i64::from(state.size) - 33).step_by(stride as usize) {
@@ -373,6 +381,82 @@ impl LivingState {
         terrain.apply_edit(&plan).map_err(|e| e.to_string())?;
         Ok(state)
     }
+    /// The gallery: every species that grows in a biome, placed on that
+    /// biome's pad: two of each tree (fully grown) and four of each other
+    /// plant, each kind in its own slot of the pad, found by searching out from
+    /// the slot's middle for ground that suits it.
+    fn place_gallery(&mut self, columns: &ColumnMap, terrain: &mut Volume) -> Result<(), String> {
+        let mut plan = EditPlan::new(terrain.id());
+        for patch in spall_worldgen::gallery_patches(columns.size()) {
+            let bit = 1u16 << patch.biome as u16;
+            let kinds: Vec<(u16, bool, i64)> = self
+                .species
+                .iter()
+                .filter(|s| s.biomes & bit != 0)
+                .map(|s| (s.id, s.tree, i64::from(s.spacing)))
+                .collect();
+            if kinds.is_empty() {
+                continue;
+            }
+            let across = (kinds.len() as f64).sqrt().ceil() as i64;
+            let down = (kinds.len() as i64 + across - 1) / across;
+            let (w, h) = (patch.x1 - patch.x0, patch.z1 - patch.z0);
+            let (sw, sh) = (w / across, h / down);
+            for (i, &(sid, tree, spacing)) in kinds.iter().enumerate() {
+                let (col, row) = (i as i64 % across, i as i64 / across);
+                let (cx, cz) = (patch.x0 + col * sw + sw / 2, patch.z0 + row * sh + sh / 2);
+                let copies: i64 = if tree { 2 } else { 4 };
+                for copy in 0..copies {
+                    let start = [
+                        cx + (copy - copies / 2) * (spacing + 3).min(sw / copies),
+                        cz,
+                    ];
+                    // First the slot, then anywhere on the pad.
+                    let reaches = [sw.max(sh) / 2, w.max(h)];
+                    let placed = reaches.iter().find_map(|&reach| {
+                        let mut r = 0;
+                        while r <= reach {
+                            let mut ring = Vec::new();
+                            if r == 0 {
+                                ring.push((0, 0));
+                            } else {
+                                let mut t = -r;
+                                while t <= r {
+                                    ring.extend([(t, -r), (t, r), (-r, t), (r, t)]);
+                                    t += 2;
+                                }
+                            }
+                            for (dx, dz) in ring {
+                                let (x, z) = (start[0] + dx, start[1] + dz);
+                                if x < patch.x0 || x >= patch.x1 || z < patch.z0 || z >= patch.z1 {
+                                    continue;
+                                }
+                                let root = [x, i64::from(columns.height(x, z)) + 1, z];
+                                if let Some(index) =
+                                    self.establish_spaced(columns, terrain, sid, root, 8)
+                                {
+                                    return Some(index);
+                                }
+                            }
+                            r += 2;
+                        }
+                        None
+                    });
+                    if let (Some(index), true) = (placed, tree) {
+                        let wood = self.species.iter().find(|s| s.id == sid).map(|s| s.wood);
+                        let p = &mut self.organisms[index];
+                        p.committed = p.wood.len() as u16;
+                        p.age_ms = 600_000;
+                        for &at in &p.wood {
+                            plan.set(cell(at), MaterialId(wood.unwrap_or(0)));
+                        }
+                    }
+                }
+            }
+        }
+        terrain.apply_edit(&plan).map_err(|e| e.to_string())?;
+        Ok(())
+    }
     fn eligible(&self, columns: &ColumnMap, terrain: &Volume, s: &Species, root: [i64; 3]) -> bool {
         let [x, y, z] = root;
         if x < 33
@@ -409,7 +493,20 @@ impl LivingState {
         sid: u16,
         root: [i64; 3],
     ) -> Option<usize> {
+        self.establish_spaced(columns, terrain, sid, root, i64::MAX)
+    }
+    /// [`Self::establish`] with the species' spacing capped at `max_spacing`
+    /// cells (the gallery packs many kinds into a small pad).
+    fn establish_spaced(
+        &mut self,
+        columns: &ColumnMap,
+        terrain: &Volume,
+        sid: u16,
+        root: [i64; 3],
+        max_spacing: i64,
+    ) -> Option<usize> {
         let s = self.species.iter().find(|s| s.id == sid)?;
+        let spacing = i64::from(s.spacing).min(max_spacing);
         let count = self
             .organisms
             .iter()
@@ -435,7 +532,7 @@ impl LivingState {
                 .filter(|p| p.alive && (p.wood.is_empty() != s.tree))
                 .any(|p| {
                     (p.root[0] - root[0]).pow(2) + (p.root[2] - root[2]).pow(2)
-                        < i64::from(s.spacing).pow(2)
+                        < spacing.pow(2)
                 })
         {
             return None;
@@ -624,7 +721,7 @@ impl LivingState {
             || self.organisms.len() > MAX_TREES + MAX_GROUND
             || self.spawns.len() > 64
             || self.cover.len() > MAX_COVER_SPECIES
-            || self.preset > 1
+            || self.preset > 2
             || self.cleared.len() > MAX_CLEARED
             || self
                 .cleared

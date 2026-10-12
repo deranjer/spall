@@ -418,6 +418,24 @@ pub fn validate_water_budget(columns: &ColumnMap) -> Result<(), GenError> {
 /// natural world they sit a short walk from a river or lake (2 to 20 m) for a
 /// good first view, falling back to any flat dry spot if none does.
 fn find_spawns(columns: &ColumnMap, caves: &CaveField) -> Vec<[f64; 3]> {
+    if columns.is_gallery() {
+        // One spawn per dry pad, at its middle (the pond's pad a little aside).
+        return crate::columns::gallery_patches(columns.size())
+            .iter()
+            .filter(|p| p.biome != Biome::Ocean)
+            .map(|p| {
+                let (mut x, z) = p.centre();
+                if p.biome == Biome::Riparian {
+                    x = p.x0 + (p.x1 - p.x0) / 6;
+                }
+                [
+                    x as f64 * CELL_M + CELL_M / 2.0,
+                    (i64::from(columns.height(x, z)) + 1) as f64 * CELL_M,
+                    z as f64 * CELL_M + CELL_M / 2.0,
+                ]
+            })
+            .collect();
+    }
     if columns.is_natural() {
         let near_water = search_spawns(columns, caves, true);
         if !near_water.is_empty() {

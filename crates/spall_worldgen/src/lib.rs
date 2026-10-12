@@ -25,7 +25,7 @@ pub mod noise;
 pub mod rivers;
 pub mod spec;
 
-pub use columns::{Biome, ColumnMap, SNOW_LINE};
+pub use columns::{Biome, ColumnMap, GalleryPatch, SNOW_LINE, gallery_patches};
 pub use generate::{
     GeneratedWorld, GenerationTimings, SPAWN_HEADROOM_CELLS, Spring, WATER_REGION_BUDGET,
     WaterPlan, WetColumn, generate, generate_with_timings,

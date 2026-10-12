@@ -536,6 +536,6 @@ fn natural_worlds_grow_underwater_plants_only_in_water() {
             );
         }
     }
-    assert!(wet > 50, "only {wet} underwater plants");
+    assert!(wet > 20, "only {wet} underwater plants");
     assert!(kinds.len() >= 4, "only {kinds:?} grew");
 }

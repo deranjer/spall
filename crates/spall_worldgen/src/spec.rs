@@ -10,6 +10,8 @@ use thiserror::Error;
 /// ([`Preset::gen_version`]) so adding a preset never invalidates saves of
 /// another.
 pub const GEN_VERSION: u32 = 3;
+/// Generation version of [`Preset::Gallery`].
+pub const GALLERY_GEN_VERSION: u32 = 1;
 /// Generation version of [`Preset::Natural`].
 pub const NATURAL_GEN_VERSION: u32 = 5;
 
@@ -41,6 +43,10 @@ pub enum Preset {
     /// A world whose layout follows cause and effect: ranges, erosion, rivers
     /// and lakes from hydrology, biomes from climate. 128 m tall.
     Natural,
+    /// A showcase of the natural flora: one small pad for each of the twelve
+    /// biomes, side by side, with every plant and cover that grows there. 128 m
+    /// tall.
+    Gallery,
 }
 
 impl Preset {
@@ -48,6 +54,7 @@ impl Preset {
         match self {
             Preset::Showcase => "showcase",
             Preset::Natural => "natural",
+            Preset::Gallery => "gallery",
         }
     }
 
@@ -56,6 +63,7 @@ impl Preset {
         match self {
             Preset::Showcase => GEN_VERSION,
             Preset::Natural => NATURAL_GEN_VERSION,
+            Preset::Gallery => GALLERY_GEN_VERSION,
         }
     }
 
@@ -64,7 +72,7 @@ impl Preset {
     pub fn height_bricks(self) -> i64 {
         match self {
             Preset::Showcase => SHOWCASE_HEIGHT_BRICKS,
-            Preset::Natural => MAX_HEIGHT_BRICKS,
+            Preset::Natural | Preset::Gallery => MAX_HEIGHT_BRICKS,
         }
     }
 
@@ -72,6 +80,7 @@ impl Preset {
         match name {
             "showcase" => Some(Preset::Showcase),
             "natural" => Some(Preset::Natural),
+            "gallery" => Some(Preset::Gallery),
             _ => None,
         }
     }

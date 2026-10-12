@@ -223,7 +223,7 @@ const MIN_BIOME_SHARE: f64 = 0.01;
 
 /// The climate a painted biome carries: temperature in degrees and wetness
 /// `0..=1`, so cover and plants read the same values the biome implies.
-fn biome_climate(biome: Biome) -> (f64, f64) {
+pub(super) fn biome_climate(biome: Biome) -> (f64, f64) {
     match biome {
         Biome::Snow => (-6.0, 0.40),
         Biome::Scree => (3.0, 0.20),
@@ -509,6 +509,7 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
         springs: Vec::new(),
         sinks: Vec::new(),
         repaired: 0,
+        gallery: false,
     };
 
     // Biomes need neighbouring heights, so they come second.
