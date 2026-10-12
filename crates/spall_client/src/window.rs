@@ -4495,6 +4495,9 @@ fn frame_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("SPALL_FRAME_TRACE").is_some())
 }
 
+/// Trees farther than this (metres) are drawn with half-resolution crowns.
+const LEAF_LOD_M: f32 = 36.0;
+
 /// Set `SPALL_VEGETATION_TRACE=1` to log each foliage rebuild and upload.
 fn vegetation_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4636,17 +4639,36 @@ impl VegetationWorker {
                     // solid) would share its faces with it and flicker, so it is
                     // left out and the wood shows.
                     let crown: Vec<_> = frame
-                        .parts(eye, foliage_radius_m)
+                        .parts_lod(eye, foliage_radius_m, LEAF_LOD_M)
                         .into_iter()
                         .filter(|p| {
-                            let leaf = p.size == [0.25; 3] && p.yaw == 0. && p.lean == 0.;
+                            // A leaf block is one quarter-cell, or at a distance a
+                            // block of 2 x 2 x 2 of them.
+                            let block = [(0.25, 1), (0.5, 2)]
+                                .into_iter()
+                                .find(|(edge, _)| p.size == [*edge; 3])
+                                .map(|(_, cells)| cells);
+                            let leaf = block.is_some() && p.yaw == 0. && p.lean == 0.;
                             !leaf
                                 || terrain.as_ref().is_none_or(|volume| {
-                                    let at = p.center.map(|c| (c / 0.25).floor() as i64);
-                                    !matches!(
-                                        volume.sample(GlobalCell::new(at[0], at[1], at[2])),
-                                        Ok(Sample::Filled(_))
-                                    )
+                                    let n = block.unwrap_or(1);
+                                    let at = p
+                                        .center
+                                        .map(|c| ((c - 0.125 * n as f32) / 0.25).round() as i64);
+                                    !(0..n).any(|dy| {
+                                        (0..n).any(|dz| {
+                                            (0..n).any(|dx| {
+                                                matches!(
+                                                    volume.sample(GlobalCell::new(
+                                                        at[0] + dx,
+                                                        at[1] + dy,
+                                                        at[2] + dz
+                                                    )),
+                                                    Ok(Sample::Filled(_))
+                                                )
+                                            })
+                                        })
+                                    })
                                 })
                         })
                         .collect();
