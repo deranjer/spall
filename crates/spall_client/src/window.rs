@@ -2051,6 +2051,17 @@ impl ApplicationHandler for InteractiveApp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
+                if renderer.vegetation_frame.is_some()
+                    && let Some(replica) =
+                        self.session.replica.get().and_then(|r| r.try_lock().ok())
+                {
+                    let generation = replica.terrain_generation();
+                    if renderer.vegetation_terrain.as_ref().map(|(g, _)| *g) != Some(generation)
+                        && let Some(volume) = replica.terrain_volume()
+                    {
+                        renderer.vegetation_terrain = Some((generation, volume.clone()));
+                    }
+                }
                 if self.sky_dirty {
                     let occupancy = self.last_sky.as_ref().filter(|_| self.sky_visibility_on);
                     // Nothing to upload yet (no rebuild has landed) keeps the
@@ -4425,7 +4436,45 @@ type VegetationRequest = (
     Arc<spall_ecology::living::VisualFrame>,
     [f32; 3],
     std::collections::HashSet<BrickCoord>,
+    Option<Volume>,
 );
+
+/// The open cell above the soil in column `(x, z)` and the soil's material,
+/// found by walking from the last column's surface (`hint`): neighbouring
+/// columns differ by a few cells, so the walk is short. `None` where the
+/// terrain is not resident or its mesh is not built yet, so cover never
+/// stands in the air waiting for the ground it grows on.
+fn cover_surface(
+    volume: &Volume,
+    ready: &std::collections::HashSet<BrickCoord>,
+    x: i64,
+    z: i64,
+    hint: &mut i64,
+) -> Option<(i64, u16)> {
+    let mut y = *hint;
+    for _ in 0..48 {
+        match volume.sample(GlobalCell::new(x, y, z)).ok()? {
+            Sample::Unknown(_) => return None,
+            Sample::Filled(_) => y += 1,
+            Sample::Empty { .. } => match volume.sample(GlobalCell::new(x, y - 1, z)).ok()? {
+                Sample::Filled(m) => {
+                    if !ready.contains(&GlobalCell::new(x, y - 1, z).split().0) {
+                        return None;
+                    }
+                    *hint = y;
+                    return Some((y, m.0));
+                }
+                Sample::Empty { .. } => y -= 1,
+                Sample::Unknown(_) => return None,
+            },
+        }
+    }
+    None
+}
+
+/// What a cover rebuild depends on; while it is unchanged the last result
+/// stands, so the once-a-second vegetation frame does not redo the carpet.
+type CoverKey = (i64, i64, u8, u64, usize, u64);
 /// Soft foliage waits for the same solid geometry that supports it. Network
 /// vegetation can arrive before the progressive terrain/trunk mesh batches.
 fn foliage_support_ready(
@@ -4456,7 +4505,13 @@ impl VegetationWorker {
         std::thread::Builder::new()
             .name("spall-client-foliage".into())
             .spawn(move || {
-                for (id, frame, eye, ready) in requests {
+                let mut grid: Option<(
+                    spall_ecology::cover::CoverField,
+                    spall_ecology::cover::CoverGrid,
+                )> = None;
+                let mut cover_cache: Option<(CoverKey, Vec<spall_ecology::living::SoftPart>)> =
+                    None;
+                for (id, frame, eye, ready, terrain) in requests {
                     // Leaves draw as far as the terrain and trunks do, so a tree
                     // never stands bare at a distance and then sprouts as you near.
                     let foliage_radius_m = view_radius_m();
@@ -4465,9 +4520,47 @@ impl VegetationWorker {
                         let tree = frame.species.iter().any(|s| s.id == p.species && s.tree);
                         foliage_support_ready(p, tree, &ready)
                     });
+                    // The ground cover: its own budget, thinning with distance,
+                    // computed from the climate raster and the terrain here.
+                    let mut cover_parts = Vec::new();
+                    if let Some(volume) = terrain.as_ref().filter(|_| !frame.cover.is_empty()) {
+                        if grid.as_ref().map(|(f, _)| f) != Some(&frame.field) {
+                            grid = frame.field.expand().ok().map(|g| (frame.field.clone(), g));
+                        }
+                        if let Some((_, grid)) = &grid {
+                            let key: CoverKey = (
+                                (eye[0] / 2.0).floor() as i64,
+                                (eye[2] / 2.0).floor() as i64,
+                                frame.season as u8,
+                                volume.state_stamp(),
+                                ready.len(),
+                                frame.seed,
+                            );
+                            match &cover_cache {
+                                Some((k, parts)) if *k == key => cover_parts = parts.clone(),
+                                _ => {
+                                    let mut hint = (eye[1] / 0.25).floor() as i64;
+                                    let mut surface =
+                                        |x, z| cover_surface(volume, &ready, x, z, &mut hint);
+                                    cover_parts = spall_ecology::cover::cover_parts(
+                                        grid,
+                                        &frame.cover,
+                                        frame.seed,
+                                        frame.season,
+                                        eye,
+                                        foliage_radius_m,
+                                        &mut surface,
+                                        spall_ecology::cover::INSTANCE_BUDGET,
+                                    );
+                                    cover_cache = Some((key, cover_parts.clone()));
+                                }
+                            }
+                        }
+                    }
                     let instances = frame
                         .parts(eye, foliage_radius_m)
                         .into_iter()
+                        .chain(cover_parts)
                         .map(|p| {
                             Instance::new(
                                 p.center,
@@ -4503,6 +4596,9 @@ pub(super) struct WorldRenderer {
     /// buffers.
     scene: GameRenderer,
     vegetation_frame: Option<Arc<spall_ecology::living::VisualFrame>>,
+    /// A cheap clone of the replica's terrain, for the cover worker to read
+    /// surfaces from, with the replica generation it was taken at.
+    vegetation_terrain: Option<(u64, Volume)>,
     vegetation_key: Option<VegetationKey>,
     vegetation_worker: VegetationWorker,
     vegetation_job: Option<u64>,
@@ -4900,6 +4996,7 @@ impl WorldRenderer {
             surface_config,
             scene,
             vegetation_frame: None,
+            vegetation_terrain: None,
             vegetation_key: None,
             vegetation_worker: VegetationWorker::spawn(vegetation_material)?,
             vegetation_job: None,
@@ -5226,6 +5323,7 @@ impl WorldRenderer {
                             frame.clone(),
                             eye.to_array(),
                             self.scene.terrain_mesh_coords().collect(),
+                            self.vegetation_terrain.as_ref().map(|(_, v)| v.clone()),
                         ))
                         .is_ok()
                     {

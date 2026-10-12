@@ -23,6 +23,8 @@ impl Simulation {
             WorldgenPalette::sequential(1),
         );
         let columns = ColumnMap::compute(&spec).map_err(|e| e.to_string())?;
+        let mut state = state;
+        state.ensure_field(&columns);
         self.vegetation = Some(AuthoritativeVegetation {
             state,
             columns,

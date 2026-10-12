@@ -113,6 +113,7 @@ pub fn generate_with_season(
         spawns,
         season,
     )
+    .and_then(|state| state.with_cover(crate::vegetation::cover_catalogue(), &world.columns))
     .map_err(WorldgenSceneError::Vegetation)?;
     tracing::info!(
         stage = "vegetation_generation",

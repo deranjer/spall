@@ -1,5 +1,6 @@
 //! The sandbox's initial vegetation catalogue. These are gameplay species,
 //! not engine materials or a claim to a botanically complete simulation.
+use spall_ecology::cover::CoverSpecies;
 use spall_ecology::living::Species;
 
 pub const NAMES: [&str; 20] = [
@@ -72,16 +73,13 @@ pub fn catalogue() -> Vec<Species> {
             },
         )
         .collect();
+    // Meadow grass (11), fescue (12), alpine tussock (13), sedge (14), clover
+    // (17) and desert bunchgrass (19) are stateless ground cover now; see
+    // [`cover_catalogue`]. The living ground plants are what is left.
     let ground = [
-        (11, 1, soil, 6, 2, 4, 4, true, [3, 1, 7, 8], 10),
-        (12, 3, alpine, 6, 3, 3, 4, true, [13, 1, 8, 8], 10),
-        (13, 2, alpine, 12, 2, 5, 5, true, [13, 13, 7, 8], 10),
-        (14, 4, soil, 9, 4, 4, 5, true, [13, 1, 7, 8], 10),
         (15, 4, soil, 7, 7, 3, 6, false, [1, 1, 7, 8], 10),
         (16, 5, soil, 8, 3, 5, 6, false, [1, 0, 5, 7], 10),
-        (17, 1, soil, 11, 1, 4, 4, false, [3, 1, 7, 8], 10),
         (18, 1, soil, 10, 3, 3, 5, false, [3, 1, 7, 8], 11),
-        (19, 8, desert, 6, 3, 4, 7, true, [15, 15, 7, 8], 10),
         (20, 8, desert, 13, 4, 6, 10, true, [14, 14, 8, 8], 12),
     ];
     out.extend(ground.into_iter().map(
@@ -113,19 +111,143 @@ pub fn catalogue() -> Vec<Species> {
     out
 }
 
+/// The sandbox's stateless ground cover: the carpet that used to be living
+/// organisms. Ids keep the numbers those species had.
+pub fn cover_catalogue() -> Vec<CoverSpecies> {
+    let p = crate::game::terrain_palette();
+    let soil = [p.grass.0, p.dirt.0, p.moss.0, p.mud.0];
+    let alpine = [p.grass.0, p.dirt.0, p.moss.0, p.gravel.0];
+    let desert = [p.sand.0, p.dirt.0, p.clay.0, p.gravel.0];
+    // (id, biomes, soils, moisture, temperature, form, height, colours, evergreen, density)
+    // Biomes: Meadow=1, Alpine=2, Swamp=4, Desert=8. Density is tufts per 256 cells.
+    let rows = [
+        (
+            11,
+            1,
+            soil,
+            [50, 235],
+            [-12, 42],
+            6,
+            2,
+            [3, 1, 7, 8],
+            true,
+            120,
+        ),
+        (
+            12,
+            3,
+            alpine,
+            [50, 235],
+            [-35, 28],
+            6,
+            3,
+            [13, 1, 8, 8],
+            true,
+            110,
+        ),
+        (
+            13,
+            2,
+            alpine,
+            [50, 235],
+            [-40, 22],
+            12,
+            2,
+            [13, 13, 7, 8],
+            true,
+            90,
+        ),
+        (
+            14,
+            4,
+            soil,
+            [150, 255],
+            [-8, 40],
+            9,
+            4,
+            [13, 1, 7, 8],
+            true,
+            130,
+        ),
+        (
+            17,
+            1,
+            soil,
+            [50, 235],
+            [-5, 40],
+            11,
+            1,
+            [3, 1, 7, 8],
+            false,
+            80,
+        ),
+        (
+            19,
+            8,
+            desert,
+            [0, 65],
+            [0, 62],
+            6,
+            3,
+            [15, 15, 7, 8],
+            true,
+            70,
+        ),
+    ];
+    rows.into_iter()
+        .map(
+            |(
+                id,
+                biomes,
+                soils,
+                moisture,
+                temperature,
+                form,
+                height,
+                colours,
+                evergreen,
+                density,
+            )| {
+                CoverSpecies {
+                    id,
+                    biomes,
+                    soils,
+                    moisture,
+                    temperature,
+                    form,
+                    height,
+                    colours,
+                    evergreen,
+                    density,
+                }
+            },
+        )
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
-    fn catalogue_has_stable_twenty_species_and_every_biome() {
+    fn catalogue_has_stable_species_ids_and_every_biome() {
         let s = super::catalogue();
-        assert_eq!(s.len(), 20);
+        assert_eq!(s.len(), 14);
         assert_eq!(s.iter().filter(|s| s.tree).count(), 10);
+        let ids: Vec<u16> = s.iter().map(|s| s.id).collect();
+        assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 18, 20]);
+        let cover = super::cover_catalogue();
+        assert_eq!(
+            cover.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [11, 12, 13, 14, 17, 19]
+        );
         for biome in [1, 2, 4, 8] {
             assert!(s.iter().any(|s| s.tree && s.biomes & biome != 0));
-            assert!(s.iter().any(|s| !s.tree && s.biomes & biome != 0));
+            assert!(
+                cover.iter().any(|c| c.biomes & biome != 0),
+                "cover for biome {biome}"
+            );
         }
-        for (i, s) in s.iter().enumerate() {
-            assert_eq!(usize::from(s.id), i + 1);
+        for c in &cover {
+            c.validate().unwrap();
         }
     }
 }

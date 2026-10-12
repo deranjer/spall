@@ -1,11 +1,14 @@
 //! Versioned living vegetation. Authored species belong to the game; this CPU
 //! module owns deterministic establishment, reproduction and retained wood paths.
+use crate::cover::{CoverField, CoverSpecies, MAX_COVER_SPECIES, is_carpet_form};
 use serde::{Deserialize, Serialize};
 use spall_core::{GlobalCell, MaterialId};
 use spall_voxel::{EditPlan, Sample, Volume};
 use spall_worldgen::{Biome, ColumnMap};
 
-pub const VERSION: u16 = 1;
+/// Version 2 moved the ground carpet out of the organisms: grass, sedge,
+/// clover and tussock are stateless cover now ([`crate::cover`]).
+pub const VERSION: u16 = 2;
 pub const MAX_TREES: usize = 512;
 pub const MAX_GROUND: usize = 8192;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -111,6 +114,27 @@ pub struct LivingState {
     pub species: Vec<Species>,
     pub organisms: Vec<Organism>,
     pub spawns: Vec<[i64; 3]>,
+    /// The stateless ground cover this world carries, and the climate raster
+    /// it reads. Nothing here ever changes after the world is made.
+    pub cover: Vec<CoverSpecies>,
+    pub field: CoverField,
+}
+/// The saved layout before ground cover: the same fields without `cover` and
+/// `field`, with carpet species among the organisms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LivingStateV1 {
+    version: u16,
+    seed: u64,
+    size: u32,
+    time_ms: u64,
+    credit_ms: u64,
+    start_season: Season,
+    season_ms: u64,
+    next_id: u64,
+    cursor: u32,
+    species: Vec<Species>,
+    organisms: Vec<Organism>,
+    spawns: Vec<[i64; 3]>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisualPlant {
@@ -125,8 +149,11 @@ pub struct VisualFrame {
     pub version: u16,
     pub time_ms: u64,
     pub season: Season,
+    pub seed: u64,
     pub species: Vec<Species>,
     pub plants: Vec<VisualPlant>,
+    pub cover: Vec<CoverSpecies>,
+    pub field: CoverField,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct SoftPart {
@@ -178,6 +205,8 @@ impl LivingState {
             species,
             organisms: Vec::new(),
             spawns,
+            cover: Vec::new(),
+            field: CoverField::default(),
         };
         state.validate()?;
         let stride = (i64::from(state.size) / 128).max(4);
@@ -316,6 +345,25 @@ impl LivingState {
         self.organisms.push(p);
         Some(self.organisms.len() - 1)
     }
+    /// Gives the world its ground cover: the species, and the climate raster
+    /// they read, sampled from the world's own columns.
+    pub fn with_cover(
+        mut self,
+        cover: Vec<CoverSpecies>,
+        columns: &ColumnMap,
+    ) -> Result<Self, String> {
+        self.cover = cover;
+        self.field = CoverField::from_columns(columns);
+        self.validate()?;
+        Ok(self)
+    }
+    /// Samples the climate raster if the state has cover but no raster yet (a
+    /// state upgraded from version 1, which had no raster).
+    pub fn ensure_field(&mut self, columns: &ColumnMap) {
+        if self.field.is_empty() && !self.cover.is_empty() {
+            self.field = CoverField::from_columns(columns);
+        }
+    }
     pub fn season(&self) -> Season {
         Season::at(self.start_season, self.time_ms, self.season_ms)
     }
@@ -331,9 +379,68 @@ impl LivingState {
         if bytes.len() > MAX_STATE_BYTES {
             return Err("vegetation state byte limit".into());
         }
-        let s: Self = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
+        let (version, _) = postcard::take_from_bytes::<u16>(bytes).map_err(|e| e.to_string())?;
+        let s = if version == 1 {
+            Self::upgrade(postcard::from_bytes::<LivingStateV1>(bytes).map_err(|e| e.to_string())?)
+        } else {
+            postcard::from_bytes(bytes).map_err(|e| e.to_string())?
+        };
         s.validate()?;
         Ok(s)
+    }
+    /// Version 1 to 2. The carpet species (grass, sedge, clover, tussock
+    /// forms) become cover species with their ids, biomes, soils, moisture,
+    /// heights and colours; their organisms are dropped, because cover is
+    /// stateless and is never placed again. Every other organism, the clock and
+    /// the ids carry over untouched: an upgrade never regenerates a world.
+    fn upgrade(old: LivingStateV1) -> Self {
+        let carpet: Vec<u16> = old
+            .species
+            .iter()
+            .filter(|s| !s.tree && is_carpet_form(s.form))
+            .map(|s| s.id)
+            .collect();
+        let cover = old
+            .species
+            .iter()
+            .filter(|s| carpet.contains(&s.id))
+            .map(|s| CoverSpecies {
+                id: s.id,
+                biomes: s.biomes,
+                soils: s.soils,
+                moisture: s.moisture,
+                temperature: [-62, 62],
+                form: s.form,
+                height: s.height,
+                colours: s.colours,
+                evergreen: s.evergreen,
+                density: 96,
+            })
+            .collect();
+        Self {
+            version: VERSION,
+            seed: old.seed,
+            size: old.size,
+            time_ms: old.time_ms,
+            credit_ms: old.credit_ms,
+            start_season: old.start_season,
+            season_ms: old.season_ms,
+            next_id: old.next_id,
+            cursor: 0,
+            species: old
+                .species
+                .into_iter()
+                .filter(|s| !carpet.contains(&s.id))
+                .collect(),
+            organisms: old
+                .organisms
+                .into_iter()
+                .filter(|o| !carpet.contains(&o.species))
+                .collect(),
+            spawns: old.spawns,
+            cover,
+            field: CoverField::default(),
+        }
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.version != VERSION
@@ -343,8 +450,17 @@ impl LivingState {
             || self.size > 4096
             || self.organisms.len() > MAX_TREES + MAX_GROUND
             || self.spawns.len() > 64
+            || self.cover.len() > MAX_COVER_SPECIES
         {
             return Err("invalid vegetation schema/limits".into());
+        }
+        self.field.validate()?;
+        let mut cover_ids = std::collections::BTreeSet::new();
+        for c in &self.cover {
+            c.validate()?;
+            if !cover_ids.insert(c.id) || self.species.iter().any(|s| s.id == c.id) {
+                return Err("duplicate cover species id".into());
+            }
         }
         let mut ids = std::collections::BTreeSet::new();
         for s in &self.species {
@@ -366,6 +482,7 @@ impl LivingState {
                     .any(|c| usize::from(*c) >= PALETTE.len())
                 || s.moisture[0] > s.moisture[1]
                 || (s.tree && (s.wood == 0 || s.trunk_width == 0 || s.trunk_width > 2))
+                || (!s.tree && is_carpet_form(s.form))
             {
                 return Err("invalid species".into());
             }
@@ -656,8 +773,11 @@ impl LivingState {
             version: VERSION,
             time_ms: self.time_ms,
             season: self.season(),
+            seed: self.seed,
             species: self.species.clone(),
             plants,
+            cover: self.cover.clone(),
+            field: self.field.clone(),
         }
     }
 }
@@ -722,6 +842,9 @@ impl VisualFrame {
         let frame: Self = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
         if frame.version != VERSION
             || frame.species.len() > 64
+            || frame.cover.len() > MAX_COVER_SPECIES
+            || frame.cover.iter().any(|c| c.validate().is_err())
+            || frame.field.validate().is_err()
             || frame.plants.len() > MAX_TREES + MAX_GROUND
             || frame.plants.iter().any(|p| {
                 p.tips.len() > 32
@@ -848,120 +971,166 @@ impl VisualFrame {
                 } else {
                     1.
                 };
-                let height = if matches!(s.form, 8 | 11 | 13) {
-                    height * winter
-                } else {
-                    height
-                };
-                if matches!(s.form, 8 | 11 | 13) {
-                    let count = if s.form == 13 { 9 } else { 6 };
-                    for leaf in 0..count {
-                        let angle = leaf as f32 * std::f32::consts::TAU / count as f32;
-                        let reach = height
-                            * if s.form == 8 {
-                                0.65
-                            } else if s.form == 13 {
-                                0.40
-                            } else {
-                                0.75
-                            };
-                        let level = if s.form == 13 {
-                            height * (0.3 + (leaf % 3) as f32 * 0.23)
-                        } else {
-                            height * 0.3
-                        };
-                        out.push(SoftPart {
-                            center: [base[0], base[1] + level / 2., base[2]],
-                            size: [0.02, level, 0.02],
-                            colour: if s.form == 13 { 7 } else { colour },
-                            yaw: angle,
-                            lean: 0.,
-                        });
-                        out.push(SoftPart {
-                            center: [
-                                base[0] + angle.cos() * reach / 2.,
-                                base[1] + level,
-                                base[2] + angle.sin() * reach / 2.,
-                            ],
-                            size: [reach, 0.02, 0.02],
-                            colour: if s.form == 13 { 7 } else { colour },
-                            yaw: -angle,
-                            lean: 0.,
-                        });
-                        for segment in 1..=3 {
-                            let distance = reach * segment as f32 / 3.;
-                            let y = base[1]
-                                + level
-                                + if s.form == 8 {
-                                    height * 0.12 * (3 - segment) as f32
-                                } else {
-                                    0.
-                                };
-                            let size = if s.form == 8 {
-                                [0.13 * (4 - segment) as f32, 0.025, 0.10]
-                            } else {
-                                [0.10, 0.04, 0.12]
-                            };
-                            out.push(SoftPart {
-                                center: [
-                                    base[0] + angle.cos() * distance,
-                                    y,
-                                    base[2] + angle.sin() * distance,
-                                ],
-                                size,
-                                colour,
-                                yaw: angle,
-                                lean: 0.,
-                            });
-                        }
-                    }
-                    continue;
-                }
-                for blade in 0..if s.form == 12 { 13 } else { 7_u64 } {
-                    let key = hash(p.id ^ blade);
-                    let yaw = (key % 628) as f32 / 100.;
-                    let dx = ((key % 101) as f32 / 100. - 0.5) * 0.20;
-                    let dz = ((key.rotate_left(23) % 101) as f32 / 100. - 0.5) * 0.20;
-                    let h = (height * (0.65 + (key % 35) as f32 / 100.) * winter).max(0.025);
-                    let wide = 0.025;
-                    let lean = if s.form == 7 {
-                        0.04
-                    } else {
-                        0.12 + (key % 25) as f32 / 100.
-                    };
-                    out.push(SoftPart {
-                        center: [
-                            base[0] + dx - h * lean.sin() * yaw.cos() / 2.,
-                            base[1] + (h * lean.cos() + wide * lean.sin()) / 2.,
-                            base[2] + dz + h * lean.sin() * yaw.sin() / 2.,
-                        ],
-                        size: [wide, h, 0.025],
-                        colour,
-                        yaw,
-                        lean,
-                    });
-                    if s.form == 7
-                        || (s.form == 10 && matches!(self.season, Season::Spring | Season::Summer))
-                    {
-                        out.push(SoftPart {
-                            center: [
-                                base[0] + dx - h * lean.sin() * yaw.cos(),
-                                base[1] + h * lean.cos(),
-                                base[2] + dz + h * lean.sin() * yaw.sin(),
-                            ],
-                            size: if s.form == 7 {
-                                [0.055, 0.18, 0.055]
-                            } else {
-                                [0.08, 0.045, 0.08]
-                            },
-                            colour: if s.form == 7 { 7 } else { s.flower },
-                            yaw,
-                            lean: 0.,
-                        });
-                    }
-                }
+                let height = height * winter;
+                crate::cover::ground_parts(
+                    s.form,
+                    height,
+                    colour,
+                    s.flower,
+                    self.season,
+                    p.id,
+                    base,
+                    crate::cover::Detail::Full,
+                    &mut out,
+                );
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn species(id: u16, tree: bool, form: u8) -> Species {
+        Species {
+            id,
+            tree,
+            biomes: 1,
+            soils: [1, 2, 0, 0],
+            moisture: [50, 200],
+            wood: if tree { 124 } else { 0 },
+            trunk_width: u8::from(tree),
+            form,
+            height: 3,
+            spread: 3,
+            spacing: 4,
+            evergreen: false,
+            colours: [1, 2, 3, 4],
+            flower: 10,
+            growth_ms: 1000,
+            seed_ms: 1000,
+        }
+    }
+
+    fn organism(id: u64, species: u16, x: i64) -> Organism {
+        Organism {
+            id,
+            species,
+            root: [x, 9, 40],
+            age_ms: 5,
+            last_update_ms: 7,
+            last_seed_ms: 7,
+            alive: true,
+            biomass: 400,
+            wood: vec![],
+            parents: vec![],
+            removed: vec![],
+            committed: 0,
+        }
+    }
+
+    #[test]
+    fn a_version_1_save_upgrades_by_moving_the_carpet_to_cover_and_keeping_the_rest() {
+        let old = LivingStateV1 {
+            version: 1,
+            seed: 9,
+            size: 256,
+            time_ms: 123_000,
+            credit_ms: 500,
+            start_season: Season::Autumn,
+            season_ms: 900_000,
+            next_id: 40,
+            cursor: 3,
+            // A tree, a meadow grass (6), a fern (8), a sedge (9), a clover (11).
+            species: vec![
+                species(1, true, 0),
+                species(11, false, 6),
+                species(16, false, 8),
+                species(14, false, 9),
+                species(17, false, 11),
+            ],
+            organisms: vec![
+                organism(1, 1, 40),
+                organism(2, 11, 41),
+                organism(3, 16, 42),
+                organism(4, 14, 43),
+                organism(5, 17, 44),
+                organism(6, 16, 45),
+            ],
+            spawns: vec![[50, 9, 50]],
+        };
+        let bytes = postcard::to_stdvec(&old).unwrap();
+        let state = LivingState::decode(&bytes).unwrap();
+        assert_eq!(state.version, VERSION);
+        // The carpet species moved to cover, with their ids and looks.
+        assert_eq!(
+            state.cover.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [11, 14, 17]
+        );
+        assert_eq!(state.cover[0].colours, [1, 2, 3, 4]);
+        assert_eq!(state.cover[1].form, 9);
+        assert_eq!(
+            state.species.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [1, 16]
+        );
+        // Their organisms are gone and every other organism is exactly as it was.
+        assert_eq!(
+            state.organisms,
+            vec![
+                old.organisms[0].clone(),
+                old.organisms[2].clone(),
+                old.organisms[5].clone()
+            ]
+        );
+        // Clock, season, ids and spawns carry over; nothing was regenerated.
+        assert_eq!(state.time_ms, 123_000);
+        assert_eq!(state.credit_ms, 500);
+        assert_eq!(state.start_season, Season::Autumn);
+        assert_eq!(state.next_id, 40);
+        assert_eq!(state.spawns, old.spawns);
+        assert!(
+            state.field.is_empty(),
+            "the raster is sampled when the world installs it"
+        );
+        // It is a normal version 2 state from here: it re-encodes and decodes.
+        assert_eq!(
+            LivingState::decode(&state.encode().unwrap()).unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn a_version_2_state_refuses_carpet_organisms_and_clashing_ids() {
+        let mut state = LivingState::decode(
+            &postcard::to_stdvec(&LivingStateV1 {
+                version: 1,
+                seed: 1,
+                size: 256,
+                time_ms: 0,
+                credit_ms: 0,
+                start_season: Season::Summer,
+                season_ms: 900_000,
+                next_id: 1,
+                cursor: 0,
+                species: vec![species(11, false, 6)],
+                organisms: vec![],
+                spawns: vec![],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        state.species.push(species(30, false, 6));
+        assert!(
+            state.validate().is_err(),
+            "a carpet form is not a living ground plant now"
+        );
+        state.species.pop();
+        state.species.push(species(11, false, 8));
+        assert!(
+            state.validate().is_err(),
+            "a cover id may not also be a species id"
+        );
     }
 }
