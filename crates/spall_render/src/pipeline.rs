@@ -876,7 +876,8 @@ impl ScenePipeline {
 
     /// Replaces a rectangle of the water field on the GPU and in the
     /// renderer's copy (which answers "is the camera under water"). `texels`
-    /// are `(top, bottom, smooth, agitation)` row by row, `w * h` of them. A
+    /// are `(top, bottom, smooth, agitation + flow)` row by row (see
+    /// [`crate::water::pack_agitation_flow`]), `w * h` of them. A
     /// rectangle outside the installed field is ignored.
     pub fn update_water_field_rect(
         &self,
@@ -907,7 +908,7 @@ impl ScenePipeline {
                 field.heights[i] = t[0];
                 field.bottoms[i] = t[1];
                 field.smooth[i] = t[2];
-                field.agitation[i] = t[3];
+                (field.agitation[i], field.flow[i]) = crate::water::unpack_agitation_flow(t[3]);
             }
         }
         queue.write_texture(

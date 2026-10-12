@@ -107,6 +107,16 @@ fn render(
     time: f32,
     name: &str,
 ) -> Vec<u8> {
+    render_field(ctx, camera, field(still, agitation), time, name)
+}
+
+fn render_field(
+    ctx: &RenderContext,
+    camera: &Camera,
+    water: WaterField,
+    time: f32,
+    name: &str,
+) -> Vec<u8> {
     let target = OffscreenTarget::new(&ctx.device, SIZE.0, SIZE.1);
     let mut renderer = GameRenderer::new(
         &ctx.device,
@@ -117,7 +127,7 @@ fn render(
         None,
     );
     renderer.set_terrain(&ctx.device, &ctx.queue, &basin());
-    renderer.set_water_field(&ctx.device, &ctx.queue, Some(field(still, agitation)));
+    renderer.set_water_field(&ctx.device, &ctx.queue, Some(water));
     renderer.set_water_grid_surface(true);
     renderer.set_water_time(time);
     let environment = EnvironmentPreset::Daylight.environment();
@@ -323,4 +333,132 @@ fn the_lakebed_seen_from_above() {
         )
         .unwrap();
     }
+}
+
+/// A lake with a uniform current of `flow` (units of 1/16 m/s) in every wet cell.
+fn flowing_field(flow: [i8; 2]) -> WaterField {
+    let mut f = field(true, 0.0);
+    for i in 0..f.heights.len() {
+        if f.heights[i] > NO_WATER * 0.5 {
+            f.flow[i] = flow;
+        }
+    }
+    f
+}
+
+/// Mean absolute difference of the water region of two renders.
+fn difference(a: &[u8], b: &[u8]) -> f32 {
+    let (w, h) = SIZE;
+    let mut sum = 0.0f32;
+    let mut n = 0.0;
+    for y in h / 2..3 * h / 4 {
+        for x in w / 3..2 * w / 3 {
+            let i = ((y * w + x) * 4) as usize;
+            for c in 0..3 {
+                sum += (f32::from(a[i + c]) - f32::from(b[i + c])).abs();
+                n += 1.0;
+            }
+        }
+    }
+    sum / n
+}
+
+/// A current changes the water: ripples travel with it (so the pattern at a
+/// later time differs from a still lake's by more than the slow still drift),
+/// run in streaks, and a fast one breaks into foam. Writes review PNGs.
+#[test]
+#[ignore = "needs a GPU adapter; writes review PNGs"]
+fn a_current_carries_the_ripples_and_a_rapid_breaks_into_foam() {
+    let Some(ctx) = RenderContext::headless().ok() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let from_bank = camera(Vec3::new(6.0, 4.2, -3.2), Vec3::new(6.0, 1.8, 7.0));
+    let still_a = render_field(
+        &ctx,
+        &from_bank,
+        flowing_field([0, 0]),
+        2.0,
+        "flow-still-t2.png",
+    );
+    let still_b = render_field(
+        &ctx,
+        &from_bank,
+        flowing_field([0, 0]),
+        2.5,
+        "flow-still-t2.5.png",
+    );
+    // 4 m/s along +x, then the same current half a second later.
+    let river_a = render_field(
+        &ctx,
+        &from_bank,
+        flowing_field([24, 0]),
+        2.0,
+        "flow-river-t2.png",
+    );
+    let river_b = render_field(
+        &ctx,
+        &from_bank,
+        flowing_field([24, 0]),
+        2.5,
+        "flow-river-t2.5.png",
+    );
+    // A gentle 0.4 m/s drift.
+    let creek_a = render_field(
+        &ctx,
+        &from_bank,
+        flowing_field([6, 0]),
+        2.0,
+        "flow-creek-t2.png",
+    );
+    let creek_b = render_field(
+        &ctx,
+        &from_bank,
+        flowing_field([6, 0]),
+        2.5,
+        "flow-creek-t2.5.png",
+    );
+    // Cross-stream current: a different direction draws a different pattern.
+    let cross = render_field(
+        &ctx,
+        &from_bank,
+        flowing_field([0, 24]),
+        2.0,
+        "flow-cross-t2.png",
+    );
+
+    let still_drift = difference(&still_a, &still_b);
+    let river_change = difference(&river_a, &river_b);
+    let creek_change = difference(&creek_a, &creek_b);
+    eprintln!(
+        "mean difference: still drift {still_drift:.2}, creek {creek_change:.2}, river {river_change:.2},          river vs still {:.2}, cross vs river {:.2}",
+        difference(&river_a, &still_a),
+        difference(&cross, &river_a)
+    );
+    assert!(
+        river_change > still_drift * 1.5,
+        "the pattern on a river moves faster than on still water: {river_change} vs {still_drift}"
+    );
+    assert!(
+        creek_change > still_drift,
+        "{creek_change} vs {still_drift}"
+    );
+    assert!(
+        difference(&river_a, &still_a) > 1.0,
+        "a rapid looks different from a calm lake"
+    );
+    assert!(
+        difference(&cross, &river_a) > 1.0,
+        "direction changes the pattern"
+    );
+    // The rapid is foamier (brighter, whiter) than the calm lake.
+    let (w, h) = SIZE;
+    let brightness = |img: &[u8]| {
+        let m = mean(img, w / 3, 2 * w / 3, h / 2, 3 * h / 4);
+        m[0] + m[1] + m[2]
+    };
+    assert!(
+        brightness(&river_a) > brightness(&still_a),
+        "foam brightens the rapid"
+    );
 }

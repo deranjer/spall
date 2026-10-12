@@ -533,11 +533,13 @@ impl ColumnSurface {
                         self.field.heights[f] = t.top[i];
                         self.field.bottoms[f] = t.bottom[i];
                         self.field.agitation[f] = t.agitation[i];
+                        self.field.flow[f] = t.flow[i];
                     }
                     _ => {
                         self.field.heights[f] = NO_WATER;
                         self.field.bottoms[f] = NO_WATER;
                         self.field.agitation[f] = 0.0;
+                        self.field.flow[f] = [0; 2];
                     }
                 }
             }
@@ -611,7 +613,7 @@ impl ColumnSurface {
         self.smooth_around(key);
     }
 
-    /// The `(top, bottom, smooth, agitation)` texels of a field rectangle.
+    /// The `(top, bottom, smooth, agitation + flow)` texels of a field rectangle.
     pub fn texels(&self, rect: Rect) -> Vec<[f32; 4]> {
         self.field.texel_rect(rect.x0, rect.z0, rect.w, rect.h)
     }
@@ -723,6 +725,43 @@ mod tests {
         };
         assert_eq!(at(3.5).flow_m_s, [1.5, -0.5]);
         assert_eq!(at(4.5).flow_m_s, [0.0, 0.0], "still neighbour");
+    }
+
+    #[test]
+    fn a_current_reaches_the_field_and_the_gpu_texel_and_stops_where_the_water_does() {
+        use spall_protocol::column_water_wire::quantize_flow;
+        let mut s = surface();
+        let running = WireSpan {
+            flow: quantize_flow([1.5, -0.5]),
+            ..span(3 + 32 * 2, 10, 320)
+        };
+        s.set_region_at((0, 0), &[running, span(4 + 32 * 2, 10, 320)], 0.0);
+        s.advance_to(0.0);
+        let (moving, still) = (cell(&s, 3, 2), cell(&s, 4, 2));
+        assert_eq!(
+            s.field().flow[moving],
+            running.flow,
+            "the current reaches the field"
+        );
+        assert_eq!(s.field().flow[still], [0, 0], "still neighbour");
+        // The texel the GPU reads carries it too.
+        let dim = s.dim();
+        let rect = Rect {
+            x0: moving as u32 % dim,
+            z0: moving as u32 / dim,
+            w: 1,
+            h: 1,
+        };
+        let (_, flow) = spall_render::water::unpack_agitation_flow(s.texels(rect)[0][3]);
+        assert_eq!(flow, running.flow);
+        // The water drains away: no current is left on a dry column.
+        s.set_region_at((0, 0), &[], 1.0);
+        s.advance_to(10.0);
+        assert_eq!(
+            s.field().flow[moving],
+            [0, 0],
+            "dry columns hold no current"
+        );
     }
 
     #[test]

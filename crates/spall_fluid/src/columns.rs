@@ -738,6 +738,28 @@ impl ColumnWorld {
     /// key in `refresh`, remapping its water column by column. New regions start
     /// asleep; refreshed ones wake with their neighbours.
     fn allocate(&mut self, add: &[RegionKey], refresh: &BTreeSet<RegionKey>) -> RemapReport {
+        // Every region's solid mask is loaded before any is built: half a MiB
+        // each at 128 m of height, so thousands of ocean regions held 2.5 GiB at
+        // once. In sorted batches the slots come out in the same order and only
+        // one batch of masks is alive.
+        const BATCH: usize = 256;
+        let wanted: BTreeSet<RegionKey> = add.iter().copied().collect();
+        if wanted.len() <= BATCH {
+            return self.allocate_batch(add, refresh);
+        }
+        let keys: Vec<RegionKey> = wanted.into_iter().collect();
+        let mut report = RemapReport::default();
+        for (n, chunk) in keys.chunks(BATCH).enumerate() {
+            let none = BTreeSet::new();
+            let done = self.allocate_batch(chunk, if n == 0 { refresh } else { &none });
+            report.columns_changed += done.columns_changed;
+            report.relocated_volume += done.relocated_volume;
+            report.unplaced_volume += done.unplaced_volume;
+        }
+        report
+    }
+
+    fn allocate_batch(&mut self, add: &[RegionKey], refresh: &BTreeSet<RegionKey>) -> RemapReport {
         let (y_lo, y_hi) = self.terrain.y_range();
         let mut fresh: HashMap<RegionKey, RegionTerrain> = HashMap::new();
         let wanted: Vec<RegionKey> = add

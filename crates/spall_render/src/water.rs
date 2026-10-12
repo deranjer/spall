@@ -29,8 +29,38 @@ pub struct WaterField {
     /// grid surface reads it ([`Self::texel_rect`] channel `b`).
     pub smooth: Vec<f32>,
     /// How disturbed the water is, 0 (still) to 1 (surging). Drives ripples
-    /// and foam; presentation only. Channel `a`.
+    /// and foam; presentation only. Channel `a`, packed with `flow`.
     pub agitation: Vec<f32>,
+    /// The current of each column, two signed bytes in units of
+    /// [`FLOW_UNIT_M_S`] (`x`, `z`), so ripples and foam can travel with the
+    /// water. Channel `a`, packed with `agitation`.
+    pub flow: Vec<[i8; 2]>,
+}
+
+/// Metres per second per unit of [`WaterField::flow`] (as on the wire).
+pub const FLOW_UNIT_M_S: f32 = 1.0 / 16.0;
+
+/// Packs agitation (0 to 1, 8 bits) and a flow (two signed bytes) into one
+/// integer-valued `f32`, the field texture's fourth channel. Integers below
+/// 2^24 are exact in `f32`, so the shader reads back what was stored. A
+/// packed zero never occurs (zero flow packs as 128 per axis), so the shader
+/// can treat a zero texel as outside the field.
+pub fn pack_agitation_flow(agitation: f32, flow: [i8; 2]) -> f32 {
+    let a = (agitation.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let x = (i32::from(flow[0].max(-127)) + 128) as u32;
+    let z = (i32::from(flow[1].max(-127)) + 128) as u32;
+    (a | (x << 8) | (z << 16)) as f32
+}
+
+/// The inverse of [`pack_agitation_flow`]. A zero texel unpacks to still water.
+pub fn unpack_agitation_flow(packed: f32) -> (f32, [i8; 2]) {
+    let u = packed as u32;
+    if u == 0 {
+        return (0.0, [0; 2]);
+    }
+    let x = ((u >> 8) & 255) as i32 - 128;
+    let z = ((u >> 16) & 255) as i32 - 128;
+    ((u & 255) as f32 / 255.0, [x as i8, z as i8])
 }
 
 impl WaterField {
@@ -45,11 +75,13 @@ impl WaterField {
             bottoms: vec![NO_WATER; dim as usize * dim as usize],
             smooth: vec![NO_WATER; dim as usize * dim as usize],
             agitation: vec![0.0; dim as usize * dim as usize],
+            flow: vec![[0; 2]; dim as usize * dim as usize],
         }
     }
 
-    /// The `(top, bottom, smooth, agitation)` texels of a rectangle of cells,
-    /// row by row, as the GPU texture stores them.
+    /// The `(top, bottom, smooth, agitation + flow)` texels of a rectangle of
+    /// cells, row by row, as the GPU texture stores them (the last channel is
+    /// [`pack_agitation_flow`]).
     pub fn texel_rect(&self, x0: u32, z0: u32, w: u32, h: u32) -> Vec<[f32; 4]> {
         let dim = self.dim as usize;
         let mut out = Vec::with_capacity(w as usize * h as usize);
@@ -60,7 +92,7 @@ impl WaterField {
                     self.heights[i],
                     self.bottoms[i],
                     self.smooth[i],
-                    self.agitation[i],
+                    pack_agitation_flow(self.agitation[i], self.flow[i]),
                 ]);
             }
         }
@@ -496,5 +528,50 @@ mod tests {
         assert_eq!(field.submerged_surface([0.5, 3.9, 0.5]), Some(4.0));
         assert_eq!(field.submerged_surface([0.5, 4.1, 0.5]), None);
         assert_eq!(field.submerged_surface([1.5, 0.0, 0.5]), None);
+    }
+}
+
+#[cfg(test)]
+mod flow_pack_tests {
+    use super::*;
+
+    #[test]
+    fn agitation_and_flow_round_trip_through_the_texel_channel() {
+        for agit in [0.0, 0.01, 0.5, 1.0] {
+            for flow in [[0, 0], [1, -1], [127, -127], [-127, 127], [16, 0], [0, -16]] {
+                let packed = pack_agitation_flow(agit, flow);
+                assert_eq!(packed, packed.trunc(), "an exact integer in f32");
+                assert!(packed < 16_777_216.0 && packed > 0.0, "{packed}");
+                let (a, f) = unpack_agitation_flow(packed);
+                assert!((a - agit).abs() <= 0.5 / 255.0 + 1e-6, "{agit} -> {a}");
+                assert_eq!(f, flow);
+            }
+        }
+        // A zero texel (outside the field) is still water, never a current.
+        assert_eq!(unpack_agitation_flow(0.0), (0.0, [0, 0]));
+        // The lowest quantised flow clamps to -127, so a legitimate value never packs to zero.
+        assert!(pack_agitation_flow(0.0, [-128, -128]) > 0.0);
+    }
+
+    #[test]
+    fn a_fields_flow_reaches_its_texels() {
+        let mut f = WaterField::new([0.0, 0.0], 0.25, 8);
+        let i = 3 + 8 * 2;
+        f.agitation[i] = 0.4;
+        f.flow[i] = [8, -4];
+        let texels = f.texel_rect(3, 2, 1, 1);
+        let (a, flow) = unpack_agitation_flow(texels[0][3]);
+        assert!((a - 0.4).abs() < 0.01);
+        assert_eq!(flow, [8, -4]);
+        assert_eq!(
+            flow.map(|q| f32::from(q) * FLOW_UNIT_M_S),
+            [0.5, -0.25],
+            "units match the wire's 1/16 m/s"
+        );
+        // A still, dry cell reads as no flow.
+        assert_eq!(
+            unpack_agitation_flow(f.texel_rect(0, 0, 1, 1)[0][3]).1,
+            [0, 0]
+        );
     }
 }

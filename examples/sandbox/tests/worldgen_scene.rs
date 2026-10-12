@@ -277,7 +277,9 @@ fn measure_memory_by_stage() {
         peak()
     );
     let mut config = SimulationConfig::new(setup);
-    config.column_water = scene.column_water_setup().cloned();
+    if std::env::var("NOWATER").is_err() {
+        config.column_water = scene.column_water_setup().cloned();
+    }
     eprintln!(
         "mem water setup  now={:.2} GiB peak={:.2} GiB",
         now(),
