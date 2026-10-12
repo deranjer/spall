@@ -59,10 +59,8 @@ fn every_fertile_biome_hosts_five_living_plants_and_three_covers() {
     for b in Biome::EVERY {
         let (trees, ground, cover) = flora(b, &tops[b as usize]);
         let living = trees + ground;
-        // The bare biomes (snow, scree, beach) need 1 to 3 plants; the sea
-        // floor has none yet (no underwater plants are drawn).
+        // The bare biomes (snow, scree, beach) need 1 to 3 plants.
         let (need_living, need_cover) = match b {
-            Biome::Ocean => (0, 0),
             Biome::Snow | Biome::Scree | Biome::Beach => (3, 2),
             Biome::Desert => (5, 3),
             _ => (5, 3),
@@ -155,10 +153,12 @@ fn the_flora_really_fits_each_biomes_climate() {
                 let top = cols.stack(&palette, x, z).top.0;
                 let m = cols.moisture(x, z);
                 let t = cols.temperature_c(x, z).round() as i32;
+                let depth = cols.water_depth(x, z).clamp(0, 255) as u8;
                 for (i, s) in living.iter().enumerate() {
                     if s.biomes & bit != 0
                         && s.soils.contains(&top)
                         && (s.moisture[0]..=s.moisture[1]).contains(&m)
+                        && (s.depth[0]..=s.depth[1]).contains(&depth)
                     {
                         living_hits[b as usize][i] += 1;
                     }
@@ -167,6 +167,7 @@ fn the_flora_really_fits_each_biomes_climate() {
                     if c.biomes & bit != 0
                         && c.soils.contains(&top)
                         && (c.moisture[0]..=c.moisture[1]).contains(&m)
+                        && (c.depth[0]..=c.depth[1]).contains(&depth)
                         && (i32::from(c.temperature[0])..=i32::from(c.temperature[1])).contains(&t)
                     {
                         cover_hits[b as usize][i] += 1;
@@ -180,7 +181,6 @@ fn the_flora_really_fits_each_biomes_climate() {
         let living_kinds = living_hits[b as usize].iter().filter(|&&n| n >= 40).count();
         let cover_kinds = cover_hits[b as usize].iter().filter(|&&n| n >= 40).count();
         let (need_living, need_cover) = match b {
-            Biome::Ocean => (0, 0),
             Biome::Snow | Biome::Scree | Biome::Beach => (3, 2),
             _ => (5, 3),
         };

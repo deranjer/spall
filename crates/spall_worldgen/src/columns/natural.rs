@@ -365,9 +365,18 @@ fn ensure_every_biome(map: &mut ColumnMap) -> u16 {
 
 /// Biome of a column from climate and terrain (Whittaker-style): temperature
 /// `t` in degrees, wetness `m` in `0..=1`.
-fn classify(t: f64, m: f64, h: i32, gradient: f64, submerged: bool, river_dist: f64) -> Biome {
+fn classify(
+    t: f64,
+    m: f64,
+    h: i32,
+    gradient: f64,
+    submerged: bool,
+    sea: bool,
+    river_dist: f64,
+) -> Biome {
     if submerged {
-        return if river_dist <= 2.0 {
+        // Lakes and rivers are riparian water however wide; only the sea is ocean.
+        return if river_dist <= 2.0 || !sea {
             Biome::Riparian
         } else {
             Biome::Ocean
@@ -533,6 +542,7 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
                             map.height(xi, z),
                             map.gradient(xi, z),
                             map.is_water(xi, z),
+                            map.water_surface(xi, z) <= SEA_LEVEL + 1,
                             f64::from(map.river_dist(xi, z)),
                         );
                         b[x] = biome as u8;

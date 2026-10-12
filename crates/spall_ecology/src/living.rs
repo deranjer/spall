@@ -88,6 +88,9 @@ pub struct Species {
     pub biomes: u16,
     pub soils: [u16; 4],
     pub moisture: [u8; 2],
+    /// Water depth in cells the plant grows in: `[0, 0]` is dry land; anything
+    /// else lives under water (kelp, coral) and is never a tree.
+    pub depth: [u8; 2],
     pub wood: u16,
     pub trunk_width: u8,
     pub form: u8,
@@ -101,6 +104,9 @@ pub struct Species {
     pub seed_ms: u64,
 }
 impl Species {
+    fn accepts_depth(&self, depth: u8) -> bool {
+        (self.depth[0]..=self.depth[1]).contains(&depth)
+    }
     fn accepts(&self, biome: Biome, moisture: u8, soil: u16) -> bool {
         self.biomes & (1 << biome as u16) != 0
             && self.soils.contains(&soil)
@@ -206,6 +212,7 @@ impl SpeciesV1 {
             tree: self.tree,
             soils: self.soils,
             moisture: self.moisture,
+            depth: [0, 0],
             wood: self.wood,
             trunk_width: self.trunk_width,
             form: self.form,
@@ -281,6 +288,10 @@ pub fn hash(mut n: u64) -> u64 {
 }
 fn cell(p: [i64; 3]) -> GlobalCell {
     GlobalCell::new(p[0], p[1], p[2])
+}
+/// Water standing over the ground at the column, in cells (0 on land).
+fn depth_of(columns: &ColumnMap, x: i64, z: i64) -> u8 {
+    columns.water_depth(x, z).clamp(0, 255) as u8
 }
 fn moisture(columns: &ColumnMap, x: i64, z: i64) -> u8 {
     columns.moisture(x, z)
@@ -370,7 +381,7 @@ impl LivingState {
             || z >= i64::from(self.size) - 33
             || y < 1
             || y + i64::from(s.height) + 8 >= 351
-            || columns.is_water(x, z)
+            || !s.accepts_depth(depth_of(columns, x, z))
             || self
                 .spawns
                 .iter()
@@ -572,6 +583,7 @@ impl LivingState {
                 colours: s.colours,
                 evergreen: s.evergreen,
                 density: 96,
+                depth: [0, 0],
             })
             .collect();
         Self {
@@ -639,7 +651,9 @@ impl LivingState {
                 || s.id == 0
                 || s.biomes == 0
                 || s.biomes > ALL_BIOMES
-                || s.form > 13
+                || s.form > 17
+                || s.depth[0] > s.depth[1]
+                || (s.tree && s.depth[1] > 0)
                 || s.spacing == 0
                 || s.height == 0
                 || s.height > 64
@@ -746,7 +760,7 @@ impl LivingState {
                         columns.biome(p.root[0], p.root[2]),
                         moisture(columns, p.root[0], p.root[2]),
                         m.0,
-                    ) => {}
+                    ) && s.accepts_depth(depth_of(columns, p.root[0], p.root[2])) => {}
                 _ => {
                     p.alive = false;
                     continue;

@@ -22,7 +22,9 @@ fn generated_world_is_deterministic_grounded_and_biome_filtered() {
             .unwrap();
         let [x, y, z] = plant.root;
         assert!(s.biomes & (1 << a.world().columns.biome(x, z) as u8) != 0);
-        assert!(!a.world().columns.is_water(x, z));
+        // Land plants stand dry; underwater ones stand in their depth range.
+        let depth = a.world().columns.water_depth(x, z).clamp(0, 255) as u8;
+        assert!((s.depth[0]..=s.depth[1]).contains(&depth));
         assert!(
             matches!(a.world().terrain.sample(GlobalCell::new(x,y-1,z)),Ok(Sample::Filled(m)) if s.soils.contains(&m.0))
         );
@@ -498,4 +500,42 @@ fn a_cleared_column_is_forgotten_after_it_regrows() {
     state.clear_cover(7, 7);
     assert_eq!(state.cleared.len(), 1);
     assert!(state.cleared[0].at_s > first);
+}
+
+/// A natural world grows its underwater plants on the sea floor and nowhere
+/// dry, and its land plants stay out of the water.
+#[test]
+fn natural_worlds_grow_underwater_plants_only_in_water() {
+    let scene = sandbox::worldgen_scene::generate("natural", 4, 1024).unwrap();
+    let state = scene.vegetation();
+    let cols = &scene.world().columns;
+    let aquatic: Vec<u16> = state
+        .species
+        .iter()
+        .filter(|s| s.depth[1] > 0)
+        .map(|s| s.id)
+        .collect();
+    assert!(aquatic.len() >= 6, "{aquatic:?}");
+    let (mut wet, mut kinds) = (0, std::collections::BTreeSet::new());
+    for p in &state.organisms {
+        let depth = cols.water_depth(p.root[0], p.root[2]);
+        if aquatic.contains(&p.species) {
+            assert!(
+                depth >= 2,
+                "plant {} species {} in {depth} cells",
+                p.id,
+                p.species
+            );
+            wet += 1;
+            kinds.insert(p.species);
+        } else {
+            assert_eq!(
+                depth, 0,
+                "land plant {} species {} stands in water",
+                p.id, p.species
+            );
+        }
+    }
+    assert!(wet > 50, "only {wet} underwater plants");
+    assert!(kinds.len() >= 4, "only {kinds:?} grew");
 }

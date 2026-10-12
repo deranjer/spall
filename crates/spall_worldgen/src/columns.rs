@@ -379,6 +379,11 @@ impl ColumnMap {
         i32::from(self.water_surface[self.idx(x, z)])
     }
 
+    /// How deep the water stands over the ground in cells, 0 on dry ground.
+    pub fn water_depth(&self, x: i64, z: i64) -> i32 {
+        (self.water_surface(x, z) - self.height(x, z)).max(0)
+    }
+
     /// Whether water covers the column: its water surface is above the ground.
     pub fn is_water(&self, x: i64, z: i64) -> bool {
         self.water_surface(x, z) > self.height(x, z)

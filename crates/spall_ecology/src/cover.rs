@@ -121,11 +121,15 @@ pub struct CoverSpecies {
     pub evergreen: bool,
     /// Tufts per 256 cells where the species is the one chosen.
     pub density: u8,
+    /// Water depth in cells the species grows in: `[0, 0]` is dry land only,
+    /// anything else lives under water (seagrass, anemones, pondweed).
+    pub depth: [u8; 2],
 }
 
 impl CoverSpecies {
-    fn accepts(&self, biome: Biome, moisture: u8, temperature: i8, soil: u16) -> bool {
+    fn accepts(&self, biome: Biome, moisture: u8, temperature: i8, soil: u16, depth: u8) -> bool {
         self.biomes & (1 << biome as u16) != 0
+            && (self.depth[0]..=self.depth[1]).contains(&depth)
             && self.soils.contains(&soil)
             && (self.moisture[0]..=self.moisture[1]).contains(&moisture)
             && (self.temperature[0]..=self.temperature[1]).contains(&temperature)
@@ -141,6 +145,7 @@ impl CoverSpecies {
             || self.density == 0
             || self.moisture[0] > self.moisture[1]
             || self.temperature[0] > self.temperature[1]
+            || self.depth[0] > self.depth[1]
             || self
                 .colours
                 .iter()
@@ -165,7 +170,8 @@ pub struct Cover {
     pub key: u64,
 }
 
-/// The cover on `cell` (the open cell just above the soil), if any.
+/// The cover on `cell` (the open cell just above the soil), if any. `depth`
+/// is the water standing over the cell in cells, 0 on dry ground.
 ///
 /// Pure: the answer depends on nothing but the arguments. `surface_material`
 /// is the soil under the cell, `moisture` is 0..=255, `temperature_c` is the
@@ -182,16 +188,14 @@ pub fn ground_cover(
     temperature_c: i8,
     biome: Biome,
     season: Season,
+    depth: u8,
 ) -> Option<Cover> {
-    if biome == Biome::Ocean {
-        return None;
-    }
     let key =
         hash(seed ^ (cell[0] as u64).rotate_left(21) ^ (cell[2] as u64).rotate_left(43) ^ 0xC0FE);
     let mut fits = [0usize; MAX_COVER_SPECIES];
     let mut n = 0;
     for (i, s) in set.iter().enumerate().take(MAX_COVER_SPECIES) {
-        if s.accepts(biome, moisture, temperature_c, surface_material) {
+        if s.accepts(biome, moisture, temperature_c, surface_material, depth) {
             fits[n] = i;
             n += 1;
         }
@@ -237,6 +241,7 @@ pub struct CoverGrid {
     biome: Vec<u8>,
     moisture: Vec<u8>,
     temperature: Vec<u8>,
+    water: Vec<u8>,
 }
 
 fn rle_push(out: &mut Vec<u8>, plane: &[u8]) {
@@ -263,7 +268,8 @@ impl CoverField {
     pub fn from_columns(columns: &ColumnMap) -> Self {
         let size = i64::from(columns.size());
         let width = ((size + FIELD_CELLS - 1) / FIELD_CELLS) as usize;
-        let (mut biome, mut moisture, mut temperature) = (
+        let (mut biome, mut moisture, mut temperature, mut water) = (
+            Vec::with_capacity(width * width),
             Vec::with_capacity(width * width),
             Vec::with_capacity(width * width),
             Vec::with_capacity(width * width),
@@ -272,6 +278,26 @@ impl CoverField {
             for gx in 0..width as i64 {
                 let x = (gx * FIELD_CELLS + FIELD_CELLS / 2).min(size - 1);
                 let z = (gz * FIELD_CELLS + FIELD_CELLS / 2).min(size - 1);
+                // The highest water level among nine samples, in steps of two
+                // cells (0: none), so a river narrower than a square still shows.
+                let mut level = 0;
+                for (dx, dz) in [
+                    (0, 0),
+                    (-5, -5),
+                    (0, -5),
+                    (5, -5),
+                    (-5, 0),
+                    (5, 0),
+                    (-5, 5),
+                    (0, 5),
+                    (5, 5),
+                ] {
+                    let (sx, sz) = ((x + dx).clamp(0, size - 1), (z + dz).clamp(0, size - 1));
+                    if columns.is_water(sx, sz) {
+                        level = level.max(i64::from(columns.water_surface(sx, sz)) / 2 + 1);
+                    }
+                }
+                water.push(level.clamp(0, 255) as u8);
                 biome.push(columns.biome(x, z) as u8);
                 moisture.push(columns.moisture(x, z) >> 3);
                 temperature.push(
@@ -284,6 +310,7 @@ impl CoverField {
         rle_push(&mut rle, &biome);
         rle_push(&mut rle, &moisture);
         rle_push(&mut rle, &temperature);
+        rle_push(&mut rle, &water);
         Self {
             width: width as u32,
             rle,
@@ -292,7 +319,7 @@ impl CoverField {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.width > MAX_FIELD_WIDTH
-            || self.rle.len() > 3 * 2 * (MAX_FIELD_WIDTH as usize).pow(2)
+            || self.rle.len() > 4 * 2 * (MAX_FIELD_WIDTH as usize).pow(2)
         {
             return Err("cover field limits".into());
         }
@@ -303,7 +330,7 @@ impl CoverField {
         self.validate()?;
         let width = self.width as usize;
         let cells = width * width;
-        let mut planes: [Vec<u8>; 3] = std::array::from_fn(|_| Vec::with_capacity(cells));
+        let mut planes: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::with_capacity(cells));
         let mut pairs = self.rle.chunks_exact(2);
         for plane in &mut planes {
             while plane.len() < cells {
@@ -319,7 +346,7 @@ impl CoverField {
         if pairs.next().is_some() || !self.rle.len().is_multiple_of(2) {
             return Err("cover field trailing bytes".into());
         }
-        let [biome, moisture, temperature] = planes;
+        let [biome, moisture, temperature, water] = planes;
         if biome.iter().any(|b| usize::from(*b) >= Biome::EVERY.len()) {
             return Err("cover field biome".into());
         }
@@ -328,6 +355,7 @@ impl CoverField {
             biome,
             moisture,
             temperature,
+            water,
         })
     }
 }
@@ -335,6 +363,18 @@ impl CoverField {
 impl CoverGrid {
     pub fn width(&self) -> usize {
         self.width
+    }
+
+    /// The water level near cell `(x, z)` as the `y` of its top water cell, or
+    /// 0 where the raster shows no water.
+    pub fn water_at(&self, x: i64, z: i64) -> i64 {
+        let last = self.width as i64 - 1;
+        let i = (z.div_euclid(FIELD_CELLS).clamp(0, last) as usize) * self.width
+            + x.div_euclid(FIELD_CELLS).clamp(0, last) as usize;
+        match self.water[i] {
+            0 => 0,
+            v => (i64::from(v) - 1) * 2,
+        }
     }
 
     /// The climate at cell `(x, z)`: biome, moisture 0..=255, temperature C.
@@ -445,6 +485,10 @@ pub fn ground_parts(
         }
         return;
     }
+    if matches!(form, 14..=17) {
+        aquatic_parts(form, height, colour, flower, key, base, detail, out);
+        return;
+    }
     let blades = match (detail, form) {
         (Detail::Coarse, 12) => 5,
         (Detail::Coarse, _) => 3,
@@ -492,6 +536,146 @@ pub fn ground_parts(
                 },
                 colour: if form == 7 { 7 } else { flower },
                 yaw,
+                lean: 0.,
+            });
+        }
+    }
+}
+
+/// A tilted thin box standing on `base`, offset by `(dx, dz)`, leaning `lean`
+/// radians towards its yaw: one blade, frond or coral branch.
+#[allow(clippy::too_many_arguments)]
+fn lean_part(
+    base: [f32; 3],
+    offset: [f32; 2],
+    h: f32,
+    lean: f32,
+    yaw: f32,
+    size_xz: [f32; 2],
+    colour: u8,
+    out: &mut Vec<SoftPart>,
+) {
+    out.push(SoftPart {
+        center: [
+            base[0] + offset[0] - h * lean.sin() * yaw.cos() / 2.,
+            base[1] + (h * lean.cos() + size_xz[0] * lean.sin()) / 2.,
+            base[2] + offset[1] + h * lean.sin() * yaw.sin() / 2.,
+        ],
+        size: [size_xz[0], h, size_xz[1]],
+        colour,
+        yaw,
+        lean,
+    });
+}
+
+/// Underwater growth. Forms: 14 kelp (tall straight fronds with float pods),
+/// 15 branching coral, 16 sea fan (spokes in one plane), 17 barrel sponge.
+/// `colour` is the body, `flower` the tips, pods or rim.
+#[allow(clippy::too_many_arguments)]
+fn aquatic_parts(
+    form: u8,
+    height: f32,
+    colour: u8,
+    tip: u8,
+    key: u64,
+    base: [f32; 3],
+    detail: Detail,
+    out: &mut Vec<SoftPart>,
+) {
+    let full = detail == Detail::Full;
+    let frac = |k: u64, n: u64| (k % n) as f32 / n as f32;
+    match form {
+        14 => {
+            for i in 0..if full { 5_u64 } else { 2 } {
+                let k = hash(key ^ i);
+                let off = [
+                    (frac(k, 101) - 0.5) * 0.24,
+                    (frac(k >> 9, 101) - 0.5) * 0.24,
+                ];
+                let h = height * (0.75 + 0.5 * frac(k >> 17, 50));
+                let lean = 0.03 + 0.12 * frac(k >> 25, 30);
+                let yaw = frac(k >> 33, 628) * std::f32::consts::TAU;
+                lean_part(base, off, h, lean, yaw, [0.05, 0.03], colour, out);
+                // A float pod near the top of the frond.
+                out.push(SoftPart {
+                    center: [
+                        base[0] + off[0] - h * 0.85 * lean.sin() * yaw.cos(),
+                        base[1] + h * 0.85 * lean.cos(),
+                        base[2] + off[1] + h * 0.85 * lean.sin() * yaw.sin(),
+                    ],
+                    size: [0.07, 0.07, 0.07],
+                    colour: tip,
+                    yaw,
+                    lean: 0.,
+                });
+            }
+        }
+        15 => {
+            lean_part(
+                base,
+                [0., 0.],
+                height * 0.4,
+                0.,
+                0.,
+                [0.08, 0.08],
+                colour,
+                out,
+            );
+            let count = if full { 7_u64 } else { 4 };
+            for i in 0..count {
+                let k = hash(key ^ (i + 40));
+                let yaw = i as f32 * std::f32::consts::TAU / count as f32;
+                let lean = 0.45 + 0.35 * frac(k, 40);
+                let h = height * (0.55 + 0.4 * frac(k >> 11, 40));
+                let off = [0., 0.];
+                let b = [base[0], base[1] + height * 0.25, base[2]];
+                lean_part(b, off, h, lean, yaw, [0.055, 0.055], colour, out);
+                out.push(SoftPart {
+                    center: [
+                        b[0] - h * lean.sin() * yaw.cos(),
+                        b[1] + h * lean.cos(),
+                        b[2] + h * lean.sin() * yaw.sin(),
+                    ],
+                    size: [0.08, 0.05, 0.08],
+                    colour: tip,
+                    yaw,
+                    lean: 0.,
+                });
+            }
+        }
+        16 => {
+            let yaw = frac(key, 628) * std::f32::consts::TAU;
+            let spokes: i32 = if full { 9 } else { 5 };
+            for i in 0..spokes {
+                let lean = (i - spokes / 2) as f32 * (1.7 / spokes as f32);
+                let h = height * (0.9 - 0.12 * (lean.abs() / 0.85));
+                lean_part(base, [0., 0.], h, lean, yaw, [0.035, 0.012], colour, out);
+            }
+            // The rim joining the spokes' tips.
+            out.push(SoftPart {
+                center: [base[0], base[1] + height * 0.85, base[2]],
+                size: [height * 1.1, 0.02, 0.02],
+                colour: tip,
+                yaw: yaw + std::f32::consts::FRAC_PI_2,
+                lean: 0.,
+            });
+        }
+        _ => {
+            let s = height / 0.3;
+            for (w, h, y) in [(0.16, 0.12, 0.06), (0.21, 0.15, 0.19), (0.18, 0.1, 0.31)] {
+                out.push(SoftPart {
+                    center: [base[0], base[1] + y * s, base[2]],
+                    size: [w * s.sqrt(), h * s, w * s.sqrt()],
+                    colour,
+                    yaw: frac(key, 628) * std::f32::consts::TAU,
+                    lean: 0.,
+                });
+            }
+            out.push(SoftPart {
+                center: [base[0], base[1] + 0.37 * s, base[2]],
+                size: [0.14 * s.sqrt(), 0.03, 0.14 * s.sqrt()],
+                colour: tip,
+                yaw: 0.,
                 lean: 0.,
             });
         }
@@ -555,6 +739,9 @@ pub fn cover_parts(
                 let jx = (thin >> 8) as i64 % 9 - 4;
                 let jz = (thin >> 20) as i64 % 9 - 4;
                 let (biome, moisture, temperature) = grid.at(x + jx, z + jz);
+                // Water standing over this cell, from the raster's level.
+                let level = grid.water_at(x + jx, z + jz);
+                let depth = if level >= y { level - y + 1 } else { 0 }.min(255) as u8;
                 let Some(c) = ground_cover(
                     set,
                     seed,
@@ -564,6 +751,7 @@ pub fn cover_parts(
                     temperature,
                     biome,
                     season,
+                    depth,
                 ) else {
                     continue;
                 };
@@ -603,6 +791,7 @@ mod tests {
                 colours: [3, 1, 7, 8],
                 evergreen: true,
                 density: 128,
+                depth: [0, 0],
             },
             CoverSpecies {
                 id: 19,
@@ -615,6 +804,7 @@ mod tests {
                 colours: [15, 15, 7, 8],
                 evergreen: true,
                 density: 255,
+                depth: [0, 0],
             },
         ]
     }
@@ -622,7 +812,19 @@ mod tests {
     #[test]
     fn cover_is_a_pure_function_of_its_inputs() {
         let s = set();
-        let at = |x, z| ground_cover(&s, 7, [x, 10, z], 1, 120, 15, Biome::Meadow, Season::Summer);
+        let at = |x, z| {
+            ground_cover(
+                &s,
+                7,
+                [x, 10, z],
+                1,
+                120,
+                15,
+                Biome::Meadow,
+                Season::Summer,
+                0,
+            )
+        };
         let first: Vec<_> = (0..200).map(|i| at(i, i * 3)).collect();
         let again: Vec<_> = (0..200).map(|i| at(i, i * 3)).collect();
         assert_eq!(first, again);
@@ -640,6 +842,7 @@ mod tests {
                     15,
                     Biome::Meadow,
                     Season::Summer,
+                    0,
                 )
             })
             .collect::<Vec<_>>();
@@ -661,6 +864,7 @@ mod tests {
                         temp,
                         biome,
                         Season::Summer,
+                        0,
                     )
                 })
                 .count()
@@ -691,6 +895,7 @@ mod tests {
             colours: [3, 1, 7, 8],
             evergreen: true,
             density: 128,
+            depth: [0, 0],
         });
         let at = |moisture: u8| {
             let mut tufts = 0;
@@ -705,6 +910,7 @@ mod tests {
                     15,
                     Biome::Meadow,
                     Season::Summer,
+                    0,
                 ) {
                     tufts += 1;
                     kinds.insert(c.species);
@@ -728,7 +934,9 @@ mod tests {
         let s = set();
         let at = |season| {
             (0..400)
-                .find_map(|i| ground_cover(&s, 1, [i, 4, 2 * i], 1, 120, 15, Biome::Meadow, season))
+                .find_map(|i| {
+                    ground_cover(&s, 1, [i, 4, 2 * i], 1, 120, 15, Biome::Meadow, season, 0)
+                })
                 .unwrap()
         };
         assert_eq!(at(Season::Summer).colour, 1);
@@ -742,6 +950,7 @@ mod tests {
         rle_push(&mut rle, &vec![biome; cells]);
         rle_push(&mut rle, &vec![moisture_q; cells]);
         rle_push(&mut rle, &vec![temp_q; cells]);
+        rle_push(&mut rle, &vec![0; cells]);
         CoverField { width, rle }
     }
 
@@ -873,6 +1082,132 @@ mod tests {
             top(&medium),
             top(&full)
         );
+    }
+
+    #[test]
+    fn land_cover_stays_dry_and_underwater_cover_needs_its_depth() {
+        let mut s = set();
+        s.push(CoverSpecies {
+            id: 80,
+            biomes: 1 << Biome::Ocean as u16,
+            soils: [1, 0, 0, 0],
+            moisture: [0, 255],
+            temperature: [-20, 62],
+            form: 6,
+            height: 2,
+            colours: [20, 20, 20, 20],
+            evergreen: true,
+            density: 255,
+            depth: [2, 30],
+        });
+        let at = |biome, depth| {
+            (0..300)
+                .filter_map(|i| {
+                    ground_cover(
+                        &s,
+                        4,
+                        [i, 4, i * 5],
+                        1,
+                        120,
+                        15,
+                        biome,
+                        Season::Summer,
+                        depth,
+                    )
+                })
+                .map(|c| c.species)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert!(
+            at(Biome::Meadow, 0).contains(&11),
+            "land cover on dry ground"
+        );
+        assert!(
+            at(Biome::Meadow, 1).is_empty(),
+            "never in water, even a film"
+        );
+        assert!(at(Biome::Ocean, 0).is_empty(), "no seagrass on land");
+        assert!(at(Biome::Ocean, 1).is_empty(), "too shallow for seagrass");
+        assert_eq!(at(Biome::Ocean, 8), [80].into(), "seagrass in the sea");
+        assert!(at(Biome::Ocean, 31).is_empty(), "too deep");
+    }
+
+    #[test]
+    fn cover_under_a_water_level_in_the_raster_is_drawn_only_where_it_is_deep_enough() {
+        let mut s = set();
+        s.push(CoverSpecies {
+            id: 80,
+            biomes: 1 << Biome::Ocean as u16,
+            soils: [1, 0, 0, 0],
+            moisture: [0, 255],
+            temperature: [-20, 62],
+            form: 6,
+            height: 2,
+            colours: [20, 20, 20, 20],
+            evergreen: true,
+            density: 255,
+            depth: [2, 60],
+        });
+        // An ocean raster whose water level is the top cell at y = 20.
+        let (width, cells) = (64u32, 64usize * 64);
+        let mut rle = Vec::new();
+        rle_push(&mut rle, &vec![Biome::Ocean as u8; cells]);
+        rle_push(&mut rle, &vec![15; cells]);
+        rle_push(&mut rle, &vec![38; cells]);
+        rle_push(&mut rle, &vec![11; cells]);
+        let g = CoverField { width, rle }.expand().unwrap();
+        assert_eq!(g.water_at(100, 100), 20);
+        let eye = [128.0, 8.0, 128.0];
+        let run = |floor: i64| {
+            let mut surface = |_x: i64, _z: i64| Some((floor, 1_u16));
+            cover_parts(
+                &g,
+                &s,
+                3,
+                Season::Summer,
+                eye,
+                30.0,
+                &mut surface,
+                &CoverMemory::default(),
+                5_000,
+            )
+        };
+        assert!(!run(10).is_empty(), "10 cells down is deep enough");
+        assert!(run(20).is_empty(), "a single cell of water is too shallow");
+        assert!(
+            run(25).is_empty(),
+            "above the water level it is dry, and land cover needs the land biome"
+        );
+    }
+
+    #[test]
+    fn every_underwater_form_draws_and_the_coarse_form_draws_less() {
+        for form in 14..=17 {
+            let draw = |detail| {
+                let mut out = Vec::new();
+                ground_parts(
+                    form,
+                    0.4,
+                    20,
+                    18,
+                    Season::Summer,
+                    77,
+                    [1.0, 2.0, 3.0],
+                    detail,
+                    &mut out,
+                );
+                out
+            };
+            let (full, coarse) = (draw(Detail::Full), draw(Detail::Coarse));
+            assert!(!full.is_empty(), "form {form}");
+            assert!(coarse.len() <= full.len(), "form {form}");
+            for p in &full {
+                assert!(p.center.iter().all(|v| v.is_finite()) && p.size.iter().all(|v| *v > 0.0));
+                // Grows up from the seabed it stands on, not down through it.
+                assert!(p.center[1] >= 2.0 - 0.1, "form {form} dips below the floor");
+            }
+            assert_eq!(draw(Detail::Full).len(), full.len(), "deterministic");
+        }
     }
 
     #[test]

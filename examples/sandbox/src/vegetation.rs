@@ -110,6 +110,23 @@ pub fn name(id: u16) -> &'static str {
         64 => "Lingonberry",
         65 => "Wood sorrel",
         66 => "Pennywort",
+        70 => "Kelp",
+        71 => "Staghorn coral",
+        72 => "Sea fan",
+        73 => "Elkhorn coral",
+        74 => "Brain coral",
+        75 => "Barrel sponge",
+        76 => "Hornwort",
+        77 => "Eelweed",
+        80 => "Seagrass",
+        81 => "Eelgrass",
+        82 => "Sea anemone",
+        83 => "Algae mat",
+        84 => "Coral rubble",
+        85 => "Sea lettuce",
+        86 => "Pondweed",
+        87 => "Water milfoil",
+        88 => "Pond algae",
         _ => "Unknown",
     }
 }
@@ -450,6 +467,7 @@ pub fn catalogue() -> Vec<Species> {
                     biomes: mask(biomes),
                     soils,
                     moisture,
+                    depth: [0, 0],
                     wood: 124 + (id - 1) % 12,
                     trunk_width: if [1, 5, 8, 9, 21, 30].contains(&id) {
                         2
@@ -741,6 +759,7 @@ pub fn catalogue() -> Vec<Species> {
                 biomes: mask(biomes),
                 soils,
                 moisture,
+                depth: [0, 0],
                 wood: 0,
                 trunk_width: 0,
                 form,
@@ -755,7 +774,154 @@ pub fn catalogue() -> Vec<Species> {
             }
         },
     ));
+    out.extend(aquatic_catalogue());
     out
+}
+
+/// Plants that live under water: kelp, corals, sponges and freshwater weeds.
+/// Interactive like the other living plants (they grow, seed, can be
+/// harvested and die with their seabed); the underwater carpet is in
+/// [`cover_catalogue`]. Depths are in cells (four to the metre).
+fn aquatic_catalogue() -> Vec<Species> {
+    use Biome::*;
+    let p = crate::game::terrain_palette();
+    let seabed = [p.sand.0, p.gravel.0, p.clay.0, p.sandstone.0];
+    let lakebed = [p.gravel.0, p.mud.0, p.clay.0, p.dirt.0];
+    // (id, biomes, soils, depth, form, height, spread, spacing, colours, tip)
+    // Forms: 12 cushion, 14 kelp, 15 branching coral, 16 sea fan, 17 barrel sponge.
+    type Row = (
+        u16,
+        &'static [Biome],
+        [u16; 4],
+        [u8; 2],
+        u8,
+        u16,
+        u16,
+        u16,
+        [u8; 4],
+        u8,
+    );
+    let rows: [Row; 8] = [
+        (
+            70,
+            &[Ocean],
+            seabed,
+            [6, 80],
+            14,
+            16,
+            3,
+            7,
+            [OLIVE, MOSS, OLIVE, MOSS],
+            BROWN,
+        ),
+        (
+            71,
+            &[Ocean],
+            seabed,
+            [3, 40],
+            15,
+            6,
+            4,
+            6,
+            [AMBER, AMBER, AMBER, AMBER],
+            YELLOW,
+        ),
+        (
+            72,
+            &[Ocean],
+            seabed,
+            [4, 60],
+            16,
+            5,
+            4,
+            8,
+            [ROSE, ROSE, ROSE, ROSE],
+            MAROON,
+        ),
+        (
+            73,
+            &[Ocean],
+            seabed,
+            [2, 24],
+            15,
+            5,
+            4,
+            7,
+            [VIOLET, VIOLET, VIOLET, VIOLET],
+            ROSE,
+        ),
+        (
+            74,
+            &[Ocean],
+            seabed,
+            [2, 30],
+            12,
+            2,
+            3,
+            5,
+            [LICHEN, TAN, LICHEN, TAN],
+            ROSE,
+        ),
+        (
+            75,
+            &[Ocean],
+            seabed,
+            [12, 120],
+            17,
+            4,
+            3,
+            10,
+            [MAROON, MAROON, MAROON, MAROON],
+            DARK_BROWN,
+        ),
+        (
+            76,
+            &[Riparian],
+            lakebed,
+            [2, 24],
+            14,
+            5,
+            3,
+            5,
+            [MOSS, MOSS, MOSS, MOSS],
+            OLIVE,
+        ),
+        (
+            77,
+            &[Riparian, Swamp],
+            lakebed,
+            [3, 30],
+            14,
+            8,
+            3,
+            6,
+            [GREEN, GREEN, OLIVE, OLIVE],
+            MOSS,
+        ),
+    ];
+    rows.into_iter()
+        .map(
+            |(id, biomes, soils, depth, form, height, spread, spacing, colours, tip)| Species {
+                id,
+                tree: false,
+                biomes: mask(biomes),
+                soils,
+                moisture: [0, 255],
+                depth,
+                wood: 0,
+                trunk_width: 0,
+                form,
+                height,
+                spread,
+                spacing,
+                evergreen: true,
+                colours,
+                flower: tip,
+                growth_ms: 1000,
+                seed_ms: 60_000,
+            },
+        )
+        .collect()
 }
 
 /// The sandbox's stateless ground cover: the carpet. Forms: 6 blades, 9 sedge,
@@ -1060,6 +1226,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
                     biomes: mask(biomes),
                     soils,
                     moisture,
+                    depth: [0, 0],
                     temperature,
                     form,
                     height,
@@ -1067,6 +1234,138 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
                     evergreen,
                     density,
                 }
+            },
+        )
+        .collect::<Vec<_>>()
+        .into_iter()
+        .chain(aquatic_cover())
+        .collect()
+}
+
+/// The underwater carpet: seagrass, anemones, algae. Like all cover it is
+/// stateless; the destroyed-cover record and regrowth apply to it too.
+fn aquatic_cover() -> Vec<CoverSpecies> {
+    use Biome::*;
+    let p = crate::game::terrain_palette();
+    let seabed = [p.sand.0, p.gravel.0, p.clay.0, p.sandstone.0];
+    let lakebed = [p.gravel.0, p.mud.0, p.clay.0, p.dirt.0];
+    // (id, biomes, soils, depth, form, height, colours, density)
+    type Row = (
+        u16,
+        &'static [Biome],
+        [u16; 4],
+        [u8; 2],
+        u8,
+        u16,
+        [u8; 4],
+        u8,
+    );
+    let rows: [Row; 9] = [
+        (
+            80,
+            &[Ocean],
+            seabed,
+            [1, 24],
+            6,
+            2,
+            [MOSS, GREEN, MOSS, OLIVE],
+            150,
+        ),
+        (
+            81,
+            &[Ocean],
+            seabed,
+            [2, 40],
+            9,
+            4,
+            [GREEN, DEEP, GREEN, OLIVE],
+            110,
+        ),
+        (
+            82,
+            &[Ocean],
+            seabed,
+            [3, 50],
+            11,
+            1,
+            [ROSE, VIOLET, ROSE, VIOLET],
+            60,
+        ),
+        (
+            83,
+            &[Ocean],
+            seabed,
+            [1, 120],
+            12,
+            1,
+            [OLIVE, OLIVE, BROWN, BROWN],
+            100,
+        ),
+        (
+            84,
+            &[Ocean],
+            seabed,
+            [6, 150],
+            12,
+            1,
+            [GREY, LICHEN, GREY, LICHEN],
+            70,
+        ),
+        (
+            85,
+            &[Ocean],
+            seabed,
+            [1, 16],
+            11,
+            1,
+            [LIGHT, LIGHT, MOSS, MOSS],
+            70,
+        ),
+        (
+            86,
+            &[Riparian],
+            lakebed,
+            [2, 40],
+            6,
+            3,
+            [MOSS, GREEN, OLIVE, BROWN],
+            130,
+        ),
+        (
+            87,
+            &[Riparian],
+            lakebed,
+            [2, 30],
+            11,
+            2,
+            [MOSS, MOSS, OLIVE, OLIVE],
+            90,
+        ),
+        (
+            88,
+            &[Riparian],
+            lakebed,
+            [1, 60],
+            12,
+            1,
+            [OLIVE, OLIVE, BROWN, BROWN],
+            110,
+        ),
+    ];
+    rows.into_iter()
+        .map(
+            |(id, biomes, soils, depth, form, height, colours, density)| CoverSpecies {
+                id,
+                biomes: mask(biomes),
+                soils,
+                moisture: [0, 255],
+                temperature: [-20, 62],
+                form,
+                height,
+                colours,
+                evergreen: true,
+                density,
+                depth,
             },
         )
         .collect()
