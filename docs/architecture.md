@@ -412,6 +412,10 @@ Vegetation has two owners. **Living** plants (trees, reeds, ferns, flowers, unde
 
 The water solver may keep deep still ocean regions dormant (`ColumnConfig::lazy_ocean`): a per-column record revived with exact volume when touched. Dormant regions are an allocation detail; the replicated and saved water state is unchanged.
 
+### Sun shadow cascades are cached (renderer)
+
+Each of the four sun cascades is a light-space box around a sphere centred on the camera, sized to hold everything its slice of the view frustum can show in any direction. The box therefore depends on the camera's position and the sun alone: turning does not change it, and moving changes it only when the centre crosses a snap step of about 8% of the cascade's reach (a multiple of its texel). Each cascade keeps its terrain-only depth between frames (`shadow_static` layers) and redraws the terrain only when its box moved or the terrain meshes changed; every frame the kept depth is copied into the sampled layer and the moving casters (bodies, instanced cubes, vegetation) are drawn over it. Measured on a 4096-cell natural world (about 3,000 resident chunks, 4.4 M triangles, one development GPU): terrain draws in the cascades were 10.3 ms of a 16.4 ms frame; standing 16.4 -> 8.1 ms (61 -> 123 fps), walking a scripted loop 19.5 -> 14.1 ms (53 -> 73 fps). Resolution is about 30% coarser than the frustum-fitted cascades it replaced; far cascades redraw every few metres of travel, the nearest about every metre.
+
 The renderer's camera-local lighting cache relights in slices: sky visibility once, then the bounce in interleaved strides sized from measured GPU cost, and a camera recentre scrolls the cache and relights only the entered strip. This changes cost, not the cache contract above (derived, camera-local, never authoritative). Editor world-generation previews are drawn from the same `ColumnMap` the server builds; layers are diagnostics, not a second generator (`docs/worldgen.md`).
 
 ### ENG-122 reconstructed support diagnostic (2026-10-04)

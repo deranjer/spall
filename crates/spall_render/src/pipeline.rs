@@ -200,7 +200,11 @@ pub struct ScenePipeline {
     point_lights: std::sync::Mutex<Vec<PointLight>>,
     shadow_globals_buffers: Vec<wgpu::Buffer>,
     tone_globals_buffer: wgpu::Buffer,
-    _shadow_texture: wgpu::Texture,
+    shadow_texture: wgpu::Texture,
+    /// The terrain-only depth of each cascade, kept between frames and copied
+    /// into `shadow_texture` before the moving casters are drawn on top.
+    shadow_static_texture: wgpu::Texture,
+    shadow_static_layer_views: Vec<wgpu::TextureView>,
     shadow_sample_view: wgpu::TextureView,
     shadow_layer_views: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
@@ -433,9 +437,37 @@ impl ScenePipeline {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
+        let shadow_static_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("spall-sun-shadow-static-cascades"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: CASCADE_COUNT as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let shadow_static_layer_views = (0..CASCADE_COUNT)
+            .map(|layer| {
+                shadow_static_texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("spall-shadow-static-layer-view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer as u32,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
         let shadow_sample_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("spall-shadow-array-view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -507,7 +539,9 @@ impl ScenePipeline {
             point_lights: std::sync::Mutex::new(Vec::new()),
             shadow_globals_buffers,
             tone_globals_buffer,
-            _shadow_texture: shadow_texture,
+            shadow_texture,
+            shadow_static_texture,
+            shadow_static_layer_views,
             shadow_sample_view,
             shadow_layer_views,
             shadow_sampler,
@@ -616,6 +650,35 @@ impl ScenePipeline {
     }
     pub fn shadow_layer(&self, index: usize) -> &wgpu::TextureView {
         &self.shadow_layer_views[index]
+    }
+
+    /// The retained terrain-only depth layer of a cascade.
+    pub fn shadow_static_layer(&self, index: usize) -> &wgpu::TextureView {
+        &self.shadow_static_layer_views[index]
+    }
+
+    /// Copies a cascade's retained terrain depth into the layer the scene
+    /// samples, ready for the moving casters to be drawn over it.
+    pub fn copy_static_shadow(&self, encoder: &mut wgpu::CommandEncoder, cascade: usize) {
+        let layer = |texture| wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: cascade as u32,
+            },
+            aspect: wgpu::TextureAspect::DepthOnly,
+        };
+        encoder.copy_texture_to_texture(
+            layer(&self.shadow_static_texture),
+            layer(&self.shadow_texture),
+            wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     pub(crate) fn indirect_resources(
@@ -1370,6 +1433,17 @@ fn opaque_primitive() -> wgpu::PrimitiveState {
     }
 }
 
+/// The four sun cascades and their split distances.
+///
+/// Each cascade is a box in light space around a *sphere centred on the
+/// camera*, big enough to hold everything the cascade's slice of the view
+/// frustum can show whichever way the camera looks. The box depends on the
+/// camera's position and the sun alone: turning the camera changes nothing,
+/// and moving it changes the box only when the centre crosses a step of
+/// about 8% of the cascade's reach (a multiple of its texel, so shadow edges
+/// never swim). A cascade whose box is unchanged and whose terrain is
+/// unchanged keeps its terrain depth from the last frame
+/// ([`crate::game_renderer`]), which is most frames for the far cascades.
 fn cascade_data(camera: &Camera, sun_dir: Vec3) -> ([Mat4; CASCADE_COUNT], [f32; 4]) {
     let near = camera.z_near.max(0.01);
     let far = camera.z_far.max(near + 0.01);
@@ -1381,32 +1455,38 @@ fn cascade_data(camera: &Camera, sun_dir: Vec3) -> ([Mat4; CASCADE_COUNT], [f32;
         *split = log * 0.65 + uniform * 0.35;
     }
 
+    // Farthest a point at view depth `d` can be from the camera: `d` times
+    // the length of the frustum's corner ray.
+    let tan_h = (camera.fov_y * 0.5).tan();
+    let tan_w = tan_h * camera.aspect;
+    let corner = (1.0 + tan_h * tan_h + tan_w * tan_w).sqrt();
+
+    let sun = sun_dir.normalize();
+    let up = if sun.dot(Vec3::Y).abs() > 0.95 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    // The light view's own axes, so the snapping below is exactly in them.
+    let right = sun.cross(up).normalize();
+    let light_up = right.cross(sun);
+
     let mut matrices = [Mat4::IDENTITY; CASCADE_COUNT];
-    let mut slice_near = near;
     for i in 0..CASCADE_COUNT {
-        let slice_far = splits[i];
-        let centre_depth = (slice_near + slice_far) * 0.5;
-        let centre = camera.position + camera.forward() * centre_depth;
-        let far_half_h = (camera.fov_y * 0.5).tan() * slice_far;
-        let far_half_w = far_half_h * camera.aspect;
-        let depth_radius = (slice_far - slice_near) * 0.5;
-        let radius =
-            (far_half_w * far_half_w + far_half_h * far_half_h + depth_radius * depth_radius)
-                .sqrt()
-                .max(1.0);
+        let reach = (splits[i] * corner).max(1.0);
+        let step_wanted = reach * 0.08;
+        let radius = reach + step_wanted * 3.0;
         let texel = (radius * 2.0) / SHADOW_MAP_SIZE as f32;
-        let centre = (centre / texel).round() * texel;
-        let light_eye = centre - sun_dir.normalize() * radius * 2.5;
-        let up = if sun_dir.normalize().dot(Vec3::Y).abs() > 0.95 {
-            Vec3::Z
-        } else {
-            Vec3::Y
-        };
+        let step = (step_wanted / texel).ceil() * texel;
+        let snap = |v: f32| (v / step).round() * step;
+        let p = camera.position;
+        let centre =
+            right * snap(p.dot(right)) + light_up * snap(p.dot(light_up)) + sun * snap(p.dot(sun));
+        let light_eye = centre - sun * radius * 2.5;
         let light_view = rh::view::look_at_mat4(light_eye, centre, up);
         let light_proj =
             rh::proj::directx::orthographic(-radius, radius, -radius, radius, 0.0, radius * 5.0);
         matrices[i] = light_proj * light_view;
-        slice_near = slice_far;
     }
     (matrices, splits)
 }
@@ -1433,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn cascade_matrices_are_finite_and_stable_for_sub_texel_camera_motion() {
+    fn cascade_matrices_are_finite_and_stable_for_small_camera_motion() {
         let camera = Camera {
             position: Vec3::new(3.0, 4.0, 8.0),
             z_far: 100.0,
@@ -1447,6 +1527,104 @@ mod tests {
         };
         let (b, _) = cascade_data(&moved, default_sun_dir());
         assert!((a[0] - b[0]).abs_diff_eq(Mat4::ZERO, 1.0e-4));
+    }
+
+    #[test]
+    fn turning_the_camera_does_not_change_any_cascade() {
+        let camera = Camera {
+            position: Vec3::new(30.0, 12.0, -8.0),
+            z_far: 120.0,
+            ..Default::default()
+        };
+        let (a, splits_a) = cascade_data(&camera, default_sun_dir());
+        for yaw in [0.3_f32, 1.7, -2.4] {
+            let (b, splits_b) = cascade_data(
+                &Camera {
+                    yaw,
+                    pitch: 0.4,
+                    ..camera
+                },
+                default_sun_dir(),
+            );
+            assert_eq!(a, b, "yaw {yaw}");
+            assert_eq!(splits_a, splits_b);
+        }
+    }
+
+    #[test]
+    fn a_cascade_changes_only_after_the_camera_moves_a_step_and_far_ones_change_less() {
+        let camera = Camera {
+            position: Vec3::new(100.0, 20.0, 100.0),
+            z_far: 120.0,
+            ..Default::default()
+        };
+        let (base, _) = cascade_data(&camera, default_sun_dir());
+        // Walk along x in 5 cm steps for 20 m and count how often each
+        // cascade's matrix differs from the previous one.
+        let mut changes = [0usize; CASCADE_COUNT];
+        let mut last = base;
+        for n in 1..=400 {
+            let moved = Camera {
+                position: camera.position + Vec3::new(0.05 * n as f32, 0.0, 0.0),
+                ..camera
+            };
+            let (m, _) = cascade_data(&moved, default_sun_dir());
+            for i in 0..CASCADE_COUNT {
+                if m[i] != last[i] {
+                    changes[i] += 1;
+                }
+            }
+            last = m;
+        }
+        assert!(
+            changes[0] > changes[1] && changes[1] > changes[2] && changes[2] > changes[3],
+            "{changes:?}"
+        );
+        // Over 20 m the farthest cascade is rebuilt a handful of times, not 400.
+        assert!(changes[3] <= 6, "{changes:?}");
+        assert!(changes[0] >= 5, "{changes:?}");
+    }
+
+    #[test]
+    fn every_point_a_cascade_serves_lies_inside_its_box() {
+        let camera = Camera {
+            position: Vec3::new(-14.3, 31.7, 9.1),
+            yaw: 0.9,
+            pitch: -0.3,
+            z_far: 120.0,
+            ..Default::default()
+        };
+        let (matrices, splits) = cascade_data(&camera, default_sun_dir());
+        let forward = camera.forward();
+        let right = forward.cross(Vec3::Y).normalize();
+        let up = right.cross(forward);
+        let (tan_h, tan_w) = (
+            (camera.fov_y * 0.5).tan(),
+            (camera.fov_y * 0.5).tan() * camera.aspect,
+        );
+        let mut slice_near = camera.z_near;
+        for (i, matrix) in matrices.iter().enumerate() {
+            // The corners and the middle of the slice's far face and its near face.
+            for depth in [slice_near.max(0.01), splits[i]] {
+                for (sx, sy) in [
+                    (-1.0, -1.0),
+                    (1.0, -1.0),
+                    (-1.0, 1.0),
+                    (1.0, 1.0),
+                    (0.0, 0.0),
+                ] {
+                    let point = camera.position
+                        + (forward + right * (sx * tan_w) + up * (sy * tan_h)) * depth;
+                    let clip = *matrix * point.extend(1.0);
+                    let ndc = clip.truncate() / clip.w;
+                    assert!(
+                        ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z),
+                        "cascade {i} depth {depth} corner ({sx}, {sy}) at {ndc:?}"
+                    );
+                }
+            }
+            slice_near = splits[i];
+        }
     }
 
     #[test]

@@ -205,6 +205,15 @@ impl PassTimer {
     }
 }
 
+/// What a cascade's retained terrain depth was drawn from: its light-space box,
+/// the terrain meshes, and whether terrain was drawn at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ShadowKey {
+    matrix: [f32; 16],
+    terrain_generation: u64,
+    terrain_visible: bool,
+}
+
 pub struct GameRenderer {
     pipeline: ScenePipeline,
     materials: wgpu::Buffer,
@@ -220,6 +229,8 @@ pub struct GameRenderer {
     terrain_bounds: HashMap<BrickCoord, Aabb>,
     terrain_generation: u64,
     terrain_meshes_visible: bool,
+    /// What each cascade's retained terrain depth was drawn from.
+    shadow_cache: [Option<ShadowKey>; CASCADE_COUNT],
     body_meshes: HashMap<u64, DynamicMesh>,
     bodies: InstanceSet,
     /// Drawn lit but never shadow-casting (debug overlays).
@@ -343,6 +354,7 @@ impl GameRenderer {
             terrain_bounds: HashMap::new(),
             terrain_generation: 0,
             terrain_meshes_visible: true,
+            shadow_cache: [None; CASCADE_COUNT],
             body_meshes: HashMap::new(),
             bodies: InstanceSet::new(),
             overlay: InstanceSet::new(),
@@ -708,40 +720,74 @@ impl GameRenderer {
             let bind = self
                 .pipeline
                 .shadow_bind_group(device, queue, cascade, matrix);
+            // The terrain's depth in this cascade is kept between frames and
+            // redrawn only when the cascade's box moved or the terrain changed;
+            // each frame it is copied into the sampled layer and the moving
+            // casters are drawn over it. A cascade's box depends on the camera's
+            // position alone, and the far cascades move only every few metres,
+            // so most frames skip the thousands of chunk draws.
+            let key = ShadowKey {
+                matrix: matrix.to_cols_array(),
+                terrain_generation: self.terrain_generation,
+                terrain_visible: self.terrain_meshes_visible,
+            };
+            let redraw_terrain = self.shadow_cache[cascade].as_ref() != Some(&key);
             // One begin/end pair spans the whole cascade set.
-            let timestamp_writes = timer.and_then(|timer| {
-                let (begin, end) = (
-                    (cascade == 0).then_some(0),
-                    (cascade == CASCADE_COUNT - 1).then_some(1),
-                );
-                (begin.is_some() || end.is_some()).then_some(wgpu::RenderPassTimestampWrites {
-                    query_set: &timer.queries,
-                    beginning_of_pass_write_index: begin,
-                    end_of_pass_write_index: end,
+            let timestamp_writes = |first: bool, last: bool| {
+                timer.and_then(|timer| {
+                    let (begin, end) = (
+                        (cascade == 0 && first).then_some(0),
+                        (cascade == CASCADE_COUNT - 1 && last).then_some(1),
+                    );
+                    (begin.is_some() || end.is_some()).then_some(wgpu::RenderPassTimestampWrites {
+                        query_set: &timer.queries,
+                        beginning_of_pass_write_index: begin,
+                        end_of_pass_write_index: end,
+                    })
                 })
-            });
+            };
+            if redraw_terrain {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("spall-game-shadow-terrain-pass"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: self.pipeline.shadow_static_layer(cascade),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: timestamp_writes(true, false),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_bind_group(0, &bind, &[]);
+                if self.terrain_meshes_visible {
+                    pass.set_pipeline(self.pipeline.shadow());
+                    self.draw_terrain_meshes(&mut pass, &Frustum::from_view_projection(matrix));
+                }
+                drop(pass);
+                self.shadow_cache[cascade] = Some(key);
+            }
+            self.pipeline.copy_static_shadow(encoder, cascade);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("spall-game-shadow-pass"),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: self.pipeline.shadow_layer(cascade),
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes,
+                timestamp_writes: timestamp_writes(!redraw_terrain, true),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             pass.set_pipeline(self.pipeline.shadow_cube());
             pass.set_bind_group(0, &bind, &[]);
-            if self.terrain_meshes_visible {
-                pass.set_pipeline(self.pipeline.shadow());
-                self.draw_terrain_meshes(&mut pass, &Frustum::from_view_projection(matrix));
-                pass.set_pipeline(self.pipeline.shadow_cube());
-            }
             if !self.body_meshes.is_empty() {
                 pass.set_pipeline(self.pipeline.shadow());
                 self.draw_body_meshes(&mut pass);
