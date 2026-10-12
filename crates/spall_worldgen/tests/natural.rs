@@ -137,7 +137,7 @@ fn climate_cools_with_height() {
 }
 
 #[test]
-fn every_world_shows_all_twelve_biomes_in_a_real_share() {
+fn every_world_shows_every_biome_in_a_real_share() {
     for (size, seeds) in [(SIZE, 1..=24u64), (1024, 1..=6)] {
         for seed in seeds {
             let cols = columns(seed, size);
@@ -265,8 +265,8 @@ fn diag_biome_coverage() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(40);
-    let mut repaired_counts = [0u32; 12];
-    let mut min_share = [1.0f64; 12];
+    let mut repaired_counts = [0u32; 13];
+    let mut min_share = [1.0f64; 13];
     for seed in 1..=seeds {
         let cols = columns(seed, size);
         let stats = column_stats(&cols);
@@ -302,7 +302,7 @@ fn every_biome_shows_at_least_three_surfaces() {
         for seed in seeds {
             let cols = columns(seed, size);
             let mut tops: Vec<std::collections::BTreeSet<u16>> =
-                vec![std::collections::BTreeSet::new(); 12];
+                vec![std::collections::BTreeSet::new(); 13];
             for z in 0..i64::from(size) {
                 for x in 0..i64::from(size) {
                     tops[cols.biome(x, z) as usize].insert(cols.stack(&palette, x, z).top.0);

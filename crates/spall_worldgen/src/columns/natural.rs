@@ -18,6 +18,7 @@ const S_DITHER_M: u64 = 0x6e03;
 const S_PATCH: u64 = 0x6e04;
 const S_PATCH_B: u64 = 0x6e05;
 const S_PATCH_C: u64 = 0x6e06;
+const S_PINE: u64 = 0x6e07;
 
 const CELLS: f64 = SAMPLE_CELLS as f64;
 
@@ -229,6 +230,7 @@ pub(super) fn biome_climate(biome: Biome) -> (f64, f64) {
         Biome::Scree => (3.0, 0.20),
         Biome::Alpine => (2.0, 0.50),
         Biome::BorealForest => (6.5, 0.50),
+        Biome::PineForest => (7.0, 0.50),
         Biome::Steppe => (14.0, 0.24),
         Biome::Meadow => (13.0, 0.41),
         Biome::TemperateForest => (13.0, 0.65),
@@ -256,6 +258,7 @@ fn repair_score(map: &ColumnMap, biome: Biome, x: i64, z: i64) -> Option<f64> {
         Biome::Scree => -gradient,
         Biome::Alpine => t + (1.0 - m) * 20.0,
         Biome::BorealForest => (t - 6.5).abs() + (m - 0.5).abs() * 20.0,
+        Biome::PineForest => (t - 7.0).abs() + (m - 0.5).abs() * 20.0,
         Biome::Steppe => (m - 0.25).abs() * 50.0 + (t - 14.0).abs(),
         Biome::Meadow => (m - 0.41).abs() * 50.0 + (t - 13.0).abs(),
         Biome::TemperateForest => (m - 0.65).abs() * 50.0 + (t - 13.0).abs(),
@@ -282,7 +285,7 @@ fn ensure_every_biome(map: &mut ColumnMap) -> u16 {
     let size = i64::from(map.size);
     let land = |map: &ColumnMap, x: i64, z: i64| !map.is_water(x, z) && !map.in_border(x, z);
     let count = |map: &ColumnMap| {
-        let mut per = [0usize; 12];
+        let mut per = [0usize; 13];
         let mut land_columns = 0usize;
         for z in 0..size {
             for x in 0..size {
@@ -302,6 +305,7 @@ fn ensure_every_biome(map: &mut ColumnMap) -> u16 {
         Biome::Swamp,
         Biome::Desert,
         Biome::BorealForest,
+        Biome::PineForest,
         Biome::Steppe,
         Biome::Meadow,
         Biome::TemperateForest,
@@ -365,6 +369,7 @@ fn ensure_every_biome(map: &mut ColumnMap) -> u16 {
 
 /// Biome of a column from climate and terrain (Whittaker-style): temperature
 /// `t` in degrees, wetness `m` in `0..=1`.
+#[allow(clippy::too_many_arguments)]
 fn classify(
     t: f64,
     m: f64,
@@ -373,6 +378,7 @@ fn classify(
     submerged: bool,
     sea: bool,
     river_dist: f64,
+    pine: bool,
 ) -> Biome {
     if submerged {
         // Lakes and rivers are riparian water however wide; only the sea is ocean.
@@ -408,6 +414,8 @@ fn classify(
     if t < 9.0 {
         return if m < 0.3 {
             Biome::Steppe
+        } else if pine {
+            Biome::PineForest
         } else {
             Biome::BorealForest
         };
@@ -421,6 +429,8 @@ fn classify(
         Biome::Steppe
     } else if m < 0.5 {
         Biome::Meadow
+    } else if pine && t < 11.0 {
+        Biome::PineForest
     } else {
         Biome::TemperateForest
     }
@@ -545,6 +555,8 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
                             map.is_water(xi, z),
                             map.water_surface(xi, z) <= SEA_LEVEL + 1,
                             f64::from(map.river_dist(xi, z)),
+                            // Pine stands: patches a few tens of metres across.
+                            fbm2(seed ^ S_PINE, xi as f64 / 52.0, z as f64 / 52.0, 2) > 0.02,
                         );
                         b[x] = biome as u8;
                         l[x] = if biome == Biome::Swamp { 255 } else { 0 };
@@ -822,6 +834,18 @@ impl ColumnMap {
                     st(p.gravel, 2, p.dirt, 10)
                 } else {
                     st(p.grass, 2, p.dirt, 10)
+                }
+            }
+            Biome::PineForest => {
+                // A bed of needles on dirt, with moss, stony and boggy patches.
+                if a > 0.15 {
+                    st(p.moss, 2, p.dirt, 8)
+                } else if b < -0.3 {
+                    st(p.gravel, 2, p.dirt, 8)
+                } else if wet > 0.6 && c > 0.3 {
+                    st(p.mud, 2, p.dirt, 8)
+                } else {
+                    st(p.dirt, 3, p.dirt, 9)
                 }
             }
             Biome::TemperateForest => {

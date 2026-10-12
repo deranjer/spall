@@ -539,3 +539,44 @@ fn natural_worlds_grow_underwater_plants_only_in_water() {
     assert!(wet > 20, "only {wet} underwater plants");
     assert!(kinds.len() >= 4, "only {kinds:?} grew");
 }
+
+/// Pine forest is a stand of pines close together: far more trees per area
+/// than the boreal forest around it, and nearly all of them pines.
+#[test]
+fn the_pine_forest_is_dense_and_made_of_pines() {
+    use spall_worldgen::Biome;
+    let scene = sandbox::worldgen_scene::generate("natural", 4, 1024).unwrap();
+    let (cols, state) = (&scene.world().columns, scene.vegetation());
+    let mut area = std::collections::BTreeMap::<u8, f64>::new();
+    for z in 0..1024 {
+        for x in 0..1024 {
+            *area.entry(cols.biome(x, z) as u8).or_default() += 1.0;
+        }
+    }
+    let pines = [5u16, 90, 91, 92, 93];
+    let (mut pine_trees, mut pine_pines, mut boreal_trees) = (0.0, 0.0, 0.0);
+    for p in state.organisms.iter().filter(|p| !p.wood.is_empty()) {
+        match cols.biome(p.root[0], p.root[2]) {
+            Biome::PineForest => {
+                pine_trees += 1.0;
+                pine_pines += f64::from(u8::from(pines.contains(&p.species)));
+            }
+            Biome::BorealForest => boreal_trees += 1.0,
+            _ => {}
+        }
+    }
+    let (pine_area, boreal_area) = (
+        area[&(Biome::PineForest as u8)],
+        area[&(Biome::BorealForest as u8)],
+    );
+    assert!(pine_area > 5_000.0 && boreal_area > 5_000.0);
+    let (pine_density, boreal_density) = (pine_trees / pine_area, boreal_trees / boreal_area);
+    assert!(
+        pine_density > 1.5 * boreal_density,
+        "pine {pine_density:.6} vs boreal {boreal_density:.6} trees per column"
+    );
+    assert!(
+        pine_pines / pine_trees > 0.9,
+        "{pine_pines} of {pine_trees} are pines"
+    );
+}

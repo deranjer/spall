@@ -13,9 +13,9 @@ fn spec(size: u32) -> WorldGenSpec {
 fn the_gallery_has_one_separate_pad_per_biome() {
     for size in [512, 1024, 2048] {
         let pads = gallery_patches(size);
-        assert_eq!(pads.len(), 12);
+        assert_eq!(pads.len(), 13);
         let biomes: BTreeSet<_> = pads.iter().map(|p| p.biome as u8).collect();
-        assert_eq!(biomes.len(), 12, "every biome once");
+        assert_eq!(biomes.len(), 13, "every biome once");
         for (i, a) in pads.iter().enumerate() {
             assert!(a.x1 - a.x0 >= 64, "size {size}: pad too small");
             assert!(a.x0 > 32 && a.z0 > 32 && a.x1 < i64::from(size) - 32);
@@ -81,7 +81,7 @@ fn the_riparian_stream_is_too_shallow_for_weed_and_the_pond_is_not() {
 fn the_gallery_generates_with_a_spawn_on_every_dry_pad() {
     let world = generate(&spec(512)).expect("gallery world");
     assert_eq!(world.version, 1);
-    assert_eq!(world.spawns.len(), 11, "every pad but the sea");
+    assert_eq!(world.spawns.len(), 12, "every pad but the sea");
     for s in &world.spawns {
         assert!(s[1] / 0.25 > f64::from(SEA_LEVEL), "{s:?} above the sea");
     }

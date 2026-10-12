@@ -19,7 +19,7 @@ fn world(seed: u64, size: u32) -> ColumnMap {
 /// Top materials per biome across a few worlds.
 fn surfaces(seeds: &[u64]) -> Vec<BTreeSet<u16>> {
     let palette = terrain_palette();
-    let mut tops = vec![BTreeSet::new(); 12];
+    let mut tops = vec![BTreeSet::new(); 13];
     for &seed in seeds {
         let cols = world(seed, 512);
         for z in 0..512 {
@@ -62,6 +62,8 @@ fn every_fertile_biome_hosts_five_living_plants_and_three_covers() {
         // The bare biomes (snow, scree, beach) need 1 to 3 plants.
         let (need_living, need_cover) = match b {
             Biome::Snow | Biome::Scree | Biome::Beach => (3, 2),
+            // The pine forest's floor is needles and nothing else.
+            Biome::PineForest => (5, 1),
             Biome::Desert => (5, 3),
             _ => (5, 3),
         };
@@ -99,6 +101,23 @@ fn wetter_ground_admits_more_kinds_of_cover() {
             })
             .count()
     };
+    // Compared across each biome's own range of wetness (its 10th, 50th and
+    // 90th percentile in four real worlds), not an arbitrary one.
+    let spread = |biome: Biome| -> [u8; 3] {
+        let mut m = Vec::new();
+        for seed in [1u64, 2, 3, 4] {
+            let cols = world(seed, 512);
+            for z in 0..512 {
+                for x in 0..512 {
+                    if cols.biome(x, z) == biome {
+                        m.push(cols.moisture(x, z));
+                    }
+                }
+            }
+        }
+        m.sort_unstable();
+        [10, 50, 90].map(|p| m[m.len() * p / 100])
+    };
     for b in [
         Biome::Meadow,
         Biome::Steppe,
@@ -108,14 +127,16 @@ fn wetter_ground_admits_more_kinds_of_cover() {
         Biome::BorealForest,
         Biome::Alpine,
     ] {
-        let (dry, mid, wet) = (kinds(b, 40), kinds(b, 130), kinds(b, 230));
+        let [lo, mid, hi] = spread(b);
+        let (dry, mid_k, wet) = (kinds(b, lo), kinds(b, mid), kinds(b, hi));
         assert!(
-            dry <= mid && mid <= wet,
-            "{b:?}: {dry} kinds when dry, {mid} mid, {wet} wet"
+            dry <= mid_k && mid_k <= wet,
+            "{b:?}: {dry} kinds at wetness {lo}, {mid_k} at {mid}, {wet} at {hi}"
         );
     }
-    // Meadow shows the climb across its whole range.
-    assert!(kinds(Biome::Meadow, 40) < kinds(Biome::Meadow, 230));
+    // Meadow shows the climb across its range.
+    let [lo, _, hi] = spread(Biome::Meadow);
+    assert!(kinds(Biome::Meadow, lo) < kinds(Biome::Meadow, hi));
     // And the sets are not the same everywhere.
     let ids = |biome: Biome| -> BTreeSet<u16> {
         cover
@@ -142,8 +163,8 @@ fn the_flora_really_fits_each_biomes_climate() {
     let palette = terrain_palette();
     let living = catalogue();
     let cover = cover_catalogue();
-    let mut living_hits = vec![vec![0u32; living.len()]; 12];
-    let mut cover_hits = vec![vec![0u32; cover.len()]; 12];
+    let mut living_hits = vec![vec![0u32; living.len()]; 13];
+    let mut cover_hits = vec![vec![0u32; cover.len()]; 13];
     for seed in [1u64, 2, 3, 4] {
         let cols = world(seed, 512);
         for z in 0..512 {
@@ -182,6 +203,8 @@ fn the_flora_really_fits_each_biomes_climate() {
         let cover_kinds = cover_hits[b as usize].iter().filter(|&&n| n >= 40).count();
         let (need_living, need_cover) = match b {
             Biome::Snow | Biome::Scree | Biome::Beach => (3, 2),
+            // The pine forest's floor is needles and nothing else.
+            Biome::PineForest => (5, 1),
             _ => (5, 3),
         };
         eprintln!("{b:?}: {living_kinds} living, {cover_kinds} cover");
@@ -190,4 +213,41 @@ fn the_flora_really_fits_each_biomes_climate() {
         }
     }
     assert!(short.is_empty(), "{short:#?}");
+}
+
+/// The pine forest's floor is needles and nothing else: of all the cover, only
+/// the pine needles can grow in any of its columns.
+#[test]
+fn nothing_but_needles_grows_on_the_pine_forest_floor() {
+    let palette = terrain_palette();
+    let cover = cover_catalogue();
+    let mut fits = BTreeSet::new();
+    let mut columns = 0;
+    for seed in [1u64, 2, 3, 4] {
+        let cols = world(seed, 512);
+        for z in 0..512 {
+            for x in 0..512 {
+                if cols.biome(x, z) != Biome::PineForest {
+                    continue;
+                }
+                columns += 1;
+                let top = cols.stack(&palette, x, z).top.0;
+                let (m, t) = (cols.moisture(x, z), cols.temperature_c(x, z).round() as i32);
+                for c in &cover {
+                    if c.biomes & (1 << Biome::PineForest as u16) != 0
+                        && c.soils.contains(&top)
+                        && (c.moisture[0]..=c.moisture[1]).contains(&m)
+                        && (i32::from(c.temperature[0])..=i32::from(c.temperature[1])).contains(&t)
+                        && c.depth == [0, 0]
+                    {
+                        fits.insert(c.id);
+                    }
+                }
+            }
+        }
+    }
+    assert!(columns > 5_000, "{columns} pine forest columns");
+    assert_eq!(fits, [114].into(), "only pine needles");
+    // And needles carpet it: the species is as dense as cover gets.
+    assert_eq!(cover.iter().find(|c| c.id == 114).unwrap().density, 255);
 }

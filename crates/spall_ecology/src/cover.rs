@@ -27,10 +27,11 @@ pub const NEAR_M: f32 = 14.0;
 pub const MID_M: f32 = 34.0;
 /// Soft parts one cover rebuild may produce: its own budget, apart from trees.
 pub const INSTANCE_BUDGET: usize = 48_000;
-/// Ground forms that cover owns: grass, sedge, clover rosette, tussock cushion.
-pub const CARPET_FORMS: [u8; 4] = [6, 9, 11, 12];
+/// Ground forms that cover owns: grass, sedge, rosette, mound, flower patch,
+/// pebble scatter, leaf litter and pine needles.
+pub const CARPET_FORMS: [u8; 8] = [6, 9, 11, 12, 18, 19, 20, 21];
 /// A species' tuft density is this many in 256 cells.
-pub const MAX_COVER_SPECIES: usize = 32;
+pub const MAX_COVER_SPECIES: usize = 64;
 /// Most destroyed-cover records a world keeps at once.
 pub const MAX_CLEARED: usize = 65_536;
 /// Cover destroyed this long ago (seconds of ecological time) is a small
@@ -111,13 +112,17 @@ pub struct CoverSpecies {
     pub moisture: [u8; 2],
     /// Air temperature range this cover lives in, degrees C.
     pub temperature: [i8; 2],
-    /// Ground form code (see `living::Species`): 6 grass, 9 sedge, 11 rosette,
-    /// 12 cushion.
+    /// Ground form code: 6 grass, 9 sedge, 11 rosette, 12 mound, 18 flower patch
+    /// (stems with blossoms), 19 pebbles or shells, 20 leaf litter, 21 pine
+    /// needles.
     pub form: u8,
     /// Mature height in quarter-cells.
     pub height: u16,
     /// Colour index per season (spring, summer, autumn, winter).
     pub colours: [u8; 4],
+    /// A second colour: the blossoms of a flower patch, the other stones of a
+    /// scatter, the other leaves of a litter.
+    pub accent: u8,
     pub evergreen: bool,
     /// Tufts per 256 cells where the species is the one chosen.
     pub density: u8,
@@ -149,6 +154,7 @@ impl CoverSpecies {
             || self
                 .colours
                 .iter()
+                .chain([&self.accent])
                 .any(|c| usize::from(*c) >= crate::living::PALETTE.len())
         {
             return Err("invalid cover species".into());
@@ -163,6 +169,7 @@ pub struct Cover {
     pub species: u16,
     pub form: u8,
     pub colour: u8,
+    pub accent: u8,
     /// Standing height, metres.
     pub height_m: f32,
     pub evergreen: bool,
@@ -218,6 +225,7 @@ pub fn ground_cover(
         species: s.id,
         form: s.form,
         colour: s.colours[season as usize],
+        accent: s.accent,
         height_m: f32::from(s.height) * 0.25 * size * if winter_shrink { 0.25 } else { 1.0 },
         evergreen: s.evergreen,
         key,
@@ -489,6 +497,10 @@ pub fn ground_parts(
         aquatic_parts(form, height, colour, flower, key, base, detail, out);
         return;
     }
+    if matches!(form, 12 | 18..=21) {
+        carpet_parts(form, height, colour, flower, key, base, detail, out);
+        return;
+    }
     let blades = match (detail, form) {
         (Detail::Coarse, 12) => 5,
         (Detail::Coarse, _) => 3,
@@ -538,6 +550,138 @@ pub fn ground_parts(
                 yaw,
                 lean: 0.,
             });
+        }
+    }
+}
+
+/// The low forms that make cover more than grass: mounds (moss, thrift,
+/// tussock), flower patches, pebble and shell scatters, fallen leaves and pine
+/// needles. `colour` is the body, `accent` the blossoms or the second kind of
+/// stone or leaf.
+#[allow(clippy::too_many_arguments)]
+fn carpet_parts(
+    form: u8,
+    height: f32,
+    colour: u8,
+    accent: u8,
+    key: u64,
+    base: [f32; 3],
+    detail: Detail,
+    out: &mut Vec<SoftPart>,
+) {
+    let full = detail == Detail::Full;
+    let frac = |k: u64, n: u64| (k % n) as f32 / n as f32;
+    let flat = |out: &mut Vec<SoftPart>, k: u64, spread: f32, size: [f32; 3], layer: f32, c: u8| {
+        out.push(SoftPart {
+            center: [
+                base[0] + (frac(k, 101) - 0.5) * spread,
+                base[1] + size[1] / 2. + layer,
+                base[2] + (frac(k >> 9, 101) - 0.5) * spread,
+            ],
+            size,
+            colour: c,
+            yaw: frac(k >> 21, 628) * std::f32::consts::TAU,
+            lean: 0.,
+        });
+    };
+    match form {
+        // A rounded mound: a centre boss ringed by lower lumps.
+        12 => {
+            let h = height.max(0.04);
+            out.push(SoftPart {
+                center: [base[0], base[1] + h * 0.4, base[2]],
+                size: [0.17, h * 0.8, 0.17],
+                colour,
+                yaw: frac(key, 628) * std::f32::consts::TAU,
+                lean: 0.,
+            });
+            for i in 0..if full { 5_u64 } else { 2 } {
+                let k = hash(key ^ (i + 7));
+                let angle = i as f32 * std::f32::consts::TAU / 5. + frac(k, 100) * 0.6;
+                let (lump, c) = (
+                    0.5 + 0.3 * frac(k >> 11, 50),
+                    if i % 2 == 0 { colour } else { accent },
+                );
+                out.push(SoftPart {
+                    center: [
+                        base[0] + angle.cos() * 0.11,
+                        base[1] + h * lump * 0.5,
+                        base[2] + angle.sin() * 0.11,
+                    ],
+                    size: [0.11, h * lump, 0.11],
+                    colour: c,
+                    yaw: angle,
+                    lean: 0.,
+                });
+            }
+        }
+        // Short stems each carrying one blossom.
+        18 => {
+            for i in 0..if full { 6_u64 } else { 3 } {
+                let k = hash(key ^ (i + 21));
+                let off = [
+                    (frac(k, 101) - 0.5) * 0.22,
+                    (frac(k >> 9, 101) - 0.5) * 0.22,
+                ];
+                let h = height.max(0.05) * (0.6 + 0.4 * frac(k >> 17, 50));
+                let lean = 0.05 + 0.12 * frac(k >> 25, 30);
+                let yaw = frac(k >> 33, 628) * std::f32::consts::TAU;
+                lean_part(base, off, h, lean, yaw, [0.014, 0.014], colour, out);
+                out.push(SoftPart {
+                    center: [
+                        base[0] + off[0] - h * lean.sin() * yaw.cos(),
+                        base[1] + h * lean.cos() + 0.02,
+                        base[2] + off[1] + h * lean.sin() * yaw.sin(),
+                    ],
+                    size: [0.075, 0.045, 0.075],
+                    colour: accent,
+                    yaw,
+                    lean: 0.,
+                });
+            }
+        }
+        // Small stones or shells lying on the ground, two tones.
+        19 => {
+            for i in 0..if full { 6_u64 } else { 3 } {
+                let k = hash(key ^ (i + 33));
+                let s = 0.035 + 0.06 * frac(k >> 5, 40);
+                flat(
+                    out,
+                    k,
+                    0.3,
+                    [s, s * (0.5 + 0.4 * frac(k >> 13, 20)), s * 1.2],
+                    0.,
+                    if i % 2 == 0 { colour } else { accent },
+                );
+            }
+        }
+        // Fallen leaves: flat squares piled a layer or two deep.
+        20 => {
+            for i in 0..if full { 9_u64 } else { 4 } {
+                let k = hash(key ^ (i + 45));
+                flat(
+                    out,
+                    k,
+                    0.28,
+                    [0.09, 0.012, 0.07],
+                    0.012 * (i % 3) as f32,
+                    if i % 3 == 0 { accent } else { colour },
+                );
+            }
+        }
+        // Pine needles: a mat of thin sticks crossing at all angles.
+        _ => {
+            for i in 0..if full { 14_u64 } else { 6 } {
+                let k = hash(key ^ (i + 57));
+                flat(
+                    out,
+                    k,
+                    0.30,
+                    [0.14, 0.008, 0.008],
+                    0.008 * (i % 3) as f32,
+                    if i % 4 == 0 { accent } else { colour },
+                );
+            }
         }
     }
 }
@@ -766,7 +910,7 @@ pub fn cover_parts(
                     (c.height_m * 1.15 * growth, Detail::Coarse)
                 };
                 ground_parts(
-                    c.form, height, c.colour, 0, season, c.key, base, detail, &mut out,
+                    c.form, height, c.colour, c.accent, season, c.key, base, detail, &mut out,
                 );
             }
         }
@@ -792,6 +936,7 @@ mod tests {
                 evergreen: true,
                 density: 128,
                 depth: [0, 0],
+                accent: 0,
             },
             CoverSpecies {
                 id: 19,
@@ -805,6 +950,7 @@ mod tests {
                 evergreen: true,
                 density: 255,
                 depth: [0, 0],
+                accent: 0,
             },
         ]
     }
@@ -896,6 +1042,7 @@ mod tests {
             evergreen: true,
             density: 128,
             depth: [0, 0],
+            accent: 0,
         });
         let at = |moisture: u8| {
             let mut tufts = 0;
@@ -1099,6 +1246,7 @@ mod tests {
             evergreen: true,
             density: 255,
             depth: [2, 30],
+            accent: 0,
         });
         let at = |biome, depth| {
             (0..300)
@@ -1147,6 +1295,7 @@ mod tests {
             evergreen: true,
             density: 255,
             depth: [2, 60],
+            accent: 0,
         });
         // An ocean raster whose water level is the top cell at y = 20.
         let (width, cells) = (64u32, 64usize * 64);
@@ -1289,5 +1438,85 @@ mod tests {
             )
             .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod carpet_tests {
+    use super::*;
+
+    #[test]
+    fn every_low_form_draws_close_to_the_ground_and_thins_with_distance() {
+        for form in [12u8, 18, 19, 20, 21] {
+            assert!(is_carpet_form(form), "form {form} is cover");
+            let draw = |detail| {
+                let mut out = Vec::new();
+                ground_parts(
+                    form,
+                    0.2,
+                    3,
+                    12,
+                    Season::Summer,
+                    99,
+                    [4.0, 2.0, 7.0],
+                    detail,
+                    &mut out,
+                );
+                out
+            };
+            let (full, coarse) = (draw(Detail::Full), draw(Detail::Coarse));
+            assert!(
+                !full.is_empty() && coarse.len() <= full.len(),
+                "form {form}"
+            );
+            assert_eq!(draw(Detail::Full).len(), full.len(), "deterministic");
+            for p in &full {
+                assert!(p.center.iter().all(|v| v.is_finite()), "form {form}");
+                assert!(p.size.iter().all(|v| *v > 0.0), "form {form}");
+                // Never below the ground; flat forms lie within a hand's breadth of it.
+                assert!(
+                    p.center[1] - p.size[1] / 2. >= 2.0 - 0.02,
+                    "form {form} sinks"
+                );
+                if matches!(form, 19..=21) {
+                    assert!(p.center[1] < 2.0 + 0.1, "form {form} piles too high");
+                }
+                assert!((p.center[0] - 4.0).abs() < 0.3 && (p.center[2] - 7.0).abs() < 0.3);
+            }
+        }
+        // Pine needles are a mat: many pieces, all of them flat.
+        let mut needles = Vec::new();
+        ground_parts(
+            21,
+            0.1,
+            7,
+            26,
+            Season::Summer,
+            5,
+            [0.0; 3],
+            Detail::Full,
+            &mut needles,
+        );
+        assert!(needles.len() >= 10 && needles.iter().all(|p| p.size[1] < 0.02));
+        // The four kinds look different: blossoms stand up, stones and litter lie down.
+        let tallest = |form| {
+            let mut out = Vec::new();
+            ground_parts(
+                form,
+                0.2,
+                3,
+                12,
+                Season::Summer,
+                3,
+                [0.0; 3],
+                Detail::Full,
+                &mut out,
+            );
+            out.iter()
+                .map(|p| p.center[1] + p.size[1] / 2.)
+                .fold(0.0f32, f32::max)
+        };
+        assert!(tallest(18) > 2.0 * tallest(20));
+        assert!(tallest(12) > tallest(19));
     }
 }

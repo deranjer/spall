@@ -4601,8 +4601,26 @@ impl VegetationWorker {
                             }
                         }
                     }
-                    let instances = frame
+                    // Leaves are drawn on the same quarter-cell grid as the wood
+                    // they grow from: a leaf cube in a cell that holds wood (or any
+                    // solid) would share its faces with it and flicker, so it is
+                    // left out and the wood shows.
+                    let crown: Vec<_> = frame
                         .parts(eye, foliage_radius_m)
+                        .into_iter()
+                        .filter(|p| {
+                            let leaf = p.size == [0.25; 3] && p.yaw == 0. && p.lean == 0.;
+                            !leaf
+                                || terrain.as_ref().is_none_or(|volume| {
+                                    let at = p.center.map(|c| (c / 0.25).floor() as i64);
+                                    !matches!(
+                                        volume.sample(GlobalCell::new(at[0], at[1], at[2])),
+                                        Ok(Sample::Filled(_))
+                                    )
+                                })
+                        })
+                        .collect();
+                    let instances = crown
                         .into_iter()
                         .chain(cover_parts)
                         .map(|p| {

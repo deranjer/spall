@@ -127,6 +127,27 @@ pub fn name(id: u16) -> &'static str {
         86 => "Pondweed",
         87 => "Water milfoil",
         88 => "Pond algae",
+        90 => "Lodgepole pine",
+        91 => "Black pine",
+        92 => "Jack pine",
+        93 => "White pine",
+        100 => "Clover blossoms",
+        101 => "Buttercups",
+        102 => "Poppies",
+        103 => "Violets",
+        104 => "Gentian",
+        105 => "Forget-me-nots",
+        106 => "Desert blooms",
+        107 => "Pebbles",
+        108 => "River stones",
+        109 => "Desert pavement",
+        110 => "Shells",
+        111 => "Seashells",
+        112 => "Fallen leaves",
+        113 => "Fallen needles",
+        114 => "Pine needles",
+        115 => "Lily pads",
+        116 => "Riverbed stones",
         _ => "Unknown",
     }
 }
@@ -140,6 +161,8 @@ struct Soils {
     arid: [u16; 4],
     shore: [u16; 4],
     rocky: [u16; 4],
+    /// The floor of the pine forest: needles lie on dirt, moss, gravel and mud.
+    pine_floor: [u16; 4],
 }
 
 fn soils() -> Soils {
@@ -155,6 +178,7 @@ fn soils() -> Soils {
         arid: [sand, dirt, clay, gravel],
         shore: [sand, gravel, sandstone, dirt],
         rocky: [gravel, slate, stone, dirt],
+        pine_floor: [dirt, moss, gravel, mud],
     }
 }
 
@@ -203,7 +227,7 @@ pub fn catalogue() -> Vec<Species> {
     // (id, biomes, soils, moisture, form, height, spread, spacing, evergreen, colours)
     // Forms: 0 broad crown, 1 cone, 2 column, 3 weeping, 4 umbrella, 5 fan.
     // Height is in quarter-cells.
-    let trees: [TreeRow; 21] = [
+    let trees: [TreeRow; 25] = [
         (
             1,
             &[Meadow, TemperateForest, Riparian],
@@ -254,13 +278,13 @@ pub fn catalogue() -> Vec<Species> {
         ),
         (
             5,
-            &[BorealForest, Alpine, Steppe],
+            &[BorealForest, Alpine, Steppe, PineForest],
             s.upland,
             [30, 200],
             4,
             36,
             6,
-            24,
+            14,
             true,
             [PINE, PINE, PINE, PINE],
         ),
@@ -456,6 +480,55 @@ pub fn catalogue() -> Vec<Species> {
             true,
             [SAGE, SAGE, SAGE, SAGE],
         ),
+        // The pines of the pine forest: close together, tall and thin or low.
+        (
+            90,
+            &[PineForest],
+            s.upland,
+            [60, 255],
+            2,
+            36,
+            4,
+            9,
+            true,
+            [PINE, PINE, PINE, PINE],
+        ),
+        (
+            91,
+            &[PineForest],
+            s.upland,
+            [60, 255],
+            1,
+            32,
+            5,
+            10,
+            true,
+            [DARK_PINE, DARK_PINE, DARK_PINE, DARK_PINE],
+        ),
+        (
+            92,
+            &[PineForest],
+            s.upland,
+            [50, 255],
+            4,
+            26,
+            5,
+            11,
+            true,
+            [DEEP, DEEP, DEEP, DEEP],
+        ),
+        (
+            93,
+            &[PineForest],
+            s.upland,
+            [70, 255],
+            1,
+            40,
+            5,
+            12,
+            true,
+            [TEAL, TEAL, TEAL, TEAL],
+        ),
     ];
     let mut out: Vec<_> = trees
         .into_iter()
@@ -623,7 +696,7 @@ pub fn catalogue() -> Vec<Species> {
         ),
         (
             39,
-            &[BorealForest, TemperateForest, Alpine],
+            &[BorealForest, TemperateForest, Alpine, PineForest],
             s.lawn,
             [100, 255],
             8,
@@ -727,7 +800,7 @@ pub fn catalogue() -> Vec<Species> {
         ),
         (
             48,
-            &[TemperateForest, BorealForest],
+            &[TemperateForest, BorealForest, PineForest],
             s.lawn,
             [100, 255],
             12,
@@ -945,7 +1018,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             2,
             [LIGHT, GREEN, BROWN, STRAW],
             true,
-            120,
+            75,
         ),
         (
             12,
@@ -957,7 +1030,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             3,
             [SAGE, GREEN, STRAW, STRAW],
             true,
-            110,
+            65,
         ),
         (
             13,
@@ -981,7 +1054,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             4,
             [SAGE, GREEN, BROWN, STRAW],
             true,
-            130,
+            85,
         ),
         (
             17,
@@ -1005,7 +1078,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             3,
             [DRY, DRY, BROWN, STRAW],
             true,
-            45,
+            30,
         ),
         (
             50,
@@ -1017,7 +1090,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             1,
             [DRY, LIGHT, STRAW, STRAW],
             true,
-            80,
+            50,
         ),
         (
             51,
@@ -1029,7 +1102,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             4,
             [DRY, LIGHT, WHEAT, WHEAT],
             true,
-            65,
+            40,
         ),
         (
             52,
@@ -1041,7 +1114,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             3,
             [DRY, WHEAT, WHEAT, STRAW],
             true,
-            60,
+            40,
         ),
         (
             53,
@@ -1053,7 +1126,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             5,
             [MOSS, GREEN, OLIVE, BROWN],
             true,
-            140,
+            85,
         ),
         (
             54,
@@ -1084,7 +1157,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             3,
             [DRY, DRY, WHEAT, STRAW],
             true,
-            60,
+            40,
         ),
         (
             56,
@@ -1132,7 +1205,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             3,
             [MOSS, DEEP, RUST, BROWN],
             true,
-            90,
+            55,
         ),
         (
             60,
@@ -1156,7 +1229,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
             4,
             [MOSS, MOSS, OLIVE, BROWN],
             false,
-            100,
+            60,
         ),
         (
             63,
@@ -1231,6 +1304,7 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
                     form,
                     height,
                     colours,
+                    accent: colours[1],
                     evergreen,
                     density,
                 }
@@ -1239,6 +1313,257 @@ pub fn cover_catalogue() -> Vec<CoverSpecies> {
         .collect::<Vec<_>>()
         .into_iter()
         .chain(aquatic_cover())
+        .chain(flair_cover())
+        .collect()
+}
+
+/// The cover that is not grass: blossoms, stones and shells, fallen leaves,
+/// pine needles. These give each biome its own ground, so grass is one of
+/// several things underfoot and not all of it. The pine forest's floor is a
+/// bed of needles and nothing else grows through it.
+fn flair_cover() -> Vec<CoverSpecies> {
+    use Biome::*;
+    let s = soils();
+    let seabed = [s.arid[0], s.shore[1], s.wetland[1], s.shore[2]];
+    let lakebed = [s.upland[3], s.lawn[3], s.wetland[1], s.lawn[1]];
+    // (id, biomes, soils, depth, moisture, form, height, colours, accent, density)
+    type Row = (
+        u16,
+        &'static [Biome],
+        [u16; 4],
+        [u8; 2],
+        [u8; 2],
+        u8,
+        u16,
+        [u8; 4],
+        u8,
+        u8,
+    );
+    let rows: [Row; 17] = [
+        (
+            100,
+            &[Meadow, Riparian, Steppe],
+            s.lawn,
+            [0, 0],
+            [60, 255],
+            18,
+            2,
+            [GREEN, GREEN, OLIVE, BROWN],
+            WHITE,
+            70,
+        ),
+        (
+            101,
+            &[Meadow, Steppe, Alpine],
+            s.upland,
+            [0, 0],
+            [50, 255],
+            18,
+            3,
+            [GREEN, GREEN, OLIVE, BROWN],
+            YELLOW,
+            60,
+        ),
+        (
+            102,
+            &[Steppe, Meadow],
+            s.dry_land,
+            [0, 0],
+            [20, 200],
+            18,
+            3,
+            [OLIVE, GREEN, TAN, BROWN],
+            RED,
+            40,
+        ),
+        (
+            103,
+            &[TemperateForest, BorealForest, Riparian],
+            s.lawn,
+            [0, 0],
+            [100, 255],
+            18,
+            2,
+            [DEEP, DEEP, OLIVE, BROWN],
+            VIOLET,
+            50,
+        ),
+        (
+            104,
+            &[Alpine, Scree],
+            s.rocky,
+            [0, 0],
+            [30, 255],
+            18,
+            2,
+            [SAGE, GREEN, OLIVE, BROWN],
+            VIOLET,
+            50,
+        ),
+        (
+            105,
+            &[Swamp, Riparian],
+            s.wetland,
+            [0, 0],
+            [150, 255],
+            18,
+            2,
+            [MOSS, GREEN, OLIVE, BROWN],
+            VIOLET,
+            60,
+        ),
+        (
+            106,
+            &[Desert, Steppe, Beach],
+            s.arid,
+            [0, 0],
+            [0, 90],
+            18,
+            2,
+            [OLIVE, OLIVE, TAN, TAN],
+            AMBER,
+            25,
+        ),
+        (
+            107,
+            &[Scree, Alpine, Riparian, Steppe],
+            s.rocky,
+            [0, 0],
+            [0, 255],
+            19,
+            1,
+            [GREY, GREY, GREY, GREY],
+            TAN,
+            90,
+        ),
+        (
+            108,
+            &[Riparian, Beach],
+            s.shore,
+            [0, 0],
+            [0, 255],
+            19,
+            1,
+            [GREY, TAN, GREY, TAN],
+            WHITE,
+            60,
+        ),
+        (
+            109,
+            &[Desert, Steppe],
+            s.arid,
+            [0, 0],
+            [0, 120],
+            19,
+            1,
+            [TAN, BROWN, TAN, BROWN],
+            RUST,
+            55,
+        ),
+        (
+            110,
+            &[Beach],
+            s.shore,
+            [0, 0],
+            [0, 255],
+            19,
+            1,
+            [WHITE, ROSE, WHITE, ROSE],
+            TAN,
+            50,
+        ),
+        (
+            111,
+            &[Ocean],
+            seabed,
+            [1, 40],
+            [0, 255],
+            19,
+            1,
+            [WHITE, ROSE, WHITE, TAN],
+            WHITE,
+            40,
+        ),
+        (
+            112,
+            &[TemperateForest, Meadow, Riparian],
+            s.lawn,
+            [0, 0],
+            [90, 255],
+            20,
+            1,
+            [BROWN, RUST, AMBER, BROWN],
+            AMBER,
+            80,
+        ),
+        (
+            113,
+            &[BorealForest, Alpine],
+            s.upland,
+            [0, 0],
+            [60, 255],
+            21,
+            1,
+            [BROWN, DARK_BROWN, BROWN, DARK_BROWN],
+            TAN,
+            45,
+        ),
+        (
+            114,
+            &[PineForest],
+            s.pine_floor,
+            [0, 0],
+            [0, 255],
+            21,
+            1,
+            [BROWN, TAN, BROWN, DARK_BROWN],
+            RUST,
+            255,
+        ),
+        (
+            115,
+            &[Swamp, Riparian],
+            s.wetland,
+            [0, 0],
+            [150, 255],
+            20,
+            1,
+            [GREEN, MOSS, OLIVE, BROWN],
+            MOSS,
+            70,
+        ),
+        (
+            116,
+            &[Riparian],
+            lakebed,
+            [1, 30],
+            [0, 255],
+            19,
+            1,
+            [GREY, TAN, GREY, TAN],
+            BROWN,
+            40,
+        ),
+    ];
+    rows.into_iter()
+        .map(
+            |(id, biomes, soils, depth, moisture, form, height, colours, accent, density)| {
+                CoverSpecies {
+                    id,
+                    biomes: mask(biomes),
+                    soils,
+                    moisture,
+                    temperature: [-40, 62],
+                    form,
+                    height,
+                    colours,
+                    accent,
+                    evergreen: true,
+                    density,
+                    depth,
+                }
+            },
+        )
         .collect()
 }
 
@@ -1366,6 +1691,7 @@ fn aquatic_cover() -> Vec<CoverSpecies> {
                 evergreen: true,
                 density,
                 depth,
+                accent: colours[1],
             },
         )
         .collect()

@@ -124,6 +124,7 @@ pub(crate) fn legend(stats: &ColumnStats) -> Vec<(&'static str, [u8; 3], f64)> {
                 Biome::Scree => "Scree",
                 Biome::Snow => "Snow",
                 Biome::Steppe => "Steppe",
+                Biome::PineForest => "Pine forest",
             };
             (name, biome_color(b), stats.biome_share[b as usize])
         })

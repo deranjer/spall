@@ -2,7 +2,7 @@
 //! ground, wetness and (for the wet ones) water, so the whole of the flora can
 //! be looked at in one walk. Not a world: a showcase.
 //!
-//! Twelve pads in a grid of four by three. Each pad is a flat or gently shaped
+//! Thirteen pads in a grid of four by four (the last row holds only the sea). Each pad is a flat or gently shaped
 //! patch of one biome; the gaps between pads take the biome of the nearest pad
 //! and step between their heights. Everything is a pure function of the size
 //! and seed.
@@ -18,22 +18,32 @@ const S_POOLS: u64 = 0x6a03;
 const S_DUNES: u64 = 0x6a04;
 
 const COLS: i64 = 4;
-const ROWS: i64 = 3;
 /// Cells between neighbouring pads.
 const GAP: i64 = 24;
 /// Ground height of a dry pad.
 const LAND: i32 = SEA_LEVEL + 24;
 
 /// Which biome sits where: rows from north to south, columns west to east.
-const LAYOUT: [[Biome; 4]; 3] = [
+const LAYOUT: [[Option<Biome>; 4]; 4] = [
     [
-        Biome::Meadow,
-        Biome::TemperateForest,
-        Biome::BorealForest,
-        Biome::Steppe,
+        Some(Biome::Meadow),
+        Some(Biome::TemperateForest),
+        Some(Biome::BorealForest),
+        Some(Biome::PineForest),
     ],
-    [Biome::Alpine, Biome::Scree, Biome::Snow, Biome::Desert],
-    [Biome::Swamp, Biome::Riparian, Biome::Beach, Biome::Ocean],
+    [
+        Some(Biome::Steppe),
+        Some(Biome::Alpine),
+        Some(Biome::Scree),
+        Some(Biome::Snow),
+    ],
+    [
+        Some(Biome::Desert),
+        Some(Biome::Swamp),
+        Some(Biome::Riparian),
+        Some(Biome::Beach),
+    ],
+    [None, None, None, Some(Biome::Ocean)],
 ];
 
 /// One pad: its biome and its cells, `[x0, x1) x [z0, z1)`.
@@ -58,7 +68,10 @@ pub fn patches(size: u32) -> Vec<GalleryPatch> {
     let pitch = (i64::from(size) - 2 * margin) / COLS;
     let mut out = Vec::new();
     for (row, biomes) in LAYOUT.iter().enumerate() {
-        for (col, &biome) in biomes.iter().enumerate() {
+        for (col, biome) in biomes.iter().enumerate() {
+            let Some(biome) = *biome else {
+                continue;
+            };
             let (x0, z0) = (
                 margin + col as i64 * pitch + GAP / 2,
                 margin + row as i64 * pitch + GAP / 2,
@@ -72,7 +85,7 @@ pub fn patches(size: u32) -> Vec<GalleryPatch> {
             });
         }
     }
-    debug_assert_eq!(out.len() as i64, COLS * ROWS);
+    debug_assert_eq!(out.len(), 13);
     out
 }
 
@@ -173,6 +186,7 @@ fn shape(biome: Biome, seed: u64, x: f64, z: f64, u: f64, v: f64, width: f64) ->
         Biome::Meadow
         | Biome::TemperateForest
         | Biome::BorealForest
+        | Biome::PineForest
         | Biome::Steppe
         | Biome::Desert => dry(base),
     }

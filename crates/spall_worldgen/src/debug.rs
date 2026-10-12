@@ -20,6 +20,7 @@ pub fn biome_color(biome: Biome) -> [u8; 3] {
         Biome::Scree => [128, 120, 112],
         Biome::Snow => [240, 244, 250],
         Biome::Steppe => [170, 164, 96],
+        Biome::PineForest => [34, 76, 58],
     }
 }
 
@@ -61,7 +62,7 @@ pub fn top_down_rgba(columns: &ColumnMap) -> Vec<u8> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnStats {
     /// Share of columns per biome, indexed by stored biome number (sums to 1).
-    pub biome_share: [f64; 12],
+    pub biome_share: [f64; 13],
     /// Share of columns covered by water.
     pub water_share: f64,
     pub min_height: i32,
@@ -71,7 +72,7 @@ pub struct ColumnStats {
 pub fn column_stats(columns: &ColumnMap) -> ColumnStats {
     let size = i64::from(columns.size());
     let total = (size * size) as f64;
-    let mut counts = [0u64; 12];
+    let mut counts = [0u64; 13];
     let mut water = 0u64;
     for z in 0..size {
         for x in 0..size {

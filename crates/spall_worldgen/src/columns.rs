@@ -69,13 +69,16 @@ pub enum Biome {
     Scree = 9,
     Snow = 10,
     Steppe = 11,
+    /// A sub-biome of the boreal and cool temperate forest: pines growing close
+    /// together over a bed of needles that leaves no room for other ground cover.
+    PineForest = 12,
 }
 
 impl Biome {
     /// The biomes the showcase uses.
     pub const ALL: [Biome; 4] = [Biome::Meadow, Biome::Alpine, Biome::Swamp, Biome::Desert];
     /// Every biome, indexed by its stored number.
-    pub const EVERY: [Biome; 12] = [
+    pub const EVERY: [Biome; 13] = [
         Biome::Meadow,
         Biome::Alpine,
         Biome::Swamp,
@@ -88,6 +91,7 @@ impl Biome {
         Biome::Scree,
         Biome::Snow,
         Biome::Steppe,
+        Biome::PineForest,
     ];
 
     fn from_u8(v: u8) -> Self {
@@ -99,7 +103,11 @@ impl Biome {
     pub fn vegetation_class(self) -> Biome {
         match self {
             Biome::Meadow | Biome::TemperateForest | Biome::Steppe => Biome::Meadow,
-            Biome::Alpine | Biome::BorealForest | Biome::Scree | Biome::Snow => Biome::Alpine,
+            Biome::Alpine
+            | Biome::BorealForest
+            | Biome::PineForest
+            | Biome::Scree
+            | Biome::Snow => Biome::Alpine,
             Biome::Swamp | Biome::Riparian => Biome::Swamp,
             Biome::Desert | Biome::Beach | Biome::Ocean => Biome::Desert,
         }

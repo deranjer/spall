@@ -13,8 +13,8 @@ use spall_worldgen::{Biome, ColumnMap};
 pub const VERSION: u16 = 2;
 pub const MAX_TREES: usize = 512;
 pub const MAX_GROUND: usize = 8192;
-/// Every biome's bit.
-pub const ALL_BIOMES: u16 = 0x0FFF;
+/// Every biome's bit (thirteen).
+pub const ALL_BIOMES: u16 = 0x1FFF;
 pub const MAX_SPECIES: usize = 128;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 pub const PALETTE: [[u8; 3]; 32] = [
@@ -681,6 +681,7 @@ impl LivingState {
                 evergreen: s.evergreen,
                 density: 96,
                 depth: [0, 0],
+                accent: s.colours[1],
             })
             .collect();
         Self {
