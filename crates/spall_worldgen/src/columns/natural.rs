@@ -259,10 +259,13 @@ fn repair_score(map: &ColumnMap, biome: Biome, x: i64, z: i64) -> Option<f64> {
         Biome::Alpine => t + (1.0 - m) * 20.0,
         Biome::BorealForest => (t - 6.5).abs() + (m - 0.5).abs() * 20.0,
         Biome::PineForest => (t - 7.0).abs() + (m - 0.5).abs() * 20.0,
-        Biome::Steppe => (m - 0.25).abs() * 50.0 + (t - 14.0).abs(),
-        Biome::Meadow => (m - 0.41).abs() * 50.0 + (t - 13.0).abs(),
-        Biome::TemperateForest => (m - 0.65).abs() * 50.0 + (t - 13.0).abs(),
-        Biome::Desert => m * 100.0 - t,
+        // The lowland biomes are painted on low, gentle ground, not on a range.
+        Biome::Steppe => (m - 0.25).abs() * 50.0 + (t - 14.0).abs() + above * 0.3 + gradient * 15.0,
+        Biome::Meadow => (m - 0.41).abs() * 50.0 + (t - 13.0).abs() + above * 0.3 + gradient * 15.0,
+        Biome::TemperateForest => {
+            (m - 0.65).abs() * 50.0 + (t - 13.0).abs() + above * 0.3 + gradient * 15.0
+        }
+        Biome::Desert => m * 100.0 - t + above * 0.4 + gradient * 20.0,
         Biome::Swamp => gradient * 50.0 + above * 0.1 + river * 0.2,
         Biome::Riparian => (river - 3.0).abs() * 2.0 + gradient * 10.0,
         Biome::Beach => {
@@ -351,10 +354,19 @@ fn ensure_every_biome(map: &mut ColumnMap) -> u16 {
                         continue;
                     }
                     let i = map.idx(x, z);
-                    map.biomes[i] = biome as u8;
-                    map.moisture[i] = moisture;
-                    map.temperature[i] = temperature;
-                    map.lowland[i] = if biome == Biome::Swamp { 255 } else { 0 };
+                    // The climate blends into the surroundings over the outer
+                    // part of the patch, so it does not show as a disc with a
+                    // hard edge on the temperature and wetness maps.
+                    let weight = 1.0 - smoothstep(0.55 * radius, radius, ragged);
+                    let blend = |old: u8, new: u8| {
+                        (f64::from(old) + (f64::from(new) - f64::from(old)) * weight).round() as u8
+                    };
+                    map.moisture[i] = blend(map.moisture[i], moisture);
+                    map.temperature[i] = blend(map.temperature[i], temperature);
+                    if weight > 0.5 {
+                        map.biomes[i] = biome as u8;
+                        map.lowland[i] = if biome == Biome::Swamp { 255 } else { 0 };
+                    }
                 }
             }
             if count(map).0[biome as usize] >= wanted {

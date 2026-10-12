@@ -1787,3 +1787,18 @@ Supersedes ENG-120, ENG-121, ENG-123, ENG-124, ENG-125 (canceled). W0 evidence:
 ENG-169 (W5, 2026-10-11): the grid water solver and its demos, probes and tests are removed; the column
 water is the only water. Wire/storage types for grid water stay (decode only); a checkpoint still holding
 grid water now fails recovery loudly. `cargo xtask check` passes. See reports/ENG-169.md.
+
+### ENG-186..ENG-191 - World generation v4: hydrology-first worlds, flowing rivers, living vegetation
+
+Natural worlds (landform, erosion, hydrology, climate, thirteen biomes), live rivers on the column water, stateless ground cover and underwater plants, and an editor preview with layers. Stacked PRs, each depending on the one before. Rules and measurements: `docs/worldgen.md`, `docs/reports/ENG-191.md`.
+
+| Work item | Ticket | Status |
+|---|---|---|
+| W1 scale foundation (4096-cell worlds, memory, lazy ocean) | ENG-186 | in review |
+| W2 landform and hydrology | ENG-187 | in review |
+| W3 live rivers, steady-flow sleep (sleep off: no measured benefit) | ENG-188 | in review |
+| W4 ground cover, underwater plants, biome catalogue, gallery, regrowth | ENG-189 | in review |
+| W5 ecological placement and shrub forms | ENG-190 | backlog |
+| W6 editor preview layers, tuning and docs | ENG-191 | in review |
+
+Statuses are the coordinator's; nothing is marked done before review and integration.
