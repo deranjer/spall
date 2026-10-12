@@ -118,6 +118,10 @@ pub struct LivingState {
     /// it reads. Nothing here ever changes after the world is made.
     pub cover: Vec<CoverSpecies>,
     pub field: CoverField,
+    /// Which worldgen preset the world came from (0 showcase, 1 natural), so
+    /// the server can rebuild the same climate columns the world was made
+    /// from when it installs or restores this state.
+    pub preset: u8,
 }
 /// The saved layout before ground cover: the same fields without `cover` and
 /// `field`, with carpet species among the organisms.
@@ -207,6 +211,7 @@ impl LivingState {
             spawns,
             cover: Vec::new(),
             field: CoverField::default(),
+            preset: u8::from(columns.is_natural()),
         };
         state.validate()?;
         let stride = (i64::from(state.size) / 128).max(4);
@@ -440,6 +445,8 @@ impl LivingState {
             spawns: old.spawns,
             cover,
             field: CoverField::default(),
+            // Version 1 predates natural worlds.
+            preset: 0,
         }
     }
     pub fn validate(&self) -> Result<(), String> {
@@ -451,6 +458,7 @@ impl LivingState {
             || self.organisms.len() > MAX_TREES + MAX_GROUND
             || self.spawns.len() > 64
             || self.cover.len() > MAX_COVER_SPECIES
+            || self.preset > 1
         {
             return Err("invalid vegetation schema/limits".into());
         }

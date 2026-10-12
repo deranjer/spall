@@ -653,3 +653,21 @@ fn river_sizing_uses_the_solvers_constants() {
     // A drain cell empties one cell^3 per exchange, one exchange per solver step.
     assert!((rivers::SINK_CELL_CAPACITY_CELLS3_S - 1.0 / COLUMN_STEP_DT_S).abs() < 1e-9);
 }
+
+/// The server grows plants against the climate the world was generated from:
+/// a natural world's own columns, not the showcase's.
+#[test]
+fn vegetation_installs_against_the_worlds_own_preset() {
+    for (preset, natural) in [("natural", true), ("showcase", false)] {
+        let scene = worldgen_scene::generate(preset, 2, 256).expect("generate");
+        assert_eq!(scene.vegetation().preset, u8::from(natural), "{preset}");
+        let mut config = SimulationConfig::new(scene.world_setup());
+        config.vegetation = Some(scene.vegetation().clone());
+        let sim = Simulation::new(config).expect("stands up");
+        assert_eq!(
+            sim.vegetation_climate_is_natural(),
+            Some(natural),
+            "{preset}"
+        );
+    }
+}

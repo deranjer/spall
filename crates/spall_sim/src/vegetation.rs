@@ -16,8 +16,15 @@ pub(crate) struct AuthoritativeVegetation {
 impl Simulation {
     pub fn install_vegetation(&mut self, state: LivingState) -> Result<(), String> {
         state.validate()?;
+        // The columns the world was generated from: its own preset, not
+        // always the showcase (a natural world's climate differs).
+        let preset = if state.preset == 1 {
+            Preset::Natural
+        } else {
+            Preset::Showcase
+        };
         let spec = WorldGenSpec::new(
-            Preset::Showcase,
+            preset,
             state.seed,
             state.size,
             WorldgenPalette::sequential(1),
@@ -32,6 +39,11 @@ impl Simulation {
             dirty: true,
         });
         Ok(())
+    }
+    /// Whether the climate columns the vegetation grows against are the
+    /// natural preset's (`None` with no vegetation installed).
+    pub fn vegetation_climate_is_natural(&self) -> Option<bool> {
+        self.vegetation.as_ref().map(|v| v.columns.is_natural())
     }
     pub fn vegetation_state(&self) -> Option<&LivingState> {
         self.vegetation.as_ref().map(|v| &v.state)
