@@ -214,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         summary.push(serde_json::json!({"group":"generated-world","season":name,"terrain_meshes":terrain_meshes.len(),"terrain_mesh_ms":terrain_mesh_ms,"soft_instances":soft.len(),"eye":eye.to_array()}));
     }
-    let counts:Vec<_>=state.species.iter().map(|s|serde_json::json!({"id":s.id,"name":sandbox::vegetation::NAMES[usize::from(s.id)-1],"count":state.organisms.iter().filter(|p|p.species==s.id).count()})).collect();
+    let counts:Vec<_>=state.species.iter().map(|s|serde_json::json!({"id":s.id,"name":sandbox::vegetation::name(s.id),"count":state.organisms.iter().filter(|p|p.species==s.id).count()})).collect();
     std::fs::write(
         std::path::Path::new(&output).join("summary.json"),
         serde_json::to_vec_pretty(

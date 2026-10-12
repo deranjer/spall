@@ -11,8 +11,11 @@ use spall_worldgen::{Biome, ColumnMap};
 pub const VERSION: u16 = 2;
 pub const MAX_TREES: usize = 512;
 pub const MAX_GROUND: usize = 8192;
+/// Every biome's bit.
+pub const ALL_BIOMES: u16 = 0x0FFF;
+pub const MAX_SPECIES: usize = 128;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
-pub const PALETTE: [[u8; 3]; 16] = [
+pub const PALETTE: [[u8; 3]; 32] = [
     [57, 105, 32],
     [82, 133, 41],
     [39, 85, 48],
@@ -29,6 +32,23 @@ pub const PALETTE: [[u8; 3]; 16] = [
     [110, 157, 106],
     [78, 124, 118],
     [177, 184, 110],
+    // Appended with ground-cover variety; indexes above never change.
+    [235, 200, 52],
+    [240, 240, 232],
+    [96, 92, 190],
+    [101, 52, 38],
+    [96, 150, 64],
+    [150, 165, 140],
+    [170, 170, 160],
+    [70, 52, 34],
+    [214, 176, 120],
+    [60, 110, 70],
+    [190, 120, 60],
+    [228, 140, 160],
+    [120, 130, 60],
+    [88, 70, 110],
+    [200, 190, 130],
+    [48, 80, 60],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +82,8 @@ impl Season {
 pub struct Species {
     pub id: u16,
     pub tree: bool,
-    pub biomes: u8,
+    /// Bit `1 << biome` for each of the twelve biomes the species grows in.
+    pub biomes: u16,
     pub soils: [u16; 4],
     pub moisture: [u8; 2],
     pub wood: u16,
@@ -79,7 +100,7 @@ pub struct Species {
 }
 impl Species {
     fn accepts(&self, biome: Biome, moisture: u8, soil: u16) -> bool {
-        self.biomes & (1 << biome as u8) != 0
+        self.biomes & (1 << biome as u16) != 0
             && self.soils.contains(&soil)
             && (self.moisture[0]..=self.moisture[1]).contains(&moisture)
     }
@@ -123,6 +144,77 @@ pub struct LivingState {
     /// from when it installs or restores this state.
     pub preset: u8,
 }
+/// A version 1 species: its `biomes` were a mask over the four vegetation
+/// classes (meadow, alpine, swamp, desert).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SpeciesV1 {
+    id: u16,
+    tree: bool,
+    biomes: u8,
+    soils: [u16; 4],
+    moisture: [u8; 2],
+    wood: u16,
+    trunk_width: u8,
+    form: u8,
+    height: u16,
+    spread: u16,
+    spacing: u16,
+    evergreen: bool,
+    colours: [u8; 4],
+    flower: u8,
+    growth_ms: u64,
+    seed_ms: u64,
+}
+impl SpeciesV1 {
+    /// The twelve-biome mask a class mask stands for.
+    fn widen(&self) -> u16 {
+        let mut mask = 0u16;
+        for (class, biomes) in [
+            (
+                0u8,
+                &[Biome::Meadow, Biome::TemperateForest, Biome::Steppe][..],
+            ),
+            (
+                1,
+                &[
+                    Biome::Alpine,
+                    Biome::BorealForest,
+                    Biome::Scree,
+                    Biome::Snow,
+                ][..],
+            ),
+            (2, &[Biome::Swamp, Biome::Riparian][..]),
+            (3, &[Biome::Desert, Biome::Beach, Biome::Ocean][..]),
+        ] {
+            if self.biomes & (1 << class) != 0 {
+                for b in biomes {
+                    mask |= 1 << *b as u16;
+                }
+            }
+        }
+        mask
+    }
+    fn into_current(self) -> Species {
+        Species {
+            biomes: self.widen(),
+            id: self.id,
+            tree: self.tree,
+            soils: self.soils,
+            moisture: self.moisture,
+            wood: self.wood,
+            trunk_width: self.trunk_width,
+            form: self.form,
+            height: self.height,
+            spread: self.spread,
+            spacing: self.spacing,
+            evergreen: self.evergreen,
+            colours: self.colours,
+            flower: self.flower,
+            growth_ms: self.growth_ms,
+            seed_ms: self.seed_ms,
+        }
+    }
+}
 /// The saved layout before ground cover: the same fields without `cover` and
 /// `field`, with carpet species among the organisms.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +228,7 @@ struct LivingStateV1 {
     season_ms: u64,
     next_id: u64,
     cursor: u32,
-    species: Vec<Species>,
+    species: Vec<SpeciesV1>,
     organisms: Vec<Organism>,
     spawns: Vec<[i64; 3]>,
 }
@@ -281,11 +373,7 @@ impl LivingState {
         let Ok(Sample::Filled(soil)) = terrain.sample(GlobalCell::new(x, y - 1, z)) else {
             return false;
         };
-        if !s.accepts(
-            columns.biome(x, z).vegetation_class(),
-            moisture(columns, x, z),
-            soil.0,
-        ) {
+        if !s.accepts(columns.biome(x, z), moisture(columns, x, z), soil.0) {
             return false;
         }
         (0..if s.tree { i64::from(s.height) + 8 } else { 4 }).all(|dy| {
@@ -310,6 +398,18 @@ impl LivingState {
             .count();
         if count >= if s.tree { MAX_TREES } else { MAX_GROUND }
             || !self.eligible(columns, terrain, s, root)
+            // A ground plant never roots in a tree's trunk column, even one
+            // whose wood has not been committed yet.
+            || (!s.tree
+                && self.organisms.iter().any(|p| {
+                    p.alive
+                        && !p.wood.is_empty()
+                        && root[0] >= p.root[0]
+                        && root[0] < p.root[0] + 2
+                        && root[2] >= p.root[2]
+                        && root[2] < p.root[2] + 2
+                        && root[1] >= p.root[1]
+                }))
             || self
                 .organisms
                 .iter()
@@ -331,6 +431,18 @@ impl LivingState {
             .any(|p| !matches!(terrain.sample(cell(*p)), Ok(Sample::Empty { .. })))
         {
             return None;
+        }
+        // And a tree never grows over a ground plant already rooted there.
+        if s.tree {
+            let ground: std::collections::HashSet<[i64; 3]> = self
+                .organisms
+                .iter()
+                .filter(|p| p.alive && p.wood.is_empty())
+                .map(|p| p.root)
+                .collect();
+            if wood.iter().any(|c| ground.contains(c)) {
+                return None;
+            }
         }
         let p = Organism {
             id: self.next_id,
@@ -411,7 +523,7 @@ impl LivingState {
             .filter(|s| carpet.contains(&s.id))
             .map(|s| CoverSpecies {
                 id: s.id,
-                biomes: s.biomes,
+                biomes: s.widen(),
                 soils: s.soils,
                 moisture: s.moisture,
                 temperature: [-62, 62],
@@ -436,6 +548,7 @@ impl LivingState {
                 .species
                 .into_iter()
                 .filter(|s| !carpet.contains(&s.id))
+                .map(SpeciesV1::into_current)
                 .collect(),
             organisms: old
                 .organisms
@@ -451,7 +564,7 @@ impl LivingState {
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.version != VERSION
-            || self.species.len() > 64
+            || self.species.len() > MAX_SPECIES
             || self.season_ms == 0
             || self.size < 128
             || self.size > 4096
@@ -475,7 +588,7 @@ impl LivingState {
             if !ids.insert(s.id)
                 || s.id == 0
                 || s.biomes == 0
-                || s.biomes > 15
+                || s.biomes > ALL_BIOMES
                 || s.form > 13
                 || s.spacing == 0
                 || s.height == 0
@@ -490,7 +603,6 @@ impl LivingState {
                     .any(|c| usize::from(*c) >= PALETTE.len())
                 || s.moisture[0] > s.moisture[1]
                 || (s.tree && (s.wood == 0 || s.trunk_width == 0 || s.trunk_width > 2))
-                || (!s.tree && is_carpet_form(s.form))
             {
                 return Err("invalid species".into());
             }
@@ -577,7 +689,7 @@ impl LivingState {
                 Ok(Sample::Unknown(_)) => continue,
                 Ok(Sample::Filled(m))
                     if s.accepts(
-                        columns.biome(p.root[0], p.root[2]).vegetation_class(),
+                        columns.biome(p.root[0], p.root[2]),
                         moisture(columns, p.root[0], p.root[2]),
                         m.0,
                     ) => {}
@@ -849,7 +961,7 @@ impl VisualFrame {
         }
         let frame: Self = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
         if frame.version != VERSION
-            || frame.species.len() > 64
+            || frame.species.len() > MAX_SPECIES
             || frame.cover.len() > MAX_COVER_SPECIES
             || frame.cover.iter().any(|c| c.validate().is_err())
             || frame.field.validate().is_err()
@@ -864,7 +976,10 @@ impl VisualFrame {
             || frame.species.iter().any(|s| {
                 s.height > 64
                     || s.spread > 20
-                    || s.colours.iter().chain([&s.flower]).any(|c| *c >= 16)
+                    || s.colours
+                        .iter()
+                        .chain([&s.flower])
+                        .any(|c| usize::from(*c) >= PALETTE.len())
             })
         {
             return Err("visual schema/limits".into());
@@ -1001,8 +1116,8 @@ impl VisualFrame {
 mod tests {
     use super::*;
 
-    fn species(id: u16, tree: bool, form: u8) -> Species {
-        Species {
+    fn species(id: u16, tree: bool, form: u8) -> SpeciesV1 {
+        SpeciesV1 {
             id,
             tree,
             biomes: 1,
@@ -1110,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_2_state_refuses_carpet_organisms_and_clashing_ids() {
+    fn a_version_2_state_refuses_a_cover_id_that_is_also_a_species_id() {
         let mut state = LivingState::decode(
             &postcard::to_stdvec(&LivingStateV1 {
                 version: 1,
@@ -1129,13 +1244,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        state.species.push(species(30, false, 6));
-        assert!(
-            state.validate().is_err(),
-            "a carpet form is not a living ground plant now"
-        );
-        state.species.pop();
-        state.species.push(species(11, false, 8));
+        state.species.push(species(11, false, 8).into_current());
         assert!(
             state.validate().is_err(),
             "a cover id may not also be a species id"

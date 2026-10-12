@@ -123,24 +123,12 @@ fn springs_are_high_river_heads() {
 }
 
 #[test]
-fn both_kinds_of_map_have_rivers_and_water_ends_somewhere() {
-    let (mut coastal, mut landlocked) = (0, 0);
+fn every_map_is_coastal_and_has_rivers() {
     for s in scapes() {
         let rivers = s.hydrology.river.iter().filter(|&&r| r).count();
-        if s.landform.is_coastal() {
-            coastal += 1;
-        } else {
-            landlocked += 1;
-            assert!(
-                !s.hydrology.lakes.iter().all(|l| l.spill != NONE) || !s.landform.basins.is_empty()
-            );
-        }
+        assert!(s.landform.is_coastal(), "seed {} has no coast", s.seed);
         assert!(rivers > 0, "seed {} has no river", s.seed);
     }
-    assert!(
-        coastal > 0 && landlocked > 0,
-        "{coastal} coastal, {landlocked} landlocked"
-    );
 }
 
 /// Manual: writes height and water maps for eyeballing, and times 1 km.

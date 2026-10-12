@@ -30,7 +30,7 @@ fn filled(w: &GeneratedWorld, x: i64, y: i64, z: i64) -> Option<MaterialId> {
 
 #[test]
 fn natural_has_its_own_version_and_height() {
-    assert_eq!(Preset::Natural.gen_version(), 4);
+    assert_eq!(Preset::Natural.gen_version(), 5);
     assert_eq!(Preset::Showcase.gen_version(), 3);
     assert_eq!(spec(1, SIZE).height_bricks, 16);
     assert_eq!(spec(1, SIZE).height_cells(), 512);
@@ -88,7 +88,7 @@ fn heights_stay_under_the_wall() {
 fn generated_worlds_hold_water_only_in_air_and_keep_a_dry_spawn() {
     for seed in [1, 2, 5] {
         let w = generate(&spec(seed, SIZE)).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-        assert_eq!(w.version, 4);
+        assert_eq!(w.version, 5);
         for c in w.water.cells().step_by(37) {
             assert_eq!(
                 filled(&w, c.x, c.y, c.z),
@@ -137,32 +137,39 @@ fn climate_cools_with_height() {
 }
 
 #[test]
-fn a_seed_sweep_produces_every_natural_biome_and_both_map_kinds() {
-    let mut seen = [false; 12];
-    let (mut coast, mut landlocked) = (0, 0);
-    for seed in 1..=24 {
-        let cols = columns(seed, SIZE);
-        let stats = column_stats(&cols);
-        for (i, share) in stats.biome_share.iter().enumerate() {
-            seen[i] |= *share > 0.0;
-        }
-        if stats.biome_share[Biome::Ocean as usize] > 0.01 {
-            coast += 1;
-        } else {
-            landlocked += 1;
+fn every_world_shows_all_twelve_biomes_in_a_real_share() {
+    for (size, seeds) in [(SIZE, 1..=24u64), (1024, 1..=6)] {
+        for seed in seeds {
+            let cols = columns(seed, size);
+            let stats = column_stats(&cols);
+            for b in Biome::EVERY {
+                let share = stats.biome_share[b as usize];
+                assert!(
+                    share >= 0.005,
+                    "seed {seed} size {size}: {b:?} holds only {:.2}% of the world",
+                    share * 100.0
+                );
+            }
         }
     }
-    let missing: Vec<_> = Biome::EVERY
-        .iter()
-        .zip(seen)
-        .filter(|(_, s)| !s)
-        .map(|(b, _)| *b)
-        .collect();
-    assert!(missing.is_empty(), "never generated: {missing:?}");
-    assert!(
-        coast > 0 && landlocked > 0,
-        "{coast} coastal, {landlocked} landlocked"
-    );
+}
+
+#[test]
+fn every_seed_has_a_coast_and_painting_is_deterministic() {
+    for seed in 1..=24 {
+        let a = columns(seed, SIZE);
+        let b = columns(seed, SIZE);
+        assert!(
+            column_stats(&a).biome_share[Biome::Ocean as usize] > 0.005,
+            "seed {seed} has no sea"
+        );
+        assert_eq!(a.repaired_biomes(), b.repaired_biomes());
+        for z in (0..i64::from(SIZE)).step_by(7) {
+            for x in (0..i64::from(SIZE)).step_by(7) {
+                assert_eq!(a.biome(x, z), b.biome(x, z));
+            }
+        }
+    }
 }
 
 /// Manual: writes top-down maps for eyeballing the world's layout.
@@ -244,4 +251,121 @@ fn diag_springs() {
         max,
         max / 64.0
     );
+}
+
+/// Manual: biome shares per seed and which biomes the generator had to paint in.
+#[test]
+#[ignore = "manual diagnostic"]
+fn diag_biome_coverage() {
+    let size: u32 = std::env::var("NATURAL_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let seeds: u64 = std::env::var("SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    let mut repaired_counts = [0u32; 12];
+    let mut min_share = [1.0f64; 12];
+    for seed in 1..=seeds {
+        let cols = columns(seed, size);
+        let stats = column_stats(&cols);
+        let r = cols.repaired_biomes();
+        for (i, share) in stats.biome_share.iter().enumerate() {
+            repaired_counts[i] += u32::from(r >> i & 1);
+            min_share[i] = min_share[i].min(*share);
+        }
+        if r != 0 {
+            let names: Vec<_> = Biome::EVERY
+                .iter()
+                .filter(|b| r >> (**b as u16) & 1 == 1)
+                .collect();
+            eprintln!("seed {seed}: painted {names:?}");
+        }
+    }
+    for b in Biome::EVERY {
+        eprintln!(
+            "{b:?}: painted in {}/{} seeds, smallest share {:.2}%",
+            repaired_counts[b as usize],
+            seeds,
+            min_share[b as usize] * 100.0
+        );
+    }
+}
+
+/// Each biome shows at least three different surfaces in every world.
+#[test]
+fn every_biome_shows_at_least_three_surfaces() {
+    let palette = spall_worldgen::WorldgenPalette::sequential(1);
+    let mut short = Vec::new();
+    for (size, seeds) in [(SIZE, 1..=12u64), (1024, 1..=4)] {
+        for seed in seeds {
+            let cols = columns(seed, size);
+            let mut tops: Vec<std::collections::BTreeSet<u16>> =
+                vec![std::collections::BTreeSet::new(); 12];
+            for z in 0..i64::from(size) {
+                for x in 0..i64::from(size) {
+                    tops[cols.biome(x, z) as usize].insert(cols.stack(&palette, x, z).top.0);
+                }
+            }
+            for b in Biome::EVERY {
+                if tops[b as usize].len() < 3 {
+                    short.push(format!(
+                        "seed {seed} size {size}: {b:?} has only {:?}",
+                        tops[b as usize]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(short.is_empty(), "{short:#?}");
+}
+
+/// Manual: one spot per biome (metres) well inside a patch of it, for tours.
+#[test]
+#[ignore = "manual diagnostic"]
+fn diag_biome_spots() {
+    let seed: u64 = std::env::var("SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let size: u32 = std::env::var("NATURAL_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
+    let cols = columns(seed, size);
+    let n = i64::from(size);
+    for b in Biome::EVERY {
+        let mut best: Option<(i64, i64, i64)> = None;
+        for z in (40..n - 40).step_by(6) {
+            for x in (40..n - 40).step_by(6) {
+                if cols.biome(x, z) != b || cols.is_water(x, z) && b != Biome::Ocean {
+                    continue;
+                }
+                let mut run = 0;
+                'grow: for r in (4..=40).step_by(4) {
+                    for (dx, dz) in [(r, 0), (-r, 0), (0, r), (0, -r), (r, r), (-r, -r)] {
+                        if cols.biome(x + dx, z + dz) != b {
+                            break 'grow;
+                        }
+                    }
+                    run = r;
+                }
+                if best.is_none_or(|(r, _, _)| run > r) {
+                    best = Some((run, x, z));
+                }
+            }
+        }
+        if let Some((run, x, z)) = best {
+            let h = cols.height(x, z);
+            eprintln!(
+                "{b:?}: radius>={run} cells at x={:.1} m z={:.1} m ground y={:.1} m moisture={} t={:.1}",
+                x as f64 * 0.25,
+                z as f64 * 0.25,
+                f64::from(h) * 0.25,
+                cols.moisture(x, z),
+                cols.temperature_c(x, z)
+            );
+        }
+    }
 }

@@ -140,6 +140,9 @@ pub struct ColumnMap {
     /// of landlocked maps. Empty for the showcase.
     springs: Vec<([i64; 3], f32)>,
     sinks: Vec<[i64; 3]>,
+    /// Biomes (bit `1 << biome`) that the climate did not produce in enough
+    /// quantity and the generator painted in. Natural worlds only.
+    repaired: u16,
 }
 
 struct Layout {
@@ -324,6 +327,7 @@ impl ColumnMap {
             natural: false,
             springs: Vec::new(),
             sinks: Vec::new(),
+            repaired: 0,
         })
     }
 
@@ -388,6 +392,12 @@ impl ColumnMap {
     /// Ground temperature in degrees Celsius.
     pub fn temperature_c(&self, x: i64, z: i64) -> f64 {
         f64::from(self.temperature[self.idx(x, z)]) / 3.1875 - 30.0
+    }
+
+    /// The biomes the generator had to paint in because the climate left them
+    /// out or nearly so (bit `1 << biome`); zero for most seeds.
+    pub fn repaired_biomes(&self) -> u16 {
+        self.repaired
     }
 
     /// Cells to the nearest river or lake, clamped to 255.

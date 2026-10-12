@@ -142,7 +142,8 @@ fn offspring_remain_on_allowed_biomes_and_survive_roundtrip() {
     });
     terrain.apply_edit(&clearing).unwrap();
     let original = state.next_id;
-    for _ in 0..240 {
+    // Trees seed only once fully grown (and 90 s apart), so give them time.
+    for _ in 0..900 {
         state.advance(&scene.world().columns, &terrain, 1000);
     }
     assert!(
@@ -360,4 +361,41 @@ fn two_network_clients_receive_generated_vegetation_and_the_same_season() {
         assert_eq!(report.final_world_hash, server.final_world_hash);
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A ground plant is never placed in a tree's trunk column (the tree's wood is
+/// planned before it is committed, so the cell still looks empty).
+#[test]
+fn no_ground_plant_roots_in_a_trunk_column() {
+    for (preset, seed) in [("showcase", 4), ("natural", 2), ("natural", 5)] {
+        let scene = sandbox::worldgen_scene::generate(preset, seed, 256).unwrap();
+        let state = scene.vegetation();
+        let trees: Vec<_> = state
+            .organisms
+            .iter()
+            .filter(|p| !p.wood.is_empty())
+            .collect();
+        for g in state.organisms.iter().filter(|p| p.wood.is_empty()) {
+            for t in &trees {
+                let width = i64::from(
+                    state
+                        .species
+                        .iter()
+                        .find(|s| s.id == t.species)
+                        .unwrap()
+                        .trunk_width,
+                );
+                assert!(
+                    !(g.root[0] >= t.root[0]
+                        && g.root[0] < t.root[0] + width
+                        && g.root[2] >= t.root[2]
+                        && g.root[2] < t.root[2] + width
+                        && g.root[1] >= t.root[1]),
+                    "{preset} {seed}: plant {} roots in tree {}'s trunk",
+                    g.id,
+                    t.id
+                );
+            }
+        }
+    }
 }

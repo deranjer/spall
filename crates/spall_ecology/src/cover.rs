@@ -41,9 +41,8 @@ pub fn is_carpet_form(form: u8) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverSpecies {
     pub id: u16,
-    /// Bit `1 << class` for the four vegetation classes (see
-    /// [`Biome::vegetation_class`]).
-    pub biomes: u8,
+    /// Bit `1 << biome` for each biome the cover grows in.
+    pub biomes: u16,
     pub soils: [u16; 4],
     pub moisture: [u8; 2],
     /// Air temperature range this cover lives in, degrees C.
@@ -61,8 +60,8 @@ pub struct CoverSpecies {
 }
 
 impl CoverSpecies {
-    fn accepts(&self, class: Biome, moisture: u8, temperature: i8, soil: u16) -> bool {
-        self.biomes & (1 << class as u8) != 0
+    fn accepts(&self, biome: Biome, moisture: u8, temperature: i8, soil: u16) -> bool {
+        self.biomes & (1 << biome as u16) != 0
             && self.soils.contains(&soil)
             && (self.moisture[0]..=self.moisture[1]).contains(&moisture)
             && (self.temperature[0]..=self.temperature[1]).contains(&temperature)
@@ -71,14 +70,17 @@ impl CoverSpecies {
     pub fn validate(&self) -> Result<(), String> {
         if self.id == 0
             || self.biomes == 0
-            || self.biomes > 15
+            || self.biomes > crate::living::ALL_BIOMES
             || !is_carpet_form(self.form)
             || self.height == 0
             || self.height > 64
             || self.density == 0
             || self.moisture[0] > self.moisture[1]
             || self.temperature[0] > self.temperature[1]
-            || self.colours.iter().any(|c| *c >= 16)
+            || self
+                .colours
+                .iter()
+                .any(|c| usize::from(*c) >= crate::living::PALETTE.len())
         {
             return Err("invalid cover species".into());
         }
@@ -117,16 +119,15 @@ pub fn ground_cover(
     biome: Biome,
     season: Season,
 ) -> Option<Cover> {
-    if matches!(biome, Biome::Ocean | Biome::Snow | Biome::Scree) {
+    if biome == Biome::Ocean {
         return None;
     }
-    let class = biome.vegetation_class();
     let key =
         hash(seed ^ (cell[0] as u64).rotate_left(21) ^ (cell[2] as u64).rotate_left(43) ^ 0xC0FE);
     let mut fits = [0usize; MAX_COVER_SPECIES];
     let mut n = 0;
     for (i, s) in set.iter().enumerate().take(MAX_COVER_SPECIES) {
-        if s.accepts(class, moisture, temperature_c, surface_material) {
+        if s.accepts(biome, moisture, temperature_c, surface_material) {
             fits[n] = i;
             n += 1;
         }
@@ -135,10 +136,15 @@ pub fn ground_cover(
         return None;
     }
     let s = &set[fits[(key >> 8) as usize % n]];
-    if ((key >> 24) & 255) as u8 >= s.density {
+    // Wetter ground carries more cover and taller cover: a species' density
+    // is for average wetness, dry ground gets under half of it and the wettest
+    // gets more. (Wetter ground also admits more species: see their ranges.)
+    let wet = f32::from(moisture) / 255.0;
+    let gate = (f32::from(s.density) * (0.35 + 1.0 * wet)).min(255.0);
+    if ((key >> 24) & 255) as f32 >= gate {
         return None;
     }
-    let size = 0.7 + 0.6 * ((key >> 40) & 255) as f32 / 255.0;
+    let size = (0.7 + 0.6 * ((key >> 40) & 255) as f32 / 255.0) * (0.85 + 0.3 * wet);
     let winter_shrink = s.form == 11 && season == Season::Winter && !s.evergreen;
     Some(Cover {
         species: s.id,
@@ -597,7 +603,55 @@ mod tests {
         assert_eq!(all(1, 120, 15, Biome::Ocean), 0, "no cover at sea");
         assert_eq!(all(1, 120, 15, Biome::Snow), 0, "no cover on snow");
         // The desert bunchgrass takes the desert class on sand and nothing else.
-        assert!(all(3, 30, 25, Biome::Desert) > 300);
+        assert!(all(3, 30, 25, Biome::Desert) > 150);
+    }
+
+    #[test]
+    fn wetter_ground_carries_more_cover_and_more_kinds() {
+        // Two species that need different wetness: a dry turf and a wet sedge.
+        let mut s = set();
+        s[0].moisture = [0, 140];
+        s.push(CoverSpecies {
+            id: 14,
+            biomes: 1,
+            soils: [1, 0, 0, 0],
+            moisture: [120, 255],
+            temperature: [-5, 40],
+            form: 9,
+            height: 4,
+            colours: [3, 1, 7, 8],
+            evergreen: true,
+            density: 128,
+        });
+        let at = |moisture: u8| {
+            let mut tufts = 0;
+            let mut kinds = std::collections::BTreeSet::new();
+            for i in 0..4000 {
+                if let Some(c) = ground_cover(
+                    &s,
+                    5,
+                    [i, 4, i * 3],
+                    1,
+                    moisture,
+                    15,
+                    Biome::Meadow,
+                    Season::Summer,
+                ) {
+                    tufts += 1;
+                    kinds.insert(c.species);
+                }
+            }
+            (tufts, kinds.len())
+        };
+        let (dry, dry_kinds) = at(40);
+        let (mid, mid_kinds) = at(130);
+        let (wet, wet_kinds) = at(240);
+        assert!(dry < mid && mid < wet, "{dry} < {mid} < {wet}");
+        assert_eq!(
+            (dry_kinds, mid_kinds, wet_kinds),
+            (1, 2, 1),
+            "kinds follow each range"
+        );
     }
 
     #[test]

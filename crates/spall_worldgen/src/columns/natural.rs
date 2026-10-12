@@ -16,6 +16,8 @@ const S_DETAIL: u64 = 0x6e01;
 const S_DITHER_T: u64 = 0x6e02;
 const S_DITHER_M: u64 = 0x6e03;
 const S_PATCH: u64 = 0x6e04;
+const S_PATCH_B: u64 = 0x6e05;
+const S_PATCH_C: u64 = 0x6e06;
 
 const CELLS: f64 = SAMPLE_CELLS as f64;
 
@@ -215,6 +217,152 @@ fn build_coarse(scape: &Landscape) -> Coarse {
     }
 }
 
+/// The smallest share of a world's land a biome may hold before the generator
+/// paints it in: every world shows every biome.
+const MIN_BIOME_SHARE: f64 = 0.01;
+
+/// The climate a painted biome carries: temperature in degrees and wetness
+/// `0..=1`, so cover and plants read the same values the biome implies.
+fn biome_climate(biome: Biome) -> (f64, f64) {
+    match biome {
+        Biome::Snow => (-6.0, 0.40),
+        Biome::Scree => (3.0, 0.20),
+        Biome::Alpine => (2.0, 0.50),
+        Biome::BorealForest => (6.5, 0.50),
+        Biome::Steppe => (14.0, 0.24),
+        Biome::Meadow => (13.0, 0.41),
+        Biome::TemperateForest => (13.0, 0.65),
+        Biome::Desert => (24.0, 0.06),
+        Biome::Swamp => (12.0, 0.75),
+        Biome::Riparian => (12.0, 0.60),
+        Biome::Beach => (16.0, 0.30),
+        Biome::Ocean => (14.0, 0.50),
+    }
+}
+
+/// How well a land column suits `biome` to be painted there (lower is better);
+/// `None` where it cannot be.
+fn repair_score(map: &ColumnMap, biome: Biome, x: i64, z: i64) -> Option<f64> {
+    if map.is_water(x, z) || map.in_border(x, z) {
+        return None;
+    }
+    let above = f64::from(map.height(x, z) - SEA_LEVEL);
+    let gradient = map.gradient(x, z);
+    let t = map.temperature_c(x, z);
+    let m = f64::from(map.moisture(x, z)) / 255.0;
+    let river = f64::from(map.river_dist(x, z));
+    Some(match biome {
+        Biome::Snow => -above,
+        Biome::Scree => -gradient,
+        Biome::Alpine => t + (1.0 - m) * 20.0,
+        Biome::BorealForest => (t - 6.5).abs() + (m - 0.5).abs() * 20.0,
+        Biome::Steppe => (m - 0.25).abs() * 50.0 + (t - 14.0).abs(),
+        Biome::Meadow => (m - 0.41).abs() * 50.0 + (t - 13.0).abs(),
+        Biome::TemperateForest => (m - 0.65).abs() * 50.0 + (t - 13.0).abs(),
+        Biome::Desert => m * 100.0 - t,
+        Biome::Swamp => gradient * 50.0 + above * 0.1 + river * 0.2,
+        Biome::Riparian => (river - 3.0).abs() * 2.0 + gradient * 10.0,
+        Biome::Beach => {
+            if above > 12.0 {
+                return None;
+            }
+            above + gradient * 5.0
+        }
+        // Water cannot be painted onto land.
+        Biome::Ocean => return None,
+    })
+}
+
+/// Paints in every biome the climate left out (or left under
+/// [`MIN_BIOME_SHARE`] of the land): a ragged patch where the terrain and
+/// climate suit it best, carrying that biome's moisture and temperature.
+/// Deterministic, and a no-op for worlds that already have everything. Returns
+/// the biomes painted, as bits.
+fn ensure_every_biome(map: &mut ColumnMap) -> u16 {
+    let size = i64::from(map.size);
+    let land = |map: &ColumnMap, x: i64, z: i64| !map.is_water(x, z) && !map.in_border(x, z);
+    let count = |map: &ColumnMap| {
+        let mut per = [0usize; 12];
+        let mut land_columns = 0usize;
+        for z in 0..size {
+            for x in 0..size {
+                let b = map.biome(x, z) as usize;
+                per[b] += 1;
+                land_columns += usize::from(land(map, x, z));
+            }
+        }
+        (per, land_columns)
+    };
+    let mut repaired = 0u16;
+    // The rarest to place first, so a later patch does not erase an earlier one.
+    for biome in [
+        Biome::Snow,
+        Biome::Scree,
+        Biome::Alpine,
+        Biome::Swamp,
+        Biome::Desert,
+        Biome::BorealForest,
+        Biome::Steppe,
+        Biome::Meadow,
+        Biome::TemperateForest,
+        Biome::Riparian,
+        Biome::Beach,
+    ] {
+        let (per, land_columns) = count(map);
+        let wanted = ((MIN_BIOME_SHARE * land_columns as f64) as usize).max(64);
+        if per[biome as usize] >= wanted {
+            continue;
+        }
+        // The best spot on a coarse grid, first in scan order on ties.
+        let mut best: Option<(f64, i64, i64)> = None;
+        for z in (0..size).step_by(8) {
+            for x in (0..size).step_by(8) {
+                if let Some(score) = repair_score(map, biome, x, z)
+                    && best.is_none_or(|b| score < b.0)
+                {
+                    best = Some((score, x, z));
+                }
+            }
+        }
+        let Some((_, cx, cz)) = best else {
+            continue;
+        };
+        let (t, m) = biome_climate(biome);
+        let temperature = ((t + 30.0) * 3.1875).round().clamp(0.0, 255.0) as u8;
+        let moisture = (m * 255.0).round().clamp(0.0, 255.0) as u8;
+        // Sized to hold the wanted share; water and the border eat into the
+        // disc, so it grows until the biome has what it needs.
+        let mut radius = ((wanted as f64 / std::f64::consts::PI).sqrt() * 1.25).max(10.0);
+        for _ in 0..5 {
+            let reach = radius.ceil() as i64 + 6;
+            for z in cz - reach..=cz + reach {
+                for x in cx - reach..=cx + reach {
+                    if x < 0 || z < 0 || x >= size || z >= size || !land(map, x, z) {
+                        continue;
+                    }
+                    let d = (((x - cx).pow(2) + (z - cz).pow(2)) as f64).sqrt();
+                    let ragged =
+                        d + 5.0 * value2(map.seed ^ S_PATCH, x as f64 / 6.0, z as f64 / 6.0);
+                    if ragged > radius {
+                        continue;
+                    }
+                    let i = map.idx(x, z);
+                    map.biomes[i] = biome as u8;
+                    map.moisture[i] = moisture;
+                    map.temperature[i] = temperature;
+                    map.lowland[i] = if biome == Biome::Swamp { 255 } else { 0 };
+                }
+            }
+            if count(map).0[biome as usize] >= wanted {
+                break;
+            }
+            radius *= 1.3;
+        }
+        repaired |= 1 << biome as u16;
+    }
+    repaired
+}
+
 /// Biome of a column from climate and terrain (Whittaker-style): temperature
 /// `t` in degrees, wetness `m` in `0..=1`.
 fn classify(t: f64, m: f64, h: i32, gradient: f64, submerged: bool, river_dist: f64) -> Biome {
@@ -229,7 +377,7 @@ fn classify(t: f64, m: f64, h: i32, gradient: f64, submerged: bool, river_dist: 
     if above <= 6 && gradient < 0.5 && river_dist > 10.0 {
         return Biome::Beach;
     }
-    if t < -2.0 {
+    if t < 1.0 {
         return Biome::Snow;
     }
     if gradient >= 1.2 || (gradient >= 0.8 && t < 6.0) {
@@ -238,11 +386,11 @@ fn classify(t: f64, m: f64, h: i32, gradient: f64, submerged: bool, river_dist: 
     if river_dist <= 7.0 && gradient < 0.4 {
         return Biome::Riparian;
     }
-    if river_dist <= 30.0 && m > 0.58 && gradient < 0.15 && t > 5.0 {
+    if river_dist <= 40.0 && m > 0.5 && gradient < 0.25 && t > 5.0 {
         return Biome::Swamp;
     }
     if t < 4.0 {
-        return if m >= 0.35 {
+        return if m >= 0.22 {
             Biome::Alpine
         } else {
             Biome::Scree
@@ -351,6 +499,7 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
         natural: true,
         springs: Vec::new(),
         sinks: Vec::new(),
+        repaired: 0,
     };
 
     // Biomes need neighbouring heights, so they come second.
@@ -395,6 +544,7 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
     });
     map.biomes = biomes;
     map.lowland = lowland;
+    map.repaired = ensure_every_biome(&mut map);
 
     // Exchange cells: a spring refills the water cell at a river head; a
     // terminal basin drains at the surface of its lake.
@@ -513,67 +663,167 @@ impl ColumnMap {
         let biome = self.biome(x, z);
         let gradient = self.gradient(x, z);
         let rd = self.river_dist(x, z);
-        let patch = fbm2(self.seed ^ S_PATCH, x as f64 / 17.0, z as f64 / 17.0, 2);
+        let wet = f64::from(self.moisture(x, z)) / 255.0;
+        // Three independent patch noises: where one kind of ground gives way to
+        // another inside a biome. Each biome shows at least three surfaces.
+        let (fx, fz) = (x as f64, z as f64);
+        let a = fbm2(self.seed ^ S_PATCH, fx / 17.0, fz / 17.0, 2);
+        let b = fbm2(self.seed ^ S_PATCH_B, fx / 11.0, fz / 11.0, 2);
+        let c = fbm2(self.seed ^ S_PATCH_C, fx / 23.0, fz / 23.0, 2);
         let rock = || st(p.stone, 1, p.stone, 0);
 
         let depth = self.water_surface(x, z) - h;
         if depth > 0 {
-            // Under water: sea floor, shallow river and shore gravel, deep lake clay.
+            // Under water: the sea floor grades from sand through gravel to clay
+            // with depth; fresh water has gravel shallows, mud pockets, clay deeps.
             return if biome == Biome::Ocean {
-                st(p.sand, 6, p.sandstone, 20)
+                if depth <= 3 {
+                    st(p.sand, 6, p.sandstone, 20)
+                } else if a > 0.25 {
+                    st(p.gravel, 3, p.sand, 8)
+                } else if depth > 14 {
+                    st(p.clay, 4, p.gravel, 6)
+                } else {
+                    st(p.sand, 6, p.sandstone, 20)
+                }
             } else if depth <= 4 {
-                st(p.gravel, 3, p.dirt, 6)
+                if b > 0.3 {
+                    st(p.mud, 2, p.dirt, 6)
+                } else {
+                    st(p.gravel, 3, p.dirt, 6)
+                }
+            } else if a > 0.3 {
+                st(p.mud, 3, p.clay, 6)
             } else {
                 st(p.clay, 4, p.gravel, 6)
             };
         }
         match biome {
-            Biome::Snow => st(p.snow, 4, p.stone, 0),
-            Biome::Scree => {
-                if patch > 0.2 {
+            Biome::Snow => {
+                if a > 0.2 {
                     st(p.slate, 6, p.stone, 0)
-                } else if gradient >= 1.1 {
+                } else if b > 0.35 {
+                    rock()
+                } else {
+                    st(p.snow, 4, p.stone, 0)
+                }
+            }
+            Biome::Scree => {
+                if a > 0.2 {
+                    st(p.slate, 6, p.stone, 0)
+                } else if gradient >= 1.1 || b > 0.3 {
                     rock()
                 } else {
                     st(p.gravel, 4, p.stone, 0)
                 }
             }
             _ if gradient >= 1.1 => rock(),
-            Biome::Beach => st(p.sand, 8, p.sandstone, 20),
-            Biome::Desert => st(p.sand, 10, p.sandstone, 30),
+            Biome::Beach => {
+                if a > 0.3 {
+                    st(p.gravel, 3, p.sand, 6)
+                } else if b < -0.3 {
+                    st(p.sandstone, 3, p.sandstone, 20)
+                } else {
+                    st(p.sand, 8, p.sandstone, 20)
+                }
+            }
+            Biome::Desert => {
+                if a > 0.28 {
+                    st(p.sandstone, 3, p.sandstone, 30)
+                } else if b < -0.32 {
+                    st(p.gravel, 3, p.sand, 10)
+                } else if c > 0.35 {
+                    st(p.clay, 3, p.sand, 10)
+                } else {
+                    st(p.sand, 10, p.sandstone, 30)
+                }
+            }
             Biome::Ocean => st(p.sand, 6, p.sandstone, 20),
             Biome::Riparian => {
-                if rd <= 3 && patch > 0.25 {
-                    st(p.gravel, 3, p.dirt, 4)
-                } else if rd <= 3 {
-                    st(p.mud, 3, p.dirt, 6)
+                if rd <= 3 {
+                    if a > 0.25 {
+                        st(p.gravel, 3, p.dirt, 4)
+                    } else if b < -0.3 {
+                        st(p.clay, 3, p.dirt, 6)
+                    } else {
+                        st(p.mud, 3, p.dirt, 6)
+                    }
+                } else if wet > 0.6 && b > 0.2 {
+                    st(p.moss, 2, p.dirt, 10)
                 } else {
                     st(p.grass, 2, p.dirt, 10)
                 }
             }
             Biome::Swamp => {
                 if rd <= 6 {
-                    st(p.mud, 6, p.clay, 4)
+                    if a > 0.12 {
+                        st(p.clay, 4, p.mud, 4)
+                    } else {
+                        st(p.mud, 6, p.clay, 4)
+                    }
+                } else if b > 0.12 {
+                    st(p.grass, 1, p.mud, 6)
+                } else if c < -0.2 {
+                    st(p.mud, 4, p.clay, 4)
                 } else {
                     st(p.moss, 3, p.mud, 6)
                 }
             }
-            Biome::Alpine => st(p.grass, 2, p.dirt, 8),
+            Biome::Alpine => {
+                if a > 0.25 {
+                    st(p.moss, 2, p.dirt, 8)
+                } else if b > 0.3 {
+                    st(p.gravel, 3, p.dirt, 8)
+                } else if b < -0.35 {
+                    st(p.dirt, 2, p.dirt, 8)
+                } else {
+                    st(p.grass, 2, p.dirt, 8)
+                }
+            }
             Biome::BorealForest => {
-                if patch > 0.1 {
+                if a > 0.1 {
                     st(p.moss, 3, p.dirt, 8)
+                } else if b < -0.3 {
+                    st(p.dirt, 2, p.dirt, 8)
+                } else if wet > 0.7 && c > 0.2 {
+                    st(p.mud, 2, p.dirt, 8)
                 } else {
                     st(p.grass, 2, p.dirt, 10)
                 }
             }
             Biome::Steppe => {
-                if patch > 0.0 {
+                if b > 0.32 {
+                    st(p.gravel, 2, p.dirt, 9)
+                } else if c < -0.35 {
+                    st(p.clay, 2, p.dirt, 9)
+                } else if a > 0.0 {
                     st(p.grass, 1, p.dirt, 10)
                 } else {
                     st(p.dirt, 2, p.dirt, 9)
                 }
             }
-            Biome::Meadow | Biome::TemperateForest => st(p.grass, 2, p.dirt, 10),
+            Biome::Meadow => {
+                if b < -0.33 {
+                    st(p.dirt, 2, p.dirt, 10)
+                } else if wet > 0.42 && a > 0.15 {
+                    st(p.moss, 2, p.dirt, 10)
+                } else if c > 0.38 {
+                    st(p.gravel, 2, p.dirt, 10)
+                } else {
+                    st(p.grass, 2, p.dirt, 10)
+                }
+            }
+            Biome::TemperateForest => {
+                if a > 0.1 {
+                    st(p.moss, 2, p.dirt, 10)
+                } else if b < -0.25 {
+                    st(p.dirt, 2, p.dirt, 10)
+                } else if wet > 0.75 && c > 0.2 {
+                    st(p.mud, 2, p.dirt, 10)
+                } else {
+                    st(p.grass, 2, p.dirt, 10)
+                }
+            }
         }
     }
 }

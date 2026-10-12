@@ -438,7 +438,7 @@ fn generated_water_runs_as_columns_at_rest_with_no_rejected_cells() {
 fn the_natural_preset_generates_a_playable_world_with_springs() {
     let scene = worldgen_scene::generate("natural", 2, 512).expect("generate");
     let world = scene.world();
-    assert_eq!(world.version, 4);
+    assert_eq!(world.version, 5);
     assert!(!world.spawns.is_empty());
     assert!(
         !scene.vegetation().organisms.is_empty(),

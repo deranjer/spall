@@ -11,7 +11,7 @@ use thiserror::Error;
 /// another.
 pub const GEN_VERSION: u32 = 3;
 /// Generation version of [`Preset::Natural`].
-pub const NATURAL_GEN_VERSION: u32 = 4;
+pub const NATURAL_GEN_VERSION: u32 = 5;
 
 /// Edge of a brick in cells (mirrors `spall_core::BRICK_EDGE`).
 pub const BRICK: i64 = 32;

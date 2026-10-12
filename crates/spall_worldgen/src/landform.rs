@@ -123,14 +123,13 @@ fn place_ranges(seed: u64) -> Vec<Range> {
         .collect()
 }
 
-/// Which edges are sea. About a third of seeds are landlocked.
+/// Which edges are sea. Every world has a coast: the ocean and its beaches are
+/// biomes too, and a world without them would miss two of the twelve. (Seeds
+/// that used to roll landlocked now get a single sea edge.)
 fn roll_coast(seed: u64) -> [bool; EDGES] {
     let roll = hash01(seed, S_COAST);
     let first = (hash01(seed, S_EDGE) * EDGES as f64) as usize % EDGES;
     let mut edges = [false; EDGES];
-    if roll < 0.35 {
-        return edges;
-    }
     edges[first] = true;
     if roll >= 0.8 {
         // A corner: one adjacent edge as well, never the opposite one.
@@ -273,12 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn seeds_roll_both_coastal_and_landlocked_maps() {
-        let landlocked = (1..=60).filter(|&s| roll_coast(s) == [false; 4]).count();
-        assert!(
-            landlocked > 8 && landlocked < 40,
-            "landlocked {landlocked}/60"
-        );
+    fn every_seed_has_a_coast_one_edge_or_a_corner() {
+        assert!((1..=200).all(|s| roll_coast(s).iter().any(|&e| e)));
         // A corner coast is two adjacent edges, never opposite ones.
         for s in 1..=200 {
             let e = roll_coast(s);
@@ -288,18 +283,12 @@ mod tests {
     }
 
     #[test]
-    fn landlocked_maps_get_basins_and_coasts_get_ocean() {
+    fn every_map_reaches_the_sea_and_has_no_terminal_basin() {
         for seed in 1..=30 {
             let l = generate(seed, 64);
-            if l.is_coastal() {
-                assert!(l.basins.is_empty());
-                assert!(l.height.iter().any(|&h| h < f64::from(SEA_LEVEL)));
-            } else {
-                assert!(!l.basins.is_empty());
-                for b in &l.basins {
-                    assert!(l.height[b.x + 64 * b.z] >= f64::from(SEA_LEVEL));
-                }
-            }
+            assert!(l.is_coastal(), "seed {seed}");
+            assert!(l.basins.is_empty());
+            assert!(l.height.iter().any(|&h| h < f64::from(SEA_LEVEL)));
         }
     }
 }
