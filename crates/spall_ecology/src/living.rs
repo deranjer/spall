@@ -81,7 +81,8 @@ impl Season {
 
 /// Fixed DTO codes: form 0 broad crown, 1 cone, 2 column, 3 weeping,
 /// 4 umbrella, 5 fan; ground forms 6 grass, 7 reed, 8 fern, 9 sedge,
-/// 10 flowering stalk, 11 rosette, 12 cushion, 13 scrub.
+/// 10 flowering stalk, 11 rosette, 12 cushion, 13 scrub; 14 to 17 underwater;
+/// 18 to 21 low cover; 22 shrub, 23 soft bush, 24 tall herb.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Species {
     pub id: u16,
@@ -862,7 +863,7 @@ impl LivingState {
                 || s.id == 0
                 || s.biomes == 0
                 || s.biomes > ALL_BIOMES
-                || s.form > 17
+                || s.form > 24
                 || s.depth[0] > s.depth[1]
                 || (s.tree && s.depth[1] > 0)
                 || s.spacing == 0

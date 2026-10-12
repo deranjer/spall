@@ -497,6 +497,10 @@ pub fn ground_parts(
         aquatic_parts(form, height, colour, flower, key, base, detail, out);
         return;
     }
+    if matches!(form, 22..=24) {
+        bush_parts(form, height, colour, flower, season, key, base, detail, out);
+        return;
+    }
     if matches!(form, 12 | 18..=21) {
         carpet_parts(form, height, colour, flower, key, base, detail, out);
         return;
@@ -550,6 +554,170 @@ pub fn ground_parts(
                 yaw,
                 lean: 0.,
             });
+        }
+    }
+}
+
+/// The medium living forms: 22 shrub (woody stems under a leafy crown), 23
+/// soft bush (a leafy mound without a woody frame) and 24 tall herb (one or two
+/// tall stems with paired leaves and a flower spike). Heights are in metres.
+#[allow(clippy::too_many_arguments)]
+fn bush_parts(
+    form: u8,
+    height: f32,
+    colour: u8,
+    flower: u8,
+    season: Season,
+    key: u64,
+    base: [f32; 3],
+    detail: Detail,
+    out: &mut Vec<SoftPart>,
+) {
+    let full = detail == Detail::Full;
+    let frac = |k: u64, n: u64| (k % n) as f32 / n as f32;
+    let blooming = matches!(season, Season::Spring | Season::Summer);
+    // A leaf cluster centred `at` (relative to the root), `size` wide.
+    let blob = |out: &mut Vec<SoftPart>, at: [f32; 3], size: f32, c: u8, yaw: f32| {
+        out.push(SoftPart {
+            center: [base[0] + at[0], base[1] + at[1], base[2] + at[2]],
+            size: [size, size * 0.7, size],
+            colour: c,
+            yaw,
+            lean: 0.,
+        });
+    };
+    match form {
+        22 => {
+            let stems = if full { 5 } else { 3 };
+            for stem in 0..stems {
+                let k = hash(key ^ (stem as u64).rotate_left(11));
+                let yaw = frac(k, 628) * 10.0;
+                let lean = 0.10 + frac(k >> 8, 25) * 0.25;
+                let h = height * (0.55 + frac(k >> 16, 30));
+                out.push(SoftPart {
+                    center: [
+                        base[0] - h * lean.sin() * yaw.cos() / 2.,
+                        base[1] + h * lean.cos() / 2.,
+                        base[2] + h * lean.sin() * yaw.sin() / 2.,
+                    ],
+                    size: [0.035, h, 0.035],
+                    colour: 7,
+                    yaw,
+                    lean,
+                });
+            }
+            let blobs = if full { 7 } else { 4 };
+            for i in 0..blobs {
+                let k = hash(key ^ 0x5b ^ (i as u64).rotate_left(17));
+                let angle = frac(k, 628) * 10.0;
+                let ring = height * 0.32 * frac(k >> 12, 100) * 2.0;
+                let rise = height * (0.55 + 0.45 * frac(k >> 20, 100));
+                blob(
+                    out,
+                    [angle.cos() * ring, rise, angle.sin() * ring],
+                    height * (0.30 + 0.12 * frac(k >> 28, 100)),
+                    colour,
+                    angle,
+                );
+            }
+            if blooming && flower != 0 {
+                for i in 0..if full { 4 } else { 2 } {
+                    let k = hash(key ^ 0xf10 ^ (i as u64).rotate_left(9));
+                    let angle = frac(k, 628) * 10.0;
+                    let ring = height * 0.3 * frac(k >> 12, 100);
+                    blob(
+                        out,
+                        [angle.cos() * ring, height * 0.95, angle.sin() * ring],
+                        0.07,
+                        flower,
+                        angle,
+                    );
+                }
+            }
+        }
+        23 => {
+            let rings: &[(f32, f32, usize)] = if full {
+                &[(0.0, 0.85, 1), (0.30, 0.55, 5), (0.55, 0.30, 7)]
+            } else {
+                &[(0.0, 0.8, 1), (0.45, 0.4, 4)]
+            };
+            for (r, rise, n) in rings {
+                for i in 0..*n {
+                    let k = hash(key ^ 0xb05 ^ ((i as u64) << 8) ^ (*n as u64));
+                    let angle = (i as f32 + frac(k, 40)) * std::f32::consts::TAU / *n as f32;
+                    let reach = height * r;
+                    blob(
+                        out,
+                        [
+                            angle.cos() * reach,
+                            height * rise * 0.7,
+                            angle.sin() * reach,
+                        ],
+                        height * (0.50 - r * 0.25),
+                        colour,
+                        angle,
+                    );
+                }
+            }
+            if blooming && flower != 0 {
+                for i in 0..if full { 5 } else { 2 } {
+                    let k = hash(key ^ 0xf10 ^ (i as u64).rotate_left(9));
+                    let angle = frac(k, 628) * 10.0;
+                    let reach = height * 0.45 * frac(k >> 12, 100);
+                    blob(
+                        out,
+                        [
+                            angle.cos() * reach,
+                            height * (0.55 + 0.3 * frac(k >> 20, 100)),
+                            angle.sin() * reach,
+                        ],
+                        0.06,
+                        flower,
+                        angle,
+                    );
+                }
+            }
+        }
+        _ => {
+            let stems = if full { 2 } else { 1 };
+            for stem in 0..stems {
+                let k = hash(key ^ 0x7a1 ^ (stem as u64).rotate_left(13));
+                let yaw = frac(k, 628) * 10.0;
+                let dx = (frac(k >> 8, 100) - 0.5) * 0.12;
+                let dz = (frac(k >> 16, 100) - 0.5) * 0.12;
+                let h = height * (0.8 + 0.2 * frac(k >> 24, 100));
+                out.push(SoftPart {
+                    center: [base[0] + dx, base[1] + h / 2., base[2] + dz],
+                    size: [0.03, h, 0.03],
+                    colour,
+                    yaw,
+                    lean: 0.,
+                });
+                // Leaves in alternating pairs up the lower stem.
+                for pair in 0..3 {
+                    let y = h * (0.12 + pair as f32 * 0.17);
+                    let span = 0.14 * (1.0 - pair as f32 * 0.22);
+                    out.push(SoftPart {
+                        center: [base[0] + dx, base[1] + y, base[2] + dz],
+                        size: [span, 0.025, 0.05],
+                        colour,
+                        yaw: yaw + pair as f32 * 1.1,
+                        lean: 0.,
+                    });
+                }
+                // The spike: flowers in season, the dry seed head after.
+                let spike = if blooming && flower != 0 { flower } else { 7 };
+                for tier in 0..if full { 4 } else { 2 } {
+                    let t = tier as f32 / 3.0;
+                    out.push(SoftPart {
+                        center: [base[0] + dx, base[1] + h * (0.74 + 0.26 * t), base[2] + dz],
+                        size: [0.07 - 0.02 * t, h * 0.09, 0.07 - 0.02 * t],
+                        colour: spike,
+                        yaw,
+                        lean: 0.,
+                    });
+                }
+            }
         }
     }
 }
@@ -1356,6 +1524,58 @@ mod tests {
                 assert!(p.center[1] >= 2.0 - 0.1, "form {form} dips below the floor");
             }
             assert_eq!(draw(Detail::Full).len(), full.len(), "deterministic");
+        }
+    }
+
+    #[test]
+    fn shrubs_soft_bushes_and_tall_herbs_stand_up_from_the_soil_and_differ_by_season() {
+        for form in 22..=24 {
+            let draw = |detail, season| {
+                let mut out = Vec::new();
+                ground_parts(
+                    form,
+                    1.2,
+                    1,
+                    18,
+                    season,
+                    91,
+                    [1.0, 2.0, 3.0],
+                    detail,
+                    &mut out,
+                );
+                out
+            };
+            let (full, coarse) = (
+                draw(Detail::Full, Season::Summer),
+                draw(Detail::Coarse, Season::Summer),
+            );
+            assert!(full.len() >= 6, "form {form}: {} parts", full.len());
+            assert!(coarse.len() < full.len(), "form {form}");
+            for p in &full {
+                assert!(p.center.iter().all(|v| v.is_finite()) && p.size.iter().all(|v| *v > 0.0));
+                assert!(
+                    // A leaning stem's box is centred as for a blade, so allow its tilt.
+                    p.center[1] - p.size[1] / 2. >= 2.0 - 0.1,
+                    "form {form} dips below its soil"
+                );
+                assert!(
+                    p.center[1] <= 2.0 + 1.2 * 1.25,
+                    "form {form} is taller than its height"
+                );
+            }
+            assert_eq!(
+                draw(Detail::Full, Season::Summer).len(),
+                full.len(),
+                "deterministic"
+            );
+            // Flowers come and go with the season.
+            let colours = |parts: &[SoftPart]| parts.iter().filter(|p| p.colour == 18).count();
+            assert!(colours(&full) > 0, "form {form} blooms in summer");
+            assert_eq!(
+                colours(&draw(Detail::Full, Season::Autumn)),
+                0,
+                "form {form} has no blossom in autumn"
+            );
         }
     }
 
