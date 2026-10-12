@@ -13,6 +13,15 @@ use std::collections::{BTreeMap, VecDeque};
 /// ticks.
 const CLEAR_COLUMNS_PER_TICK: usize = 6_000;
 
+/// Ticks between tree-growth edits (one wood cell each, five seconds at 60 Hz).
+/// Wood is real terrain, so every cell goes through the whole edit pipeline,
+/// and on a 1 km world that is about 0.2 s of staging and commit plus about
+/// 0.3 s to refresh the water's terrain, on the tick thread. With thousands of
+/// trees four such edits a second stalled the server for most of every second
+/// (measured: 130 to 660 ms ticks, once a second). Growth is a slow process, so
+/// it takes one cell at a time, rarely.
+const GROWTH_INTERVAL_TICKS: u64 = 300;
+
 /// A committed edit's footprint, waiting to be checked column by column for
 /// cover it destroyed (cells, inclusive).
 struct ClearJob {
@@ -30,6 +39,8 @@ pub(crate) struct AuthoritativeVegetation {
     pending: BTreeMap<u64, Growth>,
     jobs: VecDeque<ClearJob>,
     dirty: bool,
+    /// The tick of the last growth edit submitted.
+    last_growth_tick: Option<u64>,
 }
 
 /// The top solid cell of a column near `y_hint`: climbs out of solid, then
@@ -78,6 +89,7 @@ impl Simulation {
             pending: BTreeMap::new(),
             jobs: VecDeque::new(),
             dirty: true,
+            last_growth_tick: None,
         });
         Ok(())
     }
@@ -190,7 +202,10 @@ impl Simulation {
         );
         v.dirty |= prior_time != v.state.time_ms;
         for (slot, g) in growth.into_iter().enumerate() {
-            if v.pending.len() >= 4 {
+            if v.pending.len() >= 4
+                || v.last_growth_tick
+                    .is_some_and(|t| self.tick.get().saturating_sub(t) < GROWTH_INTERVAL_TICKS)
+            {
                 break;
             }
             if v.pending.values().any(|old| old.plant == g.plant) {
@@ -220,6 +235,9 @@ impl Simulation {
             };
             if self.submit(intent).is_ok() {
                 v.pending.insert(request.0, g);
+                v.last_growth_tick = Some(self.tick.get());
+                // One cell per interval: the rest are proposed again later.
+                break;
             }
         }
         self.vegetation = Some(v);

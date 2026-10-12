@@ -635,6 +635,19 @@ impl LivingState {
         self.organisms.push(p);
         Some(self.organisms.len() - 1)
     }
+    /// Plants a sapling of species `sid` rooted at `root` if the ground, the
+    /// spacing and the caps allow it, exactly as seeding does: it starts
+    /// unbuilt and grows through the normal edit pipeline. Returns its id.
+    pub fn plant_sapling(
+        &mut self,
+        columns: &ColumnMap,
+        terrain: &Volume,
+        sid: u16,
+        root: [i64; 3],
+    ) -> Option<u64> {
+        let index = self.establish(columns, terrain, sid, root)?;
+        Some(self.organisms[index].id)
+    }
     /// Gives the world its ground cover: the species, and the climate raster
     /// they read, sampled from the world's own columns.
     pub fn with_cover(

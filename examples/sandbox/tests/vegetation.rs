@@ -186,8 +186,26 @@ fn authoritative_growth_and_checkpoint_recovery_keep_the_same_living_state() {
     let setup = scene.world_setup();
     let mut config = spall_sim::SimulationConfig::new(setup);
     let mut vegetation = scene.vegetation().clone();
+    // A new world's trees are all grown; plant a sapling beside the first tree
+    // that has room, old enough to add its next cell as soon as it is allowed.
+    let tree = vegetation
+        .organisms
+        .iter()
+        .find(|p| !p.wood.is_empty())
+        .map(|p| (p.species, p.root))
+        .unwrap();
+    let columns = &scene.world().columns;
+    let terrain = &scene.world().terrain;
+    let sapling = (6..40_i64)
+        .flat_map(|d| [(d, 0), (-d, 0), (0, d), (0, -d), (d, d), (-d, -d)])
+        .find_map(|(dx, dz)| {
+            let (x, z) = (tree.1[0] + dx, tree.1[2] + dz);
+            let root = [x, i64::from(columns.height(x, z)) + 1, z];
+            vegetation.plant_sapling(columns, terrain, tree.0, root)
+        })
+        .expect("room for a sapling");
     for p in &mut vegetation.organisms {
-        if p.committed == 0 {
+        if p.id == sapling {
             p.age_ms = 100_000;
         }
     }
@@ -275,6 +293,62 @@ fn authoritative_growth_and_checkpoint_recovery_keep_the_same_living_state() {
     assert_eq!(replayed.vegetation_state().unwrap(), &next);
     drop(writer);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Tree growth takes one wood cell per five seconds however many trees are
+/// growing: every cell is a full edit commit on the tick thread, and four a
+/// second stalled a 1 km server for most of each second.
+#[test]
+fn tree_growth_is_throttled_to_one_cell_per_interval() {
+    let scene = sandbox::worldgen_scene::generate("showcase", 1, 256).unwrap();
+    let setup = scene.world_setup();
+    let mut config = spall_sim::SimulationConfig::new(setup);
+    let mut vegetation = scene.vegetation().clone();
+    let columns = &scene.world().columns;
+    let terrain = &scene.world().terrain;
+    let trees: Vec<(u16, [i64; 3])> = vegetation
+        .organisms
+        .iter()
+        .filter(|p| !p.wood.is_empty())
+        .map(|p| (p.species, p.root))
+        .collect();
+    let mut planted = Vec::new();
+    for (species, root) in trees.iter().cycle().take(trees.len() * 6) {
+        for (dx, dz) in [(26, 0), (-26, 0), (0, 26), (0, -26), (30, 30), (-30, -30)] {
+            let (x, z) = (root[0] + dx, root[2] + dz);
+            let at = [x, i64::from(columns.height(x, z)) + 1, z];
+            if let Some(id) = vegetation.plant_sapling(columns, terrain, *species, at) {
+                planted.push(id);
+                break;
+            }
+        }
+        if planted.len() >= 8 {
+            break;
+        }
+    }
+    assert!(planted.len() >= 4, "only {} saplings fit", planted.len());
+    for p in &mut vegetation.organisms {
+        if planted.contains(&p.id) {
+            p.age_ms = 10_000_000;
+        }
+    }
+    let committed = |v: &spall_ecology::living::LivingState| -> usize {
+        v.organisms.iter().map(|p| usize::from(p.committed)).sum()
+    };
+    let before = committed(&vegetation);
+    config.vegetation = Some(vegetation);
+    let mut sim = spall_sim::Simulation::new(config).unwrap();
+    for _ in 0..1100 {
+        sim.tick().unwrap();
+    }
+    let grown = committed(sim.vegetation_state().unwrap()) - before;
+    // About 18 seconds: the first cell as soon as a sapling is due, then one
+    // every 300 ticks at most (four in all), never one per tree per second.
+    assert!(
+        (1..=4).contains(&grown),
+        "{grown} wood cells grew in 1100 ticks with {} saplings due",
+        planted.len()
+    );
 }
 
 #[cfg(feature = "client")]

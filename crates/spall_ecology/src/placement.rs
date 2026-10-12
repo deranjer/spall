@@ -278,18 +278,19 @@ impl LivingState {
                 self.establish_with(columns, terrain, sid, root, Some(spacing.max(3)), i64::MAX)
             {
                 let p = &mut self.organisms[index];
-                // Mixed ages make initial worlds wooded immediately; the rest grow at runtime.
-                if key % 5 != 0 {
-                    p.committed = p.wood.len() as u16;
-                    p.age_ms = 600_000;
-                    let wood = self
-                        .species
-                        .iter()
-                        .find(|s| s.id == sid)
-                        .map_or(0, |s| s.wood);
-                    for &at in p.wood.iter() {
-                        plan.set(cell(at), MaterialId(wood));
-                    }
+                // A new world starts wooded: every tree is grown. Only trees
+                // seeded while the world runs grow, one cell at a time and
+                // slowly (wood is real terrain; see `GROWTH_INTERVAL_TICKS`
+                // in `spall_sim`).
+                p.committed = p.wood.len() as u16;
+                p.age_ms = 600_000;
+                let wood = self
+                    .species
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .map_or(0, |s| s.wood);
+                for &at in p.wood.iter() {
+                    plan.set(cell(at), MaterialId(wood));
                 }
             }
         }

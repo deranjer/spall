@@ -417,6 +417,15 @@ temperature and water level) that the world carries in `LivingState` and every
   one; a world reset clears it). The keyframe is droppable traffic as before.
 - **Fair work** still visits a bounded number of organisms per second:
   `clamp(n / 40, 128, 512)`.
+- **Growth is throttled.** A new world's trees are all fully grown. Trees seeded
+  while the world runs grow one wood cell per 300 ticks (5 s) in total, however
+  many are growing (`GROWTH_INTERVAL_TICKS` in `spall_sim`). Wood is real
+  terrain, so each cell is a full edit commit on the tick thread: at 4096 cells
+  about 0.2 s of staging and commit plus about 0.3 s to refresh the water's
+  terrain (an O(world) remap of 6.6 million spans). Before the throttle, a 1 km
+  world with 8,600 trees spent 130 to 660 ms of a tick in `tick.water` once a
+  second and a walking player rubber-banded; after it, a 10 minute run of
+  simulated time had three 300 to 390 ms ticks.
 
 Measured (natural, seed 1, 4096 cells, release, `vegetation_scale` example):
 
