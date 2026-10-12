@@ -31,6 +31,70 @@ pub const INSTANCE_BUDGET: usize = 48_000;
 pub const CARPET_FORMS: [u8; 4] = [6, 9, 11, 12];
 /// A species' tuft density is this many in 256 cells.
 pub const MAX_COVER_SPECIES: usize = 32;
+/// Most destroyed-cover records a world keeps at once.
+pub const MAX_CLEARED: usize = 65_536;
+/// Cover destroyed this long ago (seconds of ecological time) is a small
+/// sprout, then medium, then full grown (and forgotten).
+pub const SMALL_AFTER_S: u32 = 20;
+pub const MEDIUM_AFTER_S: u32 = 90;
+pub const FULL_AFTER_S: u32 = 180;
+
+/// A column whose cover was destroyed, and when (whole seconds of the world's
+/// ecological clock). The one thing about cover the server remembers: cover
+/// itself is stateless, but where it was torn up and how long ago is not
+/// something a formula can know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cleared {
+    pub x: u16,
+    pub z: u16,
+    pub at_s: u32,
+}
+
+/// How grown cover is `age_s` seconds after it was destroyed: `None` while
+/// nothing has sprouted yet, then small, medium and, once [`FULL_AFTER_S`] has
+/// passed, full size (`1.0`: the record can be dropped).
+pub fn regrowth(age_s: u32) -> Option<f32> {
+    match age_s {
+        a if a < SMALL_AFTER_S => None,
+        a if a < MEDIUM_AFTER_S => Some(0.3),
+        a if a < FULL_AFTER_S => Some(0.65),
+        _ => Some(1.0),
+    }
+}
+
+/// The destroyed-cover records laid out for lookups.
+#[derive(Debug, Clone, Default)]
+pub struct CoverMemory {
+    cleared: std::collections::HashMap<(i64, i64), u32>,
+    now_s: u32,
+}
+
+impl CoverMemory {
+    pub fn new(cleared: &[Cleared], now_s: u32) -> Self {
+        Self {
+            cleared: cleared
+                .iter()
+                .map(|c| ((i64::from(c.x), i64::from(c.z)), c.at_s))
+                .collect(),
+            now_s,
+        }
+    }
+
+    /// Whether the server has recorded this column as destroyed.
+    pub fn is_recorded(&self, x: i64, z: i64) -> bool {
+        self.cleared.contains_key(&(x, z))
+    }
+
+    /// The size cover has in this column: `Some(1.0)` if untouched or fully
+    /// regrown, `Some(0.3)` / `Some(0.65)` while regrowing, `None` while
+    /// destroyed.
+    pub fn growth_at(&self, x: i64, z: i64) -> Option<f32> {
+        match self.cleared.get(&(x, z)) {
+            None => Some(1.0),
+            Some(at) => regrowth(self.now_s.saturating_sub(*at)),
+        }
+    }
+}
 
 pub fn is_carpet_form(form: u8) -> bool {
     CARPET_FORMS.contains(&form)
@@ -455,6 +519,7 @@ pub fn cover_parts(
     eye: [f32; 3],
     radius_m: f32,
     surface: &mut SurfaceLookup<'_>,
+    memory: &CoverMemory,
     budget: usize,
 ) -> Vec<SoftPart> {
     let radius = radius_m.min(MID_M);
@@ -478,6 +543,10 @@ pub fn cover_parts(
                 if !near && thin & 3 != 0 {
                     continue;
                 }
+                // Destroyed cover stays away until it sprouts, then grows.
+                let Some(growth) = memory.growth_at(x, z) else {
+                    continue;
+                };
                 let Some((y, soil)) = surface(x, z) else {
                     continue;
                 };
@@ -504,9 +573,9 @@ pub fn cover_parts(
                     (z as f32 + 0.5) * 0.25,
                 ];
                 let (height, detail) = if near {
-                    (c.height_m, Detail::Full)
+                    (c.height_m * growth, Detail::Full)
                 } else {
-                    (c.height_m * 1.15, Detail::Coarse)
+                    (c.height_m * 1.15 * growth, Detail::Coarse)
                 };
                 ground_parts(
                     c.form, height, c.colour, 0, season, c.key, base, detail, &mut out,
@@ -710,6 +779,103 @@ mod tests {
     }
 
     #[test]
+    fn destroyed_cover_sprouts_then_grows_through_small_medium_and_full() {
+        assert_eq!(regrowth(0), None);
+        assert_eq!(regrowth(SMALL_AFTER_S - 1), None);
+        assert_eq!(regrowth(SMALL_AFTER_S), Some(0.3));
+        assert_eq!(regrowth(MEDIUM_AFTER_S - 1), Some(0.3));
+        assert_eq!(regrowth(MEDIUM_AFTER_S), Some(0.65));
+        assert_eq!(regrowth(FULL_AFTER_S - 1), Some(0.65));
+        assert_eq!(regrowth(FULL_AFTER_S), Some(1.0));
+        let cleared = [Cleared {
+            x: 5,
+            z: 6,
+            at_s: 100,
+        }];
+        let at = |now| CoverMemory::new(&cleared, now);
+        assert_eq!(at(110).growth_at(5, 6), None);
+        assert_eq!(at(125).growth_at(5, 6), Some(0.3));
+        assert_eq!(at(200).growth_at(5, 6), Some(0.65));
+        assert_eq!(at(300).growth_at(5, 6), Some(1.0));
+        assert_eq!(
+            at(110).growth_at(5, 7),
+            Some(1.0),
+            "other columns are untouched"
+        );
+        assert!(at(110).is_recorded(5, 6) && !at(110).is_recorded(6, 5));
+    }
+
+    #[test]
+    fn a_cleared_column_draws_nothing_then_small_then_medium_then_full_tufts() {
+        let s = set();
+        let g = grid(64, Biome::Meadow as u8, 15, 38).expand().unwrap();
+        let eye = [128.0, 10.0, 128.0];
+        let mut flat = |_x: i64, _z: i64| Some((8_i64, 1_u16));
+        // Every column within 6 m of the eye is destroyed at t = 1000 s.
+        let (ex, ez) = (512, 512);
+        let cleared: Vec<Cleared> = (ex - 24..=ex + 24)
+            .flat_map(|x| {
+                (ez - 24..=ez + 24).map(move |z| Cleared {
+                    x: x as u16,
+                    z: z as u16,
+                    at_s: 1000,
+                })
+            })
+            .collect();
+        let inside = |p: &SoftPart| {
+            let (x, z) = (
+                (p.center[0] * 4.0).floor() as i64,
+                (p.center[2] * 4.0).floor() as i64,
+            );
+            // A margin: blades lean out of the neighbouring columns a little.
+            (ex - 20..=ex + 20).contains(&x) && (ez - 20..=ez + 20).contains(&z)
+        };
+        let top = |parts: &[SoftPart]| {
+            parts
+                .iter()
+                .filter(|p| inside(p))
+                .map(|p| p.size[1])
+                .fold(0.0f32, f32::max)
+        };
+        let mut run = |now| {
+            cover_parts(
+                &g,
+                &s,
+                3,
+                Season::Summer,
+                eye,
+                40.0,
+                &mut flat,
+                &CoverMemory::new(&cleared, now),
+                INSTANCE_BUDGET,
+            )
+        };
+        let fresh = run(1005);
+        assert_eq!(
+            fresh.iter().filter(|p| inside(p)).count(),
+            0,
+            "bare while destroyed"
+        );
+        assert!(
+            fresh.iter().any(|p| !inside(p)),
+            "the rest of the carpet is untouched"
+        );
+        let (small, medium, full) = (
+            run(1000 + SMALL_AFTER_S),
+            run(1000 + MEDIUM_AFTER_S),
+            run(1000 + FULL_AFTER_S),
+        );
+        assert!(small.iter().any(inside) && top(&small) > 0.0);
+        assert!(
+            top(&small) < top(&medium) && top(&medium) < top(&full),
+            "{} {} {}",
+            top(&small),
+            top(&medium),
+            top(&full)
+        );
+    }
+
+    #[test]
     fn parts_thin_with_distance_and_stay_inside_the_budget() {
         let s = set();
         let g = grid(64, Biome::Meadow as u8, 15, 38).expand().unwrap();
@@ -723,6 +889,7 @@ mod tests {
             eye,
             60.0,
             &mut flat,
+            &CoverMemory::default(),
             INSTANCE_BUDGET,
         );
         assert!(!parts.is_empty());
@@ -736,6 +903,7 @@ mod tests {
             eye,
             60.0,
             &mut flat,
+            &CoverMemory::default(),
             INSTANCE_BUDGET,
         );
         assert_eq!(parts.len(), again.len());
@@ -757,11 +925,34 @@ mod tests {
         let mid_area = std::f32::consts::PI * (MID_M * MID_M - NEAR_M * NEAR_M);
         assert!(mid as f32 / mid_area < 0.5 * near as f32 / near_area);
         // A tight budget keeps the near carpet whole and drops the far cover.
-        let few = cover_parts(&g, &s, 3, Season::Summer, eye, 60.0, &mut flat, 2_000);
+        let few = cover_parts(
+            &g,
+            &s,
+            3,
+            Season::Summer,
+            eye,
+            60.0,
+            &mut flat,
+            &CoverMemory::default(),
+            2_000,
+        );
         assert!(few.len() <= 2_040);
         assert!(few.iter().all(|p| dist(p) < NEAR_M + 1.0));
         // No ground, no cover.
         let mut none = |_x: i64, _z: i64| None;
-        assert!(cover_parts(&g, &s, 3, Season::Summer, eye, 60.0, &mut none, 1000).is_empty());
+        assert!(
+            cover_parts(
+                &g,
+                &s,
+                3,
+                Season::Summer,
+                eye,
+                60.0,
+                &mut none,
+                &CoverMemory::default(),
+                1000
+            )
+            .is_empty()
+        );
     }
 }

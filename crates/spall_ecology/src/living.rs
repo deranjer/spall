@@ -1,6 +1,8 @@
 //! Versioned living vegetation. Authored species belong to the game; this CPU
 //! module owns deterministic establishment, reproduction and retained wood paths.
-use crate::cover::{CoverField, CoverSpecies, MAX_COVER_SPECIES, is_carpet_form};
+use crate::cover::{
+    Cleared, CoverField, CoverSpecies, FULL_AFTER_S, MAX_CLEARED, MAX_COVER_SPECIES, is_carpet_form,
+};
 use serde::{Deserialize, Serialize};
 use spall_core::{GlobalCell, MaterialId};
 use spall_voxel::{EditPlan, Sample, Volume};
@@ -139,6 +141,9 @@ pub struct LivingState {
     /// it reads. Nothing here ever changes after the world is made.
     pub cover: Vec<CoverSpecies>,
     pub field: CoverField,
+    /// Columns whose cover was destroyed and when, sorted by `(x, z)`; a record
+    /// is dropped once its cover has regrown in full.
+    pub cleared: Vec<Cleared>,
     /// Which worldgen preset the world came from (0 showcase, 1 natural), so
     /// the server can rebuild the same climate columns the world was made
     /// from when it installs or restores this state.
@@ -250,6 +255,8 @@ pub struct VisualFrame {
     pub plants: Vec<VisualPlant>,
     pub cover: Vec<CoverSpecies>,
     pub field: CoverField,
+    /// Where cover was destroyed, for the client to leave bare and regrow.
+    pub cleared: Vec<Cleared>,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct SoftPart {
@@ -303,6 +310,7 @@ impl LivingState {
             spawns,
             cover: Vec::new(),
             field: CoverField::default(),
+            cleared: Vec::new(),
             preset: u8::from(columns.is_natural()),
         };
         state.validate()?;
@@ -481,6 +489,38 @@ impl LivingState {
             self.field = CoverField::from_columns(columns);
         }
     }
+    /// Records that the cover in column `(x, z)` was destroyed now; its
+    /// regrowth starts over if it was already regrowing. Past
+    /// [`MAX_CLEARED`] records the oldest is forgotten (its cover is nearly
+    /// back anyway).
+    pub fn clear_cover(&mut self, x: i64, z: i64) {
+        let (Ok(x), Ok(z)) = (u16::try_from(x), u16::try_from(z)) else {
+            return;
+        };
+        if u32::from(x) >= self.size || u32::from(z) >= self.size {
+            return;
+        }
+        let at_s = (self.time_ms / 1000).min(u64::from(u32::MAX)) as u32;
+        match self.cleared.binary_search_by_key(&(x, z), |c| (c.x, c.z)) {
+            Ok(i) => self.cleared[i].at_s = at_s,
+            Err(i) => {
+                if self.cleared.len() >= MAX_CLEARED {
+                    if let Some(oldest) =
+                        (0..self.cleared.len()).min_by_key(|&k| self.cleared[k].at_s)
+                    {
+                        self.cleared.remove(oldest);
+                    }
+                    let i = self
+                        .cleared
+                        .binary_search_by_key(&(x, z), |c| (c.x, c.z))
+                        .unwrap_err();
+                    self.cleared.insert(i, Cleared { x, z, at_s });
+                } else {
+                    self.cleared.insert(i, Cleared { x, z, at_s });
+                }
+            }
+        }
+    }
     pub fn season(&self) -> Season {
         Season::at(self.start_season, self.time_ms, self.season_ms)
     }
@@ -558,6 +598,7 @@ impl LivingState {
             spawns: old.spawns,
             cover,
             field: CoverField::default(),
+            cleared: Vec::new(),
             // Version 1 predates natural worlds.
             preset: 0,
         }
@@ -572,6 +613,15 @@ impl LivingState {
             || self.spawns.len() > 64
             || self.cover.len() > MAX_COVER_SPECIES
             || self.preset > 1
+            || self.cleared.len() > MAX_CLEARED
+            || self
+                .cleared
+                .windows(2)
+                .any(|w| (w[0].x, w[0].z) >= (w[1].x, w[1].z))
+            || self
+                .cleared
+                .iter()
+                .any(|c| u32::from(c.x) >= self.size || u32::from(c.z) >= self.size)
         {
             return Err("invalid vegetation schema/limits".into());
         }
@@ -670,6 +720,10 @@ impl LivingState {
         self.credit_ms %= 1000;
         self.time_ms = self.time_ms.saturating_add(dt);
         let season = self.season();
+        // Cover that has regrown in full needs no record.
+        let now_s = (self.time_ms / 1000).min(u64::from(u32::MAX)) as u32;
+        self.cleared
+            .retain(|c| now_s.saturating_sub(c.at_s) < FULL_AFTER_S);
         let n = self.organisms.len();
         let mut seeds = Vec::new();
         let mut growth = Vec::new();
@@ -898,6 +952,7 @@ impl LivingState {
             plants,
             cover: self.cover.clone(),
             field: self.field.clone(),
+            cleared: self.cleared.clone(),
         }
     }
 }
@@ -965,6 +1020,7 @@ impl VisualFrame {
             || frame.cover.len() > MAX_COVER_SPECIES
             || frame.cover.iter().any(|c| c.validate().is_err())
             || frame.field.validate().is_err()
+            || frame.cleared.len() > MAX_CLEARED
             || frame.plants.len() > MAX_TREES + MAX_GROUND
             || frame.plants.iter().any(|p| {
                 p.tips.len() > 32

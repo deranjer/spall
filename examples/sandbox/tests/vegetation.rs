@@ -399,3 +399,103 @@ fn no_ground_plant_roots_in_a_trunk_column() {
         }
     }
 }
+
+/// Digging into the ground destroys the cover there and records it; a tunnel
+/// far below the surface does not.
+#[test]
+fn a_hammer_blow_records_the_cover_it_destroyed_and_only_that() {
+    use spall_core::units::{BRUSH_UNIT, BrushPoint};
+    use spall_core::{EntityId, SphereBrush};
+    use spall_protocol::RequestId;
+    use spall_sim::{EditIntent, EditTarget};
+
+    let scene = sandbox::worldgen_scene::generate("showcase", 4, 256).unwrap();
+    let cols = &scene.world().columns;
+    let mut config = spall_sim::SimulationConfig::new(scene.world_setup());
+    config.vegetation = Some(scene.vegetation().clone());
+    let mut sim = spall_sim::Simulation::new(config).unwrap();
+    let (x, z) = (120_i64, 120_i64);
+    let (dx, dz) = (180_i64, 60_i64);
+    let h = i64::from(cols.height(x, z));
+    let h2 = i64::from(cols.height(dx, dz));
+    let brush = |cx: i64, cy: i64, cz: i64, r: i64| {
+        let half = BRUSH_UNIT / 2;
+        SphereBrush::new(
+            BrushPoint::from_units(
+                cx * BRUSH_UNIT + half,
+                cy * BRUSH_UNIT + half,
+                cz * BRUSH_UNIT + half,
+            ),
+            r * BRUSH_UNIT,
+        )
+        .unwrap()
+    };
+    assert!(h2 > 24, "deep enough for a tunnel");
+    for (id, brush) in [
+        (1, brush(x, h, z, 3)),
+        // A tunnel 20 cells under the surface of another column.
+        (2, brush(dx, h2 - 20, dz, 2)),
+    ] {
+        sim.submit(EditIntent::cut(
+            RequestId(id),
+            EntityId::new(1).unwrap(),
+            EditTarget::Terrain,
+            brush,
+        ))
+        .unwrap();
+    }
+    sim.run_until_idle(120).unwrap();
+    for _ in 0..4 {
+        sim.tick().unwrap();
+    }
+    let cleared = &sim.vegetation_state().unwrap().cleared;
+    let has = |cx: i64, cz: i64| {
+        cleared
+            .iter()
+            .any(|c| i64::from(c.x) == cx && i64::from(c.z) == cz)
+    };
+    assert!(has(x, z), "the dug column is recorded");
+    assert!(has(x + 2, z - 1), "so are its neighbours inside the blow");
+    assert!(!has(x + 12, z), "columns outside the blow are not");
+    assert!(
+        !has(dx, dz),
+        "a tunnel far below the surface leaves the cover alone"
+    );
+    // The record is part of the saved state and the frame clients draw from.
+    let state = sim.vegetation_state().unwrap();
+    assert_eq!(
+        LivingState::decode(&state.encode().unwrap())
+            .unwrap()
+            .cleared,
+        state.cleared
+    );
+    assert_eq!(sim.vegetation_visual().unwrap().cleared, state.cleared);
+}
+
+/// The record is forgotten once the cover has regrown in full.
+#[test]
+fn a_cleared_column_is_forgotten_after_it_regrows() {
+    let scene = sandbox::worldgen_scene::generate("showcase", 4, 256).unwrap();
+    let mut state = scene.vegetation().clone();
+    state.clear_cover(100, 100);
+    state.clear_cover(100, 101);
+    assert_eq!(state.cleared.len(), 2);
+    let terrain = scene.world().terrain.clone();
+    for _ in 0..(spall_ecology::cover::FULL_AFTER_S - 5) {
+        state.advance(&scene.world().columns, &terrain, 1000);
+    }
+    assert_eq!(state.cleared.len(), 2, "still regrowing");
+    for _ in 0..10 {
+        state.advance(&scene.world().columns, &terrain, 1000);
+    }
+    assert!(state.cleared.is_empty(), "grown back, nothing to remember");
+    // Hitting a regrowing column again restarts its growth.
+    state.clear_cover(7, 7);
+    let first = state.cleared[0].at_s;
+    for _ in 0..30 {
+        state.advance(&scene.world().columns, &terrain, 1000);
+    }
+    state.clear_cover(7, 7);
+    assert_eq!(state.cleared.len(), 1);
+    assert!(state.cleared[0].at_s > first);
+}

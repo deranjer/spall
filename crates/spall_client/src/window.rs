@@ -4474,7 +4474,18 @@ fn cover_surface(
 
 /// What a cover rebuild depends on; while it is unchanged the last result
 /// stands, so the once-a-second vegetation frame does not redo the carpet.
-type CoverKey = (i64, i64, u8, u64, usize, u64);
+type CoverKey = (i64, i64, u8, u64, usize, u64, usize, u64);
+
+/// How long the client holds back cover in a column whose surface changed
+/// before the server's record of the destroyed cover reaches it, seconds. The
+/// hole is seen at once but the record rides the next once-a-second frame; if
+/// the server never records it (the edit did not reach the topsoil) the new
+/// surface is simply adopted after this.
+const COVER_PENDING_S: f32 = 3.0;
+
+/// The surface each column had when cover was last drawn on it, and since when
+/// it has differed (see [`COVER_PENDING_S`]).
+type SeenSurfaces = std::collections::HashMap<(i64, i64), (i64, Option<Instant>)>;
 /// Soft foliage waits for the same solid geometry that supports it. Network
 /// vegetation can arrive before the progressive terrain/trunk mesh batches.
 fn foliage_support_ready(
@@ -4511,6 +4522,7 @@ impl VegetationWorker {
                 )> = None;
                 let mut cover_cache: Option<(CoverKey, Vec<spall_ecology::living::SoftPart>)> =
                     None;
+                let mut seen: SeenSurfaces = SeenSurfaces::new();
                 for (id, frame, eye, ready, terrain) in requests {
                     // Leaves draw as far as the terrain and trunks do, so a tree
                     // never stands bare at a distance and then sprouts as you near.
@@ -4535,13 +4547,44 @@ impl VegetationWorker {
                                 volume.state_stamp(),
                                 ready.len(),
                                 frame.seed,
+                                frame.cleared.len(),
+                                frame.time_ms / 10_000,
                             );
                             match &cover_cache {
                                 Some((k, parts)) if *k == key => cover_parts = parts.clone(),
                                 _ => {
                                     let mut hint = (eye[1] / 0.25).floor() as i64;
-                                    let mut surface =
-                                        |x, z| cover_surface(volume, &ready, x, z, &mut hint);
+                                    let memory = spall_ecology::cover::CoverMemory::new(
+                                        &frame.cleared,
+                                        (frame.time_ms / 1000).min(u64::from(u32::MAX)) as u32,
+                                    );
+                                    if seen.len() > 400_000 {
+                                        seen.clear();
+                                    }
+                                    let mut surface = |x: i64, z: i64| {
+                                        let found = cover_surface(volume, &ready, x, z, &mut hint)?;
+                                        match seen.get_mut(&(x, z)) {
+                                            None => {
+                                                seen.insert((x, z), (found.0, None));
+                                            }
+                                            Some((y, since)) if *y == found.0 => *since = None,
+                                            // The server has the column on record: it
+                                            // owns the regrowth, adopt the new ground.
+                                            Some((y, since)) if memory.is_recorded(x, z) => {
+                                                *y = found.0;
+                                                *since = None;
+                                            }
+                                            Some((y, since)) => {
+                                                let from = *since.get_or_insert_with(Instant::now);
+                                                if from.elapsed().as_secs_f32() < COVER_PENDING_S {
+                                                    return None;
+                                                }
+                                                *y = found.0;
+                                                *since = None;
+                                            }
+                                        }
+                                        Some(found)
+                                    };
                                     cover_parts = spall_ecology::cover::cover_parts(
                                         grid,
                                         &frame.cover,
@@ -4550,6 +4593,7 @@ impl VegetationWorker {
                                         eye,
                                         foliage_radius_m,
                                         &mut surface,
+                                        &memory,
                                         spall_ecology::cover::INSTANCE_BUDGET,
                                     );
                                     cover_cache = Some((key, cover_parts.clone()));

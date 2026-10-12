@@ -1,17 +1,57 @@
 //! Owner-thread integration. Growth uses the existing edit/structural pipeline;
 //! no solver, invisible support, direct terrain write or extra ECS entity.
 use crate::{EditIntent, EditKind, EditTarget, Simulation, TickError, TickReport};
+use spall_core::GlobalCell;
 use spall_core::{BRUSH_UNIT, BrushPoint, EntityId, SphereBrush};
 use spall_ecology::living::{Growth, LivingState, VisualFrame};
 use spall_protocol::RequestId;
+use spall_voxel::{Sample, Volume};
 use spall_worldgen::{ColumnMap, Preset, WorldGenSpec, WorldgenPalette};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+
+/// Columns of destroyed-cover checks per tick; bigger edits finish over a few
+/// ticks.
+const CLEAR_COLUMNS_PER_TICK: usize = 6_000;
+
+/// A committed edit's footprint, waiting to be checked column by column for
+/// cover it destroyed (cells, inclusive).
+struct ClearJob {
+    x0: i64,
+    x1: i64,
+    z1: i64,
+    y_lo: i64,
+    y_hi: i64,
+    next: (i64, i64),
+}
 
 pub(crate) struct AuthoritativeVegetation {
     pub state: LivingState,
     columns: ColumnMap,
     pending: BTreeMap<u64, Growth>,
+    jobs: VecDeque<ClearJob>,
     dirty: bool,
+}
+
+/// The top solid cell of a column near `y_hint`: climbs out of solid, then
+/// descends through open air. `None` where terrain is not resident or no
+/// ground is found nearby.
+fn surface_y(terrain: &Volume, x: i64, z: i64, y_hint: i64) -> Option<i64> {
+    let mut y = y_hint;
+    for _ in 0..64 {
+        match terrain.sample(GlobalCell::new(x, y, z)).ok()? {
+            Sample::Unknown(_) => return None,
+            Sample::Filled(_) => y += 1,
+            Sample::Empty { .. } => break,
+        }
+    }
+    for _ in 0..160 {
+        match terrain.sample(GlobalCell::new(x, y, z)).ok()? {
+            Sample::Unknown(_) => return None,
+            Sample::Filled(_) => return Some(y),
+            Sample::Empty { .. } => y -= 1,
+        }
+    }
+    None
 }
 impl Simulation {
     pub fn install_vegetation(&mut self, state: LivingState) -> Result<(), String> {
@@ -36,6 +76,7 @@ impl Simulation {
             state,
             columns,
             pending: BTreeMap::new(),
+            jobs: VecDeque::new(),
             dirty: true,
         });
         Ok(())
@@ -85,10 +126,57 @@ impl Simulation {
         let Some(mut v) = self.vegetation.take() else {
             return Ok(());
         };
-        for (request, _) in &report.committed {
+        let terrain_id = self.world.terrain_volume_id();
+        let cell_m = self.world.terrain().cell_size().metres();
+        for (request, committed) in &report.committed {
             if let Some(g) = v.pending.remove(&request.0) {
                 v.state.acknowledge(g, &self.world.terrain().volume);
                 v.dirty = true;
+            } else {
+                // An edit by a player or the world: whatever cover it reached
+                // is destroyed (see `ClearJob`).
+                for (lo, hi) in
+                    crate::player::transaction_world_boxes(&committed.topology, terrain_id, cell_m)
+                {
+                    let cell = |m: f64| (m / cell_m).floor() as i64;
+                    let (x0, x1) = (cell(lo[0]), cell(hi[0]));
+                    let (z0, z1) = (cell(lo[2]), cell(hi[2]));
+                    v.jobs.push_back(ClearJob {
+                        x0,
+                        x1,
+                        z1,
+                        y_lo: cell(lo[1]),
+                        y_hi: cell(hi[1]),
+                        next: (x0, z0),
+                    });
+                }
+            }
+        }
+        let mut budget = CLEAR_COLUMNS_PER_TICK;
+        while budget > 0 {
+            let Some(job) = v.jobs.front_mut() else {
+                break;
+            };
+            while budget > 0 && job.next.1 <= job.z1 {
+                let (x, z) = job.next;
+                job.next = if x >= job.x1 {
+                    (job.x0, z + 1)
+                } else {
+                    (x + 1, z)
+                };
+                budget -= 1;
+                // The cover is gone if the edit reached the surface band of the
+                // column as it is now: a tunnel well below it leaves it be.
+                if let Some(sy) = surface_y(&self.world.terrain().volume, x, z, job.y_hi + 4)
+                    && job.y_hi >= sy - 3
+                    && job.y_lo <= sy + 10
+                {
+                    v.state.clear_cover(x, z);
+                    v.dirty = true;
+                }
+            }
+            if job.next.1 > job.z1 {
+                v.jobs.pop_front();
             }
         }
         for (request, _) in &report.rejected {
