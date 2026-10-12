@@ -623,6 +623,11 @@ impl AuthoritativeColumnWater {
             rejected_cells: rejected.len() + rejected_levels.len(),
         };
         let (prewarm_s, gated_rate) = (setup.prewarm_s, setup.gated_rate);
+        // The planned water is in the solver now; keeping it in the setup would
+        // hold a second copy (tens of MB per million columns) for the world's life.
+        let mut setup = setup;
+        setup.initial_cells = Vec::new();
+        setup.initial_levels = Vec::new();
         let mut water = Self::assemble(setup, world, seed);
         water.set_gated_sources_rate(gated_rate);
         if prewarm_s > 0.0 {

@@ -358,9 +358,11 @@ impl GeneratedScene {
     }
 
     /// Packages the world for [`spall_server::ServeConfig::custom_world`].
-    pub fn into_custom_world(self) -> CustomWorld {
+    pub fn into_custom_world(mut self) -> CustomWorld {
         let spawns = self.player_spawns().to_vec();
-        let column_water = self.column_water.clone();
+        // The scene's own copy of the planned water would outlive the world setup
+        // that needs it; hand it over instead of cloning.
+        let column_water = self.column_water.take();
         let vegetation = self.vegetation.clone();
         let scene = Arc::new(self);
         let mut custom =
