@@ -176,6 +176,8 @@ pub fn column_water_setup(
     // measured on a 1024-cell world, the active regions fall from 272 to 143
     // in five minutes and keep falling.
     setup.config.sleep_flow = WORLDGEN_SLEEP_FLOW;
+    // Deep still sea stays a record until something disturbs it.
+    setup.config.lazy_ocean = true;
     Some(setup)
 }
 

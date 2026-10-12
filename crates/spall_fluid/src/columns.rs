@@ -87,6 +87,12 @@ pub struct ColumnConfig {
     pub steady_wake_abs: f32,
     pub steady_wake_rel: f32,
     pub steady_wake_sigmas: f32,
+    /// Keep deep still sea as a record, not as solver regions. A region that
+    /// `seed_levels` finds wholly under one flat sea level, with every
+    /// neighbour the same, holds a few KiB instead of the ~200 KiB a solver
+    /// region costs; it becomes a real region the moment anything touches it
+    /// (an edit, a spring or drain, a neighbour that starts moving, a restore).
+    pub lazy_ocean: bool,
 }
 
 impl Default for ColumnConfig {
@@ -113,6 +119,7 @@ impl Default for ColumnConfig {
             steady_wake_abs: 0.02,
             steady_wake_rel: 0.1,
             steady_wake_sigmas: 6.0,
+            lazy_ocean: false,
         }
     }
 }
@@ -311,6 +318,23 @@ struct Region {
     steady_ref: Vec<(u32, f32, f32)>,
 }
 
+/// A region of still sea kept as a record (see [`ColumnConfig::lazy_ocean`]).
+struct Dormant {
+    /// Per column: the floor y and the height of the span the sea fills.
+    cols: Vec<(i32, i32)>,
+    /// The sea fills each span up to and including this cell row.
+    top: i64,
+    /// The water held, cells^3.
+    volume: f64,
+}
+
+impl Dormant {
+    fn column_volume(&self, c: usize) -> f64 {
+        let (y0, height) = self.cols[c];
+        (((self.top + 1) as f64) - f64::from(y0)).clamp(0.0, f64::from(height))
+    }
+}
+
 /// Read-only description of one span for tests and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpanView {
@@ -408,6 +432,9 @@ pub struct ColumnWorld {
     /// Largest wetted pipe area seen, for the substep limit.
     a_hint: f32,
     lists_dirty: bool,
+    /// Deep still sea held as records, by region; and the water in them.
+    dormant: HashMap<RegionKey, Dormant>,
+    dormant_volume: f64,
 }
 
 fn span_key(x: i64, z: i64, y0: i32) -> u64 {
@@ -512,6 +539,8 @@ impl ColumnWorld {
             touched: Vec::new(),
             a_hint: 0.25,
             lists_dirty: false,
+            dormant: HashMap::new(),
+            dormant_volume: 0.0,
         }
     }
 
@@ -593,7 +622,12 @@ impl ColumnWorld {
                 .map(|r| r.pipes.len() * 4)
                 .sum::<usize>()
             + (self.act_spans.len() + self.act_pipes.len()) * 4
-            + self.live.len();
+            + self.live.len()
+            + self
+                .dormant
+                .values()
+                .map(|d| d.cols.len() * 8 + std::mem::size_of::<Dormant>())
+                .sum::<usize>();
         MemoryReport {
             regions: self.regions.len(),
             columns: self.regions.len() * REGION_COLUMNS,
@@ -738,6 +772,206 @@ impl ColumnWorld {
     /// key in `refresh`, remapping its water column by column. New regions start
     /// asleep; refreshed ones wake with their neighbours.
     fn allocate(&mut self, add: &[RegionKey], refresh: &BTreeSet<RegionKey>) -> RemapReport {
+        if !self.dormant.is_empty() {
+            let touched: Vec<RegionKey> = add
+                .iter()
+                .chain(refresh.iter())
+                .copied()
+                .filter(|k| self.dormant.contains_key(k))
+                .collect();
+            self.revive(&touched);
+        }
+        self.allocate_inner(add, refresh)
+    }
+
+    /// Turns dormant sea regions into real ones, asleep, holding the water
+    /// they were recorded with. The terrain is read now, so an edited column
+    /// takes its water into the span that holds the old floor cell and the
+    /// region wakes to even it out; water with no span to go to is unplaced,
+    /// never dropped.
+    fn revive(&mut self, keys: &[RegionKey]) {
+        let mut revived = Vec::new();
+        for k in keys {
+            if let Some(d) = self.dormant.remove(k) {
+                self.dormant_volume -= d.volume;
+                revived.push((*k, d));
+            }
+        }
+        if revived.is_empty() {
+            return;
+        }
+        let want: Vec<RegionKey> = revived.iter().map(|(k, _)| *k).collect();
+        self.allocate_inner(&want, &BTreeSet::new());
+        for (key, d) in revived {
+            let Some(&slot) = self.slot_of.get(&key) else {
+                // Terrain not resident: keep it as it was.
+                self.dormant_volume += d.volume;
+                self.dormant.insert(key, d);
+                continue;
+            };
+            let mut moved = false;
+            for c in 0..REGION_COLUMNS {
+                let v = d.column_volume(c);
+                if v <= 0.0 {
+                    continue;
+                }
+                let ci = slot as usize * REGION_COLUMNS + c;
+                let y0 = i64::from(d.cols[c].0);
+                let found =
+                    (self.col_start[ci] as usize..self.col_start[ci + 1] as usize).find(|&i| {
+                        (i64::from(self.spans[i].y0)..i64::from(self.spans[i].y1)).contains(&y0)
+                    });
+                match found {
+                    Some(i) => {
+                        moved |= self.spans[i].y0 != d.cols[c].0
+                            || self.spans[i].y1 - self.spans[i].y0 != d.cols[c].1;
+                        self.volume[i] += v;
+                    }
+                    None => {
+                        moved = true;
+                        self.unplaced += v;
+                    }
+                }
+            }
+            if moved {
+                self.dirty.insert(key);
+                self.wake_slot_and_neighbours(slot as usize);
+            }
+        }
+        self.lists_dirty = true;
+    }
+
+    /// Revives the dormant region holding column `(x, z)`, if it is one.
+    fn revive_at(&mut self, x: i64, z: i64) {
+        if !self.dormant.is_empty() {
+            self.revive(&[region_of(x, z)]);
+        }
+    }
+
+    /// Revives every dormant region next to a region that is moving: the
+    /// disturbance can cross the border, so the neighbour must be real. Revived
+    /// regions start asleep; the flow into them wakes them in turn, so a wave
+    /// pulls in only the regions it actually reaches.
+    fn revive_beside_activity(&mut self) {
+        let mut next: Vec<RegionKey> = Vec::new();
+        for r in &self.regions {
+            if !r.active || r.frozen {
+                continue;
+            }
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let k = (r.key.0 + dx, r.key.1 + dz);
+                if self.dormant.contains_key(&k) {
+                    next.push(k);
+                }
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        self.revive(&next);
+    }
+
+    /// The dormant regions among the columns being seeded: regions wholly under
+    /// one flat sea level with all eight neighbours the same, whose terrain has
+    /// an open surface at that level over every column.
+    fn find_dormant(&self, columns: &[(i64, i64, i64, i64)]) -> HashMap<RegionKey, Dormant> {
+        // Per region: columns seen, lowest and highest sea top.
+        let mut seen: HashMap<RegionKey, (u32, i64, i64)> = HashMap::new();
+        for &(x, z, _, top) in columns {
+            let e = seen.entry(region_of(x, z)).or_insert((0, top, top));
+            e.0 += 1;
+            e.1 = e.1.min(top);
+            e.2 = e.2.max(top);
+        }
+        let uniform = |k: RegionKey| {
+            seen.get(&k)
+                .filter(|e| e.0 as usize == REGION_COLUMNS && e.1 == e.2)
+                .map(|e| e.1)
+        };
+        let mut interior: Vec<(RegionKey, i64)> = seen
+            .keys()
+            .filter_map(|&k| {
+                let top = uniform(k)?;
+                for dx in -1..=1 {
+                    for dz in -1..=1 {
+                        if uniform((k.0 + dx, k.1 + dz)) != Some(top) {
+                            return None;
+                        }
+                    }
+                }
+                Some((k, top))
+            })
+            .collect();
+        if interior.is_empty() {
+            return HashMap::new();
+        }
+        interior.sort_unstable();
+        let mut beds: HashMap<RegionKey, Vec<i32>> = interior
+            .iter()
+            .map(|&(k, _)| (k, vec![i32::MIN; REGION_COLUMNS]))
+            .collect();
+        for &(x, z, bed, _) in columns {
+            if let Some(b) = beds.get_mut(&region_of(x, z)) {
+                let local =
+                    (x.rem_euclid(REGION_EDGE) + REGION_EDGE * z.rem_euclid(REGION_EDGE)) as usize;
+                b[local] = bed as i32;
+            }
+        }
+        let (y_lo, y_hi) = self.terrain.y_range();
+        let mut found = HashMap::new();
+        // A bounded batch at a time: each check holds one region's solid mask.
+        for chunk in interior.chunks(64) {
+            let checked: Vec<Option<Dormant>> = chunk
+                .par_iter()
+                .map(|&(k, top)| {
+                    let terrain = self.terrain.region(k)?;
+                    let mut spans = Vec::new();
+                    let mut col_start = Vec::new();
+                    extract_columns(&terrain, y_lo, y_hi, &mut spans, &mut col_start);
+                    let mut cols = Vec::with_capacity(REGION_COLUMNS);
+                    let mut volume = 0.0;
+                    for c in 0..REGION_COLUMNS {
+                        let end = col_start.get(c + 1).map_or(spans.len(), |&e| e as usize);
+                        let bed = beds[&k][c];
+                        if bed == i32::MIN {
+                            return None;
+                        }
+                        let at = i64::from(bed) + 1;
+                        let s = spans[col_start[c] as usize..end]
+                            .iter()
+                            .find(|s| (i64::from(s.y0)..i64::from(s.y1)).contains(&at))?;
+                        // An open surface at the sea level: not under a roof.
+                        if top >= i64::from(s.y1) || top < i64::from(s.y0) {
+                            return None;
+                        }
+                        cols.push((s.y0, s.y1 - s.y0));
+                        volume += ((top + 1) as f64 - f64::from(s.y0)).clamp(0.0, s.capacity());
+                    }
+                    Some(Dormant { cols, top, volume })
+                })
+                .collect();
+            for (&(k, _), d) in chunk.iter().zip(checked) {
+                if let Some(d) = d {
+                    found.insert(k, d);
+                }
+            }
+        }
+        found
+    }
+
+    /// The wet spans of a dormant region, `(column, floor y, volume, height)`.
+    fn dormant_spans(&self, key: RegionKey, min_volume: f64) -> Option<Vec<(u16, i32, f64, i32)>> {
+        let d = self.dormant.get(&key)?;
+        Some(
+            (0..REGION_COLUMNS)
+                .filter_map(|c| {
+                    let v = d.column_volume(c);
+                    (v > min_volume).then(|| (c as u16, d.cols[c].0, v, d.cols[c].1))
+                })
+                .collect(),
+        )
+    }
+
+    fn allocate_inner(&mut self, add: &[RegionKey], refresh: &BTreeSet<RegionKey>) -> RemapReport {
         // Every region's solid mask is loaded before any is built: half a MiB
         // each at 128 m of height, so thousands of ocean regions held 2.5 GiB at
         // once. In sorted batches the slots come out in the same order and only
@@ -1446,6 +1680,7 @@ impl ColumnWorld {
 
     /// Wakes the region holding column `(x, z)`.
     pub fn wake_column(&mut self, x: i64, z: i64) {
+        self.revive_at(x, z);
         if let Some(&s) = self.slot_of.get(&region_of(x, z)) {
             self.wake_slot(s as usize);
         }
@@ -1473,7 +1708,7 @@ impl ColumnWorld {
         let mut refresh = BTreeSet::new();
         let mut add = Vec::new();
         for &k in keys {
-            if self.slot_of.contains_key(&k) {
+            if self.slot_of.contains_key(&k) || self.dormant.contains_key(&k) {
                 refresh.insert(k);
             } else if self.waiting.remove(&k) {
                 add.push(k);
@@ -1516,7 +1751,7 @@ impl ColumnWorld {
         let set: BTreeSet<_> = keys
             .iter()
             .copied()
-            .filter(|k| self.slot_of.contains_key(k))
+            .filter(|k| self.slot_of.contains_key(k) || self.dormant.contains_key(k))
             .collect();
         self.allocate(&[], &set)
     }
@@ -1569,6 +1804,7 @@ impl ColumnWorld {
     /// level `level_y` (global cell units): spans below it fill, spans above it
     /// stay dry. Wakes the region. The region must be allocated.
     pub fn fill_column_to(&mut self, x: i64, z: i64, level_y: f64) {
+        self.revive_at(x, z);
         if let Some(range) = self.column_range(x, z) {
             for i in range {
                 let s = self.spans[i];
@@ -1585,6 +1821,7 @@ impl ColumnWorld {
         if !volume.is_finite() || volume < 0.0 {
             return Err(ColumnError::InvalidAmount);
         }
+        self.revive_at(cell.x, cell.z);
         let slot = self.slot_of.get(&region_of(cell.x, cell.z)).copied();
         if let Some(slot) = slot
             && self.regions[slot as usize].steady
@@ -1601,6 +1838,7 @@ impl ColumnWorld {
         if !volume.is_finite() || volume < 0.0 {
             return Err(ColumnError::InvalidAmount);
         }
+        self.revive_at(cell.x, cell.z);
         let i = self.span_at(cell).ok_or(ColumnError::NotOpen(cell))?;
         self.volume[i] += volume;
         self.wake_column(cell.x, cell.z);
@@ -1645,11 +1883,24 @@ impl ColumnWorld {
     /// Allocates the regions and leaves every region asleep. Columns with no
     /// open span above their bed are returned, not dropped silently.
     pub fn seed_levels(&mut self, columns: &[(i64, i64, i64, i64)]) -> Vec<(i64, i64, i64, i64)> {
-        let keys: BTreeSet<RegionKey> = columns.iter().map(|c| region_of(c.0, c.1)).collect();
+        if self.config.lazy_ocean {
+            for (k, d) in self.find_dormant(columns) {
+                self.dormant_volume += d.volume;
+                self.dormant.insert(k, d);
+            }
+        }
+        let keys: BTreeSet<RegionKey> = columns
+            .iter()
+            .map(|c| region_of(c.0, c.1))
+            .filter(|k| !self.dormant.contains_key(k))
+            .collect();
         let keys: Vec<_> = keys.into_iter().collect();
         self.allocate(&keys, &BTreeSet::new());
         let mut rejected = Vec::new();
         for &(x, z, bed, top) in columns {
+            if !self.dormant.is_empty() && self.dormant.contains_key(&region_of(x, z)) {
+                continue;
+            }
             match self.span_at(GlobalCell::new(x, bed + 1, z)) {
                 Some(i) => {
                     let s = self.spans[i];
@@ -1689,7 +1940,7 @@ impl ColumnWorld {
             marked.push(s);
             for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 let k = (r.key.0 + dx, r.key.1 + dz);
-                if !self.slot_of.contains_key(&k) {
+                if !self.slot_of.contains_key(&k) && !self.dormant.contains_key(&k) {
                     add.insert(k);
                 }
             }
@@ -1706,7 +1957,7 @@ impl ColumnWorld {
     /// Total water including overfill and the unplaced ledger, cells^3.
     pub fn total_volume(&self) -> f64 {
         let ledgers: f64 = self.regions.iter().map(|r| r.steady_ledger).sum();
-        chunked_sum(&self.volume, |_, v| *v) + self.unplaced + ledgers
+        chunked_sum(&self.volume, |_, v| *v) + self.unplaced + ledgers + self.dormant_volume
     }
 
     pub fn total_volume_m3(&self) -> f64 {
@@ -1715,6 +1966,11 @@ impl ColumnWorld {
 
     /// Water in one column (all spans), cells^3.
     pub fn column_volume(&self, x: i64, z: i64) -> f64 {
+        if let Some(d) = self.dormant.get(&region_of(x, z)) {
+            let local =
+                (x.rem_euclid(REGION_EDGE) + REGION_EDGE * z.rem_euclid(REGION_EDGE)) as usize;
+            return d.column_volume(local);
+        }
         self.column_range(x, z)
             .map(|r| r.map(|i| self.volume[i]).sum())
             .unwrap_or(0.0)
@@ -1798,6 +2054,7 @@ impl ColumnWorld {
     /// open (a spring). Returns the volume added, or `None` if the cell is not
     /// open.
     pub fn fill_cell(&mut self, cell: GlobalCell) -> Option<f64> {
+        self.revive_at(cell.x, cell.z);
         let i = self.span_at(cell)?;
         let want = (cell.y + 1 - i64::from(self.spans[i].y0)) as f64;
         let added = (want - self.volume[i]).max(0.0);
@@ -1812,6 +2069,7 @@ impl ColumnWorld {
     /// Removes the water that stands in `cell` (up to one cell^3) from its span
     /// (a drain). Returns the volume removed, or `None` if the cell is not open.
     pub fn drain_cell(&mut self, cell: GlobalCell) -> Option<f64> {
+        self.revive_at(cell.x, cell.z);
         let i = self.span_at(cell)?;
         let in_cell =
             (self.volume[i] - (cell.y - i64::from(self.spans[i].y0)) as f64).clamp(0.0, 1.0);
@@ -1831,11 +2089,22 @@ impl ColumnWorld {
     /// Marks every allocated region as changed (a full baseline is wanted).
     pub fn mark_all_dirty(&mut self) {
         self.dirty.extend(self.regions.iter().map(|r| r.key));
+        self.dirty.extend(self.dormant.keys().copied());
     }
 
-    /// Allocated region keys in slot order.
+    /// Allocated region keys in slot order, then the dormant sea regions
+    /// (which hold water and report it like any other) in key order.
     pub fn region_keys(&self) -> Vec<RegionKey> {
-        self.regions.iter().map(|r| r.key).collect()
+        let mut keys: Vec<RegionKey> = self.regions.iter().map(|r| r.key).collect();
+        let mut dormant: Vec<RegionKey> = self.dormant.keys().copied().collect();
+        dormant.sort_unstable();
+        keys.extend(dormant);
+        keys
+    }
+
+    /// How many sea regions are held as records instead of solver regions.
+    pub fn dormant_region_count(&self) -> usize {
+        self.dormant.len()
     }
 
     /// Water volume ledger of the world that is not inside any span: only the
@@ -1844,7 +2113,10 @@ impl ColumnWorld {
     /// only spans holding more than `min_volume`.
     pub fn region_wet_spans(&self, key: RegionKey, min_volume: f64) -> Vec<(u16, i32, f64)> {
         let Some(&slot) = self.slot_of.get(&key) else {
-            return Vec::new();
+            return self
+                .dormant_spans(key, min_volume)
+                .map(|v| v.into_iter().map(|(c, y0, vol, _)| (c, y0, vol)).collect())
+                .unwrap_or_default();
         };
         let mut out = Vec::new();
         for c in 0..REGION_COLUMNS {
@@ -1867,7 +2139,14 @@ impl ColumnWorld {
         min_volume: f64,
     ) -> Vec<(u16, i32, f64, i32, [f32; 2])> {
         let Some(&slot) = self.slot_of.get(&key) else {
-            return Vec::new();
+            return self
+                .dormant_spans(key, min_volume)
+                .map(|v| {
+                    v.into_iter()
+                        .map(|(c, y0, vol, h)| (c, y0, vol, h, [0.0; 2]))
+                        .collect()
+                })
+                .unwrap_or_default();
         };
         let mut out = Vec::new();
         for c in 0..REGION_COLUMNS {
@@ -1901,6 +2180,7 @@ impl ColumnWorld {
     /// must be allocated. Returns false if terrain has no such span (the
     /// caller reports it; water is never silently dropped).
     pub fn restore_span(&mut self, key: RegionKey, column: u16, y0: i32, volume: f64) -> bool {
+        self.revive(&[key]);
         let Some(&slot) = self.slot_of.get(&key) else {
             return false;
         };
@@ -2035,6 +2315,9 @@ impl ColumnWorld {
     /// not depend on iteration order or thread count. Sleeping regions cost
     /// nothing; a world with no active region returns immediately.
     pub fn step(&mut self, dt: f64) -> ColumnStepMetrics {
+        if !self.dormant.is_empty() {
+            self.revive_beside_activity();
+        }
         if self.unplaced > 0.0 {
             self.release_unplaced();
         }
