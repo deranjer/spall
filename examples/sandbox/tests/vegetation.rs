@@ -365,6 +365,112 @@ fn two_network_clients_receive_generated_vegetation_and_the_same_season() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A regional client is sent the plants around its player, not the world; a
+/// client that streams everything still gets every plant. Both keep cover (the
+/// climate raster is cached from the first keyframe).
+#[cfg(feature = "client")]
+#[test]
+fn a_regional_client_receives_only_the_plants_around_its_player() {
+    use spall_client::{
+        BaselineScene, ClientNetConfig, ClientResidencyLimits, run_replication_client_with_manifest,
+    };
+    use spall_net::{Fingerprint, JoinToken, TransportConfig};
+    use std::time::{Duration, Instant};
+    let dir = std::env::temp_dir().join(format!("spall-vegetation-region-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scene = sandbox::worldgen_scene::generate("natural", 4, 512).unwrap();
+    let total = scene.vegetation().organisms.len() as u64;
+    let spawns = scene.player_spawns().to_vec();
+    let vegetation = scene.vegetation().clone();
+    let world = spall_server::CustomWorld::new(spawns, move || scene.world_setup())
+        .with_vegetation(vegetation);
+    let token = JoinToken::generate().unwrap();
+    let fp = dir.join("fingerprint");
+    let addr = dir.join("addr");
+    let mut config = spall_server::ServeConfig::headless(
+        "127.0.0.1:0".parse().unwrap(),
+        spall_server::Scene::Custom,
+        token,
+    );
+    config.custom_world = Some(world);
+    config.max_ticks = 900;
+    config.quiescence_ticks = 0;
+    config.paced = true;
+    config.fingerprint_out = Some(fp.clone());
+    config.addr_out = Some(addr.clone());
+    config.log_json = dir.join("server.jsonl");
+    let server = std::thread::spawn(move || {
+        spall_server::serve_with_game_content(
+            config,
+            sandbox::game::tool_catalog(),
+            sandbox::game::manifest(),
+        )
+        .unwrap()
+    });
+    let read = |path: &std::path::Path| {
+        let start = Instant::now();
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path)
+                && !s.trim().is_empty()
+            {
+                break s.trim().to_owned();
+            }
+            assert!(start.elapsed() < Duration::from_secs(60));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let whole = ClientNetConfig {
+        connect_addr: read(&addr).parse().unwrap(),
+        server_fingerprint: Fingerprint::from_hex(&read(&fp)).unwrap(),
+        join_token: token,
+        script: vec![],
+        movement_script: vec![],
+        late_join: true,
+        baseline_scene: BaselineScene::Walk,
+        run_ticks: 600,
+        idle_grace: Duration::from_millis(500),
+        overall_timeout: Duration::from_secs(60),
+        log_json: dir.join("whole.jsonl"),
+        summary_json: None,
+        transport: TransportConfig::for_tests(),
+        client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
+        on_replica_ready: None,
+        interactive: None,
+        client_authoritative: false,
+        admin_script: vec![],
+    };
+    let mut regional = whole.clone();
+    regional.log_json = dir.join("regional.jsonl");
+    regional.client_residency = Some(ClientResidencyLimits {
+        stream_initial: true,
+        defer_catalogue: false,
+        budget_bricks: 512,
+        interest_radius_bricks: 1,
+        max_dense_bytes: 64 * 1024 * 1024,
+    });
+    let regional_thread = std::thread::spawn(move || {
+        run_replication_client_with_manifest(regional, sandbox::game::manifest()).unwrap()
+    });
+    let full = run_replication_client_with_manifest(whole, sandbox::game::manifest()).unwrap();
+    let region = regional_thread.join().unwrap();
+    server.join().unwrap();
+    assert!(full.vegetation_keyframes_received >= 1);
+    assert!(
+        full.vegetation_plants_received >= total * 9 / 10,
+        "{} of {total}",
+        full.vegetation_plants_received
+    );
+    assert!(region.vegetation_keyframes_received >= 1);
+    assert!(
+        region.vegetation_plants_received < full.vegetation_plants_received / 3,
+        "regional {} against whole {}",
+        region.vegetation_plants_received,
+        full.vegetation_plants_received
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A ground plant is never placed in a tree's trunk column (the tree's wood is
 /// planned before it is committed, so the cell still looks empty).
 #[test]

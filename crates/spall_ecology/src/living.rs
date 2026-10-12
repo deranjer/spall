@@ -128,9 +128,12 @@ pub struct Organism {
     pub alive: bool,
     pub biomass: u16,
     /// Parent-before-child, face-connected. Cuts permanently retire descendants.
-    pub wood: Vec<[i64; 3]>,
-    pub parents: Vec<u16>,
-    pub removed: Vec<bool>,
+    /// Shared and never changed after establishment, so copying the state for
+    /// a keyframe does not copy every tree's wood.
+    pub wood: std::sync::Arc<[[i64; 3]]>,
+    pub parents: std::sync::Arc<[u16]>,
+    /// Copy-on-write, like the skeleton: a keyframe's copy of the state shares it.
+    pub removed: std::sync::Arc<Vec<bool>>,
     pub committed: u16,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,9 +282,9 @@ impl From<OrganismV2> for Organism {
             last_seed_ms: o.last_seed_ms,
             alive: o.alive,
             biomass: o.biomass,
-            wood: o.wood,
-            parents: o.parents,
-            removed: o.removed,
+            wood: o.wood.into(),
+            parents: o.parents.into(),
+            removed: std::sync::Arc::new(o.removed),
             committed: o.committed,
         }
     }
@@ -489,7 +492,7 @@ impl LivingState {
                         let p = &mut self.organisms[index];
                         p.committed = p.wood.len() as u16;
                         p.age_ms = 600_000;
-                        for &at in &p.wood {
+                        for &at in p.wood.iter() {
                             plan.set(cell(at), MaterialId(wood.unwrap_or(0)));
                         }
                     }
@@ -622,9 +625,9 @@ impl LivingState {
             last_seed_ms: self.time_ms,
             alive: true,
             biomass: 100,
-            removed: vec![false; wood.len()],
-            wood,
-            parents,
+            removed: std::sync::Arc::new(vec![false; wood.len()]),
+            wood: wood.into(),
+            parents: parents.into(),
             committed: 0,
         };
         self.next_id += 1;
@@ -687,7 +690,7 @@ impl LivingState {
         Season::at(self.start_season, self.time_ms, self.season_ms)
     }
     pub fn encode(&self) -> Result<Vec<u8>, String> {
-        self.validate()?;
+        self.validate_with(false)?;
         let bytes = postcard::to_stdvec(self).map_err(|e| e.to_string())?;
         if bytes.len() > MAX_STATE_BYTES {
             return Err("vegetation state byte limit".into());
@@ -712,7 +715,7 @@ impl LivingState {
                 s
             }
         };
-        s.validate()?;
+        s.validate_with(version < VERSION)?;
         if version < VERSION {
             s.check_skeletons_reproducible()?;
         }
@@ -730,7 +733,8 @@ impl LivingState {
                 .iter()
                 .find(|s| s.id == p.species)
                 .ok_or("organism of an unknown species")?;
-            if skeleton(p.root, s, hash(self.seed ^ p.id)) != (p.wood.clone(), p.parents.clone()) {
+            let (wood, parents) = skeleton(p.root, s, hash(self.seed ^ p.id));
+            if *p.wood != *wood || *p.parents != *parents {
                 return Err(format!(
                     "tree {} of an older save does not match the skeleton rule",
                     p.id
@@ -759,9 +763,9 @@ impl LivingState {
             if p.removed.len() > wood.len() || usize::from(p.committed) > wood.len() {
                 return Err("removed or committed cell beyond the skeleton".into());
             }
-            p.removed.resize(wood.len(), false);
-            p.wood = wood;
-            p.parents = parents;
+            std::sync::Arc::make_mut(&mut p.removed).resize(wood.len(), false);
+            p.wood = wood.into();
+            p.parents = parents.into();
         }
         Ok(())
     }
@@ -827,7 +831,14 @@ impl LivingState {
             spatial: Default::default(),
         }
     }
+    /// Full validation, including every skeleton cell of every tree.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with(true)
+    }
+    /// `skeletons: false` skips the per-cell checks of the wood, for states
+    /// whose skeletons the program itself just grew (a version 3 load) or is
+    /// about to save; they cost milliseconds at 20,000 trees.
+    fn validate_with(&self, skeletons: bool) -> Result<(), String> {
         if self.version != VERSION
             || self.species.len() > MAX_SPECIES
             || self.season_ms == 0
@@ -895,10 +906,12 @@ impl LivingState {
                 || p.parents.len() != p.wood.len()
                 || p.removed.len() != p.wood.len()
                 || usize::from(p.committed) > p.wood.len()
-                || p.root
-                    .iter()
-                    .chain(p.wood.iter().flatten())
-                    .any(|c| c.unsigned_abs() > 1_000_000)
+                || p.root.iter().any(|c| c.unsigned_abs() > 1_000_000)
+                || (skeletons
+                    && p.wood
+                        .iter()
+                        .flatten()
+                        .any(|c| c.unsigned_abs() > 1_000_000))
                 || self.credit_ms >= 1000
                 || p.root[0] < 33
                 || p.root[2] < 33
@@ -907,7 +920,10 @@ impl LivingState {
             {
                 return Err("invalid organism".into());
             }
-            for (i, (&at, &parent)) in p.wood.iter().zip(&p.parents).enumerate() {
+            for (i, (&at, &parent)) in p.wood.iter().zip(p.parents.iter()).enumerate() {
+                if !skeletons {
+                    break;
+                }
                 if i == 0 {
                     if at != p.root || parent != 0 {
                         return Err("invalid root".into());
@@ -995,7 +1011,7 @@ impl LivingState {
                         || (j > 0 && p.removed[usize::from(p.parents[j])])
                         || !matches!(terrain.sample(cell(p.wood[j])),Ok(Sample::Filled(m)) if m.0==s.wood)
                     {
-                        p.removed[j] = true;
+                        std::sync::Arc::make_mut(&mut p.removed)[j] = true;
                     }
                 }
                 if p.committed > 0 && p.removed[0] {
@@ -1030,7 +1046,7 @@ impl LivingState {
                 let j = usize::from(p.committed);
                 if j < p.wood.len() {
                     if j > 0 && p.removed[usize::from(p.parents[j])] {
-                        p.removed[j] = true;
+                        std::sync::Arc::make_mut(&mut p.removed)[j] = true;
                         p.committed += 1;
                     } else if matches!(terrain.sample(cell(p.wood[j])), Ok(Sample::Empty { .. })) {
                         growth.push(Growth {
@@ -1040,7 +1056,7 @@ impl LivingState {
                             material: MaterialId(s.wood),
                         });
                     } else if !matches!(terrain.sample(cell(p.wood[j])), Ok(Sample::Unknown(_))) {
-                        p.removed[j] = true;
+                        std::sync::Arc::make_mut(&mut p.removed)[j] = true;
                         p.committed += 1;
                     }
                 }
@@ -1237,7 +1253,58 @@ fn skeleton(root: [i64; 3], s: &Species, key: u64) -> (Vec<[i64; 3]>, Vec<u16>) 
     (wood, parents)
 }
 
+/// The part of a world one client is interested in: a square of cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub x: [i64; 2],
+    pub z: [i64; 2],
+}
+
+impl Window {
+    /// The square of `half` cells around `(x, z)`.
+    pub fn around(x: i64, z: i64, half: i64) -> Self {
+        Self {
+            x: [x - half, x + half],
+            z: [z - half, z + half],
+        }
+    }
+    pub fn contains(&self, x: i64, z: i64) -> bool {
+        (self.x[0]..=self.x[1]).contains(&x) && (self.z[0]..=self.z[1]).contains(&z)
+    }
+}
+
 impl VisualFrame {
+    /// The frame for a client that only draws `window`: the plants and the
+    /// destroyed-cover records inside it. The climate raster is the whole
+    /// world's and does not change, so it goes along only when `with_field`
+    /// (a client keeps the last one it received).
+    pub fn windowed(&self, window: Window, with_field: bool) -> VisualFrame {
+        VisualFrame {
+            version: self.version,
+            time_ms: self.time_ms,
+            season: self.season,
+            seed: self.seed,
+            species: self.species.clone(),
+            plants: self
+                .plants
+                .iter()
+                .filter(|p| window.contains(p.root[0], p.root[2]))
+                .cloned()
+                .collect(),
+            cover: self.cover.clone(),
+            field: if with_field {
+                self.field.clone()
+            } else {
+                CoverField::default()
+            },
+            cleared: self
+                .cleared
+                .iter()
+                .filter(|c| window.contains(i64::from(c.x), i64::from(c.z)))
+                .copied()
+                .collect(),
+        }
+    }
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         postcard::to_stdvec(self).map_err(|e| e.to_string())
     }
@@ -1457,10 +1524,10 @@ mod tests {
             last_seed_ms: 7,
             alive: true,
             biomass: 400,
-            removed: vec![false; wood.len()],
+            removed: std::sync::Arc::new(vec![false; wood.len()]),
             committed: wood.len() as u16,
-            wood,
-            parents,
+            wood: wood.into(),
+            parents: parents.into(),
         };
         (s, p)
     }
@@ -1488,12 +1555,71 @@ mod tests {
     }
 
     #[test]
+    fn a_windowed_frame_keeps_only_what_is_inside_and_the_field_only_on_request() {
+        let (s, a) = grown_tree(9, 3, 60);
+        let (_, b) = grown_tree(9, 4, 400);
+        let mut state = state_with(vec![a, b], vec![s]);
+        state.field = CoverField {
+            width: 4,
+            rle: vec![16, 1],
+        };
+        state.cleared = vec![
+            Cleared {
+                x: 62,
+                z: 40,
+                at_s: 1,
+            },
+            Cleared {
+                x: 401,
+                z: 40,
+                at_s: 2,
+            },
+        ];
+        let terrain_free = VisualFrame {
+            version: VERSION,
+            time_ms: 5_000,
+            season: Season::Summer,
+            seed: 9,
+            species: state.species.clone(),
+            plants: state
+                .organisms
+                .iter()
+                .map(|p| VisualPlant {
+                    id: p.id,
+                    species: p.species,
+                    root: p.root,
+                    biomass: p.biomass,
+                    tips: vec![p.root],
+                })
+                .collect(),
+            cover: vec![],
+            field: state.field.clone(),
+            cleared: state.cleared.clone(),
+        };
+        let near = terrain_free.windowed(Window::around(60, 40, 50), false);
+        assert_eq!(near.plants.len(), 1);
+        assert_eq!(near.plants[0].root[0], 60);
+        assert_eq!(near.cleared.len(), 1);
+        assert!(
+            near.field.is_empty(),
+            "the raster rides along only when asked"
+        );
+        let both = terrain_free.windowed(Window::around(230, 40, 400), true);
+        assert_eq!(both.plants.len(), 2);
+        assert_eq!(both.field, state.field);
+        // The window frame encodes smaller and decodes to itself.
+        assert!(near.encode().unwrap().len() < both.encode().unwrap().len());
+        assert_eq!(VisualFrame::decode(&near.encode().unwrap()).unwrap(), near);
+    }
+
+    #[test]
     fn a_saved_tree_keeps_only_its_removed_cells_and_grows_back_identically() {
         let (s, mut a) = grown_tree(9, 3, 60);
         let (_, b) = grown_tree(9, 4, 120);
         assert!(a.wood.len() > 20);
-        a.removed[7] = true;
-        a.removed[a.wood.len() - 1] = true;
+        let last = a.wood.len() - 1;
+        std::sync::Arc::make_mut(&mut a.removed)[7] = true;
+        std::sync::Arc::make_mut(&mut a.removed)[last] = true;
         a.committed = (a.wood.len() - 3) as u16;
         let state = state_with(vec![a.clone(), b], vec![s]);
         let bytes = state.encode().unwrap();
@@ -1530,9 +1656,9 @@ mod tests {
                 last_seed_ms: a.last_seed_ms,
                 alive: true,
                 biomass: a.biomass,
-                wood: a.wood.clone(),
-                parents: a.parents.clone(),
-                removed: a.removed.clone(),
+                wood: a.wood.to_vec(),
+                parents: a.parents.to_vec(),
+                removed: (*a.removed).clone(),
                 committed: a.committed,
             }],
             spawns: vec![],
@@ -1553,7 +1679,7 @@ mod tests {
     #[test]
     fn an_old_save_whose_tree_is_not_what_the_rule_grows_is_refused() {
         let (s, a) = grown_tree(9, 3, 60);
-        let (mut wood, parents) = (a.wood.clone(), a.parents.clone());
+        let (mut wood, parents) = (a.wood.to_vec(), a.parents.to_vec());
         // Move the last cell to another face neighbour of its parent: still a
         // connected skeleton, but not the one the rule grows.
         let last = wood.len() - 1;
@@ -1586,7 +1712,7 @@ mod tests {
                 biomass: a.biomass,
                 wood,
                 parents,
-                removed: a.removed.clone(),
+                removed: (*a.removed).clone(),
                 committed: a.committed,
             }],
             spawns: vec![],

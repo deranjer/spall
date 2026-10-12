@@ -375,10 +375,60 @@ temperature and water level) that the world carries in `LivingState` and every
   ids and every other organism carry over. `LivingState.preset` (0 showcase, 1
   natural, 2 gallery) makes the server rebuild the climate the world was made
   from (it used to assume the showcase).
-- **Not done (ENG-190, W5)**: shrub and bush forms, ecological placement
-  (canopy density, Poisson disc, understory), raised tree caps for 1 km and
-  regional vegetation replication. The living placement is still the stride-grid
-  scatter with spacing, and the 512-tree / 8,192-ground caps stand.
+
+### Living vegetation at 1 km (ENG-190)
+
+- **Ecological placement** (`spall_ecology::placement`). Trees are dart-thrown in
+  a fixed pseudo-random order over 1 m candidates. Density comes from the
+  *spacing*: a biome's canopy value (Pine forest 1.0, Temperate forest 0.95,
+  Boreal 0.85, Riparian 0.7, Swamp 0.45, Meadow 0.18, Alpine 0.12, Steppe 0.06,
+  Beach and Scree 0.03, Desert 0.01, Snow and Ocean 0) scales a species' spacing
+  from 2.2x (open) to 0.85x (dense); glade noise (56-cell lattice) thins or
+  removes patches of canopy. A 40 m stand has one dominant species (72% of its
+  trees; the choice ranks the species that could grow there by a stand hash, so
+  it does not shift with local soil), the rest are mixed, which makes ecotones
+  at stand edges. The understory (living ground plants) is rolled per 1.25 m
+  candidate by biome fertility, and plants that are not within 7 cells of a tree
+  are kept at 55%, so it gathers in shade. Placement is deterministic for a seed.
+- **Spatial index** (`Spatial`, 16-cell buckets, derived and never saved) answers
+  spacing, trunk-footprint and "a tree never grows over a ground plant" checks in
+  a few buckets, where they used to scan every organism.
+- **Caps** `MAX_TREES` 24,576 and `MAX_GROUND` 32,768 (cover is stateless and not
+  counted); skeleton cell limit 2.5 million.
+- **New forms and species.** Forms 22 shrub (woody stems under a leafy crown),
+  23 soft bush (a leafy mound), 24 tall herb (stems with paired leaves and a
+  flower spike, seed head out of season). Thirteen species, ids 120-132: Hazel,
+  Bramble, Juniper, Heather, Sagebrush, Bog myrtle, Dwarf willow, Mullein,
+  Foxglove, Fireweed, Joe-pye weed, Tamarisk, Sea buckthorn, across every fertile
+  biome including Desert and Beach.
+- **Saved state version 3** saves only what changes. A tree's skeleton is a pure
+  function of its root, species and id (`skeleton`, keyed `hash(seed ^ id)`), so
+  the save keeps the removed-cell indices and the skeleton grows back on load.
+  `skeleton()` is part of the format: changing a species' shape needs a new state
+  version. Version 1 and 2 saves still load; a tree in them that does not match
+  the rule is refused loudly rather than reshaped. `encode()` skips per-cell
+  skeleton checks (the program grew them); decode of an older save does them all.
+- **Regional vegetation replication.** The server builds the full keyframe once a
+  second on a worker; each regional client (one with a streamed radius) then
+  gets only the plants and destroyed-cover records inside a square of
+  `(radius + 2) * 32` cells around its player; a client that streams the whole
+  world still gets everything. The climate raster never changes, so it is sent
+  with a session's first keyframe and every tenth after (a client keeps the last
+  one; a world reset clears it). The keyframe is droppable traffic as before.
+- **Fair work** still visits a bounded number of organisms per second:
+  `clamp(n / 40, 128, 512)`.
+
+Measured (natural, seed 1, 4096 cells, release, `vegetation_scale` example):
+
+| | before W5 (512 / 8,192 caps) | after |
+|---|---|---|
+| trees / living ground plants | 512 / 8,192 (cap-bound; at 2048 cells) | 8,651 / 10,080 |
+| saved state | 0.52 MiB at 2048 cells | 0.39 MiB at 4096 (5.75 MiB before the v3 save) |
+| keyframe per client per second | 0.14 MiB at 2048 cells | whole world 0.65 MiB; regional 8 / 14 / 24 KiB at 4 / 8 / 16 bricks |
+| state copy on the tick thread | 10.3 ms (v2 layout) | 0.73 ms |
+| `encode()` incl. validation | 7.6 ms | 2.9 ms |
+| `advance` per second of ecology | 0.23 ms (2048) | mean 2.7 ms, worst 5.5 ms |
+| vegetation generation | n/a | 1.23 s of a 10.5 s world start |
 
 ## Editor panel update (ENG-191)
 

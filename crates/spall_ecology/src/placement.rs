@@ -38,7 +38,7 @@ pub(crate) struct Entry {
 /// footprint checks cost a few buckets instead of a scan of every plant. It is
 /// derived from the organisms and never saved; two states are equal whatever
 /// their indexes hold.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct Spatial {
     cells: HashMap<(i64, i64), Vec<Entry>>,
     pub trees: usize,
@@ -46,6 +46,14 @@ pub(crate) struct Spatial {
     /// How many organisms the index was built for; a mismatch means someone
     /// changed `organisms` directly and the index is rebuilt before use.
     built: usize,
+}
+
+/// A copy of the state starts without an index and rebuilds it if it ever
+/// needs one (a keyframe's copy never does), so copying costs nothing here.
+impl Clone for Spatial {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 impl PartialEq for Spatial {
@@ -279,7 +287,7 @@ impl LivingState {
                         .iter()
                         .find(|s| s.id == sid)
                         .map_or(0, |s| s.wood);
-                    for &at in &p.wood {
+                    for &at in p.wood.iter() {
                         plan.set(cell(at), MaterialId(wood));
                     }
                 }

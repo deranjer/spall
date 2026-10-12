@@ -82,9 +82,9 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
                 last_seed_ms: w.last_seed_ms,
                 alive: w.alive,
                 biomass: w.biomass,
-                wood: Vec::new(),
-                parents: Vec::new(),
-                removed,
+                wood: Vec::new().into(),
+                parents: Vec::new().into(),
+                removed: std::sync::Arc::new(removed),
                 committed: w.committed,
             }
         })

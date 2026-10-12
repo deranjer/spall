@@ -8,6 +8,10 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `RUST_LOG=info` shows the startup profile (terrain, vegetation, water setup).
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let mut args = std::env::args().skip(1);
     let preset = args.next().unwrap_or_else(|| "natural".into());
     let size: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(2048);
@@ -67,6 +71,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame.plants.len(),
         bytes.len() as f64 / 1_048_576.0,
         build.as_secs_f64() * 1000.0
+    );
+    let part = |name: &str, bytes: usize| {
+        println!("  keyframe part {name}: {:.1} KiB", bytes as f64 / 1024.0)
+    };
+    part("plants", postcard::to_stdvec(&frame.plants)?.len());
+    part("species", postcard::to_stdvec(&frame.species)?.len());
+    part("cover species", postcard::to_stdvec(&frame.cover)?.len());
+    part("climate raster", postcard::to_stdvec(&frame.field)?.len());
+    part("cleared", postcard::to_stdvec(&frame.cleared)?.len());
+    // What a regional client is sent instead: the plants around its player.
+    let spawn = scene.player_spawns().first().copied().unwrap_or([0.0; 3]);
+    let centre = [(spawn[0] / 0.25) as i64, (spawn[2] / 0.25) as i64];
+    for bricks in [4_i64, 8, 16] {
+        let window = spall_ecology::living::Window::around(centre[0], centre[1], (bricks + 2) * 32);
+        let part = frame.windowed(window, false);
+        let with_field = frame.windowed(window, true);
+        println!(
+            "regional window {bricks} bricks at the first spawn: {} plants, {:.1} KiB per keyframe ({:.1} KiB with the raster)",
+            part.plants.len(),
+            part.encode()?.len() as f64 / 1024.0,
+            with_field.encode()?.len() as f64 / 1024.0
+        );
+    }
+    // What the server does on its tick thread each second.
+    let started = Instant::now();
+    let copy = state.clone();
+    println!(
+        "state clone (tick thread, per keyframe): {:.2} ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    drop(copy);
+    let started = Instant::now();
+    let _ = state.encode()?;
+    println!(
+        "state encode incl. validation (per dirty checkpoint): {:.2} ms",
+        started.elapsed().as_secs_f64() * 1000.0
     );
     // One fair-work tick per second of ecological time, over a minute.
     let mut live = state.clone();

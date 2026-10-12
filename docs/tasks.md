@@ -1798,7 +1798,7 @@ Natural worlds (landform, erosion, hydrology, climate, thirteen biomes), live ri
 | W2 landform and hydrology | ENG-187 | in review |
 | W3 live rivers, steady-flow sleep (sleep off: no measured benefit) | ENG-188 | in review |
 | W4 ground cover, underwater plants, biome catalogue, gallery, regrowth | ENG-189 | in review |
-| W5 ecological placement and shrub forms | ENG-190 | backlog |
+| W5 living vegetation: placement, shrubs, caps, regional replication | ENG-190 | in review |
 | W6 editor preview layers, tuning and docs | ENG-191 | in review |
 
 Statuses are the coordinator's; nothing is marked done before review and integration.
