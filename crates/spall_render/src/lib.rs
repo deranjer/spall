@@ -59,3 +59,20 @@ pub use upload::{GpuMesh, MeshUploader, UploadBudget};
 pub use vertex::{GpuVertex, to_gpu};
 pub use viewport::{MeshChunk, ViewportFrame, ViewportRenderer};
 pub use water::{NO_WATER, WaterField};
+
+/// Milliseconds on a process-wide clock started at the first call, for lining
+/// up the diagnostic traces (`SPALL_FRAME_TRACE`, `SPALL_SWEEP_TRACE`).
+pub fn trace_clock_ms() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+        * 1000.0
+}
+
+/// Whether `SPALL_SWEEP_TRACE` is set: log every lighting-sweep slice.
+pub(crate) fn sweep_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPALL_SWEEP_TRACE").is_some())
+}

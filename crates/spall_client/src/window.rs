@@ -2311,7 +2311,8 @@ impl ApplicationHandler for InteractiveApp {
                     let total = handler_started.elapsed().as_secs_f32() * 1000.0;
                     if total > 20.0 {
                         eprintln!(
-                            "spall-frame-trace: handler {total:.1} ms = render {:.1} (acquire {:.1}, submit {:.1}, present {:.1}) + other {:.1}",
+                            "spall-frame-trace: t={:.1} handler {total:.1} ms = render {:.1} (acquire {:.1}, submit {:.1}, present {:.1}) + other {:.1}",
+                            spall_render::trace_clock_ms(),
                             timing.total_ms,
                             timing.acquire_ms,
                             timing.submit_ms,

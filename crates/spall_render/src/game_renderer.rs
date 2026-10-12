@@ -65,6 +65,9 @@ struct TimerSlot {
 /// readback slots and a later frame collects it, so timing never stalls
 /// presentation.
 struct PassTimer {
+    /// GPU milliseconds (sky plus bounce) of each sweep slice timed since the
+    /// renderer last collected them.
+    slice_costs: Vec<f64>,
     queries: wgpu::QuerySet,
     slots: [TimerSlot; TIMER_SLOTS],
     period_ns: f64,
@@ -76,6 +79,7 @@ impl PassTimer {
     fn new(device: &wgpu::Device, period_ns: f32) -> Self {
         let bytes = u64::from(TIMESTAMPS) * 8;
         Self {
+            slice_costs: Vec::new(),
             queries: device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("spall-game-pass-timestamps"),
                 ty: wgpu::QueryType::Timestamp,
@@ -138,6 +142,10 @@ impl PassTimer {
                 let ms = |a: usize, b: usize| {
                     ticks[b].saturating_sub(ticks[a]) as f64 * self.period_ns / 1.0e6
                 };
+                // Only bounce slices say what a layer costs.
+                if has_bounce {
+                    self.slice_costs.push(ms(8, 9));
+                }
                 let previous_sky = self.latest.and_then(|t| t.sky_visibility_ms);
                 let previous_bounce = self.latest.and_then(|t| t.bounce_ms);
                 self.latest = Some(GamePassTimings {
@@ -688,6 +696,11 @@ impl GameRenderer {
         let mut camera = *camera;
         camera.aspect = self.target.width as f32 / self.target.height as f32;
         self.timed_slot = self.timer.as_mut().and_then(PassTimer::begin_frame);
+        if let (Some(timer), Some(sky)) = (self.timer.as_mut(), self.sky.as_ref()) {
+            for cost in timer.slice_costs.drain(..) {
+                sky.note_slice_cost(cost);
+            }
+        }
         let timer = self.timer.as_ref().filter(|_| self.timed_slot.is_some());
 
         let (light_matrices, _) = ScenePipeline::cascade_data(&camera, environment.sun_dir);

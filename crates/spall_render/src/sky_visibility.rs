@@ -100,8 +100,18 @@ struct SkyGlobals {
 const SKY_REGION_OFFSET: u64 = 32;
 const BOUNCE_REGION_OFFSET: u64 = 96;
 
-/// Cells (z) per time slice, so a sliced sweep takes `128 / 16 = 8` frames.
-pub const SLICE_DEPTH: u32 = 16;
+/// Frames a sliced sweep takes before the GPU's speed is known. Slice `k`
+/// recomputes every `slices`-th z layer starting at layer `k`, so each slice is
+/// a thin sample of the whole cache. (Contiguous blocks of layers cost wildly
+/// different amounts, 4 ms for one and 20 ms for the next where the ground and
+/// trees are dense, which made a few frames of every sweep hitch.)
+pub const SLICE_COUNT: u32 = 32;
+/// The most GPU time one slice should take, milliseconds. A sweep is split into
+/// as many slices (16 to 128) as this takes, from the cost of recent slices, so
+/// a slower GPU takes more frames over a sweep instead of dropping frames.
+pub const TARGET_SLICE_MS: f64 = 4.0;
+const MIN_SLICES: u32 = 32;
+const MAX_SLICES: u32 = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -492,6 +502,8 @@ impl SkyPipeline {
                 recentres_completed: 0,
                 frames_in_sweep: 0,
                 last_sweep_frames: 0,
+                layer_ms: None,
+                recent_layer_ms: Vec::new(),
                 change_since: None,
                 sweep_change_since: None,
                 last_latency_ms: None,
@@ -527,6 +539,8 @@ struct Pending {
 struct Running {
     /// The next z slice to process (unused when `full`).
     next_slice: u32,
+    /// How many slices this sweep is divided into.
+    slices: u32,
     full: bool,
     sky: bool,
     bounce: bool,
@@ -567,6 +581,11 @@ struct State {
     recentres_completed: u64,
     frames_in_sweep: u32,
     last_sweep_frames: u32,
+    /// GPU milliseconds one z layer of a sweep costs (sky plus bounce): the
+    /// median of the last few timed slices (the first slice of a sweep also
+    /// gathers emitters and would skew a mean), `None` until one is timed.
+    layer_ms: Option<f64>,
+    recent_layer_ms: Vec<f64>,
     /// When the oldest not-yet-lit change arrived (CPU clock).
     change_since: Option<Instant>,
     /// The change time the running sweep is lighting.
@@ -575,6 +594,18 @@ struct State {
     /// being recorded (CPU clock; excludes the GPU finishing that frame and
     /// presentation).
     last_latency_ms: Option<f64>,
+}
+
+/// How many slices a sweep is cut into, given what one layer costs: enough that
+/// a slice stays near [`TARGET_SLICE_MS`], a power of two between
+/// [`MIN_SLICES`] and [`MAX_SLICES`]. Before any slice has been timed (or with
+/// no timestamp queries) it is [`SLICE_COUNT`].
+fn slices_for(layer_ms: Option<f64>) -> u32 {
+    let Some(layer_ms) = layer_ms.filter(|ms| ms.is_finite() && *ms > 0.0) else {
+        return SLICE_COUNT;
+    };
+    let wanted = (layer_ms * f64::from(LIGHT_VOLUME_DIM) / TARGET_SLICE_MS).ceil() as u32;
+    wanted.next_power_of_two().clamp(MIN_SLICES, MAX_SLICES)
 }
 
 fn bounce_environment_changed(previous: Environment, current: Environment) -> bool {
@@ -965,7 +996,7 @@ impl SkyVisibility {
     }
 
     /// Frames the most recent completed sweep took from start to finish (1 for
-    /// a full-cache dispatch, `128 / SLICE_DEPTH` for a sliced one). Add the
+    /// a full-cache dispatch, `SLICE_COUNT` for a sliced one). Add the
     /// frames a change waited for a running sweep to finish for the worst case.
     pub fn last_sweep_frames(&self) -> u32 {
         self.state
@@ -982,6 +1013,25 @@ impl SkyVisibility {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .last_latency_ms
+    }
+
+    /// Tells the sweep how long the last timed slice took on the GPU (sky plus
+    /// bounce, milliseconds), so the next sweep is cut into slices that keep a
+    /// frame's share of the work near [`TARGET_SLICE_MS`].
+    pub fn note_slice_cost(&self, ms: f64) {
+        if !ms.is_finite() || ms <= 0.0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let slices = state.running.map_or(SLICE_COUNT, |run| run.slices).max(1);
+        let per_layer = ms / (f64::from(LIGHT_VOLUME_DIM) / f64::from(slices));
+        state.recent_layer_ms.push(per_layer);
+        if state.recent_layer_ms.len() > 12 {
+            state.recent_layer_ms.remove(0);
+        }
+        let mut sorted = state.recent_layer_ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        state.layer_ms = Some(sorted[sorted.len() / 2]);
     }
 
     /// Whether a sweep is running or queued.
@@ -1037,9 +1087,18 @@ impl SkyVisibility {
                     return (false, false);
                 };
                 state.pending.recentre = false;
+                let upload_started = std::time::Instant::now();
                 self.apply_grid(queue, &mut state, &grid);
+                if crate::sweep_trace() {
+                    eprintln!(
+                        "spall-sweep-trace: t={:.1} recentre grid applied in {:.2} ms",
+                        crate::trace_clock_ms(),
+                        upload_started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 state.running = Some(Running {
                     next_slice: 0,
+                    slices: slices_for(state.layer_ms),
                     full: false,
                     sky: true,
                     bounce: can_bounce,
@@ -1060,6 +1119,7 @@ impl SkyVisibility {
                 }
                 state.running = Some(Running {
                     next_slice: 0,
+                    slices: slices_for(state.layer_ms),
                     full: p.full,
                     sky,
                     bounce,
@@ -1075,27 +1135,55 @@ impl SkyVisibility {
         };
         let front = self.front.load(Ordering::Acquire);
         let target = if run.recentre { 1 - front } else { front };
-        let (z0, z1, finished) = if run.full {
-            (0, LIGHT_VOLUME_DIM, true)
+        // A sweep is a few steps. Step 0 runs the sky pass over the whole cache
+        // (about 5 ms for all of it), because the bounce reads the sky
+        // visibility of cells in other layers and must see it finished. Then the
+        // emitter gather (one frame), then the bounce, the expensive part (some
+        // 170 ms for the whole cache), cut into `slices` thin interleaved slices
+        // of a few milliseconds each. A full request does all of it now.
+        let bounce_on = run.bounce && can_bounce;
+        let sky_step = run.sky && (run.full || run.next_slice == 0);
+        let gather_step = bounce_on && (run.full || run.next_slice == u32::from(run.sky));
+        let prelude = u32::from(run.sky) + u32::from(bounce_on);
+        let bounce_step = bounce_on && (run.full || run.next_slice >= prelude);
+        let steps = if bounce_on {
+            prelude + run.slices
         } else {
-            let z0 = run.next_slice * SLICE_DEPTH;
+            prelude.max(1)
+        };
+        let slice = run.next_slice.saturating_sub(prelude);
+        let (bounce_region, finished) = if run.full {
+            ([0, LIGHT_VOLUME_DIM, 0, 0], true)
+        } else {
             (
-                z0,
-                (z0 + SLICE_DEPTH).min(LIGHT_VOLUME_DIM),
-                z0 + SLICE_DEPTH >= LIGHT_VOLUME_DIM,
+                [0, LIGHT_VOLUME_DIM, run.slices, slice],
+                run.next_slice + 1 >= steps,
             )
         };
         state.frames_in_sweep += 1;
-        let region = [z0, z1, 0, 0];
-        // The shader skips cells outside `region`, so the dispatch always
-        // covers the cache; the skipped threads exit immediately.
+        if crate::sweep_trace() {
+            eprintln!(
+                "spall-sweep-trace: t={:.1} step {} of {steps} (slices {}) sky={sky_step} gather={gather_step} bounce={bounce_step} recentre={} full={} finished={finished}",
+                crate::trace_clock_ms(),
+                run.next_slice,
+                run.slices,
+                run.recentre,
+                run.full
+            );
+        }
         let groups = LIGHT_VOLUME_DIM / 4;
+        // A bounce slice dispatches only its own layers (4 per workgroup in z).
+        let slice_groups_z = if run.full {
+            groups
+        } else {
+            (LIGHT_VOLUME_DIM / run.slices).div_ceil(4)
+        };
         let (mut sky_ran, mut bounce_ran) = (false, false);
-        if run.sky {
+        if sky_step {
             queue.write_buffer(
                 &self.globals,
                 SKY_REGION_OFFSET,
-                bytemuck::cast_slice(&region),
+                bytemuck::cast_slice(&[0u32, LIGHT_VOLUME_DIM, 0, 0]),
             );
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("spall-sky-visibility-pass"),
@@ -1106,35 +1194,17 @@ impl SkyVisibility {
             pass.dispatch_workgroups(groups, groups, groups);
             sky_ran = true;
         }
-        if run.bounce && can_bounce {
-            // Gather emissive cells into the emitter list this slice reads. It
-            // is rebuilt for every slice (a few thousandths of a millisecond of
-            // bin arithmetic) so it always matches the occupancy and material
-            // table the slice sees, including edits and moving bodies.
+        if gather_step {
+            // Gather emissive cells into the emitter list the bounce slices read,
+            // once per sweep: gathering walks the whole cache. Emitters that
+            // change mid-sweep (an edit, a moving lamp) are picked up by the next
+            // sweep, which that change schedules.
             encoder.clear_buffer(&self.emitters.bins, 0, None);
-            // The bounce timing spans both passes: the emitter gather takes the
-            // begin stamp and the bounce pass the end stamp, so the reported
-            // bounce cost includes the gather.
-            let (emit_timestamps, bounce_timestamps) = match bounce_timestamps {
-                Some(ts) => (
-                    Some(wgpu::ComputePassTimestampWrites {
-                        query_set: ts.query_set,
-                        beginning_of_pass_write_index: ts.beginning_of_pass_write_index,
-                        end_of_pass_write_index: None,
-                    }),
-                    Some(wgpu::ComputePassTimestampWrites {
-                        query_set: ts.query_set,
-                        beginning_of_pass_write_index: None,
-                        end_of_pass_write_index: ts.end_of_pass_write_index,
-                    }),
-                ),
-                None => (None, None),
-            };
             {
                 let emit_bind = self.emit_bind.lock().unwrap_or_else(|e| e.into_inner());
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("spall-emitter-pass"),
-                    timestamp_writes: emit_timestamps,
+                    timestamp_writes: None,
                 });
                 pass.set_bind_group(0, &*emit_bind, &[]);
                 pass.set_pipeline(&pipeline.emit_gather);
@@ -1152,10 +1222,12 @@ impl SkyVisibility {
                 0,
                 EMITTER_BLOCK_BYTES,
             );
+        }
+        if bounce_step {
             queue.write_buffer(
                 &self.bounce_globals,
                 BOUNCE_REGION_OFFSET,
-                bytemuck::cast_slice(&region),
+                bytemuck::cast_slice(&bounce_region),
             );
             let binds = self.bounce_binds.lock().unwrap_or_else(|e| e.into_inner());
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1164,7 +1236,7 @@ impl SkyVisibility {
             });
             pass.set_pipeline(&pipeline.bounce);
             pass.set_bind_group(0, &binds[target], &[]);
-            pass.dispatch_workgroups(groups, groups, groups);
+            pass.dispatch_workgroups(groups, groups, slice_groups_z);
             bounce_ran = true;
         }
         if finished {

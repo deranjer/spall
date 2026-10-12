@@ -147,7 +147,7 @@ impl<'a> Session<'a> {
     fn settle(&mut self, bodies: &[CubeInstance]) -> (u32, Vec<u8>) {
         let mut used = 1;
         self.frame(bodies);
-        while self.renderer.lighting_is_sweeping() && used < 60 {
+        while self.renderer.lighting_is_sweeping() && used < 400 {
             self.frame(bodies);
             used += 1;
         }
@@ -235,8 +235,8 @@ fn a_body_blocks_skylight_and_leaves_no_trail() {
         "removing the body must restore the open frame exactly: mean {mean}, max {max}"
     );
     assert!(
-        shade_frames <= 12,
-        "a sliced sweep should take about 8 frames: {shade_frames}"
+        shade_frames <= 140,
+        "a sliced sweep takes at most 128 frames (32 before the GPU is timed): {shade_frames}"
     );
 }
 
@@ -608,7 +608,7 @@ fn a_terrain_edit_is_lit_within_one_sweep() {
         frame_ms.iter().sum::<f64>() / frame_ms.len() as f64
     );
     assert!(under < open_luma * 0.6, "the edit must be lit: {under}");
-    assert!(frames <= 10, "one sliced sweep: {frames} frames");
+    assert!(frames <= 140, "one sliced sweep: {frames} frames");
 }
 
 /// A change (a body arriving) that lands *while* an unrelated sweep (a terrain
@@ -644,7 +644,7 @@ fn a_change_arriving_during_an_active_sweep_is_not_lost() {
     session.frame(&[body]); // the body's cells are diffed in during that sweep
 
     let mut frames = 1;
-    while session.renderer.lighting_is_sweeping() && frames < 60 {
+    while session.renderer.lighting_is_sweeping() && frames < 400 {
         session.frame(&[body]);
         frames += 1;
     }
@@ -708,7 +708,7 @@ fn repeated_camera_recentres_each_complete_and_the_last_one_wins() {
 
     // Run to completion: every queued re-centre must finish, not get stuck.
     let mut frames = 0;
-    while session.renderer.lighting_is_sweeping() && frames < 80 {
+    while session.renderer.lighting_is_sweeping() && frames < 400 {
         session.frame(&[]);
         frames += 1;
     }
