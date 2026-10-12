@@ -10,9 +10,11 @@ use spall_worldgen::{Biome, ColumnMap};
 
 /// Version 2 moved the ground carpet out of the organisms: grass, sedge,
 /// clover and tussock are stateless cover now ([`crate::cover`]).
-pub const VERSION: u16 = 2;
-pub const MAX_TREES: usize = 512;
-pub const MAX_GROUND: usize = 8192;
+pub const VERSION: u16 = 3;
+/// Sized for a 1 km world: about 10 to 20 thousand trees and the living
+/// understory (cover is stateless and not counted here).
+pub const MAX_TREES: usize = 24_576;
+pub const MAX_GROUND: usize = 32_768;
 /// Every biome's bit (thirteen).
 pub const ALL_BIOMES: u16 = 0x1FFF;
 pub const MAX_SPECIES: usize = 128;
@@ -104,16 +106,17 @@ pub struct Species {
     pub seed_ms: u64,
 }
 impl Species {
-    fn accepts_depth(&self, depth: u8) -> bool {
+    pub(crate) fn accepts_depth(&self, depth: u8) -> bool {
         (self.depth[0]..=self.depth[1]).contains(&depth)
     }
-    fn accepts(&self, biome: Biome, moisture: u8, soil: u16) -> bool {
+    pub(crate) fn accepts(&self, biome: Biome, moisture: u8, soil: u16) -> bool {
         self.biomes & (1 << biome as u16) != 0
             && self.soils.contains(&soil)
             && (self.moisture[0]..=self.moisture[1]).contains(&moisture)
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A living plant. Saved without its skeleton (see [`crate::codec`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Organism {
     pub id: u64,
     pub species: u16,
@@ -141,6 +144,7 @@ pub struct LivingState {
     pub next_id: u64,
     pub cursor: u32,
     pub species: Vec<Species>,
+    #[serde(with = "crate::codec")]
     pub organisms: Vec<Organism>,
     pub spawns: Vec<[i64; 3]>,
     /// The stateless ground cover this world carries, and the climate raster
@@ -154,6 +158,9 @@ pub struct LivingState {
     /// the server can rebuild the same climate columns the world was made
     /// from when it installs or restores this state.
     pub preset: u8,
+    /// Where the organisms stand (derived, never saved).
+    #[serde(skip)]
+    pub(crate) spatial: crate::placement::Spatial,
 }
 /// A version 1 species: its `biomes` were a mask over the four vegetation
 /// classes (meadow, alpine, swamp, desert).
@@ -241,8 +248,86 @@ struct LivingStateV1 {
     next_id: u64,
     cursor: u32,
     species: Vec<SpeciesV1>,
-    organisms: Vec<Organism>,
+    organisms: Vec<OrganismV2>,
     spawns: Vec<[i64; 3]>,
+}
+/// An organism as versions 1 and 2 saved it: with its whole skeleton.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OrganismV2 {
+    id: u64,
+    species: u16,
+    root: [i64; 3],
+    age_ms: u64,
+    last_update_ms: u64,
+    last_seed_ms: u64,
+    alive: bool,
+    biomass: u16,
+    wood: Vec<[i64; 3]>,
+    parents: Vec<u16>,
+    removed: Vec<bool>,
+    committed: u16,
+}
+impl From<OrganismV2> for Organism {
+    fn from(o: OrganismV2) -> Self {
+        Self {
+            id: o.id,
+            species: o.species,
+            root: o.root,
+            age_ms: o.age_ms,
+            last_update_ms: o.last_update_ms,
+            last_seed_ms: o.last_seed_ms,
+            alive: o.alive,
+            biomass: o.biomass,
+            wood: o.wood,
+            parents: o.parents,
+            removed: o.removed,
+            committed: o.committed,
+        }
+    }
+}
+/// The saved layout of version 2: version 3 without the cover-independent
+/// change of saving skeletons.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LivingStateV2 {
+    version: u16,
+    seed: u64,
+    size: u32,
+    time_ms: u64,
+    credit_ms: u64,
+    start_season: Season,
+    season_ms: u64,
+    next_id: u64,
+    cursor: u32,
+    species: Vec<Species>,
+    organisms: Vec<OrganismV2>,
+    spawns: Vec<[i64; 3]>,
+    cover: Vec<CoverSpecies>,
+    field: CoverField,
+    cleared: Vec<Cleared>,
+    preset: u8,
+}
+impl From<LivingStateV2> for LivingState {
+    fn from(old: LivingStateV2) -> Self {
+        Self {
+            version: VERSION,
+            seed: old.seed,
+            size: old.size,
+            time_ms: old.time_ms,
+            credit_ms: old.credit_ms,
+            start_season: old.start_season,
+            season_ms: old.season_ms,
+            next_id: old.next_id,
+            cursor: old.cursor,
+            species: old.species,
+            organisms: old.organisms.into_iter().map(Organism::from).collect(),
+            spawns: old.spawns,
+            cover: old.cover,
+            field: old.field,
+            cleared: old.cleared,
+            preset: old.preset,
+            spatial: Default::default(),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisualPlant {
@@ -286,14 +371,14 @@ pub fn hash(mut n: u64) -> u64 {
     n = (n ^ (n >> 27)).wrapping_mul(0x94d049bb133111eb);
     n ^ (n >> 31)
 }
-fn cell(p: [i64; 3]) -> GlobalCell {
+pub(crate) fn cell(p: [i64; 3]) -> GlobalCell {
     GlobalCell::new(p[0], p[1], p[2])
 }
 /// Water standing over the ground at the column, in cells (0 on land).
 fn depth_of(columns: &ColumnMap, x: i64, z: i64) -> u8 {
     columns.water_depth(x, z).clamp(0, 255) as u8
 }
-fn moisture(columns: &ColumnMap, x: i64, z: i64) -> u8 {
+pub(crate) fn moisture(columns: &ColumnMap, x: i64, z: i64) -> u8 {
     columns.moisture(x, z)
 }
 
@@ -327,58 +412,14 @@ impl LivingState {
             } else {
                 u8::from(columns.is_natural())
             },
+            spatial: Default::default(),
         };
         state.validate()?;
         if columns.is_gallery() {
             state.place_gallery(columns, terrain)?;
             return Ok(state);
         }
-        let stride = (i64::from(state.size) / 128).max(4);
-        let mut candidates = Vec::new();
-        for z in (33..i64::from(state.size) - 33).step_by(stride as usize) {
-            for x in (33..i64::from(state.size) - 33).step_by(stride as usize) {
-                let h = hash(seed ^ (x as u64).rotate_left(21) ^ z as u64);
-                let x = (x + (h % stride as u64) as i64).min(i64::from(state.size) - 33);
-                let z = (z + (h.rotate_left(17) % stride as u64) as i64)
-                    .min(i64::from(state.size) - 33);
-                candidates.push((h, [x, i64::from(columns.height(x, z)) + 1, z]));
-            }
-        }
-        candidates.sort_unstable_by_key(|c| c.0);
-        let mut plan = EditPlan::new(terrain.id());
-        for (key, root) in candidates {
-            // Mixed ages make initial worlds wooded immediately; children grow at runtime.
-            for tree in [true, false] {
-                let options: Vec<_> = state
-                    .species
-                    .iter()
-                    .filter(|s| s.tree == tree && state.eligible(columns, terrain, s, root))
-                    .map(|s| s.id)
-                    .collect();
-                if options.is_empty() {
-                    continue;
-                }
-                let sid = options[((key / 13) % options.len() as u64) as usize];
-                if let Some(index) = state.establish(columns, terrain, sid, root)
-                    && tree
-                {
-                    let p = &mut state.organisms[index];
-                    if key % 5 != 0 {
-                        p.committed = p.wood.len() as u16;
-                        p.age_ms = 600_000;
-                        for &at in &p.wood {
-                            plan.set(
-                                cell(at),
-                                MaterialId(
-                                    state.species.iter().find(|s| s.id == sid).unwrap().wood,
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        terrain.apply_edit(&plan).map_err(|e| e.to_string())?;
+        state.populate(columns, terrain)?;
         Ok(state)
     }
     /// The gallery: every species that grows in a biome, placed on that
@@ -486,7 +527,7 @@ impl LivingState {
             )
         })
     }
-    fn establish(
+    pub(crate) fn establish(
         &mut self,
         columns: &ColumnMap,
         terrain: &Volume,
@@ -505,34 +546,48 @@ impl LivingState {
         root: [i64; 3],
         max_spacing: i64,
     ) -> Option<usize> {
+        self.establish_with(columns, terrain, sid, root, None, max_spacing)
+    }
+    /// Establishment with an explicit spacing in cells (placement scales a
+    /// species' spacing by the local canopy density), or the species' own
+    /// spacing capped at `max_spacing`.
+    pub(crate) fn establish_with(
+        &mut self,
+        columns: &ColumnMap,
+        terrain: &Volume,
+        sid: u16,
+        root: [i64; 3],
+        spacing: Option<i64>,
+        max_spacing: i64,
+    ) -> Option<usize> {
+        self.sync_index();
         let s = self.species.iter().find(|s| s.id == sid)?;
-        let spacing = i64::from(s.spacing).min(max_spacing);
-        let count = self
-            .organisms
-            .iter()
-            .filter(|p| p.wood.is_empty() != s.tree)
-            .count();
-        if count >= if s.tree { MAX_TREES } else { MAX_GROUND }
+        let spacing = spacing.unwrap_or_else(|| i64::from(s.spacing).min(max_spacing));
+        let tree = s.tree;
+        let count = if tree {
+            self.spatial.trees
+        } else {
+            self.spatial.ground
+        };
+        if count >= if tree { MAX_TREES } else { MAX_GROUND }
             || !self.eligible(columns, terrain, s, root)
             // A ground plant never roots in a tree's trunk column, even one
             // whose wood has not been committed yet.
-            || (!s.tree
-                && self.organisms.iter().any(|p| {
-                    p.alive
-                        && !p.wood.is_empty()
-                        && root[0] >= p.root[0]
-                        && root[0] < p.root[0] + 2
-                        && root[2] >= p.root[2]
-                        && root[2] < p.root[2] + 2
-                        && root[1] >= p.root[1]
+            || (!tree
+                && self.spatial.any_near(root[0], root[2], 2, |e| {
+                    e.tree
+                        && root[0] >= e.root[0]
+                        && root[0] < e.root[0] + 2
+                        && root[2] >= e.root[2]
+                        && root[2] < e.root[2] + 2
+                        && root[1] >= e.root[1]
                 }))
             || self
-                .organisms
-                .iter()
-                .filter(|p| p.alive && (p.wood.is_empty() != s.tree))
-                .any(|p| {
-                    (p.root[0] - root[0]).pow(2) + (p.root[2] - root[2]).pow(2)
-                        < spacing.pow(2)
+                .spatial
+                .any_near(root[0], root[2], spacing, |e| {
+                    e.tree == tree
+                        && (e.root[0] - root[0]).pow(2) + (e.root[2] - root[2]).pow(2)
+                            < spacing.pow(2)
                 })
         {
             return None;
@@ -549,16 +604,13 @@ impl LivingState {
             return None;
         }
         // And a tree never grows over a ground plant already rooted there.
-        if s.tree {
-            let ground: std::collections::HashSet<[i64; 3]> = self
-                .organisms
-                .iter()
-                .filter(|p| p.alive && p.wood.is_empty())
-                .map(|p| p.root)
-                .collect();
-            if wood.iter().any(|c| ground.contains(c)) {
-                return None;
-            }
+        if s.tree
+            && wood.iter().any(|c| {
+                self.spatial
+                    .any_near(c[0], c[2], 0, |e| !e.tree && e.root == *c)
+            })
+        {
+            return None;
         }
         let p = Organism {
             id: self.next_id,
@@ -575,6 +627,7 @@ impl LivingState {
             committed: 0,
         };
         self.next_id += 1;
+        self.spatial.add(root, tree);
         self.organisms.push(p);
         Some(self.organisms.len() - 1)
     }
@@ -645,13 +698,71 @@ impl LivingState {
             return Err("vegetation state byte limit".into());
         }
         let (version, _) = postcard::take_from_bytes::<u16>(bytes).map_err(|e| e.to_string())?;
-        let s = if version == 1 {
-            Self::upgrade(postcard::from_bytes::<LivingStateV1>(bytes).map_err(|e| e.to_string())?)
-        } else {
-            postcard::from_bytes(bytes).map_err(|e| e.to_string())?
+        let mut s = match version {
+            1 => Self::upgrade(
+                postcard::from_bytes::<LivingStateV1>(bytes).map_err(|e| e.to_string())?,
+            ),
+            2 => postcard::from_bytes::<LivingStateV2>(bytes)
+                .map_err(|e| e.to_string())?
+                .into(),
+            _ => {
+                let mut s: Self = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
+                s.grow_skeletons()?;
+                s
+            }
         };
         s.validate()?;
+        if version < VERSION {
+            s.check_skeletons_reproducible()?;
+        }
+        s.spatial.rebuild(&s.organisms);
         Ok(s)
+    }
+    /// An older save carried its skeletons; version 3 will save only the
+    /// removed cells and grow the rest back, so a tree whose saved wood is not
+    /// what `skeleton` makes of it would change shape on the next load. Refuse
+    /// such a save loudly rather than reshape its trees.
+    fn check_skeletons_reproducible(&self) -> Result<(), String> {
+        for p in self.organisms.iter().filter(|p| !p.wood.is_empty()) {
+            let s = self
+                .species
+                .iter()
+                .find(|s| s.id == p.species)
+                .ok_or("organism of an unknown species")?;
+            if skeleton(p.root, s, hash(self.seed ^ p.id)) != (p.wood.clone(), p.parents.clone()) {
+                return Err(format!(
+                    "tree {} of an older save does not match the skeleton rule",
+                    p.id
+                ));
+            }
+        }
+        Ok(())
+    }
+    /// Gives every tree its skeleton back after loading (version 3 saves only
+    /// the removed cells): the same `skeleton` call that established it, keyed
+    /// by the tree's id.
+    fn grow_skeletons(&mut self) -> Result<(), String> {
+        let species: std::collections::HashMap<u16, &Species> =
+            self.species.iter().map(|s| (s.id, s)).collect();
+        for p in &mut self.organisms {
+            let Some(s) = species.get(&p.species) else {
+                return Err("organism of an unknown species".into());
+            };
+            if !s.tree {
+                if !p.removed.is_empty() || p.committed != 0 {
+                    return Err("ground plant with wood state".into());
+                }
+                continue;
+            }
+            let (wood, parents) = skeleton(p.root, s, hash(self.seed ^ p.id));
+            if p.removed.len() > wood.len() || usize::from(p.committed) > wood.len() {
+                return Err("removed or committed cell beyond the skeleton".into());
+            }
+            p.removed.resize(wood.len(), false);
+            p.wood = wood;
+            p.parents = parents;
+        }
+        Ok(())
     }
     /// Version 1 to 2. The carpet species (grass, sedge, clover, tussock
     /// forms) become cover species with their ids, biomes, soils, moisture,
@@ -704,6 +815,7 @@ impl LivingState {
                 .organisms
                 .into_iter()
                 .filter(|o| !carpet.contains(&o.species))
+                .map(Organism::from)
                 .collect(),
             spawns: old.spawns,
             cover,
@@ -711,6 +823,7 @@ impl LivingState {
             cleared: Vec::new(),
             // Version 1 predates natural worlds.
             preset: 0,
+            spatial: Default::default(),
         }
     }
     pub fn validate(&self) -> Result<(), String> {
@@ -811,7 +924,7 @@ impl LivingState {
             }
             total += p.wood.len();
         }
-        if total > 262144 {
+        if total > 2_500_000 {
             return Err("skeleton cell limit".into());
         }
         Ok(())
@@ -839,7 +952,8 @@ impl LivingState {
         let n = self.organisms.len();
         let mut seeds = Vec::new();
         let mut growth = Vec::new();
-        for step in 0..n.min(128) {
+        let visits = (n / 40).clamp(128, 512).min(n);
+        for step in 0..visits {
             let i = (self.cursor as usize + step) % n;
             let s = self
                 .species
@@ -949,9 +1063,12 @@ impl LivingState {
         self.cursor = if n == 0 {
             0
         } else {
-            ((self.cursor as usize + n.min(128)) % n) as u32
+            ((self.cursor as usize + visits) % n) as u32
         };
         self.organisms.retain(|p| p.alive);
+        if self.organisms.len() != n {
+            self.spatial.rebuild(&self.organisms);
+        }
         if !self.organisms.is_empty() {
             self.cursor %= self.organisms.len() as u32;
         } else {
@@ -1069,6 +1186,7 @@ impl LivingState {
     }
 }
 
+/// The wood a tree grows: part of the saved format (see [`crate::codec`]).
 fn skeleton(root: [i64; 3], s: &Species, key: u64) -> (Vec<[i64; 3]>, Vec<u16>) {
     let height = i64::from(s.height) + (key % 5) as i64 - 2;
     let mut wood = Vec::new();
@@ -1305,8 +1423,8 @@ mod tests {
         }
     }
 
-    fn organism(id: u64, species: u16, x: i64) -> Organism {
-        Organism {
+    fn organism(id: u64, species: u16, x: i64) -> OrganismV2 {
+        OrganismV2 {
             id,
             species,
             root: [x, 9, 40],
@@ -1322,6 +1440,164 @@ mod tests {
         }
     }
 
+    /// A grown tree of a made-up species, as establishment makes it.
+    fn grown_tree(seed: u64, id: u64, x: i64) -> (Species, Organism) {
+        let mut s = species(1, true, 0).into_current();
+        s.height = 24;
+        s.spread = 6;
+        let root = [x, 9, 40];
+        let (wood, parents) = skeleton(root, &s, hash(seed ^ id));
+        let p = Organism {
+            id,
+            species: 1,
+            root,
+            age_ms: 600_000,
+            last_update_ms: 7,
+            last_seed_ms: 7,
+            alive: true,
+            biomass: 400,
+            removed: vec![false; wood.len()],
+            committed: wood.len() as u16,
+            wood,
+            parents,
+        };
+        (s, p)
+    }
+
+    fn state_with(trees: Vec<Organism>, species: Vec<Species>) -> LivingState {
+        LivingState {
+            version: VERSION,
+            seed: 9,
+            size: 256,
+            time_ms: 5_000,
+            credit_ms: 0,
+            start_season: Season::Summer,
+            season_ms: 900_000,
+            next_id: 100,
+            cursor: 0,
+            species,
+            organisms: trees,
+            spawns: vec![],
+            cover: vec![],
+            field: CoverField::default(),
+            cleared: vec![],
+            preset: 1,
+            spatial: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_saved_tree_keeps_only_its_removed_cells_and_grows_back_identically() {
+        let (s, mut a) = grown_tree(9, 3, 60);
+        let (_, b) = grown_tree(9, 4, 120);
+        assert!(a.wood.len() > 20);
+        a.removed[7] = true;
+        a.removed[a.wood.len() - 1] = true;
+        a.committed = (a.wood.len() - 3) as u16;
+        let state = state_with(vec![a.clone(), b], vec![s]);
+        let bytes = state.encode().unwrap();
+        // Two trees of dozens of cells each fit in a few hundred bytes.
+        assert!(bytes.len() < 700, "{} bytes", bytes.len());
+        let back = LivingState::decode(&bytes).unwrap();
+        assert_eq!(
+            back, state,
+            "wood, parents and removed flags regrow exactly"
+        );
+        assert_eq!(back.organisms[0].wood, a.wood);
+    }
+
+    #[test]
+    fn a_version_2_save_with_skeletons_loads_and_resaves_compactly() {
+        let (s, a) = grown_tree(9, 3, 60);
+        let old = LivingStateV2 {
+            version: 2,
+            seed: 9,
+            size: 256,
+            time_ms: 5_000,
+            credit_ms: 0,
+            start_season: Season::Summer,
+            season_ms: 900_000,
+            next_id: 100,
+            cursor: 0,
+            species: vec![s],
+            organisms: vec![OrganismV2 {
+                id: a.id,
+                species: a.species,
+                root: a.root,
+                age_ms: a.age_ms,
+                last_update_ms: a.last_update_ms,
+                last_seed_ms: a.last_seed_ms,
+                alive: true,
+                biomass: a.biomass,
+                wood: a.wood.clone(),
+                parents: a.parents.clone(),
+                removed: a.removed.clone(),
+                committed: a.committed,
+            }],
+            spawns: vec![],
+            cover: vec![],
+            field: CoverField::default(),
+            cleared: vec![],
+            preset: 1,
+        };
+        let v2_len = postcard::to_stdvec(&old).unwrap().len();
+        let state = LivingState::decode(&postcard::to_stdvec(&old).unwrap()).unwrap();
+        assert_eq!(state.version, VERSION);
+        assert_eq!(state.organisms, vec![a]);
+        let v3 = state.encode().unwrap();
+        assert!(v3.len() < v2_len / 2, "{} against {v2_len}", v3.len());
+        assert_eq!(LivingState::decode(&v3).unwrap(), state);
+    }
+
+    #[test]
+    fn an_old_save_whose_tree_is_not_what_the_rule_grows_is_refused() {
+        let (s, a) = grown_tree(9, 3, 60);
+        let (mut wood, parents) = (a.wood.clone(), a.parents.clone());
+        // Move the last cell to another face neighbour of its parent: still a
+        // connected skeleton, but not the one the rule grows.
+        let last = wood.len() - 1;
+        let parent = wood[usize::from(parents[last])];
+        let moved = [[0, 0, 1], [0, 0, -1], [1, 0, 0], [-1, 0, 0]]
+            .map(|d| [parent[0] + d[0], parent[1] + d[1], parent[2] + d[2]])
+            .into_iter()
+            .find(|c| *c != wood[last] && !wood.contains(c))
+            .unwrap();
+        wood[last] = moved;
+        let v2 = LivingStateV2 {
+            version: 2,
+            seed: 9,
+            size: 256,
+            time_ms: 5_000,
+            credit_ms: 0,
+            start_season: Season::Summer,
+            season_ms: 900_000,
+            next_id: 100,
+            cursor: 0,
+            species: vec![s],
+            organisms: vec![OrganismV2 {
+                id: a.id,
+                species: a.species,
+                root: a.root,
+                age_ms: a.age_ms,
+                last_update_ms: a.last_update_ms,
+                last_seed_ms: a.last_seed_ms,
+                alive: true,
+                biomass: a.biomass,
+                wood,
+                parents,
+                removed: a.removed.clone(),
+                committed: a.committed,
+            }],
+            spawns: vec![],
+            cover: vec![],
+            field: CoverField::default(),
+            cleared: vec![],
+            preset: 1,
+        };
+        let message = LivingState::decode(&postcard::to_stdvec(&v2).unwrap()).unwrap_err();
+        assert!(message.contains("skeleton rule"), "{message}");
+    }
+
     #[test]
     fn a_version_1_save_upgrades_by_moving_the_carpet_to_cover_and_keeping_the_rest() {
         let old = LivingStateV1 {
@@ -1334,9 +1610,9 @@ mod tests {
             season_ms: 900_000,
             next_id: 40,
             cursor: 3,
-            // A tree, a meadow grass (6), a fern (8), a sedge (9), a clover (11).
+            // A scrub (13), a meadow grass (6), a fern (8), a sedge (9), a clover (11).
             species: vec![
-                species(1, true, 0),
+                species(1, false, 13),
                 species(11, false, 6),
                 species(16, false, 8),
                 species(14, false, 9),
@@ -1370,9 +1646,9 @@ mod tests {
         assert_eq!(
             state.organisms,
             vec![
-                old.organisms[0].clone(),
-                old.organisms[2].clone(),
-                old.organisms[5].clone()
+                Organism::from(old.organisms[0].clone()),
+                Organism::from(old.organisms[2].clone()),
+                Organism::from(old.organisms[5].clone())
             ]
         );
         // Clock, season, ids and spawns carry over; nothing was regenerated.
@@ -1385,7 +1661,7 @@ mod tests {
             state.field.is_empty(),
             "the raster is sampled when the world installs it"
         );
-        // It is a normal version 2 state from here: it re-encodes and decodes.
+        // It is a normal current state from here: it re-encodes and decodes.
         assert_eq!(
             LivingState::decode(&state.encode().unwrap()).unwrap(),
             state

@@ -2032,6 +2032,8 @@ mod tests {
     }
 }
 
+mod codec;
 /// Biome-aware authoritative vegetation and seasonal presentation.
 pub mod cover;
 pub mod living;
+pub mod placement;

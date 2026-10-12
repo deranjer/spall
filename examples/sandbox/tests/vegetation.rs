@@ -182,7 +182,7 @@ fn offspring_remain_on_allowed_biomes_and_survive_roundtrip() {
 
 #[test]
 fn authoritative_growth_and_checkpoint_recovery_keep_the_same_living_state() {
-    let scene = sandbox::worldgen_scene::generate("showcase", 1, 128).unwrap();
+    let scene = sandbox::worldgen_scene::generate("showcase", 1, 256).unwrap();
     let setup = scene.world_setup();
     let mut config = spall_sim::SimulationConfig::new(setup);
     let mut vegetation = scene.vegetation().clone();
