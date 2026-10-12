@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sim.column_water().and_then(|w| w.prewarm_report())
     );
 
+    let mut spans_ms: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
     let mut window: Vec<f64> = Vec::new();
     let mut step_ms: Vec<f64> = Vec::new();
     let ticks_per_s = 60;
@@ -82,6 +83,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = Instant::now();
         let r = sim.tick()?;
         window.push(t.elapsed().as_secs_f64() * 1e3);
+        for (name, d) in spall_sim::prof::drain() {
+            *spans_ms.entry(name).or_insert(0.0) += d.as_secs_f64() * 1e3;
+        }
         let m = r.column_water.expect("column water runs");
         if m.stepped {
             step_ms.push(m.step_duration.as_secs_f64() * 1e3 / f64::from(m.steps.max(1)));
@@ -253,6 +257,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "      by depth (<0.5, <1, <2, <4, >=4 cells): {by_depth:?}; far samples (depth, x, z, dist): {samples:?}"
                     );
                 }
+            }
+            if std::env::var("PROF").is_ok() {
+                let ticks = f64::from(10 * ticks_per_s);
+                let mut rows: Vec<_> = spans_ms.iter().collect();
+                rows.sort_by(|a, b| b.1.total_cmp(a.1));
+                let line: Vec<String> = rows
+                    .iter()
+                    .take(8)
+                    .map(|(n, ms)| format!("{n} {:.2}", **ms / ticks))
+                    .collect();
+                println!("      per tick (ms): {}", line.join(" | "));
+                spans_ms.clear();
             }
             window.clear();
             step_ms.clear();

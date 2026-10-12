@@ -2116,46 +2116,51 @@ impl ColumnWorld {
             wake: BTreeSet::new(),
         };
         let (pipes, q, eff, regions) = (&self.pipes, &self.q, &self.eff, &self.regions);
+        // Fixed-size chunks: a parallel fold would split into thousands of tasks,
+        // each allocating and merging a vector the size of every allocated region.
+        const CHUNK: usize = 16 * 1024;
         let acc = self
             .act_pipes
-            .par_iter()
-            .fold(new_acc, |mut acc, &pi| {
-                let p = pipes[pi as usize];
-                let qa = q[pi as usize].abs();
-                acc.max_q[p.ra as usize] = acc.max_q[p.ra as usize].max(qa);
-                acc.max_q[p.rb as usize] = acc.max_q[p.rb as usize].max(qa);
-                let area = Self::wetted_area(&p, eff[p.a as usize], eff[p.b as usize]);
-                if area >= cfg.min_film_depth {
-                    acc.peak = acc.peak.max(qa / area);
-                }
-                if qa > cfg.sleep_flow {
+            .par_chunks(CHUNK)
+            .map(|chunk| {
+                chunk.iter().fold(new_acc(), |mut acc, &pi| {
+                    let p = pipes[pi as usize];
+                    let qa = q[pi as usize].abs();
+                    acc.max_q[p.ra as usize] = acc.max_q[p.ra as usize].max(qa);
+                    acc.max_q[p.rb as usize] = acc.max_q[p.rb as usize].max(qa);
+                    let area = Self::wetted_area(&p, eff[p.a as usize], eff[p.b as usize]);
+                    if area >= cfg.min_film_depth {
+                        acc.peak = acc.peak.max(qa / area);
+                    }
+                    if qa > cfg.sleep_flow {
+                        for r in [p.ra, p.rb] {
+                            let reg = &regions[r as usize];
+                            if !reg.active && !reg.steady {
+                                acc.wake.insert(r);
+                            }
+                        }
+                    }
+                    // A steady region wakes at once if a boundary flow jumps from its
+                    // held value (the slower drift of a neighbour is caught by volume).
                     for r in [p.ra, p.rb] {
                         let reg = &regions[r as usize];
-                        if !reg.active && !reg.steady {
+                        if !reg.steady {
+                            continue;
+                        }
+                        let moved = match reg.steady_ref.binary_search_by_key(&pi, |e| e.0) {
+                            Ok(k) => {
+                                let (_, held, band) = reg.steady_ref[k];
+                                (q[pi as usize] - held).abs() > band
+                            }
+                            // A pipe that did not exist when the region froze.
+                            Err(_) => true,
+                        };
+                        if moved {
                             acc.wake.insert(r);
                         }
                     }
-                }
-                // A steady region wakes at once if a boundary flow jumps from its
-                // held value (the slower drift of a neighbour is caught by volume).
-                for r in [p.ra, p.rb] {
-                    let reg = &regions[r as usize];
-                    if !reg.steady {
-                        continue;
-                    }
-                    let moved = match reg.steady_ref.binary_search_by_key(&pi, |e| e.0) {
-                        Ok(k) => {
-                            let (_, held, band) = reg.steady_ref[k];
-                            (q[pi as usize] - held).abs() > band
-                        }
-                        // A pipe that did not exist when the region froze.
-                        Err(_) => true,
-                    };
-                    if moved {
-                        acc.wake.insert(r);
-                    }
-                }
-                acc
+                    acc
+                })
             })
             .reduce(new_acc, |mut a, b| {
                 for (x, y) in a.max_q.iter_mut().zip(&b.max_q) {
