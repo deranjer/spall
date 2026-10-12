@@ -3281,6 +3281,21 @@ async fn serve_async(
                             }
                         }
                     }
+                    spall_protocol::AdminCommand::TeleportSelf { feet_mm } => {
+                        let feet = feet_mm.map(|mm| mm as f64 / 1000.0);
+                        let (accepted, message) = if !admin_commands {
+                            (false, "admin commands are disabled on this server")
+                        } else if sim.teleport_player(session_player_entity(session), feet) {
+                            (true, "teleported")
+                        } else {
+                            (false, "no player to teleport")
+                        };
+                        spall_protocol::AdminStatus {
+                            request_id: req.request_id,
+                            accepted,
+                            message: message.into(),
+                        }
+                    }
                     spall_protocol::AdminCommand::SetDamGate { open } => {
                         let gate = custom_world.as_ref().and_then(CustomWorld::dam_gate);
                         if !admin_commands {

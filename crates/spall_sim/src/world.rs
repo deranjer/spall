@@ -1171,6 +1171,38 @@ impl SimWorld {
         self.players.remove(&entity.get());
     }
 
+    /// Moves a player's capsule to `feet_m` (a spectator camera landing): at
+    /// rest, pushed out of any solid it was dropped into, with its movement
+    /// epoch bumped so the owning client rebuilds its prediction from the
+    /// next snapshot instead of reconciling back to the old spot. Returns
+    /// `false` for an unknown player or a non-finite position.
+    pub fn teleport_player(&mut self, entity: EntityId, feet_m: [f64; 3], dt_s: f32) -> bool {
+        if !feet_m.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let Some(player) = self.players.get_mut(&entity.get()) else {
+            return false;
+        };
+        player.state.position_m = feet_m;
+        player.state.velocity_m_s = [0.0; 3];
+        player.state.grounded = false;
+        player.movement_epoch = player.movement_epoch.wrapping_add(1);
+        let local = self
+            .physics_origin
+            .to_local_f32(player.state.position_m)
+            .map(|p| p.map(f64::from));
+        if let Some(local) = local {
+            let mv = self
+                .physics
+                .sweep_character(player.params, local, [0.0; 3], dt_s);
+            for axis in 0..3 {
+                player.state.position_m[axis] += f64::from(mv.translation_m[axis]);
+            }
+            player.state.grounded = mv.grounded;
+        }
+        true
+    }
+
     pub fn player(&self, entity: EntityId) -> Option<&Player> {
         self.players.get(&entity.get())
     }

@@ -480,6 +480,10 @@ struct InteractiveApp {
     admin_menu_open: bool,
     fly_eye: Option<Vec3>,
     last_fly_update: Option<Instant>,
+    /// Leaving flight: when the teleport went out and the feet it asked for.
+    /// The camera holds where it is until the predicted player arrives there,
+    /// so the view never shows the body at its old spot.
+    landing: Option<(Instant, [f64; 3])>,
     /// Hammer state: the button is down / a click has not been sent yet / when
     /// the last swing went out / the radius in cells (mouse wheel).
     hammer_held: bool,
@@ -1470,6 +1474,7 @@ impl InteractiveApp {
             admin_menu_open: false,
             fly_eye: None,
             last_fly_update: None,
+            landing: None,
             hammer_held: false,
             hammer_pending: false,
             torch_pending: false,
@@ -1641,6 +1646,27 @@ impl InteractiveApp {
     }
 
     fn toggle_flight(&mut self) {
+        if let Some(eye) = self.fly_eye {
+            // Land: the body is brought to the camera, not the camera to the
+            // body. The camera stays put until the server's answer reaches
+            // the predicted player.
+            if self.landing.is_some() {
+                return;
+            }
+            let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
+            let feet = [
+                f64::from(eye.x),
+                f64::from(eye.y) - eye_height_m,
+                f64::from(eye.z),
+            ];
+            self.session
+                .push_admin(spall_protocol::AdminCommand::TeleportSelf {
+                    feet_mm: feet.map(|m| (m * 1000.0).round() as i64),
+                });
+            self.landing = Some((Instant::now(), feet));
+            self.publish_movement();
+            return;
+        }
         if self.fly_eye.take().is_none() {
             self.fly_eye = self
                 .session
@@ -2087,6 +2113,20 @@ impl ApplicationHandler for InteractiveApp {
                         } else {
                             (Vec::new(), Vec::new())
                         };
+                        if let (Some((at, feet)), Some(v)) = (self.landing, fresh_view) {
+                            let p = v.predicted.position_m;
+                            let d2: f64 = (0..3).map(|i| (p[i] - feet[i]).powi(2)).sum();
+                            // Arrived, or the server refused: drop the camera
+                            // back onto whatever the player is.
+                            if d2 < 1.0
+                                || render_now.saturating_duration_since(at) > Duration::from_secs(2)
+                            {
+                                self.fly_eye = None;
+                                self.landing = None;
+                                self.last_fly_update = None;
+                                self.last_built_pos = None;
+                            }
+                        }
                         let cam = fresh_view.map(|v| {
                             let followed =
                                 self.camera_follow.eye(v, render_now, local_poses.is_none());
@@ -2123,7 +2163,7 @@ impl ApplicationHandler for InteractiveApp {
                                 if self.held.descend {
                                     wish.y -= 1.0;
                                 }
-                                if wish.length_squared() > 0.0 {
+                                if wish.length_squared() > 0.0 && self.landing.is_none() {
                                     let speed = if self.held.fast {
                                         FLY_FAST_SPEED_M_S
                                     } else {
@@ -2296,6 +2336,7 @@ impl ApplicationHandler for InteractiveApp {
                     self.last_body_draws.clear();
                     if self.fly_eye.is_some() {
                         self.fly_eye = None;
+                        self.landing = None;
                         self.last_fly_update = None;
                     }
                 }
@@ -4053,7 +4094,7 @@ fn admin_menu_panel(
                     muted(
                         13.0,
                         if view.flying {
-                            "Flying: spectator camera, no collision. Your player waits where you left it."
+                            "Flying: spectator camera, no collision. Landing brings your player to the camera."
                         } else {
                             "Walking: server-authoritative character physics."
                         },

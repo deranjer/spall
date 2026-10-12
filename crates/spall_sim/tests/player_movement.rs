@@ -158,3 +158,39 @@ fn the_player_motion_snapshot_reports_the_acked_input() {
     assert_eq!(mine.acked_input, InputSeq(7));
     assert!(!mine.sleeping);
 }
+
+#[test]
+fn a_teleported_player_stands_where_it_was_put_at_rest_and_bumps_the_epoch() {
+    let mut sim = sim();
+    let player = player_entity_for(0);
+    sim.add_player(player, WALK_ARENA_SPAWNS[0]);
+    for _ in 0..20 {
+        sim.tick().unwrap();
+    }
+    let epoch = sim.player_movement_epoch(player).unwrap();
+    let from = sim.player_state(player).unwrap().position_m;
+    let target = [from[0] + 2.0, FLOOR_TOP_M + 2.0, from[2] + 1.0];
+
+    assert!(sim.teleport_player(player, target));
+    let placed = sim.player_state(player).unwrap();
+    assert!((placed.position_m[0] - target[0]).abs() < 1e-6);
+    assert!((placed.position_m[2] - target[2]).abs() < 1e-6);
+    assert_eq!(placed.velocity_m_s, [0.0; 3]);
+    assert_ne!(sim.player_movement_epoch(player).unwrap(), epoch);
+
+    // It falls from where it was put and lands there, not back at the spawn.
+    for _ in 0..90 {
+        sim.tick().unwrap();
+    }
+    let landed = sim.player_state(player).unwrap();
+    assert!(
+        landed.grounded,
+        "{landed:?} target {target:?} from {from:?}"
+    );
+    assert!((landed.position_m[0] - target[0]).abs() < 0.05);
+    assert!((landed.position_m[2] - target[2]).abs() < 0.05);
+
+    // Refused: an unknown player and a non-finite position.
+    assert!(!sim.teleport_player(player_entity_for(7), target));
+    assert!(!sim.teleport_player(player, [f64::NAN, 0.0, 0.0]));
+}
