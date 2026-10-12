@@ -36,6 +36,20 @@ fn hash21(p: vec2<f32>) -> f32 {
     return fract((h.x + h.y) * h.z * (h.x + 19.19));
 }
 
+// An integer hash of a star cell. The float hash above is fine for the small
+// coordinates of the clouds, but at star-field coordinates (hundreds to
+// thousands) its precision collapses into straight dotted lines of stars.
+fn pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+fn star_hash(cell: vec2<f32>) -> f32 {
+    let q = vec2<i32>(cell);
+    return f32(pcg(u32(q.x) + pcg(u32(q.y) + 2654435769u))) / 4294967295.0;
+}
+
 fn value_noise(p: vec2<f32>) -> f32 {
     let i = floor(p);
     let f = fract(p);
@@ -71,6 +85,7 @@ fn value_noise(p: vec2<f32>) -> f32 {
 
     // Cloud layers live on a camera-independent sky projection. Quantized
     // coordinates and thresholded noise create chunky silhouettes at distance.
+    var cloud_cover = 0.0;
     if ray.y > -0.02 {
         let projection = ray.xz / max(ray.y + 0.22, 0.18);
         let cloud_uv = floor(projection * 13.0) / 13.0;
@@ -81,6 +96,7 @@ fn value_noise(p: vec2<f32>) -> f32 {
         let cloud_alpha = smoothstep(0.57, 0.72, density) * horizon_fade * 0.88;
         let lighting = 0.78 + max(dot(ray, normalize(globals.sun_direction.xyz)), 0.0) * 0.22;
         color = mix(color, globals.cloud.rgb * lighting, cloud_alpha);
+        cloud_cover = cloud_alpha;
     }
     // Keep the sun readable over the procedural cloud silhouette.
     color = mix(color, vec3<f32>(1.0, 0.91, 0.68), disc * globals.params.w);
@@ -109,8 +125,9 @@ fn value_noise(p: vec2<f32>) -> f32 {
     // same sky projection and remain fixed as the camera moves.
     if globals.params.w < 0.5 && ray.y > 0.04 {
         let star_coord = floor(ray.xz / max(ray.y, 0.1) * 850.0);
-        let star = step(0.9975, hash21(star_coord));
-        color += vec3<f32>(0.52, 0.62, 0.82) * star * 0.8;
+        let star = step(0.9975, star_hash(star_coord));
+        // Clouds hide the stars behind them.
+        color += vec3<f32>(0.52, 0.62, 0.82) * star * 0.8 * (1.0 - cloud_cover);
     }
     // Keep the output in a useful HDR range for the shared ACES tone mapper.
     let upper_sky = 0.92 + 0.08 * elevation;

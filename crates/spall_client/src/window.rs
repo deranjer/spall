@@ -1748,7 +1748,7 @@ impl ApplicationHandler for InteractiveApp {
         let window = match event_loop.create_window(
             WindowAttributes::default()
                 .with_title("Spall sandbox — interactive")
-                .with_inner_size(PhysicalSize::new(1280, 720)),
+                .with_inner_size(window_size_from_env().unwrap_or(PhysicalSize::new(1280, 720))),
         ) {
             Ok(window) => Arc::new(window),
             Err(error) => return self.fail(event_loop, ClientError::Gpu(error.to_string())),
@@ -4493,6 +4493,17 @@ fn cover_surface(
 fn frame_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPALL_FRAME_TRACE").is_some())
+}
+
+/// `SPALL_WINDOW_SIZE=1928x931` opens the game window at that size, to measure
+/// at the resolution a player actually uses.
+fn window_size_from_env() -> Option<PhysicalSize<u32>> {
+    let value = std::env::var("SPALL_WINDOW_SIZE").ok()?;
+    let (w, h) = value.split_once(['x', 'X'])?;
+    Some(PhysicalSize::new(
+        w.trim().parse().ok()?,
+        h.trim().parse().ok()?,
+    ))
 }
 
 /// Trees farther than this (metres) are drawn with half-resolution crowns.

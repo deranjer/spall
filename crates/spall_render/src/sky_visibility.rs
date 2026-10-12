@@ -701,8 +701,15 @@ fn slices_for(layer_ms: Option<f64>, work_fraction: f64) -> u32 {
     wanted.next_power_of_two().clamp(floor, MAX_SLICES)
 }
 
+/// How far (degrees) the sun must move before the bounce is lit again. Each
+/// relight is a sweep that adds several milliseconds to every frame for about a
+/// second; at the day cycle's pace 2 degrees came round every 7 seconds and the
+/// frame rate visibly pulsed. At 5 degrees it is every 17 seconds, and the
+/// bounce's direction is a soft, blocky term that 5 degrees does not change.
+const SUN_RELIGHT_DEGREES: f32 = 5.0;
+
 fn bounce_environment_changed(previous: Environment, current: Environment) -> bool {
-    let direction_cos = 2.0_f32.to_radians().cos();
+    let direction_cos = SUN_RELIGHT_DEGREES.to_radians().cos();
     previous
         .sun_dir
         .normalize()
@@ -1015,7 +1022,7 @@ impl SkyVisibility {
         }
         state.bounce_environment = Some(*environment);
         // Sliced like an occupancy change, not done in one frame: the sun moves
-        // past the 2 degree threshold every few seconds, and relighting the
+        // past the threshold every few seconds, and relighting the
         // whole volume at once cost 20-40 ms of GPU time in a single frame (a
         // visible hitch on a mid-range card). Spread over the sweep's frames
         // the same work is a few milliseconds each, and a sun that has moved
