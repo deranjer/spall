@@ -359,7 +359,8 @@ fn lighting_quality_trades_rays_for_speed_and_off_means_no_bounce() {
             && of(LightingQuality::Low) < of(LightingQuality::High) * 0.05,
         "no bounce when lighting is off or low"
     );
-    for quality in [LightingQuality::Medium] {
+    {
+        let quality = LightingQuality::Medium;
         let ratio = of(quality) / of(LightingQuality::High);
         assert!(
             (0.6..=1.6).contains(&ratio),
