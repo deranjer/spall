@@ -515,6 +515,21 @@ forest lake. Measured on that walk (natural 4096, seed 4, 1928x931, release):
 median frame 6.6 ms to 5.4 ms, shadow GPU 1.9 ms to 0.1 ms, p90 and the worst
 frame per second unchanged. Costs 3 more 2048x2048 depth layers.
 
+Water frame spikes (found with `SPALL_WATER_TRACE=1`, which logs client water
+work over half a millisecond on the frame trace's clock, and `SPALL_NO_WATER=1`,
+which generates the world dry). On the lake walk a dry world had 2-8 frames over
+20 ms and the wet one 250-270, with the median unchanged. The cause was not the
+client's water upload (2 of 46 slow frames contained 2 ms of it) but the
+server's water step: it ran on rayon's global pool, taking every core for its
+3-10 ms, twenty times a second, and the client's render and driver threads lost
+their cores (acquire and submit stalls). The water worker now has a pool of its
+own, half the cores (at most 8, `SPALL_WATER_THREADS` overrides): 50-60 slow
+frames at 4 or 8 threads, 11 at 1 thread but then the water falls minutes
+behind real time. Separately the client eased the water surface every frame
+(about 0.8 ms of the main thread at 200 fps, 8.5 s over the walk): it now eases
+at 60 Hz (1.8 s). What remains over a dry world is not in the water traces; the
+frames show acquire and submit stalls.
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale

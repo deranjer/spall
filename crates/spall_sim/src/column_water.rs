@@ -601,6 +601,19 @@ impl Shared {
     }
 }
 
+/// Threads for the water worker's pool: `SPALL_WATER_THREADS`, or half the
+/// cores, at least two and at most eight.
+fn water_pool_threads() -> usize {
+    std::env::var("SPALL_WATER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+            (cores / 2).clamp(2, 8)
+        })
+}
+
 impl AuthoritativeColumnWater {
     pub fn new(terrain: &Volume, setup: ColumnWaterSetup) -> Result<Self, ColumnWaterError> {
         check_setup(&setup)?;
@@ -746,10 +759,21 @@ impl AuthoritativeColumnWater {
             return;
         }
         let shared = Arc::clone(&self.shared);
+        // The step is data-parallel, and on rayon's global pool it takes every
+        // core for its few milliseconds, twenty times a second: a client on the
+        // same machine then loses its render thread to it and drops frames in
+        // bursts. A pool of its own, half the cores, leaves the rest
+        // for the render and driver threads (`SPALL_WATER_THREADS` overrides).
+        let threads = water_pool_threads();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("spall-water-{index}"))
+            .build()
+            .expect("column water thread pool starts");
         self.worker = Some(
             std::thread::Builder::new()
                 .name("spall-column-water".into())
-                .spawn(move || shared.run_worker())
+                .spawn(move || pool.install(|| shared.run_worker()))
                 .expect("column water worker thread starts"),
         );
     }

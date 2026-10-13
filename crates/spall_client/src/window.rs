@@ -5264,10 +5264,33 @@ impl WorldRenderer {
         let Some(center) = window else {
             return;
         };
+        let trace = crate::column_surface::water_trace().then(Instant::now);
         let mut surface = surface.lock().unwrap_or_else(|e| e.into_inner());
-        surface.recentre(center);
+        let lock_ms = trace.map(|t| t.elapsed().as_secs_f64() * 1e3);
+        let recentred = surface.recentre(center);
+        let recentre_ms = trace.map(|t| t.elapsed().as_secs_f64() * 1e3);
         let rects = surface.advance();
-        if surface.take_full_upload() || !self.water_grid_on {
+        let advance_ms = trace.map(|t| t.elapsed().as_secs_f64() * 1e3);
+        let full = surface.take_full_upload();
+        let finish = |full: bool, rect_count: usize| {
+            if let (Some(t), Some(lock), Some(recentre), Some(advance)) =
+                (trace, lock_ms, recentre_ms, advance_ms)
+            {
+                let total = t.elapsed().as_secs_f64() * 1e3;
+                if total > 0.5 {
+                    eprintln!(
+                        "spall-water-trace: t={:.1} sync {total:.2} ms = lock {lock:.2} + recentre {:.2}{} + advance {:.2} + upload {:.2} ({}, {rect_count} rects)",
+                        spall_render::trace_clock_ms(),
+                        recentre - lock,
+                        if recentred { " (moved)" } else { "" },
+                        advance - recentre,
+                        total - advance,
+                        if full { "full field" } else { "rects" },
+                    );
+                }
+            }
+        };
+        if full || !self.water_grid_on {
             // The grid surface replaces the old mesh sheet.
             self.scene
                 .set_water_surface(&self.device, &self.queue, &[], &[]);
@@ -5275,8 +5298,10 @@ impl WorldRenderer {
                 .set_water_field(&self.device, &self.queue, Some(surface.field().clone()));
             self.scene.set_water_grid_surface(true);
             self.water_grid_on = true;
+            finish(true, rects.len());
             return;
         }
+        let rect_count = rects.len();
         for rect in rects {
             let texels = surface.texels(rect);
             self.scene.update_water_field_rect(
@@ -5288,6 +5313,7 @@ impl WorldRenderer {
                 &texels,
             );
         }
+        finish(false, rect_count);
     }
 
     pub(super) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
