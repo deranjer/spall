@@ -2331,6 +2331,16 @@ impl ColumnWorld {
         self.steady_boundary.clear();
         let mut touched = vec![false; self.regions.len()];
         let part: Vec<bool> = (0..self.regions.len()).map(|s| self.stepping(s)).collect();
+        // Active regions that sit this step out (resting, or not the one being
+        // caught up): the water between them and a stepping region does not
+        // move, or the edge of the one that rests would take water it cannot
+        // pass on and the two would slosh against each other.
+        let held: Vec<bool> = self
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(s, r)| r.active && !r.frozen && !part[s])
+            .collect();
         for (slot, r) in self.regions.iter().enumerate() {
             if part[slot] {
                 for s in r.span_start..r.span_end {
@@ -2349,6 +2359,9 @@ impl ColumnWorld {
                 // (or rests).
                 let owner_active = part[p.ra as usize];
                 if p.ra as usize != slot && owner_active {
+                    continue;
+                }
+                if held[p.ra as usize] || held[p.rb as usize] {
                     continue;
                 }
                 self.act_pipes.push(pi);
@@ -2452,7 +2465,11 @@ impl ColumnWorld {
                 } else {
                     1
                 };
-                (period, period > 1 && !(counter + slot as u64).is_multiple_of(period))
+                // Regions of a period all step on the same steps, and the periods
+                // nest, so two neighbours step together whenever the slower of
+                // them does and the water between them moves at its pace.
+                let _ = slot;
+                (period, !counter.is_multiple_of(period))
             } else {
                 (1, false)
             };
@@ -2535,6 +2552,27 @@ impl ColumnWorld {
             r.owed_s = (r.owed_s - (want - remaining)).max(0.0);
             for &t in &self.touched {
                 self.dirty.insert(self.regions[t as usize].key);
+            }
+            // Water this region pushed into a sleeping neighbour wakes it, as
+            // it would in an ordinary step; left asleep it would hold the water
+            // as a ridge at the border.
+            let cfg = self.config;
+            let mut wake = BTreeSet::new();
+            for &pi in &self.act_pipes {
+                let p = self.pipes[pi as usize];
+                if self.q[pi as usize].abs() > cfg.sleep_flow {
+                    for r in [p.ra, p.rb] {
+                        let reg = &self.regions[r as usize];
+                        if !reg.active && !reg.steady {
+                            wake.insert(r as usize);
+                        }
+                    }
+                }
+            }
+            for s in wake {
+                if self.wake_slot(s) {
+                    metrics.regions_woken += 1;
+                }
             }
             metrics.caught_up_regions += 1;
         }
@@ -2806,7 +2844,10 @@ impl ColumnWorld {
                 r.steady_snap.clear();
                 r.steady_qsum.clear();
                 r.steady_qsq.clear();
-                r.quiet_steps += 1;
+                // A far region is stepped one time in `period`: each quiet step
+                // stands for that many, so it falls asleep at the real-time
+                // pace a near one does.
+                r.quiet_steps += u32::from(r.period);
                 if r.quiet_steps >= cfg.sleep_steps {
                     r.active = false;
                     r.owed_s = 0.0;

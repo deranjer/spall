@@ -234,3 +234,25 @@ fn a_region_that_is_near_again_runs_the_time_it_missed() {
         gap(&still_far)
     );
 }
+
+/// Water between regions that step at different paces must settle, not slosh:
+/// with the focus off to one side of the basin its regions step every 2nd and
+/// 4th time. Earlier versions let a resting region take water through its edge
+/// that it could not pass on, and the basin kept surging for good.
+#[test]
+fn water_between_regions_of_different_paces_settles_and_sleeps() {
+    let mut l = lake(throttled());
+    // 30 m west of the basin: its regions are 136 to 200 cells away.
+    l.world.set_focus(&[[-30.0, 12.0]]);
+    l.run(10.0);
+    l.sinks.clear();
+    assert!(l.world.resting_region_count() > 0 || l.world.active_region_count() > 0);
+    let mut worst = 0.0f32;
+    for _ in 0..8 {
+        l.run(100.0);
+        worst = l.world.max_abs_flow();
+    }
+    assert!(worst < 1.0e-3, "still moving after 800 s: {worst}");
+    assert_eq!(l.world.active_region_count(), 0, "every region slept");
+    assert!(l.drift() < 1.0e-9, "drift {}", l.drift());
+}
