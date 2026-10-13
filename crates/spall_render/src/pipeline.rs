@@ -212,6 +212,11 @@ pub struct ScenePipeline {
     /// into `shadow_texture` before the moving casters are drawn on top.
     shadow_static_texture: wgpu::Texture,
     shadow_static_layer_views: Vec<wgpu::TextureView>,
+    /// `shadow_static_texture` with the foliage drawn over it: the terrain's
+    /// depth is copied in and the foliage rasterised on top only when either
+    /// changes, and this is what is copied into `shadow_texture` each frame.
+    shadow_merged_texture: wgpu::Texture,
+    shadow_merged_layer_views: Vec<wgpu::TextureView>,
     shadow_sample_view: wgpu::TextureView,
     shadow_layer_views: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
@@ -471,6 +476,33 @@ impl ScenePipeline {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
+        let shadow_merged_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("spall-sun-shadow-merged-cascades"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: CASCADE_COUNT as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let shadow_merged_layer_views = (0..CASCADE_COUNT)
+            .map(|layer| {
+                shadow_merged_texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("spall-shadow-merged-layer-view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer as u32,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
         let shadow_static_layer_views = (0..CASCADE_COUNT)
             .map(|layer| {
                 shadow_static_texture.create_view(&wgpu::TextureViewDescriptor {
@@ -557,6 +589,8 @@ impl ScenePipeline {
             shadow_texture,
             shadow_static_texture,
             shadow_static_layer_views,
+            shadow_merged_texture,
+            shadow_merged_layer_views,
             shadow_sample_view,
             shadow_layer_views,
             shadow_sampler,
@@ -672,9 +706,17 @@ impl ScenePipeline {
         &self.shadow_static_layer_views[index]
     }
 
-    /// Copies a cascade's retained terrain depth into the layer the scene
-    /// samples, ready for the moving casters to be drawn over it.
-    pub fn copy_static_shadow(&self, encoder: &mut wgpu::CommandEncoder, cascade: usize) {
+    /// The retained terrain-plus-foliage depth layer of a cascade.
+    pub fn shadow_merged_layer(&self, index: usize) -> &wgpu::TextureView {
+        &self.shadow_merged_layer_views[index]
+    }
+
+    fn copy_depth_layer(
+        encoder: &mut wgpu::CommandEncoder,
+        from: &wgpu::Texture,
+        to: &wgpu::Texture,
+        cascade: usize,
+    ) {
         let layer = |texture| wgpu::TexelCopyTextureInfo {
             texture,
             mip_level: 0,
@@ -686,13 +728,35 @@ impl ScenePipeline {
             aspect: wgpu::TextureAspect::DepthOnly,
         };
         encoder.copy_texture_to_texture(
-            layer(&self.shadow_static_texture),
-            layer(&self.shadow_texture),
+            layer(from),
+            layer(to),
             wgpu::Extent3d {
                 width: SHADOW_MAP_SIZE,
                 height: SHADOW_MAP_SIZE,
                 depth_or_array_layers: 1,
             },
+        );
+    }
+
+    /// Copies a cascade's retained terrain depth into its merged layer, ready
+    /// for the foliage to be drawn over it.
+    pub fn copy_static_to_merged(&self, encoder: &mut wgpu::CommandEncoder, cascade: usize) {
+        Self::copy_depth_layer(
+            encoder,
+            &self.shadow_static_texture,
+            &self.shadow_merged_texture,
+            cascade,
+        );
+    }
+
+    /// Copies a cascade's retained terrain and foliage depth into the layer the
+    /// scene samples, ready for the moving casters to be drawn over it.
+    pub fn copy_static_shadow(&self, encoder: &mut wgpu::CommandEncoder, cascade: usize) {
+        Self::copy_depth_layer(
+            encoder,
+            &self.shadow_merged_texture,
+            &self.shadow_texture,
+            cascade,
         );
     }
 

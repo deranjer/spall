@@ -240,6 +240,10 @@ pub struct GameRenderer {
     occlusion_enabled: bool,
     /// What each cascade's retained terrain depth was drawn from.
     shadow_cache: [Option<ShadowKey>; CASCADE_COUNT],
+    /// The foliage generation each cascade's merged (terrain plus foliage)
+    /// depth was drawn with; `None` when the terrain depth under it was
+    /// redrawn since.
+    shadow_merged: [Option<u64>; CASCADE_COUNT],
     body_meshes: HashMap<u64, DynamicMesh>,
     bodies: InstanceSet,
     /// Drawn lit but never shadow-casting (debug overlays).
@@ -248,6 +252,11 @@ pub struct GameRenderer {
     /// The foliage instances grouped by 16 m square, each with its bounds and
     /// its range in `vegetation`, so a pass draws only the groups it can see.
     vegetation_buckets: Vec<(Aabb, u32, u32)>,
+    /// The instances `vegetation` holds, and a count that changes whenever a
+    /// new set differs from them: foliage is as static as the terrain between
+    /// rebuilds, so its depth is kept in the cached cascade depth too.
+    vegetation_last: Vec<CubeInstance>,
+    vegetation_generation: u64,
     transparent: InstanceSet,
     /// The smoothed water surface sheet, drawn alpha-blended after the opaque
     /// scene.
@@ -370,11 +379,14 @@ impl GameRenderer {
             occlusion: crate::occlusion::OcclusionCuller::new(device),
             occlusion_enabled: std::env::var_os("SPALL_NO_OCCLUSION").is_none(),
             shadow_cache: [None; CASCADE_COUNT],
+            shadow_merged: [None; CASCADE_COUNT],
             body_meshes: HashMap::new(),
             bodies: InstanceSet::new(),
             overlay: InstanceSet::new(),
             vegetation: InstanceSet::new(),
             vegetation_buckets: Vec::new(),
+            vegetation_last: Vec::new(),
+            vegetation_generation: 0,
             transparent: InstanceSet::new(),
             water_surface: DynamicMesh::new(device),
             water_grid: false,
@@ -623,6 +635,10 @@ impl GameRenderer {
         };
         let mut sorted: Vec<CubeInstance> = instances.to_vec();
         sorted.sort_by_key(|i| key(i));
+        if sorted != self.vegetation_last {
+            self.vegetation_generation = self.vegetation_generation.wrapping_add(1);
+            self.vegetation_last.clone_from(&sorted);
+        }
         self.vegetation_buckets.clear();
         let mut start = 0;
         while start < sorted.len() {
@@ -890,9 +906,36 @@ impl GameRenderer {
                 }
                 drop(pass);
                 self.shadow_cache[cascade] = Some(key);
+                self.shadow_merged[cascade] = None;
             } else if let Some(cached) = self.shadow_cache[cascade].as_mut() {
                 // Nothing that changed touches this cascade: still valid.
                 cached.terrain_generation = key.terrain_generation;
+            }
+            // Foliage is as static as the terrain between rebuilds: it is
+            // drawn over a copy of the terrain depth only when that depth was
+            // redrawn or the foliage changed.
+            if self.shadow_merged[cascade] != Some(self.vegetation_generation) {
+                self.pipeline.copy_static_to_merged(encoder, cascade);
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("spall-game-shadow-foliage-pass"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: self.pipeline.shadow_merged_layer(cascade),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_bind_group(0, &bind, &[]);
+                pass.set_pipeline(self.pipeline.shadow_cube());
+                self.draw_vegetation(&mut pass, &Frustum::from_view_projection(matrix));
+                drop(pass);
+                self.shadow_merged[cascade] = Some(self.vegetation_generation);
             }
             self.pipeline.copy_static_shadow(encoder, cascade);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -918,7 +961,6 @@ impl GameRenderer {
                 pass.set_pipeline(self.pipeline.shadow_cube());
             }
             self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies]);
-            self.draw_vegetation(&mut pass, &Frustum::from_view_projection(matrix));
         }
 
         // Recompute sky visibility / bounce when the occupancy, environment or

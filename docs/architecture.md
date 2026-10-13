@@ -506,6 +506,15 @@ reframing the maps for each of those slid the texel grid across the terrain and
 made shadows on slopes shimmer once a second. Held for several seconds they stay
 still and their cached terrain depth stays valid.
 
+Foliage shadows are cached like the terrain's: each cascade keeps a merged
+layer (the terrain depth plus the foliage drawn over a copy of it) that is
+redrawn only when the terrain depth was redrawn or the foliage instances
+changed, and the moving casters are drawn over it each frame. Before, every
+frame redrew all the foliage in each cascade, about 1.8 ms of GPU time at a
+forest lake. Measured on that walk (natural 4096, seed 4, 1928x931, release):
+median frame 6.6 ms to 5.4 ms, shadow GPU 1.9 ms to 0.1 ms, p90 and the worst
+frame per second unchanged. Costs 3 more 2048x2048 depth layers.
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale
