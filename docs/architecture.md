@@ -500,6 +500,12 @@ change forced a shadow redraw and the worker rebuilt about 1000 chunks per 8 m
 walked. Standing: 8.1 ms to 7.5 ms in the open and 8.1 ms to 7.1 ms in forest.
 The runs are noisy by a few ms; GPU capture and other hardware are unrun.
 
+The shadow cascades follow the sun in steps of half a degree (`SHADOW_SUN_STEP_DEG`
+in `pipeline.rs`): the day clock moves it a tenth of a degree a second, and
+reframing the maps for each of those slid the texel grid across the terrain and
+made shadows on slopes shimmer once a second. Held for several seconds they stay
+still and their cached terrain depth stays valid.
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale

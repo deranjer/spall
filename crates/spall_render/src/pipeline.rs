@@ -1468,6 +1468,31 @@ fn opaque_primitive() -> wgpu::PrimitiveState {
 /// never swim). A cascade whose box is unchanged and whose terrain is
 /// unchanged keeps its terrain depth from the last frame
 /// ([`crate::game_renderer`]), which is most frames for the far cascades.
+/// The angular step the shadow maps follow the sun in, degrees. The day clock
+/// moves the sun a tenth of a degree a second; framing the maps afresh for
+/// each of those makes the texel grid slide across the terrain and the
+/// stair-stepped edges of its shadows shimmer on a slope. Held for a few
+/// seconds at a time they stay still (and the cached terrain depth stays
+/// valid), and the shift when they do move is under a texel near the camera.
+const SHADOW_SUN_STEP_DEG: f32 = 0.5;
+
+/// `sun_dir` rounded to a grid of [`SHADOW_SUN_STEP_DEG`] in azimuth and
+/// elevation, normalised.
+fn quantized_sun(sun_dir: Vec3) -> Vec3 {
+    let sun = sun_dir.normalize();
+    let step = SHADOW_SUN_STEP_DEG.to_radians();
+    let elevation = sun.y.clamp(-1.0, 1.0).asin();
+    let azimuth = sun.z.atan2(sun.x);
+    let elevation = (elevation / step).round() * step;
+    let azimuth = (azimuth / step).round() * step;
+    Vec3::new(
+        elevation.cos() * azimuth.cos(),
+        elevation.sin(),
+        elevation.cos() * azimuth.sin(),
+    )
+    .normalize()
+}
+
 fn cascade_data(camera: &Camera, sun_dir: Vec3) -> ([Mat4; CASCADE_COUNT], [f32; 4]) {
     let near = camera.z_near.max(0.01);
     let far = camera.z_far.max(near + 0.01);
@@ -1485,7 +1510,7 @@ fn cascade_data(camera: &Camera, sun_dir: Vec3) -> ([Mat4; CASCADE_COUNT], [f32;
     let tan_w = tan_h * camera.aspect;
     let corner = (1.0 + tan_h * tan_h + tan_w * tan_w).sqrt();
 
-    let sun = sun_dir.normalize();
+    let sun = quantized_sun(sun_dir);
     let up = if sun.dot(Vec3::Y).abs() > 0.95 {
         Vec3::Z
     } else {
@@ -1522,6 +1547,29 @@ pub fn default_sun_dir() -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shadow_sun_holds_still_between_steps_and_stays_close() {
+        let at = |deg: f32| {
+            let r = deg.to_radians();
+            Vec3::new(r.cos(), -r.sin(), 0.3).normalize()
+        };
+        // A tenth of a degree, the day clock's pace for a second, moves nothing
+        // except when it crosses a step...
+        let a = quantized_sun(at(40.0));
+        assert_eq!(a, quantized_sun(at(40.05)));
+        // ...a change of a step does move it, and it is never far from the sun.
+        assert_ne!(a, quantized_sun(at(41.0)));
+        for deg in [3.0, 17.3, 40.0, 61.7, 88.0] {
+            let sun = at(deg).normalize();
+            let angle = quantized_sun(sun)
+                .dot(sun)
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            assert!(angle < SHADOW_SUN_STEP_DEG, "{deg}: {angle}");
+        }
+    }
 
     #[test]
     fn cascade_splits_are_ordered_and_cover_the_camera_range() {
