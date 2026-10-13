@@ -146,6 +146,28 @@ impl PassTimer {
                 if has_bounce {
                     self.slice_costs.push(ms(8, 9));
                 }
+                if std::env::var_os("SPALL_FRAME_TRACE").is_some() {
+                    let scene = ms(0, 1) + ms(2, 3) + ms(4, 5);
+                    if scene > 5.0 || has_sky || has_bounce {
+                        eprintln!(
+                            "spall-gpu-trace: t={:.1} scene {scene:.1} ms (shadow {:.1}, opaque {:.1}, tone {:.1}){}{}",
+                            crate::trace_clock_ms(),
+                            ms(0, 1),
+                            ms(2, 3),
+                            ms(4, 5),
+                            if has_sky {
+                                format!(" + sky {:.1}", ms(6, 7))
+                            } else {
+                                String::new()
+                            },
+                            if has_bounce {
+                                format!(" + bounce {:.1}", ms(8, 9))
+                            } else {
+                                String::new()
+                            },
+                        );
+                    }
+                }
                 let previous_sky = self.latest.and_then(|t| t.sky_visibility_ms);
                 let previous_bounce = self.latest.and_then(|t| t.bounce_ms);
                 self.latest = Some(GamePassTimings {

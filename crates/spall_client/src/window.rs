@@ -2278,6 +2278,8 @@ impl ApplicationHandler for InteractiveApp {
                     return;
                 };
                 renderer.scene.set_terrain_meshes_visible(self.show_terrain);
+                let terrain_upload_started = Instant::now();
+                let terrain_upload_count = terrain_updates.len();
                 if (!terrain_updates.is_empty() || !terrain_removed.is_empty())
                     && let Err(error) = renderer.scene.update_terrain_meshes_detail(
                         &renderer.device,
@@ -2288,6 +2290,15 @@ impl ApplicationHandler for InteractiveApp {
                 {
                     self.fail(event_loop, ClientError::Render(error.to_string()));
                     return;
+                }
+                if frame_trace() && terrain_upload_count > 0 {
+                    let ms = terrain_upload_started.elapsed().as_secs_f32() * 1000.0;
+                    if ms > 1.0 {
+                        eprintln!(
+                            "spall-frame-work: t={:.1} terrain upload {terrain_upload_count} chunks {ms:.1} ms",
+                            spall_render::trace_clock_ms()
+                        );
+                    }
                 }
                 renderer.sync_water_surface(&self.session.column_surface, water_window);
                 renderer.vegetation_frame = self
@@ -2564,6 +2575,16 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 };
                 self.hud.record_frame(&timing);
+                if std::env::var_os("SPALL_FRAME_CSV").is_some() {
+                    eprintln!(
+                        "spall-frame-csv: {:.1},{:.2},{:.2},{:.2},{}",
+                        spall_render::trace_clock_ms(),
+                        handler_started.elapsed().as_secs_f32() * 1000.0,
+                        timing.acquire_ms,
+                        timing.submit_ms,
+                        self.renderer.as_ref().map_or(0, |r| r.water_rects_frame)
+                    );
+                }
                 if frame_trace() {
                     let total = handler_started.elapsed().as_secs_f32() * 1000.0;
                     if total > 20.0 {
@@ -5044,6 +5065,8 @@ pub(super) struct WorldRenderer {
     crosshair: Option<CrosshairView>,
     debug_water_source: Vec<Instance>,
     water_window: Option<[f64; 3]>,
+    /// Rectangles of the water field uploaded this frame (for the frame CSV).
+    water_rects_frame: usize,
     debug_water_instances: Vec<Instance>,
     /// Clock for the water's animated caustics.
     water_epoch: Instant,
@@ -5261,6 +5284,7 @@ impl WorldRenderer {
         surface: &std::sync::Mutex<crate::column_surface::ColumnSurface>,
         window: Option<[f64; 3]>,
     ) {
+        self.water_rects_frame = 0;
         let Some(center) = window else {
             return;
         };
@@ -5302,6 +5326,7 @@ impl WorldRenderer {
             return;
         }
         let rect_count = rects.len();
+        self.water_rects_frame = rect_count;
         for rect in rects {
             let texels = surface.texels(rect);
             self.scene.update_water_field_rect(
@@ -5466,6 +5491,7 @@ impl WorldRenderer {
             crosshair: None,
             debug_water_source: Vec::new(),
             water_window: None,
+            water_rects_frame: 0,
             debug_water_instances: Vec::new(),
             water_epoch: Instant::now(),
             water_grid_on: false,

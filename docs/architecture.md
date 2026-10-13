@@ -530,6 +530,21 @@ behind real time. Separately the client eased the water surface every frame
 at 60 Hz (1.8 s). What remains over a dry world is not in the water traces; the
 frames show acquire and submit stalls.
 
+Slow frames at the lake (`SPALL_FRAME_CSV=1` prints one line per client frame:
+clock, handler, acquire and submit milliseconds, water rectangles uploaded;
+`SPALL_FRAME_TRACE=1` now also prints GPU pass times over 5 ms and terrain
+uploads over 1 ms). Over about 20,000 frames of the lake walk, 5% took over 8 ms
+and about 1.2% over 16 ms (a dry world: 2.9% and 0.14%). Two causes, neither the
+client's water or terrain uploads: (1) the bounce lighting sweep, in 2.7% of
+frames, each carrying a slice of median 5 ms GPU (p90 10, worst 66) that makes
+the next frame wait 7 ms for the swapchain: 41% of the frames over 8 ms and
+25% of those over 16; (2) the server's water step competing for cores with the
+render and driver threads: the frames over 16 ms with no sweep fell from 347 to
+133 to 27 to 1 going from 8 water threads to 4, 2 and a dry world, but runs
+vary by about half a percentage point, and fewer threads let the water fall
+behind (2 threads: 48 s behind real time in 130 s). Not established: lowering the
+server's process priority (`SPALL_SERVER_PRIORITY=low` in `xtask play`).
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale
