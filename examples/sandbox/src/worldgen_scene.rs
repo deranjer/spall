@@ -183,6 +183,14 @@ pub fn column_water_setup(
     setup.config.sleep_flow = WORLDGEN_SLEEP_FLOW;
     // Deep still sea stays a record until something disturbs it.
     setup.config.lazy_ocean = true;
+    // Water far from every player steps every 2nd, 4th, 8th time beyond 160,
+    // 320 and 640 m, so a far lake drains late rather than costing every step,
+    // and a region catches up on what it missed when a player comes back.
+    // `SPALL_WATER_THROTTLE=off` steps all water every time.
+    if !std::env::var("SPALL_WATER_THROTTLE").is_ok_and(|v| v == "off") {
+        setup.config.throttle_from_cells = [640.0, 1280.0, 2560.0];
+        setup.config.catch_up_substeps = 24;
+    }
     Some(setup)
 }
 

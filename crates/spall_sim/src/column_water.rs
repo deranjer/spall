@@ -247,6 +247,9 @@ struct Owed {
 struct Shared {
     setup: ColumnWaterSetup,
     gated_rate: AtomicU8,
+    /// Where the players are (metres, x and z): the water far from every one
+    /// steps less often (see `ColumnConfig::throttle_from_cells`).
+    focus: Mutex<Vec<[f64; 2]>>,
     core: Mutex<Core>,
     owed: Mutex<Owed>,
     wake: Condvar,
@@ -478,6 +481,8 @@ impl Shared {
     /// frame. On the worker thread, or inline in the tick.
     fn advance(&self) {
         let mut core = lock(&self.core);
+        let focus = lock(&self.focus).clone();
+        core.world.set_focus(&focus);
         let started = Instant::now();
         let mut steps = 0u32;
         let mut last_step = None;
@@ -694,6 +699,7 @@ impl AuthoritativeColumnWater {
         let shared = Shared {
             setup,
             gated_rate: AtomicU8::new(0),
+            focus: Mutex::new(Vec::new()),
             core: Mutex::new(Core {
                 world,
                 regions: BTreeMap::new(),
@@ -776,6 +782,12 @@ impl AuthoritativeColumnWater {
                 .spawn(move || pool.install(|| shared.run_worker()))
                 .expect("column water worker thread starts"),
         );
+    }
+
+    /// Tells the water where the players are (metres, x and z), so the water far
+    /// from all of them can be stepped less often. No points: nothing is far.
+    pub fn set_focus(&self, points_m: &[[f64; 2]]) {
+        *lock(&self.shared.focus) = points_m.to_vec();
     }
 
     pub fn has_worker(&self) -> bool {

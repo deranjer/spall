@@ -554,6 +554,31 @@ about 25 ms in one frame (2-7 ms CPU rebuild, 21 ms upload); it is now 8 ms
 frame) and a millisecond a frame for 16 frames. The first install of a field is
 still immediate (17 ms once).
 
+Water far from every player steps less often, and catches up when one returns
+(`ColumnConfig::throttle_from_cells`, `catch_up_substeps`; the server sets
+them for generated worlds, `SPALL_WATER_THROTTLE=off` turns them off). The sim
+tells the water where the players are each tick (`ColumnWorld::set_focus`). An
+active region farther than 160, 320 or 640 m from the nearest player steps one
+step in 2, 4 or 8; on the others it rests: it exchanges water with its
+neighbours through its edge, as a sleeping region does, but does not
+redistribute, so far water runs in slow motion and no water is made or lost.
+The time a region rested is its debt (`region_owed_s`); once a region is near
+again it spends up to 24 substeps a step, nearest and largest debt first, four
+regions a step, stepped alone for up to 4 s of its debt, until it has caught up.
+A region that is quiet for its sleep count still sleeps (counted in steps it was
+stepped), and a draining lake is never quiet, so it never sleeps early; with no
+player nothing is throttled. Tests (`tests/column_throttle.rs`): a far lake
+drains late but finishes and conserves volume to 1e-9; no focus, a focus on the
+lake, or the bands off change nothing bit for bit; after 40 s far and 40 s near,
+a lake is at the level of one never throttled (29.17 against 29.17 cells; one
+that stayed far was at 29.54) and its debt went from 35 s to 0.2 s. At the lake
+walk (natural 4096, two runs each): frames over 16 ms 0.56% and 0.41% with it
+against 1.58% and 0.91% without (a dry world: 0.14%), the water's lag behind
+real time 3 s against 10 s at 130 s, and 190 of about 260 active regions resting.
+More regions stay active (they go quiet at a slower pace), which costs memory
+bandwidth rather than CPU. A catch-up hitch when a player arrives at a far lake
+has not been measured in the game.
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale
