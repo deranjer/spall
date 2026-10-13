@@ -418,6 +418,12 @@ Each of the four sun cascades is a light-space box around a sphere centred on th
 
 The renderer's camera-local lighting cache relights in slices: sky visibility once, then the bounce in interleaved strides sized from measured GPU cost, and a camera recentre scrolls the cache and relights only the entered strip. This changes cost, not the cache contract above (derived, camera-local, never authoritative). Editor world-generation previews are drawn from the same `ColumnMap` the server builds; layers are diagnostics, not a second generator (`docs/worldgen.md`).
 
+### Occlusion culling, distance fog and the frame limiter (client renderer)
+
+About four in five terrain chunks inside the camera's frustum show no pixel (underground shells, the far side of hills). The camera pass skips chunks judged hidden by GPU occlusion queries (`spall_render::occlusion`): after the opaque pass, the bounding boxes of up to 192 chunks a frame are drawn against that pass's depth, each inside an occlusion query; the counts are read back asynchronously over three slots, and each chunk keeps a verdict. A chunk with no verdict (new, edited, back in the frustum, or after the camera jumps) is drawn; a visible chunk is drawn and re-tested every 16 frames; a hidden chunk is skipped and re-tested every few frames, and drawn anyway once its verdict is 90 frames old. The test is exact (the box covers the chunk), so it can only draw too much, never leave a hole, apart from the few frames a newly uncovered chunk waits for its next test. The sun cascades are not culled this way. Measured on the 4096-cell natural world at 1928x931: 61% of chunks culled, standing frame 10.6 -> 7.3 ms, scripted walk median 10.5 -> 9.6 ms. `SPALL_NO_OCCLUSION=1` turns it off.
+
+Distance fog fades the outer third of the view radius (62% to 97%) into the sky's horizon colour, in terrain, water and foliage, so chunks that stop being drawn at the edge do not pop (`SPALL_NO_FOG=1` off). The uncapped frame loop is limited to `SPALL_MAX_FPS` (default 240, 0 for none): without vsync the loading screen ran at 3,000+ frames a second and starved the rest of the PC. Terrain level of detail beyond the near chunks is not implemented.
+
 ### ENG-122 reconstructed support diagnostic (2026-10-04)
 
 The opt-in `MacGridWorld::set_cut_surface_support` backend constructs PLIC
