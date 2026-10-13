@@ -4059,6 +4059,7 @@ fn clip_water_to_window(boxes: &[Instance], center_m: [f64; 3], out: &mut Vec<In
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admin_menu_view(
     session: &InteractiveSession,
     flying: bool,
