@@ -664,6 +664,48 @@ fn daylight_skybox_has_a_sun_and_varied_voxel_clouds() {
 }
 
 #[test]
+#[ignore = "requires a working GPU adapter; captures the night sky's stars"]
+fn night_stars_are_soft_discs_that_move_smoothly_with_the_camera() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let environment = EnvironmentPreset::Night.environment();
+    let mut camera = Camera::looking_along(
+        Vec3::ZERO,
+        Vec3::new(0.3, 0.8, 0.5),
+        82_f32.to_radians(),
+        SIZE.0 as f32 / SIZE.1 as f32,
+    );
+    let mut frames = Vec::new();
+    for step in 0..2 {
+        let pixels = render_game_from(
+            &ctx,
+            &camera,
+            &environment,
+            DebugView::Shaded,
+            &[],
+            &[],
+            &materials(),
+        );
+        save_png(&format!("skybox-night-{step}.png"), &pixels);
+        frames.push(pixels);
+        // A turn of a fifth of a pixel: stars that are single-pixel samples
+        // flicker; soft discs only change a little.
+        camera.look(0.0004, 0.0);
+    }
+    let lit = |pixels: &[u8]| pixels.chunks_exact(4).filter(|p| p[2] > 60).count();
+    assert!(lit(&frames[0]) > 8, "stars visible: {}", lit(&frames[0]));
+    let changed = frames[0]
+        .chunks_exact(4)
+        .zip(frames[1].chunks_exact(4))
+        .filter(|(a, b)| a[2].abs_diff(b[2]) > 40)
+        .count();
+    assert!(
+        changed * 4 < lit(&frames[0]),
+        "{changed} pixels jumped of {} lit",
+        lit(&frames[0])
+    );
+}
+
+#[test]
 #[ignore = "requires a working GPU adapter; checks sky orientation during camera movement"]
 fn skybox_sun_tracks_world_direction_under_camera_rotation() {
     let ctx = RenderContext::headless().expect("GPU adapter");

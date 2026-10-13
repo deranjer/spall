@@ -37,17 +37,37 @@ fn hash21(p: vec2<f32>) -> f32 {
 }
 
 // An integer hash of a star cell. The float hash above is fine for the small
-// coordinates of the clouds, but at star-field coordinates (hundreds to
-// thousands) its precision collapses into straight dotted lines of stars.
+// coordinates of the clouds, but at star-field coordinates its precision
+// collapses into straight dotted lines of stars.
 fn pcg(v: u32) -> u32 {
     let s = v * 747796405u + 2891336453u;
     let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
     return (w >> 22u) ^ w;
 }
 
-fn star_hash(cell: vec2<f32>) -> f32 {
-    let q = vec2<i32>(cell);
-    return f32(pcg(u32(q.x) + pcg(u32(q.y) + 2654435769u))) / 4294967295.0;
+fn star_hash(cell: vec2<i32>) -> u32 {
+    return pcg(u32(cell.x) + pcg(u32(cell.y) + 2654435769u));
+}
+
+// Stars on a stereographic grid of the sky (about a degree to a cell, evenly
+// enough across the upper hemisphere): each cell may hold one star at a fixed
+// spot, drawn as a soft disc at least a pixel and a half across, so it slides
+// across the screen with the camera instead of flickering in and out of
+// pixels. `pixel` is the grid's size of one screen pixel.
+fn star_field(p: vec2<f32>, pixel: f32) -> f32 {
+    let grid = p * 120.0;
+    let cell = floor(grid);
+    let h = star_hash(vec2<i32>(cell));
+    if (h & 31u) != 0u { return 0.0; }
+    let jitter = vec2<f32>(f32((h >> 5u) & 255u), f32((h >> 13u) & 255u)) / 255.0;
+    let at = vec2<f32>(0.3) + jitter * 0.4;
+    let rank = f32((h >> 21u) & 255u) / 255.0;
+    let brightness = 0.3 + 0.7 * rank * rank;
+    let d = length(fract(grid) - at);
+    let radius = max(pixel * 120.0 * 0.75, 0.04 + 0.06 * brightness);
+    // Dim a star that is smaller than its pixels, so its energy is kept.
+    let fade = min(1.0, (0.04 + 0.06 * brightness) / radius * 1.6);
+    return (1.0 - smoothstep(radius * 0.4, radius, d)) * brightness * fade;
 }
 
 fn value_noise(p: vec2<f32>) -> f32 {
@@ -65,6 +85,9 @@ fn value_noise(p: vec2<f32>) -> f32 {
         // The framebuffer Y flip happens during rasterization, not here.
         + globals.up.xyz * (in.ndc.y * globals.params.x));
     let elevation = clamp(ray.y * 0.5 + 0.5, 0.0, 1.0);
+    // Derivatives are taken here, in uniform control flow, for the stars.
+    let star_p = ray.xz / (1.0 + max(ray.y, 0.0));
+    let star_pixel = max(length(dpdx(star_p)), length(dpdy(star_p)));
     let horizon_band = exp(-abs(ray.y) * 5.0);
     var color = mix(globals.horizon.rgb, globals.zenith.rgb, smoothstep(-0.08, 0.72, ray.y));
     color += vec3<f32>(0.12, 0.16, 0.2) * horizon_band * 0.22;
@@ -124,10 +147,9 @@ fn value_noise(p: vec2<f32>) -> f32 {
     // A small stable star field comes out as daylight fades. Stars use the
     // same sky projection and remain fixed as the camera moves.
     if globals.params.w < 0.5 && ray.y > 0.04 {
-        let star_coord = floor(ray.xz / max(ray.y, 0.1) * 850.0);
-        let star = step(0.9975, star_hash(star_coord));
+        let star = star_field(star_p, star_pixel);
         // Clouds hide the stars behind them.
-        color += vec3<f32>(0.52, 0.62, 0.82) * star * 0.8 * (1.0 - cloud_cover);
+        color += vec3<f32>(0.52, 0.62, 0.82) * star * 1.4 * (1.0 - cloud_cover);
     }
     // Keep the output in a useful HDR range for the shared ACES tone mapper.
     let upper_sky = 0.92 + 0.08 * elevation;
