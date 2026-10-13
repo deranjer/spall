@@ -424,6 +424,8 @@ About four in five terrain chunks inside the camera's frustum show no pixel (und
 
 Distance fog fades the outer third of the view radius (62% to 97%) into the sky's horizon colour, in terrain, water and foliage, so chunks that stop being drawn at the edge do not pop (`SPALL_NO_FOG=1` off). The uncapped frame loop is limited to `SPALL_MAX_FPS` (default 240, 0 for none): without vsync the loading screen ran at 3,000+ frames a second and starved the rest of the PC. Terrain level of detail beyond the near chunks is not implemented.
 
+Lighting quality (`spall_render::sky_visibility::LightingQuality`, client key `F7`, menu button, `SPALL_LIGHTING=off|low|medium|high`, scripted step `lighting:low`) sets how much of the camera-local lighting cache is computed; it changes the cache, never the world. Off: flat ambient light, no cache. Low: skylight visibility only (no bounce), re-centred after 16 m of drift, sun relit every 12 degrees. Medium: bounce with 42 rays per cell, 12 m drift, 8 degrees. High (default): bounce with all 66 rays, 8 m drift, 5 degrees. Measured on a scripted walk through the dense forest of the 4096-cell natural world at 1928x931, where a lighting sweep step ran in about two frames out of three: Off 8.8-11.7 ms a frame, High 12.9-14.8, Low 12.6-13.4, Medium 12.0-17.1 across runs (run-to-run noise is about 1.5 ms, so Low and Medium are not clearly separated from High; Off and Low's missing bounce are). The bounce slice cost did not fall with the ray count; the cost per sweep step is dominated by the sky pass and the slice dispatch, not the rays.
+
 ### ENG-122 reconstructed support diagnostic (2026-10-04)
 
 The opt-in `MacGridWorld::set_cut_surface_support` backend constructs PLIC

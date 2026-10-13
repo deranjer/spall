@@ -83,6 +83,9 @@ fn nee_active() -> bool {
     return emitters.header.x <= MAX_EMITTERS;
 }
 
+// The most rays a cell casts. The first 18 are the axes and edge diagonals, the
+// next 24 the first shallow ring, the last 24 the second, so any prefix is a
+// usable, evenly spread set: `globals.dimensions.z` says how many to use.
 const RAY_COUNT: u32 = 66u;
 
 // 66 fixed rays: the six axes, the twelve edge diagonals, and two rings of 24
@@ -316,7 +319,8 @@ fn bounce_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let world_cell = cell + vec3<i32>(round(globals.origin_cell_size.xyz / globals.origin_cell_size.w));
     let jitter = cell_jitter(world_cell);
-    for (var i = 0u; i < RAY_COUNT; i += 1u) {
+    let ray_count = select(RAY_COUNT, min(globals.dimensions.z, RAY_COUNT), globals.dimensions.z > 0u);
+    for (var i = 0u; i < ray_count; i += 1u) {
         let dir = jitter_dir(jitter, ray_direction(i));
         var source = vec3<f32>(0.0);
         let hit = trace_first_hit(origin, dir, dim, max_cells);

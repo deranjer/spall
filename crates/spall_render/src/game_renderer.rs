@@ -704,6 +704,17 @@ impl GameRenderer {
 
     /// Switch the diffuse bounce on or off (a no-op until occupancy exists).
     /// Off skips the pass; sky visibility is unaffected.
+    /// How much lighting to compute; see [`crate::sky_visibility::LightingQuality`].
+    pub fn set_lighting_quality(
+        &self,
+        queue: &wgpu::Queue,
+        quality: crate::sky_visibility::LightingQuality,
+    ) {
+        if let Some(sky) = self.sky.as_ref() {
+            sky.set_quality(queue, quality);
+        }
+    }
+
     pub fn set_bounce_enabled(&self, queue: &wgpu::Queue, enabled: bool) {
         if let Some(sky) = &self.sky {
             sky.set_bounce_enabled(queue, enabled);

@@ -331,6 +331,44 @@ fn a_moving_lamp_relights_the_floor() {
     );
 }
 
+/// Fewer bounce rays still light the floor beside a lamp (about as bright);
+/// `Low` and `Off` have no bounce at all.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn lighting_quality_trades_rays_for_speed_and_off_means_no_bounce() {
+    use spall_render::sky_visibility::LightingQuality;
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored test");
+    let lamp = boxed(LAMP, [-4.0, 0.5, 0.0], [1.0, 1.0, 1.0]);
+    let beside = Vec3::new(-2.0, 0.0, 0.0);
+    let mut brightness = Vec::new();
+    for quality in LightingQuality::ALL {
+        let mut session = Session::new(&ctx, lamp_only(), DebugView::IndirectOnly, &[ground()]);
+        session.renderer.set_lighting_quality(&ctx.queue, quality);
+        let (_, image) = session.settle(&[lamp]);
+        let value = at(&session.camera, &image, beside)[0];
+        println!("{}: floor beside the lamp {value:.3}", quality.name());
+        brightness.push((quality, value));
+    }
+    let of = |q: LightingQuality| brightness.iter().find(|(k, _)| *k == q).unwrap().1;
+    assert!(
+        of(LightingQuality::High) > 0.01,
+        "the lamp lights the floor at High"
+    );
+    assert!(
+        of(LightingQuality::Off) < of(LightingQuality::High) * 0.05
+            && of(LightingQuality::Low) < of(LightingQuality::High) * 0.05,
+        "no bounce when lighting is off or low"
+    );
+    for quality in [LightingQuality::Medium] {
+        let ratio = of(quality) / of(LightingQuality::High);
+        assert!(
+            (0.6..=1.6).contains(&ratio),
+            "{} lights the floor like High: ratio {ratio:.2}",
+            quality.name()
+        );
+    }
+}
+
 /// Two overlapping bodies share cache cells; when one leaves, the other still
 /// blocks and the terrain under both is intact.
 #[test]

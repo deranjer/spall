@@ -63,28 +63,16 @@ fn shader_constants() -> String {
 /// blocks; this one is distinguishable in debugging and counts.
 pub const UNKNOWN_CELL: u32 = u32::MAX;
 
-/// How far (metres) the camera moves before the cache is re-centred on it,
-/// horizontally and vertically. The origin is snapped to these steps, so it is
-/// also on the 0.5 m cell grid. A re-centre starts a lighting sweep; at a step
-/// of one cell the cache moved every 0.1 s of walking and a sweep was running
-/// in nearly every frame (a forest walk spent about 6 ms a frame on lighting). At
-/// 8 m a walker re-centres every couple of seconds, each time copying what is
-/// still inside and lighting only the strip that entered, and the camera stays
-/// between 24 and 40 m from the cache's edge.
-const RECENTRE_STEP_H_M: f32 = 8.0;
-const RECENTRE_STEP_V_M: f32 = 4.0;
-
 /// Where to put the camera-local cache so `center` (metres) sits inside it:
-/// about 32 m either side horizontally, 16 m below and 48 m above vertically,
-/// snapped to [`RECENTRE_STEP_H_M`] / [`RECENTRE_STEP_V_M`] (multiples of the
-/// 0.5 m cell, so world voxels of 0.25 m align with cells).
+/// 32 m either side horizontally, 16 m below and 48 m above vertically,
+/// snapped to the 0.5 m grid so world voxels of 0.25 m align with cells.
 pub fn cache_origin_around(center: Vec3) -> Vec3 {
-    let snap = |v: f32, step: f32| (v / step).floor() * step;
+    let snap = |v: f32| (v / LIGHT_CELL_SIZE_METRES).floor() * LIGHT_CELL_SIZE_METRES;
     let half = LIGHT_VOLUME_DIM as f32 * LIGHT_CELL_SIZE_METRES * 0.5;
     Vec3::new(
-        snap(center.x - half, RECENTRE_STEP_H_M),
-        snap(center.y - 16.0, RECENTRE_STEP_V_M),
-        snap(center.z - half, RECENTRE_STEP_H_M),
+        snap(center.x - half),
+        snap(center.y - 16.0),
+        snap(center.z - half),
     )
 }
 
@@ -122,6 +110,92 @@ pub const SLICE_COUNT: u32 = 32;
 /// as many slices (16 to 128) as this takes, from the cost of recent slices, so
 /// a slower GPU takes more frames over a sweep instead of dropping frames.
 pub const TARGET_SLICE_MS: f64 = 4.0;
+
+/// How much of the frame budget the lighting cache may use, from none to all
+/// the rays. The cache is derived, client-local lighting; this changes how it is
+/// computed, never the world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LightingQuality {
+    /// No skylight cache and no bounce: flat ambient light.
+    Off,
+    /// Skylight visibility only (interiors and shade are dark), no bounce
+    /// light, and the cache re-centres less often.
+    Low,
+    /// Bounce with 42 rays per cell.
+    Medium,
+    /// All 66 rays per cell and the full slice budget.
+    #[default]
+    High,
+}
+
+impl LightingQuality {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Low, Self::Medium, Self::High];
+
+    /// Rays each cell casts for its bounce (0 when there is no bounce).
+    pub fn rays(self) -> u32 {
+        match self {
+            Self::Off | Self::Low => 0,
+            Self::Medium => 42,
+            Self::High => 66,
+        }
+    }
+
+    /// The most GPU time one slice of a lighting sweep should take, ms.
+    pub fn slice_target_ms(self) -> f64 {
+        match self {
+            Self::Off | Self::High => TARGET_SLICE_MS,
+            Self::Low => 1.5,
+            Self::Medium => 2.5,
+        }
+    }
+
+    /// Whether the diffuse bounce is computed at all.
+    pub fn bounce(self) -> bool {
+        !matches!(self, Self::Off | Self::Low)
+    }
+
+    /// How far (metres) the player may drift from where the cache was centred
+    /// before it is re-centred: a re-centre starts a sweep, and walking
+    /// re-centres every drift's worth of travel. The cache reaches 32 m each
+    /// way, so the larger drifts leave less lit ground ahead of the player.
+    pub fn anchor_drift_m(self) -> f64 {
+        match self {
+            Self::Off | Self::High => 8.0,
+            Self::Medium => 12.0,
+            Self::Low => 16.0,
+        }
+    }
+
+    /// How far (degrees) the sun must move before the bounce is lit again.
+    pub fn sun_relight_degrees(self) -> f32 {
+        match self {
+            Self::Off | Self::High => SUN_RELIGHT_DEGREES,
+            Self::Medium => 8.0,
+            Self::Low => 12.0,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|q| q.name().eq_ignore_ascii_case(text.trim()))
+    }
+
+    /// The next quality, wrapping from High to Off.
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|q| *q == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
 const MIN_SLICES: u32 = 32;
 const MAX_SLICES: u32 = 128;
 
@@ -584,6 +658,7 @@ impl SkyPipeline {
                 environment: None,
                 bounce_environment: None,
                 bounce_enabled: true,
+                quality: LightingQuality::High,
                 populated: false,
                 base: Vec::new(),
                 bodies: HashMap::new(),
@@ -665,6 +740,7 @@ struct State {
     /// a perceptible change so a moving clock cannot continually restart it.
     bounce_environment: Option<Environment>,
     bounce_enabled: bool,
+    quality: LightingQuality,
     populated: bool,
     /// The terrain occupancy last supplied, so a body that leaves a cell
     /// restores what was underneath instead of erasing it.
@@ -701,15 +777,14 @@ struct State {
 /// a slice stays near [`TARGET_SLICE_MS`], a power of two between
 /// [`MIN_SLICES`] and [`MAX_SLICES`]. Before any slice has been timed (or with
 /// no timestamp queries) it is [`SLICE_COUNT`].
-fn slices_for(layer_ms: Option<f64>, work_fraction: f64) -> u32 {
+fn slices_for(layer_ms: Option<f64>, work_fraction: f64, target_ms: f64) -> u32 {
     let Some(layer_ms) = layer_ms.filter(|ms| ms.is_finite() && *ms > 0.0) else {
         return SLICE_COUNT;
     };
     // A scrolled sweep lights only a share of the cache, so it needs fewer
     // slices (down to 8) for the same cost per slice.
     let floor = if work_fraction < 0.5 { 8 } else { MIN_SLICES };
-    let wanted =
-        (layer_ms * work_fraction * f64::from(LIGHT_VOLUME_DIM) / TARGET_SLICE_MS).ceil() as u32;
+    let wanted = (layer_ms * work_fraction * f64::from(LIGHT_VOLUME_DIM) / target_ms).ceil() as u32;
     wanted.next_power_of_two().clamp(floor, MAX_SLICES)
 }
 
@@ -720,8 +795,12 @@ fn slices_for(layer_ms: Option<f64>, work_fraction: f64) -> u32 {
 /// bounce's direction is a soft, blocky term that 5 degrees does not change.
 const SUN_RELIGHT_DEGREES: f32 = 5.0;
 
-fn bounce_environment_changed(previous: Environment, current: Environment) -> bool {
-    let direction_cos = SUN_RELIGHT_DEGREES.to_radians().cos();
+fn bounce_environment_changed(
+    previous: Environment,
+    current: Environment,
+    sun_degrees: f32,
+) -> bool {
+    let direction_cos = sun_degrees.to_radians().cos();
     previous
         .sun_dir
         .normalize()
@@ -896,7 +975,7 @@ impl SkyVisibility {
         let [gr, gg, gb] = environment.ground;
         let globals = BounceGlobals {
             origin_cell_size: [o.x, o.y, o.z, LIGHT_CELL_SIZE_METRES],
-            dimensions: [LIGHT_VOLUME_DIM, SKY_MAX_RAY_CELLS, 0, 0],
+            dimensions: [LIGHT_VOLUME_DIM, SKY_MAX_RAY_CELLS, state.quality.rays(), 0],
             sun_dir: environment.sun_dir.extend(0.0).to_array(),
             sun_radiance: [
                 sr * environment.sun_intensity,
@@ -1026,10 +1105,9 @@ impl SkyVisibility {
         }
         state.environment = Some(*environment);
         self.write_bounce_globals(queue, &state, environment);
-        if state
-            .bounce_environment
-            .is_some_and(|previous| !bounce_environment_changed(previous, *environment))
-        {
+        if state.bounce_environment.is_some_and(|previous| {
+            !bounce_environment_changed(previous, *environment, state.quality.sun_relight_degrees())
+        }) {
             return;
         }
         state.bounce_environment = Some(*environment);
@@ -1045,6 +1123,32 @@ impl SkyVisibility {
 
     /// Switch the bounce on or off. Off skips the pass and the shader adds no
     /// bounce; sky visibility is unaffected.
+    /// Sets how much lighting is computed: the bounce's rays per cell and how
+    /// thin its sweep slices are, or none at all for `Off`. A change relights
+    /// the bounce.
+    pub fn set_quality(&self, queue: &wgpu::Queue, quality: LightingQuality) {
+        let changed = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.quality == quality {
+                false
+            } else {
+                state.quality = quality;
+                if let Some(environment) = state.environment {
+                    self.write_bounce_globals(queue, &state, &environment);
+                }
+                true
+            }
+        };
+        if changed {
+            self.set_bounce_enabled(queue, quality.bounce());
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if quality.bounce() {
+                state.pending.bounce_only = true;
+                state.note_change();
+            }
+        }
+    }
+
     pub fn set_bounce_enabled(&self, queue: &wgpu::Queue, enabled: bool) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.bounce_enabled == enabled {
@@ -1222,7 +1326,7 @@ impl SkyVisibility {
                 let fraction = scroll.map_or(1.0, scroll_work_fraction);
                 state.running = Some(Running {
                     next_slice: 0,
-                    slices: slices_for(state.layer_ms, fraction),
+                    slices: slices_for(state.layer_ms, fraction, state.quality.slice_target_ms()),
                     scroll,
                     full: false,
                     sky: true,
@@ -1244,7 +1348,7 @@ impl SkyVisibility {
                 }
                 state.running = Some(Running {
                     next_slice: 0,
-                    slices: slices_for(state.layer_ms, 1.0),
+                    slices: slices_for(state.layer_ms, 1.0, state.quality.slice_target_ms()),
                     scroll: None,
                     full: p.full,
                     sky,
@@ -1446,6 +1550,34 @@ impl SkyVisibility {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn lighting_quality_levels_order_cost_and_round_trip_by_name() {
+        use LightingQuality::*;
+        assert_eq!(LightingQuality::default(), High);
+        assert_eq!(
+            [Off.rays(), Low.rays(), Medium.rays(), High.rays()],
+            [0, 0, 42, 66]
+        );
+        assert_eq!(
+            [Off.bounce(), Low.bounce(), Medium.bounce(), High.bounce()],
+            [false, false, true, true]
+        );
+        assert!(Low.slice_target_ms() < Medium.slice_target_ms());
+        assert!(Medium.slice_target_ms() < High.slice_target_ms());
+        for q in LightingQuality::ALL {
+            assert_eq!(LightingQuality::parse(q.name()), Some(q));
+            assert_eq!(LightingQuality::parse(&q.name().to_lowercase()), Some(q));
+        }
+        assert_eq!(LightingQuality::parse("ultra"), None);
+        // Cycling visits every level and comes back.
+        let mut q = Off;
+        for _ in 0..4 {
+            q = q.next();
+        }
+        assert_eq!(q, Off);
+        assert_eq!(High.next(), Off);
+    }
     use super::*;
 
     #[test]

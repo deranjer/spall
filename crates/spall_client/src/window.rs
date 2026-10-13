@@ -181,6 +181,8 @@ pub enum ShotStep {
     Skylight(bool),
     /// Diffuse bounce on or off, without a screenshot.
     Bounce(bool),
+    /// Lighting quality (`lighting:off|low|medium|high`), without a screenshot.
+    Lighting(spall_render::sky_visibility::LightingQuality),
     /// Switch the environment preset (`daylight`, `night`...) without a
     /// screenshot.
     Environment(EnvironmentPreset),
@@ -239,6 +241,11 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
             "sky:off" => Ok(ShotStep::Skylight(false)),
             "bounce:on" => Ok(ShotStep::Bounce(true)),
             "bounce:off" => Ok(ShotStep::Bounce(false)),
+            s if s.starts_with("lighting:") => {
+                spall_render::sky_visibility::LightingQuality::parse(&s["lighting:".len()..])
+                    .map(ShotStep::Lighting)
+                    .ok_or_else(|| format!("unknown lighting quality `{step}`"))
+            }
             _ => {
                 let v: Vec<f32> = step
                     .split(',')
@@ -436,6 +443,12 @@ struct InteractiveApp {
     sky_visibility_on: bool,
     /// `F6`: the one-diffuse-bounce term (colour bleed, emissive light).
     bounce_on: bool,
+    /// How much lighting is computed (`F7`, the menu, or `SPALL_LIGHTING`).
+    lighting: spall_render::sky_visibility::LightingQuality,
+    /// Whether `lighting` has been sent to the renderer yet.
+    lighting_applied: bool,
+    /// The lighting quality as an index, shared with the rebuild worker.
+    lighting_index: Arc<std::sync::atomic::AtomicU8>,
     held: HeldKeys,
     yaw: f32,
     pitch: f32,
@@ -807,6 +820,7 @@ pub fn rebuild_sky(
         last_sky,
         absent_is_open,
         false,
+        SKY_ANCHOR_DRIFT_M,
     );
     (sky, stats, elapsed)
 }
@@ -824,6 +838,7 @@ fn rebuild_sky_deferring(
     last_sky: &mut Option<spall_render::indirect::LightingVolume>,
     absent_is_open: bool,
     defer_minor: bool,
+    drift_m: f64,
 ) -> (
     Option<spall_render::indirect::LightingVolume>,
     crate::sky::SkyOccupancyStats,
@@ -832,7 +847,7 @@ fn rebuild_sky_deferring(
 ) {
     let start = Instant::now();
     let sky_center = match *sky_anchor {
-        Some(anchor) if within_sky_anchor(anchor, center_m) => anchor,
+        Some(anchor) if within_sky_anchor(anchor, center_m, drift_m) => anchor,
         _ => center_m,
     };
     *sky_anchor = Some(sky_center);
@@ -980,6 +995,7 @@ impl RebuildWorker {
         session: Arc<InteractiveSession>,
         absent_is_open: bool,
         emissive: Vec<bool>,
+        quality: Arc<std::sync::atomic::AtomicU8>,
     ) -> Result<Self, ClientError> {
         let (request_tx, request_rx) = mpsc::channel::<[f64; 3]>();
         let (result_tx, result_rx) = mpsc::channel();
@@ -1071,7 +1087,11 @@ impl RebuildWorker {
                     // rebuilt when the terrain changed or the player left the
                     // area the last grid was built around; rebuilding it on every
                     // step cost 15-40 ms for an identical result.
-                    let anchored = sky_anchor.is_some_and(|a| within_sky_anchor(a, center_m));
+                    let drift_m = spall_render::sky_visibility::LightingQuality::ALL
+                        [usize::from(quality.load(std::sync::atomic::Ordering::Relaxed)).min(3)]
+                    .anchor_drift_m();
+                    let anchored =
+                        sky_anchor.is_some_and(|a| within_sky_anchor(a, center_m, drift_m));
                     let emitters = emitter_cache.update(&volume, center_m, &emissive, &volatile);
                     let (sky, sky_stats, elapsed) =
                         if last_sky_generation == Some(generation) && anchored {
@@ -1093,6 +1113,11 @@ impl RebuildWorker {
                                 &mut last_sky,
                                 absent_is_open,
                                 defer_minor,
+                                spall_render::sky_visibility::LightingQuality::ALL[usize::from(
+                                    quality.load(std::sync::atomic::Ordering::Relaxed),
+                                )
+                                .min(3)]
+                                .anchor_drift_m(),
                             );
                             // Held: retry next pass instead of recording this generation.
                             if !held {
@@ -1441,6 +1466,10 @@ impl InteractiveApp {
         absent_is_open: bool,
     ) -> Result<Self, ClientError> {
         let emissive: Vec<bool> = render_materials.iter().map(|m| m.emissive > 0.0).collect();
+        let lighting = std::env::var("SPALL_LIGHTING")
+            .ok()
+            .and_then(|v| spall_render::sky_visibility::LightingQuality::parse(&v))
+            .unwrap_or_default();
         if let Some(radius) = options.view_distance_m {
             let radius = radius.clamp(MIN_VIEW_DISTANCE_M, MAX_VIEW_DISTANCE_M);
             VIEW_RADIUS_BITS.store(radius.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -1450,7 +1479,18 @@ impl InteractiveApp {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_view_radius_m(view_radius_m());
-        let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open, emissive)?;
+        let lighting_index = Arc::new(std::sync::atomic::AtomicU8::new(
+            spall_render::sky_visibility::LightingQuality::ALL
+                .iter()
+                .position(|q| *q == lighting)
+                .unwrap_or(3) as u8,
+        ));
+        let rebuild = RebuildWorker::spawn(
+            session.clone(),
+            absent_is_open,
+            emissive,
+            lighting_index.clone(),
+        )?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         Ok(Self {
             session,
@@ -1472,6 +1512,9 @@ impl InteractiveApp {
             sky_dirty: false,
             sky_visibility_on: std::env::var_os("SPALL_NO_SKYVIS").is_none(),
             bounce_on: std::env::var_os("SPALL_NO_BOUNCE").is_none(),
+            lighting,
+            lighting_index,
+            lighting_applied: false,
             held: HeldKeys::default(),
             // Face -Z at spawn, matching `PlayerInput::NEUTRAL`.
             yaw: 0.0,
@@ -1635,9 +1678,38 @@ impl InteractiveApp {
                 self.script_at = Some(now + Duration::from_secs(2));
                 return;
             }
+            ShotStep::Lighting(quality) => {
+                self.set_lighting(quality);
+                self.script_at = Some(now + Duration::from_secs(2));
+                return;
+            }
         };
         self.capture_due = true;
         self.script_at = Some(now + Duration::from_secs_f32(settle));
+    }
+
+    /// Sets the lighting quality: `Off` is flat ambient light, the others are
+    /// how many rays the bounce casts and how thinly a sweep is sliced.
+    fn set_lighting(&mut self, quality: spall_render::sky_visibility::LightingQuality) {
+        use spall_render::sky_visibility::LightingQuality;
+        self.lighting = quality;
+        self.lighting_index.store(
+            LightingQuality::ALL
+                .iter()
+                .position(|q| *q == quality)
+                .unwrap_or(3) as u8,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.sky_visibility_on = quality != LightingQuality::Off;
+        self.bounce_on = quality.bounce();
+        self.sky_dirty = true;
+        if let Some(renderer) = &self.renderer {
+            renderer
+                .scene
+                .set_lighting_quality(&renderer.queue, quality);
+            self.lighting_applied = true;
+        }
+        println!("spall-interactive: lighting quality {}", quality.name());
     }
 
     fn toggle_sky_visibility(&mut self) {
@@ -1923,6 +1995,10 @@ impl ApplicationHandler for InteractiveApp {
                         self.toggle_bounce();
                         return;
                     }
+                    KeyCode::F7 if held && !event.repeat => {
+                        self.set_lighting(self.lighting.next());
+                        return;
+                    }
                     KeyCode::F4 if held && !event.repeat => {
                         if let Some(renderer) = &mut self.renderer {
                             let view = next_debug_view(renderer.debug_view);
@@ -2083,6 +2159,18 @@ impl ApplicationHandler for InteractiveApp {
                     {
                         renderer.vegetation_terrain = Some((generation, volume.clone()));
                     }
+                }
+                if !self.lighting_applied {
+                    // The quality asked for at start (`SPALL_LIGHTING`).
+                    self.lighting_applied = true;
+                    if self.lighting == spall_render::sky_visibility::LightingQuality::Off {
+                        self.sky_visibility_on = false;
+                    }
+                    self.bounce_on = self.lighting.bounce() && self.bounce_on;
+                    self.sky_dirty = true;
+                    renderer
+                        .scene
+                        .set_lighting_quality(&renderer.queue, self.lighting);
                 }
                 if self.sky_dirty {
                     let occupancy = self.last_sky.as_ref().filter(|_| self.sky_visibility_on);
@@ -2306,6 +2394,7 @@ impl ApplicationHandler for InteractiveApp {
                                 self.admin_request_pending,
                                 self.sky_visibility_on,
                                 self.bounce_on,
+                                self.lighting.name(),
                                 renderer.day_cycle_enabled,
                                 renderer.day_clock_label.clone(),
                             )
@@ -2350,6 +2439,9 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 if menu_actions.toggle_bounce {
                     self.toggle_bounce();
+                }
+                if menu_actions.cycle_lighting {
+                    self.set_lighting(self.lighting.next());
                 }
                 if menu_actions.recentre {
                     self.recentre_view();
@@ -3973,6 +4065,7 @@ fn admin_menu_view(
     pending: bool,
     sky_visibility_on: bool,
     bounce_on: bool,
+    lighting: &'static str,
     day_cycle_enabled: bool,
     world_time: String,
 ) -> AdminMenuView {
@@ -4003,6 +4096,7 @@ fn admin_menu_view(
         water,
         sky_visibility_on,
         bounce_on,
+        lighting,
         day_cycle_enabled,
         world_time,
     }
@@ -4078,6 +4172,7 @@ const KEYBINDS: &[(&str, &str)] = &[
     ("F4", "Cycle render debug views"),
     ("F5", "Toggle visibility-aware skylight"),
     ("F6", "Toggle diffuse bounce"),
+    ("F7", "Cycle lighting quality"),
 ];
 
 /// What the admin menu shows this frame.
@@ -4092,6 +4187,8 @@ pub(super) struct AdminMenuView {
     pub sky_visibility_on: bool,
     /// Diffuse bounce (`F6`) is on.
     pub bounce_on: bool,
+    /// Lighting quality (`F7`), as a word.
+    pub lighting: &'static str,
     pub world_time: String,
     pub day_cycle_enabled: bool,
 }
@@ -4110,6 +4207,7 @@ pub(super) struct AdminMenuActions {
     pub set_dam_gate: Option<bool>,
     pub toggle_sky_visibility: bool,
     pub toggle_bounce: bool,
+    pub cycle_lighting: bool,
 }
 
 fn section(title: &'static str) {
@@ -4280,6 +4378,17 @@ fn admin_menu_panel(
                                 }
                             });
                         });
+                        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                            if yakui::button(format!("F7 Lighting quality: {}", view.lighting))
+                                .clicked
+                            {
+                                actions.cycle_lighting = true;
+                            }
+                        });
+                        muted(
+                            12.0,
+                            "Quality: Off = flat ambient, Low = skylight only, Medium / High = bounce light with fewer / more rays.",
+                        );
                         muted(
                             12.0,
                             "F5 off = legacy flat ambient (no interior darkening, no bounce).",
@@ -4457,9 +4566,9 @@ fn next_debug_view(view: DebugView) -> DebugView {
 /// m, so 8 m of drift keeps every nearby surface well inside it.
 const SKY_ANCHOR_DRIFT_M: f64 = 8.0;
 
-fn within_sky_anchor(anchor: [f64; 3], center: [f64; 3]) -> bool {
+fn within_sky_anchor(anchor: [f64; 3], center: [f64; 3], drift_m: f64) -> bool {
     let horizontal = (anchor[0] - center[0]).hypot(anchor[2] - center[2]);
-    horizontal <= SKY_ANCHOR_DRIFT_M && (anchor[1] - center[1]).abs() <= SKY_ANCHOR_DRIFT_M
+    horizontal <= drift_m && (anchor[1] - center[1]).abs() <= drift_m
 }
 
 /// One cube drawn by the shared `spall_render` instanced-cube path. The
@@ -5920,13 +6029,25 @@ mod input_tests {
     #[test]
     fn the_lighting_cache_only_recentres_after_real_movement() {
         let anchor = [10.0, 1.0, 10.0];
-        assert!(within_sky_anchor(anchor, [10.5, 1.0, 12.0]));
+        assert!(within_sky_anchor(
+            anchor,
+            [10.5, 1.0, 12.0],
+            SKY_ANCHOR_DRIFT_M
+        ));
         assert!(
-            within_sky_anchor(anchor, [15.0, 1.0, 16.0]),
+            within_sky_anchor(anchor, [15.0, 1.0, 16.0], SKY_ANCHOR_DRIFT_M),
             "6.4 m of drift is fine"
         );
-        assert!(!within_sky_anchor(anchor, [10.0, 1.0, 19.0]));
-        assert!(!within_sky_anchor(anchor, [10.0, 10.0, 10.0]));
+        assert!(!within_sky_anchor(
+            anchor,
+            [10.0, 1.0, 19.0],
+            SKY_ANCHOR_DRIFT_M
+        ));
+        assert!(!within_sky_anchor(
+            anchor,
+            [10.0, 10.0, 10.0],
+            SKY_ANCHOR_DRIFT_M
+        ));
     }
 
     #[test]
