@@ -14,6 +14,7 @@ pub mod fixtures;
 pub mod game_renderer;
 pub mod indirect;
 pub mod instances;
+pub mod occlusion;
 pub mod pipeline;
 pub(crate) mod probe;
 pub mod scene;

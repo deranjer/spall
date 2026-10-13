@@ -115,6 +115,11 @@ struct Globals {
     water_cam: [f32; 4],
     /// The water field's `xy` origin, cell size `z` and cells per side `w`.
     water_field: [f32; 4],
+    /// Distance fog colour (linear, the sky's horizon colour).
+    fog_color: [f32; 4],
+    /// Distance fog: `x` where it starts and `y` where it is complete, in
+    /// metres of horizontal distance from the camera; `y <= x` turns it off.
+    fog_range: [f32; 4],
 }
 
 /// Most point lights the opaque pass shades with at once (the nearest ones).
@@ -198,6 +203,8 @@ pub struct ScenePipeline {
     tone_layout: wgpu::BindGroupLayout,
     globals_buffer: wgpu::Buffer,
     point_lights: std::sync::Mutex<Vec<PointLight>>,
+    /// Distance fog start and end (metres); `[0, 0]` is off.
+    fog_range: std::sync::Mutex<[f32; 2]>,
     shadow_globals_buffers: Vec<wgpu::Buffer>,
     tone_globals_buffer: wgpu::Buffer,
     shadow_texture: wgpu::Texture,
@@ -221,6 +228,13 @@ pub struct ScenePipeline {
 impl ScenePipeline {
     /// Sets the point lights the next frames are shaded with (the first
     /// [`MAX_POINT_LIGHTS`] are used; pass the nearest ones).
+    /// Fades everything between `start_m` and `end_m` (horizontal metres from
+    /// the camera) into the sky's horizon colour, so terrain that is not drawn
+    /// past `end_m` does not pop in at the edge. `end_m <= start_m` turns it off.
+    pub fn set_fog_range(&self, start_m: f32, end_m: f32) {
+        *self.fog_range.lock().unwrap_or_else(|e| e.into_inner()) = [start_m, end_m];
+    }
+
     pub fn set_point_lights(&self, lights: &[PointLight]) {
         let mut slot = self.point_lights.lock().unwrap_or_else(|e| e.into_inner());
         slot.clear();
@@ -537,6 +551,7 @@ impl ScenePipeline {
             tone_layout,
             globals_buffer,
             point_lights: std::sync::Mutex::new(Vec::new()),
+            fog_range: std::sync::Mutex::new([0.0, 0.0]),
             shadow_globals_buffers,
             tone_globals_buffer,
             shadow_texture,
@@ -844,6 +859,15 @@ impl ScenePipeline {
             point_count,
             water_cam,
             water_field,
+            fog_color: {
+                let [r, g, b, _] = environment.background_linear().map(|v| v as f32);
+                // What the sky shader draws at the horizon.
+                [r * 0.96, g * 0.96, b * 0.96, 0.0]
+            },
+            fog_range: {
+                let [start, end] = *self.fog_range.lock().unwrap_or_else(|e| e.into_inner());
+                [start, end, 0.0, 0.0]
+            },
         };
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
         let water_view = water

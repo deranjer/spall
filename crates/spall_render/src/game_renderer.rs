@@ -229,6 +229,10 @@ pub struct GameRenderer {
     terrain_bounds: HashMap<BrickCoord, Aabb>,
     terrain_generation: u64,
     terrain_meshes_visible: bool,
+    /// Which chunks the camera pass skips because nothing of them shows.
+    occlusion: crate::occlusion::OcclusionCuller,
+    /// `SPALL_NO_OCCLUSION=1` draws every chunk in the frustum.
+    occlusion_enabled: bool,
     /// What each cascade's retained terrain depth was drawn from.
     shadow_cache: [Option<ShadowKey>; CASCADE_COUNT],
     body_meshes: HashMap<u64, DynamicMesh>,
@@ -354,6 +358,8 @@ impl GameRenderer {
             terrain_bounds: HashMap::new(),
             terrain_generation: 0,
             terrain_meshes_visible: true,
+            occlusion: crate::occlusion::OcclusionCuller::new(device),
+            occlusion_enabled: std::env::var_os("SPALL_NO_OCCLUSION").is_none(),
             shadow_cache: [None; CASCADE_COUNT],
             body_meshes: HashMap::new(),
             bodies: InstanceSet::new(),
@@ -402,12 +408,14 @@ impl GameRenderer {
         for coord in removed {
             self.terrain_meshes.remove(coord);
             self.terrain_bounds.remove(coord);
+            self.occlusion.forget(*coord);
         }
         const BUDGET: UploadBudget = UploadBudget {
             max_vertex_bytes: 128 << 20,
             max_index_bytes: 64 << 20,
         };
         for (coord, vertices, indices) in updates {
+            self.occlusion.forget(*coord);
             let mesh = GpuMesh::create(device, vertices, indices, BUDGET)?;
             if mesh.index_count == 0 {
                 self.terrain_meshes.remove(coord);
@@ -427,8 +435,20 @@ impl GameRenderer {
         Ok(())
     }
 
+    /// Fades the scene into the sky's horizon colour between `start_m` and
+    /// `end_m` metres from the camera; see [`ScenePipeline::set_fog_range`].
+    pub fn set_fog_range(&self, start_m: f32, end_m: f32) {
+        self.pipeline.set_fog_range(start_m, end_m);
+    }
+
     pub fn set_terrain_meshes_visible(&mut self, visible: bool) {
         self.terrain_meshes_visible = visible;
+    }
+
+    /// How many terrain chunks the camera pass drew last frame (the chunks in
+    /// the frustum that were not known to be hidden).
+    pub fn terrain_chunks_drawn(&self) -> usize {
+        self.occlusion.drawn
     }
 
     pub fn terrain_geometry_generation(&self) -> u64 {
@@ -859,6 +879,30 @@ impl GameRenderer {
             pass.set_bind_group(0, *bind, &[]);
             pass.draw(0..3, 0..1);
         }
+        // The chunks the camera pass draws: those in the frustum that are not
+        // known to be hidden (see `occlusion`).
+        let camera_chunks: Vec<(BrickCoord, Aabb)> = if self.terrain_meshes_visible {
+            let frustum = camera.frustum();
+            self.terrain_meshes
+                .keys()
+                .filter_map(|coord| {
+                    let bounds = *self.terrain_bounds.get(coord)?;
+                    frustum.intersects_aabb(bounds).then_some((*coord, bounds))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if self.occlusion_enabled {
+            self.occlusion.begin_frame(device, camera.position);
+        }
+        let mut draw_chunks: Vec<BrickCoord> = camera_chunks
+            .iter()
+            .map(|(coord, _)| *coord)
+            .filter(|coord| !self.occlusion_enabled || self.occlusion.should_draw(*coord))
+            .collect();
+        draw_chunks.sort_by_key(|coord| coord.sort_key());
+        self.occlusion.drawn = draw_chunks.len();
         let clear = [0.0, 0.0, 0.0, 1.0];
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -915,7 +959,7 @@ impl GameRenderer {
                     ),
                     &[],
                 );
-                self.draw_terrain_meshes(&mut pass, &camera.frustum());
+                self.draw_terrain_list(&mut pass, &draw_chunks);
             }
             if !self.body_meshes.is_empty() {
                 pass.set_pipeline(self.pipeline.opaque());
@@ -952,6 +996,16 @@ impl GameRenderer {
         } else {
             0
         };
+        if self.occlusion_enabled && self.terrain_meshes_visible {
+            self.occlusion.encode(
+                queue,
+                encoder,
+                self.target.depth_view(),
+                camera.view_projection(),
+                &camera_chunks,
+                camera.position,
+            );
+        }
         if self.transparent.count() > 0
             || self.water_surface.index_count > 0
             || water_grid_cells > 0
@@ -1035,6 +1089,8 @@ impl GameRenderer {
     /// Start the asynchronous timestamp readback for the frame just recorded.
     /// Call once after submitting the encoder passed to [`Self::render`].
     pub fn finish_timing(&mut self) {
+        // The occlusion batch recorded with this frame is read back too.
+        self.occlusion.after_submit();
         if let (Some(timer), Some(slot)) = (self.timer.as_mut(), self.timed_slot.take()) {
             timer.map(slot);
         }
@@ -1076,6 +1132,20 @@ impl GameRenderer {
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    }
+
+    fn draw_terrain_list<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        chunks: &[BrickCoord],
+    ) {
+        for coord in chunks {
+            if let Some(mesh) = self.terrain_meshes.get(coord) {
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
         }
     }
 

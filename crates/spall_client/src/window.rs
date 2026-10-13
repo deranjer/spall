@@ -414,6 +414,8 @@ struct InteractiveApp {
     /// Material index of the debug overlay colour (one past the manifest).
     debug_material: u32,
     uncapped: bool,
+    /// When the last frame was requested, for the uncapped frame limiter.
+    last_redraw: Instant,
     /// Scripted camera tour (`--shots`); empty for normal play.
     script: std::collections::VecDeque<ShotStep>,
     shots_dir: PathBuf,
@@ -1412,6 +1414,24 @@ impl Hud {
 }
 
 impl InteractiveApp {
+    /// The shortest time between frames. With vsync the display paces and this
+    /// is zero. Uncapped play is limited to `SPALL_MAX_FPS` frames a second
+    /// (default 240; 0 means no limit at all).
+    fn max_frame_interval(&self) -> Duration {
+        if !self.uncapped {
+            return Duration::ZERO;
+        }
+        let fps = std::env::var("SPALL_MAX_FPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(240.0);
+        if fps <= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(1.0 / fps)
+        }
+    }
+
     fn new(
         session: Arc<InteractiveSession>,
         environment: Environment,
@@ -1441,6 +1461,7 @@ impl InteractiveApp {
             render_materials,
             debug_material,
             uncapped: options.uncapped,
+            last_redraw: Instant::now(),
             script: options.shots.into(),
             shots_dir: options.shots_dir,
             script_at: None,
@@ -2445,9 +2466,7 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     eprintln!("spall-interactive: {line}");
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                // The next frame is requested by `about_to_wait`, which paces it.
             }
             _ => {}
         }
@@ -2478,9 +2497,20 @@ impl ApplicationHandler for InteractiveApp {
         }
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Without vsync nothing paces the loop: the loading screen ran at
+        // thousands of frames a second and starved the rest of the PC (the
+        // desktop shares the GPU). Wait until the next frame is due instead.
+        let interval = self.max_frame_interval();
+        let next = self.last_redraw + interval;
+        if interval.is_zero() || Instant::now() >= next {
+            self.last_redraw = Instant::now();
+            event_loop.set_control_flow(ControlFlow::Poll);
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next));
         }
     }
 }
@@ -4506,6 +4536,12 @@ fn window_size_from_env() -> Option<PhysicalSize<u32>> {
     ))
 }
 
+/// Distance fog covers this part of the view radius, from where it starts to
+/// where it is complete (a little inside the edge, so the last chunks are
+/// already the horizon's colour).
+const FOG_START_FRACTION: f32 = 0.62;
+const FOG_END_FRACTION: f32 = 0.97;
+
 /// Trees farther than this (metres) are drawn with half-resolution crowns.
 const LEAF_LOD_M: f32 = 36.0;
 
@@ -5429,6 +5465,18 @@ impl WorldRenderer {
             .map_err(|error| ClientError::Render(error.to_string()))?;
         self.scene
             .set_water_time(self.water_epoch.elapsed().as_secs_f32());
+        // Terrain, water and foliage stop at the view radius; fading them into
+        // the horizon over its outer third leaves nothing to pop at the edge.
+        // `SPALL_NO_FOG=1` turns it off for comparison.
+        let fog_radius = view_radius_m();
+        if std::env::var_os("SPALL_NO_FOG").is_some() {
+            self.scene.set_fog_range(0.0, 0.0);
+        } else {
+            self.scene.set_fog_range(
+                fog_radius * FOG_START_FRACTION,
+                fog_radius * FOG_END_FRACTION,
+            );
+        }
         while let Ok((id, instances)) = self.vegetation_worker.rx.try_recv() {
             if self.vegetation_job == Some(id) {
                 self.vegetation_job = None;

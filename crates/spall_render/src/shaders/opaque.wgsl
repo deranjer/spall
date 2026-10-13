@@ -24,6 +24,9 @@ struct Globals {
     water_cam: vec4<f32>,
     // Water field origin xz, cell size, cells per side.
     water_field: vec4<f32>,
+    // Distance fog: linear colour, and start / end in metres (end <= start: off).
+    fog_color: vec4<f32>,
+    fog_range: vec4<f32>,
 };
 struct Material { base_color: vec4<f32>, params: vec4<f32>, };
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -348,6 +351,16 @@ fn sample_indirect(world_pos: vec3<f32>, normal: vec3<f32>, base: vec3<f32>) -> 
 const WATER_NONE: f32 = -1.0e8;
 // Per-metre absorption in linear RGB: red dies first, blue last.
 const WATER_ABSORB: vec3<f32> = vec3<f32>(0.45, 0.11, 0.05);
+// Fades `color` into the horizon colour between the fog's start and end
+// distance (horizontal, from the camera), so geometry that stops being drawn at
+// the end distance leaves nothing to pop.
+fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    if globals.fog_range.y <= globals.fog_range.x { return color; }
+    let d = distance(world_pos.xz, globals.camera_pos.xz);
+    let t = smoothstep(globals.fog_range.x, globals.fog_range.y, d);
+    return mix(color, globals.fog_color.rgb, t);
+}
+
 // Water thinner than this (metres) is a film left on the ground, not water:
 // no fog, tint or caustics on the dry ground it sits on.
 const WATER_MIN_DEPTH_M: f32 = 0.04;
@@ -536,7 +549,7 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
     }
     let torch_light = base * point / PI;
     let lit = ambient + direct + moon_direct + (indirect + bounced) * sub_light + emission + torch_light;
-    return vec4<f32>(apply_water_view(lit, in.world_pos, probe_xz), mat.base_color.a);
+    return vec4<f32>(apply_fog(apply_water_view(lit, in.world_pos, probe_xz), in.world_pos), mat.base_color.a);
 }
 
 // Water surface sheet: the smoothed heightfield mesh, flat-shaded per triangle.
@@ -569,7 +582,7 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
         let sky = hemisphere_radiance(1.0) * vec3<f32>(0.55, 0.85, 1.0);
         var color = mix(mirror, sky, window) * voxel;
         color = water_fog(color, cam, in.world_pos, in.world_pos.y);
-        return vec4<f32>(color, clamp(mix(0.92, 0.18, window) * voxel, 0.0, 1.0));
+        return vec4<f32>(apply_fog(color, in.world_pos), clamp(mix(0.92, 0.18, window) * voxel, 0.0, 1.0));
     }
     let fresnel = 0.02 + 0.98 * pow(1.0 - cos_t, 5.0);
     let r = reflect(-v, n);
@@ -577,7 +590,7 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
     let glint = pow(max(dot(r, l), 0.0), 220.0) * globals.sun.w * 0.5;
     let tint = vec3<f32>(0.03, 0.17, 0.22) * (0.5 * dot(globals.sky_color.rgb, vec3<f32>(0.3, 0.59, 0.11)) + 0.1);
     let color = (sky * fresnel + globals.sun.rgb * glint + tint * (1.0 - fresnel)) * voxel;
-    return vec4<f32>(color, clamp((0.16 + fresnel * 0.8 + glint) * voxel, 0.0, 1.0));
+    return vec4<f32>(apply_fog(color, in.world_pos), clamp((0.16 + fresnel * 0.8 + glint) * voxel, 0.0, 1.0));
 }
 
 // ---- Water grid surface (presentation only) ----
@@ -789,7 +802,7 @@ fn water_ripple(p: vec2<f32>, t: f32) -> f32 {
         let sky = hemisphere_radiance(1.0) * vec3<f32>(0.55, 0.85, 1.0);
         var color = mix(mirror, sky, window);
         color = water_fog(color, cam, in.world_pos, in.world_pos.y);
-        return vec4<f32>(color, clamp(mix(0.92, 0.18, window), 0.0, 1.0) * cover);
+        return vec4<f32>(apply_fog(color, in.world_pos), clamp(mix(0.92, 0.18, window), 0.0, 1.0) * cover);
     }
 
     let fresnel = 0.02 + 0.98 * pow(1.0 - cos_t, 5.0);
@@ -826,5 +839,5 @@ fn water_ripple(p: vec2<f32>, t: f32) -> f32 {
 
     let body_alpha = 0.18 + 0.75 * fresnel + 0.55 * (1.0 - exp(-depth * 1.1)) + glint;
     let alpha = clamp(mix(body_alpha, 0.80, foam), 0.0, 1.0) * cover;
-    return vec4<f32>(color, alpha);
+    return vec4<f32>(apply_fog(color, in.world_pos), alpha);
 }
