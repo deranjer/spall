@@ -63,16 +63,28 @@ fn shader_constants() -> String {
 /// blocks; this one is distinguishable in debugging and counts.
 pub const UNKNOWN_CELL: u32 = u32::MAX;
 
+/// How far (metres) the camera moves before the cache is re-centred on it,
+/// horizontally and vertically. The origin is snapped to these steps, so it is
+/// also on the 0.5 m cell grid. A re-centre starts a lighting sweep; at a step
+/// of one cell the cache moved every 0.1 s of walking and a sweep was running
+/// in nearly every frame (a forest walk spent about 6 ms a frame on lighting). At
+/// 8 m a walker re-centres every couple of seconds, each time copying what is
+/// still inside and lighting only the strip that entered, and the camera stays
+/// between 24 and 40 m from the cache's edge.
+const RECENTRE_STEP_H_M: f32 = 8.0;
+const RECENTRE_STEP_V_M: f32 = 4.0;
+
 /// Where to put the camera-local cache so `center` (metres) sits inside it:
-/// 32 m either side horizontally, 16 m below and 48 m above vertically,
-/// snapped to the 0.5 m grid so world voxels of 0.25 m align with cells.
+/// about 32 m either side horizontally, 16 m below and 48 m above vertically,
+/// snapped to [`RECENTRE_STEP_H_M`] / [`RECENTRE_STEP_V_M`] (multiples of the
+/// 0.5 m cell, so world voxels of 0.25 m align with cells).
 pub fn cache_origin_around(center: Vec3) -> Vec3 {
-    let snap = |v: f32| (v / LIGHT_CELL_SIZE_METRES).floor() * LIGHT_CELL_SIZE_METRES;
+    let snap = |v: f32, step: f32| (v / step).floor() * step;
     let half = LIGHT_VOLUME_DIM as f32 * LIGHT_CELL_SIZE_METRES * 0.5;
     Vec3::new(
-        snap(center.x - half),
-        snap(center.y - 16.0),
-        snap(center.z - half),
+        snap(center.x - half, RECENTRE_STEP_H_M),
+        snap(center.y - 16.0, RECENTRE_STEP_V_M),
+        snap(center.z - half, RECENTRE_STEP_H_M),
     )
 }
 

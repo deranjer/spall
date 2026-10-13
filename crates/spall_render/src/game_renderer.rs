@@ -240,6 +240,9 @@ pub struct GameRenderer {
     /// Drawn lit but never shadow-casting (debug overlays).
     overlay: InstanceSet,
     vegetation: InstanceSet,
+    /// The foliage instances grouped by 16 m square, each with its bounds and
+    /// its range in `vegetation`, so a pass draws only the groups it can see.
+    vegetation_buckets: Vec<(Aabb, u32, u32)>,
     transparent: InstanceSet,
     /// The smoothed water surface sheet, drawn alpha-blended after the opaque
     /// scene.
@@ -365,6 +368,7 @@ impl GameRenderer {
             bodies: InstanceSet::new(),
             overlay: InstanceSet::new(),
             vegetation: InstanceSet::new(),
+            vegetation_buckets: Vec::new(),
             transparent: InstanceSet::new(),
             water_surface: DynamicMesh::new(device),
             water_grid: false,
@@ -573,7 +577,37 @@ impl GameRenderer {
         queue: &wgpu::Queue,
         instances: &[CubeInstance],
     ) -> u64 {
-        self.vegetation.set(device, queue, instances)
+        // Sorted into 16 m squares so each pass can cull whole squares.
+        const SQUARE_M: f32 = 16.0;
+        let key = |i: &CubeInstance| {
+            (
+                (i.offset[0] / SQUARE_M).floor() as i64,
+                (i.offset[2] / SQUARE_M).floor() as i64,
+            )
+        };
+        let mut sorted: Vec<CubeInstance> = instances.to_vec();
+        sorted.sort_by_key(|i| key(i));
+        self.vegetation_buckets.clear();
+        let mut start = 0;
+        while start < sorted.len() {
+            let square = key(&sorted[start]);
+            let mut end = start;
+            let mut lo = glam::Vec3::splat(f32::INFINITY);
+            let mut hi = glam::Vec3::splat(f32::NEG_INFINITY);
+            while end < sorted.len() && key(&sorted[end]) == square {
+                let i = &sorted[end];
+                let centre = glam::Vec3::from_array(i.offset);
+                // A rotated box reaches half its diagonal from its centre.
+                let reach = glam::Vec3::splat(glam::Vec3::from_array(i.size).length() * 0.5);
+                lo = lo.min(centre - reach);
+                hi = hi.max(centre + reach);
+                end += 1;
+            }
+            self.vegetation_buckets
+                .push((Aabb::new(lo, hi), start as u32, (end - start) as u32));
+            start = end;
+        }
+        self.vegetation.set(device, queue, &sorted)
     }
 
     /// Replace the debug overlay instances (lit, not shadow-casting).
@@ -813,7 +847,8 @@ impl GameRenderer {
                 self.draw_body_meshes(&mut pass);
                 pass.set_pipeline(self.pipeline.shadow_cube());
             }
-            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies, &self.vegetation]);
+            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies]);
+            self.draw_vegetation(&mut pass, &Frustum::from_view_projection(matrix));
         }
 
         // Recompute sky visibility / bounce when the occupancy, environment or
@@ -986,10 +1021,8 @@ impl GameRenderer {
                 ),
                 &[],
             );
-            self.draw_cubes(
-                &mut pass,
-                &[&self.terrain, &self.bodies, &self.vegetation, &self.overlay],
-            );
+            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies, &self.overlay]);
+            self.draw_vegetation(&mut pass, &camera.frustum());
         }
         let water_grid_cells = if self.water_grid {
             self.pipeline.water_field_dim()
@@ -1132,6 +1165,21 @@ impl GameRenderer {
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    }
+
+    /// Draws the foliage squares inside `frustum`.
+    fn draw_vegetation<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, frustum: &Frustum) {
+        let Some(buffer) = self.vegetation.buffer() else {
+            return;
+        };
+        pass.set_vertex_buffer(0, self.cube_vertices.slice(..));
+        pass.set_index_buffer(self.cube_indices.slice(..), wgpu::IndexFormat::Uint16);
+        pass.set_vertex_buffer(1, buffer.slice(..));
+        for (bounds, first, count) in &self.vegetation_buckets {
+            if frustum.intersects_aabb(*bounds) {
+                pass.draw_indexed(0..self.cube_index_count, 0, *first..*first + *count);
+            }
         }
     }
 

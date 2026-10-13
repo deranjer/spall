@@ -1470,8 +1470,8 @@ impl InteractiveApp {
             capture_due: false,
             last_sky: None,
             sky_dirty: false,
-            sky_visibility_on: true,
-            bounce_on: true,
+            sky_visibility_on: std::env::var_os("SPALL_NO_SKYVIS").is_none(),
+            bounce_on: std::env::var_os("SPALL_NO_BOUNCE").is_none(),
             held: HeldKeys::default(),
             // Face -Z at spawn, matching `PlayerInput::NEUTRAL`.
             yaw: 0.0,
@@ -4542,6 +4542,14 @@ fn window_size_from_env() -> Option<PhysicalSize<u32>> {
 const FOG_START_FRACTION: f32 = 0.62;
 const FOG_END_FRACTION: f32 = 0.97;
 
+/// The shortest time between foliage rebuilds. A rebuild takes tens of
+/// milliseconds on a worker thread and uploads megabytes, and while walking the
+/// terrain changes every frame as chunks stream in; rebuilding on every change
+/// kept a core busy and the upload queue full (a deep forest ran at half the
+/// frame rate with it, measured), for foliage that is a few hundred
+/// milliseconds late at most.
+const FOLIAGE_REBUILD_INTERVAL: Duration = Duration::from_millis(400);
+
 /// Trees farther than this (metres) are drawn with half-resolution crowns.
 const LEAF_LOD_M: f32 = 36.0;
 
@@ -4768,6 +4776,8 @@ pub(super) struct WorldRenderer {
     /// surfaces from, with the replica generation it was taken at.
     vegetation_terrain: Option<(u64, Volume)>,
     vegetation_key: Option<VegetationKey>,
+    /// When the foliage was last rebuilt, to space rebuilds out.
+    vegetation_built: Instant,
     vegetation_worker: VegetationWorker,
     vegetation_job: Option<u64>,
     vegetation_seq: u64,
@@ -5166,6 +5176,7 @@ impl WorldRenderer {
             vegetation_frame: None,
             vegetation_terrain: None,
             vegetation_key: None,
+            vegetation_built: Instant::now(),
             vegetation_worker: VegetationWorker::spawn(vegetation_material)?,
             vegetation_job: None,
             vegetation_seq: 0,
@@ -5502,6 +5513,7 @@ impl WorldRenderer {
                 );
                 if self.vegetation_job.is_none()
                     && self.vegetation_key != Some(key)
+                    && self.vegetation_built.elapsed() >= FOLIAGE_REBUILD_INTERVAL
                     && std::env::var_os("SPALL_NO_FOLIAGE").is_none()
                 {
                     self.vegetation_seq = self.vegetation_seq.wrapping_add(1);
@@ -5520,6 +5532,7 @@ impl WorldRenderer {
                     {
                         self.vegetation_job = Some(id);
                         self.vegetation_key = Some(key);
+                        self.vegetation_built = Instant::now();
                     }
                 }
             } else {
