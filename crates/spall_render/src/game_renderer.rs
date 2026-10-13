@@ -867,6 +867,7 @@ impl GameRenderer {
         let (mut sky_ran, mut bounce_ran) = (false, false);
         if let Some(sky) = self.sky.as_ref() {
             sky.set_environment(queue, environment);
+            sky.set_focus(camera.position);
             let writes = |begin, end| {
                 timer.map(|timer| wgpu::ComputePassTimestampWrites {
                     query_set: &timer.queries,

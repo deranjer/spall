@@ -533,6 +533,12 @@ fn sky_visibility_cost_at_forest_scale() {
         );
         renderer.set_terrain(&ctx.device, &ctx.queue, terrain);
         renderer.set_bodies(&ctx.device, &ctx.queue, &bodies);
+        if let Some(q) = std::env::var("SPALL_TEST_QUALITY")
+            .ok()
+            .and_then(|v| spall_render::sky_visibility::LightingQuality::parse(&v))
+        {
+            renderer.set_lighting_quality(&ctx.queue, q);
+        }
         if with_sky {
             renderer.set_sky_occupancy(&ctx.device, &ctx.queue, Some(&occupancy));
         }

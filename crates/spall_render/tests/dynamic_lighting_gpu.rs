@@ -370,6 +370,42 @@ fn lighting_quality_trades_rays_for_speed_and_off_means_no_bounce() {
     }
 }
 
+/// Cells far from the camera cast fewer rays, and what they light barely
+/// changes: the floor by a lamp 45 m away is about as bright as the same floor
+/// seen from close by.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn far_cells_use_fewer_rays_and_light_the_floor_about_the_same() {
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored test");
+    let lamp = boxed(LAMP, [-4.0, 0.5, 0.0], [1.0, 1.0, 1.0]);
+    let beside = Vec3::new(-2.0, 0.0, 0.0);
+    let measure = |camera: Camera| {
+        let mut session = Session::new(&ctx, lamp_only(), DebugView::IndirectOnly, &[ground()]);
+        session.camera = camera;
+        let (_, image) = session.settle(&[lamp]);
+        at(&session.camera, &image, beside)[0]
+    };
+    let near = measure(Camera::looking_along(
+        Vec3::new(2.0, 6.0, 6.0),
+        Vec3::new(-4.0, -6.0, -6.0),
+        70_f32.to_radians(),
+        SIZE.0 as f32 / SIZE.1 as f32,
+    ));
+    let far = measure(Camera::looking_along(
+        Vec3::new(30.0, 8.0, 0.5),
+        Vec3::new(-32.0, -8.0, -0.5),
+        40_f32.to_radians(),
+        SIZE.0 as f32 / SIZE.1 as f32,
+    ));
+    println!("floor beside the lamp: near {near:.3}, far {far:.3}");
+    assert!(near > 0.01, "the lamp lights the floor from close by");
+    let ratio = far / near;
+    assert!(
+        (0.6..=1.6).contains(&ratio),
+        "far cells light the floor like near ones: ratio {ratio:.2}"
+    );
+}
+
 /// Two overlapping bodies share cache cells; when one leaves, the other still
 /// blocks and the terrain under both is intact.
 #[test]

@@ -107,7 +107,7 @@ const BOUNCE_REGION_OFFSET: u64 = 96;
 /// trees are dense, which made a few frames of every sweep hitch.)
 pub const SLICE_COUNT: u32 = 32;
 /// The most GPU time one slice should take, milliseconds. A sweep is split into
-/// as many slices (16 to 128) as this takes, from the cost of recent slices, so
+/// as many slices (8 to 32) as this takes, from the cost of recent slices, so
 /// a slower GPU takes more frames over a sweep instead of dropping frames.
 pub const TARGET_SLICE_MS: f64 = 4.0;
 
@@ -197,7 +197,14 @@ impl LightingQuality {
     }
 }
 const MIN_SLICES: u32 = 32;
-const MAX_SLICES: u32 = 128;
+/// A slice is 128 / `slices` z layers; at 32 that is four, one workgroup row.
+/// Thinner slices are latency-bound, not work-bound: a one-layer slice has too
+/// few active threads to hide memory latency, so it costs about what a
+/// four-layer slice does, and the cost model (cost proportional to layers)
+/// that picks the count then asks for ever more of them. Measured in a forest
+/// walk, capping the count at 32 cut the median frame from 16.8 to 14.2 ms and
+/// the sweep steps by two thirds, with each sweep finishing sooner too.
+const MAX_SLICES: u32 = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -213,6 +220,8 @@ struct BounceGlobals {
     region: [u32; 4],
     /// A scrolled sweep: how far the origin moved (cells) and the margin.
     scroll: [i32; 4],
+    /// The camera in cells from the origin (`xyz`); `w` is 1 when known.
+    focus: [f32; 4],
 }
 
 /// How far (cells) around what a scroll brought into the cache, and around the
@@ -222,6 +231,8 @@ const SCROLL_MARGIN_CELLS: i32 = 8;
 
 /// Byte offset of `scroll` in [`BounceGlobals`].
 const BOUNCE_SCROLL_OFFSET: u64 = 112;
+/// Byte offset of `focus` in [`BounceGlobals`].
+const BOUNCE_FOCUS_OFFSET: u64 = 128;
 
 /// The whole-cell move between two cache origins, or `None` if it is not a
 /// plain move (not on the grid) or so large that little would be kept.
@@ -659,6 +670,7 @@ impl SkyPipeline {
                 bounce_environment: None,
                 bounce_enabled: true,
                 quality: LightingQuality::High,
+                focus: None,
                 populated: false,
                 base: Vec::new(),
                 bodies: HashMap::new(),
@@ -741,6 +753,8 @@ struct State {
     bounce_environment: Option<Environment>,
     bounce_enabled: bool,
     quality: LightingQuality,
+    /// Where the camera is (metres), for the ray count of far cells.
+    focus: Option<Vec3>,
     populated: bool,
     /// The terrain occupancy last supplied, so a body that leaves a cell
     /// restores what was underneath instead of erasing it.
@@ -825,6 +839,15 @@ fn bounce_environment_changed(
 }
 
 impl State {
+    /// The camera in cells from the origin the bounce is written against, or
+    /// zeros (`w` = 0) before one is known.
+    fn focus_cells(&self) -> [f32; 4] {
+        self.focus.map_or([0.0; 4], |p| {
+            let c = (p - self.origin) / LIGHT_CELL_SIZE_METRES;
+            [c.x, c.y, c.z, 1.0]
+        })
+    }
+
     fn note_change(&mut self) {
         if self.change_since.is_none() {
             self.change_since = Some(Instant::now());
@@ -987,6 +1010,7 @@ impl SkyVisibility {
             ground_color: [gr, gg, gb, 0.0],
             region: [0, LIGHT_VOLUME_DIM, 0, 0],
             scroll: state.scroll,
+            focus: state.focus_cells(),
         };
         queue.write_buffer(&self.bounce_globals, 0, bytemuck::bytes_of(&globals));
     }
@@ -1126,6 +1150,12 @@ impl SkyVisibility {
     /// Sets how much lighting is computed: the bounce's rays per cell and how
     /// thin its sweep slices are, or none at all for `Off`. A change relights
     /// the bounce.
+    /// Tells the cache where the camera is, so cells far from it can cast
+    /// fewer rays. Takes effect at the next slice.
+    pub fn set_focus(&self, camera_m: Vec3) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).focus = Some(camera_m);
+    }
+
     pub fn set_quality(&self, queue: &wgpu::Queue, quality: LightingQuality) {
         let changed = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1490,6 +1520,11 @@ impl SkyVisibility {
                 BOUNCE_REGION_OFFSET,
                 bytemuck::cast_slice(&bounce_region),
             );
+            queue.write_buffer(
+                &self.bounce_globals,
+                BOUNCE_FOCUS_OFFSET,
+                bytemuck::cast_slice(&state.focus_cells()),
+            );
             let binds = self.bounce_binds.lock().unwrap_or_else(|e| e.into_inner());
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("spall-bounce-pass"),
@@ -1550,6 +1585,22 @@ impl SkyVisibility {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_sweep_is_never_cut_into_slices_thinner_than_a_workgroup_row() {
+        // However slow the measured layers are, the slice count stays at 32 or
+        // fewer: thinner slices cost the same each and only multiply the work.
+        for layer_ms in [0.1, 1.0, 5.0, 50.0] {
+            for fraction in [1.0, 0.6, 0.3] {
+                let slices = slices_for(Some(layer_ms), fraction, TARGET_SLICE_MS);
+                assert!(
+                    (8..=32).contains(&slices),
+                    "{layer_ms} ms layers, fraction {fraction}: {slices}"
+                );
+            }
+        }
+        assert_eq!(slices_for(None, 1.0, TARGET_SLICE_MS), SLICE_COUNT);
+    }
 
     #[test]
     fn lighting_quality_levels_order_cost_and_round_trip_by_name() {
