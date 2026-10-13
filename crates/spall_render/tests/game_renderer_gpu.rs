@@ -434,7 +434,7 @@ fn foliage_shadows_follow_the_foliage_through_the_retained_depth() {
     );
     renderer.set_terrain(&ctx.device, &ctx.queue, &terrain);
     let cam = camera();
-    let mut frame = |renderer: &mut GameRenderer| {
+    let frame = |renderer: &mut GameRenderer| {
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
