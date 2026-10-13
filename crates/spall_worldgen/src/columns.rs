@@ -350,6 +350,15 @@ impl ColumnMap {
         self.size
     }
 
+    /// Leaves every column dry: no water surface anywhere, no river heads or
+    /// sinks. The ground is unchanged.
+    pub fn remove_water(&mut self) {
+        let n = self.size as usize;
+        self.water_surface = vec![0; n * n];
+        self.springs.clear();
+        self.sinks.clear();
+    }
+
     #[inline]
     fn idx(&self, x: i64, z: i64) -> usize {
         let max = i64::from(self.size) - 1;

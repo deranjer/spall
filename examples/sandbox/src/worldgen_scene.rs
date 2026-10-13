@@ -75,7 +75,11 @@ pub fn generate_with_season(
 ) -> Result<GeneratedScene, WorldgenSceneError> {
     let preset = Preset::from_name(preset)
         .ok_or_else(|| WorldgenSceneError::UnknownPreset(preset.into()))?;
-    let spec = WorldGenSpec::new(preset, seed, size_cells, crate::game::terrain_palette());
+    let mut spec = WorldGenSpec::new(preset, seed, size_cells, crate::game::terrain_palette());
+    // `SPALL_NO_WATER=1`: the same terrain with its lakes, rivers and sea dry.
+    if std::env::var_os("SPALL_NO_WATER").is_some() {
+        spec = spec.dry();
+    }
     let started = std::time::Instant::now();
     let (mut world, timings) = spall_worldgen::generate_with_timings(&spec)?;
     for (stage, elapsed) in [
