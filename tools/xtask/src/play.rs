@@ -346,6 +346,8 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     if args.client_authoritative {
         client_cmd.arg("--client-authoritative");
     }
+    // The window's debug report (F9) appends the end of the server's log.
+    client_cmd.env("SPALL_SERVER_LOG", &server_stderr);
     // Packaged launches have no terminal; the interactive client reports
     // failures through its own window/log. Development launches keep the
     // terminal visible for diagnostics.

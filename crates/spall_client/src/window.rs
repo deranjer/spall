@@ -63,6 +63,8 @@ use spall_core::MaterialManifest;
 /// Rows of a replacement water field uploaded per frame: a 1024-row field takes
 /// 16 frames.
 const WATER_UPLOAD_ROWS_PER_FRAME: u32 = 64;
+/// Frames of handler time the debug report summarises (about 10 s at 200 fps).
+const FRAME_HISTORY: usize = 2400;
 const DEFAULT_VIEW_RADIUS_M: f32 = crate::column_surface::DEFAULT_VIEW_RADIUS_M;
 /// The horizontal radius (metres) the terrain, and the water field, is
 /// drawn to. Set once at startup from `InteractiveOptions::view_distance_m`;
@@ -173,6 +175,8 @@ pub enum ShotStep {
     Move { seconds: f32, movement: [f32; 3] },
     /// Toggle the admin menu.
     Menu,
+    /// Copy the debug report, as `F9` does.
+    Report,
     /// Ask the server for an admin world reset.
     Reset,
     /// Pause without a screenshot.
@@ -191,7 +195,7 @@ pub enum ShotStep {
     Environment(EnvironmentPreset),
 }
 
-/// Parses `x,y,z,yaw,pitch;menu;reset;walk;wait:2;view:indirect_only;sky:off;
+/// Parses `x,y,z,yaw,pitch;menu;report;reset;walk;wait:2;view:indirect_only;sky:off;
 /// bounce:on` into steps.
 pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
     spec.split(';')
@@ -200,6 +204,7 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
         .map(|step| match step {
             "walk" => Ok(ShotStep::Walk),
             "menu" => Ok(ShotStep::Menu),
+            "report" => Ok(ShotStep::Report),
             "reset" => Ok(ShotStep::Reset),
             _ if step.starts_with("move:") => {
                 let v = step[5..]
@@ -479,6 +484,16 @@ struct InteractiveApp {
     pending_mesh_updates: Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
     pending_mesh_removed: Vec<BrickCoord>,
     pending_mesh_detail_only: Vec<BrickCoord>,
+    /// Handler time of the most recent frames (ms), for the debug report's
+    /// percentiles; the HUD line is the average of a moment.
+    frame_history: std::collections::VecDeque<f32>,
+    /// The last line the HUD printed, kept for the debug report.
+    last_hud_line: String,
+    /// What the last "copy debug report" did, shown in the menu for a while.
+    report_status: Option<(String, Instant)>,
+    /// `F9` was pressed; the next frame copies the report.
+    copy_report_key: bool,
+    started_at: Instant,
     /// [`BodyWorker`]'s most recently completed result — see that struct's
     /// doc for why this moved off the render thread entirely (first a
     /// blocking lock, then even a `try_lock`-gated build, both measurably
@@ -1676,6 +1691,11 @@ impl InteractiveApp {
             pending_mesh_updates: Vec::new(),
             pending_mesh_removed: Vec::new(),
             pending_mesh_detail_only: Vec::new(),
+            frame_history: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
+            last_hud_line: String::new(),
+            report_status: None,
+            copy_report_key: false,
+            started_at: Instant::now(),
             last_body_draws: Vec::new(),
             pose_stats: PoseStats::default(),
             show_terrain: true,
@@ -1782,6 +1802,10 @@ impl InteractiveApp {
             }
             ShotStep::Menu => {
                 self.admin_menu_open = !self.admin_menu_open;
+                0.5
+            }
+            ShotStep::Report => {
+                self.copy_report_key = true;
                 0.5
             }
             ShotStep::Reset => {
@@ -1925,6 +1949,177 @@ impl InteractiveApp {
 
     /// Looks straight ahead again and, while flying, returns the camera to
     /// the player.
+    /// Everything worth pasting when something looks wrong: where the player
+    /// is, how the frames have run, what the renderer and the water hold, and
+    /// which settings are on. Plain ASCII, one fact to a line.
+    fn debug_report(&self, view: Option<&InteractiveView>) -> String {
+        use std::fmt::Write as _;
+        let mut r = String::new();
+        let _ = writeln!(r, "SPALL DEBUG REPORT");
+        let _ = writeln!(
+            r,
+            "uptime {:.0} s | version {} | commit {} on {} (when built) | pid {}",
+            self.started_at.elapsed().as_secs_f32(),
+            env!("CARGO_PKG_VERSION"),
+            env!("SPALL_GIT_COMMIT"),
+            env!("SPALL_GIT_BRANCH"),
+            std::process::id(),
+        );
+        let _ = writeln!(
+            r,
+            "exe {} | args {}",
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+        );
+        let _ = writeln!(r, "\n-- Player --");
+        match view {
+            Some(v) => {
+                let p = v.predicted.position_m;
+                let _ = writeln!(
+                    r,
+                    "feet ({:.2}, {:.2}, {:.2}) m | cell ({}, {}, {}) | region ({}, {})",
+                    p[0],
+                    p[1],
+                    p[2],
+                    (p[0] * 4.0).floor() as i64,
+                    (p[1] * 4.0).floor() as i64,
+                    (p[2] * 4.0).floor() as i64,
+                    ((p[0] * 4.0).floor() as i64).div_euclid(32),
+                    ((p[2] * 4.0).floor() as i64).div_euclid(32),
+                );
+                let _ = writeln!(r, "server tick {}", v.server_tick);
+            }
+            None => {
+                let _ = writeln!(r, "no predicted player yet");
+            }
+        }
+        let _ = writeln!(
+            r,
+            "mode {} | yaw {:.1} deg pitch {:.1} deg{}",
+            if self.fly_eye.is_some() {
+                "flying"
+            } else {
+                "walking"
+            },
+            self.yaw.to_degrees(),
+            self.pitch.to_degrees(),
+            self.fly_eye
+                .map(|e| format!(" | fly eye ({:.2}, {:.2}, {:.2})", e.x, e.y, e.z))
+                .unwrap_or_default()
+        );
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            let _ = writeln!(r, "window {}x{}", size.width, size.height);
+        }
+
+        let _ = writeln!(r, "\n-- Frames --");
+        for line in frame_summary(&self.frame_history) {
+            let _ = writeln!(r, "{line}");
+        }
+        let _ = writeln!(r, "HUD (last report, one field a line):");
+        for field in self.last_hud_line.split(" | ") {
+            let _ = writeln!(r, "  {field}");
+        }
+
+        let _ = writeln!(r, "\n-- Lighting and sky --");
+        let _ = writeln!(
+            r,
+            "lighting quality {} | skylight {} | bounce {} | {}",
+            self.lighting.name(),
+            if self.sky_visibility_on { "on" } else { "off" },
+            if self.bounce_on { "on" } else { "off" },
+            self.hud.sky_report()
+        );
+        if let Some(renderer) = &self.renderer {
+            let _ = writeln!(
+                r,
+                "day cycle {} | {}",
+                if renderer.day_cycle_enabled {
+                    "on"
+                } else {
+                    "paused"
+                },
+                renderer.day_clock_label
+            );
+            let _ = writeln!(r, "render view {}", renderer.debug_view.stem());
+            let _ = writeln!(r, "{}", renderer.scene_report());
+            let _ = writeln!(
+                r,
+                "terrain chunks resident {} | drawn last frame {}",
+                renderer.scene.terrain_mesh_coords().count(),
+                renderer.scene.terrain_chunks_drawn()
+            );
+        }
+
+        let _ = writeln!(r, "\n-- Water (client) --");
+        {
+            let surface = self
+                .session
+                .column_surface
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let field = surface.field();
+            let _ = writeln!(
+                r,
+                "regions replicated {} | animating tiles {} | field {}x{} cells at origin ({:.1}, {:.1}) m",
+                surface.region_count(),
+                surface.animating_tiles(),
+                field.dim,
+                field.dim,
+                field.origin_xz[0],
+                field.origin_xz[1]
+            );
+        }
+        match std::env::var_os("SPALL_SERVER_LOG").map(std::path::PathBuf::from) {
+            Some(path) => {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let tail: Vec<&str> = text.lines().rev().take(12).collect();
+                let _ = writeln!(
+                    r,
+                    "\n-- Server log (last {} lines of {}) --",
+                    tail.len(),
+                    path.display()
+                );
+                for line in tail.into_iter().rev() {
+                    let _ = writeln!(r, "{line}");
+                }
+            }
+            None => {
+                let _ = writeln!(
+                    r,
+                    "server water and tick status are in the server's stderr log (not in this report)"
+                );
+            }
+        }
+
+        let _ = writeln!(r, "\n-- Settings --");
+        let _ = writeln!(
+            r,
+            "view radius {:.0} m | fog {:.0}%-{:.0}% of it | terrain LOD from {:?} m, {} level changes a pass | foliage rebuild every {:.1} s",
+            view_radius_m(),
+            FOG_START_FRACTION * 100.0,
+            FOG_END_FRACTION * 100.0,
+            TERRAIN_LOD_FROM_M,
+            TERRAIN_LOD_FLIPS_PER_PASS,
+            FOLIAGE_REBUILD_INTERVAL.as_secs_f32()
+        );
+        let mut vars: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| {
+                k.starts_with("SPALL_") || k.starts_with("RAYON") || k.starts_with("WGPU")
+            })
+            .collect();
+        vars.sort();
+        if vars.is_empty() {
+            let _ = writeln!(r, "no SPALL_* / RAYON* / WGPU* environment variables set");
+        }
+        for (k, v) in vars {
+            let _ = writeln!(r, "{k}={v}");
+        }
+        r
+    }
+
     fn recentre_view(&mut self) {
         self.yaw = 0.0;
         self.pitch = 0.0;
@@ -2085,6 +2280,10 @@ impl ApplicationHandler for InteractiveApp {
                         self.pending_capture = Some(
                             PathBuf::from(".local/screenshots").join(format!("spall-{stamp}.png")),
                         );
+                        return;
+                    }
+                    KeyCode::F9 if held && !event.repeat => {
+                        self.copy_report_key = true;
                         return;
                     }
                     KeyCode::F10 if held && !event.repeat => {
@@ -2558,6 +2757,11 @@ impl ApplicationHandler for InteractiveApp {
                                 self.lighting.name(),
                                 renderer.day_cycle_enabled,
                                 renderer.day_clock_label.clone(),
+                                self.report_status
+                                    .as_ref()
+                                    .filter(|(_, at)| at.elapsed() < Duration::from_secs(20))
+                                    .map(|(text, _)| text.clone()),
+                                frame_summary(&self.frame_history),
                             )
                         });
                         match renderer.finish_frame(
@@ -2578,6 +2782,11 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 };
                 self.hud.record_frame(&timing);
+                if self.frame_history.len() >= FRAME_HISTORY {
+                    self.frame_history.pop_front();
+                }
+                self.frame_history
+                    .push_back(handler_started.elapsed().as_secs_f32() * 1000.0);
                 if std::env::var_os("SPALL_FRAME_CSV").is_some() {
                     eprintln!(
                         "spall-frame-csv: {:.1},{:.2},{:.2},{:.2},{}",
@@ -2616,6 +2825,12 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 if menu_actions.recentre {
                     self.recentre_view();
+                }
+                if menu_actions.copy_debug_report || std::mem::take(&mut self.copy_report_key) {
+                    let report = self.debug_report(view.as_ref());
+                    let status = copy_report(&report);
+                    println!("spall-interactive: {status}");
+                    self.report_status = Some((status, Instant::now()));
                 }
                 if menu_actions.reset_world {
                     self.admin_request_pending = true;
@@ -2728,6 +2943,7 @@ impl ApplicationHandler for InteractiveApp {
                         window.set_title(&format!("Spall sandbox — interactive | {line}"));
                     }
                     eprintln!("spall-interactive: {line}");
+                    self.last_hud_line = line;
                 }
                 // The next frame is requested by `about_to_wait`, which paces it.
             }
@@ -4230,6 +4446,78 @@ fn clip_water_to_window(boxes: &[Instance], center_m: [f64; 3], out: &mut Vec<In
     }
 }
 
+/// Mean, percentiles and worst of the recent frames' handler time, and how many
+/// ran long, as a few lines.
+fn frame_summary(history: &std::collections::VecDeque<f32>) -> Vec<String> {
+    if history.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<f32> = history.iter().copied().collect();
+    sorted.sort_by(f32::total_cmp);
+    let n = sorted.len();
+    let at = |q: f32| sorted[((n as f32 - 1.0) * q).round() as usize];
+    let mean = sorted.iter().sum::<f32>() / n as f32;
+    let over = |ms: f32| sorted.iter().filter(|v| **v > ms).count();
+    let pct = |count: usize| 100.0 * count as f32 / n as f32;
+    vec![
+        format!(
+            "last {n} frames: mean {mean:.1} ms, p50 {:.1}, p90 {:.1}, p99 {:.1}, worst {:.1}",
+            at(0.5),
+            at(0.9),
+            at(0.99),
+            sorted[n - 1]
+        ),
+        format!(
+            "over 8 ms {:.1}%, over 16 ms {:.2}%, over 33 ms {:.2}%",
+            pct(over(8.0)),
+            pct(over(16.0)),
+            pct(over(33.0))
+        ),
+    ]
+}
+
+/// Puts `report` on the clipboard (Windows `clip`, macOS `pbcopy`, X11
+/// `xclip`) and always saves it beside the system temp files too; says what
+/// happened.
+fn copy_report(report: &str) -> String {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("spall-debug-report.txt");
+    let saved = std::fs::write(&path, report).is_ok();
+    let tool: &[(&str, &[&str])] = &[
+        ("clip", &[]),
+        ("pbcopy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+    ];
+    let mut copied = false;
+    for (program, args) in tool {
+        let child = std::process::Command::new(program)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { continue };
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(report.as_bytes());
+        }
+        drop(child.stdin.take());
+        if child.wait().is_ok_and(|status| status.success()) {
+            copied = true;
+            break;
+        }
+    }
+    match (copied, saved) {
+        (true, true) => format!(
+            "Copied {} lines to the clipboard (also saved to {})",
+            report.lines().count(),
+            path.display()
+        ),
+        (true, false) => format!("Copied {} lines to the clipboard", report.lines().count()),
+        (false, true) => format!("No clipboard tool; saved the report to {}", path.display()),
+        (false, false) => "Could not copy or save the report".to_owned(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admin_menu_view(
     session: &InteractiveSession,
@@ -4240,6 +4528,8 @@ fn admin_menu_view(
     lighting: &'static str,
     day_cycle_enabled: bool,
     world_time: String,
+    report_status: Option<String>,
+    frame_summary: Vec<String>,
 ) -> AdminMenuView {
     let admin_status = match (
         pending,
@@ -4271,6 +4561,8 @@ fn admin_menu_view(
         lighting,
         day_cycle_enabled,
         world_time,
+        report_status,
+        frame_summary,
     }
 }
 
@@ -4345,6 +4637,7 @@ const KEYBINDS: &[(&str, &str)] = &[
     ("F5", "Toggle visibility-aware skylight"),
     ("F6", "Toggle diffuse bounce"),
     ("F7", "Cycle lighting quality"),
+    ("F9", "Copy a debug report to the clipboard"),
 ];
 
 /// What the admin menu shows this frame.
@@ -4363,6 +4656,10 @@ pub(super) struct AdminMenuView {
     pub lighting: &'static str,
     pub world_time: String,
     pub day_cycle_enabled: bool,
+    /// What the last debug-report copy did.
+    pub report_status: Option<String>,
+    /// A few lines of recent frame statistics, shown beside the copy button.
+    pub frame_summary: Vec<String>,
 }
 
 /// Buttons clicked in the admin menu this frame.
@@ -4380,6 +4677,7 @@ pub(super) struct AdminMenuActions {
     pub toggle_sky_visibility: bool,
     pub toggle_bounce: bool,
     pub cycle_lighting: bool,
+    pub copy_debug_report: bool,
 }
 
 fn section(title: &'static str) {
@@ -4672,6 +4970,21 @@ fn admin_menu_panel(
                             .chain(environment.ground.iter_mut())
                         {
                             *channel *= d_sky;
+                        }
+                        section("Debug");
+                        yakui::row(|| {
+                            actions.copy_debug_report |=
+                                yakui::button("Copy debug report (F9)").clicked;
+                        });
+                        muted(
+                            12.0,
+                            "Copies position, frame statistics, lighting, water and settings as text.",
+                        );
+                        if let Some(status) = &view.report_status {
+                            yakui::text(13.0, status.clone());
+                        }
+                        for line in &view.frame_summary {
+                            muted(12.0, line.clone());
                         }
                     });
                 });
@@ -6039,6 +6352,24 @@ mod input_tests {
     use spall_core::BUTTON_JUMP;
 
     use super::*;
+
+    #[test]
+    fn the_frame_summary_reports_percentiles_and_long_frames() {
+        assert!(frame_summary(&std::collections::VecDeque::new()).is_empty());
+        let mut history = std::collections::VecDeque::new();
+        for _ in 0..98 {
+            history.push_back(4.0);
+        }
+        history.push_back(12.0);
+        history.push_back(40.0);
+        let lines = frame_summary(&history);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("last 100 frames"), "{}", lines[0]);
+        assert!(lines[0].contains("p50 4.0"), "{}", lines[0]);
+        assert!(lines[0].contains("worst 40.0"), "{}", lines[0]);
+        assert!(lines[1].contains("over 8 ms 2.0%"), "{}", lines[1]);
+        assert!(lines[1].contains("over 33 ms 1.00%"), "{}", lines[1]);
+    }
 
     #[test]
     fn terrain_lod_follows_distance_with_hysteresis_and_new_chunks_use_the_plain_edge() {

@@ -579,6 +579,19 @@ More regions stay active (they go quiet at a slower pace), which costs memory
 bandwidth rather than CPU. A catch-up hitch when a player arrives at a far lake
 has not been measured in the game.
 
+Debug report (`F9`, or "Copy debug report" in the `F10` menu): copies a plain
+text report to the clipboard (Windows `clip`, `pbcopy`, `xclip`) and saves it to
+`spall-debug-report.txt` in the system temp directory. It holds the build (git
+commit and branch when built, command line), the player's position, cell and
+region, camera mode, window size, the last 2400 frames' handler time (mean,
+p50/p90/p99, worst, share over 8/16/33 ms), the HUD's last line one field per
+line (GPU passes, chunks, tris, lighting sweep, corrections), lighting settings
+and time of day, resident and drawn chunks, the client's water field, the end of
+the server's stderr log (when launched by `xtask play`, which sets
+`SPALL_SERVER_LOG`; it carries the water status and slow-tick lines), the view
+radius, fog, LOD constants and every `SPALL_*`/`RAYON*`/`WGPU*` environment
+variable. A `report` step in `--shots` triggers it from a scripted run.
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale
