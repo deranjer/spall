@@ -210,6 +210,8 @@ impl PassTimer {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ShadowKey {
     matrix: [f32; 16],
+    /// The terrain generation this depth was drawn at; later changes that miss
+    /// the cascade's box leave it valid (see `terrain_changes`).
     terrain_generation: u64,
     terrain_visible: bool,
 }
@@ -228,6 +230,9 @@ pub struct GameRenderer {
     terrain_meshes: HashMap<BrickCoord, GpuMesh>,
     terrain_bounds: HashMap<BrickCoord, Aabb>,
     terrain_generation: u64,
+    /// Where the terrain changed, by generation: a cascade's retained depth is
+    /// stale only if a change since it was drawn touches its box.
+    terrain_changes: Vec<(u64, Aabb)>,
     terrain_meshes_visible: bool,
     /// Which chunks the camera pass skips because nothing of them shows.
     occlusion: crate::occlusion::OcclusionCuller,
@@ -360,6 +365,7 @@ impl GameRenderer {
             terrain_meshes: HashMap::new(),
             terrain_bounds: HashMap::new(),
             terrain_generation: 0,
+            terrain_changes: Vec::new(),
             terrain_meshes_visible: true,
             occlusion: crate::occlusion::OcclusionCuller::new(device),
             occlusion_enabled: std::env::var_os("SPALL_NO_OCCLUSION").is_none(),
@@ -406,10 +412,31 @@ impl GameRenderer {
         updates: &[(BrickCoord, Vec<GpuVertex>, Vec<u32>)],
         removed: &[BrickCoord],
     ) -> Result<(), crate::context::RenderError> {
-        if !updates.is_empty() || !removed.is_empty() {
+        self.update_terrain_meshes_detail(device, updates, removed, &[])
+    }
+
+    /// [`Self::update_terrain_meshes`], where the chunks in `detail_only` are
+    /// the same terrain meshed at another level of detail: the cascaded shadow
+    /// maps keep what they drew of them rather than redrawing the terrain.
+    pub fn update_terrain_meshes_detail(
+        &mut self,
+        device: &wgpu::Device,
+        updates: &[(BrickCoord, Vec<GpuVertex>, Vec<u32>)],
+        removed: &[BrickCoord],
+        detail_only: &[BrickCoord],
+    ) -> Result<(), crate::context::RenderError> {
+        let shadows_change = !removed.is_empty()
+            || updates
+                .iter()
+                .any(|(coord, _, _)| !detail_only.contains(coord));
+        if shadows_change {
             self.terrain_generation = self.terrain_generation.wrapping_add(1);
         }
+        let generation = self.terrain_generation;
         for coord in removed {
+            if let Some(old) = self.terrain_bounds.get(coord) {
+                self.terrain_changes.push((generation, *old));
+            }
             self.terrain_meshes.remove(coord);
             self.terrain_bounds.remove(coord);
             self.occlusion.forget(*coord);
@@ -420,6 +447,11 @@ impl GameRenderer {
         };
         for (coord, vertices, indices) in updates {
             self.occlusion.forget(*coord);
+            if !detail_only.contains(coord)
+                && let Some(old) = self.terrain_bounds.get(coord)
+            {
+                self.terrain_changes.push((generation, *old));
+            }
             let mesh = GpuMesh::create(device, vertices, indices, BUDGET)?;
             if mesh.index_count == 0 {
                 self.terrain_meshes.remove(coord);
@@ -432,7 +464,11 @@ impl GameRenderer {
                     min = min.min(p);
                     max = max.max(p);
                 }
-                self.terrain_bounds.insert(*coord, Aabb::new(min, max));
+                let bounds = Aabb::new(min, max);
+                if !detail_only.contains(coord) {
+                    self.terrain_changes.push((generation, bounds));
+                }
+                self.terrain_bounds.insert(*coord, bounds);
                 self.terrain_meshes.insert(*coord, mesh);
             }
         }
@@ -781,6 +817,15 @@ impl GameRenderer {
         let timer = self.timer.as_ref().filter(|_| self.timed_slot.is_some());
 
         let (light_matrices, _) = ScenePipeline::cascade_data(&camera, environment.sun_dir);
+        // Changes every cascade has already drawn past are no longer needed.
+        let oldest = self
+            .shadow_cache
+            .iter()
+            .map(|k| k.as_ref().map_or(0, |k| k.terrain_generation))
+            .min()
+            .unwrap_or(0);
+        self.terrain_changes
+            .retain(|(generation, _)| *generation > oldest);
         for (cascade, matrix) in light_matrices.into_iter().enumerate() {
             let bind = self
                 .pipeline
@@ -796,7 +841,18 @@ impl GameRenderer {
                 terrain_generation: self.terrain_generation,
                 terrain_visible: self.terrain_meshes_visible,
             };
-            let redraw_terrain = self.shadow_cache[cascade].as_ref() != Some(&key);
+            let redraw_terrain = match &self.shadow_cache[cascade] {
+                Some(cached)
+                    if cached.matrix == key.matrix
+                        && cached.terrain_visible == key.terrain_visible =>
+                {
+                    let frustum = Frustum::from_view_projection(matrix);
+                    self.terrain_changes.iter().any(|(generation, bounds)| {
+                        *generation > cached.terrain_generation && frustum.intersects_aabb(*bounds)
+                    })
+                }
+                _ => true,
+            };
             // One begin/end pair spans the whole cascade set.
             let timestamp_writes = |first: bool, last: bool| {
                 timer.and_then(|timer| {
@@ -834,6 +890,9 @@ impl GameRenderer {
                 }
                 drop(pass);
                 self.shadow_cache[cascade] = Some(key);
+            } else if let Some(cached) = self.shadow_cache[cascade].as_mut() {
+                // Nothing that changed touches this cascade: still valid.
+                cached.terrain_generation = key.terrain_generation;
             }
             self.pipeline.copy_static_shadow(encoder, cascade);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

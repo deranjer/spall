@@ -468,6 +468,38 @@ memory and local momentum-accuracy gates remain open. No default promotion
 follows from the passing motion gates. See docs/reports/ENG-122.md for the
 regularized inertia, unchanged gates and precise integration blocker.
 
+### Terrain level of detail (client renderer)
+
+Chunks far from the camera are meshed from a strided sample of their bricks
+(`spall_mesh::build_brick_mesh_lod`): blocks of 2 cells beyond 40 m, 4 cells
+beyond 72 m (3D distance from the camera to the chunk centre; 6 m hysteresis so
+a chunk standing on a line does not flip). A block is solid when at least a
+quarter of its cells are, so a two-cell trunk survives however it is aligned
+and flat ground rises by at most a quarter block; the fog (62%-97% of the view
+radius) hides the change. The coarse mesh reads exactly the bricks the fine one
+does, so its staleness token is unchanged. A chunk whose neighbour is meshed at
+another level closes that side (the neighbour reads as open air there), so each
+chunk carries its own skin and no crack opens at the seam.
+
+The client keeps each chunk's level and closed sides with its cached mesh and
+rebuilds when either changes. A walk crosses a shell of hundreds of chunks at
+once, and each change is a rebuild, an upload and (through the closed sides)
+rebuilds of the neighbours, so at most 24 chunks whose bricks are unchanged
+change level per rebuild pass, nearest first; the rest keep the level they
+have and catch up on the next passes. Such an upload is flagged detail-only and
+the renderer neither invalidates the cached shadow cascades for it, nor does a
+change that misses a cascade's box (the cascades are invalidated per change
+bounds now, not by one global generation). `SPALL_NO_TERRAIN_LOD=1` turns the
+levels off.
+
+Measured on the natural 4096 world, forest walk at 1928x931 (release, one GPU,
+same session): 104 fps median with levels against 87 without (frame 9.7 ms
+against 11.1 ms), terrain triangles 4.1M to 1.1M. Without the per-pass budget
+and the shadow change the same walk ran 51-56 fps against 62-78: every level
+change forced a shadow redraw and the worker rebuilt about 1000 chunks per 8 m
+walked. Standing: 8.1 ms to 7.5 ms in the open and 8.1 ms to 7.1 ms in forest.
+The runs are noisy by a few ms; GPU capture and other hardware are unrun.
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale
