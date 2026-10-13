@@ -60,6 +60,9 @@ use spall_core::MaterialManifest;
 /// the player was standing right in front of it — raised after user report.
 /// The brick walk in [`build_instances`] skips empty and buried space, so the
 /// window is tall enough for valley walls and a flying camera.
+/// Rows of a replacement water field uploaded per frame: a 1024-row field takes
+/// 16 frames.
+const WATER_UPLOAD_ROWS_PER_FRAME: u32 = 64;
 const DEFAULT_VIEW_RADIUS_M: f32 = crate::column_surface::DEFAULT_VIEW_RADIUS_M;
 /// The horizontal radius (metres) the terrain, and the water field, is
 /// drawn to. Set once at startup from `InteractiveOptions::view_distance_m`;
@@ -5285,6 +5288,10 @@ impl WorldRenderer {
         window: Option<[f64; 3]>,
     ) {
         self.water_rects_frame = 0;
+        // A field being replaced goes up a slice a frame (about a millisecond
+        // each) instead of stalling the frame that recentred it.
+        self.scene
+            .advance_water_upload(&self.queue, WATER_UPLOAD_ROWS_PER_FRAME);
         let Some(center) = window else {
             return;
         };
@@ -5318,8 +5325,16 @@ impl WorldRenderer {
             // The grid surface replaces the old mesh sheet.
             self.scene
                 .set_water_surface(&self.device, &self.queue, &[], &[]);
-            self.scene
-                .set_water_field(&self.device, &self.queue, Some(surface.field().clone()));
+            if self.water_grid_on {
+                self.scene
+                    .replace_water_field(&self.device, &self.queue, surface.field().clone());
+            } else {
+                self.scene.set_water_field(
+                    &self.device,
+                    &self.queue,
+                    Some(surface.field().clone()),
+                );
+            }
             self.scene.set_water_grid_surface(true);
             self.water_grid_on = true;
             finish(true, rects.len());

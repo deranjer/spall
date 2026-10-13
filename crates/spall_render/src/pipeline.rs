@@ -179,6 +179,20 @@ struct WaterState {
     field: Option<WaterField>,
     gpu: Option<(wgpu::Texture, wgpu::TextureView)>,
     time_s: f32,
+    /// A replacement field being uploaded a slice per frame (see
+    /// [`ScenePipeline::replace_water_field`]); the field above keeps drawing
+    /// until it is complete.
+    staged: Option<StagedWaterField>,
+    /// The texture of the field last replaced, kept for the next replacement.
+    spare: Option<(wgpu::Texture, wgpu::TextureView)>,
+}
+
+struct StagedWaterField {
+    field: WaterField,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// Rows uploaded so far.
+    next_row: u32,
 }
 
 pub struct ScenePipeline {
@@ -1025,6 +1039,108 @@ impl ScenePipeline {
         state.field = Some(field);
     }
 
+    /// Replaces the installed water field with `field` without a stall: the new
+    /// field is uploaded to a second texture a few rows a frame by
+    /// [`Self::advance_water_upload`], and the old one keeps drawing until the
+    /// last row is in, when they swap. Rectangle updates in the meantime are for
+    /// the new field. With no field installed yet, or one of another size, the
+    /// replacement is immediate (as [`Self::set_water_field`]).
+    pub fn replace_water_field(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        field: WaterField,
+    ) {
+        let immediate = {
+            let state = self.water.lock().unwrap_or_else(|e| e.into_inner());
+            state.gpu.is_none() || state.field.as_ref().is_none_or(|f| f.dim != field.dim)
+        };
+        if immediate {
+            self.set_water_field(device, queue, Some(field));
+            return;
+        }
+        let mut state = self.water.lock().unwrap_or_else(|e| e.into_inner());
+        // A staging still under way is dropped: its texture is reused.
+        let reuse = state
+            .staged
+            .take()
+            .map(|s| (s.texture, s.view))
+            .or_else(|| state.spare.take())
+            .filter(|(texture, _)| texture.width() == field.dim);
+        let (texture, view) = reuse.unwrap_or_else(|| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("spall-water-field-staged"),
+                size: wgpu::Extent3d {
+                    width: field.dim,
+                    height: field.dim,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            (texture, view)
+        });
+        state.staged = Some(StagedWaterField {
+            field,
+            texture,
+            view,
+            next_row: 0,
+        });
+    }
+
+    /// Uploads up to `rows` more rows of a field being replaced (see
+    /// [`Self::replace_water_field`]) and swaps it in when it is complete.
+    /// Returns whether a replacement is still under way.
+    pub fn advance_water_upload(&self, queue: &wgpu::Queue, rows: u32) -> bool {
+        let mut guard = self.water.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
+        let Some(staged) = state.staged.as_mut() else {
+            return false;
+        };
+        let dim = staged.field.dim;
+        let count = rows.min(dim - staged.next_row);
+        if count > 0 {
+            let texels = staged.field.texel_rect(0, staged.next_row, dim, count);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &staged.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: staged.next_row,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&texels),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(dim * 16),
+                    rows_per_image: Some(count),
+                },
+                wgpu::Extent3d {
+                    width: dim,
+                    height: count,
+                    depth_or_array_layers: 1,
+                },
+            );
+            staged.next_row += count;
+        }
+        if staged.next_row < dim {
+            return true;
+        }
+        let done = state.staged.take().expect("checked above");
+        state.spare = state.gpu.take();
+        state.gpu = Some((done.texture, done.view));
+        state.field = Some(done.field);
+        false
+    }
+
     /// Replaces a rectangle of the water field on the GPU and in the
     /// renderer's copy (which answers "is the camera under water"). `texels`
     /// are `(top, bottom, smooth, agitation + flow)` row by row (see
@@ -1041,7 +1157,14 @@ impl ScenePipeline {
     ) {
         let mut guard = self.water.lock().unwrap_or_else(|e| e.into_inner());
         let state = &mut *guard;
-        let (Some(field), Some((texture, _))) = (state.field.as_mut(), state.gpu.as_ref()) else {
+        // While a replacement is being uploaded the rectangles are for it: its
+        // rows not yet uploaded read this copy, the rest are written now.
+        let (field, texture) = if let Some(staged) = state.staged.as_mut() {
+            (&mut staged.field, &staged.texture)
+        } else if let (Some(field), Some((texture, _))) = (state.field.as_mut(), state.gpu.as_ref())
+        {
+            (field, texture)
+        } else {
             return;
         };
         if w == 0
@@ -1081,6 +1204,16 @@ impl ScenePipeline {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// World origin (x, z, metres) of the installed water field, if any.
+    pub fn water_field_origin(&self) -> Option<[f32; 2]> {
+        self.water
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .field
+            .as_ref()
+            .map(|f| f.origin_xz)
     }
 
     /// Cells per side of the installed water field, 0 if none.

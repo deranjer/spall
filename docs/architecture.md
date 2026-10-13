@@ -545,6 +545,15 @@ vary by about half a percentage point, and fewer threads let the water fall
 behind (2 threads: 48 s behind real time in 130 s). Not established: lowering the
 server's process priority (`SPALL_SERVER_PRIORITY=low` in `xtask play`).
 
+The water field's recentre no longer stalls a frame on its upload. A replacement
+field (`GameRenderer::replace_water_field`) goes to a second texture 64 rows a
+frame (16 frames for 1024 rows) while the old field keeps drawing, then swaps;
+rectangle updates in the meantime are for the new field. A recentre used to cost
+about 25 ms in one frame (2-7 ms CPU rebuild, 21 ms upload); it is now 8 ms
+(5.5-6.3 ms of it the CPU rebuild in `ColumnSurface::recentre`, still in one
+frame) and a millisecond a frame for 16 frames. The first install of a field is
+still immediate (17 ms once).
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale

@@ -727,6 +727,27 @@ impl GameRenderer {
         self.pipeline.set_water_field(device, queue, field);
     }
 
+    /// Replaces the water field a slice at a time (see
+    /// [`ScenePipeline::replace_water_field`]).
+    pub fn replace_water_field(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        field: crate::water::WaterField,
+    ) {
+        self.pipeline.replace_water_field(device, queue, field);
+    }
+
+    /// World origin (x, z, metres) of the water field currently drawn.
+    pub fn water_field_origin(&self) -> Option<[f32; 2]> {
+        self.pipeline.water_field_origin()
+    }
+
+    /// Uploads more of a field being replaced; call once a frame.
+    pub fn advance_water_upload(&mut self, queue: &wgpu::Queue, rows: u32) -> bool {
+        self.pipeline.advance_water_upload(queue, rows)
+    }
+
     /// Turns the smooth grid surface on or off. When on, the installed water
     /// field is drawn as a displaced grid (nothing is uploaded per frame but
     /// changed field rectangles), and the mesh sheet should be empty.
