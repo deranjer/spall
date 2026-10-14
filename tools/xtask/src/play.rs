@@ -257,6 +257,7 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         },
     )?));
     hide_console(&mut server_cmd);
+    lower_priority(&mut server_cmd);
     let mut guard = ChildGuard::default();
     let server_child = server_cmd.spawn().map_err(|source| XtaskError::Output {
         path: "sandbox-server (spawn)".into(),
@@ -345,6 +346,8 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     if args.client_authoritative {
         client_cmd.arg("--client-authoritative");
     }
+    // The window's debug report (F9) appends the end of the server's log.
+    client_cmd.env("SPALL_SERVER_LOG", &server_stderr);
     // Packaged launches have no terminal; the interactive client reports
     // failures through its own window/log. Development launches keep the
     // terminal visible for diagnostics.
@@ -418,6 +421,25 @@ fn hide_console(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn hide_console(_: &mut Command) {}
+
+/// With `SPALL_SERVER_PRIORITY=low`, starts the command below normal priority,
+/// so the server a local game runs beside its window (whose fluid threads
+/// compete with the render and driver threads) gives way to them. Off by
+/// default: one run of the lake walk went from 2.4% of frames over 16 ms to
+/// 1.2%, a repeat of a different setting did not, so it is not established.
+#[cfg(windows)]
+fn lower_priority(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    if !std::env::var("SPALL_SERVER_PRIORITY").is_ok_and(|v| v == "low") {
+        return;
+    }
+    command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+}
+
+#[cfg(not(windows))]
+fn lower_priority(_: &mut Command) {}
 
 #[cfg(test)]
 mod environment_tests {

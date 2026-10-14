@@ -1912,7 +1912,10 @@ async fn run_async(
                         if update.server_tick.get() < column_water_floor {
                             continue;
                         }
-                        match column_water.apply(&update) {
+                        let trace_started = std::time::Instant::now();
+                        let applied = column_water.apply(&update);
+                        let trace_apply_ms = trace_started.elapsed().as_secs_f64() * 1e3;
+                        match applied {
                             Ok(applied) => {
                                 let counter = if applied.baseline {
                                     &counters.water_keyframes
@@ -1935,10 +1938,13 @@ async fn run_async(
                                     .water_regions
                                     .store(column_water.region_count() as u64, Ordering::Relaxed);
                                 if let Some(session) = &interactive {
+                                    let lock_started = std::time::Instant::now();
                                     let mut surface = session
                                         .column_surface
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner());
+                                    let trace_lock_ms = lock_started.elapsed().as_secs_f64() * 1e3;
+                                    let surface_started = std::time::Instant::now();
                                     if applied.region_empty
                                         && column_water.region_spans(applied.key).is_empty()
                                     {
@@ -1947,6 +1953,17 @@ async fn run_async(
                                         let spans =
                                             column_water.window_spans(applied.key, update.window);
                                         surface.set_window(applied.key, update.window, &spans);
+                                    }
+                                    if crate::column_surface::water_trace() {
+                                        let surface_ms =
+                                            surface_started.elapsed().as_secs_f64() * 1e3;
+                                        if trace_apply_ms + trace_lock_ms + surface_ms > 0.5 {
+                                            eprintln!(
+                                                "spall-water-trace: t={:.1} net apply {trace_apply_ms:.2} ms, lock wait {trace_lock_ms:.2} ms, surface {surface_ms:.2} ms (baseline {})",
+                                                spall_render::trace_clock_ms(),
+                                                applied.baseline
+                                            );
+                                        }
                                     }
                                 }
                             }

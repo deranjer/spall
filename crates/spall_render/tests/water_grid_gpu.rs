@@ -462,3 +462,55 @@ fn a_current_carries_the_ripples_and_a_rapid_breaks_into_foam() {
         "foam brightens the rapid"
     );
 }
+
+/// A replacement field goes up a slice at a time and only then takes over: the
+/// old field draws until the last row is in, and a rectangle update meanwhile is
+/// for the new field.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn a_replacement_water_field_swaps_in_after_its_last_row() {
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored test");
+    let mut renderer = GameRenderer::new(
+        &ctx.device,
+        &ctx.queue,
+        COLOR_FORMAT,
+        &materials(),
+        SIZE,
+        None,
+    );
+    let field = |x: f32| spall_render::water::WaterField::new([x, 0.0], 0.25, 128);
+    renderer.replace_water_field(&ctx.device, &ctx.queue, field(0.0));
+    assert_eq!(
+        renderer.water_field_origin(),
+        Some([0.0, 0.0]),
+        "the first field installs at once"
+    );
+
+    renderer.replace_water_field(&ctx.device, &ctx.queue, field(32.0));
+    assert_eq!(renderer.water_field_origin(), Some([0.0, 0.0]));
+    // A rectangle for the new field while it uploads is accepted, and does not
+    // move the field being drawn.
+    renderer.update_water_field_rect(&ctx.queue, 4, 4, 1, 1, &[[1.0, 0.0, 1.0, 0.0]]);
+    assert!(
+        renderer.advance_water_upload(&ctx.queue, 64),
+        "64 of 128 rows"
+    );
+    assert_eq!(renderer.water_field_origin(), Some([0.0, 0.0]));
+    assert!(
+        !renderer.advance_water_upload(&ctx.queue, 64),
+        "the last rows"
+    );
+    assert_eq!(renderer.water_field_origin(), Some([32.0, 0.0]));
+    assert!(
+        !renderer.advance_water_upload(&ctx.queue, 64),
+        "nothing pending"
+    );
+
+    // A second replacement started before the first finished supersedes it.
+    renderer.replace_water_field(&ctx.device, &ctx.queue, field(64.0));
+    assert!(renderer.advance_water_upload(&ctx.queue, 64));
+    renderer.replace_water_field(&ctx.device, &ctx.queue, field(96.0));
+    assert!(renderer.advance_water_upload(&ctx.queue, 64));
+    assert!(!renderer.advance_water_upload(&ctx.queue, 64));
+    assert_eq!(renderer.water_field_origin(), Some([96.0, 0.0]));
+}

@@ -29,8 +29,12 @@ pub enum WorldgenSceneError {
     Vegetation(String),
 }
 
-/// A pipe quieter than this (cells^3/s) lets its region sleep.
-pub const WORLDGEN_SLEEP_FLOW: f32 = 0.1;
+/// A pipe quieter than this (cells^3/s, 8 mL/s at 0.5) lets its region sleep.
+/// At 0.1 a 4096 world's active regions climbed from 100 to about 450 in 15
+/// minutes with nobody walking (most of them carrying 0.1-1: slow currents),
+/// each step cost 14-40 ms and the water fell behind real time; at 0.5 they
+/// stay at 50-80 and a step costs about 1 ms (measured, seed 4).
+pub const WORLDGEN_SLEEP_FLOW: f32 = 0.5;
 
 /// The default arena edge in cells (1 km). Needs regional streaming and several
 /// GiB of server memory; CI and quick iteration use [`CI_SIZE_CELLS`].
@@ -75,7 +79,11 @@ pub fn generate_with_season(
 ) -> Result<GeneratedScene, WorldgenSceneError> {
     let preset = Preset::from_name(preset)
         .ok_or_else(|| WorldgenSceneError::UnknownPreset(preset.into()))?;
-    let spec = WorldGenSpec::new(preset, seed, size_cells, crate::game::terrain_palette());
+    let mut spec = WorldGenSpec::new(preset, seed, size_cells, crate::game::terrain_palette());
+    // `SPALL_NO_WATER=1`: the same terrain with its lakes, rivers and sea dry.
+    if std::env::var_os("SPALL_NO_WATER").is_some() {
+        spec = spec.dry();
+    }
     let started = std::time::Instant::now();
     let (mut world, timings) = spall_worldgen::generate_with_timings(&spec)?;
     for (stage, elapsed) in [
@@ -177,8 +185,31 @@ pub fn column_water_setup(
     // measured on a 1024-cell world, the active regions fall from 272 to 143
     // in five minutes and keep falling.
     setup.config.sleep_flow = WORLDGEN_SLEEP_FLOW;
+    // Experiments: `SPALL_WATER_SLEEP_FLOW` (cells^3/s) and
+    // `SPALL_WATER_STEADY_STEPS` override the sleep threshold and turn on the
+    // steady-flow sleep.
+    if let Some(v) = std::env::var("SPALL_WATER_SLEEP_FLOW")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        setup.config.sleep_flow = v;
+    }
+    if let Some(v) = std::env::var("SPALL_WATER_STEADY_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        setup.config.steady_steps = v;
+    }
     // Deep still sea stays a record until something disturbs it.
     setup.config.lazy_ocean = true;
+    // Water far from every player steps every 2nd, 4th, 8th time beyond 160,
+    // 320 and 640 m, so a far lake drains late rather than costing every step,
+    // and a region catches up on what it missed when a player comes back.
+    // `SPALL_WATER_THROTTLE=off` steps all water every time.
+    if !std::env::var("SPALL_WATER_THROTTLE").is_ok_and(|v| v == "off") {
+        setup.config.throttle_from_cells = [640.0, 1280.0, 2560.0];
+        setup.config.catch_up_substeps = 24;
+    }
     Some(setup)
 }
 

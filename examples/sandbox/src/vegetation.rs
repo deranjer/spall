@@ -1714,7 +1714,7 @@ fn flair_cover() -> Vec<CoverSpecies> {
             1,
             [WHITE, ROSE, WHITE, TAN],
             WHITE,
-            40,
+            10,
         ),
         (
             112,
@@ -1774,7 +1774,7 @@ fn flair_cover() -> Vec<CoverSpecies> {
             1,
             [GREY, TAN, GREY, TAN],
             BROWN,
-            40,
+            8,
         ),
     ];
     rows.into_iter()

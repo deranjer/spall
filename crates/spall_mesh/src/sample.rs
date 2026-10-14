@@ -55,6 +55,151 @@ impl Occupancy {
 pub struct VolumeSampler<'a> {
     volume: &'a Volume,
     padded: Option<&'a PaddedBrick>,
+    /// Coarse blocks instead of cells, for a level-of-detail mesh: `at` then
+    /// takes coarse cell coordinates.
+    coarse: Option<&'a CoarseBrick>,
+    /// Faces toward some sides of the meshed brick are always exposed.
+    closed: Option<ClosedSides>,
+}
+
+/// Brick sides whose neighbour is read as open air whatever it holds, so the
+/// meshed brick emits its faces on those sides. Used where a neighbour is
+/// meshed at another level of detail: each side closes its own skin, and the
+/// seam between the two cannot crack open where their surfaces differ.
+/// Bits 0 to 5: -x, +x, -y, +y, -z, +z (`2 * axis + (positive as u8)`).
+#[derive(Debug, Clone, Copy)]
+pub struct ClosedSides {
+    pub sides: u8,
+    /// The meshed brick's cell box, in the sampler's coordinates.
+    pub bounds: CellBox,
+}
+
+impl ClosedSides {
+    fn hides(&self, cell: [i64; 3]) -> bool {
+        (0..3).any(|a| {
+            (cell[a] < self.bounds.min[a] && self.sides & (1 << (2 * a)) != 0)
+                || (cell[a] > self.bounds.max[a] && self.sides & (1 << (2 * a + 1)) != 0)
+        })
+    }
+}
+
+/// A brick's occupancy at `stride` cells to a block, with a one-block halo:
+/// the cells of a coarse mesh. A block is solid when at least a quarter of its
+/// cells are (so a two-cell trunk survives however it is aligned, and flat
+/// ground rises by at most a quarter block), with the material of its highest
+/// solid cell (so a surface keeps its top material); unknown when any cell of
+/// it is unknown, so the mesh is rebuilt when a missing brick arrives.
+#[derive(Debug)]
+pub(crate) struct CoarseBrick {
+    origin: [i64; 3],
+    n: i64,
+    cells: Vec<Occupancy>,
+}
+
+enum FineBrick {
+    Resident(spall_voxel::BrickSnapshot),
+    Missing(Residency),
+    Outside,
+}
+
+impl CoarseBrick {
+    pub(crate) fn new(volume: &Volume, coord: BrickCoord, stride: i64) -> Option<Self> {
+        debug_assert!(matches!(stride, 2 | 4 | 8));
+        let edge = i64::from(spall_core::BRICK_EDGE);
+        let n = edge / stride;
+        let base = [coord.x, coord.y, coord.z].map(|c| c.checked_mul(edge));
+        let base = [base[0]?, base[1]?, base[2]?];
+        for v in base {
+            v.checked_sub(stride)?;
+            v.checked_add(edge + stride)?;
+        }
+        let origin = base.map(|v| v / stride);
+        let mut bricks: Vec<(BrickCoord, FineBrick)> = Vec::new();
+        let mut fine = |cell: [i64; 3]| -> Occupancy {
+            let (b, local) = GlobalCell::new(cell[0], cell[1], cell[2]).split();
+            let at = match bricks.iter().position(|(c, _)| *c == b) {
+                Some(i) => i,
+                None => {
+                    let entry = match volume.snapshot_brick(b) {
+                        Ok(Some(snapshot)) => FineBrick::Resident(snapshot),
+                        Ok(None) => match volume.brick_state(b) {
+                            Ok(spall_voxel::BrickState::Failed) => {
+                                FineBrick::Missing(Residency::Failed)
+                            }
+                            _ => FineBrick::Missing(Residency::Absent),
+                        },
+                        Err(_) => FineBrick::Outside,
+                    };
+                    bricks.push((b, entry));
+                    bricks.len() - 1
+                }
+            };
+            match &bricks[at].1 {
+                FineBrick::Resident(snapshot) => {
+                    let material = snapshot.get(local);
+                    if material == MaterialId::AIR {
+                        Occupancy::Open
+                    } else {
+                        Occupancy::Solid(material)
+                    }
+                }
+                FineBrick::Missing(residency) => Occupancy::Unknown(*residency),
+                FineBrick::Outside => Occupancy::Open,
+            }
+        };
+        let side = (n + 2) as usize;
+        let mut cells = Vec::with_capacity(side * side * side);
+        for cz in -1..=n {
+            for cy in -1..=n {
+                for cx in -1..=n {
+                    let first = [
+                        (origin[0] + cx) * stride,
+                        (origin[1] + cy) * stride,
+                        (origin[2] + cz) * stride,
+                    ];
+                    let (mut solid, mut unknown, mut top) = (0i64, None, None::<(i64, MaterialId)>);
+                    for dz in 0..stride {
+                        for dy in 0..stride {
+                            for dx in 0..stride {
+                                match fine([first[0] + dx, first[1] + dy, first[2] + dz]) {
+                                    Occupancy::Solid(m) => {
+                                        solid += 1;
+                                        if top.is_none_or(|(y, _)| dy >= y) {
+                                            top = Some((dy, m));
+                                        }
+                                    }
+                                    Occupancy::Unknown(r) => unknown = Some(r),
+                                    Occupancy::Open => {}
+                                }
+                            }
+                        }
+                    }
+                    cells.push(if let Some(residency) = unknown {
+                        Occupancy::Unknown(residency)
+                    } else if solid * 4 >= stride * stride * stride {
+                        Occupancy::Solid(top.map_or(MaterialId::AIR, |(_, m)| m))
+                    } else {
+                        Occupancy::Open
+                    });
+                }
+            }
+        }
+        Some(Self { origin, n, cells })
+    }
+
+    fn at(&self, cell: [i64; 3]) -> Option<Occupancy> {
+        let [x, y, z] = [
+            cell[0].checked_sub(self.origin[0])?,
+            cell[1].checked_sub(self.origin[1])?,
+            cell[2].checked_sub(self.origin[2])?,
+        ];
+        if [x, y, z].into_iter().all(|v| (-1..=self.n).contains(&v)) {
+            let side = self.n + 2;
+            Some(self.cells[((x + 1) + side * ((y + 1) + side * (z + 1))) as usize])
+        } else {
+            None
+        }
+    }
 }
 
 /// One immutable 34^3 occupancy snapshot, including face/edge/corner AO halos.
@@ -101,11 +246,32 @@ impl<'a> VolumeSampler<'a> {
         Self {
             volume,
             padded: None,
+            coarse: None,
+            closed: None,
         }
     }
 
     pub(crate) fn with_padded(volume: &'a Volume, padded: Option<&'a PaddedBrick>) -> Self {
-        Self { volume, padded }
+        Self {
+            volume,
+            padded,
+            coarse: None,
+            closed: None,
+        }
+    }
+
+    pub(crate) fn with_coarse(volume: &'a Volume, coarse: &'a CoarseBrick) -> Self {
+        Self {
+            volume,
+            padded: None,
+            coarse: Some(coarse),
+            closed: None,
+        }
+    }
+
+    pub(crate) fn closing(mut self, closed: Option<ClosedSides>) -> Self {
+        self.closed = closed;
+        self
     }
 
     pub fn volume(&self) -> &'a Volume {
@@ -115,6 +281,12 @@ impl<'a> VolumeSampler<'a> {
     /// Occupancy of one global cell.
     #[inline]
     pub fn at(&self, cell: [i64; 3]) -> Occupancy {
+        if self.closed.is_some_and(|closed| closed.hides(cell)) {
+            return Occupancy::Open;
+        }
+        if let Some(coarse) = self.coarse {
+            return coarse.at(cell).unwrap_or(Occupancy::Open);
+        }
         if let Some(sample) = self.padded.and_then(|p| p.at(cell)) {
             return sample;
         }
@@ -225,6 +397,22 @@ impl ResidentCells {
         };
         Ok(Self {
             boxes: vec![bounds],
+        })
+    }
+
+    /// Plan one brick for a coarse mesh whose cells are `stride` fine cells
+    /// wide: the brick's blocks, in coarse cell coordinates.
+    pub fn coarse_brick(coord: BrickCoord, stride: i64) -> Result<Self, MeshError> {
+        let Some(fine) = CellBox::of_brick(coord) else {
+            return Err(MeshError::CoordinateOverflow { coord });
+        };
+        let n = i64::from(spall_core::BRICK_EDGE) / stride;
+        let min = fine.min.map(|v| v / stride);
+        Ok(Self {
+            boxes: vec![CellBox {
+                min,
+                max: [min[0] + n - 1, min[1] + n - 1, min[2] + n - 1],
+            }],
         })
     }
 
