@@ -487,6 +487,8 @@ struct InteractiveApp {
     /// Handler time of the most recent frames (ms), for the debug report's
     /// percentiles; the HUD line is the average of a moment.
     frame_history: std::collections::VecDeque<f32>,
+    /// Swapchain acquire and queue submit time of the same frames (ms).
+    frame_waits: std::collections::VecDeque<(f32, f32)>,
     /// The last line the HUD printed, kept for the debug report.
     last_hud_line: String,
     /// What the last "copy debug report" did, shown in the menu for a while.
@@ -1692,6 +1694,7 @@ impl InteractiveApp {
             pending_mesh_removed: Vec::new(),
             pending_mesh_detail_only: Vec::new(),
             frame_history: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
+            frame_waits: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
             last_hud_line: String::new(),
             report_status: None,
             copy_report_key: false,
@@ -2017,6 +2020,21 @@ impl InteractiveApp {
         let _ = writeln!(r, "\n-- Frames --");
         for line in frame_summary(&self.frame_history) {
             let _ = writeln!(r, "{line}");
+        }
+        if !self.frame_waits.is_empty() {
+            let n = self.frame_waits.len() as f32;
+            let mean = |f: fn(&(f32, f32)) -> f32| self.frame_waits.iter().map(f).sum::<f32>() / n;
+            let share = |f: fn(&(f32, f32)) -> bool| {
+                100.0 * self.frame_waits.iter().filter(|w| f(w)).count() as f32 / n
+            };
+            let _ = writeln!(
+                r,
+                "waiting on the GPU or driver: acquire mean {:.2} ms (over 2 ms in {:.1}% of frames), submit mean {:.2} ms (over 4 ms in {:.1}%)",
+                mean(|w| w.0),
+                share(|w| w.0 > 2.0),
+                mean(|w| w.1),
+                share(|w| w.1 > 4.0)
+            );
         }
         let _ = writeln!(r, "HUD (last report, one field a line):");
         for field in self.last_hud_line.split(" | ") {
@@ -2787,6 +2805,11 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 self.frame_history
                     .push_back(handler_started.elapsed().as_secs_f32() * 1000.0);
+                if self.frame_waits.len() >= FRAME_HISTORY {
+                    self.frame_waits.pop_front();
+                }
+                self.frame_waits
+                    .push_back((timing.acquire_ms, timing.submit_ms));
                 if std::env::var_os("SPALL_FRAME_CSV").is_some() {
                     eprintln!(
                         "spall-frame-csv: {:.1},{:.2},{:.2},{:.2},{}",
