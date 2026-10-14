@@ -551,6 +551,65 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Far trees are drawn with half-resolution crowns: about an eighth of the leaf
+/// cubes, half a metre a side, filling the same space; near trees and ground
+/// plants are untouched.
+#[test]
+fn far_crowns_use_fewer_larger_blocks_over_the_same_space() {
+    let scene = sandbox::worldgen_scene::generate("showcase", 1, 256).unwrap();
+    let frame = scene.vegetation().visual(&scene.world().terrain);
+    let eye = [32., 0., 32.];
+    let leaf = |p: &spall_ecology::living::SoftPart, size: f32| p.size == [size; 3];
+    let fine = frame.parts(eye, 200.);
+    let all_far = frame.parts_lod(eye, 200., 0.0);
+    let all_near = frame.parts_lod(eye, 200., 1.0e9);
+    assert_eq!(
+        fine.len(),
+        all_near.len(),
+        "a far limit past every plant changes nothing"
+    );
+    let fine_leaves: Vec<_> = fine
+        .iter()
+        .filter(|p| leaf(p, 0.25) && p.yaw == 0.)
+        .collect();
+    let coarse_leaves: Vec<_> = all_far.iter().filter(|p| leaf(p, 0.5)).collect();
+    assert!(fine_leaves.len() > 500, "{} fine leaves", fine_leaves.len());
+    assert!(
+        coarse_leaves.len() * 3 < fine_leaves.len(),
+        "{} coarse against {} fine",
+        coarse_leaves.len(),
+        fine_leaves.len()
+    );
+    // The crowns cover the same volume to within a block.
+    let extent = |parts: &[&spall_ecology::living::SoftPart]| {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for p in parts {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p.center[a] - p.size[a] / 2.);
+                hi[a] = hi[a].max(p.center[a] + p.size[a] / 2.);
+            }
+        }
+        (lo, hi)
+    };
+    let (flo, fhi) = extent(&fine_leaves);
+    let (clo, chi) = extent(&coarse_leaves);
+    for a in 0..3 {
+        assert!(
+            (flo[a] - clo[a]).abs() <= 1.0 && (fhi[a] - chi[a]).abs() <= 1.0,
+            "axis {a}: {flo:?}..{fhi:?} against {clo:?}..{chi:?}"
+        );
+    }
+    // Ground plants draw the same either way.
+    let blades = |parts: &[spall_ecology::living::SoftPart]| {
+        parts
+            .iter()
+            .filter(|p| p.size[0] < 0.2 || p.yaw != 0.)
+            .count()
+    };
+    assert_eq!(blades(&fine), blades(&all_far));
+}
+
 /// A ground plant is never placed in a tree's trunk column (the tree's wood is
 /// planned before it is committed, so the cell still looks empty).
 #[test]

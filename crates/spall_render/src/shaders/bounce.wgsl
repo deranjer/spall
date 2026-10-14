@@ -45,6 +45,9 @@ struct BounceGlobals {
     // the old cache ended at, are lit again; the rest hold what the scroll
     // copied. w = 0: a plain sweep.
     scroll: vec4<i32>,
+    // xyz: the camera in cells from the cache origin; w = 1 when it is known.
+    // Cells far from it cast fewer rays (see `ray_count_for`).
+    focus: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> cells: array<u32>;
@@ -79,10 +82,30 @@ fn nee_weight(distance_cells: f32) -> f32 {
 
 // Whether the emitter list is complete. On overflow every emitter is sampled by
 // rays as before, so a lamp is never silently dropped.
+// How many rays a cell casts: the configured count near the camera, at most 42
+// (the axes, edge diagonals and the first shallow ring) beyond 16 m and at most
+// 18 (axes and diagonals) beyond 32 m. Distant cells fill most of the cache
+// but little of what is on screen, and their light varies slowly.
+fn ray_count_for(cell: vec3<i32>) -> u32 {
+    var count = select(RAY_COUNT, min(globals.dimensions.z, RAY_COUNT), globals.dimensions.z > 0u);
+    if globals.focus.w > 0.5 {
+        let d = distance(vec3<f32>(cell) + vec3<f32>(0.5), globals.focus.xyz);
+        if d > 64.0 {
+            count = min(count, 18u);
+        } else if d > 32.0 {
+            count = min(count, 42u);
+        }
+    }
+    return count;
+}
+
 fn nee_active() -> bool {
     return emitters.header.x <= MAX_EMITTERS;
 }
 
+// The most rays a cell casts. The first 18 are the axes and edge diagonals, the
+// next 24 the first shallow ring, the last 24 the second, so any prefix is a
+// usable, evenly spread set: `globals.dimensions.z` says how many to use.
 const RAY_COUNT: u32 = 66u;
 
 // 66 fixed rays: the six axes, the twelve edge diagonals, and two rings of 24
@@ -316,7 +339,8 @@ fn bounce_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let world_cell = cell + vec3<i32>(round(globals.origin_cell_size.xyz / globals.origin_cell_size.w));
     let jitter = cell_jitter(world_cell);
-    for (var i = 0u; i < RAY_COUNT; i += 1u) {
+    let ray_count = ray_count_for(cell);
+    for (var i = 0u; i < ray_count; i += 1u) {
         let dir = jitter_dir(jitter, ray_direction(i));
         var source = vec3<f32>(0.0);
         let hit = trace_first_hit(origin, dir, dim, max_cells);

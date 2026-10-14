@@ -115,6 +115,11 @@ struct Globals {
     water_cam: [f32; 4],
     /// The water field's `xy` origin, cell size `z` and cells per side `w`.
     water_field: [f32; 4],
+    /// Distance fog colour (linear, the sky's horizon colour).
+    fog_color: [f32; 4],
+    /// Distance fog: `x` where it starts and `y` where it is complete, in
+    /// metres of horizontal distance from the camera; `y <= x` turns it off.
+    fog_range: [f32; 4],
 }
 
 /// Most point lights the opaque pass shades with at once (the nearest ones).
@@ -174,6 +179,20 @@ struct WaterState {
     field: Option<WaterField>,
     gpu: Option<(wgpu::Texture, wgpu::TextureView)>,
     time_s: f32,
+    /// A replacement field being uploaded a slice per frame (see
+    /// [`ScenePipeline::replace_water_field`]); the field above keeps drawing
+    /// until it is complete.
+    staged: Option<StagedWaterField>,
+    /// The texture of the field last replaced, kept for the next replacement.
+    spare: Option<(wgpu::Texture, wgpu::TextureView)>,
+}
+
+struct StagedWaterField {
+    field: WaterField,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// Rows uploaded so far.
+    next_row: u32,
 }
 
 pub struct ScenePipeline {
@@ -198,6 +217,8 @@ pub struct ScenePipeline {
     tone_layout: wgpu::BindGroupLayout,
     globals_buffer: wgpu::Buffer,
     point_lights: std::sync::Mutex<Vec<PointLight>>,
+    /// Distance fog start and end (metres); `[0, 0]` is off.
+    fog_range: std::sync::Mutex<[f32; 2]>,
     shadow_globals_buffers: Vec<wgpu::Buffer>,
     tone_globals_buffer: wgpu::Buffer,
     shadow_texture: wgpu::Texture,
@@ -205,6 +226,11 @@ pub struct ScenePipeline {
     /// into `shadow_texture` before the moving casters are drawn on top.
     shadow_static_texture: wgpu::Texture,
     shadow_static_layer_views: Vec<wgpu::TextureView>,
+    /// `shadow_static_texture` with the foliage drawn over it: the terrain's
+    /// depth is copied in and the foliage rasterised on top only when either
+    /// changes, and this is what is copied into `shadow_texture` each frame.
+    shadow_merged_texture: wgpu::Texture,
+    shadow_merged_layer_views: Vec<wgpu::TextureView>,
     shadow_sample_view: wgpu::TextureView,
     shadow_layer_views: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
@@ -221,6 +247,13 @@ pub struct ScenePipeline {
 impl ScenePipeline {
     /// Sets the point lights the next frames are shaded with (the first
     /// [`MAX_POINT_LIGHTS`] are used; pass the nearest ones).
+    /// Fades everything between `start_m` and `end_m` (horizontal metres from
+    /// the camera) into the sky's horizon colour, so terrain that is not drawn
+    /// past `end_m` does not pop in at the edge. `end_m <= start_m` turns it off.
+    pub fn set_fog_range(&self, start_m: f32, end_m: f32) {
+        *self.fog_range.lock().unwrap_or_else(|e| e.into_inner()) = [start_m, end_m];
+    }
+
     pub fn set_point_lights(&self, lights: &[PointLight]) {
         let mut slot = self.point_lights.lock().unwrap_or_else(|e| e.into_inner());
         slot.clear();
@@ -457,6 +490,33 @@ impl ScenePipeline {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
+        let shadow_merged_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("spall-sun-shadow-merged-cascades"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: CASCADE_COUNT as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let shadow_merged_layer_views = (0..CASCADE_COUNT)
+            .map(|layer| {
+                shadow_merged_texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("spall-shadow-merged-layer-view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer as u32,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
         let shadow_static_layer_views = (0..CASCADE_COUNT)
             .map(|layer| {
                 shadow_static_texture.create_view(&wgpu::TextureViewDescriptor {
@@ -537,11 +597,14 @@ impl ScenePipeline {
             tone_layout,
             globals_buffer,
             point_lights: std::sync::Mutex::new(Vec::new()),
+            fog_range: std::sync::Mutex::new([0.0, 0.0]),
             shadow_globals_buffers,
             tone_globals_buffer,
             shadow_texture,
             shadow_static_texture,
             shadow_static_layer_views,
+            shadow_merged_texture,
+            shadow_merged_layer_views,
             shadow_sample_view,
             shadow_layer_views,
             shadow_sampler,
@@ -657,9 +720,17 @@ impl ScenePipeline {
         &self.shadow_static_layer_views[index]
     }
 
-    /// Copies a cascade's retained terrain depth into the layer the scene
-    /// samples, ready for the moving casters to be drawn over it.
-    pub fn copy_static_shadow(&self, encoder: &mut wgpu::CommandEncoder, cascade: usize) {
+    /// The retained terrain-plus-foliage depth layer of a cascade.
+    pub fn shadow_merged_layer(&self, index: usize) -> &wgpu::TextureView {
+        &self.shadow_merged_layer_views[index]
+    }
+
+    fn copy_depth_layer(
+        encoder: &mut wgpu::CommandEncoder,
+        from: &wgpu::Texture,
+        to: &wgpu::Texture,
+        cascade: usize,
+    ) {
         let layer = |texture| wgpu::TexelCopyTextureInfo {
             texture,
             mip_level: 0,
@@ -671,13 +742,35 @@ impl ScenePipeline {
             aspect: wgpu::TextureAspect::DepthOnly,
         };
         encoder.copy_texture_to_texture(
-            layer(&self.shadow_static_texture),
-            layer(&self.shadow_texture),
+            layer(from),
+            layer(to),
             wgpu::Extent3d {
                 width: SHADOW_MAP_SIZE,
                 height: SHADOW_MAP_SIZE,
                 depth_or_array_layers: 1,
             },
+        );
+    }
+
+    /// Copies a cascade's retained terrain depth into its merged layer, ready
+    /// for the foliage to be drawn over it.
+    pub fn copy_static_to_merged(&self, encoder: &mut wgpu::CommandEncoder, cascade: usize) {
+        Self::copy_depth_layer(
+            encoder,
+            &self.shadow_static_texture,
+            &self.shadow_merged_texture,
+            cascade,
+        );
+    }
+
+    /// Copies a cascade's retained terrain and foliage depth into the layer the
+    /// scene samples, ready for the moving casters to be drawn over it.
+    pub fn copy_static_shadow(&self, encoder: &mut wgpu::CommandEncoder, cascade: usize) {
+        Self::copy_depth_layer(
+            encoder,
+            &self.shadow_merged_texture,
+            &self.shadow_texture,
+            cascade,
         );
     }
 
@@ -844,6 +937,15 @@ impl ScenePipeline {
             point_count,
             water_cam,
             water_field,
+            fog_color: {
+                let [r, g, b, _] = environment.background_linear().map(|v| v as f32);
+                // What the sky shader draws at the horizon.
+                [r * 0.96, g * 0.96, b * 0.96, 0.0]
+            },
+            fog_range: {
+                let [start, end] = *self.fog_range.lock().unwrap_or_else(|e| e.into_inner());
+                [start, end, 0.0, 0.0]
+            },
         };
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
         let water_view = water
@@ -937,6 +1039,108 @@ impl ScenePipeline {
         state.field = Some(field);
     }
 
+    /// Replaces the installed water field with `field` without a stall: the new
+    /// field is uploaded to a second texture a few rows a frame by
+    /// [`Self::advance_water_upload`], and the old one keeps drawing until the
+    /// last row is in, when they swap. Rectangle updates in the meantime are for
+    /// the new field. With no field installed yet, or one of another size, the
+    /// replacement is immediate (as [`Self::set_water_field`]).
+    pub fn replace_water_field(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        field: WaterField,
+    ) {
+        let immediate = {
+            let state = self.water.lock().unwrap_or_else(|e| e.into_inner());
+            state.gpu.is_none() || state.field.as_ref().is_none_or(|f| f.dim != field.dim)
+        };
+        if immediate {
+            self.set_water_field(device, queue, Some(field));
+            return;
+        }
+        let mut state = self.water.lock().unwrap_or_else(|e| e.into_inner());
+        // A staging still under way is dropped: its texture is reused.
+        let reuse = state
+            .staged
+            .take()
+            .map(|s| (s.texture, s.view))
+            .or_else(|| state.spare.take())
+            .filter(|(texture, _)| texture.width() == field.dim);
+        let (texture, view) = reuse.unwrap_or_else(|| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("spall-water-field-staged"),
+                size: wgpu::Extent3d {
+                    width: field.dim,
+                    height: field.dim,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            (texture, view)
+        });
+        state.staged = Some(StagedWaterField {
+            field,
+            texture,
+            view,
+            next_row: 0,
+        });
+    }
+
+    /// Uploads up to `rows` more rows of a field being replaced (see
+    /// [`Self::replace_water_field`]) and swaps it in when it is complete.
+    /// Returns whether a replacement is still under way.
+    pub fn advance_water_upload(&self, queue: &wgpu::Queue, rows: u32) -> bool {
+        let mut guard = self.water.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
+        let Some(staged) = state.staged.as_mut() else {
+            return false;
+        };
+        let dim = staged.field.dim;
+        let count = rows.min(dim - staged.next_row);
+        if count > 0 {
+            let texels = staged.field.texel_rect(0, staged.next_row, dim, count);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &staged.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: staged.next_row,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&texels),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(dim * 16),
+                    rows_per_image: Some(count),
+                },
+                wgpu::Extent3d {
+                    width: dim,
+                    height: count,
+                    depth_or_array_layers: 1,
+                },
+            );
+            staged.next_row += count;
+        }
+        if staged.next_row < dim {
+            return true;
+        }
+        let done = state.staged.take().expect("checked above");
+        state.spare = state.gpu.take();
+        state.gpu = Some((done.texture, done.view));
+        state.field = Some(done.field);
+        false
+    }
+
     /// Replaces a rectangle of the water field on the GPU and in the
     /// renderer's copy (which answers "is the camera under water"). `texels`
     /// are `(top, bottom, smooth, agitation + flow)` row by row (see
@@ -953,7 +1157,14 @@ impl ScenePipeline {
     ) {
         let mut guard = self.water.lock().unwrap_or_else(|e| e.into_inner());
         let state = &mut *guard;
-        let (Some(field), Some((texture, _))) = (state.field.as_mut(), state.gpu.as_ref()) else {
+        // While a replacement is being uploaded the rectangles are for it: its
+        // rows not yet uploaded read this copy, the rest are written now.
+        let (field, texture) = if let Some(staged) = state.staged.as_mut() {
+            (&mut staged.field, &staged.texture)
+        } else if let (Some(field), Some((texture, _))) = (state.field.as_mut(), state.gpu.as_ref())
+        {
+            (field, texture)
+        } else {
             return;
         };
         if w == 0
@@ -993,6 +1204,16 @@ impl ScenePipeline {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// World origin (x, z, metres) of the installed water field, if any.
+    pub fn water_field_origin(&self) -> Option<[f32; 2]> {
+        self.water
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .field
+            .as_ref()
+            .map(|f| f.origin_xz)
     }
 
     /// Cells per side of the installed water field, 0 if none.
@@ -1444,6 +1665,31 @@ fn opaque_primitive() -> wgpu::PrimitiveState {
 /// never swim). A cascade whose box is unchanged and whose terrain is
 /// unchanged keeps its terrain depth from the last frame
 /// ([`crate::game_renderer`]), which is most frames for the far cascades.
+/// The angular step the shadow maps follow the sun in, degrees. The day clock
+/// moves the sun a tenth of a degree a second; framing the maps afresh for
+/// each of those makes the texel grid slide across the terrain and the
+/// stair-stepped edges of its shadows shimmer on a slope. Held for a few
+/// seconds at a time they stay still (and the cached terrain depth stays
+/// valid), and the shift when they do move is under a texel near the camera.
+const SHADOW_SUN_STEP_DEG: f32 = 0.5;
+
+/// `sun_dir` rounded to a grid of [`SHADOW_SUN_STEP_DEG`] in azimuth and
+/// elevation, normalised.
+fn quantized_sun(sun_dir: Vec3) -> Vec3 {
+    let sun = sun_dir.normalize();
+    let step = SHADOW_SUN_STEP_DEG.to_radians();
+    let elevation = sun.y.clamp(-1.0, 1.0).asin();
+    let azimuth = sun.z.atan2(sun.x);
+    let elevation = (elevation / step).round() * step;
+    let azimuth = (azimuth / step).round() * step;
+    Vec3::new(
+        elevation.cos() * azimuth.cos(),
+        elevation.sin(),
+        elevation.cos() * azimuth.sin(),
+    )
+    .normalize()
+}
+
 fn cascade_data(camera: &Camera, sun_dir: Vec3) -> ([Mat4; CASCADE_COUNT], [f32; 4]) {
     let near = camera.z_near.max(0.01);
     let far = camera.z_far.max(near + 0.01);
@@ -1461,7 +1707,7 @@ fn cascade_data(camera: &Camera, sun_dir: Vec3) -> ([Mat4; CASCADE_COUNT], [f32;
     let tan_w = tan_h * camera.aspect;
     let corner = (1.0 + tan_h * tan_h + tan_w * tan_w).sqrt();
 
-    let sun = sun_dir.normalize();
+    let sun = quantized_sun(sun_dir);
     let up = if sun.dot(Vec3::Y).abs() > 0.95 {
         Vec3::Z
     } else {
@@ -1498,6 +1744,29 @@ pub fn default_sun_dir() -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shadow_sun_holds_still_between_steps_and_stays_close() {
+        let at = |deg: f32| {
+            let r = deg.to_radians();
+            Vec3::new(r.cos(), -r.sin(), 0.3).normalize()
+        };
+        // A tenth of a degree, the day clock's pace for a second, moves nothing
+        // except when it crosses a step...
+        let a = quantized_sun(at(40.0));
+        assert_eq!(a, quantized_sun(at(40.05)));
+        // ...a change of a step does move it, and it is never far from the sun.
+        assert_ne!(a, quantized_sun(at(41.0)));
+        for deg in [3.0, 17.3, 40.0, 61.7, 88.0] {
+            let sun = at(deg).normalize();
+            let angle = quantized_sun(sun)
+                .dot(sun)
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            assert!(angle < SHADOW_SUN_STEP_DEG, "{deg}: {angle}");
+        }
+    }
 
     #[test]
     fn cascade_splits_are_ordered_and_cover_the_camera_range() {

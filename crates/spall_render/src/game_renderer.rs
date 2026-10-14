@@ -146,6 +146,28 @@ impl PassTimer {
                 if has_bounce {
                     self.slice_costs.push(ms(8, 9));
                 }
+                if std::env::var_os("SPALL_FRAME_TRACE").is_some() {
+                    let scene = ms(0, 1) + ms(2, 3) + ms(4, 5);
+                    if scene > 5.0 || has_sky || has_bounce {
+                        eprintln!(
+                            "spall-gpu-trace: t={:.1} scene {scene:.1} ms (shadow {:.1}, opaque {:.1}, tone {:.1}){}{}",
+                            crate::trace_clock_ms(),
+                            ms(0, 1),
+                            ms(2, 3),
+                            ms(4, 5),
+                            if has_sky {
+                                format!(" + sky {:.1}", ms(6, 7))
+                            } else {
+                                String::new()
+                            },
+                            if has_bounce {
+                                format!(" + bounce {:.1}", ms(8, 9))
+                            } else {
+                                String::new()
+                            },
+                        );
+                    }
+                }
                 let previous_sky = self.latest.and_then(|t| t.sky_visibility_ms);
                 let previous_bounce = self.latest.and_then(|t| t.bounce_ms);
                 self.latest = Some(GamePassTimings {
@@ -210,6 +232,8 @@ impl PassTimer {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ShadowKey {
     matrix: [f32; 16],
+    /// The terrain generation this depth was drawn at; later changes that miss
+    /// the cascade's box leave it valid (see `terrain_changes`).
     terrain_generation: u64,
     terrain_visible: bool,
 }
@@ -228,14 +252,33 @@ pub struct GameRenderer {
     terrain_meshes: HashMap<BrickCoord, GpuMesh>,
     terrain_bounds: HashMap<BrickCoord, Aabb>,
     terrain_generation: u64,
+    /// Where the terrain changed, by generation: a cascade's retained depth is
+    /// stale only if a change since it was drawn touches its box.
+    terrain_changes: Vec<(u64, Aabb)>,
     terrain_meshes_visible: bool,
+    /// Which chunks the camera pass skips because nothing of them shows.
+    occlusion: crate::occlusion::OcclusionCuller,
+    /// `SPALL_NO_OCCLUSION=1` draws every chunk in the frustum.
+    occlusion_enabled: bool,
     /// What each cascade's retained terrain depth was drawn from.
     shadow_cache: [Option<ShadowKey>; CASCADE_COUNT],
+    /// The foliage generation each cascade's merged (terrain plus foliage)
+    /// depth was drawn with; `None` when the terrain depth under it was
+    /// redrawn since.
+    shadow_merged: [Option<u64>; CASCADE_COUNT],
     body_meshes: HashMap<u64, DynamicMesh>,
     bodies: InstanceSet,
     /// Drawn lit but never shadow-casting (debug overlays).
     overlay: InstanceSet,
     vegetation: InstanceSet,
+    /// The foliage instances grouped by 16 m square, each with its bounds and
+    /// its range in `vegetation`, so a pass draws only the groups it can see.
+    vegetation_buckets: Vec<(Aabb, u32, u32)>,
+    /// The instances `vegetation` holds, and a count that changes whenever a
+    /// new set differs from them: foliage is as static as the terrain between
+    /// rebuilds, so its depth is kept in the cached cascade depth too.
+    vegetation_last: Vec<CubeInstance>,
+    vegetation_generation: u64,
     transparent: InstanceSet,
     /// The smoothed water surface sheet, drawn alpha-blended after the opaque
     /// scene.
@@ -353,12 +396,19 @@ impl GameRenderer {
             terrain_meshes: HashMap::new(),
             terrain_bounds: HashMap::new(),
             terrain_generation: 0,
+            terrain_changes: Vec::new(),
             terrain_meshes_visible: true,
+            occlusion: crate::occlusion::OcclusionCuller::new(device),
+            occlusion_enabled: std::env::var_os("SPALL_NO_OCCLUSION").is_none(),
             shadow_cache: [None; CASCADE_COUNT],
+            shadow_merged: [None; CASCADE_COUNT],
             body_meshes: HashMap::new(),
             bodies: InstanceSet::new(),
             overlay: InstanceSet::new(),
             vegetation: InstanceSet::new(),
+            vegetation_buckets: Vec::new(),
+            vegetation_last: Vec::new(),
+            vegetation_generation: 0,
             transparent: InstanceSet::new(),
             water_surface: DynamicMesh::new(device),
             water_grid: false,
@@ -396,18 +446,46 @@ impl GameRenderer {
         updates: &[(BrickCoord, Vec<GpuVertex>, Vec<u32>)],
         removed: &[BrickCoord],
     ) -> Result<(), crate::context::RenderError> {
-        if !updates.is_empty() || !removed.is_empty() {
+        self.update_terrain_meshes_detail(device, updates, removed, &[])
+    }
+
+    /// [`Self::update_terrain_meshes`], where the chunks in `detail_only` are
+    /// the same terrain meshed at another level of detail: the cascaded shadow
+    /// maps keep what they drew of them rather than redrawing the terrain.
+    pub fn update_terrain_meshes_detail(
+        &mut self,
+        device: &wgpu::Device,
+        updates: &[(BrickCoord, Vec<GpuVertex>, Vec<u32>)],
+        removed: &[BrickCoord],
+        detail_only: &[BrickCoord],
+    ) -> Result<(), crate::context::RenderError> {
+        let shadows_change = !removed.is_empty()
+            || updates
+                .iter()
+                .any(|(coord, _, _)| !detail_only.contains(coord));
+        if shadows_change {
             self.terrain_generation = self.terrain_generation.wrapping_add(1);
         }
+        let generation = self.terrain_generation;
         for coord in removed {
+            if let Some(old) = self.terrain_bounds.get(coord) {
+                self.terrain_changes.push((generation, *old));
+            }
             self.terrain_meshes.remove(coord);
             self.terrain_bounds.remove(coord);
+            self.occlusion.forget(*coord);
         }
         const BUDGET: UploadBudget = UploadBudget {
             max_vertex_bytes: 128 << 20,
             max_index_bytes: 64 << 20,
         };
         for (coord, vertices, indices) in updates {
+            self.occlusion.forget(*coord);
+            if !detail_only.contains(coord)
+                && let Some(old) = self.terrain_bounds.get(coord)
+            {
+                self.terrain_changes.push((generation, *old));
+            }
             let mesh = GpuMesh::create(device, vertices, indices, BUDGET)?;
             if mesh.index_count == 0 {
                 self.terrain_meshes.remove(coord);
@@ -420,15 +498,31 @@ impl GameRenderer {
                     min = min.min(p);
                     max = max.max(p);
                 }
-                self.terrain_bounds.insert(*coord, Aabb::new(min, max));
+                let bounds = Aabb::new(min, max);
+                if !detail_only.contains(coord) {
+                    self.terrain_changes.push((generation, bounds));
+                }
+                self.terrain_bounds.insert(*coord, bounds);
                 self.terrain_meshes.insert(*coord, mesh);
             }
         }
         Ok(())
     }
 
+    /// Fades the scene into the sky's horizon colour between `start_m` and
+    /// `end_m` metres from the camera; see [`ScenePipeline::set_fog_range`].
+    pub fn set_fog_range(&self, start_m: f32, end_m: f32) {
+        self.pipeline.set_fog_range(start_m, end_m);
+    }
+
     pub fn set_terrain_meshes_visible(&mut self, visible: bool) {
         self.terrain_meshes_visible = visible;
+    }
+
+    /// How many terrain chunks the camera pass drew last frame (the chunks in
+    /// the frustum that were not known to be hidden).
+    pub fn terrain_chunks_drawn(&self) -> usize {
+        self.occlusion.drawn
     }
 
     pub fn terrain_geometry_generation(&self) -> u64 {
@@ -553,7 +647,41 @@ impl GameRenderer {
         queue: &wgpu::Queue,
         instances: &[CubeInstance],
     ) -> u64 {
-        self.vegetation.set(device, queue, instances)
+        // Sorted into 16 m squares so each pass can cull whole squares.
+        const SQUARE_M: f32 = 16.0;
+        let key = |i: &CubeInstance| {
+            (
+                (i.offset[0] / SQUARE_M).floor() as i64,
+                (i.offset[2] / SQUARE_M).floor() as i64,
+            )
+        };
+        let mut sorted: Vec<CubeInstance> = instances.to_vec();
+        sorted.sort_by_key(|i| key(i));
+        if sorted != self.vegetation_last {
+            self.vegetation_generation = self.vegetation_generation.wrapping_add(1);
+            self.vegetation_last.clone_from(&sorted);
+        }
+        self.vegetation_buckets.clear();
+        let mut start = 0;
+        while start < sorted.len() {
+            let square = key(&sorted[start]);
+            let mut end = start;
+            let mut lo = glam::Vec3::splat(f32::INFINITY);
+            let mut hi = glam::Vec3::splat(f32::NEG_INFINITY);
+            while end < sorted.len() && key(&sorted[end]) == square {
+                let i = &sorted[end];
+                let centre = glam::Vec3::from_array(i.offset);
+                // A rotated box reaches half its diagonal from its centre.
+                let reach = glam::Vec3::splat(glam::Vec3::from_array(i.size).length() * 0.5);
+                lo = lo.min(centre - reach);
+                hi = hi.max(centre + reach);
+                end += 1;
+            }
+            self.vegetation_buckets
+                .push((Aabb::new(lo, hi), start as u32, (end - start) as u32));
+            start = end;
+        }
+        self.vegetation.set(device, queue, &sorted)
     }
 
     /// Replace the debug overlay instances (lit, not shadow-casting).
@@ -597,6 +725,27 @@ impl GameRenderer {
         field: Option<crate::water::WaterField>,
     ) {
         self.pipeline.set_water_field(device, queue, field);
+    }
+
+    /// Replaces the water field a slice at a time (see
+    /// [`ScenePipeline::replace_water_field`]).
+    pub fn replace_water_field(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        field: crate::water::WaterField,
+    ) {
+        self.pipeline.replace_water_field(device, queue, field);
+    }
+
+    /// World origin (x, z, metres) of the water field currently drawn.
+    pub fn water_field_origin(&self) -> Option<[f32; 2]> {
+        self.pipeline.water_field_origin()
+    }
+
+    /// Uploads more of a field being replaced; call once a frame.
+    pub fn advance_water_upload(&mut self, queue: &wgpu::Queue, rows: u32) -> bool {
+        self.pipeline.advance_water_upload(queue, rows)
     }
 
     /// Turns the smooth grid surface on or off. When on, the installed water
@@ -650,6 +799,17 @@ impl GameRenderer {
 
     /// Switch the diffuse bounce on or off (a no-op until occupancy exists).
     /// Off skips the pass; sky visibility is unaffected.
+    /// How much lighting to compute; see [`crate::sky_visibility::LightingQuality`].
+    pub fn set_lighting_quality(
+        &self,
+        queue: &wgpu::Queue,
+        quality: crate::sky_visibility::LightingQuality,
+    ) {
+        if let Some(sky) = self.sky.as_ref() {
+            sky.set_quality(queue, quality);
+        }
+    }
+
     pub fn set_bounce_enabled(&self, queue: &wgpu::Queue, enabled: bool) {
         if let Some(sky) = &self.sky {
             sky.set_bounce_enabled(queue, enabled);
@@ -716,6 +876,15 @@ impl GameRenderer {
         let timer = self.timer.as_ref().filter(|_| self.timed_slot.is_some());
 
         let (light_matrices, _) = ScenePipeline::cascade_data(&camera, environment.sun_dir);
+        // Changes every cascade has already drawn past are no longer needed.
+        let oldest = self
+            .shadow_cache
+            .iter()
+            .map(|k| k.as_ref().map_or(0, |k| k.terrain_generation))
+            .min()
+            .unwrap_or(0);
+        self.terrain_changes
+            .retain(|(generation, _)| *generation > oldest);
         for (cascade, matrix) in light_matrices.into_iter().enumerate() {
             let bind = self
                 .pipeline
@@ -731,7 +900,18 @@ impl GameRenderer {
                 terrain_generation: self.terrain_generation,
                 terrain_visible: self.terrain_meshes_visible,
             };
-            let redraw_terrain = self.shadow_cache[cascade].as_ref() != Some(&key);
+            let redraw_terrain = match &self.shadow_cache[cascade] {
+                Some(cached)
+                    if cached.matrix == key.matrix
+                        && cached.terrain_visible == key.terrain_visible =>
+                {
+                    let frustum = Frustum::from_view_projection(matrix);
+                    self.terrain_changes.iter().any(|(generation, bounds)| {
+                        *generation > cached.terrain_generation && frustum.intersects_aabb(*bounds)
+                    })
+                }
+                _ => true,
+            };
             // One begin/end pair spans the whole cascade set.
             let timestamp_writes = |first: bool, last: bool| {
                 timer.and_then(|timer| {
@@ -769,6 +949,36 @@ impl GameRenderer {
                 }
                 drop(pass);
                 self.shadow_cache[cascade] = Some(key);
+                self.shadow_merged[cascade] = None;
+            } else if let Some(cached) = self.shadow_cache[cascade].as_mut() {
+                // Nothing that changed touches this cascade: still valid.
+                cached.terrain_generation = key.terrain_generation;
+            }
+            // Foliage is as static as the terrain between rebuilds: it is
+            // drawn over a copy of the terrain depth only when that depth was
+            // redrawn or the foliage changed.
+            if self.shadow_merged[cascade] != Some(self.vegetation_generation) {
+                self.pipeline.copy_static_to_merged(encoder, cascade);
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("spall-game-shadow-foliage-pass"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: self.pipeline.shadow_merged_layer(cascade),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_bind_group(0, &bind, &[]);
+                pass.set_pipeline(self.pipeline.shadow_cube());
+                self.draw_vegetation(&mut pass, &Frustum::from_view_projection(matrix));
+                drop(pass);
+                self.shadow_merged[cascade] = Some(self.vegetation_generation);
             }
             self.pipeline.copy_static_shadow(encoder, cascade);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -793,7 +1003,7 @@ impl GameRenderer {
                 self.draw_body_meshes(&mut pass);
                 pass.set_pipeline(self.pipeline.shadow_cube());
             }
-            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies, &self.vegetation]);
+            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies]);
         }
 
         // Recompute sky visibility / bounce when the occupancy, environment or
@@ -801,6 +1011,7 @@ impl GameRenderer {
         let (mut sky_ran, mut bounce_ran) = (false, false);
         if let Some(sky) = self.sky.as_ref() {
             sky.set_environment(queue, environment);
+            sky.set_focus(camera.position);
             let writes = |begin, end| {
                 timer.map(|timer| wgpu::ComputePassTimestampWrites {
                     query_set: &timer.queries,
@@ -859,6 +1070,30 @@ impl GameRenderer {
             pass.set_bind_group(0, *bind, &[]);
             pass.draw(0..3, 0..1);
         }
+        // The chunks the camera pass draws: those in the frustum that are not
+        // known to be hidden (see `occlusion`).
+        let camera_chunks: Vec<(BrickCoord, Aabb)> = if self.terrain_meshes_visible {
+            let frustum = camera.frustum();
+            self.terrain_meshes
+                .keys()
+                .filter_map(|coord| {
+                    let bounds = *self.terrain_bounds.get(coord)?;
+                    frustum.intersects_aabb(bounds).then_some((*coord, bounds))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if self.occlusion_enabled {
+            self.occlusion.begin_frame(device, camera.position);
+        }
+        let mut draw_chunks: Vec<BrickCoord> = camera_chunks
+            .iter()
+            .map(|(coord, _)| *coord)
+            .filter(|coord| !self.occlusion_enabled || self.occlusion.should_draw(*coord))
+            .collect();
+        draw_chunks.sort_by_key(|coord| coord.sort_key());
+        self.occlusion.drawn = draw_chunks.len();
         let clear = [0.0, 0.0, 0.0, 1.0];
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -915,7 +1150,7 @@ impl GameRenderer {
                     ),
                     &[],
                 );
-                self.draw_terrain_meshes(&mut pass, &camera.frustum());
+                self.draw_terrain_list(&mut pass, &draw_chunks);
             }
             if !self.body_meshes.is_empty() {
                 pass.set_pipeline(self.pipeline.opaque());
@@ -942,16 +1177,24 @@ impl GameRenderer {
                 ),
                 &[],
             );
-            self.draw_cubes(
-                &mut pass,
-                &[&self.terrain, &self.bodies, &self.vegetation, &self.overlay],
-            );
+            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies, &self.overlay]);
+            self.draw_vegetation(&mut pass, &camera.frustum());
         }
         let water_grid_cells = if self.water_grid {
             self.pipeline.water_field_dim()
         } else {
             0
         };
+        if self.occlusion_enabled && self.terrain_meshes_visible {
+            self.occlusion.encode(
+                queue,
+                encoder,
+                self.target.depth_view(),
+                camera.view_projection(),
+                &camera_chunks,
+                camera.position,
+            );
+        }
         if self.transparent.count() > 0
             || self.water_surface.index_count > 0
             || water_grid_cells > 0
@@ -1035,6 +1278,8 @@ impl GameRenderer {
     /// Start the asynchronous timestamp readback for the frame just recorded.
     /// Call once after submitting the encoder passed to [`Self::render`].
     pub fn finish_timing(&mut self) {
+        // The occlusion batch recorded with this frame is read back too.
+        self.occlusion.after_submit();
         if let (Some(timer), Some(slot)) = (self.timer.as_mut(), self.timed_slot.take()) {
             timer.map(slot);
         }
@@ -1076,6 +1321,35 @@ impl GameRenderer {
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    }
+
+    /// Draws the foliage squares inside `frustum`.
+    fn draw_vegetation<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, frustum: &Frustum) {
+        let Some(buffer) = self.vegetation.buffer() else {
+            return;
+        };
+        pass.set_vertex_buffer(0, self.cube_vertices.slice(..));
+        pass.set_index_buffer(self.cube_indices.slice(..), wgpu::IndexFormat::Uint16);
+        pass.set_vertex_buffer(1, buffer.slice(..));
+        for (bounds, first, count) in &self.vegetation_buckets {
+            if frustum.intersects_aabb(*bounds) {
+                pass.draw_indexed(0..self.cube_index_count, 0, *first..*first + *count);
+            }
+        }
+    }
+
+    fn draw_terrain_list<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        chunks: &[BrickCoord],
+    ) {
+        for coord in chunks {
+            if let Some(mesh) = self.terrain_meshes.get(coord) {
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
         }
     }
 

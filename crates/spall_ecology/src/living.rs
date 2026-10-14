@@ -1356,6 +1356,13 @@ impl VisualFrame {
     /// Deterministic soft geometry, culled before allocation. Leaves occupy quarter
     /// cells; stems/blades are smaller, grounded at the exact top of the soil cell.
     pub fn parts(&self, eye: [f32; 3], radius: f32) -> Vec<SoftPart> {
+        self.parts_lod(eye, radius, f32::INFINITY)
+    }
+    /// [`Self::parts`] with a level of detail: trees farther than `far_m`
+    /// metres from `eye` get their crowns at half resolution, leaf blocks of
+    /// 2 x 2 x 2 cells (half a metre), about an eighth of the cubes. Ground
+    /// plants are unchanged.
+    pub fn parts_lod(&self, eye: [f32; 3], radius: f32, far_m: f32) -> Vec<SoftPart> {
         let mut out = Vec::new();
         let distance = |p: &VisualPlant| {
             (p.root[0] as f32 * 0.25 - eye[0]).powi(2) + (p.root[2] as f32 * 0.25 - eye[2]).powi(2)
@@ -1386,6 +1393,8 @@ impl VisualFrame {
                 if self.season == Season::Winter && !s.evergreen {
                     continue;
                 }
+                // Cells of `step` quarter-cells a side: 1 near, 2 far away.
+                let step: i64 = if distance(p) > far_m * far_m { 2 } else { 1 };
                 let mut leaves = std::collections::HashSet::new();
                 for tip in &p.tips {
                     let juvenile = tip == &p.root;
@@ -1394,6 +1403,13 @@ impl VisualFrame {
                     } else {
                         i64::from(s.spread).clamp(2, 6)
                     };
+                    let (tip, r) = if step == 1 {
+                        (*tip, r)
+                    } else {
+                        (tip.map(|v| v.div_euclid(step)), (r + step - 1) / step)
+                    };
+                    let tip = &tip;
+                    let lift = if step == 1 { 1 } else { 0 };
                     for y in -r..=r {
                         for z in -r..=r {
                             for x in -r..=r {
@@ -1417,7 +1433,7 @@ impl VisualFrame {
                                 {
                                     continue;
                                 }
-                                leaves.insert([tip[0] + x, tip[1] + y + 1, tip[2] + z]);
+                                leaves.insert([tip[0] + x, tip[1] + y + lift, tip[2] + z]);
                             }
                         }
                     }
@@ -1446,9 +1462,10 @@ impl VisualFrame {
                     if out.len() >= 150_000 {
                         return out;
                     }
+                    let cell = 0.25 * step as f32;
                     out.push(SoftPart {
-                        center: at.map(|v| v as f32 * 0.25 + 0.125),
-                        size: [0.25; 3],
+                        center: at.map(|v| v as f32 * cell + cell / 2.),
+                        size: [cell; 3],
                         colour,
                         yaw: 0.,
                         lean: 0.,

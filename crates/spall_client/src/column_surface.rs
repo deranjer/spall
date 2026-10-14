@@ -57,6 +57,18 @@ const RECENTRE_SLACK_CELLS: i64 = 128;
 
 /// Cells per side of the camera field for a view radius: the view on both
 /// sides of the camera plus the slack, in whole regions.
+/// `SPALL_WATER_TRACE=1` logs the client's water work that took over half a
+/// millisecond, on the clock the frame trace uses, to find what makes a frame
+/// long: `net` is the network thread applying a water update, `sync` the
+/// window's per-frame water upload.
+pub fn water_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPALL_WATER_TRACE").is_some())
+}
+
+/// Shortest time between two easings of the surface.
+const ADVANCE_INTERVAL_S: f64 = 1.0 / 60.0;
+
 pub fn field_dim_for_radius(radius_m: f32) -> u32 {
     let radius_cells = (radius_m / CELL_M).ceil() as i64;
     let dim = 2 * (radius_cells + RECENTRE_SLACK_CELLS);
@@ -180,6 +192,9 @@ pub struct ColumnSurface {
     dirty: Vec<Rect>,
     needs_full_upload: bool,
     last_advance_s: f64,
+    /// A region arrived since the last easing: it is composed at once, not at
+    /// the next 60 Hz step.
+    fresh: bool,
     /// The server's heights and currents for movement prediction, behind its
     /// own lock so the render thread's long hold of this struct never stalls
     /// the prediction tick (see [`WaterQuery`]).
@@ -208,6 +223,7 @@ impl ColumnSurface {
             dirty: Vec::new(),
             needs_full_upload: false,
             last_advance_s: 0.0,
+            fresh: false,
             query: SharedWaterQuery::default(),
         }
     }
@@ -403,6 +419,7 @@ impl ColumnSurface {
         // The tile is now animating, so the next `advance` recomposes and
         // reports it; doing it here as well would smooth every tile twice.
         tile.animating = true;
+        self.fresh = true;
     }
 
     /// Eases every animating tile by the time since the last call and returns
@@ -414,8 +431,16 @@ impl ColumnSurface {
     }
 
     pub fn advance_to(&mut self, now: f64) -> Vec<Rect> {
+        // The surface eases at a steady 60 Hz however fast frames come: at 200
+        // frames a second the same recomposition, a millisecond of the main
+        // thread, would run three times as often to move heights by a third
+        // as much, and the eye cannot tell.
+        if !self.fresh && now - self.last_advance_s < ADVANCE_INTERVAL_S {
+            return std::mem::take(&mut self.dirty);
+        }
         let dt = (now - self.last_advance_s).clamp(0.0, 0.25) as f32;
         self.last_advance_s = now;
+        self.fresh = false;
         let ease = 1.0 - (-dt / EASE_S).exp();
         let decay = (-dt / AGITATION_DECAY_S).exp();
         let mut keys = Vec::new();

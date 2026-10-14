@@ -520,7 +520,10 @@ pub fn generate_with_timings(
     spec: &WorldGenSpec,
 ) -> Result<(GeneratedWorld, GenerationTimings), GenError> {
     let started = std::time::Instant::now();
-    let columns = ColumnMap::compute(spec)?;
+    let mut columns = ColumnMap::compute(spec)?;
+    if !spec.water {
+        columns.remove_water();
+    }
     validate_water_budget(&columns)?;
     let caves = CaveField::new(spec.seed, &columns);
     let column_time = started.elapsed();

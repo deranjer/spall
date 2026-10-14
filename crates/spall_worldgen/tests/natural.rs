@@ -74,6 +74,26 @@ fn water_sits_above_the_ground_and_never_in_the_border() {
 }
 
 #[test]
+fn a_dry_world_has_the_same_ground_and_no_water() {
+    let wet = generate(&spec(3, SIZE)).expect("wet world");
+    let dry = generate(&spec(3, SIZE).dry()).expect("dry world");
+    assert!(wet.water.cell_count() > 0, "the seed has water to remove");
+    assert_eq!(dry.water.cell_count(), 0);
+    assert!(dry.water.springs.is_empty() && dry.water.sinks.is_empty());
+    let (wet_columns, dry_columns) = (&wet.columns, &dry.columns);
+    for z in (0..SIZE as i64).step_by(7) {
+        for x in (0..SIZE as i64).step_by(7) {
+            assert_eq!(wet_columns.height(x, z), dry_columns.height(x, z));
+            assert!(!dry_columns.is_water(x, z));
+        }
+    }
+    assert_eq!(
+        wet.terrain.resident_brick_count(),
+        dry.terrain.resident_brick_count()
+    );
+}
+
+#[test]
 fn heights_stay_under_the_wall() {
     for seed in 1..=6 {
         let cols = columns(seed, SIZE);

@@ -59,6 +59,16 @@ pub struct ColumnConfig {
     pub sleep_flow: f32,
     /// Consecutive quiet steps before a region sleeps.
     pub sleep_steps: u32,
+    /// Distances (cells, from the nearest focus point, see
+    /// [`ColumnWorld::set_focus`]) beyond which an active region is stepped only
+    /// every 2nd, 4th and 8th step. The rest of the steps it rests: its water
+    /// exchanges with neighbours through its edge but does not redistribute, so
+    /// far water runs slower than real time rather than stopping (and none is
+    /// created or lost). 0 in the first entry turns this off.
+    pub throttle_from_cells: [f32; 3],
+    /// Substeps a region that is near again may spend catching up on the time
+    /// it rested, per step (0: no catching up, the water stays behind).
+    pub catch_up_substeps: u32,
     /// EXPERIMENTAL, off by default (0). A flowing region freezes as a steady
     /// region when no span's volume moved by more than `steady_volume` over a
     /// window of this many steps. It is then
@@ -110,6 +120,8 @@ impl Default for ColumnConfig {
             max_substeps: 64,
             sleep_flow: 1.0e-3,
             sleep_steps: 20,
+            throttle_from_cells: [0.0; 3],
+            catch_up_substeps: 0,
             steady_steps: 0,
             steady_volume: 0.2,
             steady_drift_abs: 2.0e-5,
@@ -296,6 +308,13 @@ struct Region {
     /// Neighbours have been allocated (or found non-resident).
     ring_done: bool,
     frozen: bool,
+    /// Resting this step: far from every focus point, so stepped only every
+    /// `period` steps (see [`ColumnConfig::throttle_from_cells`]).
+    resting: bool,
+    period: u8,
+    /// Time this region rested while it was active, seconds: how far behind
+    /// real time its water is.
+    owed_s: f32,
     /// Flowing but balanced: not stepped, flows and volumes held (see
     /// [`ColumnConfig::steady_steps`]).
     steady: bool,
@@ -353,11 +372,25 @@ pub struct SpanView {
     pub head_y: f64,
 }
 
+/// One active region's state, see [`ColumnWorld::active_regions_diag`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActiveRegionDiag {
+    pub key: RegionKey,
+    pub max_flow: f32,
+    pub quiet_steps: u32,
+    pub resting: bool,
+    pub steady: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ColumnStepMetrics {
     pub substeps: u32,
     /// Regions, spans and pipes that did work this step.
     pub active_regions: usize,
+    /// Active regions that rested this step (far from every focus point).
+    pub resting_regions: usize,
+    /// Regions that spent substeps catching up on rested time this step.
+    pub caught_up_regions: usize,
     pub active_spans: usize,
     pub active_pipes: usize,
     pub regions_slept: usize,
@@ -431,6 +464,12 @@ pub struct ColumnWorld {
     touched: Vec<u32>,
     /// Largest wetted pipe area seen, for the substep limit.
     a_hint: f32,
+    /// Points (cell x, z) the water is kept up to date around, and the number
+    /// of steps taken: see [`ColumnConfig::throttle_from_cells`].
+    focus: Vec<[f64; 2]>,
+    step_counter: u64,
+    /// While catching a region up, the only one stepped.
+    only: Option<u32>,
     lists_dirty: bool,
     /// Deep still sea held as records, by region; and the water in them.
     dormant: HashMap<RegionKey, Dormant>,
@@ -538,6 +577,9 @@ impl ColumnWorld {
             dirty: BTreeSet::new(),
             touched: Vec::new(),
             a_hint: 0.25,
+            focus: Vec::new(),
+            step_counter: 0,
+            only: None,
             lists_dirty: false,
             dormant: HashMap::new(),
             dormant_volume: 0.0,
@@ -587,6 +629,58 @@ impl ColumnWorld {
 
     pub fn region_count(&self) -> usize {
         self.regions.len()
+    }
+
+    /// Sets the points (metres, x and z) around which the water is kept up to
+    /// date: active regions farther than [`ColumnConfig::throttle_from_cells`]
+    /// step less often. An empty list (no players) throttles nothing.
+    pub fn set_focus(&mut self, points_m: &[[f64; 2]]) {
+        self.focus = points_m
+            .iter()
+            .map(|p| [p[0] / CELL_SIZE_M, p[1] / CELL_SIZE_M])
+            .collect();
+    }
+
+    /// Seconds a region's water is behind real time because it rested.
+    pub fn region_owed_s(&self, key: RegionKey) -> f32 {
+        self.slot_of
+            .get(&key)
+            .map_or(0.0, |&s| self.regions[s as usize].owed_s)
+    }
+
+    /// What every active region is doing, for finding out why one does not
+    /// sleep: the largest flow through any of its pipes (cells^3/s), its quiet
+    /// steps so far, and whether it rests or is steady.
+    pub fn active_regions_diag(&self) -> Vec<ActiveRegionDiag> {
+        self.regions
+            .iter()
+            .filter(|r| r.active && !r.frozen)
+            .map(|r| ActiveRegionDiag {
+                key: r.key,
+                max_flow: r
+                    .pipes
+                    .iter()
+                    .map(|&pi| self.q[pi as usize].abs())
+                    .fold(0.0, f32::max),
+                quiet_steps: r.quiet_steps,
+                resting: r.resting,
+                steady: r.steady,
+            })
+            .collect()
+    }
+
+    /// Active regions resting at the moment.
+    pub fn resting_region_count(&self) -> usize {
+        self.regions
+            .iter()
+            .filter(|r| r.active && !r.frozen && r.resting)
+            .count()
+    }
+
+    /// Whether a region takes part in the step being run.
+    fn stepping(&self, slot: usize) -> bool {
+        let r = &self.regions[slot];
+        r.active && !r.frozen && !r.resting && self.only.is_none_or(|o| o as usize == slot)
     }
 
     pub fn active_region_count(&self) -> usize {
@@ -1078,6 +1172,9 @@ impl ColumnWorld {
                     quiet_steps: 0,
                     ring_done: false,
                     frozen: false,
+                    resting: false,
+                    period: 1,
+                    owed_s: 0.0,
                     steady: false,
                     steady_steps: 0,
                     steady_time: 0.0,
@@ -1572,6 +1669,9 @@ impl ColumnWorld {
                 quiet_steps: 0,
                 ring_done: false,
                 frozen: false,
+                resting: false,
+                period: 1,
+                owed_s: 0.0,
                 steady: false,
                 steady_steps: 0,
                 steady_time: 0.0,
@@ -2261,8 +2361,19 @@ impl ColumnWorld {
         }
         self.steady_boundary.clear();
         let mut touched = vec![false; self.regions.len()];
-        for r in &self.regions {
-            if r.active && !r.frozen {
+        let part: Vec<bool> = (0..self.regions.len()).map(|s| self.stepping(s)).collect();
+        // Active regions that sit this step out (resting, or not the one being
+        // caught up): the water between them and a stepping region does not
+        // move, or the edge of the one that rests would take water it cannot
+        // pass on and the two would slosh against each other.
+        let held: Vec<bool> = self
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(s, r)| r.active && !r.frozen && !part[s])
+            .collect();
+        for (slot, r) in self.regions.iter().enumerate() {
+            if part[slot] {
                 for s in r.span_start..r.span_end {
                     stamp[s as usize] = true;
                     self.act_spans.push(s);
@@ -2270,14 +2381,18 @@ impl ColumnWorld {
             }
         }
         for (slot, r) in self.regions.iter().enumerate() {
-            if !r.active || r.frozen {
+            if !part[slot] {
                 continue;
             }
             for &pi in &r.pipes {
                 let p = self.pipes[pi as usize];
-                // Each pipe is owned by its `a` region unless that one sleeps.
-                let owner_active = self.regions[p.ra as usize].active;
+                // Each pipe is owned by its `a` region unless that one sleeps
+                // (or rests).
+                let owner_active = part[p.ra as usize];
                 if p.ra as usize != slot && owner_active {
+                    continue;
+                }
+                if held[p.ra as usize] || held[p.rb as usize] {
                     continue;
                 }
                 self.act_pipes.push(pi);
@@ -2297,8 +2412,8 @@ impl ColumnWorld {
                 }
             }
         }
-        for (slot, r) in self.regions.iter().enumerate() {
-            if r.active && !r.frozen {
+        for (slot, stepping) in part.iter().enumerate() {
+            if *stepping {
                 touched[slot] = true;
             }
         }
@@ -2321,18 +2436,91 @@ impl ColumnWorld {
         if self.unplaced > 0.0 {
             self.release_unplaced();
         }
+        self.update_resting(dt as f32);
         if self.lists_dirty {
             self.rebuild_lists();
         }
         let mut metrics = ColumnStepMetrics {
             active_regions: self.active_region_count(),
+            resting_regions: self.resting_region_count(),
             active_spans: self.act_spans.len(),
             active_pipes: self.act_pipes.len(),
             ..ColumnStepMetrics::default()
         };
-        if metrics.active_regions == 0 {
+        self.step_counter += 1;
+        if self.act_pipes.is_empty() && self.act_spans.is_empty() {
             return metrics;
         }
+        let mut remaining = dt as f32;
+        self.prepare_substeps();
+        while remaining > 1.0e-9 && metrics.substeps < self.config.max_substeps {
+            remaining -= self.substep(remaining);
+            metrics.substeps += 1;
+        }
+        metrics.skipped_s = remaining.max(0.0);
+        for &slot in &self.touched {
+            self.dirty.insert(self.regions[slot as usize].key);
+        }
+        let advanced_s = dt as f32 - metrics.skipped_s;
+        self.after_step(&mut metrics, advanced_s);
+        metrics.steady_regions = self.steady_region_count();
+        self.catch_up(&mut metrics);
+        metrics
+    }
+
+    /// Decides which active regions rest this step and how long each has been
+    /// resting (see [`ColumnConfig::throttle_from_cells`]).
+    fn update_resting(&mut self, dt: f32) {
+        const OWED_CAP_S: f32 = 1800.0;
+        let bands = self.config.throttle_from_cells;
+        let on = bands[0] > 0.0 && !self.focus.is_empty();
+        let counter = self.step_counter;
+        let mut changed = false;
+        for (slot, r) in self.regions.iter_mut().enumerate() {
+            let (period, rest) = if on && r.active && !r.frozen {
+                let centre = [
+                    f64::from(r.key.0) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
+                    f64::from(r.key.1) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
+                ];
+                let distance = self
+                    .focus
+                    .iter()
+                    .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
+                    .fold(f64::INFINITY, f64::min);
+                let period = if distance >= f64::from(bands[2]) {
+                    8u64
+                } else if distance >= f64::from(bands[1]) {
+                    4
+                } else if distance >= f64::from(bands[0]) {
+                    2
+                } else {
+                    1
+                };
+                // Regions of a period all step on the same steps, and the periods
+                // nest, so two neighbours step together whenever the slower of
+                // them does and the water between them moves at its pace.
+                let _ = slot;
+                (period, !counter.is_multiple_of(period))
+            } else {
+                (1, false)
+            };
+            r.period = period as u8;
+            if r.resting != rest {
+                r.resting = rest;
+                changed = true;
+            }
+            if rest {
+                r.owed_s = (r.owed_s + dt).min(OWED_CAP_S);
+            }
+        }
+        if changed {
+            self.lists_dirty = true;
+        }
+    }
+
+    /// Per-step set-up the substeps rely on, for whichever regions the lists
+    /// now hold: the pressured spans, effective heads and the area hint.
+    fn prepare_substeps(&mut self) {
         // Near-full spans carry a pressure head; the set is fixed for the step.
         self.nodes = self
             .act_spans
@@ -2352,19 +2540,75 @@ impl ColumnWorld {
                 Self::wetted_area(p, eff[p.a as usize], eff[p.b as usize])
             })
             .reduce(|| 0.25f32, f32::max);
-        let mut remaining = dt as f32;
-        while remaining > 1.0e-9 && metrics.substeps < self.config.max_substeps {
-            remaining -= self.substep(remaining);
-            metrics.substeps += 1;
+    }
+
+    /// Spends a few substeps, region by region, on the nearest regions that
+    /// rested while they were far: each is stepped alone for the time it owes
+    /// (up to a limit) so the water catches up with real time as the player
+    /// comes back, instead of staying where it stopped.
+    fn catch_up(&mut self, metrics: &mut ColumnStepMetrics) {
+        const MIN_OWED_S: f32 = 0.2;
+        const MAX_PER_STEP: usize = 4;
+        const MAX_SPAN_S: f32 = 4.0;
+        let budget = self.config.catch_up_substeps;
+        if budget == 0 || self.focus.is_empty() {
+            return;
         }
-        metrics.skipped_s = remaining.max(0.0);
-        for &slot in &self.touched {
-            self.dirty.insert(self.regions[slot as usize].key);
+        let mut due: Vec<(usize, f32)> = self
+            .regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.active && !r.frozen && !r.resting && r.period == 1)
+            .filter(|(_, r)| r.owed_s > MIN_OWED_S)
+            .map(|(s, r)| (s, r.owed_s))
+            .collect();
+        if due.is_empty() {
+            return;
         }
-        let advanced_s = dt as f32 - metrics.skipped_s;
-        self.after_step(&mut metrics, advanced_s);
-        metrics.steady_regions = self.steady_region_count();
-        metrics
+        due.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        due.truncate(MAX_PER_STEP);
+        for (slot, owed) in due {
+            self.only = Some(slot as u32);
+            self.lists_dirty = true;
+            self.rebuild_lists();
+            self.prepare_substeps();
+            let want = owed.min(MAX_SPAN_S);
+            let mut remaining = want;
+            let mut n = 0;
+            while remaining > 1.0e-9 && n < budget {
+                remaining -= self.substep(remaining);
+                n += 1;
+            }
+            let r = &mut self.regions[slot];
+            r.owed_s = (r.owed_s - (want - remaining)).max(0.0);
+            for &t in &self.touched {
+                self.dirty.insert(self.regions[t as usize].key);
+            }
+            // Water this region pushed into a sleeping neighbour wakes it, as
+            // it would in an ordinary step; left asleep it would hold the water
+            // as a ridge at the border.
+            let cfg = self.config;
+            let mut wake = BTreeSet::new();
+            for &pi in &self.act_pipes {
+                let p = self.pipes[pi as usize];
+                if self.q[pi as usize].abs() > cfg.sleep_flow {
+                    for r in [p.ra, p.rb] {
+                        let reg = &self.regions[r as usize];
+                        if !reg.active && !reg.steady {
+                            wake.insert(r as usize);
+                        }
+                    }
+                }
+            }
+            for s in wake {
+                if self.wake_slot(s) {
+                    metrics.regions_woken += 1;
+                }
+            }
+            metrics.caught_up_regions += 1;
+        }
+        self.only = None;
+        self.lists_dirty = true;
     }
 
     /// Regions frozen as steady: flowing, balanced, and not stepped.
@@ -2486,7 +2730,7 @@ impl ColumnWorld {
                 if r.steady {
                     continue;
                 }
-                if !(r.active && !r.frozen && max_q[s] >= cfg.sleep_flow) {
+                if !r.active || r.frozen || r.resting || max_q[s] < cfg.sleep_flow {
                     r.steady_snap.clear();
                     r.steady_qsum.clear();
                     r.steady_qsq.clear();
@@ -2623,7 +2867,7 @@ impl ColumnWorld {
         }
         let mut slept = Vec::new();
         for (s, r) in self.regions.iter_mut().enumerate() {
-            if !r.active || r.frozen {
+            if !r.active || r.frozen || r.resting {
                 continue;
             }
             if max_q[s] < cfg.sleep_flow {
@@ -2631,9 +2875,13 @@ impl ColumnWorld {
                 r.steady_snap.clear();
                 r.steady_qsum.clear();
                 r.steady_qsq.clear();
-                r.quiet_steps += 1;
+                // A far region is stepped one time in `period`: each quiet step
+                // stands for that many, so it falls asleep at the real-time
+                // pace a near one does.
+                r.quiet_steps += u32::from(r.period);
                 if r.quiet_steps >= cfg.sleep_steps {
                     r.active = false;
+                    r.owed_s = 0.0;
                     slept.push(s);
                 }
             } else {

@@ -427,6 +427,15 @@ temperature and water level) that the world carries in `LivingState` and every
   second and a walking player rubber-banded; after it, a 10 minute run of
   simulated time had three 300 to 390 ms ticks.
 
+- **Foliage level of detail (client).** Tree crowns beyond 36 m are drawn at half
+  resolution (`LivingState`'s `VisualFrame::parts_lod`): leaf blocks of 2 x 2 x 2
+  cells, half a metre, filling the same space with about an eighth of the cubes.
+  Ground plants and near trees are unchanged. On the 4096 natural world the
+  foliage set fell from 69,935 to 42,203 instances, its rebuild (on the foliage
+  worker thread, about once a second) from about 50 to 23 ms, and a standing frame
+  from 8.3 to 7.2 ms (121 to 141 fps; scene GPU 3.4 to 2.6 ms). A coarser second
+  level (1 m blocks beyond about 65 m) gave nothing measurable and was dropped.
+
 Measured (natural, seed 1, 4096 cells, release, `vegetation_scale` example):
 
 | | before W5 (512 / 8,192 caps) | after |
