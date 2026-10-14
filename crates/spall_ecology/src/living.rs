@@ -10,7 +10,7 @@ use spall_worldgen::{Biome, ColumnMap};
 
 /// Version 2 moved the ground carpet out of the organisms: grass, sedge,
 /// clover and tussock are stateless cover now ([`crate::cover`]).
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 /// Sized for a 1 km world: about 10 to 20 thousand trees and the living
 /// understory (cover is stateless and not counted here).
 pub const MAX_TREES: usize = 24_576;
@@ -123,6 +123,10 @@ pub struct Organism {
     pub species: u16,
     pub root: [i64; 3],
     pub age_ms: u64,
+    /// Accumulated age during spring, summer and autumn only.
+    pub growth_ms: u64,
+    /// Active growing time since the last seed attempt.
+    pub seed_growth_ms: u64,
     pub last_update_ms: u64,
     pub last_seed_ms: u64,
     pub alive: bool,
@@ -165,6 +169,118 @@ pub struct LivingState {
     /// Where the organisms stand (derived, never saved).
     #[serde(skip)]
     pub(crate) spatial: crate::placement::Spatial,
+}
+
+/// Version 3 cleared-cover layout. `at_s` was a chronological timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ClearedV3 {
+    x: u16,
+    z: u16,
+    at_s: u32,
+}
+
+/// Previous saved schema, retained solely for deterministic migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LivingStateV3 {
+    version: u16,
+    seed: u64,
+    size: u32,
+    time_ms: u64,
+    credit_ms: u64,
+    start_season: Season,
+    season_ms: u64,
+    next_id: u64,
+    cursor: u32,
+    species: Vec<Species>,
+    #[serde(with = "crate::codec::v3")]
+    organisms: Vec<Organism>,
+    spawns: Vec<[i64; 3]>,
+    cover: Vec<CoverSpecies>,
+    field: CoverField,
+    cleared: Vec<ClearedV3>,
+    preset: u8,
+}
+
+fn active_prefix(start: Season, season_ms: u64, time_ms: u64) -> u64 {
+    let length = season_ms.max(1);
+    let elapsed_seasons = time_ms / length;
+    let cycles = elapsed_seasons / 4;
+    let remainder_seasons = elapsed_seasons % 4;
+    let partial = time_ms % length;
+    let mut active = cycles.saturating_mul(length).saturating_mul(3);
+    for i in 0..remainder_seasons {
+        let season = (start as usize + i as usize) % 4;
+        if season != Season::Winter as usize {
+            active = active.saturating_add(length);
+        }
+    }
+    if (start as u64 + remainder_seasons) % 4 != Season::Winter as u64 {
+        active = active.saturating_add(partial);
+    }
+    active
+}
+
+fn active_between(start: Season, season_ms: u64, from_ms: u64, to_ms: u64) -> u64 {
+    active_prefix(start, season_ms, to_ms).saturating_sub(active_prefix(start, season_ms, from_ms))
+}
+
+fn upgrade_v3(old: LivingStateV3) -> LivingState {
+    LivingState {
+        version: VERSION,
+        seed: old.seed,
+        size: old.size,
+        time_ms: old.time_ms,
+        credit_ms: old.credit_ms,
+        start_season: old.start_season,
+        season_ms: old.season_ms,
+        next_id: old.next_id,
+        cursor: old.cursor,
+        species: old.species,
+        organisms: old.organisms,
+        spawns: old.spawns,
+        cover: old.cover,
+        field: old.field,
+        cleared: old
+            .cleared
+            .into_iter()
+            .map(|c| Cleared {
+                x: c.x,
+                z: c.z,
+                growth_ms: c.at_s.saturating_mul(1000),
+            })
+            .collect(),
+        preset: old.preset,
+        spatial: Default::default(),
+    }
+}
+
+fn migrate_legacy_clocks(state: &mut LivingState) {
+    for p in &mut state.organisms {
+        let from = p.last_update_ms.saturating_sub(p.age_ms);
+        p.growth_ms = if p.age_ms > state.time_ms {
+            p.age_ms
+        } else {
+            active_between(state.start_season, state.season_ms, from, p.last_update_ms)
+                .min(p.age_ms)
+        };
+        p.seed_growth_ms = active_between(
+            state.start_season,
+            state.season_ms,
+            p.last_seed_ms,
+            p.last_update_ms,
+        );
+    }
+    for c in &mut state.cleared {
+        let timestamp_ms = u64::from(c.growth_ms);
+        c.growth_ms = active_between(
+            state.start_season,
+            state.season_ms,
+            timestamp_ms,
+            state.time_ms,
+        )
+        .min(u64::from(FULL_AFTER_S * 1000)) as u32;
+    }
+    state.cleared.retain(|c| c.growth_ms < FULL_AFTER_S * 1000);
 }
 /// A version 1 species: its `biomes` were a mask over the four vegetation
 /// classes (meadow, alpine, swamp, desert).
@@ -278,6 +394,8 @@ impl From<OrganismV2> for Organism {
             species: o.species,
             root: o.root,
             age_ms: o.age_ms,
+            growth_ms: o.age_ms,
+            seed_growth_ms: 0,
             last_update_ms: o.last_update_ms,
             last_seed_ms: o.last_seed_ms,
             alive: o.alive,
@@ -307,7 +425,7 @@ struct LivingStateV2 {
     spawns: Vec<[i64; 3]>,
     cover: Vec<CoverSpecies>,
     field: CoverField,
-    cleared: Vec<Cleared>,
+    cleared: Vec<ClearedV3>,
     preset: u8,
 }
 impl From<LivingStateV2> for LivingState {
@@ -327,7 +445,15 @@ impl From<LivingStateV2> for LivingState {
             spawns: old.spawns,
             cover: old.cover,
             field: old.field,
-            cleared: old.cleared,
+            cleared: old
+                .cleared
+                .into_iter()
+                .map(|c| Cleared {
+                    x: c.x,
+                    z: c.z,
+                    growth_ms: c.at_s.saturating_mul(1000),
+                })
+                .collect(),
             preset: old.preset,
             spatial: Default::default(),
         }
@@ -492,6 +618,7 @@ impl LivingState {
                         let p = &mut self.organisms[index];
                         p.committed = p.wood.len() as u16;
                         p.age_ms = 600_000;
+                        p.growth_ms = 600_000;
                         for &at in p.wood.iter() {
                             plan.set(cell(at), MaterialId(wood.unwrap_or(0)));
                         }
@@ -621,6 +748,8 @@ impl LivingState {
             species: sid,
             root,
             age_ms: 0,
+            growth_ms: 0,
+            seed_growth_ms: 0,
             last_update_ms: self.time_ms,
             last_seed_ms: self.time_ms,
             alive: true,
@@ -678,13 +807,12 @@ impl LivingState {
         if u32::from(x) >= self.size || u32::from(z) >= self.size {
             return;
         }
-        let at_s = (self.time_ms / 1000).min(u64::from(u32::MAX)) as u32;
         match self.cleared.binary_search_by_key(&(x, z), |c| (c.x, c.z)) {
-            Ok(i) => self.cleared[i].at_s = at_s,
+            Ok(i) => self.cleared[i].growth_ms = 0,
             Err(i) => {
                 if self.cleared.len() >= MAX_CLEARED {
                     if let Some(oldest) =
-                        (0..self.cleared.len()).min_by_key(|&k| self.cleared[k].at_s)
+                        (0..self.cleared.len()).min_by_key(|&k| self.cleared[k].growth_ms)
                     {
                         self.cleared.remove(oldest);
                     }
@@ -692,9 +820,9 @@ impl LivingState {
                         .cleared
                         .binary_search_by_key(&(x, z), |c| (c.x, c.z))
                         .unwrap_err();
-                    self.cleared.insert(i, Cleared { x, z, at_s });
+                    self.cleared.insert(i, Cleared { x, z, growth_ms: 0 });
                 } else {
-                    self.cleared.insert(i, Cleared { x, z, at_s });
+                    self.cleared.insert(i, Cleared { x, z, growth_ms: 0 });
                 }
             }
         }
@@ -722,12 +850,22 @@ impl LivingState {
             2 => postcard::from_bytes::<LivingStateV2>(bytes)
                 .map_err(|e| e.to_string())?
                 .into(),
+            3 => {
+                let mut state = upgrade_v3(
+                    postcard::from_bytes::<LivingStateV3>(bytes).map_err(|e| e.to_string())?,
+                );
+                state.grow_skeletons()?;
+                state
+            }
             _ => {
                 let mut s: Self = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
                 s.grow_skeletons()?;
                 s
             }
         };
+        if version < VERSION {
+            migrate_legacy_clocks(&mut s);
+        }
         s.validate_with(version < VERSION)?;
         if version < VERSION {
             s.check_skeletons_reproducible()?;
@@ -973,12 +1111,21 @@ impl LivingState {
         }
         let dt = self.credit_ms / 1000 * 1000;
         self.credit_ms %= 1000;
+        let previous_time_ms = self.time_ms;
         self.time_ms = self.time_ms.saturating_add(dt);
         let season = self.season();
-        // Cover that has regrown in full needs no record.
-        let now_s = (self.time_ms / 1000).min(u64::from(u32::MAX)) as u32;
-        self.cleared
-            .retain(|c| now_s.saturating_sub(c.at_s) < FULL_AFTER_S);
+        let active_world_dt = active_between(
+            self.start_season,
+            self.season_ms,
+            previous_time_ms,
+            self.time_ms,
+        );
+        for c in &mut self.cleared {
+            c.growth_ms = u64::from(c.growth_ms)
+                .saturating_add(active_world_dt)
+                .min(u64::from(FULL_AFTER_S * 1000)) as u32;
+        }
+        self.cleared.retain(|c| c.growth_ms < FULL_AFTER_S * 1000);
         let n = self.organisms.len();
         let mut seeds = Vec::new();
         let mut growth = Vec::new();
@@ -1043,18 +1190,24 @@ impl LivingState {
             }
             // Elapsed ecological time, including fair-budget deferral, never wall-clock time.
             let due = self.time_ms.saturating_sub(p.last_update_ms);
+            let active_due = active_between(
+                self.start_season,
+                self.season_ms,
+                p.last_update_ms,
+                self.time_ms,
+            );
             p.age_ms = p.age_ms.saturating_add(due);
+            p.growth_ms = p.growth_ms.saturating_add(active_due);
+            p.seed_growth_ms = p.seed_growth_ms.saturating_add(active_due);
             p.last_update_ms = self.time_ms;
-            if season != Season::Winter {
-                p.biomass = p
-                    .biomass
-                    .saturating_add((due / 1000).min(50) as u16 * 20)
-                    .min(1000);
-            }
+            p.biomass = p
+                .biomass
+                .saturating_add((active_due / 1000).min(50) as u16 * 20)
+                .min(1000);
             if s.tree
                 && season != Season::Winter
                 && growth.len() < 4
-                && p.age_ms >= u64::from(p.committed + 1) * s.growth_ms
+                && p.growth_ms >= u64::from(p.committed + 1) * s.growth_ms
             {
                 let j = usize::from(p.committed);
                 if j < p.wood.len() {
@@ -1075,11 +1228,9 @@ impl LivingState {
                 }
             }
             let mature = !s.tree || usize::from(p.committed) == p.wood.len();
-            if mature
-                && season != Season::Winter
-                && self.time_ms.saturating_sub(p.last_seed_ms) >= s.seed_ms
-            {
+            if mature && season != Season::Winter && p.seed_growth_ms >= s.seed_ms {
                 p.last_seed_ms = self.time_ms;
+                p.seed_growth_ms = 0;
                 let key = hash(self.seed ^ p.id ^ self.time_ms);
                 let radius = i64::from(s.spacing) * 3;
                 let dx = (key % (radius as u64 * 2 + 1)) as i64 - radius;
@@ -1521,6 +1672,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_growth_splits_long_and_deferred_intervals_at_season_boundaries() {
+        let length = 10_000;
+        assert_eq!(active_between(Season::Spring, length, 0, 40_000), 30_000);
+        assert_eq!(
+            active_between(Season::Spring, length, 5_000, 35_000),
+            25_000
+        );
+        assert_eq!(
+            active_between(Season::Spring, length, 5_000, 15_000)
+                + active_between(Season::Spring, length, 15_000, 35_000),
+            active_between(Season::Spring, length, 5_000, 35_000),
+            "fair-budget splits preserve the same active credit"
+        );
+        assert_eq!(active_between(Season::Winter, length, 0, 10_000), 0);
+        assert_eq!(active_between(Season::Winter, length, 0, 40_000), 30_000);
+        assert_eq!(active_between(Season::Spring, length, 0, 400_000), 300_000);
+    }
+
+    #[test]
+    fn legacy_cleared_timestamp_migrates_to_active_growth_and_freezes_in_winter() {
+        let mut state = state_with(vec![], vec![]);
+        state.start_season = Season::Spring;
+        state.season_ms = 100_000;
+        state.time_ms = 400_000;
+        state.cleared = vec![Cleared {
+            x: 5,
+            z: 6,
+            growth_ms: 200_000,
+        }];
+        migrate_legacy_clocks(&mut state);
+        assert_eq!(
+            state.cleared,
+            [Cleared {
+                x: 5,
+                z: 6,
+                growth_ms: 100_000
+            }]
+        );
+    }
+
+    #[test]
+    fn version_3_save_decodes_with_explicit_clock_migration_and_exact_v4_recovery() {
+        #[derive(Serialize)]
+        struct LegacyV3 {
+            version: u16,
+            seed: u64,
+            size: u32,
+            time_ms: u64,
+            credit_ms: u64,
+            start_season: Season,
+            season_ms: u64,
+            next_id: u64,
+            cursor: u32,
+            species: Vec<Species>,
+            #[serde(with = "crate::codec::v3")]
+            organisms: Vec<Organism>,
+            spawns: Vec<[i64; 3]>,
+            cover: Vec<CoverSpecies>,
+            field: CoverField,
+            cleared: Vec<ClearedV3>,
+            preset: u8,
+        }
+        let (species, mut plant) = grown_tree(9, 3, 60);
+        plant.age_ms = 200_000;
+        plant.last_update_ms = 200_000;
+        plant.last_seed_ms = 200_000;
+        let legacy = LegacyV3 {
+            version: 3,
+            seed: 9,
+            size: 256,
+            time_ms: 400_000,
+            credit_ms: 0,
+            start_season: Season::Spring,
+            season_ms: 100_000,
+            next_id: 4,
+            cursor: 0,
+            species: vec![species],
+            organisms: vec![plant],
+            spawns: vec![],
+            cover: vec![],
+            field: CoverField::default(),
+            cleared: vec![ClearedV3 {
+                x: 5,
+                z: 6,
+                at_s: 200,
+            }],
+            preset: 1,
+        };
+        let state = LivingState::decode(&postcard::to_stdvec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            state.cleared,
+            [Cleared {
+                x: 5,
+                z: 6,
+                growth_ms: 100_000
+            }]
+        );
+        assert_eq!(state.organisms[0].growth_ms, 200_000);
+        let recovered = LivingState::decode(&state.encode().unwrap()).unwrap();
+        assert_eq!(recovered, state);
+    }
+
     fn organism(id: u64, species: u16, x: i64) -> OrganismV2 {
         OrganismV2 {
             id,
@@ -1550,6 +1804,8 @@ mod tests {
             species: 1,
             root,
             age_ms: 600_000,
+            growth_ms: 600_000,
+            seed_growth_ms: 0,
             last_update_ms: 7,
             last_seed_ms: 7,
             alive: true,
@@ -1597,12 +1853,12 @@ mod tests {
             Cleared {
                 x: 62,
                 z: 40,
-                at_s: 1,
+                growth_ms: 1000,
             },
             Cleared {
                 x: 401,
                 z: 40,
-                at_s: 2,
+                growth_ms: 2000,
             },
         ];
         let terrain_free = VisualFrame {

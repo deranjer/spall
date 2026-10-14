@@ -207,6 +207,7 @@ fn authoritative_growth_and_checkpoint_recovery_keep_the_same_living_state() {
     for p in &mut vegetation.organisms {
         if p.id == sapling {
             p.age_ms = 100_000;
+            p.growth_ms = 100_000;
         }
     }
     let before: usize = vegetation
@@ -749,13 +750,101 @@ fn a_cleared_column_is_forgotten_after_it_regrows() {
     assert!(state.cleared.is_empty(), "grown back, nothing to remember");
     // Hitting a regrowing column again restarts its growth.
     state.clear_cover(7, 7);
-    let first = state.cleared[0].at_s;
+    assert_eq!(state.cleared[0].growth_ms, 0);
     for _ in 0..30 {
         state.advance(&scene.world().columns, &terrain, 1000);
     }
     state.clear_cover(7, 7);
     assert_eq!(state.cleared.len(), 1);
-    assert!(state.cleared[0].at_s > first);
+    assert_eq!(state.cleared[0].growth_ms, 0, "clearing restarts regrowth");
+}
+
+#[test]
+fn winter_freezes_wood_biomass_seeds_and_cleared_cover_then_spring_resumes_once() {
+    let scene = sandbox::worldgen_scene::generate("showcase", 1, 256).unwrap();
+    let mut state = scene.vegetation().clone();
+    state.start_season = spall_ecology::living::Season::Winter;
+    state.season_ms = 3_000;
+    let columns = &scene.world().columns;
+    let terrain = &scene.world().terrain;
+    let tree = state.organisms.iter().find(|p| !p.wood.is_empty()).unwrap();
+    let species_id = tree.species;
+    let root = tree.root;
+    let sapling = (6..40_i64)
+        .flat_map(|d| [(d, 0), (-d, 0), (0, d), (0, -d), (d, d), (-d, -d)])
+        .find_map(|(dx, dz)| {
+            let (x, z) = (root[0] + dx, root[2] + dz);
+            let root = [x, i64::from(columns.height(x, z)) + 1, z];
+            state.plant_sapling(columns, terrain, species_id, root)
+        })
+        .expect("open soil for a sapling");
+    let sapling_index = state
+        .organisms
+        .iter()
+        .position(|p| p.id == sapling)
+        .unwrap();
+    let sapling_growth_ms = state
+        .species
+        .iter()
+        .find(|s| s.id == species_id)
+        .unwrap()
+        .growth_ms;
+    state.organisms[sapling_index].growth_ms = sapling_growth_ms;
+    state.organisms[sapling_index].biomass = 250;
+    let mature_index = state
+        .organisms
+        .iter()
+        .position(|p| !p.wood.is_empty() && usize::from(p.committed) == p.wood.len())
+        .unwrap();
+    let seed_ms = state
+        .species
+        .iter()
+        .find(|s| s.id == state.organisms[mature_index].species)
+        .unwrap()
+        .seed_ms;
+    state.organisms[mature_index].seed_growth_ms = seed_ms - 2_000;
+    state.clear_cover(100, 100);
+
+    state.cursor = sapling_index as u32;
+    assert!(state.advance(columns, terrain, 1_000).is_empty());
+    assert_eq!(state.organisms[sapling_index].growth_ms, sapling_growth_ms);
+    assert_eq!(state.organisms[sapling_index].biomass, 250);
+    assert_eq!(state.cleared[0].growth_ms, 0);
+
+    state.cursor = mature_index as u32;
+    assert!(state.advance(columns, terrain, 1_000).is_empty());
+    assert_eq!(
+        state.organisms[mature_index].seed_growth_ms,
+        seed_ms - 2_000
+    );
+    assert_eq!(
+        state.cleared[0].growth_ms, 0,
+        "cover time also pauses in winter"
+    );
+
+    state.cursor = sapling_index as u32;
+    let spring_growth = state.advance(columns, terrain, 1_000);
+    assert_eq!(
+        spring_growth.iter().filter(|g| g.plant == sapling).count(),
+        1
+    );
+    assert_eq!(state.organisms[sapling_index].biomass, 250);
+    assert_eq!(state.cleared[0].growth_ms, 0);
+
+    state.cursor = sapling_index as u32;
+    state.advance(columns, terrain, 1_000);
+    assert_eq!(state.organisms[sapling_index].biomass, 270);
+    assert_eq!(state.cleared[0].growth_ms, 1_000);
+
+    state.cursor = mature_index as u32;
+    state.advance(columns, terrain, 1_000);
+    assert_eq!(state.organisms[mature_index].seed_growth_ms, 0);
+    state.cursor = mature_index as u32;
+    state.advance(columns, terrain, 1_000);
+    assert_eq!(
+        state.organisms[mature_index].seed_growth_ms, 1_000,
+        "no stored winter seed burst"
+    );
 }
 
 /// A natural world grows its underwater plants on the sea floor and nowhere

@@ -5356,10 +5356,8 @@ impl VegetationWorker {
                                 Some((k, parts)) if *k == key => cover_parts = parts.clone(),
                                 _ => {
                                     let mut hint = (eye[1] / 0.25).floor() as i64;
-                                    let memory = spall_ecology::cover::CoverMemory::new(
-                                        &frame.cleared,
-                                        (frame.time_ms / 1000).min(u64::from(u32::MAX)) as u32,
-                                    );
+                                    let memory =
+                                        spall_ecology::cover::CoverMemory::new(&frame.cleared);
                                     if seen.len() > 400_000 {
                                         seen.clear();
                                     }
