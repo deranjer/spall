@@ -217,10 +217,9 @@ pub fn decode(bytes: &[u8]) -> Result<Asset> {
             b"META" => meta = Some(decode_meta(payload)?),
             b"MTRL" => materials = Some(decode_materials(payload)?),
             b"PALT" => tints = Some(decode_palette(payload)?),
-            b"PART" => parts = Some(decode_parts(payload, minor)?),
+            b"PART" => parts = Some(decode_parts(payload)?),
             b"VOXL" => runs = Some(decode_runs(payload)?),
-            b"ANIM" if minor >= 1 => clips = Some(decode_clips(payload)?),
-            b"ANIM" => return invalid("ANIM is unavailable in SPVX minor version 0"),
+            b"ANIM" => clips = Some(decode_clips(payload)?),
             b"STRC" => return invalid("STRC is unsupported by this animated consumer"),
             b"LAYR" => return invalid("LAYR is unsupported by this animated consumer"),
             other => return invalid(format!("unknown chunk {}", fourcc(*other))),
@@ -498,17 +497,13 @@ fn decode_palette(bytes: &[u8]) -> Result<Vec<[u8; 3]>> {
     r.finish()?;
     Ok(v)
 }
-fn decode_parts(bytes: &[u8], minor: u16) -> Result<Vec<Part>> {
+fn decode_parts(bytes: &[u8]) -> Result<Vec<Part>> {
     let mut r = Reader::new(bytes);
     let n = r.u16()? as usize;
     if n == 0 || n > MAX_PARTS {
         return invalid("PART count must be 1..=1024");
     }
-    if minor == 0 {
-        preflight(&r, n, 36, "legacy PART records")?;
-    } else {
-        preflight(&r, n, 38, "PART records")?;
-    }
+    preflight(&r, n, 38, "PART records")?;
     let mut parts = Vec::with_capacity(n);
     let mut ids = BTreeSet::new();
     let mut siblings = BTreeSet::new();
@@ -520,9 +515,7 @@ fn decode_parts(bytes: &[u8], minor: u16) -> Result<Vec<Part>> {
         let translation = [r.i32()?, r.i32()?, r.i32()?];
         let q = [r.i16()?, r.i16()?, r.i16()?, r.i16()?];
         let scale = [r.u16()?, r.u16()?, r.u16()?];
-        // v1.0 PART predates the structural-profile extension; its records
-        // omit this final field and therefore imply the material baseline.
-        let structural_profile_slot = if minor == 0 { 0 } else { r.u16()? };
+        let structural_profile_slot = r.u16()?;
         if id == 0 || !ids.insert(id) {
             return invalid("PART IDs must be nonzero and unique");
         }
@@ -842,6 +835,13 @@ fn validate_clips(clips: &[Clip], parts: &[Part]) -> Result<()> {
                     return invalid("animation keys must be strictly ordered within clip duration");
                 }
                 tick = Some(k.tick);
+                if k.translation.is_none()
+                    && k.rotation.is_none()
+                    && k.scale.is_none()
+                    && k.visibility.is_none()
+                {
+                    return invalid("animation key has no fields");
+                }
                 if k.interpolation == Interpolation::Spherical && k.rotation.is_none() {
                     return invalid("spherical interpolation key lacks rotation");
                 }
@@ -1375,13 +1375,31 @@ mod tests {
         }
     }
     #[test]
-    fn minor_zero_part_uses_legacy_record_without_profile_slot() {
-        let mut part = parts_root();
-        part.truncate(part.len() - 2);
-        let mut bytes = make(Some(part), empty_vox(), None, None);
+    fn minor_zero_accepts_documented_part_and_anim_layout() {
+        let mut bytes = make(
+            Some(parts_root()),
+            empty_vox(),
+            Some(anim_two_keys([0, 0, 0, 32767], [0, 0, 0, 32767])),
+            None,
+        );
         bytes[6] = 0;
         let asset = decode(&bytes).unwrap();
         assert_eq!(asset.parts[0].structural_profile_slot, 0);
+        assert_eq!(
+            sample_clip(&asset, "turn", 30.0).unwrap()[&1]
+                .transform
+                .translation
+                .x,
+            0.5
+        );
+
+        // The repository has no historical v1.0 PART record layout; the
+        // documented PART schema includes structural_profile_slot.
+        let mut undocumented = parts_root();
+        undocumented.truncate(undocumented.len() - 2);
+        let mut bytes = make(Some(undocumented), empty_vox(), None, None);
+        bytes[6] = 0;
+        assert!(decode(&bytes).is_err());
     }
     #[test]
     fn mutated_public_asset_returns_sampling_error_without_panicking() {
@@ -1393,6 +1411,27 @@ mod tests {
         ))
         .unwrap();
         asset.clips[0].tracks[0].part_id = 99;
+        assert!(sample_clip(&asset, "turn", 1.0).is_err());
+
+        let mut asset = decode(&make(
+            Some(parts_root()),
+            empty_vox(),
+            Some(anim_two_keys([0, 0, 0, 32767], [0, 0, 0, 32767])),
+            None,
+        ))
+        .unwrap();
+        asset.clips[0].tracks[0].keys[0].rotation = Some([0; 4]);
+        assert!(sample_clip(&asset, "turn", 1.0).is_err());
+
+        let mut asset = decode(&make(
+            Some(parts_root()),
+            empty_vox(),
+            Some(anim_two_keys([0, 0, 0, 32767], [0, 0, 0, 32767])),
+            None,
+        ))
+        .unwrap();
+        asset.clips[0].tracks[0].keys[0].translation = None;
+        asset.clips[0].tracks[0].keys[0].rotation = None;
         assert!(sample_clip(&asset, "turn", 1.0).is_err());
     }
     #[test]
