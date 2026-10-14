@@ -14,6 +14,7 @@ pub mod residency;
 pub mod segmented;
 pub mod sky;
 pub mod tick_accumulator;
+pub mod weather;
 pub mod window;
 
 pub use catalogue::CatalogueReceiver;
