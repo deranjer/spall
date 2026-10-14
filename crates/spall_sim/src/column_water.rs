@@ -232,8 +232,25 @@ struct Published {
     steady_regions: usize,
     allocated_regions: usize,
     skipped_s: f64,
+    /// Terrain changes the worker applied since the tick last looked.
+    refresh: RefreshMetrics,
     /// A worker that panicked, so the tick can fail loudly.
     failure: Option<String>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct RefreshMetrics {
+    time: Duration,
+    columns_remapped: usize,
+    relocated_m3: f64,
+}
+
+/// A committed terrain change waiting for the water: the terrain as it was then,
+/// the regions whose bricks were edited, and those whose bricks became resident.
+struct PendingTerrain {
+    source: Arc<VolumeTerrain<Arc<Volume>>>,
+    edited: Vec<RegionKey>,
+    reloaded: Vec<RegionKey>,
 }
 
 struct Owed {
@@ -246,6 +263,12 @@ struct Owed {
 
 struct Shared {
     setup: ColumnWaterSetup,
+    /// Terrain changes queued by the tick and applied by whoever steps next
+    /// (the worker, or the tick itself without one): refreshing a region costs
+    /// time in proportion to every region the water holds, tens to hundreds of
+    /// milliseconds in a large world, and a tick that did it waited for the step
+    /// in flight first, so a walk that made bricks resident stalled the server.
+    pending_terrain: Mutex<Vec<PendingTerrain>>,
     gated_rate: AtomicU8,
     /// Where the players are (metres, x and z): the water far from every one
     /// steps less often (see `ColumnConfig::throttle_from_cells`).
@@ -481,6 +504,17 @@ impl Shared {
     /// frame. On the worker thread, or inline in the tick.
     fn advance(&self) {
         let mut core = lock(&self.core);
+        let pending: Vec<PendingTerrain> = std::mem::take(&mut *lock(&self.pending_terrain));
+        let mut refresh = RefreshMetrics::default();
+        for change in pending {
+            let started = Instant::now();
+            let report = core.world.replace_terrain(change.source, &change.edited);
+            core.world.notify_resident(&change.reloaded);
+            core.edit_pending = true;
+            refresh.time += started.elapsed();
+            refresh.columns_remapped += report.columns_changed;
+            refresh.relocated_m3 += report.relocated_volume * CELL_SIZE_M.powi(3);
+        }
         let focus = lock(&self.focus).clone();
         core.world.set_focus(&focus);
         let started = Instant::now();
@@ -560,6 +594,9 @@ impl Shared {
         if let Some(frame) = new_frame {
             published.frame = frame;
         }
+        published.refresh.time += refresh.time;
+        published.refresh.columns_remapped += refresh.columns_remapped;
+        published.refresh.relocated_m3 += refresh.relocated_m3;
         published.steps += steps;
         if last_step.is_some() {
             published.last_step = last_step;
@@ -699,6 +736,7 @@ impl AuthoritativeColumnWater {
         let shared = Shared {
             setup,
             gated_rate: AtomicU8::new(0),
+            pending_terrain: Mutex::new(Vec::new()),
             focus: Mutex::new(Vec::new()),
             core: Mutex::new(Core {
                 world,
@@ -732,6 +770,7 @@ impl AuthoritativeColumnWater {
                 steady_regions: 0,
                 allocated_regions: 0,
                 skipped_s: 0.0,
+                refresh: RefreshMetrics::default(),
                 failure: None,
             }),
         };
@@ -874,19 +913,13 @@ impl AuthoritativeColumnWater {
             .collect();
         let terrain_changed = !edited_keys.is_empty() || !reloaded_keys.is_empty();
         if terrain_changed {
-            // Waits for a step in flight: the refresh must see a whole world.
-            let started = Instant::now();
-            let mut core = lock(&self.shared.core);
-            let report = core.world.replace_terrain(
-                terrain_source(terrain, &self.shared.setup),
-                &edited_keys.iter().copied().collect::<Vec<_>>(),
-            );
-            core.world.notify_resident(&reloaded_keys);
-            core.edit_pending = true;
-            drop(core);
-            metrics.boundary_refresh = started.elapsed();
-            metrics.columns_remapped = report.columns_changed;
-            metrics.relocated_m3 = report.relocated_volume * CELL_SIZE_M.powi(3);
+            // Applied by the next step (see `Shared::pending_terrain`); the
+            // terrain is captured now, so the refresh sees this commit.
+            lock(&self.shared.pending_terrain).push(PendingTerrain {
+                source: terrain_source(terrain, &self.shared.setup),
+                edited: edited_keys.iter().copied().collect(),
+                reloaded: reloaded_keys.clone(),
+            });
         }
         {
             let mut owed = lock(&self.shared.owed);
@@ -906,6 +939,10 @@ impl AuthoritativeColumnWater {
         if let Some(message) = &published.failure {
             return Err(ColumnWaterError::Worker(message.clone()));
         }
+        let refresh = std::mem::take(&mut published.refresh);
+        metrics.boundary_refresh = refresh.time;
+        metrics.columns_remapped = refresh.columns_remapped;
+        metrics.relocated_m3 = refresh.relocated_m3;
         metrics.steps = std::mem::take(&mut published.steps);
         metrics.stepped = metrics.steps > 0;
         metrics.step = published.last_step.take();
