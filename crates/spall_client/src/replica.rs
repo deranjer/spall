@@ -806,12 +806,15 @@ impl ReplicaWorld {
         // included (G3-residency-hash.md lifecycle).
         self.evicted = staged.evicted;
         self.now_tick = staged.checkpoint_tick;
+        // A full baseline is an explicit world replacement, even when no weather
+        // frame had arrived yet. Advance the fence so queued pre-reset weather is rejected.
         self.weather_epoch_floor = self
             .weather
             .as_ref()
             .map_or(self.weather_epoch_floor, |old| {
-                old.world_epoch.saturating_add(1)
-            });
+                self.weather_epoch_floor.max(old.world_epoch)
+            })
+            .saturating_add(1);
         self.weather = None;
         // A replacement baseline supersedes any catalogue still arriving for the old one.
         self.catalogue_pending = None;
@@ -823,9 +826,6 @@ impl ReplicaWorld {
     /// Accept a bounded weather keyframe only when its tick and revision do not regress.
     pub fn apply_weather(&mut self, state: spall_protocol::WeatherState) -> Result<(), String> {
         state.validate().map_err(|e| e.to_string())?;
-        if state.effective_tick < self.now_tick {
-            return Err("stale weather tick".into());
-        }
         if state.world_epoch < self.weather_epoch_floor {
             return Err("stale weather epoch".into());
         }
@@ -2672,6 +2672,57 @@ mod tests {
         ))
         .unwrap();
         v
+    }
+
+    #[test]
+    fn delayed_weather_uses_its_own_stream_and_reset_fences_without_prior_weather() {
+        use spall_protocol::{
+            BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume, BaselineWorld,
+            WeatherClock, WeatherClockSource, WeatherState,
+        };
+        let world = BaselineWorld {
+            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            checkpoint_tick: 500,
+            volumes: vec![BaselineVolume {
+                volume_id: VolumeId::new(1).unwrap(),
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner: BaselineOwner::Terrain,
+                bounds: None,
+                bricks: vec![BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 1,
+                    edited: false,
+                    cells: BaselineCells::Uniform(MaterialId(1).0),
+                }],
+            }],
+        };
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        replica.install_baseline_world(&world).unwrap();
+        replica.install_baseline_world(&world).unwrap(); // reset before any weather frame, floor 2
+        let clock = WeatherClock {
+            time_ms: 0,
+            source: WeatherClockSource::ServerFallback,
+            start_season: 0,
+            season_ms: 900_000,
+        };
+        let mut stale = WeatherState::initial(7, 1, clock);
+        stale.effective_tick = 1;
+        assert!(
+            replica.apply_weather(stale).is_err(),
+            "reset must reject queued prior-epoch weather without an installed prior frame"
+        );
+        let mut current = WeatherState::initial(7, 2, clock);
+        current.effective_tick = 1;
+        replica.now_tick = 500;
+        replica
+            .apply_weather(current)
+            .expect("weather older than motion can be the newest weather frame");
+        replica.now_tick = 900;
+        let mut delayed = WeatherState::initial(7, 2, clock);
+        delayed.effective_tick = 2;
+        replica
+            .apply_weather(delayed)
+            .expect("motion tick must not fence the independent weather stream");
     }
 
     #[test]

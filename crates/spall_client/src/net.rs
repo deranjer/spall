@@ -2044,7 +2044,7 @@ async fn run_async(
                             Ok(world) => {
                                 vegetation_floor = begin.checkpoint_tick.get();
                                 column_water_floor = begin.checkpoint_tick.get();
-                                weather_floor = begin.checkpoint_tick.get();
+                                weather_floor = begin.checkpoint_tick.get().saturating_add(1);
                                 vegetation =
                                     spall_protocol::vegetation::VegetationAssembler::default();
                                 cover_field = spall_ecology::cover::CoverField::default();

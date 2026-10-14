@@ -8,6 +8,7 @@
 //! the replay at that point *and* is reported, and the previous checkpoint is
 //! always surfaced as a fallback.
 
+use serde::Deserialize;
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -19,6 +20,66 @@ use crate::dto::{
     StoredBody, StoredBrick, StoredWorldMeta,
 };
 use crate::schema::read_user_version;
+
+#[derive(Deserialize)]
+enum JournalPayloadV1 {
+    Topology {
+        transaction: Vec<u8>,
+        participants: Vec<Vec<u8>>,
+    },
+    PoseBatch {
+        snapshots: Vec<Vec<u8>>,
+    },
+    TopologyBulkSplit {
+        transaction: Vec<u8>,
+        participants: Vec<Vec<u8>>,
+        baseline: Vec<u8>,
+    },
+    VegetationState(Vec<u8>),
+    VegetationClock {
+        time_ms: u64,
+        credit_ms: u64,
+    },
+    ColumnWaterDelta(spall_protocol::ColumnWaterDelta),
+    WeatherState(spall_protocol::WeatherStateV1),
+}
+fn decode_journal_payload(bytes: &[u8]) -> Result<JournalPayload, dto::DtoError> {
+    match dto::decode(bytes) {
+        Ok(payload) => Ok(payload),
+        Err(current_error) => match dto::decode::<JournalPayloadV1>(bytes) {
+            Ok(payload) => Ok(match payload {
+                JournalPayloadV1::Topology {
+                    transaction,
+                    participants,
+                } => JournalPayload::Topology {
+                    transaction,
+                    participants,
+                },
+                JournalPayloadV1::PoseBatch { snapshots } => {
+                    JournalPayload::PoseBatch { snapshots }
+                }
+                JournalPayloadV1::TopologyBulkSplit {
+                    transaction,
+                    participants,
+                    baseline,
+                } => JournalPayload::TopologyBulkSplit {
+                    transaction,
+                    participants,
+                    baseline,
+                },
+                JournalPayloadV1::VegetationState(bytes) => JournalPayload::VegetationState(bytes),
+                JournalPayloadV1::VegetationClock { time_ms, credit_ms } => {
+                    JournalPayload::VegetationClock { time_ms, credit_ms }
+                }
+                JournalPayloadV1::ColumnWaterDelta(delta) => {
+                    JournalPayload::ColumnWaterDelta(delta)
+                }
+                JournalPayloadV1::WeatherState(state) => JournalPayload::WeatherState(state.into()),
+            }),
+            Err(_) => Err(current_error),
+        },
+    }
+}
 
 /// One non-fatal problem found during recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +251,7 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
                 )));
                 break;
             }
-            let decoded: JournalPayload = match dto::decode(&payload) {
+            let decoded: JournalPayload = match decode_journal_payload(&payload) {
                 Ok(p) => p,
                 Err(e) => {
                     corruption.push(CorruptionReport::new(format!(
@@ -383,7 +444,10 @@ fn load_weather(
             "weather checkpoint checksum mismatch".into(),
         ));
     }
-    let state: Option<spall_protocol::WeatherState> = dto::decode(&blob)?;
+    let state: Option<spall_protocol::WeatherState> = match dto::decode(&blob) {
+        Ok(state) => state,
+        Err(_) => dto::decode::<Option<spall_protocol::WeatherStateV1>>(&blob)?.map(Into::into),
+    };
     if let Some(state) = &state {
         state
             .validate()

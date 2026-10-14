@@ -605,6 +605,29 @@ impl Simulation {
         self.weather_dirty = true;
     }
 
+    /// Apply or clear a persisted server-authorized weather override at the current tick.
+    pub fn set_weather_override(&mut self, kind: Option<spall_protocol::WeatherKind>) {
+        self.weather.world_revision = self.weather.world_revision.saturating_add(1);
+        self.weather.effective_tick = self.tick.get();
+        if let Some(kind) = kind {
+            self.weather.force_kind(Some(kind));
+        } else {
+            self.weather = spall_protocol::WeatherState::for_clock(
+                self.weather_seed,
+                self.weather.world_epoch,
+                self.tick.get(),
+                spall_protocol::WeatherClock {
+                    time_ms: self.weather.clock_ms,
+                    source: self.weather.clock_source,
+                    start_season: self.weather.start_season,
+                    season_ms: self.weather.season_ms,
+                },
+                self.weather.world_revision,
+            );
+        }
+        self.weather_dirty = true;
+    }
+
     /// Current authoritative weather state. Clock source is fixed per world.
     pub fn weather_state(&self) -> &spall_protocol::WeatherState {
         &self.weather
@@ -637,6 +660,8 @@ impl Simulation {
     pub fn restore_weather(&mut self, state: spall_protocol::WeatherState) -> Result<(), String> {
         state.validate().map_err(|e| e.to_string())?;
         self.weather_seed = state.weather_seed;
+        let mut state = state;
+        state.schema = spall_protocol::WEATHER_SCHEMA;
         self.weather = state;
         self.weather_dirty = false;
         Ok(())
@@ -678,6 +703,10 @@ impl Simulation {
             clock,
             self.weather.world_revision,
         );
+        let mut next = next;
+        if let Some(kind) = self.weather.override_kind {
+            next.force_kind(Some(kind));
+        }
         let profile_changed = next.transition_id != self.weather.transition_id
             || next.kind != self.weather.kind
             || next.precipitation_q16 != self.weather.precipitation_q16
@@ -1551,6 +1580,25 @@ mod weather_clock_tests {
         sim.replace_world(fresh).unwrap();
         assert_eq!(sim.weather_state().world_epoch, prior_epoch + 1);
         assert_eq!(sim.weather_state().clock_ms, 0);
+        sim.wait_for_retired();
+    }
+
+    #[test]
+    fn weather_override_survives_ticks_and_reset_clears_it() {
+        let mut sim =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        sim.set_weather_override(Some(spall_protocol::WeatherKind::Snow));
+        assert_eq!(sim.weather_state().kind, spall_protocol::WeatherKind::Snow);
+        assert_eq!(
+            sim.weather_state().override_kind,
+            Some(spall_protocol::WeatherKind::Snow)
+        );
+        sim.tick().unwrap();
+        assert_eq!(sim.weather_state().kind, spall_protocol::WeatherKind::Snow);
+        let fresh =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        sim.replace_world(fresh).unwrap();
+        assert_eq!(sim.weather_state().override_kind, None);
         sim.wait_for_retired();
     }
 }

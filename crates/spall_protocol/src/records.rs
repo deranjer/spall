@@ -24,7 +24,7 @@ use crate::limits::{
 /// decode a single record, so mismatched builds refuse each other at the first message. Bumped to
 /// 4 with the chunked topology hash (`spall.topology.v2`): every `result_hashes` and world hash
 /// value changed, so a mixed pair could otherwise connect and then reject every transaction.
-pub const WIRE_SCHEMA_VERSION: u16 = 5;
+pub const WIRE_SCHEMA_VERSION: u16 = 6;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -37,6 +37,8 @@ pub enum AdminCommand {
     /// (a spectator camera that lands where it is). Millimetres, so the command
     /// stays `Eq`; the server pushes the capsule out of any solid it lands in.
     TeleportSelf { feet_mm: [i64; 3] },
+    /// Force a weather kind, or restore automatic seeded policy.
+    SetWeather { kind: Option<crate::WeatherKind> },
 }
 
 /// `AdminRequest`: reliable operator command. The server decides whether this

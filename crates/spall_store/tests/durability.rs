@@ -848,6 +848,95 @@ fn unsupported_save_versions_are_rejected_before_changing_rollback_journal_mode(
 }
 
 #[test]
+fn schema_one_weather_checkpoint_and_journal_migrate_to_automatic_state() {
+    use serde::Serialize;
+    use spall_protocol::{WeatherClock, WeatherClockSource, WeatherState, WeatherStateV1};
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum LegacyJournal {
+        Topology {
+            transaction: Vec<u8>,
+            participants: Vec<Vec<u8>>,
+        },
+        PoseBatch {
+            snapshots: Vec<Vec<u8>>,
+        },
+        TopologyBulkSplit {
+            transaction: Vec<u8>,
+            participants: Vec<Vec<u8>>,
+            baseline: Vec<u8>,
+        },
+        VegetationState(Vec<u8>),
+        VegetationClock {
+            time_ms: u64,
+            credit_ms: u64,
+        },
+        ColumnWaterDelta(spall_protocol::ColumnWaterDelta),
+        WeatherState(WeatherStateV1),
+    }
+    let scratch = Scratch::new("weather-v1-upgrade");
+    let mut cp = checkpoint(120, 0);
+    let current = WeatherState::for_clock(
+        42,
+        3,
+        120,
+        WeatherClock {
+            time_ms: 987_654_321,
+            source: WeatherClockSource::ServerFallback,
+            start_season: 0,
+            season_ms: 900_000,
+        },
+        9,
+    );
+    cp.weather = Some(current.clone());
+    let mut writer = Writer::open(scratch.db()).unwrap();
+    writer.publish_checkpoint(&cp).unwrap();
+    drop(writer);
+    let old = WeatherStateV1 {
+        schema: 1,
+        world_epoch: current.world_epoch,
+        world_revision: current.world_revision,
+        effective_tick: current.effective_tick,
+        clock_ms: current.clock_ms,
+        clock_source: current.clock_source,
+        start_season: current.start_season,
+        season_ms: current.season_ms,
+        weather_seed: current.weather_seed,
+        transition_id: current.transition_id,
+        transition_start_ms: current.transition_start_ms,
+        transition_duration_ms: current.transition_duration_ms,
+        kind: current.kind,
+        precipitation_q16: current.precipitation_q16,
+        wind_x_q15: current.wind_x_q15,
+        wind_z_q15: current.wind_z_q15,
+        gust_q16: current.gust_q16,
+        temperature_centi_c: current.temperature_centi_c,
+        lightning_id: current.lightning_id,
+        lightning_tick: current.lightning_tick,
+    };
+    let checkpoint_blob = postcard::to_stdvec(&Some(old.clone())).unwrap();
+    let legacy_payload = postcard::to_stdvec(&LegacyJournal::WeatherState(old)).unwrap();
+    let crc = |b: &[u8]| blake3::hash(b).as_bytes()[..16].to_vec();
+    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+    conn.execute(
+        "UPDATE checkpoint_weather SET state=?1,crc=?2 WHERE tick=120",
+        rusqlite::params![checkpoint_blob, crc(&checkpoint_blob)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO journal(seq,tick,payload,crc) VALUES(1,121,?1,?2)",
+        rusqlite::params![legacy_payload, crc(&legacy_payload)],
+    )
+    .unwrap();
+    drop(conn);
+    let recovered = recover(scratch.db()).unwrap();
+    assert_eq!(recovered.checkpoint.weather.unwrap().override_kind, None);
+    assert!(
+        matches!(recovered.journal[0].payload,JournalPayload::WeatherState(ref state) if state.schema==spall_protocol::WEATHER_SCHEMA && state.override_kind==None)
+    );
+}
+
+#[test]
 fn weather_clock_checkpoint_and_journal_survive_restart_exactly() {
     use spall_protocol::{WeatherClock, WeatherClockSource, WeatherState};
     let scratch = Scratch::new("weather-restart");
@@ -858,11 +947,12 @@ fn weather_clock_checkpoint_and_journal_survive_restart_exactly() {
         start_season: 0,
         season_ms: 900_000,
     };
-    let state = WeatherState::for_clock(42, 3, 120, clock, 9);
+    let mut state = WeatherState::for_clock(42, 3, 120, clock, 9);
+    state.force_kind(Some(spall_protocol::WeatherKind::Snow));
     cp.weather = Some(state.clone());
     let mut writer = Writer::open(scratch.db()).unwrap();
     writer.publish_checkpoint(&cp).unwrap();
-    let clock_next = WeatherState::for_clock(
+    let mut clock_next = WeatherState::for_clock(
         42,
         3,
         121,
@@ -874,6 +964,7 @@ fn weather_clock_checkpoint_and_journal_survive_restart_exactly() {
         },
         9,
     );
+    clock_next.force_kind(Some(spall_protocol::WeatherKind::Snow));
     writer
         .append_journal(&[JournalRecord {
             seq: 1,

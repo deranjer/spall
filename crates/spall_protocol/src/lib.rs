@@ -34,7 +34,7 @@ pub mod water;
 pub mod weather;
 pub use weather::{
     WEATHER_PROFILE_MS, WEATHER_SCHEMA, WEATHER_TRANSITION_MS, WeatherClock, WeatherClockSource,
-    WeatherError, WeatherKind, WeatherSnapshot, WeatherState,
+    WeatherError, WeatherKind, WeatherSnapshot, WeatherState, WeatherStateV1,
 };
 
 pub use input::{frame_input, player_entity, recent_input, session_player_entity};

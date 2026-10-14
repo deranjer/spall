@@ -3333,6 +3333,9 @@ async fn serve_async(
                             }
                         }
                     }
+                    spall_protocol::AdminCommand::SetWeather { kind } => {
+                        set_weather_admin(&mut sim, admin_commands, req.request_id, kind)
+                    }
                     spall_protocol::AdminCommand::TeleportSelf { feet_mm } => {
                         let feet = feet_mm.map(|mm| mm as f64 / 1000.0);
                         let (accepted, message) = if !admin_commands {
@@ -5759,6 +5762,39 @@ fn setup_persistence_with_game_content(
 /// periodic body pose batches at 20 Hz"; ENG-50: "contiguous sequence
 /// ownership"). Advances `journalled_through` to the last sequence in the
 /// batch.
+fn set_weather_admin(
+    sim: &mut Simulation,
+    enabled: bool,
+    request_id: RequestId,
+    kind: Option<spall_protocol::WeatherKind>,
+) -> spall_protocol::AdminStatus {
+    if !enabled {
+        return spall_protocol::AdminStatus {
+            request_id,
+            accepted: false,
+            message: "admin commands are disabled on this server".into(),
+        };
+    }
+    sim.set_weather_override(kind);
+    let weather = sim.weather_state();
+    let mode = kind.map_or("automatic", |k| match k {
+        spall_protocol::WeatherKind::Clear => "clear",
+        spall_protocol::WeatherKind::Rain => "rain",
+        spall_protocol::WeatherKind::Storm => "storm",
+        spall_protocol::WeatherKind::Snow => "snow",
+        spall_protocol::WeatherKind::HighWind => "high wind",
+        spall_protocol::WeatherKind::Blizzard => "blizzard",
+    });
+    spall_protocol::AdminStatus {
+        request_id,
+        accepted: true,
+        message: format!(
+            "weather {mode} (precipitation q16 {}, gust q16 {})",
+            weather.precipitation_q16, weather.gust_q16
+        ),
+    }
+}
+
 fn tick_journal_batch(
     sim: &mut Simulation,
     journalled_through: &mut u64,
@@ -6746,6 +6782,57 @@ async fn serve_conn(
 mod tests {
     use super::*;
     use spall_store::{JournalPayload, JournalRecord};
+
+    #[test]
+    fn weather_admin_gate_forces_snow_persists_through_ticks_and_restores_automatic() {
+        let mut sim = Simulation::new(spall_sim::SimulationConfig::new(
+            spall_sim::fixtures::flat_terrain_setup(),
+        ))
+        .unwrap();
+        let initial = sim.weather_state().clone();
+        let disabled = set_weather_admin(
+            &mut sim,
+            false,
+            RequestId(1),
+            Some(spall_protocol::WeatherKind::Snow),
+        );
+        assert!(!disabled.accepted);
+        assert_eq!(sim.weather_state(), &initial);
+        let forced = set_weather_admin(
+            &mut sim,
+            true,
+            RequestId(2),
+            Some(spall_protocol::WeatherKind::Snow),
+        );
+        assert!(forced.accepted);
+        assert!(forced.message.contains("precipitation q16 19661"));
+        assert_eq!(sim.weather_state().kind, spall_protocol::WeatherKind::Snow);
+        assert_eq!(
+            sim.weather_state().override_kind,
+            Some(spall_protocol::WeatherKind::Snow)
+        );
+        sim.tick().unwrap();
+        assert_eq!(sim.weather_state().kind, spall_protocol::WeatherKind::Snow);
+        let automatic = set_weather_admin(&mut sim, true, RequestId(3), None);
+        assert!(automatic.accepted);
+        assert_eq!(sim.weather_state().override_kind, None);
+        assert_eq!(
+            sim.weather_state().kind,
+            spall_protocol::WeatherState::for_clock(
+                sim.weather_state().weather_seed,
+                sim.weather_state().world_epoch,
+                sim.weather_state().effective_tick,
+                spall_protocol::WeatherClock {
+                    time_ms: sim.weather_state().clock_ms,
+                    source: sim.weather_state().clock_source,
+                    start_season: sim.weather_state().start_season,
+                    season_ms: sim.weather_state().season_ms
+                },
+                sim.weather_state().world_revision
+            )
+            .kind
+        );
+    }
 
     #[test]
     fn streamed_baseline_has_one_bounded_fifo_slot_and_drain_releases_it() {

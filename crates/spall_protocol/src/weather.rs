@@ -1,7 +1,7 @@
 use crate::records::{Record, RecordError, WireTag};
 use serde::{Deserialize, Serialize};
 
-pub const WEATHER_SCHEMA: u16 = 1;
+pub const WEATHER_SCHEMA: u16 = 2;
 pub const WEATHER_MAX_CLOCK_MS: u64 = 100_000_000_000_000;
 pub const WEATHER_TRANSITION_MS: u64 = 300_000;
 pub const WEATHER_PROFILE_MS: u64 = 1_800_000;
@@ -55,6 +55,59 @@ pub struct WeatherState {
     pub temperature_centi_c: i16,
     pub lightning_id: u64,
     pub lightning_tick: u64,
+    #[serde(default)]
+    pub override_kind: Option<WeatherKind>,
+}
+/// Explicit schema-1 layout used only when reading pre-override save and journal bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeatherStateV1 {
+    pub schema: u16,
+    pub world_epoch: u64,
+    pub world_revision: u64,
+    pub effective_tick: u64,
+    pub clock_ms: u64,
+    pub clock_source: WeatherClockSource,
+    pub start_season: u8,
+    pub season_ms: u64,
+    pub weather_seed: u64,
+    pub transition_id: u64,
+    pub transition_start_ms: u64,
+    pub transition_duration_ms: u32,
+    pub kind: WeatherKind,
+    pub precipitation_q16: u16,
+    pub wind_x_q15: i16,
+    pub wind_z_q15: i16,
+    pub gust_q16: u16,
+    pub temperature_centi_c: i16,
+    pub lightning_id: u64,
+    pub lightning_tick: u64,
+}
+impl From<WeatherStateV1> for WeatherState {
+    fn from(v: WeatherStateV1) -> Self {
+        Self {
+            schema: WEATHER_SCHEMA,
+            world_epoch: v.world_epoch,
+            world_revision: v.world_revision,
+            effective_tick: v.effective_tick,
+            clock_ms: v.clock_ms,
+            clock_source: v.clock_source,
+            start_season: v.start_season,
+            season_ms: v.season_ms,
+            weather_seed: v.weather_seed,
+            transition_id: v.transition_id,
+            transition_start_ms: v.transition_start_ms,
+            transition_duration_ms: v.transition_duration_ms,
+            kind: v.kind,
+            precipitation_q16: v.precipitation_q16,
+            wind_x_q15: v.wind_x_q15,
+            wind_z_q15: v.wind_z_q15,
+            gust_q16: v.gust_q16,
+            temperature_centi_c: v.temperature_centi_c,
+            lightning_id: v.lightning_id,
+            lightning_tick: v.lightning_tick,
+            override_kind: None,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WeatherError {
@@ -105,7 +158,7 @@ impl WeatherState {
         let lightning_id = if kind == WeatherKind::Storm
             && clock.time_ms % WEATHER_PROFILE_MS < WEATHER_TRANSITION_MS
         {
-            bucket.wrapping_add(1)
+            mix(seed ^ bucket.rotate_left(23) ^ 0x4C49_4748_544E_494E).max(1)
         } else {
             0
         };
@@ -123,13 +176,67 @@ impl WeatherState {
             transition_start_ms: bucket * WEATHER_PROFILE_MS,
             transition_duration_ms: WEATHER_TRANSITION_MS as u32,
             kind,
+            override_kind: None,
             precipitation_q16: precip,
             wind_x_q15: wx,
             wind_z_q15: wz,
             gust_q16: gust,
             temperature_centi_c: ((seasonal_c + offset) * 100) as i16,
             lightning_id,
-            lightning_tick: if lightning_id == 0 { 0 } else { tick },
+            lightning_tick: if lightning_id == 0 {
+                0
+            } else {
+                tick.saturating_sub((clock.time_ms % WEATHER_PROFILE_MS) * 60 / 1000)
+                    .max(1)
+            },
+        }
+    }
+    /// Apply an authoritative preset with normalized presentation values.
+    pub fn force_kind(&mut self, kind: Option<WeatherKind>) {
+        let previous_kind = self.override_kind;
+        let previous_lightning_id = self.lightning_id;
+        let previous_lightning_tick = self.lightning_tick;
+        self.schema = WEATHER_SCHEMA;
+        self.override_kind = kind;
+        if let Some(kind) = kind {
+            self.kind = kind;
+            let (precip, gust, offset) = match kind {
+                WeatherKind::Clear => (0, 6554, 0),
+                WeatherKind::Rain => (26214, 9830, 1),
+                WeatherKind::Storm => (58982, 39321, 1),
+                WeatherKind::Snow => (19661, 13107, -1),
+                WeatherKind::HighWind => (0, 42000, 0),
+                WeatherKind::Blizzard => (52429, 55000, -1),
+            };
+            self.precipitation_q16 = precip;
+            self.gust_q16 = gust;
+            let season = (u64::from(self.start_season) + self.clock_ms / self.season_ms.max(1)) % 4;
+            let base_c = match season {
+                0 => 8,
+                1 => 22,
+                2 => 10,
+                _ => -8,
+            };
+            self.temperature_centi_c = (base_c + offset) * 100;
+            self.lightning_id = if kind == WeatherKind::Storm {
+                mix(self.weather_seed
+                    ^ self.world_epoch.rotate_left(11)
+                    ^ self.world_revision
+                    ^ 0x4C49_4748_544E_494E)
+                .max(1)
+            } else {
+                0
+            };
+            self.lightning_tick = if self.lightning_id == 0 {
+                0
+            } else if previous_kind == Some(kind) && previous_lightning_id == self.lightning_id {
+                previous_lightning_tick
+            } else {
+                self.effective_tick.max(1)
+            };
+        } else {
+            self.lightning_id = 0;
+            self.lightning_tick = 0;
         }
     }
     pub fn validate(&self) -> Result<(), WeatherError> {
@@ -240,6 +347,88 @@ mod tests {
         frame.extend_from_slice(&(WireTag::WeatherSnapshot as u16).to_le_bytes());
         frame.extend(body);
         assert!(crate::decode_control::<WeatherSnapshot>(&frame).is_err());
+    }
+
+    #[test]
+    fn forced_weather_presets_are_normalized_and_legacy_states_decode() {
+        #[derive(serde::Serialize)]
+        struct LegacyWeatherState {
+            schema: u16,
+            world_epoch: u64,
+            world_revision: u64,
+            effective_tick: u64,
+            clock_ms: u64,
+            clock_source: WeatherClockSource,
+            start_season: u8,
+            season_ms: u64,
+            weather_seed: u64,
+            transition_id: u64,
+            transition_start_ms: u64,
+            transition_duration_ms: u32,
+            kind: WeatherKind,
+            precipitation_q16: u16,
+            wind_x_q15: i16,
+            wind_z_q15: i16,
+            gust_q16: u16,
+            temperature_centi_c: i16,
+            lightning_id: u64,
+            lightning_tick: u64,
+        }
+        let clock = WeatherClock {
+            time_ms: 0,
+            source: WeatherClockSource::ServerFallback,
+            start_season: 1,
+            season_ms: 900_000,
+        };
+        for seed in 0..256 {
+            WeatherState::initial(seed, 1, clock).validate().unwrap();
+        }
+        let mut state = WeatherState::initial(33, 1, clock);
+        state.force_kind(Some(WeatherKind::Snow));
+        assert_eq!(state.kind, WeatherKind::Snow);
+        assert_eq!(state.precipitation_q16, 19661);
+        assert_eq!(state.temperature_centi_c, 2100);
+        assert_eq!(state.override_kind, Some(WeatherKind::Snow));
+        state.validate().unwrap();
+        let storm_clock = WeatherClock {
+            start_season: 3,
+            ..clock
+        };
+        let mut storm = WeatherState::for_clock(44, 1, 7, storm_clock, 1);
+        storm.force_kind(Some(WeatherKind::Storm));
+        let id = storm.lightning_id;
+        let event_tick = storm.lightning_tick;
+        storm.effective_tick = 8;
+        storm.force_kind(Some(WeatherKind::Storm));
+        assert_eq!((storm.lightning_id, storm.lightning_tick), (id, event_tick));
+        let old = LegacyWeatherState {
+            schema: 1,
+            world_epoch: 1,
+            world_revision: 0,
+            effective_tick: 5,
+            clock_ms: 0,
+            clock_source: clock.source,
+            start_season: 1,
+            season_ms: 900_000,
+            weather_seed: 2,
+            transition_id: 0,
+            transition_start_ms: 0,
+            transition_duration_ms: 0,
+            kind: WeatherKind::Clear,
+            precipitation_q16: 0,
+            wind_x_q15: 0,
+            wind_z_q15: 0,
+            gust_q16: 0,
+            temperature_centi_c: 2200,
+            lightning_id: 0,
+            lightning_tick: 0,
+        };
+        let bytes = postcard::to_stdvec(&old).unwrap();
+        let decoded: WeatherStateV1 = postcard::from_bytes(&bytes).unwrap();
+        let decoded: WeatherState = decoded.into();
+        assert_eq!(decoded.schema, WEATHER_SCHEMA);
+        assert_eq!(decoded.override_kind, None);
+        decoded.validate().unwrap();
     }
 
     #[test]
