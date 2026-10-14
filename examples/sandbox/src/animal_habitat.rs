@@ -512,6 +512,17 @@ mod tests {
             )
             .is_ok()
         );
+        let floating = envelope(DVec3::new(1.0, 8.35, 1.0), DVec3::new(0.5, 0.5, 0.5));
+        assert_eq!(
+            validate_candidate(
+                &flat,
+                None,
+                AnimalHabitat::Land,
+                floating,
+                ValidationLimits::default()
+            ),
+            Err(RejectReason::MissingSupport)
+        );
         let removed = EditPlan::filled_box(
             flat.id(),
             GlobalCell::new(0, 27, 0),

@@ -357,6 +357,8 @@ impl Dormant {
 /// Read-only description of one span for tests and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpanView {
+    /// Dense solver-span index, or `usize::MAX` for a dormant-ocean record
+    /// returned through `visit_spans_in_column`.
     pub index: usize,
     /// Global y of the floor (first open cell) and one past the last open cell.
     pub floor_y: i64,
@@ -870,15 +872,39 @@ impl ColumnWorld {
         max_spans: usize,
         mut visit: impl FnMut(SpanView),
     ) -> bool {
-        let Some(range) = self.column_range(x, z) else {
+        if let Some(range) = self.column_range(x, z) {
+            if range.len() > max_spans {
+                return false;
+            }
+            for index in range {
+                visit(self.view(index));
+            }
+            return true;
+        }
+
+        let Some(dormant) = self.dormant.get(&region_of(x, z)) else {
             return true;
         };
-        if range.len() > max_spans {
+        // Dormant records represent one still-water span per column. Derive its
+        // current depth directly from the immutable record; do not revive or
+        // allocate the solver region as a side effect of inspection.
+        if max_spans == 0 {
             return false;
         }
-        for index in range {
-            visit(self.view(index));
-        }
+        let local = (x.rem_euclid(REGION_EDGE) + REGION_EDGE * z.rem_euclid(REGION_EDGE)) as usize;
+        let (floor_y, height) = dormant.cols[local];
+        let depth = dormant.column_volume(local);
+        visit(SpanView {
+            // Dormant columns have no solver-span index.
+            index: usize::MAX,
+            floor_y: i64::from(floor_y),
+            ceiling_y: i64::from(floor_y + height),
+            sky: true,
+            volume: depth,
+            depth,
+            overfill: 0.0,
+            head_y: f64::from(floor_y) + depth,
+        });
         true
     }
 
