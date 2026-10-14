@@ -1,9 +1,0 @@
-# Keep downloaded candidate audio local until selections and distribution are reviewed.
-*.wav
-*.mp3
-*.ogg
-*.flac
-*.aiff
-*.aif
-*.m4a
-*.zip
