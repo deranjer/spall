@@ -30,7 +30,7 @@ fn filled(w: &GeneratedWorld, x: i64, y: i64, z: i64) -> Option<MaterialId> {
 
 #[test]
 fn natural_has_its_own_version_and_height() {
-    assert_eq!(Preset::Natural.gen_version(), 5);
+    assert_eq!(Preset::Natural.gen_version(), 7);
     assert_eq!(Preset::Showcase.gen_version(), 3);
     assert_eq!(spec(1, SIZE).height_bricks, 16);
     assert_eq!(spec(1, SIZE).height_cells(), 512);
@@ -73,6 +73,102 @@ fn water_sits_above_the_ground_and_never_in_the_border() {
     }
 }
 
+/// Fresh water stands level, so no bank beside it may be lower than its surface:
+/// the solver, started from this plan, would spill the water over it and drain
+/// the lake (version 6 raises such banks; before, a river on a side slope or a
+/// lake with a channel cut through its rim left them up to 40 cells low).
+#[test]
+fn fresh_water_has_no_lower_dry_bank() {
+    for seed in 1..=4 {
+        let c = columns(seed, 1024);
+        let n = 1024i64;
+        let mut wet = 0;
+        for z in 40..n - 40 {
+            for x in 40..n - 40 {
+                if !c.is_water(x, z) || c.water_surface(x, z) <= SEA_LEVEL + 1 {
+                    continue;
+                }
+                wet += 1;
+                for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let (nx, nz) = (x + dx, z + dz);
+                    if !c.is_water(nx, nz) {
+                        assert!(
+                            c.height(nx, nz) >= c.water_surface(x, z),
+                            "seed {seed}: water at ({x},{z}) stands {} over a dry bank of {} at ({nx},{nz})",
+                            c.water_surface(x, z),
+                            c.height(nx, nz)
+                        );
+                    }
+                }
+            }
+        }
+        assert!(wet > 1000, "seed {seed} has fresh water to check: {wet}");
+    }
+}
+
+/// A natural world's cave entrances are not all one round tube, and none is in
+/// or beside water: each is its own width and height, and the opening, the way
+/// down and the chambers keep clear of rivers and lakes.
+#[test]
+fn natural_cave_mouths_vary_and_stay_clear_of_water() {
+    for seed in 1..=3 {
+        let c = columns(seed, 1024);
+        let caves = caves::CaveField::new(seed, &c);
+        assert!(
+            caves.mouth_count() >= 6,
+            "seed {seed}: {} mouths",
+            caves.mouth_count()
+        );
+        for (path, site) in caves.mouth_paths().iter().zip(caves.mouth_sites()) {
+            assert!(
+                c.river_dist(site.0, site.1) >= 28 && !c.is_water(site.0, site.1),
+                "seed {seed}: a mouth opens at {site:?}, {} cells from water",
+                c.river_dist(site.0, site.1)
+            );
+            for &(x, z) in path {
+                let (x, z) = (x as i64, z as i64);
+                assert!(
+                    !c.is_water(x, z) && c.river_dist(x, z) >= 14,
+                    "seed {seed}: a cave passes {} cells from water at ({x},{z})",
+                    c.river_dist(x, z)
+                );
+            }
+        }
+        let widths: Vec<f64> = caves.mouth_entrances().iter().map(|e| e[0]).collect();
+        let (lo, hi) = (
+            widths.iter().cloned().fold(f64::MAX, f64::min),
+            widths.iter().cloned().fold(f64::MIN, f64::max),
+        );
+        assert!(
+            hi > lo * 1.8,
+            "seed {seed}: entrances all about as wide: {widths:?}"
+        );
+        let aspects: Vec<f64> = caves
+            .mouth_entrances()
+            .iter()
+            .map(|e| e[0] / e[1])
+            .collect();
+        assert!(
+            aspects.iter().any(|a| *a > 1.8) && aspects.iter().any(|a| *a < 1.3),
+            "seed {seed}: entrances all the same shape: {aspects:?}"
+        );
+    }
+}
+
+/// Each natural mouth's site opens onto the surface in the generated voxels.
+#[test]
+fn natural_cave_mouths_open_onto_the_surface() {
+    let w = generate(&spec(2, 1024)).expect("world");
+    assert!(!w.cave_mouths.is_empty());
+    for &(x, z) in &w.cave_mouths {
+        let h = i64::from(w.columns.height(x, z));
+        assert!(
+            filled(&w, x, h - 1, z).is_none(),
+            "mouth at {x},{z} is not open below the surface"
+        );
+    }
+}
+
 #[test]
 fn heights_stay_under_the_wall() {
     for seed in 1..=6 {
@@ -88,7 +184,7 @@ fn heights_stay_under_the_wall() {
 fn generated_worlds_hold_water_only_in_air_and_keep_a_dry_spawn() {
     for seed in [1, 2, 5] {
         let w = generate(&spec(seed, SIZE)).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-        assert_eq!(w.version, 5);
+        assert_eq!(w.version, 7);
         for c in w.water.cells().step_by(37) {
             assert_eq!(
                 filled(&w, c.x, c.y, c.z),
