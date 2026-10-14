@@ -860,6 +860,28 @@ impl ColumnWorld {
             .unwrap_or_default()
     }
 
+    /// Visits a bounded number of spans in one column without allocating a
+    /// temporary `Vec`. Returns false if the column has more spans than the
+    /// caller's budget; in that case no visitor calls are made.
+    pub fn visit_spans_in_column(
+        &self,
+        x: i64,
+        z: i64,
+        max_spans: usize,
+        mut visit: impl FnMut(SpanView),
+    ) -> bool {
+        let Some(range) = self.column_range(x, z) else {
+            return true;
+        };
+        if range.len() > max_spans {
+            return false;
+        }
+        for index in range {
+            visit(self.view(index));
+        }
+        true
+    }
+
     // ---- allocation and terrain -------------------------------------------
 
     /// Allocates the given regions (those that are resident) and re-reads every

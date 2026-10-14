@@ -36,18 +36,31 @@ pub struct WaterSpan {
 /// Implemented by the authoritative live water state; implementations must
 /// answer from the current step, not generated-world or biome metadata.
 pub trait CurrentWaterQuery {
-    fn spans_in_column(&self, x: i64, z: i64) -> Vec<WaterSpan>;
+    /// Visits at most `max_spans`, returning false when the column exceeds the
+    /// bound. Implementations must check the bound before allocating or visiting.
+    fn visit_spans_in_column(
+        &self,
+        x: i64,
+        z: i64,
+        max_spans: usize,
+        visit: &mut dyn FnMut(WaterSpan),
+    ) -> bool;
 }
 
 impl CurrentWaterQuery for ColumnWorld {
-    fn spans_in_column(&self, x: i64, z: i64) -> Vec<WaterSpan> {
-        ColumnWorld::spans_in_column(self, x, z)
-            .into_iter()
-            .map(|span: SpanView| WaterSpan {
+    fn visit_spans_in_column(
+        &self,
+        x: i64,
+        z: i64,
+        max_spans: usize,
+        visit: &mut dyn FnMut(WaterSpan),
+    ) -> bool {
+        ColumnWorld::visit_spans_in_column(self, x, z, max_spans, |span: SpanView| {
+            visit(WaterSpan {
                 floor_y: span.floor_y,
                 depth_cells: span.depth,
             })
-            .collect()
+        })
     }
 }
 
@@ -55,8 +68,9 @@ impl CurrentWaterQuery for ColumnWorld {
 pub struct ValidationLimits {
     /// Maximum terrain cells sampled plus water spans inspected.
     pub max_work: usize,
-    /// Maximum number of empty cells below the candidate in which support may
-    /// be found. Support is required beneath every horizontal footprint cell.
+    /// Placement tolerance below the envelope for finding support. The default
+    /// is zero; nonzero values are only for fitting an axis-aligned envelope to
+    /// uneven ground and must not be used to authorize live floating spawns.
     pub max_support_drop_cells: u32,
     /// Maximum height variation between support points under the footprint.
     pub max_support_height_delta_m: f64,
@@ -68,7 +82,7 @@ impl Default for ValidationLimits {
     fn default() -> Self {
         Self {
             max_work: 16_384,
-            max_support_drop_cells: 4,
+            max_support_drop_cells: 0,
             max_support_height_delta_m: 0.5,
             aquatic_min_depth_m: 0.5,
         }
@@ -123,6 +137,9 @@ pub fn validate_candidate(
     let half = candidate.size_m * 0.5;
     let min = candidate.center_m - half;
     let max = candidate.center_m + half;
+    if !min.is_finite() || !max.is_finite() {
+        return Err(RejectReason::InvalidEnvelope);
+    }
     let bounds = [
         cell_range(min.x, max.x)?,
         cell_range(min.y, max.y)?,
@@ -202,20 +219,32 @@ pub fn validate_candidate(
             let required_below = limits.aquatic_min_depth_m / TERRAIN_CELL_M;
             for z in bounds[2].0..=bounds[2].1 {
                 for x in bounds[0].0..=bounds[0].1 {
-                    let spans = water.spans_in_column(x, z);
-                    work = work
-                        .checked_add(spans.len())
-                        .ok_or(RejectReason::WorkBudgetExceeded)?;
-                    if work > max_work {
+                    // Charge even for dry/unallocated columns. The visitor checks
+                    // its span limit before any per-column allocation or scan.
+                    charge(&mut work, max_work)?;
+                    let remaining = max_work - work;
+                    let mut contains = false;
+                    let mut over_budget = false;
+                    let within_span_budget =
+                        water.visit_spans_in_column(x, z, remaining, &mut |span| {
+                            if work < max_work {
+                                work += 1;
+                            } else {
+                                over_budget = true;
+                                return;
+                            }
+                            let surface_y = span.floor_y as f64 + span.depth_cells;
+                            contains |= span.depth_cells.is_finite()
+                                && span.depth_cells > 0.02
+                                && surface_y.is_finite()
+                                && min_y >= span.floor_y as f64
+                                && min_y - span.floor_y as f64 >= required_below
+                                && max_y <= surface_y;
+                        });
+                    if !within_span_budget || over_budget {
                         return Err(RejectReason::WorkBudgetExceeded);
                     }
-                    if !spans.iter().any(|span| {
-                        span.depth_cells.is_finite()
-                            && span.depth_cells > 0.02
-                            && min_y >= span.floor_y as f64
-                            && max_y <= span.floor_y as f64 + span.depth_cells
-                            && span.floor_y as f64 + span.depth_cells - max_y >= required_below
-                    }) {
+                    if !contains {
                         return Err(RejectReason::WaterTooShallow);
                     }
                 }
@@ -263,10 +292,39 @@ mod tests {
     use spall_core::{BrickCoord, MaterialId, Revision, VolumeId};
     use spall_voxel::{Brick, EditPlan};
 
-    struct Water(Vec<WaterSpan>);
+    struct Water {
+        spans: Vec<WaterSpan>,
+        dry_column: Option<(i64, i64)>,
+    }
+
     impl CurrentWaterQuery for Water {
-        fn spans_in_column(&self, _: i64, _: i64) -> Vec<WaterSpan> {
-            self.0.clone()
+        fn visit_spans_in_column(
+            &self,
+            x: i64,
+            z: i64,
+            max_spans: usize,
+            visit: &mut dyn FnMut(WaterSpan),
+        ) -> bool {
+            if self.dry_column == Some((x, z)) {
+                return true;
+            }
+            if self.spans.len() > max_spans {
+                return false;
+            }
+            for &span in &self.spans {
+                visit(span);
+            }
+            true
+        }
+    }
+
+    fn water(depth_cells: f64) -> Water {
+        Water {
+            spans: vec![WaterSpan {
+                floor_y: 0,
+                depth_cells,
+            }],
+            dry_column: None,
         }
     }
 
@@ -322,10 +380,7 @@ mod tests {
     fn aquatic_requires_current_containing_water_and_depth() {
         let terrain = empty_terrain();
         let candidate = envelope(DVec3::new(1.0, 2.0, 1.0), DVec3::splat(0.5));
-        let deep = Water(vec![WaterSpan {
-            floor_y: 0,
-            depth_cells: 16.0,
-        }]);
+        let deep = water(16.0);
         assert!(
             validate_candidate(
                 &terrain,
@@ -336,10 +391,7 @@ mod tests {
             )
             .is_ok()
         );
-        let shallow = Water(vec![WaterSpan {
-            floor_y: 0,
-            depth_cells: 10.0,
-        }]);
+        let shallow = water(8.5);
         assert_eq!(
             validate_candidate(
                 &terrain,
@@ -350,10 +402,7 @@ mod tests {
             ),
             Err(RejectReason::WaterTooShallow)
         );
-        let drained = Water(vec![WaterSpan {
-            floor_y: 0,
-            depth_cells: 0.0,
-        }]);
+        let drained = water(0.0);
         assert_eq!(
             validate_candidate(
                 &terrain,
@@ -363,6 +412,76 @@ mod tests {
                 ValidationLimits::default()
             ),
             Err(RejectReason::WaterTooShallow)
+        );
+        let near_floor = envelope(DVec3::new(1.0, 0.625, 1.0), DVec3::splat(0.5));
+        assert_eq!(
+            validate_candidate(
+                &terrain,
+                Some(&deep),
+                AnimalHabitat::Aquatic,
+                near_floor,
+                ValidationLimits::default()
+            ),
+            Err(RejectReason::WaterTooShallow)
+        );
+        let near_surface = envelope(DVec3::new(1.0, 3.5, 1.0), DVec3::splat(0.5));
+        assert!(
+            validate_candidate(
+                &terrain,
+                Some(&deep),
+                AnimalHabitat::Aquatic,
+                near_surface,
+                ValidationLimits::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn aquatic_requires_water_under_every_horizontal_footprint_column() {
+        let terrain = empty_terrain();
+        let candidate = envelope(DVec3::new(1.0, 2.0, 1.0), DVec3::splat(0.5));
+        let mut edge_dry = water(16.0);
+        edge_dry.dry_column = Some((4, 3));
+        assert_eq!(
+            validate_candidate(
+                &terrain,
+                Some(&edge_dry),
+                AnimalHabitat::Aquatic,
+                candidate,
+                ValidationLimits::default()
+            ),
+            Err(RejectReason::WaterTooShallow)
+        );
+    }
+
+    #[test]
+    fn aquatic_water_span_scan_obeys_remaining_work_budget() {
+        let terrain = empty_terrain();
+        let candidate = envelope(DVec3::new(1.0, 2.0, 1.0), DVec3::splat(0.5));
+        let many_spans = Water {
+            spans: vec![
+                WaterSpan {
+                    floor_y: 0,
+                    depth_cells: 16.0
+                };
+                20
+            ],
+            dry_column: None,
+        };
+        let limits = ValidationLimits {
+            max_work: 12,
+            ..ValidationLimits::default()
+        };
+        assert_eq!(
+            validate_candidate(
+                &terrain,
+                Some(&many_spans),
+                AnimalHabitat::Aquatic,
+                candidate,
+                limits
+            ),
+            Err(RejectReason::WorkBudgetExceeded)
         );
     }
 
@@ -436,6 +555,7 @@ mod tests {
         terrain.apply_edit(&trench).unwrap();
         let candidate = envelope(DVec3::new(1.25, 8.25, 1.25), DVec3::new(0.5, 0.5, 0.5));
         let strict = ValidationLimits {
+            max_support_drop_cells: 4,
             max_support_height_delta_m: 0.25,
             ..ValidationLimits::default()
         };
@@ -478,6 +598,28 @@ mod tests {
                 ValidationLimits::default()
             ),
             Err(RejectReason::InvalidEnvelope)
+        );
+        let overflow = envelope(DVec3::splat(1.7e308), DVec3::splat(1.7e308));
+        assert_eq!(
+            validate_candidate(
+                &terrain,
+                None,
+                AnimalHabitat::Flying,
+                overflow,
+                ValidationLimits::default()
+            ),
+            Err(RejectReason::InvalidEnvelope)
+        );
+        let finite_out_of_range = envelope(DVec3::new(1.0e100, 1.0, 1.0), DVec3::splat(0.25));
+        assert_eq!(
+            validate_candidate(
+                &terrain,
+                None,
+                AnimalHabitat::Flying,
+                finite_out_of_range,
+                ValidationLimits::default()
+            ),
+            Err(RejectReason::OutsideCellRange)
         );
     }
 }
