@@ -675,3 +675,18 @@ Additive wire records under envelope schema 3; matched client and server builds 
 Single-brick repair requests no longer fill `current_hash`/`expected_hash` (the server never read
 them), and a transaction whose result hash covers a volume with an earlier transaction still held
 for a repair or bulk blob waits behind it.
+
+### ENG-196/199 - Weather state and authorized overrides
+
+Wire schema/protocol 6 adds WeatherSnapshot tag 24 and appended
+AdminCommand::SetWeather { kind: Option<WeatherKind> }; None restores automatic.
+WeatherState schema 2 carries the canonical override along with explicit clock,
+epoch/revision, quantized precipitation/wind and stable lightning event fields.
+Matching client/server versions are required. Explicit schema-1 checkpoint and
+journal migration produces automatic mode; no runtime enum bytes are persisted.
+Existing ecology chronological clock and VegetationClock journal semantics stay
+unchanged. A persisted fallback tick clock serves worlds without vegetation.
+Weather overrides require the existing admin authorization and persist through
+checkpoint/restart; world reset clears them. Per-weather stream fences allow
+weather older than motion while refusing stale weather/reset records. See
+reports/ENG-196-weather-foundation.md and reports/ENG-199-weather-controls.md.

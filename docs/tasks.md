@@ -1830,3 +1830,14 @@ chronological ecology fields and VegetationClock journal semantics stay unchange
 weather consumes read-only time, and winter owns private active-growth accounting.
 Workers own separate code areas; coordinator owns shared docs and integration.
 WX2-WX4 remain unassigned. No implementation gate is accepted at dispatch.
+
+### ENG-198 / ENG-199 / ENG-200 - F10 weather/audio and combined 1 km playtest
+
+User requested integration and live testing, 2026-10-14. ENG-198 coordinates
+ENG-194 nature audio, integrated ENG-196 weather and ENG-197 winter dormancy,
+ENG-199 authorized weather overrides/compatibility and ENG-200 visual effects.
+All stay in progress until integration review and required evidence are recorded.
+Coordinator owns F10/audio/window/common docs/build/launch. Luna Medium workers
+implemented separate server/protocol and client/render slices in isolated worktrees.
+Canonical plan: weather.md; exact combined checks and launch evidence:
+reports/ENG-198-integrated-weather-playtest.md. WX3/WX4 remain unassigned.

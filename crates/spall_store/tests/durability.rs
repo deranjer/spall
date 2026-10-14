@@ -932,7 +932,7 @@ fn schema_one_weather_checkpoint_and_journal_migrate_to_automatic_state() {
     let recovered = recover(scratch.db()).unwrap();
     assert_eq!(recovered.checkpoint.weather.unwrap().override_kind, None);
     assert!(
-        matches!(recovered.journal[0].payload,JournalPayload::WeatherState(ref state) if state.schema==spall_protocol::WEATHER_SCHEMA && state.override_kind==None)
+        matches!(recovered.journal[0].payload,JournalPayload::WeatherState(ref state) if state.schema==spall_protocol::WEATHER_SCHEMA && state.override_kind.is_none())
     );
 }
 

@@ -31,6 +31,22 @@ pub fn config() -> BiomeAudioConfig {
             .iter()
             .map(|name| (!name.is_empty()).then(|| root.join("biomes").join(name)))
             .collect(),
+        labels: Biome::EVERY
+            .into_iter()
+            .map(|biome| format!("{biome:?}"))
+            .collect(),
+        weather_tracks: [
+            None,
+            Some("weather/light-rain.ogg"),
+            Some("weather/heavy-rain.ogg"),
+            None,
+            Some("biomes/pine-wind.ogg"),
+            Some("biomes/pine-wind.ogg"),
+        ]
+        .into_iter()
+        .map(|name| name.map(|name| root.join(name)))
+        .collect(),
+        thunder: Some(root.join("weather/thunder-clap.ogg")),
     }
 }
 
@@ -83,6 +99,7 @@ mod tests {
                     (!name.is_empty()).then(|| source_audio_root().join("biomes").join(name))
                 })
                 .collect(),
+            ..Default::default()
         };
         for path in config.tracks.into_iter().flatten() {
             assert!(
@@ -90,6 +107,26 @@ mod tests {
                 "missing runtime ambience {}",
                 path.display()
             );
+        }
+    }
+
+    #[test]
+    fn weather_controls_only_select_approved_decodable_assets() {
+        let config = config();
+        assert_eq!(config.weather_tracks.len(), 6);
+        assert!(config.weather_tracks[0].is_none());
+        assert!(
+            config.weather_tracks[3].is_none(),
+            "no snowfall bed was accepted"
+        );
+        for path in config
+            .weather_tracks
+            .into_iter()
+            .flatten()
+            .chain(config.thunder)
+        {
+            spall_client::audio::validate_asset(&path).unwrap();
+            assert!(!path.to_string_lossy().to_lowercase().contains("snowfall"));
         }
     }
 

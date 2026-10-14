@@ -3,6 +3,10 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +19,10 @@ const UPDATE: Duration = Duration::from_millis(25);
 #[derive(Debug, Clone, Default)]
 pub struct BiomeAudioConfig {
     pub tracks: Vec<Option<PathBuf>>,
+    pub labels: Vec<String>,
+    /// Weather beds indexed by the stable WeatherKind code; game-owned assets.
+    pub weather_tracks: Vec<Option<PathBuf>>,
+    pub thunder: Option<PathBuf>,
 }
 
 /// Resolves a world-space listener position into the replicated climate field.
@@ -96,6 +104,8 @@ fn existing_slot(paths: &[Option<PathBuf>; 2], request: &Option<PathBuf>) -> Opt
 #[derive(Clone)]
 pub struct AmbienceAudio {
     tx: SyncSender<Option<PathBuf>>,
+    one_shots: SyncSender<PathBuf>,
+    gain: Arc<AtomicU32>,
 }
 
 impl AmbienceAudio {
@@ -109,11 +119,18 @@ impl AmbienceAudio {
             .filter(|value| value.is_finite())
             .map_or(gain, |value| value.clamp(0.0, 1.0));
         let (tx, rx) = mpsc::sync_channel(1);
+        let (one_shots, shot_rx) = mpsc::sync_channel(4);
+        let gain = Arc::new(AtomicU32::new(gain.to_bits()));
+        let worker_gain = Arc::clone(&gain);
         thread::Builder::new()
             .name("spall-ambience".into())
-            .spawn(move || run_audio(rx, gain))
+            .spawn(move || run_audio(rx, shot_rx, worker_gain))
             .ok()?;
-        Some(Self { tx })
+        Some(Self {
+            tx,
+            one_shots,
+            gain,
+        })
     }
 
     pub fn set_track(&self, path: Option<PathBuf>) -> Result<(), TrySendError<Option<PathBuf>>> {
@@ -122,9 +139,30 @@ impl AmbienceAudio {
             Err(error) => Err(error),
         }
     }
+
+    pub fn set_gain(&self, gain: f32) {
+        self.gain
+            .store(safe_gain(gain).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn play_once(&self, path: PathBuf) -> Result<(), TrySendError<PathBuf>> {
+        self.one_shots.try_send(path)
+    }
 }
 
-fn run_audio(rx: mpsc::Receiver<Option<PathBuf>>, gain: f32) {
+fn safe_gain(gain: f32) -> f32 {
+    if gain.is_finite() {
+        gain.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn run_audio(
+    rx: mpsc::Receiver<Option<PathBuf>>,
+    shot_rx: mpsc::Receiver<PathBuf>,
+    gain: Arc<AtomicU32>,
+) {
     let stream = match OutputStreamBuilder::open_default_stream() {
         Ok(stream) => stream,
         Err(error) => {
@@ -136,6 +174,7 @@ fn run_audio(rx: mpsc::Receiver<Option<PathBuf>>, gain: f32) {
         Sink::connect_new(stream.mixer()),
         Sink::connect_new(stream.mixer()),
     ];
+    let thunder = Sink::connect_new(stream.mixer());
     let mut paths: [Option<PathBuf>; 2] = [None, None];
     let mut volumes = [0.0_f32; 2];
     let mut fade = Crossfade {
@@ -195,6 +234,23 @@ fn run_audio(rx: mpsc::Receiver<Option<PathBuf>>, gain: f32) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
+        // One bounded one-shot voice. Do not build an unbounded thunder queue.
+        while let Ok(path) = shot_rx.try_recv() {
+            if thunder.empty() {
+                match std::fs::File::open(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|f| Decoder::try_from(f).map_err(|e| e.to_string()))
+                {
+                    Ok(source) => {
+                        thunder.append(source);
+                        thunder.play();
+                    }
+                    Err(error) => tracing::warn!(%error, "weather one-shot unavailable"),
+                }
+            }
+        }
+        let gain = f32::from_bits(gain.load(Ordering::Relaxed));
+        thunder.set_volume(gain);
         let t = (fade_started.elapsed().as_secs_f32() / CROSSFADE.as_secs_f32()).clamp(0.0, 1.0);
         volumes = fade.sample(t);
         for index in 0..2 {
@@ -206,6 +262,7 @@ fn run_audio(rx: mpsc::Receiver<Option<PathBuf>>, gain: f32) {
         }
     }
     drop(sinks);
+    drop(thunder);
     drop(stream);
 }
 
@@ -227,6 +284,15 @@ impl Crossfade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_rejects_nonfinite_and_clamps() {
+        assert_eq!(safe_gain(f32::NAN), 0.0);
+        assert_eq!(safe_gain(f32::INFINITY), 0.0);
+        assert_eq!(safe_gain(-1.0), 0.0);
+        assert_eq!(safe_gain(2.0), 1.0);
+        assert_eq!(safe_gain(0.4), 0.4);
+    }
 
     #[test]
     fn crossfade_switches_tracks_and_fades_to_silence() {

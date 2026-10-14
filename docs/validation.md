@@ -1636,3 +1636,13 @@ same-track reuse and invalid/out-of-world biome samples. The sandbox client
 tests verify every mapped biome file and decode initial samples from all 19
 packaged accepted recordings without requiring an audio device. The manual
 output-device playtest is documented in [ENG-194](reports/ENG-194-biome-audio.md).
+
+## ENG-198 - Combined weather and nature-audio playtest
+
+Build/check and actual launch evidence is in reports/ENG-198-integrated-weather-playtest.md.
+F10 offers server weather profiles, nature preview/follow-biome, separate audio
+mute/volume and local effects/reduced-flash controls. The real-world test uses
+cargo xtask play --release --worldgen natural --worldgen-size 4096 --season winter
+(1024 m edge). Scripted captures use weather:auto|clear|rain|storm|snow|wind|blizzard
+through the same admin path; menu captures the actual F10 panel. Ground snow and
+footprints are later phases and must not be reported as available in this run.

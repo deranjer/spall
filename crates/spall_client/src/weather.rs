@@ -199,11 +199,11 @@ impl WeatherPresentation {
                 12.0 + self.wind * 15.0
             };
             let y = position.y + 20.0 - (self.phase_seconds * speed + phase).rem_euclid(24.0);
-            let side_x = (unit(h ^ 0xA5A5) * 40.0 - 20.0
+            let side_x = (unit(hash(h ^ 0xA5A5)) * 40.0 - 20.0
                 + self.phase_seconds * wx * (0.15 + self.wind) * 1.5)
                 .rem_euclid(40.0)
                 - 20.0;
-            let side_z = (unit(h ^ 0x5A5A) * 40.0 - 20.0
+            let side_z = (unit(hash(h ^ 0x5A5A)) * 40.0 - 20.0
                 + self.phase_seconds * wz * (0.15 + self.wind) * 1.5)
                 .rem_euclid(40.0)
                 - 20.0;
@@ -403,6 +403,24 @@ mod tests {
     }
 
     #[test]
+    fn precipitation_populates_all_horizontal_quadrants_instead_of_one_diagonal() {
+        let volume = known_air();
+        let mut presentation = WeatherPresentation::new();
+        let weather = state(WeatherKind::Blizzard, u16::MAX);
+        for _ in 0..60 {
+            presentation.update(&weather, &camera(), 1.0 / 60.0, &volume);
+        }
+        let frame = presentation.update(&weather, &camera(), 1.0 / 60.0, &volume);
+        let mut quadrants = [0usize; 4];
+        for particle in frame.particles {
+            let quadrant =
+                usize::from(particle.centre[0] >= 0.0) + 2 * usize::from(particle.centre[2] >= 0.0);
+            quadrants[quadrant] += 1;
+        }
+        assert!(quadrants.iter().all(|&count| count > 30), "{quadrants:?}");
+    }
+
+    #[test]
     fn unknown_and_roofed_columns_are_sheltered_but_open_columns_remain_exposed() {
         let empty = Volume::new(VolumeId::new(2).unwrap(), CellSizeCode::Quarter);
         let grid = sky_exposure_grid(Vec3::ZERO, &empty);
@@ -431,7 +449,7 @@ mod tests {
         let mut plan = EditPlan::new(v.id());
         plan.set(cell, spall_core::MaterialId(1));
         v.apply_edit(&plan).unwrap();
-        assert!(column_open(Vec3::new(0.0, 1.0, 0.0), &v, 2, 2) == false);
+        assert!(!column_open(Vec3::new(0.0, 1.0, 0.0), &v, 2, 2));
         assert!(column_open(Vec3::new(0.0, 1.0, 0.0), &v, 1, 2));
         assert_eq!(
             presentation

@@ -132,8 +132,11 @@ history, not durable gameplay evidence. Moving-body/vehicle tracks are deferred.
 
 ## Implementation slices and acceptance
 
-ENG-195 tracks the overall scope. ENG-196 (WX0) and ENG-197 (WX1) are assigned
-in separate worktrees to Luna Medium workers. Later slices remain unassigned.
+ENG-195 tracks the overall scope. ENG-196 (WX0) and ENG-197 (WX1) are integrated
+into the local test branch. ENG-198 owns the combined F10/audio/1 km playtest;
+ENG-199 supplies authorized overrides and ENG-200 supplies bounded screen effects.
+WX3 snow coating and WX4 footprints remain unassigned. Combined checks and launch
+evidence are recorded in `docs/reports/ENG-198-integrated-weather-playtest.md`.
 
 ### Frozen clock boundary for independent WX0/WX1 work
 
@@ -184,4 +187,5 @@ the first pass. Full-world destruction and multiplayer remain mandatory.
 WX0 settles climate offsets/snowline, weather frequency/duration, clock ownership
 and compatibility. WX3 settles surface storage and distant catch-up from measured
 costs. WX4 settles visual track density/TTL. Next scoped work: **ENG-195 / WX0**
-contract and integration audit, once implementation is requested.
+contract and integration audit (now integrated). Current work is ENG-198 / WX2
+combined validation; next scope after that is WX3 snow coating, then WX4 footprints.

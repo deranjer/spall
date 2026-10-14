@@ -149,7 +149,8 @@ pub struct InteractiveOptions {
     /// Present without vsync (rendering-throughput measurement only).
     pub uncapped: bool,
     /// A scripted tour: each step runs, then the frame is saved to
-    /// `shots_dir`; the window closes after the last step. Empty = normal play.
+    /// `shots_dir`; the window closes after the last step unless it is `play`.
+    /// Empty = normal play.
     pub shots: Vec<ShotStep>,
     pub shots_dir: PathBuf,
     /// Whether to advance the world clock from authoritative server ticks.
@@ -182,6 +183,10 @@ pub enum ShotStep {
     Report,
     /// Ask the server for an admin world reset.
     Reset,
+    /// Select authoritative weather through the same admin path as F10.
+    Weather(Option<spall_protocol::WeatherKind>),
+    /// End a capture tour and hand the running window to the player.
+    Play,
     /// Pause without a screenshot.
     Wait(f32),
     /// Switch the render view (`shaded`, `indirect_only`, `sky_visibility`...)
@@ -199,7 +204,7 @@ pub enum ShotStep {
 }
 
 /// Parses `x,y,z,yaw,pitch;menu;report;reset;walk;wait:2;view:indirect_only;sky:off;
-/// bounce:on` into steps.
+/// bounce:on;weather:snow;play` into steps. `play` hands the window to the user.
 pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
     spec.split(';')
         .map(str::trim)
@@ -209,6 +214,21 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
             "menu" => Ok(ShotStep::Menu),
             "report" => Ok(ShotStep::Report),
             "reset" => Ok(ShotStep::Reset),
+            "play" => Ok(ShotStep::Play),
+            _ if step.starts_with("weather:") => {
+                use spall_protocol::WeatherKind::*;
+                let kind = match &step[8..] {
+                    "auto" => None,
+                    "clear" => Some(Clear),
+                    "rain" => Some(Rain),
+                    "storm" => Some(Storm),
+                    "snow" => Some(Snow),
+                    "wind" => Some(HighWind),
+                    "blizzard" => Some(Blizzard),
+                    _ => return Err(format!("unknown weather `{step}`")),
+                };
+                Ok(ShotStep::Weather(kind))
+            }
             _ if step.starts_with("move:") => {
                 let v = step[5..]
                     .split(',')
@@ -438,6 +458,19 @@ struct InteractiveApp {
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
     ambience_track: Option<PathBuf>,
+    weather_audio: Option<AmbienceAudio>,
+    weather_track: Option<PathBuf>,
+    nature_volume: f32,
+    weather_volume: f32,
+    nature_muted: bool,
+    nature_preview: Option<usize>,
+    weather_muted: bool,
+    latest_weather: Option<spall_protocol::WeatherState>,
+    thunder_event: Option<(u64, u64)>,
+    pending_thunder: Option<(Instant, PathBuf)>,
+    weather_effects_enabled: bool,
+    reduced_weather_flashes: bool,
+    weather_exposure: f32,
     /// When the last frame was requested, for the uncapped frame limiter.
     last_redraw: Instant,
     /// Scripted camera tour (`--shots`); empty for normal play.
@@ -1679,6 +1712,19 @@ impl InteractiveApp {
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
             ambience_track: None,
+            weather_audio: AmbienceAudio::start(0.3),
+            weather_track: None,
+            nature_volume: 0.2,
+            weather_volume: 0.3,
+            nature_muted: false,
+            nature_preview: None,
+            weather_muted: false,
+            latest_weather: None,
+            thunder_event: None,
+            pending_thunder: None,
+            weather_effects_enabled: true,
+            reduced_weather_flashes: false,
+            weather_exposure: 1.0,
             last_redraw: Instant::now(),
             script: options.shots.into(),
             shots_dir: options.shots_dir,
@@ -1752,6 +1798,66 @@ impl InteractiveApp {
             return;
         }
         self.ambience_check_at = Instant::now();
+        if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
+            self.latest_weather = replica.weather().cloned();
+        }
+        if let Some(audio) = &self.ambience {
+            let weather_duck = if self.nature_preview.is_some() {
+                1.0
+            } else {
+                self.latest_weather.as_ref().map_or(1.0, |state| {
+                    1.0 - 0.65 * f32::from(state.precipitation_q16.max(state.gust_q16))
+                        / f32::from(u16::MAX)
+                })
+            };
+            audio.set_gain(if self.nature_muted {
+                0.0
+            } else {
+                self.nature_volume * weather_duck
+            });
+        }
+        let weather_track = self.latest_weather.as_ref().and_then(|state| {
+            self.biome_audio
+                .weather_tracks
+                .get(state.kind as usize)
+                .cloned()
+                .flatten()
+        });
+        if let Some(audio) = &self.weather_audio {
+            if self
+                .pending_thunder
+                .as_ref()
+                .is_some_and(|(due, _)| Instant::now() >= *due)
+                && let Some((_, path)) = self.pending_thunder.take()
+                && !self.weather_muted
+            {
+                let _ = audio.play_once(path);
+            }
+            audio.set_gain(if self.weather_muted {
+                0.0
+            } else {
+                self.weather_volume * (0.25 + 0.75 * self.weather_exposure)
+            });
+            if weather_track != self.weather_track && audio.set_track(weather_track.clone()).is_ok()
+            {
+                self.weather_track = weather_track;
+            }
+            if let Some(state) = &self.latest_weather {
+                let event = (state.world_epoch, state.lightning_id);
+                let age = state.effective_tick.saturating_sub(state.lightning_tick);
+                if state.lightning_id != 0 && self.thunder_event != Some(event) {
+                    if age <= 120
+                        && !self.weather_muted
+                        && let Some(path) = &self.biome_audio.thunder
+                    {
+                        // WX0 has no strike position: use a short atmospheric delay.
+                        self.pending_thunder =
+                            Some((Instant::now() + Duration::from_millis(750), path.clone()));
+                    }
+                    self.thunder_event = Some(event);
+                }
+            }
+        }
         let field = self
             .session
             .vegetation
@@ -1788,12 +1894,16 @@ impl InteractiveApp {
                     .as_ref()
                     .map(|view| view.predicted.position_m)
             });
-        let track = position.and_then(|position| {
-            let field = self.ambience_field.as_ref()?;
-            let grid = self.ambience_grid.as_ref()?;
-            let biome = crate::audio::biome_at(field, grid, position)?;
-            self.biome_audio.track(biome).cloned()
-        });
+        let track = if let Some(index) = self.nature_preview {
+            self.biome_audio.tracks.get(index).cloned().flatten()
+        } else {
+            position.and_then(|position| {
+                let field = self.ambience_field.as_ref()?;
+                let grid = self.ambience_grid.as_ref()?;
+                let biome = crate::audio::biome_at(field, grid, position)?;
+                self.biome_audio.track(biome).cloned()
+            })
+        };
         if track != self.ambience_track {
             let sent = self
                 .ambience
@@ -1890,6 +2000,9 @@ impl InteractiveApp {
             }
             ShotStep::Menu => {
                 self.admin_menu_open = !self.admin_menu_open;
+                if self.admin_menu_open {
+                    self.set_cursor_locked(false);
+                }
                 0.5
             }
             ShotStep::Report => {
@@ -1901,6 +2014,22 @@ impl InteractiveApp {
                 self.session
                     .push_admin(spall_protocol::AdminCommand::ResetWorld);
                 6.0
+            }
+            ShotStep::Weather(kind) => {
+                self.admin_request_pending = true;
+                self.session
+                    .push_admin(spall_protocol::AdminCommand::SetWeather { kind });
+                3.0
+            }
+            ShotStep::Play => {
+                self.script.clear();
+                self.script_at = None;
+                self.session.input.set_movement([0.0; 3]);
+                if self.admin_menu_open {
+                    self.set_cursor_locked(false);
+                }
+                println!("spall-interactive: capture tour complete; ready for player input");
+                return;
             }
             ShotStep::Wait(seconds) => {
                 self.script_at = Some(now + Duration::from_secs_f32(seconds.max(0.0)));
@@ -2583,6 +2712,9 @@ impl ApplicationHandler for InteractiveApp {
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
+                renderer.weather_state = self.latest_weather.clone();
+                renderer.weather_effects_enabled = self.weather_effects_enabled;
+                renderer.reduced_weather_flashes = self.reduced_weather_flashes;
                 renderer.scene.set_terrain_meshes_visible(self.show_terrain);
                 let terrain_upload_started = Instant::now();
                 let terrain_upload_count = terrain_updates.len();
@@ -2613,10 +2745,7 @@ impl ApplicationHandler for InteractiveApp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                if renderer.vegetation_frame.is_some()
-                    && let Some(replica) =
-                        self.session.replica.get().and_then(|r| r.try_lock().ok())
-                {
+                if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
                     let generation = replica.terrain_generation();
                     if renderer.vegetation_terrain.as_ref().map(|(g, _)| *g) != Some(generation)
                         && let Some(volume) = replica.terrain_volume()
@@ -2852,7 +2981,7 @@ impl ApplicationHandler for InteractiveApp {
                             renderer.screenshot_request = Some(path);
                         }
                         let menu_view = self.admin_menu_open.then(|| {
-                            admin_menu_view(
+                            let mut menu = admin_menu_view(
                                 &self.session,
                                 self.fly_eye.is_some(),
                                 self.admin_request_pending,
@@ -2866,7 +2995,41 @@ impl ApplicationHandler for InteractiveApp {
                                     .filter(|(_, at)| at.elapsed() < Duration::from_secs(20))
                                     .map(|(text, _)| text.clone()),
                                 frame_summary(&self.frame_history),
-                            )
+                            );
+                            menu.weather = self
+                                .latest_weather
+                                .as_ref()
+                                .map(|state| {
+                                    format!(
+                                        "Weather: {} ({}) | {} | {:.1} C",
+                                        weather_label(state.kind),
+                                        if state.override_kind.is_some() {
+                                            "forced"
+                                        } else {
+                                            "auto"
+                                        },
+                                        ["Spring", "Summer", "Autumn", "Winter"][(u64::from(
+                                            state.start_season
+                                        ) + state
+                                            .clock_ms
+                                            / state.season_ms.max(1))
+                                            as usize
+                                            % 4],
+                                        f32::from(state.temperature_centi_c) / 100.0
+                                    )
+                                })
+                                .unwrap_or_else(|| "Weather: waiting for server".into());
+                            menu.nature_volume = self.nature_volume;
+                            menu.weather_volume = self.weather_volume;
+                            menu.nature_muted = self.nature_muted;
+                            menu.nature_selection = self
+                                .nature_preview
+                                .and_then(|i| self.biome_audio.labels.get(i).cloned())
+                                .unwrap_or_else(|| "Follow local biome".into());
+                            menu.weather_muted = self.weather_muted;
+                            menu.weather_effects_enabled = self.weather_effects_enabled;
+                            menu.reduced_weather_flashes = self.reduced_weather_flashes;
+                            menu
                         });
                         match renderer.finish_frame(
                             acquired,
@@ -2886,6 +3049,9 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 };
                 self.hud.record_frame(&timing);
+                if let Some(renderer) = &self.renderer {
+                    self.weather_exposure = renderer.weather_exposure;
+                }
                 if self.frame_history.len() >= FRAME_HISTORY {
                     self.frame_history.pop_front();
                 }
@@ -2956,6 +3122,36 @@ impl ApplicationHandler for InteractiveApp {
                     self.session
                         .push_admin(spall_protocol::AdminCommand::SetDamGate { open });
                 }
+                if let Some(kind) = menu_actions.set_weather {
+                    self.admin_request_pending = true;
+                    self.session
+                        .push_admin(spall_protocol::AdminCommand::SetWeather { kind });
+                }
+                if menu_actions.toggle_nature_audio {
+                    self.nature_muted = !self.nature_muted;
+                }
+                if menu_actions.nature_follow {
+                    self.nature_preview = None;
+                }
+                if menu_actions.nature_next && !self.biome_audio.tracks.is_empty() {
+                    self.nature_preview = Some(
+                        self.nature_preview
+                            .map_or(0, |i| (i + 1) % self.biome_audio.tracks.len()),
+                    );
+                }
+                if menu_actions.toggle_weather_audio {
+                    self.weather_muted = !self.weather_muted;
+                }
+                self.nature_volume =
+                    (self.nature_volume + menu_actions.nature_volume_delta).clamp(0.0, 1.0);
+                self.weather_volume =
+                    (self.weather_volume + menu_actions.weather_volume_delta).clamp(0.0, 1.0);
+                if menu_actions.toggle_weather_effects {
+                    self.weather_effects_enabled = !self.weather_effects_enabled;
+                }
+                if menu_actions.toggle_weather_flashes {
+                    self.reduced_weather_flashes = !self.reduced_weather_flashes;
+                }
                 if menu_actions.close {
                     self.admin_menu_open = false;
                 }
@@ -2968,6 +3164,12 @@ impl ApplicationHandler for InteractiveApp {
                     self.seen_world_resets = resets;
                     self.last_built_pos = None;
                     self.last_body_draws.clear();
+                    self.latest_weather = None;
+                    self.thunder_event = None;
+                    self.pending_thunder = None;
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.weather_presentation.reset();
+                    }
                     if self.fly_eye.is_some() {
                         self.fly_eye = None;
                         self.landing = None;
@@ -4683,6 +4885,14 @@ fn admin_menu_view(
         world_time,
         report_status,
         frame_summary,
+        weather: String::new(),
+        nature_volume: 0.0,
+        weather_volume: 0.0,
+        nature_muted: false,
+        nature_selection: String::new(),
+        weather_muted: false,
+        weather_effects_enabled: true,
+        reduced_weather_flashes: false,
     }
 }
 
@@ -4763,6 +4973,14 @@ const KEYBINDS: &[(&str, &str)] = &[
 /// What the admin menu shows this frame.
 #[derive(Debug, Clone, Default)]
 pub(super) struct AdminMenuView {
+    pub weather: String,
+    pub nature_volume: f32,
+    pub weather_volume: f32,
+    pub nature_muted: bool,
+    pub nature_selection: String,
+    pub weather_muted: bool,
+    pub weather_effects_enabled: bool,
+    pub reduced_weather_flashes: bool,
     pub flying: bool,
     /// Server's reply to the last admin command, or "waiting" while pending.
     pub admin_status: Option<String>,
@@ -4785,6 +5003,15 @@ pub(super) struct AdminMenuView {
 /// Buttons clicked in the admin menu this frame.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct AdminMenuActions {
+    pub set_weather: Option<Option<spall_protocol::WeatherKind>>,
+    pub toggle_nature_audio: bool,
+    pub nature_follow: bool,
+    pub nature_next: bool,
+    pub toggle_weather_audio: bool,
+    pub nature_volume_delta: f32,
+    pub weather_volume_delta: f32,
+    pub toggle_weather_effects: bool,
+    pub toggle_weather_flashes: bool,
     pub toggle_flight: bool,
     pub reset_world: bool,
     pub recentre: bool,
@@ -4806,6 +5033,18 @@ fn section(title: &'static str) {
         text.style.color = PANEL_ACCENT;
         text.show();
     });
+}
+
+fn weather_label(kind: spall_protocol::WeatherKind) -> &'static str {
+    use spall_protocol::WeatherKind::*;
+    match kind {
+        Clear => "Clear",
+        Rain => "Rain",
+        Storm => "Storm",
+        Snow => "Snow",
+        HighWind => "High wind",
+        Blizzard => "Blizzard",
+    }
 }
 
 fn muted(size: f32, line: impl Into<std::borrow::Cow<'static, str>>) {
@@ -4830,10 +5069,110 @@ fn admin_menu_panel(
                     yakui::row(|| {
                         yakui::text(22.0, "SPALL ADMIN");
                         yakui::pad(yakui::widgets::Pad::balanced(12.0, 6.0), || {
-                            muted(13.0, "F10 to close");
+                            muted(13.0, "F10 to close | scroll for more");
                         });
                     });
 
+                    section("Weather & nature sounds");
+                    muted(13.0, view.weather.clone());
+                    yakui::row(|| {
+                        if yakui::button("Automatic").clicked {
+                            actions.set_weather = Some(None);
+                        }
+                        for kind in [
+                            spall_protocol::WeatherKind::Clear,
+                            spall_protocol::WeatherKind::Rain,
+                            spall_protocol::WeatherKind::Storm,
+                        ] {
+                            yakui::pad(yakui::widgets::Pad::horizontal(3.0), || {
+                                if yakui::button(weather_label(kind)).clicked {
+                                    actions.set_weather = Some(Some(kind));
+                                }
+                            });
+                        }
+                    });
+                    yakui::row(|| {
+                        for kind in [
+                            spall_protocol::WeatherKind::Snow,
+                            spall_protocol::WeatherKind::HighWind,
+                            spall_protocol::WeatherKind::Blizzard,
+                        ] {
+                            yakui::pad(yakui::widgets::Pad::horizontal(3.0), || {
+                                if yakui::button(weather_label(kind)).clicked {
+                                    actions.set_weather = Some(Some(kind));
+                                }
+                            });
+                        }
+                    });
+                    yakui::row(|| {
+                        if yakui::button(if view.nature_muted {
+                            "Nature: muted"
+                        } else {
+                            "Nature: on"
+                        })
+                        .clicked
+                        {
+                            actions.toggle_nature_audio = true;
+                        }
+                        muted(13.0, format!(" {:.0}% ", view.nature_volume * 100.0));
+                        if yakui::button("- Nature").clicked {
+                            actions.nature_volume_delta = -0.1;
+                        }
+                        if yakui::button("+ Nature").clicked {
+                            actions.nature_volume_delta = 0.1;
+                        }
+                    });
+                    yakui::row(|| {
+                        muted(12.0, view.nature_selection.clone());
+                        if yakui::button("Next biome sound").clicked {
+                            actions.nature_next = true;
+                        }
+                        if yakui::button("Follow biome").clicked {
+                            actions.nature_follow = true;
+                        }
+                    });
+                    yakui::row(|| {
+                        if yakui::button(if view.weather_muted {
+                            "Weather audio: muted"
+                        } else {
+                            "Weather audio: on"
+                        })
+                        .clicked
+                        {
+                            actions.toggle_weather_audio = true;
+                        }
+                        muted(13.0, format!(" {:.0}% ", view.weather_volume * 100.0));
+                        if yakui::button("- Weather").clicked {
+                            actions.weather_volume_delta = -0.1;
+                        }
+                        if yakui::button("+ Weather").clicked {
+                            actions.weather_volume_delta = 0.1;
+                        }
+                    });
+                    yakui::row(|| {
+                        if yakui::button(if view.weather_effects_enabled {
+                            "Effects: on"
+                        } else {
+                            "Effects: off"
+                        })
+                        .clicked
+                        {
+                            actions.toggle_weather_effects = true;
+                        }
+                        if yakui::button(if view.reduced_weather_flashes {
+                            "Lightning: reduced"
+                        } else {
+                            "Lightning: normal"
+                        })
+                        .clicked
+                        {
+                            actions.toggle_weather_flashes = true;
+                        }
+                    });
+                    muted(
+                        12.0,
+                        "Snow cover and footprints are planned for a later update.",
+                    );
                     section("Movement");
                     muted(
                         13.0,
@@ -5472,6 +5811,12 @@ impl VegetationWorker {
 }
 
 pub(super) struct WorldRenderer {
+    weather_state: Option<spall_protocol::WeatherState>,
+    weather_presentation: crate::weather::WeatherPresentation,
+    weather_render_at: Instant,
+    weather_exposure: f32,
+    weather_effects_enabled: bool,
+    reduced_weather_flashes: bool,
     environment: Environment,
     day_cycle_enabled: bool,
     day_clock_label: String,
@@ -5921,6 +6266,12 @@ impl WorldRenderer {
         Ok(Self {
             environment,
             day_cycle_enabled,
+            weather_state: None,
+            weather_presentation: crate::weather::WeatherPresentation::new(),
+            weather_render_at: Instant::now(),
+            weather_exposure: 1.0,
+            weather_effects_enabled: true,
+            reduced_weather_flashes: false,
             day_clock_label: "Waiting for server time".to_owned(),
             device,
             queue,
@@ -6323,6 +6674,34 @@ impl WorldRenderer {
             );
             camera.z_near = CAMERA_Z_NEAR_M;
             camera.z_far = CAMERA_Z_FAR_M;
+            self.weather_presentation
+                .set_enabled(self.weather_effects_enabled);
+            self.weather_presentation
+                .set_reduced_flashes(self.reduced_weather_flashes);
+            let weather_now = Instant::now();
+            let weather_dt = weather_now
+                .duration_since(self.weather_render_at)
+                .as_secs_f32()
+                .min(0.1);
+            self.weather_render_at = weather_now;
+            if let (Some(state), Some((_, volume))) =
+                (&self.weather_state, &self.vegetation_terrain)
+            {
+                let frame = self
+                    .weather_presentation
+                    .update(state, &camera, weather_dt, volume);
+                if self.screenshot_request.is_some() {
+                    tracing::info!(kind = ?state.kind, particles = frame.particles.len(), exposure = frame.lighting.exposure, "weather capture presentation");
+                }
+                self.weather_exposure = frame.lighting.exposure;
+                self.scene
+                    .set_weather_particles(frame.particles, frame.lighting)
+                    .map_err(|error| ClientError::Render(error.to_string()))?;
+            } else {
+                self.scene
+                    .set_weather_particles(&[], spall_render::WeatherLighting::default())
+                    .map_err(|error| ClientError::Render(error.to_string()))?;
+            }
             self.scene.render(
                 &self.device,
                 &self.queue,
@@ -6368,6 +6747,8 @@ impl WorldRenderer {
         self.yakui.start();
         let mut selected_environment = None;
         let mut admin_menu = admin_menu;
+        let menu_height =
+            (self.surface_config.height as f32 / self.yakui.scale_factor() - 24.0).max(100.0);
         {
             yakui::align(yakui::Alignment::TOP_LEFT, || {
                 yakui::pad(yakui::widgets::Pad::all(12.0), || {
@@ -6378,14 +6759,18 @@ impl WorldRenderer {
                             yakui::text(12.0, status.to_owned());
                         });
                     } else if let Some((view, actions)) = admin_menu.as_mut() {
-                        admin_menu_panel(
-                            view,
-                            actions,
-                            &mut selected_environment,
-                            &mut self.environment,
-                            &mut self.debug_view,
-                            &mut self.day_cycle_enabled,
-                        );
+                        yakui::constrained(yakui::Constraints::height(0.0, menu_height), || {
+                            yakui::scroll_vertical(|| {
+                                admin_menu_panel(
+                                    view,
+                                    actions,
+                                    &mut selected_environment,
+                                    &mut self.environment,
+                                    &mut self.debug_view,
+                                    &mut self.day_cycle_enabled,
+                                );
+                            });
+                        });
                     } else {
                         yakui::colored_box_container(PANEL_BG.with_alpha(0.55), || {
                             yakui::pad(yakui::widgets::Pad::balanced(10.0, 6.0), || {
@@ -6470,6 +6855,21 @@ mod input_tests {
     use spall_core::BUTTON_JUMP;
 
     use super::*;
+
+    #[test]
+    fn weather_capture_script_uses_typed_admin_choices() {
+        assert_eq!(
+            parse_shots("weather:auto;weather:rain;weather:snow;weather:blizzard;play").unwrap(),
+            vec![
+                ShotStep::Weather(None),
+                ShotStep::Weather(Some(spall_protocol::WeatherKind::Rain)),
+                ShotStep::Weather(Some(spall_protocol::WeatherKind::Snow)),
+                ShotStep::Weather(Some(spall_protocol::WeatherKind::Blizzard)),
+                ShotStep::Play,
+            ]
+        );
+        assert!(parse_shots("weather:garbage").is_err());
+    }
 
     #[test]
     fn the_frame_summary_reports_percentiles_and_long_frames() {

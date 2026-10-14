@@ -106,6 +106,15 @@ The first useful deliverable is a networked destruction sandbox. It must already
 
 ## Read and assign work
 
+Nature and weather playtest: `cargo xtask play --release --worldgen natural
+--worldgen-size 4096 --season winter` launches a 1024 m world. **F10** selects
+automatic or forced weather, previews nature sounds, adjusts nature/weather
+volume and mute, and toggles visual effects/reduced lightning. Scroll the menu
+for the remaining controls. Weather choices are server-authorized; changing a
+weather profile does not change the ecological season. Thin ground snow and
+footprints remain planned work. See [weather plan](docs/weather.md) and
+[combined test evidence](docs/reports/ENG-198-integrated-weather-playtest.md).
+
 - [Architecture and invariants](docs/architecture.md): subsystem ownership, voxel representation, structural destruction, physics, and renderer.
 - [Protocol and persistence](docs/protocol.md): exact replication and recovery contracts.
 - [Implementation tasks](docs/tasks.md): dependency-ordered, bounded assignments with acceptance tests.
