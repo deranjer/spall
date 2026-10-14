@@ -1,0 +1,37 @@
+[
+  {
+    "path": "G:\\Programming\\voxel_engine\\artifacts\\audio-research\\terrestrial\\forest-ambience-nille.ogg",
+    "bytes": 3467115,
+    "sha256": "43848C3EDA5F42829F1033112C2A91BA3E5C91B79A0532FDA264C9F59856D431"
+  },
+  {
+    "path": "G:\\Programming\\voxel_engine\\artifacts\\audio-research\\terrestrial\\meadow-pipit.ogg",
+    "bytes": 2395975,
+    "sha256": "AF9A3E548E4EB582472647BBD609E7A8A3DD5A7BE0B4C40889E30E5A6AD0A801"
+  },
+  {
+    "path": "G:\\Programming\\voxel_engine\\artifacts\\audio-research\\terrestrial\\pine-wind.ogg",
+    "bytes": 1909781,
+    "sha256": "964E7D4EC810227BF2435197D3DA4AD82AAF8CA16C59E4D1E02B41C6CAC02CE6"
+  },
+  {
+    "path": "G:\\Programming\\voxel_engine\\artifacts\\audio-research\\terrestrial\\snowfall.ogg",
+    "bytes": 1100031,
+    "sha256": "9FE57713A67FA1E45CC45DB56A7FAA220503F8123635BCA4C21AFC4BEE0189FD"
+  },
+  {
+    "path": "G:\\Programming\\voxel_engine\\artifacts\\audio-research\\terrestrial\\walking-on-gravel.ogg",
+    "bytes": 254156,
+    "sha256": "693ED7CFE35E19403A5BF0C2B1511B045AD23DB07AA66EF17E2C7753E53EA9CD"
+  },
+  {
+    "path": "G:\\Programming\\voxel_engine\\artifacts\\audio-research\\water-weather\\lake-ontario-waves.ogg",
+    "bytes": 17407459,
+    "sha256": "8015CBCF2E8016CCDCAAB103342CC53C105F2592E29C0FA754285C9B54BFAABA"
+  },
+  {
+    "path": "G:\\Programming\\voxel_engine\\artifacts\\audio-research\\water-weather\\rhumphries-thunderstorm.ogg",
+    "bytes": 3130366,
+    "sha256": "40DF6D0ABE5FD270FD036091817077076C0B42458B8AFB3780B24DE4799F12D7"
+  }
+]
