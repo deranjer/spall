@@ -1805,3 +1805,28 @@ Natural worlds (landform, erosion, hydrology, climate, thirteen biomes), live ri
 | W6 editor preview layers, tuning and docs | ENG-191 | in review |
 
 Statuses are the coordinator's; nothing is marked done before review and integration.
+
+### ENG-195 - Weather, snow cover, footprints and winter dormancy (plan only)
+
+Status: backlog. User requested planning only on 2026-10-14. Canonical scope,
+ownership, dependencies and future acceptance: [weather plan](weather.md).
+Rain/storms, snowfall, high wind and blizzards start with client presentation of
+server-owned weather; thin terrain snow and shared temporary footprints follow.
+Living vegetation already blocks winter biomass/wood/seeding, but chronological
+age/seed credit and cleared-cover elapsed-time regrowth need dormancy fixes.
+Preserve ongoing ENG-194 audio work and integrated ENG-189/190 interfaces.
+
+Future slices: WX0 state/clock/compatibility; WX1 winter dormancy after WX0;
+WX2 screen effects/audio hooks after WX0; WX3 snow surfaces after WX0/WX2;
+WX4 validated footprints/integration after WX3. Split implementation tickets when
+requested. No runtime change or weather gate is claimed. Next scoped work:
+ENG-195 / WX0 contract and integration audit.
+
+ENG-195 implementation authorized (2026-10-14): parent now in progress.
+ENG-196 / WX0 weather foundation and ENG-197 / WX1 winter dormancy are in progress
+with Luna Medium workers in separate managed worktrees. The frozen clock contract
+in weather.md resolves WX1's WX0 clock prerequisite before parallel work: existing
+chronological ecology fields and VegetationClock journal semantics stay unchanged;
+weather consumes read-only time, and winter owns private active-growth accounting.
+Workers own separate code areas; coordinator owns shared docs and integration.
+WX2-WX4 remain unassigned. No implementation gate is accepted at dispatch.
