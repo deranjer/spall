@@ -369,6 +369,15 @@ const WATER_MIN_DEPTH_M: f32 = 0.04;
 // is under water, which drew fog on and off in fine stripes.
 const WATER_BOTTOM_TOL_M: f32 = 0.03;
 
+// Coarse terrain meshes (see spall_client's terrain LOD) lie up to a quarter of
+// their block below the true bed, which the water field holds: farther than
+// 30 m the margin grows with distance (0.14 m at 40 m, 0.5 m at 72 m) so a
+// fragment of a far lake bed is not mistaken for a dry space under the pool,
+// which drew it unfogged and bright.
+fn water_bottom_tol(distance_m: f32) -> f32 {
+    return WATER_BOTTOM_TOL_M + 0.011 * max(distance_m - 30.0, 0.0);
+}
+
 // Size of the faint grain cells on the water surface (one voxel) and how strong
 // they are: 0.0 is glass, 0.2 is plainly checkered.
 const WATER_VOXEL_M: f32 = 0.25;
@@ -415,7 +424,7 @@ fn apply_water_view(lit: vec3<f32>, p: vec3<f32>, probe_xz: vec2<f32>) -> vec3<f
     let cam_in = globals.water_cam.x > 0.5;
     let bounds = water_bounds_at(probe_xz);
     // Dry spaces below a pool are not underwater, even at the same X/Z.
-    if p.y < bounds.y - WATER_BOTTOM_TOL_M { return lit; }
+    if p.y < bounds.y - water_bottom_tol(distance(p, cam)) { return lit; }
     var s = bounds.x;
     if cam_in { s = globals.water_cam.y; }
     if s <= WATER_NONE { return lit; }
@@ -524,7 +533,9 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
     let wet_bounds = water_bounds_at(probe_xz);
     let wet_h = wet_bounds.x;
     var sub_light = vec3<f32>(1.0);
-    if in.world_pos.y >= wet_bounds.y - WATER_BOTTOM_TOL_M && in.world_pos.y < wet_h {
+    if in.world_pos.y >= wet_bounds.y - water_bottom_tol(distance(in.world_pos, globals.camera_pos.xyz))
+        && in.world_pos.y < wet_h
+    {
         let depth = wet_h - in.world_pos.y;
         let sun_path = depth / max(l.y, 0.3);
         direct = direct * exp(-WATER_ABSORB * sun_path) * water_caustics(in.world_pos, depth, n);

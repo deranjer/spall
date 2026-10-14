@@ -4481,6 +4481,17 @@ fn frame_summary(history: &std::collections::VecDeque<f32>) -> Vec<String> {
 /// happened.
 fn copy_report(report: &str) -> String {
     use std::io::Write;
+    // The clipboard tools read the console code page, not UTF-8: keep it ASCII.
+    let ascii: String = report
+        .chars()
+        .map(|c| match c {
+            _ if c.is_ascii() => c,
+            '\u{b7}' => '|',
+            '\u{b3}' => '3',
+            _ => '?',
+        })
+        .collect();
+    let report = ascii.as_str();
     let path = std::env::temp_dir().join("spall-debug-report.txt");
     let saved = std::fs::write(&path, report).is_ok();
     let tool: &[(&str, &[&str])] = &[
