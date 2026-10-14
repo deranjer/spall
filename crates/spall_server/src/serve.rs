@@ -3490,6 +3490,9 @@ async fn serve_async(
                     drains_m3 = frame.drain_removed_m3,
                     "water status"
                 );
+                if std::env::var_os("SPALL_WATER_DIAG").is_some() {
+                    eprintln!("sandbox-server: water diag: {}", water.diag_summary());
+                }
                 eprintln!(
                     "sandbox-server: water frame {} | fluid {:.1} s | skipped {:.1} s | last step {:.1} ms | {} active regions ({} resting far from players) | {:.0} m³ (+{:.0} springs, -{:.0} drains)",
                     frame.seq,

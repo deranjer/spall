@@ -372,6 +372,16 @@ pub struct SpanView {
     pub head_y: f64,
 }
 
+/// One active region's state, see [`ColumnWorld::active_regions_diag`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActiveRegionDiag {
+    pub key: RegionKey,
+    pub max_flow: f32,
+    pub quiet_steps: u32,
+    pub resting: bool,
+    pub steady: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ColumnStepMetrics {
     pub substeps: u32,
@@ -636,6 +646,27 @@ impl ColumnWorld {
         self.slot_of
             .get(&key)
             .map_or(0.0, |&s| self.regions[s as usize].owed_s)
+    }
+
+    /// What every active region is doing, for finding out why one does not
+    /// sleep: the largest flow through any of its pipes (cells^3/s), its quiet
+    /// steps so far, and whether it rests or is steady.
+    pub fn active_regions_diag(&self) -> Vec<ActiveRegionDiag> {
+        self.regions
+            .iter()
+            .filter(|r| r.active && !r.frozen)
+            .map(|r| ActiveRegionDiag {
+                key: r.key,
+                max_flow: r
+                    .pipes
+                    .iter()
+                    .map(|&pi| self.q[pi as usize].abs())
+                    .fold(0.0, f32::max),
+                quiet_steps: r.quiet_steps,
+                resting: r.resting,
+                steady: r.steady,
+            })
+            .collect()
     }
 
     /// Active regions resting at the moment.

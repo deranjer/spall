@@ -823,6 +823,54 @@ impl AuthoritativeColumnWater {
         );
     }
 
+    /// A line saying why the active regions are awake: how many carry which
+    /// flow, and how many hold a spring or a drain. For `SPALL_WATER_DIAG=1`.
+    pub fn diag_summary(&self) -> String {
+        let core = lock(&self.shared.core);
+        let diag = core.world.active_regions_diag();
+        let setup = &self.shared.setup;
+        let exchange: BTreeSet<RegionKey> = setup
+            .sources
+            .iter()
+            .chain(setup.gated_sources.iter().flatten())
+            .chain(&setup.sinks)
+            .chain(setup.discharges.iter().map(|d| &d.cell))
+            .map(|c| spall_fluid::columns::region_of(c.x, c.z))
+            .collect();
+        let bands = [0.1f32, 1.0, 10.0, 100.0];
+        let mut count = [0usize; 5];
+        let mut with_exchange = [0usize; 5];
+        let (mut quiet, mut steady, mut resting) = (0usize, 0usize, 0usize);
+        for d in &diag {
+            let b = bands.iter().take_while(|edge| d.max_flow >= **edge).count();
+            count[b] += 1;
+            if exchange.contains(&d.key) {
+                with_exchange[b] += 1;
+            }
+            quiet += usize::from(d.quiet_steps > 0);
+            steady += usize::from(d.steady);
+            resting += usize::from(d.resting);
+        }
+        format!(
+            "{} active | max flow <0.1: {} ({} with a spring/drain), 0.1-1: {} ({}), 1-10: {} ({}), 10-100: {} ({}), >=100: {} ({}) | counting quiet {} | steady {} | resting {} | regions with a spring or drain {}",
+            diag.len(),
+            count[0],
+            with_exchange[0],
+            count[1],
+            with_exchange[1],
+            count[2],
+            with_exchange[2],
+            count[3],
+            with_exchange[3],
+            count[4],
+            with_exchange[4],
+            quiet,
+            steady,
+            resting,
+            exchange.len()
+        )
+    }
+
     /// Tells the water where the players are (metres, x and z), so the water far
     /// from all of them can be stepped less often. No points: nothing is far.
     pub fn set_focus(&self, points_m: &[[f64; 2]]) {

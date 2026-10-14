@@ -609,6 +609,21 @@ status line's `last step 0.0 ms ... (0 resting)` lines are ticks with no new ste
 a walk (live rivers and their springs, regions woken as bricks come resident) is
 not investigated.
 
+Why water regions stay awake (`SPALL_WATER_DIAG=1` prints, with each water
+status line, how many active regions carry which largest flow and how many hold
+a spring or drain). Standing still on a 4096 world, active regions climbed from
+100 to about 360 in 500 s of water time and stayed near 330, with no walking.
+Of them 200-270 carried a largest flow of 0.1-1 cells^3/s, just over the 0.1
+sleep threshold; only 27 regions in the world hold a spring or drain and at most
+9 awake ones did, so it is currents in channels, not the springs. The steady-flow
+sleep (`SPALL_WATER_STEADY_STEPS=40`) never froze a single region (steady 0 all
+run). Raising the threshold to 0.5 (`SPALL_WATER_SLEEP_FLOW`, now the generated
+worlds' default): active regions stayed 53-78 standing and 51-83 walking the lake
+for 508 s, a step about 1 ms (before 14-40), the water 1.9-2.5 s behind real time
+(before 5-8 s). Flows under 0.5 cells^3/s (8 mL/s through the busiest pipe) stop
+being stepped until something disturbs them, so the slowest creeping on slopes
+and in channels freezes; rivers (1-100) keep running. Not looked at in game.
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale
