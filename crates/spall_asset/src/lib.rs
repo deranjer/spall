@@ -164,6 +164,9 @@ pub fn decode(bytes: &[u8]) -> Result<Asset> {
         }
         let id = input.array::<4>()?;
         let codec = input.u8()?;
+        if (id == *b"META" || id == *b"HASH") && codec != 0 {
+            return invalid("META and HASH chunks must use the raw codec");
+        }
         if input.array::<3>()? != [0; 3] {
             return invalid("chunk reserved bytes are nonzero");
         }
@@ -214,9 +217,10 @@ pub fn decode(bytes: &[u8]) -> Result<Asset> {
             b"META" => meta = Some(decode_meta(payload)?),
             b"MTRL" => materials = Some(decode_materials(payload)?),
             b"PALT" => tints = Some(decode_palette(payload)?),
-            b"PART" => parts = Some(decode_parts(payload)?),
+            b"PART" => parts = Some(decode_parts(payload, minor)?),
             b"VOXL" => runs = Some(decode_runs(payload)?),
-            b"ANIM" => clips = Some(decode_clips(payload)?),
+            b"ANIM" if minor >= 1 => clips = Some(decode_clips(payload)?),
+            b"ANIM" => return invalid("ANIM is unavailable in SPVX minor version 0"),
             b"STRC" => return invalid("STRC is unsupported by this animated consumer"),
             b"LAYR" => return invalid("LAYR is unsupported by this animated consumer"),
             other => return invalid(format!("unknown chunk {}", fourcc(*other))),
@@ -245,6 +249,9 @@ pub fn decode(bytes: &[u8]) -> Result<Asset> {
     if meta.optional_features & FEATURE_LAYERS != 0 {
         return invalid("LAYR feature is unsupported by this animated consumer");
     }
+    if minor == 0 && meta.required_features & FEATURE_STRUCTURAL != 0 {
+        return invalid("structural profiles require SPVX minor version 1");
+    }
     let has_profiles = parts.iter().any(|p| p.structural_profile_slot != 0);
     if has_profiles != (meta.required_features & FEATURE_STRUCTURAL != 0) {
         return invalid("STRUCTURAL_PROFILES feature bit disagrees with PART data");
@@ -252,6 +259,7 @@ pub fn decode(bytes: &[u8]) -> Result<Asset> {
     if has_profiles {
         return invalid("PART structural profiles require unsupported STRC");
     }
+    validate_parts(&parts)?;
     validate_runs(&runs, &parts, materials.len(), tints.len())?;
     validate_clips(&clips, &parts)?;
     Ok(Asset {
@@ -279,6 +287,8 @@ pub fn sample_clip(
     if !time_ticks.is_finite() {
         return invalid("animation time must be finite");
     }
+    validate_parts(&asset.parts)?;
+    validate_clips(&asset.clips, &asset.parts)?;
     let clip = asset
         .clips
         .iter()
@@ -303,8 +313,10 @@ pub fn sample_clip(
             .parts
             .iter()
             .find(|p| p.id == track.part_id)
-            .expect("validated part reference");
-        let pose = poses.get_mut(&track.part_id).expect("validated pose");
+            .ok_or_else(|| err("animation track references unknown part"))?;
+        let pose = poses
+            .get_mut(&track.part_id)
+            .ok_or_else(|| err("animation pose references unknown part"))?;
         pose.transform = sample_transform(part.rest, &track.keys, tick);
         pose.visible = sample_visibility(&track.keys, tick);
     }
@@ -330,8 +342,10 @@ fn sample_transform(rest: Transform, keys: &[Keyframe], time: f64) -> Transform 
     let mut out = rest;
     if let Some((x, y, t, interpolation)) = sample_field(keys, time, |key| key.translation) {
         out.translation = subcell_vec(x);
+        // Both Linear and Spherical key modes linearly interpolate
+        // translation/scale; Spherical additionally applies to rotation.
         if let Some(y) = y
-            && interpolation == Interpolation::Linear
+            && interpolation != Interpolation::Step
         {
             out.translation = out.translation.lerp(subcell_vec(y), t);
         }
@@ -347,7 +361,7 @@ fn sample_transform(rest: Transform, keys: &[Keyframe], time: f64) -> Transform 
     if let Some((x, y, t, interpolation)) = sample_field(keys, time, |key| key.scale) {
         out.scale = scale_vec(x);
         if let Some(y) = y
-            && interpolation == Interpolation::Linear
+            && interpolation != Interpolation::Step
         {
             out.scale = out.scale.lerp(scale_vec(y), t);
         }
@@ -429,6 +443,7 @@ fn decode_meta(bytes: &[u8]) -> Result<Meta> {
     let required_features = r.u64()?;
     let optional_features = r.u64()?;
     let n = r.u16()? as usize;
+    preflight(&r, n, 4, "META tags")?;
     let mut tags = BTreeMap::new();
     let mut last: Option<String> = None;
     for _ in 0..n {
@@ -457,6 +472,7 @@ fn decode_materials(bytes: &[u8]) -> Result<Vec<String>> {
     if n > MAX_TABLE {
         return invalid("too many materials");
     }
+    preflight(&r, n, 2, "MTRL entries")?;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         let s = r.string_u8()?;
@@ -474,6 +490,7 @@ fn decode_palette(bytes: &[u8]) -> Result<Vec<[u8; 3]>> {
     if n > MAX_TABLE {
         return invalid("too many palette entries");
     }
+    preflight(&r, n, 3, "PALT entries")?;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         v.push(r.array::<3>()?);
@@ -481,16 +498,20 @@ fn decode_palette(bytes: &[u8]) -> Result<Vec<[u8; 3]>> {
     r.finish()?;
     Ok(v)
 }
-fn decode_parts(bytes: &[u8]) -> Result<Vec<Part>> {
+fn decode_parts(bytes: &[u8], minor: u16) -> Result<Vec<Part>> {
     let mut r = Reader::new(bytes);
     let n = r.u16()? as usize;
     if n == 0 || n > MAX_PARTS {
         return invalid("PART count must be 1..=1024");
     }
+    if minor == 0 {
+        preflight(&r, n, 36, "legacy PART records")?;
+    } else {
+        preflight(&r, n, 38, "PART records")?;
+    }
     let mut parts = Vec::with_capacity(n);
     let mut ids = BTreeSet::new();
     let mut siblings = BTreeSet::new();
-    let mut last_key = None;
     for i in 0..n {
         let id = r.u32()?;
         let parent_id = r.u32()?;
@@ -499,7 +520,9 @@ fn decode_parts(bytes: &[u8]) -> Result<Vec<Part>> {
         let translation = [r.i32()?, r.i32()?, r.i32()?];
         let q = [r.i16()?, r.i16()?, r.i16()?, r.i16()?];
         let scale = [r.u16()?, r.u16()?, r.u16()?];
-        let structural_profile_slot = r.u16()?;
+        // v1.0 PART predates the structural-profile extension; its records
+        // omit this final field and therefore imply the material baseline.
+        let structural_profile_slot = if minor == 0 { 0 } else { r.u16()? };
         if id == 0 || !ids.insert(id) {
             return invalid("PART IDs must be nonzero and unique");
         }
@@ -521,11 +544,6 @@ fn decode_parts(bytes: &[u8]) -> Result<Vec<Part>> {
         if !siblings.insert((parent_id, name.clone())) {
             return invalid("PART sibling names must be unique");
         }
-        let key = (parent_id, id);
-        if last_key.is_some_and(|k| k > key) {
-            return invalid("PART records are not canonical");
-        }
-        last_key = Some(key);
         parts.push(Part {
             id,
             parent_id,
@@ -539,9 +557,7 @@ fn decode_parts(bytes: &[u8]) -> Result<Vec<Part>> {
         });
     }
     r.finish()?;
-    if parts[0].id != 1 || parts[0].parent_id != 0 {
-        return invalid("PART root must be part 1");
-    }
+    validate_parts(&parts)?;
     Ok(parts)
 }
 fn decode_runs(bytes: &[u8]) -> Result<Vec<VoxelRun>> {
@@ -553,6 +569,7 @@ fn decode_runs(bytes: &[u8]) -> Result<Vec<VoxelRun>> {
     if n > MAX_RUNS {
         return invalid("too many voxel runs");
     }
+    preflight(&r, n, 24, "VOXL runs")?;
     let mut runs = Vec::with_capacity(n);
     for _ in 0..n {
         runs.push(VoxelRun {
@@ -634,6 +651,7 @@ fn decode_clips(bytes: &[u8]) -> Result<Vec<Clip>> {
     if n > MAX_CLIPS {
         return invalid("too many clips");
     }
+    preflight(&r, n, 11, "ANIM clips")?;
     let mut clips = Vec::with_capacity(n);
     let mut names = BTreeSet::new();
     for _ in 0..n {
@@ -653,6 +671,7 @@ fn decode_clips(bytes: &[u8]) -> Result<Vec<Clip>> {
         if tn > MAX_TRACKS {
             return invalid("too many tracks in clip");
         }
+        preflight(&r, tn, 6, "ANIM tracks")?;
         let mut tracks = Vec::with_capacity(tn);
         for _ in 0..tn {
             let part_id = r.u32()?;
@@ -660,6 +679,7 @@ fn decode_clips(bytes: &[u8]) -> Result<Vec<Clip>> {
             if kn > MAX_KEYS {
                 return invalid("too many keys in track");
             }
+            preflight(&r, kn, 7, "ANIM keys")?;
             let mut keys = Vec::with_capacity(kn);
             for _ in 0..kn {
                 let tick = r.u32()?;
@@ -715,6 +735,7 @@ fn decode_clips(bytes: &[u8]) -> Result<Vec<Clip>> {
             tracks.push(Track { part_id, keys });
         }
         let en = r.u16()? as usize;
+        preflight(&r, en, 6, "ANIM events")?;
         let mut events = Vec::with_capacity(en);
         for _ in 0..en {
             let tick = r.u32()?;
@@ -733,11 +754,81 @@ fn decode_clips(bytes: &[u8]) -> Result<Vec<Clip>> {
     r.finish()?;
     Ok(clips)
 }
+fn validate_parts(parts: &[Part]) -> Result<()> {
+    if parts.len() > MAX_PARTS {
+        return invalid("part count exceeds 1,024");
+    }
+    if parts.is_empty() || parts[0].id != 1 || parts[0].parent_id != 0 {
+        return invalid("part hierarchy must begin with root part 1");
+    }
+    let mut ids = BTreeSet::new();
+    let mut siblings = BTreeSet::new();
+    for (index, part) in parts.iter().enumerate() {
+        if part.id == 0 || !ids.insert(part.id) {
+            return invalid("part IDs must be nonzero and unique");
+        }
+        validate_name(&part.name)?;
+        if !siblings.insert((part.parent_id, part.name.as_str())) {
+            return invalid("part sibling names must be unique");
+        }
+        let q = part.rest.rotation;
+        let q_norm = q.length_squared().sqrt();
+        if !part.rest.translation.is_finite()
+            || !part.rest.scale.is_finite()
+            || part.rest.scale.min_element() <= 0.0
+            || ![q.x, q.y, q.z, q.w].iter().all(|v| v.is_finite())
+            || !q_norm.is_finite()
+            || (q_norm - 1.0).abs() > 0.002
+        {
+            return invalid("part rest transform is invalid");
+        }
+        if index == 0 {
+            continue;
+        }
+        if part.parent_id == 0 || !parts[..index].iter().any(|p| p.id == part.parent_id) {
+            return invalid("part parent must precede child");
+        }
+    }
+    // Canonical topological order: among parts whose parent has already been
+    // emitted, the smallest part_id comes next. This preserves arbitrary
+    // stable IDs while making parent-before-child ordering deterministic.
+    let mut emitted = BTreeSet::from([parts[0].id]);
+    for i in 1..parts.len() {
+        let next = parts[i..]
+            .iter()
+            .filter(|p| emitted.contains(&p.parent_id))
+            .map(|p| p.id)
+            .min()
+            .ok_or_else(|| err("part hierarchy contains a cycle or disconnected root"))?;
+        if parts[i].id != next {
+            return invalid(
+                "PART records are not canonical parent-before-child, ascending part_id",
+            );
+        }
+        emitted.insert(next);
+    }
+    Ok(())
+}
+
 fn validate_clips(clips: &[Clip], parts: &[Part]) -> Result<()> {
+    if clips.len() > MAX_CLIPS {
+        return invalid("clip count exceeds 256");
+    }
     let ids: BTreeSet<_> = parts.iter().map(|p| p.id).collect();
+    let mut clip_names = BTreeSet::new();
     for c in clips {
+        if c.tracks.len() > MAX_TRACKS {
+            return invalid("track count exceeds 1,024");
+        }
+        validate_name(&c.name)?;
+        if !clip_names.insert(&c.name) {
+            return invalid("clip names are duplicated");
+        }
         let mut prev = None;
         for t in &c.tracks {
+            if t.keys.len() > MAX_KEYS {
+                return invalid("key count exceeds 65,535");
+            }
             if !ids.contains(&t.part_id) {
                 return invalid("animation track references unknown part");
             }
@@ -754,13 +845,23 @@ fn validate_clips(clips: &[Clip], parts: &[Part]) -> Result<()> {
                 if k.interpolation == Interpolation::Spherical && k.rotation.is_none() {
                     return invalid("spherical interpolation key lacks rotation");
                 }
+                if let Some(q) = k.rotation {
+                    validate_quat(q, "animation")?;
+                }
+                if k.scale.is_some_and(|scale| scale.contains(&0)) {
+                    return invalid("animation scale component is zero");
+                }
             }
         }
         let mut event_key = None;
+        if c.events.len() > u16::MAX as usize {
+            return invalid("event count exceeds 65,535");
+        }
         for e in &c.events {
             if e.tick > c.duration_ticks {
                 return invalid("event tick exceeds clip duration");
             }
+            validate_name(&e.name)?;
             let key = (e.tick, e.name.as_str());
             if event_key.is_some_and(|p| p >= key) {
                 return invalid("events must be sorted by (tick,name)");
@@ -861,6 +962,9 @@ impl<'a> Reader<'a> {
     fn is_empty(&self) -> bool {
         self.offset == self.bytes.len()
     }
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self
             .offset
@@ -916,6 +1020,16 @@ impl<'a> Reader<'a> {
     }
 }
 
+fn preflight(reader: &Reader<'_>, count: usize, minimum_bytes: usize, label: &str) -> Result<()> {
+    let required = count
+        .checked_mul(minimum_bytes)
+        .ok_or_else(|| err(format!("{label} count overflows")))?;
+    if required > reader.remaining() {
+        return invalid(format!("{label} count exceeds remaining payload"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,6 +1055,29 @@ mod tests {
         u32v(o, p.len() as u32);
         u32v(o, p.len() as u32);
         o.extend(p);
+    }
+    fn compress_chunk(file: &mut Vec<u8>, target: &[u8; 4]) {
+        let mut offset = 12;
+        while offset + 16 <= file.len() {
+            let id: [u8; 4] = file[offset..offset + 4].try_into().unwrap();
+            let stored_len =
+                u32::from_le_bytes(file[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let raw_len = u32::from_le_bytes(file[offset + 12..offset + 16].try_into().unwrap());
+            if &id == target {
+                let compressed =
+                    zstd::bulk::compress(&file[offset + 16..offset + 16 + stored_len], 1).unwrap();
+                let mut replacement = id.to_vec();
+                replacement.push(1);
+                replacement.extend([0; 3]);
+                u32v(&mut replacement, compressed.len() as u32);
+                u32v(&mut replacement, raw_len);
+                replacement.extend(compressed);
+                file.splice(offset..offset + 16 + stored_len, replacement);
+                return;
+            }
+            offset += 16 + stored_len;
+        }
+        panic!("test chunk not found");
     }
     fn make(
         parts: Option<Vec<u8>>,
@@ -1016,6 +1153,50 @@ mod tests {
         u16v(&mut p, 0);
         p
     }
+    fn push_part(p: &mut Vec<u8>, id: u32, parent_id: u32, name: &str) {
+        u32v(p, id);
+        u32v(p, parent_id);
+        p.push(name.len() as u8);
+        p.extend(name.as_bytes());
+        for _ in 0..3 {
+            i32v(p, 0);
+        }
+        for q in [0, 0, 0, 32767] {
+            i16v(p, q);
+        }
+        for _ in 0..3 {
+            u16v(p, 1024);
+        }
+        u16v(p, 0);
+    }
+    fn parts_nonmonotonic_deep() -> Vec<u8> {
+        let mut p = vec![];
+        u16v(&mut p, 4);
+        push_part(&mut p, 1, 0, "root");
+        push_part(&mut p, 3, 1, "sibling");
+        push_part(&mut p, 9, 1, "parent");
+        push_part(&mut p, 2, 9, "child");
+        p
+    }
+    fn anim_scale_two_keys() -> Vec<u8> {
+        let mut a = vec![];
+        u16v(&mut a, 1);
+        a.extend([4, b't', b'e', b's', b't']);
+        u32v(&mut a, 60);
+        a.push(1);
+        u16v(&mut a, 1);
+        u32v(&mut a, 1);
+        u16v(&mut a, 2);
+        for (tick, scale) in [(0, 1024), (60, 2048)] {
+            u32v(&mut a, tick);
+            a.extend([1, 4]);
+            for _ in 0..3 {
+                u16v(&mut a, scale);
+            }
+        }
+        u16v(&mut a, 0);
+        a
+    }
     fn anim_two_keys(q0: [i16; 4], q1: [i16; 4]) -> Vec<u8> {
         let mut a = vec![];
         u16v(&mut a, 1);
@@ -1052,6 +1233,27 @@ mod tests {
         animation[24] = 2;
         animation
     }
+    fn truncated_anim_count(kind: &str) -> Vec<u8> {
+        let mut animation = vec![];
+        u16v(&mut animation, 1);
+        animation.extend([1, b'x']);
+        u32v(&mut animation, 1);
+        animation.push(0);
+        match kind {
+            "tracks" => u16v(&mut animation, MAX_TRACKS as u16),
+            "keys" => {
+                u16v(&mut animation, 1);
+                u32v(&mut animation, 1);
+                u16v(&mut animation, MAX_KEYS as u16);
+            }
+            "events" => {
+                u16v(&mut animation, 0);
+                u16v(&mut animation, u16::MAX);
+            }
+            _ => unreachable!(),
+        }
+        animation
+    }
     #[test]
     fn static_implicit_root_and_symbolic_runs_are_preserved() {
         let mut v = vec![0];
@@ -1081,6 +1283,16 @@ mod tests {
         let mid = sample_clip(&a, "turn", 30.0).unwrap();
         assert!((mid[&1].transform.translation.x - 0.5).abs() < 1e-6);
         assert_eq!(mid[&1].transform.scale, Vec3::ONE);
+        let scaled = decode(&make(
+            Some(parts_root()),
+            empty_vox(),
+            Some(anim_scale_two_keys()),
+            None,
+        ))
+        .unwrap();
+        let midpoint = sample_clip(&scaled, "test", 30.0).unwrap();
+        assert!((midpoint[&1].transform.scale.x - 1.5).abs() < 1e-6);
+        assert!(midpoint[&1].transform.scale.is_finite());
     }
     #[test]
     fn fields_keep_rest_values_until_their_first_key() {
@@ -1103,6 +1315,85 @@ mod tests {
         .unwrap();
         let mid = sample_clip(&a, "turn", 30.0).unwrap();
         assert!(mid[&1].transform.rotation.dot(Quat::IDENTITY).abs() > 0.999);
+        assert!((mid[&1].transform.translation.x - 0.5).abs() < 1e-6);
+    }
+    #[test]
+    fn canonical_hierarchy_allows_deep_parent_before_child_with_arbitrary_ids() {
+        let mut part = vec![];
+        u16v(&mut part, 4);
+        push_part(&mut part, 1, 0, "root");
+        push_part(&mut part, 10, 1, "left");
+        push_part(&mut part, 2, 10, "left-child");
+        push_part(&mut part, 20, 1, "right");
+        let asset = decode(&make(Some(part), empty_vox(), None, None)).unwrap();
+        assert_eq!(
+            asset.parts.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [1, 10, 2, 20]
+        );
+        let authored_order = decode(&make(
+            Some(parts_nonmonotonic_deep()),
+            empty_vox(),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            authored_order
+                .parts
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            [1, 3, 9, 2]
+        );
+    }
+    #[test]
+    fn truncated_declared_counts_and_compressed_meta_hash_reject_before_decode() {
+        let mut huge_runs = vec![0];
+        u32v(&mut huge_runs, MAX_RUNS as u32);
+        assert!(decode(&make(None, huge_runs, None, None)).is_err());
+
+        let mut compressed_meta = make(None, empty_vox(), None, None);
+        compress_chunk(&mut compressed_meta, b"META");
+        assert!(
+            decode(&compressed_meta)
+                .unwrap_err()
+                .to_string()
+                .contains("raw codec")
+        );
+
+        let mut compressed_hash = make(None, empty_vox(), None, None);
+        compress_chunk(&mut compressed_hash, b"HASH");
+        assert!(
+            decode(&compressed_hash)
+                .unwrap_err()
+                .to_string()
+                .contains("raw codec")
+        );
+        for kind in ["tracks", "keys", "events"] {
+            let malformed = make(None, empty_vox(), Some(truncated_anim_count(kind)), None);
+            assert!(decode(&malformed).is_err(), "{kind} count must preflight");
+        }
+    }
+    #[test]
+    fn minor_zero_part_uses_legacy_record_without_profile_slot() {
+        let mut part = parts_root();
+        part.truncate(part.len() - 2);
+        let mut bytes = make(Some(part), empty_vox(), None, None);
+        bytes[6] = 0;
+        let asset = decode(&bytes).unwrap();
+        assert_eq!(asset.parts[0].structural_profile_slot, 0);
+    }
+    #[test]
+    fn mutated_public_asset_returns_sampling_error_without_panicking() {
+        let mut asset = decode(&make(
+            Some(parts_root()),
+            empty_vox(),
+            Some(anim_two_keys([0, 0, 0, 32767], [0, 0, 0, 32767])),
+            None,
+        ))
+        .unwrap();
+        asset.clips[0].tracks[0].part_id = 99;
+        assert!(sample_clip(&asset, "turn", 1.0).is_err());
     }
     #[test]
     fn pingpong_keeps_both_endpoints() {
