@@ -480,6 +480,10 @@ struct InteractiveApp {
     admin_menu_open: bool,
     fly_eye: Option<Vec3>,
     last_fly_update: Option<Instant>,
+    /// Leaving flight: when the teleport went out and the feet it asked for.
+    /// The camera holds where it is until the predicted player arrives there,
+    /// so the view never shows the body at its old spot.
+    landing: Option<(Instant, [f64; 3])>,
     /// Hammer state: the button is down / a click has not been sent yet / when
     /// the last swing went out / the radius in cells (mouse wheel).
     hammer_held: bool,
@@ -1470,6 +1474,7 @@ impl InteractiveApp {
             admin_menu_open: false,
             fly_eye: None,
             last_fly_update: None,
+            landing: None,
             hammer_held: false,
             hammer_pending: false,
             torch_pending: false,
@@ -1641,6 +1646,27 @@ impl InteractiveApp {
     }
 
     fn toggle_flight(&mut self) {
+        if let Some(eye) = self.fly_eye {
+            // Land: the body is brought to the camera, not the camera to the
+            // body. The camera stays put until the server's answer reaches
+            // the predicted player.
+            if self.landing.is_some() {
+                return;
+            }
+            let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
+            let feet = [
+                f64::from(eye.x),
+                f64::from(eye.y) - eye_height_m,
+                f64::from(eye.z),
+            ];
+            self.session
+                .push_admin(spall_protocol::AdminCommand::TeleportSelf {
+                    feet_mm: feet.map(|m| (m * 1000.0).round() as i64),
+                });
+            self.landing = Some((Instant::now(), feet));
+            self.publish_movement();
+            return;
+        }
         if self.fly_eye.take().is_none() {
             self.fly_eye = self
                 .session
@@ -1892,6 +1918,7 @@ impl ApplicationHandler for InteractiveApp {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
+                let handler_started = now;
                 self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);
 
@@ -2025,6 +2052,17 @@ impl ApplicationHandler for InteractiveApp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
+                if renderer.vegetation_frame.is_some()
+                    && let Some(replica) =
+                        self.session.replica.get().and_then(|r| r.try_lock().ok())
+                {
+                    let generation = replica.terrain_generation();
+                    if renderer.vegetation_terrain.as_ref().map(|(g, _)| *g) != Some(generation)
+                        && let Some(volume) = replica.terrain_volume()
+                    {
+                        renderer.vegetation_terrain = Some((generation, volume.clone()));
+                    }
+                }
                 if self.sky_dirty {
                     let occupancy = self.last_sky.as_ref().filter(|_| self.sky_visibility_on);
                     // Nothing to upload yet (no rebuild has landed) keeps the
@@ -2087,6 +2125,20 @@ impl ApplicationHandler for InteractiveApp {
                         } else {
                             (Vec::new(), Vec::new())
                         };
+                        if let (Some((at, feet)), Some(v)) = (self.landing, fresh_view) {
+                            let p = v.predicted.position_m;
+                            let d2: f64 = (0..3).map(|i| (p[i] - feet[i]).powi(2)).sum();
+                            // Arrived, or the server refused: drop the camera
+                            // back onto whatever the player is.
+                            if d2 < 1.0
+                                || render_now.saturating_duration_since(at) > Duration::from_secs(2)
+                            {
+                                self.fly_eye = None;
+                                self.landing = None;
+                                self.last_fly_update = None;
+                                self.last_built_pos = None;
+                            }
+                        }
                         let cam = fresh_view.map(|v| {
                             let followed =
                                 self.camera_follow.eye(v, render_now, local_poses.is_none());
@@ -2123,7 +2175,7 @@ impl ApplicationHandler for InteractiveApp {
                                 if self.held.descend {
                                     wish.y -= 1.0;
                                 }
-                                if wish.length_squared() > 0.0 {
+                                if wish.length_squared() > 0.0 && self.landing.is_none() {
                                     let speed = if self.held.fast {
                                         FLY_FAST_SPEED_M_S
                                     } else {
@@ -2255,6 +2307,20 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 };
                 self.hud.record_frame(&timing);
+                if frame_trace() {
+                    let total = handler_started.elapsed().as_secs_f32() * 1000.0;
+                    if total > 20.0 {
+                        eprintln!(
+                            "spall-frame-trace: t={:.1} handler {total:.1} ms = render {:.1} (acquire {:.1}, submit {:.1}, present {:.1}) + other {:.1}",
+                            spall_render::trace_clock_ms(),
+                            timing.total_ms,
+                            timing.acquire_ms,
+                            timing.submit_ms,
+                            timing.present_ms,
+                            total - timing.total_ms
+                        );
+                    }
+                }
                 if menu_actions.toggle_flight {
                     self.toggle_flight();
                 }
@@ -2296,6 +2362,7 @@ impl ApplicationHandler for InteractiveApp {
                     self.last_body_draws.clear();
                     if self.fly_eye.is_some() {
                         self.fly_eye = None;
+                        self.landing = None;
                         self.last_fly_update = None;
                     }
                 }
@@ -4053,7 +4120,7 @@ fn admin_menu_panel(
                     muted(
                         13.0,
                         if view.flying {
-                            "Flying: spectator camera, no collision. Your player waits where you left it."
+                            "Flying: spectator camera, no collision. Landing brings your player to the camera."
                         } else {
                             "Walking: server-authoritative character physics."
                         },
@@ -4384,7 +4451,68 @@ type VegetationRequest = (
     Arc<spall_ecology::living::VisualFrame>,
     [f32; 3],
     std::collections::HashSet<BrickCoord>,
+    Option<Volume>,
 );
+
+/// The open cell above the soil in column `(x, z)` and the soil's material,
+/// found by walking from the last column's surface (`hint`): neighbouring
+/// columns differ by a few cells, so the walk is short. `None` where the
+/// terrain is not resident or its mesh is not built yet, so cover never
+/// stands in the air waiting for the ground it grows on.
+fn cover_surface(
+    volume: &Volume,
+    ready: &std::collections::HashSet<BrickCoord>,
+    x: i64,
+    z: i64,
+    hint: &mut i64,
+) -> Option<(i64, u16)> {
+    let mut y = *hint;
+    for _ in 0..48 {
+        match volume.sample(GlobalCell::new(x, y, z)).ok()? {
+            Sample::Unknown(_) => return None,
+            Sample::Filled(_) => y += 1,
+            Sample::Empty { .. } => match volume.sample(GlobalCell::new(x, y - 1, z)).ok()? {
+                Sample::Filled(m) => {
+                    if !ready.contains(&GlobalCell::new(x, y - 1, z).split().0) {
+                        return None;
+                    }
+                    *hint = y;
+                    return Some((y, m.0));
+                }
+                Sample::Empty { .. } => y -= 1,
+                Sample::Unknown(_) => return None,
+            },
+        }
+    }
+    None
+}
+
+/// What a cover rebuild depends on; while it is unchanged the last result
+/// stands, so the once-a-second vegetation frame does not redo the carpet.
+/// Set `SPALL_FRAME_TRACE=1` to log frames whose handler took over 20 ms and where.
+fn frame_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPALL_FRAME_TRACE").is_some())
+}
+
+/// Set `SPALL_VEGETATION_TRACE=1` to log each foliage rebuild and upload.
+fn vegetation_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPALL_VEGETATION_TRACE").is_some())
+}
+
+type CoverKey = (i64, i64, u8, u64, usize, u64, usize, u64);
+
+/// How long the client holds back cover in a column whose surface changed
+/// before the server's record of the destroyed cover reaches it, seconds. The
+/// hole is seen at once but the record rides the next once-a-second frame; if
+/// the server never records it (the edit did not reach the topsoil) the new
+/// surface is simply adopted after this.
+const COVER_PENDING_S: f32 = 3.0;
+
+/// The surface each column had when cover was last drawn on it, and since when
+/// it has differed (see [`COVER_PENDING_S`]).
+type SeenSurfaces = std::collections::HashMap<(i64, i64), (i64, Option<Instant>)>;
 /// Soft foliage waits for the same solid geometry that supports it. Network
 /// vegetation can arrive before the progressive terrain/trunk mesh batches.
 fn foliage_support_ready(
@@ -4415,7 +4543,15 @@ impl VegetationWorker {
         std::thread::Builder::new()
             .name("spall-client-foliage".into())
             .spawn(move || {
-                for (id, frame, eye, ready) in requests {
+                let mut grid: Option<(
+                    spall_ecology::cover::CoverField,
+                    spall_ecology::cover::CoverGrid,
+                )> = None;
+                let mut cover_cache: Option<(CoverKey, Vec<spall_ecology::living::SoftPart>)> =
+                    None;
+                let mut seen: SeenSurfaces = SeenSurfaces::new();
+                for (id, frame, eye, ready, terrain) in requests {
+                    let job_started = Instant::now();
                     // Leaves draw as far as the terrain and trunks do, so a tree
                     // never stands bare at a distance and then sprouts as you near.
                     let foliage_radius_m = view_radius_m();
@@ -4424,9 +4560,99 @@ impl VegetationWorker {
                         let tree = frame.species.iter().any(|s| s.id == p.species && s.tree);
                         foliage_support_ready(p, tree, &ready)
                     });
-                    let instances = frame
+                    // The ground cover: its own budget, thinning with distance,
+                    // computed from the climate raster and the terrain here.
+                    let mut cover_parts = Vec::new();
+                    if let Some(volume) = terrain.as_ref().filter(|_| {
+                        !frame.cover.is_empty() && std::env::var_os("SPALL_NO_COVER").is_none()
+                    }) {
+                        if grid.as_ref().map(|(f, _)| f) != Some(&frame.field) {
+                            grid = frame.field.expand().ok().map(|g| (frame.field.clone(), g));
+                        }
+                        if let Some((_, grid)) = &grid {
+                            let key: CoverKey = (
+                                (eye[0] / 2.0).floor() as i64,
+                                (eye[2] / 2.0).floor() as i64,
+                                frame.season as u8,
+                                volume.state_stamp(),
+                                ready.len(),
+                                frame.seed,
+                                frame.cleared.len(),
+                                frame.time_ms / 10_000,
+                            );
+                            match &cover_cache {
+                                Some((k, parts)) if *k == key => cover_parts = parts.clone(),
+                                _ => {
+                                    let mut hint = (eye[1] / 0.25).floor() as i64;
+                                    let memory = spall_ecology::cover::CoverMemory::new(
+                                        &frame.cleared,
+                                        (frame.time_ms / 1000).min(u64::from(u32::MAX)) as u32,
+                                    );
+                                    if seen.len() > 400_000 {
+                                        seen.clear();
+                                    }
+                                    let mut surface = |x: i64, z: i64| {
+                                        let found = cover_surface(volume, &ready, x, z, &mut hint)?;
+                                        match seen.get_mut(&(x, z)) {
+                                            None => {
+                                                seen.insert((x, z), (found.0, None));
+                                            }
+                                            Some((y, since)) if *y == found.0 => *since = None,
+                                            // The server has the column on record: it
+                                            // owns the regrowth, adopt the new ground.
+                                            Some((y, since)) if memory.is_recorded(x, z) => {
+                                                *y = found.0;
+                                                *since = None;
+                                            }
+                                            Some((y, since)) => {
+                                                let from = *since.get_or_insert_with(Instant::now);
+                                                if from.elapsed().as_secs_f32() < COVER_PENDING_S {
+                                                    return None;
+                                                }
+                                                *y = found.0;
+                                                *since = None;
+                                            }
+                                        }
+                                        Some(found)
+                                    };
+                                    cover_parts = spall_ecology::cover::cover_parts(
+                                        grid,
+                                        &frame.cover,
+                                        frame.seed,
+                                        frame.season,
+                                        eye,
+                                        foliage_radius_m,
+                                        &mut surface,
+                                        &memory,
+                                        spall_ecology::cover::INSTANCE_BUDGET,
+                                    );
+                                    cover_cache = Some((key, cover_parts.clone()));
+                                }
+                            }
+                        }
+                    }
+                    // Leaves are drawn on the same quarter-cell grid as the wood
+                    // they grow from: a leaf cube in a cell that holds wood (or any
+                    // solid) would share its faces with it and flicker, so it is
+                    // left out and the wood shows.
+                    let crown: Vec<_> = frame
                         .parts(eye, foliage_radius_m)
                         .into_iter()
+                        .filter(|p| {
+                            let leaf = p.size == [0.25; 3] && p.yaw == 0. && p.lean == 0.;
+                            !leaf
+                                || terrain.as_ref().is_none_or(|volume| {
+                                    let at = p.center.map(|c| (c / 0.25).floor() as i64);
+                                    !matches!(
+                                        volume.sample(GlobalCell::new(at[0], at[1], at[2])),
+                                        Ok(Sample::Filled(_))
+                                    )
+                                })
+                        })
+                        .collect();
+                    let instances = crown
+                        .into_iter()
+                        .chain(cover_parts)
                         .map(|p| {
                             Instance::new(
                                 p.center,
@@ -4439,6 +4665,13 @@ impl VegetationWorker {
                         })
                         .collect();
                     let compact = spall_render::compact_vegetation_instances(instances);
+                    if vegetation_trace() {
+                        eprintln!(
+                            "spall-vegetation-trace: job {id} built {} instances in {:.1} ms",
+                            compact.len(),
+                            job_started.elapsed().as_secs_f32() * 1000.0
+                        );
+                    }
                     if results.send((id, compact)).is_err() {
                         return;
                     }
@@ -4462,6 +4695,9 @@ pub(super) struct WorldRenderer {
     /// buffers.
     scene: GameRenderer,
     vegetation_frame: Option<Arc<spall_ecology::living::VisualFrame>>,
+    /// A cheap clone of the replica's terrain, for the cover worker to read
+    /// surfaces from, with the replica generation it was taken at.
+    vegetation_terrain: Option<(u64, Volume)>,
     vegetation_key: Option<VegetationKey>,
     vegetation_worker: VegetationWorker,
     vegetation_job: Option<u64>,
@@ -4859,6 +5095,7 @@ impl WorldRenderer {
             surface_config,
             scene,
             vegetation_frame: None,
+            vegetation_terrain: None,
             vegetation_key: None,
             vegetation_worker: VegetationWorker::spawn(vegetation_material)?,
             vegetation_job: None,
@@ -5162,8 +5399,16 @@ impl WorldRenderer {
         while let Ok((id, instances)) = self.vegetation_worker.rx.try_recv() {
             if self.vegetation_job == Some(id) {
                 self.vegetation_job = None;
+                let upload_started = Instant::now();
                 self.scene
                     .set_vegetation(&self.device, &self.queue, &instances);
+                if vegetation_trace() {
+                    eprintln!(
+                        "spall-vegetation-trace: upload of {} instances took {:.2} ms",
+                        instances.len(),
+                        upload_started.elapsed().as_secs_f32() * 1000.0
+                    );
+                }
             }
         }
         if let Some((eye, _)) = cam {
@@ -5174,7 +5419,10 @@ impl WorldRenderer {
                     (eye.z / 4.).floor() as i64,
                     self.scene.terrain_geometry_generation(),
                 );
-                if self.vegetation_job.is_none() && self.vegetation_key != Some(key) {
+                if self.vegetation_job.is_none()
+                    && self.vegetation_key != Some(key)
+                    && std::env::var_os("SPALL_NO_FOLIAGE").is_none()
+                {
                     self.vegetation_seq = self.vegetation_seq.wrapping_add(1);
                     let id = self.vegetation_seq;
                     if self
@@ -5185,6 +5433,7 @@ impl WorldRenderer {
                             frame.clone(),
                             eye.to_array(),
                             self.scene.terrain_mesh_coords().collect(),
+                            self.vegetation_terrain.as_ref().map(|(_, v)| v.clone()),
                         ))
                         .is_ok()
                     {

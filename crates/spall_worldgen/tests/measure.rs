@@ -24,10 +24,10 @@ fn measure_showcase() {
     let m = w.terrain.memory_report();
     println!("{m:?} bricks {}", w.terrain.resident_brick_count());
     println!(
-        "water cells {} bounds {:?} domain {}",
-        w.water.cells.len(),
+        "water cells {} bounds {:?} wet regions {}",
+        w.water.cell_count(),
         w.water.bounds,
-        w.water.domain_cells()
+        w.water.wet_regions()
     );
     println!("mouths {:?} spawns {:?}", w.cave_mouths, w.spawns);
     for (x, z) in &w.cave_mouths {

@@ -948,6 +948,11 @@ impl Simulation {
         self.world.set_player_input(entity, input, seq)
     }
 
+    /// Moves a player to `feet_m` at rest (see `SimWorld::teleport_player`).
+    pub fn teleport_player(&mut self, entity: EntityId, feet_m: [f64; 3]) -> bool {
+        self.world.teleport_player(entity, feet_m, 1.0 / 60.0)
+    }
+
     /// The authoritative kinematic state of a player, if it exists.
     pub fn player_state(&self, entity: EntityId) -> Option<CharacterState> {
         self.world.player(entity).map(|p| p.state)

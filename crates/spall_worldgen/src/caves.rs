@@ -119,6 +119,10 @@ impl CaveField {
         // even in small arenas where the tunnel is short.
         let drop = (length * 0.45).max(CHAMBER_RADIUS + 10.0);
         let mut mouths = Vec::new();
+        if columns.is_gallery() {
+            // Flat pads for looking at plants: no cave mouths on them.
+            return Self { seed, mouths };
+        }
         // Candidate sites on a hashed walk; keep those on dry land away from
         // the swamp basin and with room to descend and stay inside the arena.
         let mut attempt = 0u64;

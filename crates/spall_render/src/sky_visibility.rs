@@ -100,8 +100,18 @@ struct SkyGlobals {
 const SKY_REGION_OFFSET: u64 = 32;
 const BOUNCE_REGION_OFFSET: u64 = 96;
 
-/// Cells (z) per time slice, so a sliced sweep takes `128 / 16 = 8` frames.
-pub const SLICE_DEPTH: u32 = 16;
+/// Frames a sliced sweep takes before the GPU's speed is known. Slice `k`
+/// recomputes every `slices`-th z layer starting at layer `k`, so each slice is
+/// a thin sample of the whole cache. (Contiguous blocks of layers cost wildly
+/// different amounts, 4 ms for one and 20 ms for the next where the ground and
+/// trees are dense, which made a few frames of every sweep hitch.)
+pub const SLICE_COUNT: u32 = 32;
+/// The most GPU time one slice should take, milliseconds. A sweep is split into
+/// as many slices (16 to 128) as this takes, from the cost of recent slices, so
+/// a slower GPU takes more frames over a sweep instead of dropping frames.
+pub const TARGET_SLICE_MS: f64 = 4.0;
+const MIN_SLICES: u32 = 32;
+const MAX_SLICES: u32 = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -115,9 +125,46 @@ struct BounceGlobals {
     ground_color: [f32; 4],
     /// `x..y` half-open z range a dispatch may write.
     region: [u32; 4],
+    /// A scrolled sweep: how far the origin moved (cells) and the margin.
+    scroll: [i32; 4],
+}
+
+/// How far (cells) around what a scroll brought into the cache, and around the
+/// old cache's edge, the bounce is lit again: the old edge cells were lit with
+/// rays that ended at the edge.
+const SCROLL_MARGIN_CELLS: i32 = 8;
+
+/// Byte offset of `scroll` in [`BounceGlobals`].
+const BOUNCE_SCROLL_OFFSET: u64 = 112;
+
+/// The whole-cell move between two cache origins, or `None` if it is not a
+/// plain move (not on the grid) or so large that little would be kept.
+fn scroll_shift(old: Vec3, new: Vec3) -> Option<[i32; 3]> {
+    let cells = (new - old) / LIGHT_CELL_SIZE_METRES;
+    let rounded = cells.round();
+    if (cells - rounded).abs().max_element() > 1.0e-3 {
+        return None;
+    }
+    let shift = [rounded.x as i32, rounded.y as i32, rounded.z as i32];
+    (shift != [0; 3] && scroll_work_fraction(shift) < 0.75).then_some(shift)
+}
+
+/// The share of the cache a scroll by `shift` cells lights again.
+fn scroll_work_fraction(shift: [i32; 3]) -> f64 {
+    let dim = LIGHT_VOLUME_DIM as i32;
+    let kept: f64 = shift
+        .iter()
+        .map(|&s| {
+            let margin = if s != 0 { 2 * SCROLL_MARGIN_CELLS } else { 0 };
+            f64::from((dim - margin - s.abs()).max(0)) / f64::from(dim)
+        })
+        .product();
+    1.0 - kept
 }
 
 pub(crate) struct SkyPipeline {
+    scroll: wgpu::ComputePipeline,
+    scroll_layout: wgpu::BindGroupLayout,
     compute: wgpu::ComputePipeline,
     compute_layout: wgpu::BindGroupLayout,
     bounce: wgpu::ComputePipeline,
@@ -197,6 +244,14 @@ impl SkyPipeline {
                 uniform_entry(5, wgpu::ShaderStages::COMPUTE), // emitter block
             ],
         });
+        let scroll_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("spall-scroll-compute-layout"),
+            entries: &[
+                storage_entry(0, true, wgpu::ShaderStages::COMPUTE),
+                storage_entry(1, false, wgpu::ShaderStages::COMPUTE),
+                uniform_entry(2, wgpu::ShaderStages::COMPUTE),
+            ],
+        });
         let emit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("spall-emitter-compute-layout"),
             entries: &[
@@ -249,6 +304,12 @@ impl SkyPipeline {
             &bounce_layout,
             "bounce_main",
         );
+        let scroll = make(
+            "spall-bounce-scroll-pipeline",
+            include_str!("shaders/scroll.wgsl").to_owned(),
+            &scroll_layout,
+            "scroll_main",
+        );
         let emitter_source = [constants.as_str(), include_str!("shaders/emitters.wgsl")].concat();
         let emit_gather = make(
             "spall-emitter-gather-pipeline",
@@ -269,6 +330,8 @@ impl SkyPipeline {
             "finish_main",
         );
         Self {
+            scroll,
+            scroll_layout,
             compute,
             compute_layout,
             bounce,
@@ -340,6 +403,20 @@ impl SkyPipeline {
                 entry(4, globals),
                 entry(5, &emitters.uniform),
             ],
+        })
+    }
+
+    fn scroll_bind(
+        &self,
+        device: &wgpu::Device,
+        from: &wgpu::Buffer,
+        to: &wgpu::Buffer,
+        params: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spall-scroll-compute-bind"),
+            layout: &self.scroll_layout,
+            entries: &[entry(0, from), entry(1, to), entry(2, params)],
         })
     }
 
@@ -464,7 +541,19 @@ impl SkyPipeline {
             )
         };
         let ((set0, bounce0), (set1, bounce1)) = (make_set(), make_set());
+        let scroll_params = buffer(
+            "spall-scroll-params",
+            32,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
+        // Scrolling into set `t` copies from the other set.
+        let scroll_binds = [
+            self.scroll_bind(device, &set1._radiance, &set0._radiance, &scroll_params),
+            self.scroll_bind(device, &set0._radiance, &set1._radiance, &scroll_params),
+        ];
         SkyVisibility {
+            scroll_params,
+            scroll_binds,
             cells,
             globals,
             display_globals,
@@ -492,6 +581,10 @@ impl SkyPipeline {
                 recentres_completed: 0,
                 frames_in_sweep: 0,
                 last_sweep_frames: 0,
+                layer_ms: None,
+                recent_layer_ms: Vec::new(),
+                scroll: [0; 4],
+                work_fraction: 1.0,
                 change_since: None,
                 sweep_change_since: None,
                 last_latency_ms: None,
@@ -527,6 +620,11 @@ struct Pending {
 struct Running {
     /// The next z slice to process (unused when `full`).
     next_slice: u32,
+    /// How many slices this sweep is divided into.
+    slices: u32,
+    /// A re-centre that moved the origin by this many cells: the bounce of the
+    /// cells still inside the cache is carried over, not recomputed.
+    scroll: Option<[i32; 3]>,
     full: bool,
     sky: bool,
     bounce: bool,
@@ -567,6 +665,16 @@ struct State {
     recentres_completed: u64,
     frames_in_sweep: u32,
     last_sweep_frames: u32,
+    /// GPU milliseconds one z layer of a sweep costs (sky plus bounce): the
+    /// median of the last few timed slices (the first slice of a sweep also
+    /// gathers emitters and would skew a mean), `None` until one is timed.
+    layer_ms: Option<f64>,
+    recent_layer_ms: Vec<f64>,
+    /// The scroll the bounce globals currently hold (`w` 0: none).
+    scroll: [i32; 4],
+    /// The share of the cache the last dispatched bounce slice lit (1 for a
+    /// plain sweep), to turn a timed slice into a cost per layer of a full one.
+    work_fraction: f64,
     /// When the oldest not-yet-lit change arrived (CPU clock).
     change_since: Option<Instant>,
     /// The change time the running sweep is lighting.
@@ -575,6 +683,22 @@ struct State {
     /// being recorded (CPU clock; excludes the GPU finishing that frame and
     /// presentation).
     last_latency_ms: Option<f64>,
+}
+
+/// How many slices a sweep is cut into, given what one layer costs: enough that
+/// a slice stays near [`TARGET_SLICE_MS`], a power of two between
+/// [`MIN_SLICES`] and [`MAX_SLICES`]. Before any slice has been timed (or with
+/// no timestamp queries) it is [`SLICE_COUNT`].
+fn slices_for(layer_ms: Option<f64>, work_fraction: f64) -> u32 {
+    let Some(layer_ms) = layer_ms.filter(|ms| ms.is_finite() && *ms > 0.0) else {
+        return SLICE_COUNT;
+    };
+    // A scrolled sweep lights only a share of the cache, so it needs fewer
+    // slices (down to 8) for the same cost per slice.
+    let floor = if work_fraction < 0.5 { 8 } else { MIN_SLICES };
+    let wanted =
+        (layer_ms * work_fraction * f64::from(LIGHT_VOLUME_DIM) / TARGET_SLICE_MS).ceil() as u32;
+    wanted.next_power_of_two().clamp(floor, MAX_SLICES)
 }
 
 fn bounce_environment_changed(previous: Environment, current: Environment) -> bool {
@@ -631,6 +755,10 @@ impl State {
 /// re-centring costs the same 1/8 per frame instead of one whole-cache hitch,
 /// and shading keeps the old, consistent cache until the new one is ready.
 pub struct SkyVisibility {
+    /// Uniform for the scroll copy: the shift and the cache size.
+    scroll_params: wgpu::Buffer,
+    /// The scroll copy's bind group per destination set.
+    scroll_binds: [wgpu::BindGroup; 2],
     cells: wgpu::Buffer,
     /// Compute-pass globals: the origin being computed for, and the slice region.
     globals: wgpu::Buffer,
@@ -760,6 +888,7 @@ impl SkyVisibility {
             sky_color: [kr, kg, kb, 0.0],
             ground_color: [gr, gg, gb, 0.0],
             region: [0, LIGHT_VOLUME_DIM, 0, 0],
+            scroll: state.scroll,
         };
         queue.write_buffer(&self.bounce_globals, 0, bytemuck::bytes_of(&globals));
     }
@@ -885,8 +1014,13 @@ impl SkyVisibility {
             return;
         }
         state.bounce_environment = Some(*environment);
+        // Sliced like an occupancy change, not done in one frame: the sun moves
+        // past the 2 degree threshold every few seconds, and relighting the
+        // whole volume at once cost 20-40 ms of GPU time in a single frame (a
+        // visible hitch on a mid-range card). Spread over the sweep's frames
+        // the same work is a few milliseconds each, and a sun that has moved
+        // two degrees is not a change the eye can catch mid-sweep.
         state.pending.bounce_only = true;
-        state.pending.full = true;
         state.note_change();
     }
 
@@ -960,7 +1094,7 @@ impl SkyVisibility {
     }
 
     /// Frames the most recent completed sweep took from start to finish (1 for
-    /// a full-cache dispatch, `128 / SLICE_DEPTH` for a sliced one). Add the
+    /// a full-cache dispatch, `SLICE_COUNT` for a sliced one). Add the
     /// frames a change waited for a running sweep to finish for the worst case.
     pub fn last_sweep_frames(&self) -> u32 {
         self.state
@@ -977,6 +1111,27 @@ impl SkyVisibility {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .last_latency_ms
+    }
+
+    /// Tells the sweep how long the last timed slice took on the GPU (sky plus
+    /// bounce, milliseconds), so the next sweep is cut into slices that keep a
+    /// frame's share of the work near [`TARGET_SLICE_MS`].
+    pub fn note_slice_cost(&self, ms: f64) {
+        if !ms.is_finite() || ms <= 0.0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let slices = state.running.map_or(SLICE_COUNT, |run| run.slices).max(1);
+        // Per layer of a full sweep: a scrolled slice only lit a share of its cells.
+        let per_layer =
+            ms / (f64::from(LIGHT_VOLUME_DIM) / f64::from(slices)) / state.work_fraction.max(0.05);
+        state.recent_layer_ms.push(per_layer);
+        if state.recent_layer_ms.len() > 12 {
+            state.recent_layer_ms.remove(0);
+        }
+        let mut sorted = state.recent_layer_ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        state.layer_ms = Some(sorted[sorted.len() / 2]);
     }
 
     /// Whether a sweep is running or queued.
@@ -1032,9 +1187,24 @@ impl SkyVisibility {
                     return (false, false);
                 };
                 state.pending.recentre = false;
+                let upload_started = std::time::Instant::now();
                 self.apply_grid(queue, &mut state, &grid);
+                if crate::sweep_trace() {
+                    eprintln!(
+                        "spall-sweep-trace: t={:.1} recentre grid applied in {:.2} ms",
+                        crate::trace_clock_ms(),
+                        upload_started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                // The front set holds the cache as it was at `display_origin`; what
+                // is still inside the new cache is carried over (see `scroll.wgsl`).
+                let scroll = scroll_shift(state.display_origin, state.origin)
+                    .filter(|_| state.populated && can_bounce);
+                let fraction = scroll.map_or(1.0, scroll_work_fraction);
                 state.running = Some(Running {
                     next_slice: 0,
+                    slices: slices_for(state.layer_ms, fraction),
+                    scroll,
                     full: false,
                     sky: true,
                     bounce: can_bounce,
@@ -1055,6 +1225,8 @@ impl SkyVisibility {
                 }
                 state.running = Some(Running {
                     next_slice: 0,
+                    slices: slices_for(state.layer_ms, 1.0),
+                    scroll: None,
                     full: p.full,
                     sky,
                     bounce,
@@ -1070,27 +1242,55 @@ impl SkyVisibility {
         };
         let front = self.front.load(Ordering::Acquire);
         let target = if run.recentre { 1 - front } else { front };
-        let (z0, z1, finished) = if run.full {
-            (0, LIGHT_VOLUME_DIM, true)
+        // A sweep is a few steps. Step 0 runs the sky pass over the whole cache
+        // (about 5 ms for all of it), because the bounce reads the sky
+        // visibility of cells in other layers and must see it finished. Then the
+        // emitter gather (one frame), then the bounce, the expensive part (some
+        // 170 ms for the whole cache), cut into `slices` thin interleaved slices
+        // of a few milliseconds each. A full request does all of it now.
+        let bounce_on = run.bounce && can_bounce;
+        let sky_step = run.sky && (run.full || run.next_slice == 0);
+        let gather_step = bounce_on && (run.full || run.next_slice == u32::from(run.sky));
+        let prelude = u32::from(run.sky) + u32::from(bounce_on);
+        let bounce_step = bounce_on && (run.full || run.next_slice >= prelude);
+        let steps = if bounce_on {
+            prelude + run.slices
         } else {
-            let z0 = run.next_slice * SLICE_DEPTH;
+            prelude.max(1)
+        };
+        let slice = run.next_slice.saturating_sub(prelude);
+        let (bounce_region, finished) = if run.full {
+            ([0, LIGHT_VOLUME_DIM, 0, 0], true)
+        } else {
             (
-                z0,
-                (z0 + SLICE_DEPTH).min(LIGHT_VOLUME_DIM),
-                z0 + SLICE_DEPTH >= LIGHT_VOLUME_DIM,
+                [0, LIGHT_VOLUME_DIM, run.slices, slice],
+                run.next_slice + 1 >= steps,
             )
         };
         state.frames_in_sweep += 1;
-        let region = [z0, z1, 0, 0];
-        // The shader skips cells outside `region`, so the dispatch always
-        // covers the cache; the skipped threads exit immediately.
+        if crate::sweep_trace() {
+            eprintln!(
+                "spall-sweep-trace: t={:.1} step {} of {steps} (slices {}) sky={sky_step} gather={gather_step} bounce={bounce_step} recentre={} full={} finished={finished}",
+                crate::trace_clock_ms(),
+                run.next_slice,
+                run.slices,
+                run.recentre,
+                run.full
+            );
+        }
         let groups = LIGHT_VOLUME_DIM / 4;
+        // A bounce slice dispatches only its own layers (4 per workgroup in z).
+        let slice_groups_z = if run.full {
+            groups
+        } else {
+            (LIGHT_VOLUME_DIM / run.slices).div_ceil(4)
+        };
         let (mut sky_ran, mut bounce_ran) = (false, false);
-        if run.sky {
+        if sky_step {
             queue.write_buffer(
                 &self.globals,
                 SKY_REGION_OFFSET,
-                bytemuck::cast_slice(&region),
+                bytemuck::cast_slice(&[0u32, LIGHT_VOLUME_DIM, 0, 0]),
             );
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("spall-sky-visibility-pass"),
@@ -1101,35 +1301,48 @@ impl SkyVisibility {
             pass.dispatch_workgroups(groups, groups, groups);
             sky_ran = true;
         }
-        if run.bounce && can_bounce {
-            // Gather emissive cells into the emitter list this slice reads. It
-            // is rebuilt for every slice (a few thousandths of a millisecond of
-            // bin arithmetic) so it always matches the occupancy and material
-            // table the slice sees, including edits and moving bodies.
+        if gather_step {
+            // A re-centre that scrolls carries the old bounce over first (and the
+            // bounce globals say which cells to light again); any other sweep
+            // clears the scroll.
+            let scroll = run.scroll.filter(|_| run.recentre && !run.full);
+            state.scroll = scroll.map_or([0; 4], |s| [s[0], s[1], s[2], SCROLL_MARGIN_CELLS]);
+            queue.write_buffer(
+                &self.bounce_globals,
+                BOUNCE_SCROLL_OFFSET,
+                bytemuck::cast_slice(&state.scroll),
+            );
+            if let Some(shift) = scroll {
+                let params: [i32; 8] = [
+                    shift[0],
+                    shift[1],
+                    shift[2],
+                    0,
+                    LIGHT_VOLUME_DIM as i32,
+                    0,
+                    0,
+                    0,
+                ];
+                queue.write_buffer(&self.scroll_params, 0, bytemuck::cast_slice(&params));
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("spall-scroll-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline.scroll);
+                pass.set_bind_group(0, &self.scroll_binds[target], &[]);
+                pass.dispatch_workgroups(groups, groups, groups);
+            }
+            state.work_fraction = scroll.map_or(1.0, scroll_work_fraction);
+            // Gather emissive cells into the emitter list the bounce slices read,
+            // once per sweep: gathering walks the whole cache. Emitters that
+            // change mid-sweep (an edit, a moving lamp) are picked up by the next
+            // sweep, which that change schedules.
             encoder.clear_buffer(&self.emitters.bins, 0, None);
-            // The bounce timing spans both passes: the emitter gather takes the
-            // begin stamp and the bounce pass the end stamp, so the reported
-            // bounce cost includes the gather.
-            let (emit_timestamps, bounce_timestamps) = match bounce_timestamps {
-                Some(ts) => (
-                    Some(wgpu::ComputePassTimestampWrites {
-                        query_set: ts.query_set,
-                        beginning_of_pass_write_index: ts.beginning_of_pass_write_index,
-                        end_of_pass_write_index: None,
-                    }),
-                    Some(wgpu::ComputePassTimestampWrites {
-                        query_set: ts.query_set,
-                        beginning_of_pass_write_index: None,
-                        end_of_pass_write_index: ts.end_of_pass_write_index,
-                    }),
-                ),
-                None => (None, None),
-            };
             {
                 let emit_bind = self.emit_bind.lock().unwrap_or_else(|e| e.into_inner());
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("spall-emitter-pass"),
-                    timestamp_writes: emit_timestamps,
+                    timestamp_writes: None,
                 });
                 pass.set_bind_group(0, &*emit_bind, &[]);
                 pass.set_pipeline(&pipeline.emit_gather);
@@ -1147,10 +1360,12 @@ impl SkyVisibility {
                 0,
                 EMITTER_BLOCK_BYTES,
             );
+        }
+        if bounce_step {
             queue.write_buffer(
                 &self.bounce_globals,
                 BOUNCE_REGION_OFFSET,
-                bytemuck::cast_slice(&region),
+                bytemuck::cast_slice(&bounce_region),
             );
             let binds = self.bounce_binds.lock().unwrap_or_else(|e| e.into_inner());
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1159,10 +1374,11 @@ impl SkyVisibility {
             });
             pass.set_pipeline(&pipeline.bounce);
             pass.set_bind_group(0, &binds[target], &[]);
-            pass.dispatch_workgroups(groups, groups, groups);
+            pass.dispatch_workgroups(groups, groups, slice_groups_z);
             bounce_ran = true;
         }
         if finished {
+            state.scroll = [0; 4];
             state.running = None;
             state.sweeps_completed += 1;
             state.last_sweep_frames = state.frames_in_sweep;

@@ -1561,6 +1561,52 @@ impl ProgressionWorker {
     }
 }
 
+/// One client's share of a vegetation keyframe.
+struct VegetationTarget {
+    session: SessionId,
+    window: Option<spall_ecology::living::Window>,
+    with_field: bool,
+}
+
+type VegetationFrames = Result<Vec<(SessionId, Arc<Vec<WireRecord>>)>, String>;
+
+/// Encodes a keyframe for each target: the whole world for a client without a
+/// window (encoded once and shared), the window's plants for the others.
+fn vegetation_frames(
+    frame: &spall_ecology::living::VisualFrame,
+    tick: u64,
+    targets: &[VegetationTarget],
+) -> VegetationFrames {
+    let records =
+        |frame: &spall_ecology::living::VisualFrame| -> Result<Arc<Vec<WireRecord>>, String> {
+            let chunks = spall_protocol::vegetation::chunks(tick, &frame.encode()?)
+                .map_err(|e| e.to_string())?;
+            Ok(Arc::new(
+                chunks
+                    .into_iter()
+                    .map(WireRecord::VegetationSnapshot)
+                    .collect(),
+            ))
+        };
+    let mut whole: Option<Arc<Vec<WireRecord>>> = None;
+    let mut out = Vec::with_capacity(targets.len());
+    for target in targets {
+        let shared = match target.window {
+            Some(window) => records(&frame.windowed(window, target.with_field))?,
+            None => match &whole {
+                Some(shared) => shared.clone(),
+                None => {
+                    let shared = records(frame)?;
+                    whole = Some(shared.clone());
+                    shared
+                }
+            },
+        };
+        out.push((target.session, shared));
+    }
+    Ok(out)
+}
+
 /// One message from the sim bridge to a client's writer task. Repair replies and
 /// baseline transfers are already routed to one client's queue, so they need no
 /// session tag here.
@@ -2824,8 +2870,13 @@ async fn serve_async(
         // The tick budget grows one tick at a time while regional clients drain (see
         // `ServeConfig::drain_timeout`); `iteration` counts ticks of this loop.
         let mut tick_budget = max_ticks;
-        let mut vegetation_job: Option<std::sync::mpsc::Receiver<Result<Vec<WireRecord>, String>>> =
-            None;
+        let mut vegetation_job: Option<std::sync::mpsc::Receiver<VegetationFrames>> = None;
+        // Keyframes built so far, and the sessions that have been sent the climate raster
+        // (it never changes, so a client keeps the last one; it is repeated every tenth
+        // keyframe in case a droppable frame carrying it was lost).
+        let mut vegetation_keyframes: u64 = 0;
+        let mut vegetation_field_sent: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
         // Phases at least this long are logged with the tick's other phases; lower it with
         // `SPALL_SLOW_PHASE_MS` to see what the tail of the tick distribution is made of.
         let slow_phase = Duration::from_millis(
@@ -3281,6 +3332,21 @@ async fn serve_async(
                             }
                         }
                     }
+                    spall_protocol::AdminCommand::TeleportSelf { feet_mm } => {
+                        let feet = feet_mm.map(|mm| mm as f64 / 1000.0);
+                        let (accepted, message) = if !admin_commands {
+                            (false, "admin commands are disabled on this server")
+                        } else if sim.teleport_player(session_player_entity(session), feet) {
+                            (true, "teleported")
+                        } else {
+                            (false, "no player to teleport")
+                        };
+                        spall_protocol::AdminStatus {
+                            request_id: req.request_id,
+                            accepted,
+                            message: message.into(),
+                        }
+                    }
                     spall_protocol::AdminCommand::SetDamGate { open } => {
                         let gate = custom_world.as_ref().and_then(CustomWorld::dam_gate);
                         if !admin_commands {
@@ -3675,23 +3741,28 @@ async fn serve_async(
             {
                 let (done_tx, done_rx) = std::sync::mpsc::channel();
                 let frame_tick = tick.get();
+                vegetation_keyframes += 1;
+                let repeat_field = vegetation_keyframes.is_multiple_of(10);
+                // Each regional client is sent the plants around its player; every other
+                // client gets the whole world.
+                let sessions: Vec<VegetationTarget> = lj
+                    .live_sessions()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|session| VegetationTarget {
+                        session,
+                        window: lj.vegetation_window(&sim, session),
+                        with_field: repeat_field || vegetation_field_sent.insert(session.raw()),
+                    })
+                    .collect();
                 match std::thread::Builder::new()
                     .name("spall-vegetation-frame".into())
                     .spawn(move || {
-                        let records = state
-                            .visual(&terrain)
-                            .encode()
-                            .and_then(|encoded| {
-                                spall_protocol::vegetation::chunks(frame_tick, &encoded)
-                                    .map_err(|e| e.to_string())
-                            })
-                            .map(|chunks| {
-                                chunks
-                                    .into_iter()
-                                    .map(WireRecord::VegetationSnapshot)
-                                    .collect::<Vec<_>>()
-                            });
-                        let _ = done_tx.send(records);
+                        let _ = done_tx.send(vegetation_frames(
+                            &state.visual(&terrain),
+                            frame_tick,
+                            &sessions,
+                        ));
                     }) {
                     Ok(_) => vegetation_job = Some(done_rx),
                     Err(e) => {
@@ -3704,14 +3775,15 @@ async fn serve_async(
             }
             if let Some(done_rx) = &vegetation_job {
                 match done_rx.try_recv() {
-                    Ok(Ok(records)) => {
+                    Ok(Ok(frames)) => {
                         vegetation_job = None;
-                        let records = Arc::new(records);
-                        for session in lj.live_sessions().collect::<Vec<_>>() {
-                            if water_backlogged(&clients_for_sim, session) {
+                        for (session, records) in frames {
+                            if !lj.is_live(session) || water_backlogged(&clients_for_sim, session) {
+                                // Not sent: it must be offered the raster again.
+                                vegetation_field_sent.remove(&session.raw());
                                 continue;
                             }
-                            send_to(&clients_for_sim, session, Outbound::Water(records.clone()));
+                            send_to(&clients_for_sim, session, Outbound::Water(records));
                         }
                     }
                     Ok(Err(e)) => {
@@ -5079,6 +5151,30 @@ impl LateJoin {
     /// still pulling a late-join baseline is excluded — it gets a motion
     /// keyframe when its catch-up barrier is reached, not the live 20 Hz feed
     /// (`docs/protocol.md` late-join step 4).
+    fn is_live(&self, session: SessionId) -> bool {
+        self.links
+            .get(&session.raw())
+            .is_some_and(|link| matches!(link.phase, Phase::Live))
+    }
+
+    /// The square of the world a regional client draws plants for: its streamed
+    /// radius (in bricks) around its player, plus room for a tree's crown.
+    /// `None` (everything) for a client that is not regional or has no player yet.
+    fn vegetation_window(
+        &self,
+        sim: &Simulation,
+        session: SessionId,
+    ) -> Option<spall_ecology::living::Window> {
+        let radius = self.links.get(&session.raw())?.region_radius?;
+        let player = sim.player_state(session_player_entity(session))?;
+        let cells = |m: f64| (m / 0.25).floor() as i64;
+        Some(spall_ecology::living::Window::around(
+            cells(player.position_m[0]),
+            cells(player.position_m[2]),
+            (radius + 2) * 32,
+        ))
+    }
+
     fn live_sessions(&self) -> impl Iterator<Item = SessionId> + '_ {
         self.links
             .values()

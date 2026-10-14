@@ -69,9 +69,15 @@ fn pack4(a: f32, b: f32, c: f32, d: f32) -> u32 {
 @compute @workgroup_size(4, 4, 4)
 fn sky_visibility_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dim = i32(globals.dimensions.x);
-    let cell = vec3<i32>(gid);
+    var cell = vec3<i32>(gid);
+    // A sweep slice dispatches only the layers it recomputes: with `region.z`
+    // slices, thread row `gid.z` is layer `region.w + gid.z * region.z`. A full
+    // dispatch (`region.z` of 0) walks every layer.
+    if globals.region.z > 1u {
+        cell.z = i32(globals.region.w + gid.z * globals.region.z);
+    }
     if !inside(cell, dim) { return; }
-    if gid.z < globals.region.x || gid.z >= globals.region.y { return; }
+    if u32(cell.z) < globals.region.x || u32(cell.z) >= globals.region.y { return; }
     let index = index_of(cell, dim);
     if cells[index] != 0u {
         // Inside geometry: nothing sees the sky from here.

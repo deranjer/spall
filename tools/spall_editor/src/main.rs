@@ -730,7 +730,12 @@ impl EditorApp {
                 return;
             }
         };
-        let preview = match worldgen_panel::generate_preview(seed, self.worldgen.size_cells) {
+        let preview = match worldgen_panel::generate_preview(
+            self.worldgen.preset,
+            seed,
+            self.worldgen.size_cells,
+            self.worldgen.layer,
+        ) {
             Ok(preview) => preview,
             Err(error) => {
                 self.worldgen.error = Some(error);
@@ -738,9 +743,37 @@ impl EditorApp {
                 return;
             }
         };
+        self.worldgen.preview = Some(preview);
+        if !self.upload_worldgen_texture() {
+            self.worldgen.preview = None;
+            return;
+        }
+        self.status = format!(
+            "Generated {} preview: seed {seed}, {} m arena",
+            worldgen_panel::preset_label(self.worldgen.preset).to_lowercase(),
+            self.worldgen.size_cells / 4
+        );
+        self.worldgen.error = None;
+    }
+
+    /// Redraws the previewed map as the chosen layer and re-uploads the texture.
+    fn show_worldgen_layer(&mut self) {
+        let layer = self.worldgen.layer;
+        if let Some(preview) = self.worldgen.preview.as_mut() {
+            preview.set_layer(layer);
+        }
+        self.upload_worldgen_texture();
+    }
+
+    /// Uploads the current preview picture; `false` (with the error shown) if
+    /// there is no GPU to show it on.
+    fn upload_worldgen_texture(&mut self) -> bool {
+        let Some(preview) = self.worldgen.preview.as_ref() else {
+            return false;
+        };
         let Some(gpu) = self.gpu.as_mut() else {
             self.worldgen.error = Some("No GPU surface to show the preview on".into());
-            return;
+            return false;
         };
         let extent = wgpu::Extent3d {
             width: preview.size_cells,
@@ -780,12 +813,7 @@ impl EditorApp {
                 ));
             }
         }
-        self.status = format!(
-            "Generated showcase preview: seed {seed}, {} m arena",
-            preview.size_cells / 4
-        );
-        self.worldgen.error = None;
-        self.worldgen.preview = Some(preview);
+        true
     }
 
     /// Plays the previewed world: `cargo xtask play --worldgen ...` builds the
@@ -801,8 +829,12 @@ impl EditorApp {
             self.worldgen.error = Some(error.clone());
             return;
         }
-        let args =
-            worldgen_panel::play_args(preview.seed, preview.size_cells, &self.worldgen.season);
+        let args = worldgen_panel::play_args(
+            preview.preset,
+            preview.seed,
+            preview.size_cells,
+            &self.worldgen.season,
+        );
         let args = self.game_launch_args(args);
         self.status = match spawn_play(&args) {
             Ok(launch) => {
@@ -1960,7 +1992,7 @@ mod viewport_tests {
     #[test]
     fn game_launch_options_preserve_world_and_scene_arguments() {
         let mut app = EditorApp::default();
-        let world = worldgen_panel::play_args(42, 1024, "winter");
+        let world = worldgen_panel::play_args(spall_worldgen::Preset::Showcase, 42, 1024, "winter");
         let scene = vec![
             "xtask".into(),
             "play".into(),

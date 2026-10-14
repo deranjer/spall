@@ -1854,6 +1854,9 @@ async fn run_async(
             // deltas have no base in the new one.
             let mut column_water_floor = 0_u64;
             let mut vegetation = spall_protocol::vegetation::VegetationAssembler::default();
+            // The climate raster rides along with only some keyframes (it never changes
+            // within a world); the last one received stands in for the rest.
+            let mut cover_field = spall_ecology::cover::CoverField::default();
             let mut column_water = spall_protocol::ColumnWaterReplica::default();
             // Diagnostic: how the control reader spends its time, by record kind.
             let mut profile = ControlProfile::with_watch(control_watch);
@@ -1879,7 +1882,12 @@ async fn run_async(
                             b.map(|bytes| spall_ecology::living::VisualFrame::decode(&bytes))
                                 .transpose()
                         }) {
-                            Ok(Some(frame)) => {
+                            Ok(Some(mut frame)) => {
+                                if frame.field.is_empty() {
+                                    frame.field = cover_field.clone();
+                                } else {
+                                    cover_field = frame.field.clone();
+                                }
                                 counters
                                     .vegetation_keyframes
                                     .fetch_add(1, Ordering::Relaxed);
@@ -2001,6 +2009,7 @@ async fn run_async(
                                 column_water_floor = begin.checkpoint_tick.get();
                                 vegetation =
                                     spall_protocol::vegetation::VegetationAssembler::default();
+                                cover_field = spall_ecology::cover::CoverField::default();
                                 let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                                 // A delta catalogue builds on what this client held before.
                                 let basis = (begin.world_version

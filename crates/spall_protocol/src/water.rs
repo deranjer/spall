@@ -33,6 +33,10 @@ pub enum AdminCommand {
     /// Opens (cuts to air) or closes (refills with stone) the scene's dam
     /// gate. A scene with no authored gate refuses.
     SetDamGate { open: bool },
+    /// Moves the sender's own player to a position, at rest, with no snap back
+    /// (a spectator camera that lands where it is). Millimetres, so the command
+    /// stays `Eq`; the server pushes the capsule out of any solid it lands in.
+    TeleportSelf { feet_mm: [i64; 3] },
 }
 
 /// `AdminRequest`: reliable operator command. The server decides whether this

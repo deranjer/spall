@@ -88,18 +88,22 @@ fn generated_terrain_only_uses_defined_materials() {
     }
 }
 
-/// The column water starts from exactly the plan's cells, all in open terrain
-/// inside the arena, and its height range covers the arena.
+/// The column water starts from exactly the plan's wet columns, all in open
+/// terrain inside the arena, and its height range covers the arena.
 #[test]
 fn water_starts_from_the_plan_inside_the_arena() {
     let scene = worldgen_scene::generate("showcase", 1, SMALL).expect("generate");
     let water = scene.column_water_setup().expect("showcase has water");
-    assert_eq!(water.initial_cells.len(), scene.world().water.cells.len());
+    assert_eq!(
+        water.initial_levels.len(),
+        scene.world().water.columns.len()
+    );
+    assert!(water.initial_cells.is_empty());
     let terrain = &scene.world().terrain;
     let (lo, hi) = scene.world().region;
-    for cell in &water.initial_cells {
+    for cell in scene.world().water.cells() {
         assert!(
-            matches!(terrain.sample(*cell), Ok(Sample::Empty { .. })),
+            matches!(terrain.sample(cell), Ok(Sample::Empty { .. })),
             "{cell:?}"
         );
         assert!(cell.x >= lo.x && cell.x <= hi.x);
@@ -158,8 +162,8 @@ fn a_player_at_a_generated_spawn_stands_on_the_ground_with_water_running() {
 #[ignore]
 fn measure_full_arena_stand_up() {
     let t = Instant::now();
-    let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
-        .expect("generate");
+    let scene =
+        worldgen_scene::generate("showcase", 1, worldgen_scene::CI_SIZE_CELLS).expect("generate");
     println!("generate + water plan: {:?}", t.elapsed());
     println!("{:?}", scene.world().terrain.memory_report());
     let spawn = scene.player_spawns()[0];
@@ -193,7 +197,7 @@ fn measure_cut_latency_on_the_full_arena() {
     use spall_sim::{EditIntent, EditTarget};
 
     for with_water in [false, true] {
-        let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
+        let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::CI_SIZE_CELLS)
             .expect("generate");
         let spawn = scene.player_spawns()[0];
         let (x, z) = (
@@ -241,6 +245,61 @@ fn measure_cut_latency_on_the_full_arena() {
                 }
             }
         }
+    }
+}
+
+/// Manual: where a 4096-cell world's memory goes, stage by stage. Several GiB:
+/// `NATURAL_SEED=5 cargo test -p sandbox --release --test worldgen_scene -- --ignored --nocapture measure_memory_by_stage`.
+#[test]
+#[ignore]
+fn measure_memory_by_stage() {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let now = || spall_server::mem_stats::process_current_bytes().map_or(0.0, gib);
+    let peak = || spall_server::mem_stats::process_peak_bytes().map_or(0.0, gib);
+    let preset = std::env::var("PRESET").unwrap_or_else(|_| "natural".into());
+    let seed: u64 = std::env::var("SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    eprintln!("mem start        now={:.2} GiB", now());
+    let scene = worldgen_scene::generate(&preset, seed, 4096).expect("generate");
+    eprintln!(
+        "mem generated    now={:.2} GiB peak={:.2} GiB  (terrain dense {:.2} GiB, vegetation organisms {})",
+        now(),
+        peak(),
+        gib(scene.world().terrain.memory_report().owned_dense_bytes as u64),
+        scene.vegetation().organisms.len()
+    );
+    let setup = scene.world_setup();
+    eprintln!(
+        "mem world_setup  now={:.2} GiB peak={:.2} GiB",
+        now(),
+        peak()
+    );
+    let mut config = SimulationConfig::new(setup);
+    if std::env::var("NOWATER").is_err() {
+        config.column_water = scene.column_water_setup().cloned();
+    }
+    eprintln!(
+        "mem water setup  now={:.2} GiB peak={:.2} GiB",
+        now(),
+        peak()
+    );
+    let sim = Simulation::new(config).expect("stands up");
+    eprintln!(
+        "mem sim up       now={:.2} GiB peak={:.2} GiB",
+        now(),
+        peak()
+    );
+    if let Some(water) = sim.column_water() {
+        let m = water.memory();
+        eprintln!(
+            "mem column water regions={} spans={} pipes={} solver_bytes={:.3} GiB",
+            m.regions,
+            m.spans,
+            m.pipes,
+            gib(m.bytes as u64)
+        );
     }
 }
 
@@ -346,7 +405,7 @@ fn generated_water_runs_as_columns_at_rest_with_no_rejected_cells() {
         .column_water_setup()
         .expect("showcase has water")
         .clone();
-    let planned = setup.initial_cells.len();
+    let planned = scene.world().water.cell_count();
     assert!(planned > 0);
     let mut config = SimulationConfig::new(scene.world_setup());
     config.column_water = Some(setup);
@@ -369,6 +428,110 @@ fn generated_water_runs_as_columns_at_rest_with_no_rejected_cells() {
         let m = report.column_water.expect("reported each tick");
         assert_eq!(m.active_regions, 0, "an idle lake costs nothing");
         assert!((m.volume_m3 - seeded).abs() < 1e-6);
+    }
+}
+
+/// The natural preset runs end to end in the sandbox: it is selectable by name,
+/// grows vegetation on its biomes, seeds every wet column into open terrain,
+/// hands the solver its springs and sinks, and the server stands up.
+#[test]
+fn the_natural_preset_generates_a_playable_world_with_springs() {
+    let scene = worldgen_scene::generate("natural", 2, 512).expect("generate");
+    let world = scene.world();
+    assert_eq!(world.version, 5);
+    assert!(!world.spawns.is_empty());
+    assert!(
+        !scene.vegetation().organisms.is_empty(),
+        "natural biomes grow plants"
+    );
+    let water = scene
+        .column_water_setup()
+        .expect("natural worlds have water");
+    assert_eq!(water.initial_levels.len(), world.water.columns.len());
+    assert_eq!(water.discharges.len(), world.water.springs.len());
+    assert!(!world.water.springs.is_empty(), "rivers start at springs");
+    for (d, s) in water.discharges.iter().zip(&world.water.springs) {
+        assert_eq!(d.cell, s.cell);
+        assert!(d.flow_cells3_s > 0.0, "a spring with no flow");
+    }
+    let mut config = SimulationConfig::new(scene.world_setup());
+    config.column_water = Some(water.clone());
+    let sim = Simulation::new(config).expect("the generated world stands up");
+    let column_water = sim.column_water().expect("server owns the column water");
+    assert_eq!(
+        column_water.seed_report().rejected_cells,
+        0,
+        "every wet column has open terrain above its bed"
+    );
+    let seeded = column_water.frame().volume_m3;
+    let planned = world.water.cell_count() as f64 * 0.25f64.powi(3);
+    // A cave that opens onto a river bed is open terrain: its span fills too.
+    assert!(
+        seeded >= planned * 0.999 && seeded <= planned * 1.1,
+        "{seeded} vs {planned}"
+    );
+}
+
+/// A world is generated without floating rock. The first edit makes the structure
+/// analysis turn every unanchored fragment of the connected world into a body, so
+/// a generator that leaves hundreds of them (cave roofs hanging off cliffs) makes
+/// the first cut anywhere a giant split. A cut inside the bedrock slab, far from
+/// the surface, splits off only a handful in either preset.
+#[test]
+fn the_first_cut_splits_off_only_a_handful_of_fragments() {
+    use spall_core::units::{BRUSH_UNIT, BrushPoint};
+    use spall_core::{SphereBrush, player_entity_for};
+    use spall_protocol::RequestId;
+    use spall_sim::{EditIntent, EditTarget};
+
+    for (preset, seed) in [
+        ("showcase", 5),
+        ("natural", 1),
+        ("natural", 5),
+        ("natural", 9),
+    ] {
+        let scene = worldgen_scene::generate(preset, seed, 512).expect("generate");
+        let spawn = scene.player_spawns()[0];
+        let mut sim = Simulation::new(SimulationConfig::new(scene.world_setup())).expect("up");
+        let player = player_entity_for(0);
+        sim.add_player(player, spawn);
+        let half = BRUSH_UNIT / 2;
+        let brush = SphereBrush::new(
+            BrushPoint::from_units(
+                256 * BRUSH_UNIT + half,
+                16 * BRUSH_UNIT + half,
+                256 * BRUSH_UNIT + half,
+            ),
+            8 * BRUSH_UNIT,
+        )
+        .unwrap();
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            player,
+            EditTarget::Terrain,
+            brush,
+        ))
+        .expect("submit");
+        let mut committed = None;
+        for _ in 0..200 {
+            let report = sim.tick().expect("tick");
+            assert!(
+                report.rejected.is_empty(),
+                "{preset} {seed}: {:?}",
+                report.rejected
+            );
+            if let Some((_, c)) = report.committed.into_iter().next() {
+                committed = Some(c);
+                break;
+            }
+        }
+        let c = committed.unwrap_or_else(|| panic!("{preset} {seed}: the cut never committed"));
+        assert!(
+            c.children.len() <= 32,
+            "{preset} {seed}: the first cut split off {} fragments",
+            c.children.len()
+        );
+        assert!(c.bulk_baseline.is_none(), "{preset} {seed}");
     }
 }
 
@@ -398,9 +561,9 @@ fn the_lake_spawn_stands_on_dry_ground_beside_the_water() {
     let water: BTreeSet<(i64, i64)> = scene
         .world()
         .water
-        .cells
+        .columns
         .iter()
-        .map(|c| (c.x, c.z))
+        .map(|c| (i64::from(c.x), i64::from(c.z)))
         .collect();
     assert!(!water.contains(&(x, z)), "the spawn is not on water");
     let near = (-12..=12).any(|d: i64| water.contains(&(x + d, z)) || water.contains(&(x, z + d)));
@@ -476,4 +639,35 @@ fn the_lake_floaters_float_or_sink_as_their_density_says() {
         "stone at {} vs surface {surface}",
         pose(5).translation_m[1]
     );
+}
+
+/// Worldgen sizes rivers with the solver's own constants, which it cannot
+/// import (it may not depend on the fluid crate): they must stay equal.
+#[test]
+fn river_sizing_uses_the_solvers_constants() {
+    use spall_sim::column_water::{COLUMN_STEP_DT_S, ColumnSolverConfig};
+    use spall_worldgen::rivers;
+    let solver = ColumnSolverConfig::default();
+    assert!((rivers::GRAVITY_CELLS_S2 - f64::from(solver.gravity)).abs() < 1e-4);
+    assert!((rivers::DAMPING_PER_S - f64::from(solver.damping_per_s)).abs() < 1e-6);
+    // A drain cell empties one cell^3 per exchange, one exchange per solver step.
+    assert!((rivers::SINK_CELL_CAPACITY_CELLS3_S - 1.0 / COLUMN_STEP_DT_S).abs() < 1e-9);
+}
+
+/// The server grows plants against the climate the world was generated from:
+/// a natural world's own columns, not the showcase's.
+#[test]
+fn vegetation_installs_against_the_worlds_own_preset() {
+    for (preset, natural) in [("natural", true), ("showcase", false)] {
+        let scene = worldgen_scene::generate(preset, 2, 256).expect("generate");
+        assert_eq!(scene.vegetation().preset, u8::from(natural), "{preset}");
+        let mut config = SimulationConfig::new(scene.world_setup());
+        config.vegetation = Some(scene.vegetation().clone());
+        let sim = Simulation::new(config).expect("stands up");
+        assert_eq!(
+            sim.vegetation_climate_is_natural(),
+            Some(natural),
+            "{preset}"
+        );
+    }
 }

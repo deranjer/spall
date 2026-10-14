@@ -406,6 +406,18 @@ change to the frozen wire record set (the sentinel reuses `BaselineAck`).
 
 The sandbox worldgen factory adds game-authored procedural vegetation after base terrain generation, before authoritative collision/world creation. CPU-only spall_ecology::living owns stable-ID plants, biome/soil eligibility, retained connected wood paths and a plant season clock. Simulation owns it; growth is acknowledged only through the normal edit pipeline. Wood remains ordinary destructible terrain/body cells. Non-solid leaf/ground geometry is derived from server keyframes and shares opaque lighting/shadows. Atomic persistence includes full state after topology plus small clock rows. No hidden supports, per-voxel entities or alternate physics. Rules, budgets and remaining global-season/moisture work: docs/reports/ENG-118-vegetation.md.
 
+### Ground cover, underwater plants and lighting scroll (ENG-189, ENG-191)
+
+Vegetation has two owners. **Living** plants (trees, reeds, ferns, flowers, underwater kelp and corals) stay `LivingState` organisms owned by simulation as above. **Ground cover** is stateless: `spall_ecology::cover::ground_cover` is a pure function of seed, cell, soil, moisture, temperature, biome, season and water depth, read from a coarse climate raster (`CoverField`) that `LivingState` carries and every `VisualFrame` repeats. No per-blade record exists, is saved or is sent. The only cover state is the destroyed-cover record (`LivingState.cleared`: column, time of destruction), which the server writes when an edit reaches topsoil and the client uses to hold back and regrow cover (bare, then small, medium, full). The client derives cover geometry on a worker thread, two-pass LOD, and never mutates terrain.
+
+The water solver may keep deep still ocean regions dormant (`ColumnConfig::lazy_ocean`): a per-column record revived with exact volume when touched. Dormant regions are an allocation detail; the replicated and saved water state is unchanged.
+
+### Sun shadow cascades are cached (renderer)
+
+Each of the four sun cascades is a light-space box around a sphere centred on the camera, sized to hold everything its slice of the view frustum can show in any direction. The box therefore depends on the camera's position and the sun alone: turning does not change it, and moving changes it only when the centre crosses a snap step of about 8% of the cascade's reach (a multiple of its texel). Each cascade keeps its terrain-only depth between frames (`shadow_static` layers) and redraws the terrain only when its box moved or the terrain meshes changed; every frame the kept depth is copied into the sampled layer and the moving casters (bodies, instanced cubes, vegetation) are drawn over it. Measured on a 4096-cell natural world (about 3,000 resident chunks, 4.4 M triangles, one development GPU): terrain draws in the cascades were 10.3 ms of a 16.4 ms frame; standing 16.4 -> 8.1 ms (61 -> 123 fps), walking a scripted loop 19.5 -> 14.1 ms (53 -> 73 fps). Resolution is about 30% coarser than the frustum-fitted cascades it replaced; far cascades redraw every few metres of travel, the nearest about every metre.
+
+The renderer's camera-local lighting cache relights in slices: sky visibility once, then the bounce in interleaved strides sized from measured GPU cost, and a camera recentre scrolls the cache and relights only the entered strip. This changes cost, not the cache contract above (derived, camera-local, never authoritative). Editor world-generation previews are drawn from the same `ColumnMap` the server builds; layers are diagnostics, not a second generator (`docs/worldgen.md`).
+
 ### ENG-122 reconstructed support diagnostic (2026-10-04)
 
 The opt-in `MacGridWorld::set_cut_surface_support` backend constructs PLIC

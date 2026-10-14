@@ -236,7 +236,232 @@ window's rebuild worker was reworked on top of that path:
   cache) remains as the reference path for measurements; the live window does
   not use it.
 
-## Editor panel (ENG-115)
+## Presets (worldgen v4, ENG-186 to ENG-191)
+
+`Preset::{Showcase, Natural, Gallery}`; each carries its own `gen_version()` and
+world height, so adding or changing one never changes another's output.
+
+| Preset | Version | Height | What it is |
+|---|---|---|---|
+| `showcase` | 3 (unchanged, digest-pinned) | 96 m (12 bricks) | the small arena above |
+| `natural` | 5 | 128 m (16 bricks) | landform, erosion, hydrology, climate, thirteen biomes |
+| `gallery` | 1 | 128 m | one pad per biome with all its plants (a showcase for looking at flora) |
+
+`cargo xtask play --worldgen natural --seed 4 --worldgen-size 2048 --release`
+(`gallery` with `--worldgen-size 1024` gives 54 m pads). The default world size is
+4096 cells (1 km). A natural or gallery world has no `GEN_VERSION` digest pin;
+tests assert invariants (below) instead.
+
+### Natural preset
+
+Everything below is derived from a 1 m coarse grid and sampled to 0.25 m cells.
+Same determinism rule as the showcase (integer hashing, `+ - * /`, `floor`,
+`sqrt`).
+
+1. `landform.rs`: seed-placed ranges, a coast on every world (one sea edge, or a
+   corner of two), tilt toward the sea, hills. **Every world has a sea**: ocean
+   and beach are biomes too. (Earlier versions rolled landlocked maps; those seeds
+   now get one sea edge.)
+2. `erosion.rs`: stream-power erosion plus thermal relaxation; large pits are
+   breached first so rivers reach the sea.
+3. `hydrology.rs`: priority-flood, D8 flow, accumulation, lakes at their spill
+   height, rivers from springs (and lake outflows), bed height that never rises
+   downstream, river heads attributed once (no double counting through lakes).
+4. `climate.rs`: temperature (latitude, lapse rate), wind and orographic rain,
+   wetness near fresh water.
+5. `columns/natural.rs`: the cell-resolution `ColumnMap` (height, biome,
+   moisture, temperature, river distance, water surface, springs, sinks) and the
+   biome table below.
+
+**Biomes** (first match wins; `t` is degrees C, `m` wetness 0-1):
+
+| Biome | Rule | Surfaces (top material) | Plant class |
+|---|---|---|---|
+| Ocean | under sea level water, more than 2 cells from a bank | sand, gravel, clay by depth | sea |
+| Riparian | fresh water (rivers and lakes) and gentle ground within 7 cells of it | gravel, clay, mud, moss, grass | wet |
+| Beach | at most 6 cells above sea, gradient < 0.5, 10+ cells from rivers | sand, gravel, sandstone | coast |
+| Snow | `t < 1` | snow, slate, stone | cold |
+| Scree | gradient >= 1.2, or >= 0.8 when `t < 6`, or cold and dry | slate, stone, gravel | rock |
+| Swamp | within 40 cells of water, `m > 0.5`, gradient < 0.25, `t > 5` | mud, clay, moss, grass | wet |
+| Alpine | `t < 4`, `m >= 0.22` | moss, gravel, dirt, grass | cold |
+| Boreal forest | `4 <= t < 9`, `m >= 0.3` | moss, dirt, mud, grass | forest |
+| Pine forest | boreal (and cool temperate) ground inside a pine-stand noise patch | dirt, moss, gravel, mud | forest |
+| Steppe | cool and dry, or warmer with `m` below 0.32 | gravel, clay, grass, dirt | dry |
+| Desert | `m < 0.16 + 0.012 (t - 9)` | sand, sandstone, gravel, clay | dry |
+| Meadow | warm, `m` 0.32-0.5 | grass, dirt, moss, gravel | grass |
+| Temperate forest | warm, `m >= 0.5` | grass, moss, dirt, mud | forest |
+
+Slopes of 1.1 or more are bare rock in every biome. Biome borders are dithered.
+
+**Every biome in every world.** After classification, `ensure_every_biome`
+paints in any biome holding under 1% of the land (and at least 64 columns): a
+ragged patch where terrain and climate suit it best, blending the biome's
+moisture and temperature into the surroundings (`ColumnMap::repaired_biomes()`
+reports what was painted). Thresholds are tuned so painting is rare: over 40
+seeds at 1024 cells Swamp was painted in 7, Alpine in 2, Snow in 2, Desert in 1,
+and nothing else (measured, `diag_biome_coverage`). Test:
+`every_world_shows_every_biome_in_a_real_share` (24 seeds at 512, 6 at 1024).
+**Three surfaces per biome**: `natural_stack` uses three patch noises plus
+wetness; `every_biome_shows_at_least_three_surfaces` checks 16 worlds.
+
+**Water.** The plan lists every wet column (`WaterPlan`: surfaces, springs,
+sinks). Rivers start as full channels at rest. Springs are discharge sources
+(`Discharge`, fixed-point 2^-16 cells^3/s, persisted in `ColumnWaterState` v4);
+sinks hold the sea and terminal lakes level. The solver is
+`spall_fluid::columns` (stacked columns with virtual pipes; see
+`docs/water-agent-handoff.md`). Measured (seed 1, 4096 cells, 30 min of fluid
+time): step p50 14-17 ms, p95 26-32 ms (budget 50 ms); wet columns off the
+planned channels plateau at about 28k (0.17% of the map) holding about 1,200 m3.
+Steady-flow sleep exists (`steady_steps`, exact ledger) and is **off**: it gave no
+measured benefit.
+Memory: `ColumnWorld::allocate` loads solid masks in batches of 256, and with
+`ColumnConfig::lazy_ocean` still deep sea (a region wholly under one flat level
+with all eight neighbours the same) is kept as a per-column record (about 8 KiB
+instead of about 200 KiB) and revived with exact volume the moment an edit,
+spring or drain, restore, or moving neighbour touches it. Measured on
+`eng187-natural-1024m-stress` (Natural seed 5, 4096): server process peak 9.07 ->
+8.40 -> **7.73 GiB** (target 8). A restore from a save allocates every saved
+region (not lazy).
+
+**Spawns** sit near water (2-20 m), falling back to any flat dry spot.
+
+### Gallery preset
+
+Thirteen pads (4x4 grid, the sea alone in the last row), each 54 m at 1024 cells:
+Meadow, Temperate forest, Boreal forest, Pine forest / Steppe, Alpine, Scree,
+Snow / Desert, Swamp, Riparian, Beach / Ocean. Each pad has its own surfaces and
+a wetness ramp from drier west to wetter east; the wet ones have water (a sea 16 m
+deep, a riparian pond 10 m deep and a shallow stream, swamp pools). No cave
+mouths. `LivingState::generate` places every species of a biome on its pad
+(trees twice, other plants four times). One spawn per dry pad.
+`cargo run --release -p sandbox --example gallery_legend` prints and writes
+`.local/gallery-legend.md`: each pad's centre in metres, trees, plants and cover.
+
+## Vegetation v2: living plants and stateless ground cover (ENG-189)
+
+`spall_ecology` has two kinds of plants. **Living** plants (trees, reeds, ferns,
+flowers, scrub, and the underwater kelp, corals and weeds) are organisms in
+`LivingState` (version 2): they grow, seed, die and are harvestable; trees are
+real wood in the terrain. **Ground cover** (`spall_ecology::cover`) is stateless:
+`ground_cover(set, seed, cell, soil, moisture, temperature, biome, season, depth)`
+is a pure function, so there is no per-plant record, save or wire message. The
+climate it reads is a run-length-coded 4 m raster (`CoverField`: biome, moisture,
+temperature and water level) that the world carries in `LivingState` and every
+`VisualFrame`.
+
+- **Per-biome catalogue** (sandbox): 25 trees, 27 living ground and underwater
+  plants, 48 cover species, with species masks over the thirteen biomes (`u16`).
+  Measured against real worlds (a kind counts with 40+ matching columns): Meadow
+  11 living / 9 cover, Alpine 14/8, Swamp 7/5, Desert 7/3, Beach 4/3, Riparian
+  12/11, Temperate forest 11/6, Boreal 12/6, Scree 6/4, Snow 3/2, Steppe 12/9,
+  Ocean 6/6, Pine forest 7/1. (`tests/biome_flora.rs`.)
+- **Wetness**: cover density is `0.12 + 0.55w + 0.25w^2` of a species' density
+  (dry ground about a fifth), height scales 0.85-1.15x, and most cover species only
+  set a minimum wetness, so wetter ground admits more kinds.
+- **Low forms** beyond blades: mounds (moss, thrift), flower patches, pebbles and
+  shells, fallen leaves, pine needles; underwater kelp, branching coral, sea fan,
+  barrel sponge. **Pine forest** has needles as its only cover.
+- **Underwater**: `Species.depth` / `CoverSpecies.depth` give the water depth
+  range in cells (`[0, 0]` is dry land). Kelp needs 4 m of water, fresh-water
+  weeds 7-8 m; land plants refuse any water.
+- **Destroyed cover** (`LivingState.cleared`, sorted `(x, z, at_s)`, at most
+  65,536): an edit that reaches a column's topsoil records it. Cleared cover
+  stays bare 20 s of ecological time, regrows small (0.3x) to 90 s, medium (0.65x)
+  to 180 s, then is full size and the record is dropped. A tunnel well below the
+  surface leaves cover alone. The client holds back cover in a column whose surface
+  just changed until the record arrives (3 s cap).
+- **Saves**: `LivingState` v1 upgrades on decode: carpet species (forms 6, 9,
+  11, 12) become cover species and only their organisms are dropped; the clock,
+  ids and every other organism carry over. `LivingState.preset` (0 showcase, 1
+  natural, 2 gallery) makes the server rebuild the climate the world was made
+  from (it used to assume the showcase).
+
+### Living vegetation at 1 km (ENG-190)
+
+- **Ecological placement** (`spall_ecology::placement`). Trees are dart-thrown in
+  a fixed pseudo-random order over 1 m candidates. Density comes from the
+  *spacing*: a biome's canopy value (Pine forest 1.0, Temperate forest 0.95,
+  Boreal 0.85, Riparian 0.7, Swamp 0.45, Meadow 0.18, Alpine 0.12, Steppe 0.06,
+  Beach and Scree 0.03, Desert 0.01, Snow and Ocean 0) scales a species' spacing
+  from 2.2x (open) to 0.85x (dense); glade noise (56-cell lattice) thins or
+  removes patches of canopy. A 40 m stand has one dominant species (72% of its
+  trees; the choice ranks the species that could grow there by a stand hash, so
+  it does not shift with local soil), the rest are mixed, which makes ecotones
+  at stand edges. The understory (living ground plants) is rolled per 1.25 m
+  candidate by biome fertility, and plants that are not within 7 cells of a tree
+  are kept at 55%, so it gathers in shade. Placement is deterministic for a seed.
+- **Spatial index** (`Spatial`, 16-cell buckets, derived and never saved) answers
+  spacing, trunk-footprint and "a tree never grows over a ground plant" checks in
+  a few buckets, where they used to scan every organism.
+- **Caps** `MAX_TREES` 24,576 and `MAX_GROUND` 32,768 (cover is stateless and not
+  counted); skeleton cell limit 2.5 million.
+- **New forms and species.** Forms 22 shrub (woody stems under a leafy crown),
+  23 soft bush (a leafy mound), 24 tall herb (stems with paired leaves and a
+  flower spike, seed head out of season). Thirteen species, ids 120-132: Hazel,
+  Bramble, Juniper, Heather, Sagebrush, Bog myrtle, Dwarf willow, Mullein,
+  Foxglove, Fireweed, Joe-pye weed, Tamarisk, Sea buckthorn, across every fertile
+  biome including Desert and Beach.
+- **Saved state version 3** saves only what changes. A tree's skeleton is a pure
+  function of its root, species and id (`skeleton`, keyed `hash(seed ^ id)`), so
+  the save keeps the removed-cell indices and the skeleton grows back on load.
+  `skeleton()` is part of the format: changing a species' shape needs a new state
+  version. Version 1 and 2 saves still load; a tree in them that does not match
+  the rule is refused loudly rather than reshaped. `encode()` skips per-cell
+  skeleton checks (the program grew them); decode of an older save does them all.
+- **Regional vegetation replication.** The server builds the full keyframe once a
+  second on a worker; each regional client (one with a streamed radius) then
+  gets only the plants and destroyed-cover records inside a square of
+  `(radius + 2) * 32` cells around its player; a client that streams the whole
+  world still gets everything. The climate raster never changes, so it is sent
+  with a session's first keyframe and every tenth after (a client keeps the last
+  one; a world reset clears it). The keyframe is droppable traffic as before.
+- **Fair work** still visits a bounded number of organisms per second:
+  `clamp(n / 40, 128, 512)`.
+- **Growth is throttled.** A new world's trees are all fully grown. Trees seeded
+  while the world runs grow one wood cell per 300 ticks (5 s) in total, however
+  many are growing (`GROWTH_INTERVAL_TICKS` in `spall_sim`). Wood is real
+  terrain, so each cell is a full edit commit on the tick thread: at 4096 cells
+  about 0.2 s of staging and commit plus about 0.3 s to refresh the water's
+  terrain (an O(world) remap of 6.6 million spans). Before the throttle, a 1 km
+  world with 8,600 trees spent 130 to 660 ms of a tick in `tick.water` once a
+  second and a walking player rubber-banded; after it, a 10 minute run of
+  simulated time had three 300 to 390 ms ticks.
+
+Measured (natural, seed 1, 4096 cells, release, `vegetation_scale` example):
+
+| | before W5 (512 / 8,192 caps) | after |
+|---|---|---|
+| trees / living ground plants | 512 / 8,192 (cap-bound; at 2048 cells) | 8,651 / 10,080 |
+| saved state | 0.52 MiB at 2048 cells | 0.39 MiB at 4096 (5.75 MiB before the v3 save) |
+| keyframe per client per second | 0.14 MiB at 2048 cells | whole world 0.65 MiB; regional 8 / 14 / 24 KiB at 4 / 8 / 16 bricks |
+| state copy on the tick thread | 10.3 ms (v2 layout) | 0.73 ms |
+| `encode()` incl. validation | 7.6 ms | 2.9 ms |
+| `advance` per second of ecology | 0.23 ms (2048) | mean 2.7 ms, worst 5.5 ms |
+| vegetation generation | n/a | 1.23 s of a 10.5 s world start |
+
+## Editor panel update (ENG-191)
+
+The World Gen dialog (File > Generate World...) now picks the world (Natural,
+Showcase, Gallery; default Natural) as well as seed, size and season, and shows
+the preview as one of six layers drawn from the same `ColumnMap` the server
+builds (`spall_worldgen::debug::layer_rgba`):
+
+| Layer | Shows |
+|---|---|
+| Biomes | biome colour shaded by height (the old minimap), legend of shares |
+| Height | green lowland through brown to white peaks; water by depth |
+| Moisture | dry tan to wet blue, range in the legend |
+| Temperature | cold blue through warm yellow to hot red, range in degrees C |
+| Rivers, lakes and springs | sea, fresh water, springs (yellow), sinks (magenta) |
+| Vegetation density | an **estimate** from biome fertility and wetness (`vegetation_density`), not a plant count |
+
+Switching layer redraws the stored map (no regeneration). Run in game passes the
+chosen preset to `cargo xtask play --worldgen`. Logic is in
+`tools/spall_editor/src/worldgen_panel.rs` (tested on the CPU), layers in
+`crates/spall_worldgen/src/debug.rs` (`tests/preview_layers.rs`).
+
+
+## Editor panel (ENG-115, first version)
 
 File > Generate World... opens a dialog in `spall-editor` (no project needed):
 seed field (empty = 1), arena size (128 m or 256 m), Randomize seed, Generate
@@ -254,10 +479,11 @@ preview, and Run in game.
 - Logic lives in `tools/spall_editor/src/worldgen_panel.rs` (CPU-testable);
   the dialog is in `ui.rs` and the texture upload in `main.rs`.
 
-## Not included
-Trees, grass, props, flowing rivers (water is initially static, filled to sea
-level; springs/sinks are a consumer decision), streaming/infinite worlds, 3D
-editor preview, persistence of spec/version in `StoredWorldMeta`.
+## Not included (showcase preset)
+The showcase arena itself still has no trees, grass or flowing rivers; the
+natural preset below adds rivers, and vegetation lives in `spall_ecology`.
+Still not included anywhere: infinite worlds, a 3D editor preview, persistence of
+spec/version in `StoredWorldMeta`.
 
 
 ## Vegetation plan boundary (ENG-116)

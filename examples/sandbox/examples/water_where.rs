@@ -9,12 +9,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seed: u64 = a.get(1).map_or(Ok(7), |s| s.parse())?;
     let scene = worldgen_scene::generate("showcase", seed, size)?;
     let plan = &scene.world().water;
-    println!("surface_y={} cells={}", plan.surface_y, plan.cells.len());
+    println!("surface_y={} cells={}", plan.surface_y, plan.cell_count());
     println!("bounds={:?}", plan.bounds);
     println!("spawns={:?}", scene.player_spawns());
     // Deepest column and the centroid of the water, in metres.
     let mut depth: HashMap<(i64, i64), i64> = HashMap::new();
-    for c in &plan.cells {
+    for c in plan.cells() {
         *depth.entry((c.x, c.z)).or_default() += 1;
     }
     let (n, sx, sz) = depth.keys().fold((0.0, 0.0, 0.0), |(n, sx, sz), (x, z)| {

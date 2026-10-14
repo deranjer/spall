@@ -40,6 +40,11 @@ struct BounceGlobals {
     ground_color: vec4<f32>,
     // x, y = the half-open z range of cells this dispatch may write.
     region: vec4<u32>,
+    // After a scroll (the cache origin moved by xyz cells): w is the margin in
+    // cells, and only cells within it of what entered the cache, or of the edge
+    // the old cache ended at, are lit again; the rest hold what the scroll
+    // copied. w = 0: a plain sweep.
+    scroll: vec4<i32>,
 };
 
 @group(0) @binding(0) var<storage, read> cells: array<u32>;
@@ -275,9 +280,26 @@ fn face_axis(face: u32) -> vec3<f32> {
 @compute @workgroup_size(4, 4, 4)
 fn bounce_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dim = i32(globals.dimensions.x);
-    let cell = vec3<i32>(gid);
+    var cell = vec3<i32>(gid);
+    // A sweep slice dispatches only the layers it recomputes: with `region.z`
+    // slices, thread row `gid.z` is layer `region.w + gid.z * region.z`. A full
+    // dispatch (`region.z` of 0) walks every layer.
+    if globals.region.z > 1u {
+        cell.z = i32(globals.region.w + gid.z * globals.region.z);
+    }
     if !inside(cell, dim) { return; }
-    if gid.z < globals.region.x || gid.z >= globals.region.y { return; }
+    if u32(cell.z) < globals.region.x || u32(cell.z) >= globals.region.y { return; }
+    if globals.scroll.w > 0 {
+        // This cell was inside the old cache at `cell + shift`. If that spot was
+        // well inside it, the scroll copied its radiance and it stands.
+        let m = globals.scroll.w;
+        let moved = vec3<i32>(globals.scroll.x, globals.scroll.y, globals.scroll.z);
+        let old = cell + moved;
+        let fresh = (moved.x != 0 && (old.x < m || old.x >= dim - m))
+            || (moved.y != 0 && (old.y < m || old.y >= dim - m))
+            || (moved.z != 0 && (old.z < m || old.z >= dim - m));
+        if !fresh { return; }
+    }
     let index = index_of(cell, dim);
     // Solid cells and air far from any surface are never sampled.
     if cells[index] != 0u || !near_solid(cell, dim) {

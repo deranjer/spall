@@ -745,13 +745,37 @@ impl EditorApp {
     }
 
     fn worldgen_dialog(&mut self) {
-        use crate::worldgen_panel::{SEASONS, SIZES, legend};
-        theme::hint("Preview the generated showcase arena, then walk it in the game.");
-        theme::hint("Mountains, hills, swamp with lake and river, desert, caves.");
+        use crate::worldgen_panel::{
+            PRESETS, SEASONS, SIZES, layer_legend, legend, preset_hint, preset_label,
+        };
+        use spall_worldgen::debug::PreviewLayer;
+        theme::hint("Preview a generated world, then walk it in the game.");
+        theme::hint(preset_hint(self.worldgen.preset));
         theme::hint("The preview checks world capacity before launch. Startup errors appear here.");
         theme::field_with_placeholder("Seed", &mut self.worldgen.seed_text, "1");
         theme::hstack(8.0, || {
-            theme::label(12.0, theme::TEXT, "World size");
+            theme::label(12.0, theme::TEXT, "World");
+            if theme::dropdown_button(preset_label(self.worldgen.preset)) {
+                self.worldgen.preset_menu_open = !self.worldgen.preset_menu_open;
+                self.worldgen.layer_menu_open = false;
+                self.worldgen.size_menu_open = false;
+                self.worldgen.season_menu_open = false;
+            }
+            if self.worldgen.preset_menu_open {
+                let entries: Vec<_> = PRESETS
+                    .iter()
+                    .map(|preset| MenuEntry::new(preset_label(*preset)))
+                    .collect();
+                let refs: Vec<_> = entries.iter().collect();
+                if let Some(index) = theme::dropdown_from(DropdownSide::Left, 220.0, &refs) {
+                    self.worldgen.preset = PRESETS[index];
+                    self.worldgen.preview = None;
+                    self.worldgen.preset_menu_open = false;
+                }
+            }
+        });
+        theme::hstack(8.0, || {
+            theme::label(12.0, theme::TEXT, "Size");
             let selected_size = format!("{} m", self.worldgen.size_cells / 4);
             if theme::dropdown_button(&selected_size) {
                 self.worldgen.size_menu_open = !self.worldgen.size_menu_open;
@@ -790,13 +814,38 @@ impl EditorApp {
         if let Some(error) = &self.worldgen.error {
             theme::label(12.0, theme::TEXT_MUTED, error.clone());
         }
+        if self.worldgen.preview.is_none() {
+            return;
+        }
+        // The layer shown: switching redraws the same map, nothing is regenerated.
+        theme::hstack(8.0, || {
+            theme::label(12.0, theme::TEXT, "Layer");
+            if theme::dropdown_button(self.worldgen.layer.name()) {
+                self.worldgen.layer_menu_open = !self.worldgen.layer_menu_open;
+                self.worldgen.preset_menu_open = false;
+                self.worldgen.size_menu_open = false;
+                self.worldgen.season_menu_open = false;
+            }
+            if self.worldgen.layer_menu_open {
+                let entries: Vec<_> = PreviewLayer::ALL
+                    .iter()
+                    .map(|layer| MenuEntry::new(layer.name()))
+                    .collect();
+                let refs: Vec<_> = entries.iter().collect();
+                if let Some(index) = theme::dropdown_from(DropdownSide::Left, 240.0, &refs) {
+                    self.worldgen.layer = PreviewLayer::ALL[index];
+                    self.worldgen.layer_menu_open = false;
+                    self.show_worldgen_layer();
+                }
+            }
+        });
         let Some(preview) = &self.worldgen.preview else {
             return;
         };
         if let Some(texture) = self.worldgen_texture {
             yakui::image(texture, Vec2::splat(420.0));
         }
-        for (name, [r, g, b], share) in legend(&preview.stats) {
+        let swatch = |[r, g, b]: [u8; 3], text: String| {
             theme::hstack(8.0, || {
                 yakui::constrained(Constraints::tight(Vec2::splat(12.0)), || {
                     RoundRect::new(2.0)
@@ -804,8 +853,24 @@ impl EditorApp {
                         .min_size(Vec2::splat(12.0))
                         .show();
                 });
-                theme::label(12.0, theme::TEXT, format!("{name}  {:.0}%", share * 100.0));
+                theme::label(12.0, theme::TEXT, text);
             });
+        };
+        if preview.layer == PreviewLayer::Biome {
+            for (name, rgb, share) in legend(&preview.stats) {
+                swatch(rgb, format!("{name}  {:.0}%", share * 100.0));
+            }
+        } else {
+            let (swatches, range) = layer_legend(preview);
+            for (rgb, label) in swatches {
+                swatch(rgb, label.to_owned());
+            }
+            if let Some(range) = range {
+                theme::hint(&format!("{}: {range}", preview.layer.name()));
+            }
+            if preview.layer == PreviewLayer::Vegetation {
+                theme::hint("An estimate from biome and wetness, not a count of plants.");
+            }
         }
         let (low, high) = (preview.stats.min_height, preview.stats.max_height);
         theme::hint(&format!(

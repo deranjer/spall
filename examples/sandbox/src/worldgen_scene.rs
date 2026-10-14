@@ -12,7 +12,7 @@ use std::sync::Arc;
 use spall_core::GlobalCell;
 use spall_server::CustomWorld;
 use spall_sim::WorldSetup;
-use spall_sim::column_water::ColumnWaterSetup;
+use spall_sim::column_water::{ColumnWaterSetup, Discharge};
 use spall_structure::AnchorPlane;
 use spall_worldgen::{
     GenError, GeneratedWorld, Preset, SHOWCASE_SIZE_CELLS, WaterPlan, WorldGenSpec,
@@ -21,7 +21,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum WorldgenSceneError {
-    #[error("unknown --worldgen preset `{0}` (expected: showcase)")]
+    #[error("unknown --worldgen preset `{0}` (expected: showcase, natural)")]
     UnknownPreset(String),
     #[error("world generation failed: {0}")]
     Generate(#[from] GenError),
@@ -29,8 +29,14 @@ pub enum WorldgenSceneError {
     Vegetation(String),
 }
 
-/// The default arena edge in cells (256 m).
-pub const DEFAULT_SIZE_CELLS: u32 = SHOWCASE_SIZE_CELLS;
+/// A pipe quieter than this (cells^3/s) lets its region sleep.
+pub const WORLDGEN_SLEEP_FLOW: f32 = 0.1;
+
+/// The default arena edge in cells (1 km). Needs regional streaming and several
+/// GiB of server memory; CI and quick iteration use [`CI_SIZE_CELLS`].
+pub const DEFAULT_SIZE_CELLS: u32 = 4096;
+/// The arena edge CPU CI fixtures and fast iteration use (256 m).
+pub const CI_SIZE_CELLS: u32 = SHOWCASE_SIZE_CELLS;
 
 /// A generated world, ready to package for the server.
 /// Where the player stands beside a lake.
@@ -107,6 +113,7 @@ pub fn generate_with_season(
         spawns,
         season,
     )
+    .and_then(|state| state.with_cover(crate::vegetation::cover_catalogue(), &world.columns))
     .map_err(WorldgenSceneError::Vegetation)?;
     tracing::info!(
         stage = "vegetation_generation",
@@ -128,9 +135,10 @@ pub fn generate_with_season(
     })
 }
 
-/// The stacked-column water for a water plan: the plan's full cells seeded at
-/// rest over the world's whole height range. There is no domain box and no
-/// coarsening, so a one-voxel wall always blocks water.
+/// The stacked-column water for a water plan: each wet column seeded at rest
+/// to its own surface, over the world's whole height range, plus the plan's
+/// springs (refilled every step) and sinks (emptied every step). There is no
+/// domain box and no coarsening, so a one-voxel wall always blocks water.
 pub fn column_water_setup(
     plan: &WaterPlan,
     region: (GlobalCell, GlobalCell),
@@ -138,11 +146,40 @@ pub fn column_water_setup(
     plan.bounds?;
     let y_lo = region.0.y.div_euclid(32) * 32;
     let y_hi = (region.1.y + 1 + 31).div_euclid(32) * 32;
-    Some(ColumnWaterSetup::new(
-        y_lo as i32,
-        y_hi as i32,
-        plan.cells.clone(),
-    ))
+    let mut setup = ColumnWaterSetup::new(y_lo as i32, y_hi as i32, Vec::new());
+    setup.initial_levels = plan
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                i64::from(c.x),
+                i64::from(c.z),
+                i64::from(c.bed),
+                i64::from(c.top),
+            )
+        })
+        .collect();
+    // Springs are fixed discharges (cells^3/s from the catchment each carries),
+    // not refill-to-full cells: a refilling spring takes whatever the channel
+    // lets through, about 1.3 m3/s each measured, and floods a basin.
+    setup.discharges = plan
+        .springs
+        .iter()
+        .map(|s| Discharge {
+            cell: s.cell,
+            flow_cells3_s: f64::from(s.flow_cells3_s),
+        })
+        .collect();
+    setup.sinks = plan.sinks.clone();
+    // Rivers creep for a long time (about 0.1 m/s on a 1% slope), and at the
+    // solver's default sensitivity every region they touch stays awake. A pipe
+    // moving under 0.1 cells^3/s (6 mL/s) does not need stepping: with this,
+    // measured on a 1024-cell world, the active regions fall from 272 to 143
+    // in five minutes and keep falling.
+    setup.config.sleep_flow = WORLDGEN_SLEEP_FLOW;
+    // Deep still sea stays a record until something disturbs it.
+    setup.config.lazy_ocean = true;
+    Some(setup)
 }
 
 impl GeneratedScene {
@@ -186,8 +223,8 @@ impl GeneratedScene {
         use std::collections::{HashMap, HashSet};
         let plan = &self.world.water;
         let mut depth: HashMap<(i64, i64), i64> = HashMap::new();
-        for c in &plan.cells {
-            *depth.entry((c.x, c.z)).or_default() += 1;
+        for c in &plan.columns {
+            depth.insert((i64::from(c.x), i64::from(c.z)), i64::from(c.top - c.bed));
         }
         // The deepest column (ties by position, so the result is stable).
         let deep = depth
@@ -256,8 +293,8 @@ impl GeneratedScene {
         };
         let plan = &self.world.water;
         let mut depth: HashMap<(i64, i64), i64> = HashMap::new();
-        for c in &plan.cells {
-            *depth.entry((c.x, c.z)).or_default() += 1;
+        for c in &plan.columns {
+            depth.insert((i64::from(c.x), i64::from(c.z)), i64::from(c.top - c.bed));
         }
         let surface_m = (plan.surface_y + 1) as f64 * 0.25;
         // Open water at least 1 m deep over the whole stretch the objects use
@@ -324,9 +361,11 @@ impl GeneratedScene {
     }
 
     /// Packages the world for [`spall_server::ServeConfig::custom_world`].
-    pub fn into_custom_world(self) -> CustomWorld {
+    pub fn into_custom_world(mut self) -> CustomWorld {
         let spawns = self.player_spawns().to_vec();
-        let column_water = self.column_water.clone();
+        // The scene's own copy of the planned water would outlive the world setup
+        // that needs it; hand it over instead of cloning.
+        let column_water = self.column_water.take();
         let vegetation = self.vegetation.clone();
         let scene = Arc::new(self);
         let mut custom =

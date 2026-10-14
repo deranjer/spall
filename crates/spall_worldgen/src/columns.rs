@@ -5,8 +5,13 @@
 //! are cells; `u = x / size`, `v = z / size` are the preset's normalized
 //! layout coordinates, so one layout scales to any arena size.
 
+mod gallery;
+mod natural;
+
+pub use gallery::{GalleryPatch, patches as gallery_patches};
+
 use crate::noise::{fbm2, ridged2, smoothstep};
-use crate::spec::{BORDER_CELLS, GenError, SEA_LEVEL, WorldGenSpec, WorldgenPalette};
+use crate::spec::{BORDER_CELLS, GenError, Preset, SEA_LEVEL, WorldGenSpec, WorldgenPalette};
 use spall_core::MaterialId;
 
 /// Above this many cells over the sea, mountain surfaces are snow.
@@ -44,17 +49,68 @@ const S_RIM: u64 = 0x54;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Biome {
+    // The four biomes of the showcase. Their numbers are stored in saves and
+    // in vegetation masks: never renumber them.
+    /// Showcase hills; grassland in natural worlds.
     Meadow = 0,
+    /// Showcase mountains; alpine meadow in natural worlds.
     Alpine = 1,
+    /// Showcase basin; wetland in natural worlds.
     Swamp = 2,
     Desert = 3,
+    // Natural worlds only.
+    Ocean = 4,
+    Beach = 5,
+    /// Banks of rivers and lakes.
+    Riparian = 6,
+    TemperateForest = 7,
+    BorealForest = 8,
+    /// Bare broken rock and gravel on steep slopes and above the tree line.
+    Scree = 9,
+    Snow = 10,
+    Steppe = 11,
+    /// A sub-biome of the boreal and cool temperate forest: pines growing close
+    /// together over a bed of needles that leaves no room for other ground cover.
+    PineForest = 12,
 }
 
 impl Biome {
+    /// The biomes the showcase uses.
     pub const ALL: [Biome; 4] = [Biome::Meadow, Biome::Alpine, Biome::Swamp, Biome::Desert];
+    /// Every biome, indexed by its stored number.
+    pub const EVERY: [Biome; 13] = [
+        Biome::Meadow,
+        Biome::Alpine,
+        Biome::Swamp,
+        Biome::Desert,
+        Biome::Ocean,
+        Biome::Beach,
+        Biome::Riparian,
+        Biome::TemperateForest,
+        Biome::BorealForest,
+        Biome::Scree,
+        Biome::Snow,
+        Biome::Steppe,
+        Biome::PineForest,
+    ];
 
     fn from_u8(v: u8) -> Self {
-        Self::ALL[usize::from(v)]
+        Self::EVERY[usize::from(v)]
+    }
+
+    /// The showcase biome whose vegetation fits this one, until vegetation
+    /// understands every biome.
+    pub fn vegetation_class(self) -> Biome {
+        match self {
+            Biome::Meadow | Biome::TemperateForest | Biome::Steppe => Biome::Meadow,
+            Biome::Alpine
+            | Biome::BorealForest
+            | Biome::PineForest
+            | Biome::Scree
+            | Biome::Snow => Biome::Alpine,
+            Biome::Swamp | Biome::Riparian => Biome::Swamp,
+            Biome::Desert | Biome::Beach | Biome::Ocean => Biome::Desert,
+        }
     }
 }
 
@@ -81,6 +137,25 @@ pub struct ColumnMap {
     heights: Vec<u16>,
     biomes: Vec<u8>,
     lowland: Vec<u8>,
+    /// Wetness `0..=255`. Showcase: a constant per biome.
+    moisture: Vec<u8>,
+    /// Degrees Celsius as `(t + 30) * 3.1875`. Showcase: a constant.
+    temperature: Vec<u8>,
+    /// Cells to the nearest river or lake, clamped to 255. Showcase: 255.
+    river_dist: Vec<u8>,
+    /// `y` of the top water cell per column, 0 for dry. Empty for the
+    /// showcase, whose water is everything below [`SEA_LEVEL`].
+    water_surface: Vec<u16>,
+    natural: bool,
+    /// Water exchange cells the generator places: river heads and the sinks
+    /// of landlocked maps. Empty for the showcase.
+    springs: Vec<([i64; 3], f32)>,
+    sinks: Vec<[i64; 3]>,
+    /// Biomes (bit `1 << biome`) that the climate did not produce in enough
+    /// quantity and the generator painted in. Natural worlds only.
+    repaired: u16,
+    /// The gallery preset: one pad per biome (see [`gallery_patches`]).
+    gallery: bool,
 }
 
 struct Layout {
@@ -191,6 +266,14 @@ impl Layout {
 impl ColumnMap {
     pub fn compute(spec: &WorldGenSpec) -> Result<Self, GenError> {
         spec.validate()?;
+        match spec.preset {
+            Preset::Showcase => Self::compute_showcase(spec),
+            Preset::Natural => natural::compute(spec),
+            Preset::Gallery => gallery::compute(spec),
+        }
+    }
+
+    fn compute_showcase(spec: &WorldGenSpec) -> Result<Self, GenError> {
         let size = spec.size_cells;
         let layout = Layout::new(spec.seed, size);
         let n = size as usize;
@@ -236,12 +319,30 @@ impl ColumnMap {
                 });
             }
         });
+        let moisture = biomes
+            .iter()
+            .map(|&b| match Biome::from_u8(b) {
+                Biome::Meadow => 120,
+                Biome::Alpine => 85,
+                Biome::Swamp => 210,
+                _ => 25,
+            })
+            .collect();
         Ok(Self {
             size,
             seed: spec.seed,
             heights,
             biomes,
             lowland,
+            moisture,
+            temperature: vec![128; n * n],
+            river_dist: vec![255; n * n],
+            water_surface: Vec::new(),
+            natural: false,
+            springs: Vec::new(),
+            sinks: Vec::new(),
+            repaired: 0,
+            gallery: false,
         })
     }
 
@@ -277,10 +378,79 @@ impl ColumnMap {
         x < BORDER_CELLS || z < BORDER_CELLS || x >= edge || z >= edge
     }
 
-    /// Whether water covers the column: terrain below the sea surface, outside
-    /// the border wall (water never enters the wall).
+    /// `y` of the top water cell of the column, or 0 if it is dry. Water never
+    /// enters the border wall.
+    pub fn water_surface(&self, x: i64, z: i64) -> i32 {
+        if self.in_border(x, z) {
+            return 0;
+        }
+        if self.water_surface.is_empty() {
+            return if self.height(x, z) < SEA_LEVEL {
+                SEA_LEVEL
+            } else {
+                0
+            };
+        }
+        i32::from(self.water_surface[self.idx(x, z)])
+    }
+
+    /// How deep the water stands over the ground in cells, 0 on dry ground.
+    pub fn water_depth(&self, x: i64, z: i64) -> i32 {
+        (self.water_surface(x, z) - self.height(x, z)).max(0)
+    }
+
+    /// Whether water covers the column: its water surface is above the ground.
     pub fn is_water(&self, x: i64, z: i64) -> bool {
-        !self.in_border(x, z) && self.height(x, z) < SEA_LEVEL
+        self.water_surface(x, z) > self.height(x, z)
+    }
+
+    /// Wetness `0..=255`.
+    pub fn moisture(&self, x: i64, z: i64) -> u8 {
+        self.moisture[self.idx(x, z)]
+    }
+
+    /// Ground temperature in degrees Celsius.
+    pub fn temperature_c(&self, x: i64, z: i64) -> f64 {
+        f64::from(self.temperature[self.idx(x, z)]) / 3.1875 - 30.0
+    }
+
+    /// Whether this is the gallery preset's map.
+    pub fn is_gallery(&self) -> bool {
+        self.gallery
+    }
+
+    /// The biomes the generator had to paint in because the climate left them
+    /// out or nearly so (bit `1 << biome`); zero for most seeds.
+    pub fn repaired_biomes(&self) -> u16 {
+        self.repaired
+    }
+
+    /// Cells to the nearest river or lake, clamped to 255.
+    pub fn river_dist(&self, x: i64, z: i64) -> u8 {
+        self.river_dist[self.idx(x, z)]
+    }
+
+    /// River heads: the cell each spring adds water to, and its discharge in
+    /// cells^3/s (the catchment it carries times the runoff).
+    pub fn springs(&self) -> &[([i64; 3], f32)] {
+        &self.springs
+    }
+
+    /// Where landlocked water ends: cells to empty every step.
+    pub fn sinks(&self) -> &[[i64; 3]] {
+        &self.sinks
+    }
+
+    /// Whether this map was made by the natural pipeline.
+    pub fn is_natural(&self) -> bool {
+        self.natural
+    }
+
+    /// Steepness in cells of height per cell, over a four-cell baseline.
+    pub fn gradient(&self, x: i64, z: i64) -> f64 {
+        let dx = self.height(x + 2, z) - self.height(x - 2, z);
+        let dz = self.height(x, z + 2) - self.height(x, z - 2);
+        f64::from(dx.abs().max(dz.abs())) / 4.0
     }
 
     pub fn min_max_height(&self) -> (i32, i32) {
@@ -310,6 +480,9 @@ impl ColumnMap {
             sub_cells,
         };
         let rock = || st(p.stone, 1, p.stone, 0);
+        if self.natural {
+            return self.natural_stack(p, x, z);
+        }
         match self.biome(x, z) {
             Biome::Swamp => {
                 if h < SEA_LEVEL - 6 {
@@ -342,6 +515,7 @@ impl ColumnMap {
                     st(p.grass, 2, p.dirt, 10)
                 }
             }
+            _ => unreachable!("showcase maps only hold showcase biomes"),
         }
     }
 }

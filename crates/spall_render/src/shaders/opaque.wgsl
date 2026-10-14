@@ -606,6 +606,23 @@ fn field_texel(c: vec2<i32>) -> vec4<f32> {
 
 fn is_water(v: f32) -> bool { return v > WATER_NONE * 0.5; }
 
+// The field's fourth channel packs agitation (8 bits) and the column's flow (two
+// signed bytes of 1/16 m/s, offset by 128) into one exactly-represented float
+// (spall_render::water::pack_agitation_flow). A zero texel is outside the field.
+fn unpack_agitation(w: f32) -> f32 {
+    let u = u32(w);
+    return f32(u & 255u) / 255.0;
+}
+
+fn unpack_flow(w: f32) -> vec2<f32> {
+    let u = u32(w);
+    if u == 0u { return vec2<f32>(0.0); }
+    return vec2<f32>(
+        f32(i32((u >> 8u) & 255u) - 128),
+        f32(i32((u >> 16u) & 255u) - 128),
+    ) * (1.0 / 16.0);
+}
+
 // Mean smoothed height of the cells around grid corner `c`, WATER_NONE if none.
 fn corner_height(c: vec2<i32>) -> f32 {
     var sum = 0.0;
@@ -655,7 +672,7 @@ fn corner_height(c: vec2<i32>) -> f32 {
         let t = field_texel(c + vec2<i32>(k & 1, k >> 1) - vec2<i32>(1));
         if is_water(t.x) {
             wet += 0.25;
-            agit += 0.25 * t.w;
+            agit += 0.25 * unpack_agitation(t.w);
         }
     }
     let xz = globals.water_field.xy + vec2<f32>(c) * cell_m;
@@ -678,6 +695,27 @@ fn water_depth_at(xz: vec2<f32>) -> f32 {
         if is_water(t.x) { d[k] = max(t.x - t.y, 0.0); }
     }
     return mix(mix(d[0], d[1], f.x), mix(d[2], d[3], f.x), f.y);
+}
+
+// The water's current at `xz` in m/s: bilinear over the wet cells around it.
+fn water_flow_at(xz: vec2<f32>) -> vec2<f32> {
+    let p = (xz - globals.water_field.xy) / globals.water_field.z - vec2<f32>(0.5);
+    let i = vec2<i32>(floor(p));
+    let f = p - floor(p);
+    var sum = vec2<f32>(0.0);
+    var weight = 0.0;
+    for (var k = 0; k < 4; k += 1) {
+        let o = vec2<i32>(k & 1, k >> 1);
+        let t = field_texel(i + o);
+        if is_water(t.x) {
+            let wx = select(1.0 - f.x, f.x, o.x == 1);
+            let wz = select(1.0 - f.y, f.y, o.y == 1);
+            sum += unpack_flow(t.w) * (wx * wz);
+            weight += wx * wz;
+        }
+    }
+    if weight < 0.0001 { return vec2<f32>(0.0); }
+    return sum / weight;
 }
 
 fn water_value_noise(p: vec2<f32>) -> f32 {
@@ -710,11 +748,28 @@ fn water_ripple(p: vec2<f32>, t: f32) -> f32 {
     // "alive", and it never jumps from cell to cell.
     let e = 0.06;
     let p = in.world_pos.xz;
-    let grad = vec2<f32>(
+    let grad_still = vec2<f32>(
         water_ripple(p + vec2<f32>(e, 0.0), t) - water_ripple(p - vec2<f32>(e, 0.0), t),
         water_ripple(p + vec2<f32>(0.0, e), t) - water_ripple(p - vec2<f32>(0.0, e), t),
     ) / (2.0 * e);
-    let amount = 0.012 + 0.07 * agit;
+
+    // A current carries the ripples with it and draws them out along its
+    // direction into streaks: the pattern is advected by the flow and stretched
+    // the faster it runs. Slow water (under about 5 cm/s) keeps the still look.
+    let flow = water_flow_at(p);
+    let speed = length(flow);
+    let moving = smoothstep(0.05, 0.4, speed);
+    let dir = flow / max(speed, 0.0001);
+    let across = vec2<f32>(-dir.y, dir.x);
+    let advected = p - flow * (t * 0.9);
+    let stretch = 1.0 / (1.0 + 0.8 * min(speed, 3.0));
+    let streak_p = dir * (dot(advected, dir) * stretch) + across * dot(advected, across);
+    let grad_flow = vec2<f32>(
+        water_ripple(streak_p + vec2<f32>(e, 0.0), 0.0) - water_ripple(streak_p - vec2<f32>(e, 0.0), 0.0),
+        water_ripple(streak_p + vec2<f32>(0.0, e), 0.0) - water_ripple(streak_p - vec2<f32>(0.0, e), 0.0),
+    ) / (2.0 * e);
+    let grad = mix(grad_still, grad_flow, moving);
+    let amount = 0.012 + 0.07 * agit + 0.05 * moving * min(speed / 1.5, 1.0);
     var n = normalize(normalize(in.normal) + vec3<f32>(grad.x, 0.0, grad.y) * amount);
     if dot(n, v) < 0.0 { n = -n; }
     let cos_t = clamp(dot(n, v), 0.0, 1.0);
@@ -760,7 +815,11 @@ fn water_ripple(p: vec2<f32>, t: f32) -> f32 {
         * (0.35 + 0.65 * ragged);
     let churn_foam = smoothstep(0.55, 1.0, agit) * smoothstep(0.50, 0.80, patches)
         * (0.5 + 0.5 * ragged) * 0.75;
-    let foam = clamp(0.85 * shore_foam + churn_foam, 0.0, 1.0);
+    // Rapids: fast water breaks into foam in streaks that run with the current.
+    let rapid = smoothstep(1.0, 2.2, speed);
+    let streak_noise = water_value_noise(streak_p * 4.5);
+    let rapid_foam = rapid * smoothstep(0.40, 0.78, streak_noise) * 0.8;
+    let foam = clamp(0.85 * shore_foam + churn_foam + rapid_foam, 0.0, 1.0);
     let foam_color = vec3<f32>(0.85, 0.92, 0.95)
         * (0.30 * sky_lum + 0.35 * globals.sun.w * max(l.y, 0.0) + 0.04);
     color = mix(color, foam_color, foam);

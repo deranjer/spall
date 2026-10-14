@@ -47,6 +47,14 @@ const DRY_VOLUME: f64 = 1.0e-6;
 
 pub use spall_fluid::columns::{ColumnConfig as ColumnSolverConfig, MemoryReport};
 
+/// A spring with a fixed discharge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Discharge {
+    pub cell: GlobalCell,
+    /// Cells^3 of water added per second.
+    pub flow_cells3_s: f64,
+}
+
 /// Initial water and exchange cells for an authoritative column world.
 #[derive(Debug, Clone)]
 pub struct ColumnWaterSetup {
@@ -57,6 +65,9 @@ pub struct ColumnWaterSetup {
     pub config: ColumnConfig,
     /// Full water cells seeded at rest (e.g. a worldgen water plan).
     pub initial_cells: Vec<GlobalCell>,
+    /// Water seeded at rest per column as `(x, z, bed, top)`: the span above
+    /// terrain surface `bed` fills to cell `top`. Compact for big lakes and seas.
+    pub initial_levels: Vec<(i64, i64, i64, i64)>,
     /// Springs: cells refilled to full after every fluid step.
     pub sources: Vec<GlobalCell>,
     /// Gated springs by rate (index 0 is rate 1); only the current rate's
@@ -64,6 +75,19 @@ pub struct ColumnWaterSetup {
     pub gated_sources: [Vec<GlobalCell>; 3],
     /// Drains: cells emptied after every fluid step.
     pub sinks: Vec<GlobalCell>,
+    /// Springs with a fixed discharge: the span holding each cell gains its flow
+    /// every solver slice, whatever the channel carries away. Unlike `sources`
+    /// they cannot flood a basin faster than their stated rate.
+    pub discharges: Vec<Discharge>,
+    /// The gated-spring rate the water starts at (0 refills no gated spring).
+    /// Restored worlds take the saved rate instead.
+    pub gated_rate: u8,
+    /// Fluid seconds to run before the water is first published: wakes every
+    /// region and steps the solver with the springs and drains running, so
+    /// rivers start near their running state, not frozen at the planned levels.
+    /// A fixed amount of simulated time, never wall time: the result is
+    /// deterministic. 0 starts at rest.
+    pub prewarm_s: f64,
 }
 
 impl ColumnWaterSetup {
@@ -73,9 +97,13 @@ impl ColumnWaterSetup {
             y_hi,
             config: ColumnConfig::default(),
             initial_cells,
+            initial_levels: Vec::new(),
             sources: Vec::new(),
             gated_sources: [Vec::new(), Vec::new(), Vec::new()],
             sinks: Vec::new(),
+            discharges: Vec::new(),
+            gated_rate: 0,
+            prewarm_s: 0.0,
         }
     }
 }
@@ -148,6 +176,8 @@ pub struct ColumnWaterTickMetrics {
     pub steps: u32,
     pub step: Option<ColumnStepMetrics>,
     pub active_regions: usize,
+    /// Regions frozen as steady: flowing, balanced, not stepped.
+    pub steady_regions: usize,
     pub allocated_regions: usize,
     pub volume_m3: f64,
     /// Volume held above span capacity, and unplaced, in m^3.
@@ -199,6 +229,7 @@ struct Published {
     overfill_m3: f64,
     unplaced_m3: f64,
     active_regions: usize,
+    steady_regions: usize,
     allocated_regions: usize,
     skipped_s: f64,
     /// A worker that panicked, so the tick can fail loudly.
@@ -232,9 +263,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// [`Self::start_worker`] moves it to its own thread: the tick then only
 /// hands over the fluid time owed and reads the last published frame, so a
 /// slow step (a busy machine, a big lake) delays the water, never the tick.
+/// What the start-up prewarm did (see [`ColumnWaterSetup::prewarm_s`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrewarmReport {
+    /// Solver slices run.
+    pub slices: u32,
+    /// Fluid seconds simulated.
+    pub fluid_s: f64,
+    /// Wall time it took.
+    pub elapsed: Duration,
+    /// Regions awake at the end, and frozen as steady.
+    pub active_regions: usize,
+    pub steady_regions: usize,
+}
+
 pub struct AuthoritativeColumnWater {
     shared: Arc<Shared>,
     seed: ColumnSeedReport,
+    prewarm: Option<PrewarmReport>,
     worker: Option<std::thread::JoinHandle<()>>,
     journal_wait_ticks: u32,
 }
@@ -254,6 +300,7 @@ impl std::ops::Deref for WorldGuard<'_> {
 /// stretch of time, which is three times as many (shorter) steps.
 fn sliced(mut config: ColumnConfig) -> ColumnConfig {
     config.sleep_steps = config.sleep_steps.saturating_mul(COLUMN_SLICES);
+    config.steady_steps = config.steady_steps.saturating_mul(COLUMN_SLICES);
     config
 }
 
@@ -269,9 +316,20 @@ fn check_setup(setup: &ColumnWaterSetup) -> Result<(), ColumnWaterError> {
         .iter()
         .chain(setup.gated_sources.iter().flatten())
         .chain(&setup.sinks)
+        .chain(setup.discharges.iter().map(|d| &d.cell))
         .any(|c| !in_range(c))
     {
         return bad("source or sink outside the height range");
+    }
+    if setup
+        .discharges
+        .iter()
+        .any(|d| !d.flow_cells3_s.is_finite() || d.flow_cells3_s < 0.0)
+    {
+        return bad("discharge must be finite and non-negative");
+    }
+    if setup.discharges.len() > spall_protocol::water::MAX_WATER_SOURCE_CELLS {
+        return bad("too many discharge springs");
     }
     if setup
         .sources
@@ -386,6 +444,17 @@ impl Shared {
         self.gated_rate.load(Ordering::Relaxed)
     }
 
+    /// Adds one slice of every discharge spring's flow. A spring in a column
+    /// with no open span at its cell adds nothing (the terrain was dug away).
+    fn discharge(&self, core: &mut Core) {
+        for d in &self.setup.discharges {
+            let volume = d.flow_cells3_s * SLICE_DT_S;
+            if core.world.add_flow(d.cell, volume).is_ok() {
+                core.added_cells3 += volume;
+            }
+        }
+    }
+
     /// Applies springs and drains after a fluid step.
     fn exchange(&self, core: &mut Core) {
         let rate = usize::from(self.gated_rate());
@@ -424,6 +493,7 @@ impl Shared {
             last_step = Some(core.world.step(SLICE_DT_S));
             drop(step_span);
             core.fluid_time_s += SLICE_DT_S;
+            self.discharge(&mut core);
             core.slice += 1;
             if core.slice == COLUMN_SLICES {
                 core.slice = 0;
@@ -477,6 +547,7 @@ impl Shared {
         }
         let (volume_m3, overfill_m3, unplaced_m3) = core.totals.unwrap_or_default();
         let active_regions = core.world.active_region_count();
+        let steady_regions = core.world.steady_region_count();
         let allocated_regions = core.world.region_count();
         let skipped_s = core.skipped_s;
         drop(core);
@@ -494,6 +565,7 @@ impl Shared {
         published.overfill_m3 = overfill_m3;
         published.unplaced_m3 = unplaced_m3;
         published.active_regions = active_regions;
+        published.steady_regions = steady_regions;
         published.allocated_regions = allocated_regions;
         published.skipped_s = skipped_s;
     }
@@ -535,22 +607,65 @@ impl AuthoritativeColumnWater {
         let mut world =
             ColumnWorld::with_terrain(terrain_source(terrain, &setup), sliced(setup.config));
         let rejected = world.seed_cells(&setup.initial_cells);
+        let rejected_levels = world.seed_levels(&setup.initial_levels);
         // Springs and drains need their regions allocated even in a dry world.
         let exchange_keys: BTreeSet<RegionKey> = setup
             .sources
             .iter()
             .chain(setup.gated_sources.iter().flatten())
             .chain(&setup.sinks)
+            .chain(setup.discharges.iter().map(|d| &d.cell))
             .map(|c| spall_fluid::columns::region_of(c.x, c.z))
             .collect();
         world.allocate_regions(&exchange_keys.into_iter().collect::<Vec<_>>());
         let seed = ColumnSeedReport {
-            seeded_m3: (setup.initial_cells.len() - rejected.len()) as f64 * CELL_SIZE_M.powi(3),
-            rejected_cells: rejected.len(),
+            seeded_m3: world.total_volume_m3(),
+            rejected_cells: rejected.len() + rejected_levels.len(),
         };
+        let (prewarm_s, gated_rate) = (setup.prewarm_s, setup.gated_rate);
+        // The planned water is in the solver now; keeping it in the setup would
+        // hold a second copy (tens of MB per million columns) for the world's life.
+        let mut setup = setup;
+        setup.initial_cells = Vec::new();
+        setup.initial_levels = Vec::new();
         let mut water = Self::assemble(setup, world, seed);
+        water.set_gated_sources_rate(gated_rate);
+        if prewarm_s > 0.0 {
+            water.prewarm = Some(water.run_prewarm(prewarm_s));
+        }
         water.publish_all();
         Ok(water)
+    }
+
+    /// What the start-up prewarm did, if one ran.
+    pub fn prewarm_report(&self) -> Option<PrewarmReport> {
+        self.prewarm
+    }
+
+    /// Runs `seconds` of fluid time with every region awake and the springs and
+    /// drains exchanging as they do in play. Returns the slices run.
+    fn run_prewarm(&self, seconds: f64) -> PrewarmReport {
+        let started = Instant::now();
+        let mut core = lock(&self.shared.core);
+        core.world.wake_all();
+        let slices = (seconds / SLICE_DT_S).round() as u32;
+        for _ in 0..slices {
+            core.world.step(SLICE_DT_S);
+            core.fluid_time_s += SLICE_DT_S;
+            self.shared.discharge(&mut core);
+            core.slice += 1;
+            if core.slice == COLUMN_SLICES {
+                core.slice = 0;
+                self.shared.exchange(&mut core);
+            }
+        }
+        PrewarmReport {
+            slices,
+            fluid_s: f64::from(slices) * SLICE_DT_S,
+            elapsed: started.elapsed(),
+            active_regions: core.world.active_region_count(),
+            steady_regions: core.world.steady_region_count(),
+        }
     }
 
     fn assemble(setup: ColumnWaterSetup, world: ColumnWorld, seed: ColumnSeedReport) -> Self {
@@ -595,6 +710,7 @@ impl AuthoritativeColumnWater {
                 overfill_m3: 0.0,
                 unplaced_m3: 0.0,
                 active_regions: 0,
+                steady_regions: 0,
                 allocated_regions: 0,
                 skipped_s: 0.0,
                 failure: None,
@@ -603,6 +719,7 @@ impl AuthoritativeColumnWater {
         Self {
             shared: Arc::new(shared),
             seed,
+            prewarm: None,
             worker: None,
             journal_wait_ticks: 0,
         }
@@ -762,6 +879,7 @@ impl AuthoritativeColumnWater {
         metrics.overfill_m3 = published.overfill_m3;
         metrics.unplaced_m3 = published.unplaced_m3;
         metrics.active_regions = published.active_regions;
+        metrics.steady_regions = published.steady_regions;
         metrics.allocated_regions = published.allocated_regions;
         metrics.skipped_s = published.skipped_s;
         metrics.frame_seq = published.frame.seq;
@@ -845,6 +963,14 @@ impl AuthoritativeColumnWater {
             gated_sources: setup.gated_sources.each_ref().map(|v| coords(v)),
             sinks: coords(&setup.sinks),
             gated_rate: self.shared.gated_rate(),
+            discharges: setup
+                .discharges
+                .iter()
+                .map(|d| spall_protocol::column_water::DischargeRecord {
+                    cell: [d.cell.x, d.cell.y, d.cell.z],
+                    flow_fixed: spall_protocol::column_water::discharge_to_fixed(d.flow_cells3_s),
+                })
+                .collect(),
         }
     }
 
@@ -870,6 +996,14 @@ impl AuthoritativeColumnWater {
         setup.sources = cells(&state.sources);
         setup.gated_sources = state.gated_sources.each_ref().map(|v| cells(v));
         setup.sinks = cells(&state.sinks);
+        setup.discharges = state
+            .discharges
+            .iter()
+            .map(|d| Discharge {
+                cell: GlobalCell::new(d.cell[0], d.cell[1], d.cell[2]),
+                flow_cells3_s: spall_protocol::column_water::discharge_from_fixed(d.flow_fixed),
+            })
+            .collect();
         check_setup(&setup)?;
         let mut world = ColumnWorld::with_terrain(terrain_source(terrain, &setup), sliced(config));
         let keys: Vec<RegionKey> = state.regions.iter().map(|r| (r.rx, r.rz)).collect();
@@ -878,6 +1012,7 @@ impl AuthoritativeColumnWater {
             .iter()
             .chain(setup.gated_sources.iter().flatten())
             .chain(&setup.sinks)
+            .chain(setup.discharges.iter().map(|d| &d.cell))
             .map(|c| spall_fluid::columns::region_of(c.x, c.z))
             .collect();
         let mut keys = keys;

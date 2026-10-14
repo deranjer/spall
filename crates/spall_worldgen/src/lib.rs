@@ -13,18 +13,24 @@
 //! [`WorldgenPalette`].
 
 pub mod caves;
+pub mod climate;
 pub mod columns;
 pub mod debug;
+pub mod erosion;
 pub mod generate;
+pub mod hydrology;
+pub mod landform;
+pub mod landscape;
 pub mod noise;
+pub mod rivers;
 pub mod spec;
 
-pub use columns::{Biome, ColumnMap, SNOW_LINE};
+pub use columns::{Biome, ColumnMap, GalleryPatch, SNOW_LINE, gallery_patches};
 pub use generate::{
-    GeneratedWorld, GenerationTimings, SPAWN_HEADROOM_CELLS, WATER_DOMAIN_BUDGET, WaterPlan,
-    generate, generate_with_timings,
+    GeneratedWorld, GenerationTimings, SPAWN_HEADROOM_CELLS, Spring, WATER_REGION_BUDGET,
+    WaterPlan, WetColumn, generate, generate_with_timings,
 };
 pub use spec::{
-    BORDER_CELLS, GEN_VERSION, GenError, HEIGHT_CELLS, Preset, SEA_LEVEL, SHOWCASE_SIZE_CELLS,
-    WALL_TOP, WorldGenSpec, WorldgenPalette,
+    BORDER_CELLS, GEN_VERSION, GenError, MAX_HEIGHT_BRICKS, NATURAL_GEN_VERSION, Preset, SEA_LEVEL,
+    SHOWCASE_HEIGHT_BRICKS, SHOWCASE_SIZE_CELLS, WorldGenSpec, WorldgenPalette,
 };

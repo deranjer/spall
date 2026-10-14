@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v.parse::<u32>())
         .transpose()?
         .unwrap_or(512);
-    let scene = sandbox::worldgen_scene::generate("showcase", 1, size)?;
+    let scene = sandbox::worldgen_scene::generate("gallery", 1, size)?;
     let state = scene.vegetation();
     let mut materials = spall_render::materials_from_manifest(&sandbox::game::manifest());
     let colour_base = materials.len() as u32;
@@ -46,94 +46,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Season::Winter, "winter"),
     ] {
         for tree in [true, false] {
-            let mut geometry = Vec::new();
-            let mut ids = Vec::new();
             let spacing = if tree { 5.5 } else { 1.0 };
-            for (slot, s) in state.species.iter().filter(|s| s.tree == tree).enumerate() {
-                let Some(p) = state
-                    .organisms
-                    .iter()
-                    .filter(|p| p.species == s.id)
-                    .max_by_key(|p| p.committed)
-                else {
-                    return Err(format!("missing specimen {}", s.id).into());
-                };
-                ids.push(s.id);
-                let delta = Vec3::new(
-                    slot as f32 * spacing - p.root[0] as f32 * 0.25,
-                    -p.root[1] as f32 * 0.25,
-                    -p.root[2] as f32 * 0.25,
+            let all: Vec<_> = state.species.iter().filter(|s| s.tree == tree).collect();
+            // Ten specimens fill a frame; a larger catalogue takes several pages.
+            for (page, chunk) in all.chunks(10).enumerate() {
+                let mut geometry = Vec::new();
+                let mut ids = Vec::new();
+                for (slot, s) in chunk.iter().enumerate() {
+                    let Some(p) = state
+                        .organisms
+                        .iter()
+                        .filter(|p| p.species == s.id)
+                        .max_by_key(|p| p.committed)
+                    else {
+                        return Err(format!("missing specimen {}", s.id).into());
+                    };
+                    ids.push(s.id);
+                    let delta = Vec3::new(
+                        slot as f32 * spacing - p.root[0] as f32 * 0.25,
+                        -p.root[1] as f32 * 0.25,
+                        -p.root[2] as f32 * 0.25,
+                    );
+                    for at in p.wood.iter().take(usize::from(p.committed)) {
+                        geometry.push(CubeInstance::new(
+                            (Vec3::from_array(at.map(|v| v as f32 * 0.25 + 0.125)) + delta)
+                                .to_array(),
+                            u32::from(s.wood),
+                            [0.25; 3],
+                            CubeInstance::IDENTITY_ROTATION,
+                        ));
+                    }
+                    let mut frame = state.visual(&scene.world().terrain);
+                    frame.season = season;
+                    frame.plants.retain(|plant| plant.id == p.id);
+                    // Specimens are shown fully grown.
+                    for plant in &mut frame.plants {
+                        plant.biomass = 1000;
+                    }
+                    for part in
+                        frame.parts([p.root[0] as f32 * 0.25, 0., p.root[2] as f32 * 0.25], 30.)
+                    {
+                        geometry.push(CubeInstance::new(
+                            (Vec3::from_array(part.center) + delta).to_array(),
+                            colour_base + u32::from(part.colour),
+                            part.size,
+                            (Quat::from_rotation_y(part.yaw) * Quat::from_rotation_z(part.lean))
+                                .to_array(),
+                        ));
+                    }
+                }
+                geometry.push(CubeInstance::new(
+                    [4.5 * spacing, -0.125, 0.],
+                    104,
+                    [10. * spacing + 4., 0.25, 8.],
+                    CubeInstance::IDENTITY_ROTATION,
+                ));
+                let center = Vec3::new(4.5 * spacing, if tree { 4.0 } else { 0.65 }, 0.);
+                let eye = center
+                    + Vec3::new(0., if tree { 5. } else { 1.8 }, if tree { 29. } else { 6. });
+                let camera = Camera::looking_along(
+                    eye,
+                    center - eye,
+                    50_f32.to_radians(),
+                    width as f32 / height as f32,
                 );
-                for at in p.wood.iter().take(usize::from(p.committed)) {
-                    geometry.push(CubeInstance::new(
-                        (Vec3::from_array(at.map(|v| v as f32 * 0.25 + 0.125)) + delta).to_array(),
-                        u32::from(s.wood),
-                        [0.25; 3],
-                        CubeInstance::IDENTITY_ROTATION,
-                    ));
-                }
-                let mut frame = state.visual(&scene.world().terrain);
-                frame.season = season;
-                frame.plants.retain(|plant| plant.id == p.id);
-                for part in frame.parts([p.root[0] as f32 * 0.25, 0., p.root[2] as f32 * 0.25], 30.)
-                {
-                    geometry.push(CubeInstance::new(
-                        (Vec3::from_array(part.center) + delta).to_array(),
-                        colour_base + u32::from(part.colour),
-                        part.size,
-                        (Quat::from_rotation_y(part.yaw) * Quat::from_rotation_z(part.lean))
-                            .to_array(),
-                    ));
-                }
+                let (solid, soft): (Vec<_>, Vec<_>) = geometry
+                    .iter()
+                    .copied()
+                    .partition(|part| part.material < colour_base);
+                renderer.set_terrain(&ctx.device, &ctx.queue, &solid);
+                let soft = spall_render::compact_vegetation_instances(soft);
+                renderer.set_vegetation(&ctx.device, &ctx.queue, &soft);
+                let mut encoder =
+                    ctx.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("seasonal-vegetation-evidence"),
+                        });
+                renderer.render(
+                    &ctx.device,
+                    &ctx.queue,
+                    &mut encoder,
+                    target.color_view(),
+                    &camera,
+                    &EnvironmentPreset::Daylight.environment(),
+                    DebugView::Shaded,
+                );
+                target.copy_to_readback(&mut encoder);
+                ctx.queue.submit([encoder.finish()]);
+                let rgba = target.read_rgba(&ctx)?;
+                let group = if tree { "trees" } else { "ground" };
+                image::save_buffer(
+                    std::path::Path::new(&output).join(format!("{group}-{name}-{page}.png")),
+                    &rgba,
+                    width,
+                    height,
+                    image::ColorType::Rgba8,
+                )?;
+                summary.push(serde_json::json!({"group":group,"season":name,"species":ids,"instances":geometry.len()}));
             }
-            geometry.push(CubeInstance::new(
-                [4.5 * spacing, -0.125, 0.],
-                104,
-                [10. * spacing + 4., 0.25, 8.],
-                CubeInstance::IDENTITY_ROTATION,
-            ));
-            let center = Vec3::new(4.5 * spacing, if tree { 4.0 } else { 0.65 }, 0.);
-            let eye =
-                center + Vec3::new(0., if tree { 5. } else { 1.8 }, if tree { 29. } else { 6. });
-            let camera = Camera::looking_along(
-                eye,
-                center - eye,
-                50_f32.to_radians(),
-                width as f32 / height as f32,
-            );
-            let (solid, soft): (Vec<_>, Vec<_>) = geometry
-                .iter()
-                .copied()
-                .partition(|part| part.material < colour_base);
-            renderer.set_terrain(&ctx.device, &ctx.queue, &solid);
-            let soft = spall_render::compact_vegetation_instances(soft);
-            renderer.set_vegetation(&ctx.device, &ctx.queue, &soft);
-            let mut encoder = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("seasonal-vegetation-evidence"),
-                });
-            renderer.render(
-                &ctx.device,
-                &ctx.queue,
-                &mut encoder,
-                target.color_view(),
-                &camera,
-                &EnvironmentPreset::Daylight.environment(),
-                DebugView::Shaded,
-            );
-            target.copy_to_readback(&mut encoder);
-            ctx.queue.submit([encoder.finish()]);
-            let rgba = target.read_rgba(&ctx)?;
-            let group = if tree { "trees" } else { "ground" };
-            image::save_buffer(
-                std::path::Path::new(&output).join(format!("{group}-{name}.png")),
-                &rgba,
-                width,
-                height,
-                image::ColorType::Rgba8,
-            )?;
-            summary.push(serde_json::json!({"group":group,"season":name,"species":ids,"instances":geometry.len()}));
         }
     }
     let eye = Vec3::from_array(scene.player_spawns()[0].map(|v| v as f32)) + Vec3::Y * 1.7;
@@ -214,7 +224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         summary.push(serde_json::json!({"group":"generated-world","season":name,"terrain_meshes":terrain_meshes.len(),"terrain_mesh_ms":terrain_mesh_ms,"soft_instances":soft.len(),"eye":eye.to_array()}));
     }
-    let counts:Vec<_>=state.species.iter().map(|s|serde_json::json!({"id":s.id,"name":sandbox::vegetation::NAMES[usize::from(s.id)-1],"count":state.organisms.iter().filter(|p|p.species==s.id).count()})).collect();
+    let counts:Vec<_>=state.species.iter().map(|s|serde_json::json!({"id":s.id,"name":sandbox::vegetation::name(s.id),"count":state.organisms.iter().filter(|p|p.species==s.id).count()})).collect();
     std::fs::write(
         std::path::Path::new(&output).join("summary.json"),
         serde_json::to_vec_pretty(

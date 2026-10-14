@@ -2,6 +2,8 @@
 //! cuts the biggest lake's shore and reports whole-tick and fluid-step wall
 //! time, steps run and fluid time skipped, per phase of the run.
 //! `cargo run --release -p sandbox --example water_tick_cost_probe -- SIZE SEED SECONDS`
+//! `PRESET=natural` picks the world; `IDLE=SECONDS` runs a quiet world and lists
+//! every tick over 30 ms (with `VEG=1` that shows what tree growth costs).
 use std::time::Instant;
 
 use sandbox::worldgen_scene;
@@ -23,7 +25,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let size: u32 = a.first().map_or(Ok(1024), |s| s.parse())?;
     let seed: u64 = a.get(1).map_or(Ok(7), |s| s.parse())?;
     let seconds: u32 = a.get(2).map_or(Ok(60), |s| s.parse())?;
-    let scene = worldgen_scene::generate("showcase", seed, size)?;
+    let scene = worldgen_scene::generate(
+        &std::env::var("PRESET").unwrap_or_else(|_| "showcase".into()),
+        seed,
+        size,
+    )?;
     let mut setup = scene.column_water_setup().ok_or("dry world")?.clone();
     // NOSLEEP=1 keeps every region awake: the upper bound on fluid work.
     if std::env::var("NOSLEEP").is_ok() {
@@ -39,8 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut sim = Simulation::new(config)?;
     let plan = &scene.world().water;
-    let wet: std::collections::HashSet<(i64, i64)> =
-        plan.cells.iter().map(|c| (c.x, c.z)).collect();
+    let wet: std::collections::HashSet<(i64, i64)> = plan.cells().map(|c| (c.x, c.z)).collect();
     let shore = wet
         .iter()
         .copied()
@@ -79,7 +84,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(secs) = std::env::var("IDLE") {
         let secs: u32 = secs.parse()?;
         for tick in 0..secs * 60 {
+            let started = Instant::now();
             let r = sim.tick()?;
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            if ms > 30.0 {
+                let spans = spall_sim::prof::drain();
+                let mut top: Vec<_> = spans
+                    .iter()
+                    .filter(|(_, d)| d.as_secs_f64() * 1e3 > 5.0)
+                    .collect();
+                top.sort_by_key(|e| std::cmp::Reverse(e.1));
+                let m = r.column_water.as_ref().unwrap();
+                println!(
+                    "  slow tick {tick} ({:.1}s): {ms:.0} ms [{}] refresh {:.0} ms, fluid {:.0} ms, active {}",
+                    f64::from(tick) / 60.0,
+                    top.iter()
+                        .take(3)
+                        .map(|(n, d)| format!("{n} {:.0}", d.as_secs_f64() * 1e3))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    m.boundary_refresh.as_secs_f64() * 1e3,
+                    m.step_duration.as_secs_f64() * 1e3,
+                    m.active_regions
+                );
+            }
             if tick % 600 == 0 {
                 let m = r.column_water.unwrap();
                 println!(

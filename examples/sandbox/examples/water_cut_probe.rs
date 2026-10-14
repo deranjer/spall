@@ -72,8 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<i64>().ok())
     {
         let plan = &scene.world().water;
-        let wet: std::collections::HashSet<(i64, i64)> =
-            plan.cells.iter().map(|c| (c.x, c.z)).collect();
+        let wet: std::collections::HashSet<(i64, i64)> = plan.cells().map(|c| (c.x, c.z)).collect();
         let shore = wet
             .iter()
             .copied()
@@ -84,8 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for dx in 0..n {
                 let (x, z) = (shore.0 - 4 - dx, shore.1 + dz);
                 let low = plan
-                    .cells
-                    .iter()
+                    .cells()
                     .filter(|c| c.x == x && c.z == z)
                     .map(|c| c.y)
                     .min();
@@ -111,8 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plan = &scene.world().water;
     let (lo, hi) = plan.bounds.ok_or("no water")?;
     // A shore column of the biggest lake: wet with a dry +x neighbour.
-    let wet: std::collections::HashSet<(i64, i64)> =
-        plan.cells.iter().map(|c| (c.x, c.z)).collect();
+    let wet: std::collections::HashSet<(i64, i64)> = plan.cells().map(|c| (c.x, c.z)).collect();
     let shore = wet
         .iter()
         .copied()

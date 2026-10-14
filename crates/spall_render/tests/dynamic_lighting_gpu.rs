@@ -36,7 +36,12 @@ fn ground() -> CubeInstance {
 }
 
 fn terrain_occupancy(boxes: &[CubeInstance]) -> LightingVolume {
-    let mut volume = LightingVolume::empty(cache_origin_around(Vec3::ZERO));
+    occupancy_around(Vec3::ZERO, boxes)
+}
+
+/// The same boxes in a cache centred on `center` (they keep their world places).
+fn occupancy_around(center: Vec3, boxes: &[CubeInstance]) -> LightingVolume {
+    let mut volume = LightingVolume::empty(cache_origin_around(center));
     for b in boxes {
         let (c, h) = (Vec3::from_array(b.offset), Vec3::from_array(b.size) * 0.5);
         mark_world_box(&mut volume, c - h, c + h, b.material);
@@ -98,6 +103,16 @@ impl<'a> Session<'a> {
         view: DebugView,
         terrain: &[CubeInstance],
     ) -> Self {
+        Self::new_with(ctx, environment, view, terrain, terrain_occupancy(terrain))
+    }
+
+    fn new_with(
+        ctx: &'a RenderContext,
+        environment: Environment,
+        view: DebugView,
+        terrain: &[CubeInstance],
+        occupancy: LightingVolume,
+    ) -> Self {
         let mut renderer = GameRenderer::new(
             &ctx.device,
             &ctx.queue,
@@ -107,7 +122,7 @@ impl<'a> Session<'a> {
             None,
         );
         renderer.set_terrain(&ctx.device, &ctx.queue, terrain);
-        renderer.set_sky_occupancy(&ctx.device, &ctx.queue, Some(&terrain_occupancy(terrain)));
+        renderer.set_sky_occupancy(&ctx.device, &ctx.queue, Some(&occupancy));
         Self {
             ctx,
             renderer,
@@ -147,7 +162,7 @@ impl<'a> Session<'a> {
     fn settle(&mut self, bodies: &[CubeInstance]) -> (u32, Vec<u8>) {
         let mut used = 1;
         self.frame(bodies);
-        while self.renderer.lighting_is_sweeping() && used < 60 {
+        while self.renderer.lighting_is_sweeping() && used < 400 {
             self.frame(bodies);
             used += 1;
         }
@@ -235,8 +250,8 @@ fn a_body_blocks_skylight_and_leaves_no_trail() {
         "removing the body must restore the open frame exactly: mean {mean}, max {max}"
     );
     assert!(
-        shade_frames <= 12,
-        "a sliced sweep should take about 8 frames: {shade_frames}"
+        shade_frames <= 140,
+        "a sliced sweep takes at most 128 frames (32 before the GPU is timed): {shade_frames}"
     );
 }
 
@@ -608,7 +623,7 @@ fn a_terrain_edit_is_lit_within_one_sweep() {
         frame_ms.iter().sum::<f64>() / frame_ms.len() as f64
     );
     assert!(under < open_luma * 0.6, "the edit must be lit: {under}");
-    assert!(frames <= 10, "one sliced sweep: {frames} frames");
+    assert!(frames <= 140, "one sliced sweep: {frames} frames");
 }
 
 /// A change (a body arriving) that lands *while* an unrelated sweep (a terrain
@@ -644,7 +659,7 @@ fn a_change_arriving_during_an_active_sweep_is_not_lost() {
     session.frame(&[body]); // the body's cells are diffed in during that sweep
 
     let mut frames = 1;
-    while session.renderer.lighting_is_sweeping() && frames < 60 {
+    while session.renderer.lighting_is_sweeping() && frames < 400 {
         session.frame(&[body]);
         frames += 1;
     }
@@ -708,7 +723,7 @@ fn repeated_camera_recentres_each_complete_and_the_last_one_wins() {
 
     // Run to completion: every queued re-centre must finish, not get stuck.
     let mut frames = 0;
-    while session.renderer.lighting_is_sweeping() && frames < 80 {
+    while session.renderer.lighting_is_sweeping() && frames < 400 {
         session.frame(&[]);
         frames += 1;
     }
@@ -729,5 +744,51 @@ fn repeated_camera_recentres_each_complete_and_the_last_one_wins() {
     assert!(
         luma > 0.3,
         "the last re-centre's result must be what shading ends up showing: {luma}"
+    );
+}
+
+/// Re-centring the cache carries over the bounce of the cells that stay inside
+/// it and lights only what entered (and a margin at the old edge): the image
+/// after a scroll matches a cache built at the new origin from scratch, in a
+/// fraction of the frames.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn a_scrolled_recentre_matches_a_fresh_cache_at_the_new_origin() {
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored test");
+    let slab = boxed(WHITE, [0.0, 2.0, 0.0], [6.0, 0.5, 6.0]);
+    let lamp = boxed(LAMP, [-3.0, 0.5, 2.0], [0.5, 0.5, 0.5]);
+    let world = [ground(), slab, lamp];
+    let environment = EnvironmentPreset::Daylight.environment();
+    let moved_center = Vec3::new(8.0, 0.0, 4.0);
+
+    let mut scrolled = Session::new(&ctx, environment, DebugView::Shaded, &world);
+    scrolled.camera = side_camera();
+    let (first_frames, before) = scrolled.settle(&[]);
+    scrolled.renderer.set_sky_occupancy(
+        &ctx.device,
+        &ctx.queue,
+        Some(&occupancy_around(moved_center, &world)),
+    );
+    let (scroll_frames, after) = scrolled.settle(&[]);
+
+    let mut fresh = Session::new_with(
+        &ctx,
+        environment,
+        DebugView::Shaded,
+        &world,
+        occupancy_around(moved_center, &world),
+    );
+    fresh.camera = side_camera();
+    let (_, reference) = fresh.settle(&[]);
+    save_png("scroll-matches-after.png", &after);
+    save_png("scroll-matches-fresh.png", &reference);
+    let (mean, max) = max_abs_diff(&after, &reference);
+    let (mean_before, _) = max_abs_diff(&before, &reference);
+    println!(
+        "first population {first_frames} frames; scroll sweep {scroll_frames} frames; scrolled vs fresh: mean {mean:.4} max {max}; before the move vs fresh: mean {mean_before:.4}"
+    );
+    assert!(
+        mean < 0.1 && max <= 12,
+        "a scrolled cache must match a fresh one: mean {mean}, max {max}"
     );
 }

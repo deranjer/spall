@@ -94,7 +94,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["scene", "editor_scene"])]
     worldgen: Option<String>,
     /// Arena edge of a `--worldgen` world in cells (0.25 m each): a multiple of
-    /// 32 from 128 to 4096. The default is 1024 (256 m).
+    /// 32 from 128 to 4096. The default is 4096 (1 km).
     #[arg(long, default_value_t = sandbox::worldgen_scene::DEFAULT_SIZE_CELLS, requires = "worldgen")]
     worldgen_size: u32,
     /// Spawn the player on solid ground beside the shore of the deepest lake
@@ -474,7 +474,9 @@ fn run_serve(args: Args) -> ExitCode {
                     size_cells = args.worldgen_size,
                     gen_version = world.version,
                     bricks = world.terrain.resident_brick_count(),
-                    water_cells = world.water.cells.len(),
+                    water_cells = world.water.cell_count(),
+                    water_springs = world.water.springs.len(),
+                    water_sinks = world.water.sinks.len(),
                     cave_mouths = world.cave_mouths.len(),
                     player_spawns = ?generated.player_spawns(),
                     generate_ms = started.elapsed().as_millis() as u64,
