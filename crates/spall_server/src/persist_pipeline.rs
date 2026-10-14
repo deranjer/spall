@@ -134,9 +134,23 @@ pub struct PersistPipeline {
 impl PersistPipeline {
     /// Takes ownership of `writer` and starts the writer thread.
     pub fn spawn(writer: Writer, config: PipelineConfig) -> Self {
+        Self::spawn_with_durable_seq(writer, config, 0)
+    }
+
+    /// Starts from a journal prefix already proven durable by store recovery.
+    /// This avoids waiting for replayed records to be written again when a
+    /// recovered world has no new journal events before clean shutdown.
+    pub fn spawn_with_durable_seq(
+        writer: Writer,
+        config: PipelineConfig,
+        durable_seq: u64,
+    ) -> Self {
         let capacity = config.queue_capacity.max(1);
         let (tx, rx) = sync_channel::<PersistJob>(capacity);
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let shared = Arc::new(Mutex::new(Shared {
+            durable_seq,
+            ..Shared::default()
+        }));
         let depth = Arc::new(AtomicUsize::new(0));
 
         let worker_shared = shared.clone();
@@ -506,6 +520,21 @@ mod tests {
         assert_eq!(out.status.durable_seq, 10);
         assert_eq!(out.status.journal_records, 10);
         assert_eq!(out.metrics.journal_commits, 10);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn recovered_durable_prefix_needs_no_rewrite_before_shutdown() {
+        let db = scratch_db("recovered-prefix");
+        let pipe = PersistPipeline::spawn_with_durable_seq(
+            Writer::open(&db).unwrap(),
+            PipelineConfig::default(),
+            17,
+        );
+        pipe.wait_durable_through(17).unwrap();
+        let out = pipe.shutdown();
+        assert_eq!(out.status.durable_seq, 17);
+        assert_eq!(out.status.journal_records, 0);
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 

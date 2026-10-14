@@ -26,4 +26,12 @@ Weather ingress compares epoch, revision and effective tick against the prior we
 
 The server keyframe cadence remains one second; a forced override is included in the next bounded keyframe, with no separate immediate-send path. The server unit scenario directly exercises the same authorization helper used by command dispatch; final live F10/two-client behavior remains for the coordinator's combined playtest. The protocol bump requires all connected clients and servers to use schema 6 together. GPU/audio performance and capture were not measured here.
 
+Restart regression found during coordinator integration: a recovered journal cursor was passed to clean-shutdown durability wait, while a fresh `PersistPipeline` incorrectly initialized its acknowledged cursor to zero. Static recovered worlds with no new journal entries therefore waited forever on a prefix the store had already proven durable. Pipeline setup now seeds its acknowledged cursor from that recovery result; new worlds still start at zero. The network fixture now bounds its post-restart server join at 45 seconds so a future regression fails with a diagnostic instead of hanging indefinitely.
+
+Additional checks for this correction:
+
+- `cargo test -p spall_server --lib recovered_durable_prefix_needs_no_rewrite_before_shutdown` — 1 passed.
+- `cargo test -p sandbox --features client --test progression_network -- --nocapture` — 1 passed; the recovered second server exited normally and the full authenticated crafting/restart scenario completed in 20.11 seconds.
+- `cargo fmt --all -- --check` — passed after formatting the fixture change.
+
 Next: coordinator integration and the combined live 1 km test.

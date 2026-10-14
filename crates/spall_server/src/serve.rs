@@ -5745,7 +5745,11 @@ fn setup_persistence_with_game_content(
             writer.acknowledge_outbox(&ids).map_err(|e| e.to_string())?;
         }
     }
-    let pipeline = PersistPipeline::spawn(writer, PipelineConfig::default());
+    let pipeline = PersistPipeline::spawn_with_durable_seq(
+        writer,
+        PipelineConfig::default(),
+        journalled_through,
+    );
     Ok(Persistence {
         sim,
         pipeline: Some(pipeline),

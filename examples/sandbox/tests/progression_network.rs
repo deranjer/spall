@@ -197,6 +197,21 @@ fn start_server(
     })
 }
 
+fn join_server_bounded(
+    server: std::thread::JoinHandle<Result<spall_server::ServeSummary, spall_server::ServeError>>,
+    context: &str,
+) -> Result<spall_server::ServeSummary, spall_server::ServeError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while !server.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server did not exit within 45s ({context})"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    server.join().expect("server thread panicked")
+}
+
 fn client_config(
     dir: &std::path::Path,
     label: &str,
@@ -521,7 +536,12 @@ fn authenticated_crafting_retries_disconnects_isolates_players_and_survives_rest
         spall_client::ClientNetError::Transport(TransportError::Auth(AuthReject::BadToken))
     ));
     assert!(!format!("{revoked:?}").contains(&second.token.to_hex()));
-    assert_eq!(server.join().unwrap().unwrap().result, "passed");
+    assert_eq!(
+        join_server_bounded(server, "post-restart server")
+            .unwrap()
+            .result,
+        "passed"
+    );
 
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
