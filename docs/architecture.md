@@ -592,6 +592,23 @@ the server's stderr log (when launched by `xtask play`, which sets
 radius, fog, LOD constants and every `SPALL_*`/`RAYON*`/`WGPU*` environment
 variable. A `report` step in `--shots` triggers it from a scripted run.
 
+Water terrain refreshes run on the water worker. Refreshing a region's terrain
+(a committed edit, or bricks becoming resident as a player walks) costs time in
+proportion to every region the water holds, not the one refreshed (a probe in
+debug: 30 ms at 196 regions, 163 ms at 784, 627 ms at 3025), and the tick did it
+under the core lock after waiting for the step in flight: during a 7.7-minute
+walk the server's ticks reached 0.4, 2.4, 2.2 and 4.9 s in `tick.water`. The tick
+now captures the terrain and queues it (`pending_terrain`); the next step applies
+it, and the refresh figures reach the tick's metrics a tick later. The same walk
+afterwards: worst slow ticks 326 ms and 305 ms (the first is the opening tick),
+none in the seconds. Active regions grow along the walk with or without the
+far-water throttle (100 to 438 with it, 93 to 382 without, over about 480 s of
+water time); with it the water ended 8 s behind real time, without it 26 s. The
+status line's `last step 0.0 ms ... (0 resting)` lines are ticks with no new step
+(the metrics are taken once), not a stalled worker. Why regions stay active along
+a walk (live rivers and their springs, regions woken as bricks come resident) is
+not investigated.
+
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
 Water tick metrics distinguish fixed-step skips for a busy worker, a stale
