@@ -371,11 +371,11 @@ const WATER_BOTTOM_TOL_M: f32 = 0.03;
 
 // Coarse terrain meshes (see spall_client's terrain LOD) lie up to a quarter of
 // their block below the true bed, which the water field holds: farther than
-// 30 m the margin grows with distance (0.14 m at 40 m, 0.5 m at 72 m) so a
+// 30 m the margin grows with distance (0.2 m at 40 m, 0.84 m at 72 m) so a
 // fragment of a far lake bed is not mistaken for a dry space under the pool,
 // which drew it unfogged and bright.
 fn water_bottom_tol(distance_m: f32) -> f32 {
-    return WATER_BOTTOM_TOL_M + 0.011 * max(distance_m - 30.0, 0.0);
+    return WATER_BOTTOM_TOL_M + 0.02 * max(distance_m - 30.0, 0.0);
 }
 
 // Size of the faint grain cells on the water surface (one voxel) and how strong
