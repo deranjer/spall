@@ -78,4 +78,9 @@ Press `F` to toggle the free camera; use the mouse to look, `W/A/S/D` to move, `
 - `cargo check -p sandbox --features client --bin sandbox-client`: passed.
 - `cargo check -p sandbox --bin sandbox-server`: passed with the client feature and audio runtime absent.
 - `cargo fmt --package spall_client --package sandbox -- --check`: run after source formatting.
-- Hardware output and portable release packaging have not been playtested in this worktree; the coordinator will run release/package checks after integration.
+- Coordinator integration: fetched `origin/main` again and fast-forwarded the primary checkout to the reviewed implementation. All 19 original recording hashes still match the approved-file audit.
+- `cargo xtask check`: passed formatting, strict workspace Clippy and the full test suite: 1,334 passed, zero failed, 98 ignored across 154 test-result suites. Ignored hardware/performance gates are not claimed as passed.
+- Full decode of all 19 normalized runtime Oggs with `ffmpeg -nostdin -v error -i <file> -map 0:a:0 -f null -`: all exited zero with no warnings. This verifies decoding, not audible quality or seamless loop edits.
+- `cargo tree -p sandbox --no-default-features --edges normal --prefix none --locked`: verified no `rodio`, `cpal`, `wgpu` or `winit` in the headless game graph.
+- `tools/package-portable.ps1`: passed release builds for editor, launcher, server and client. All 21 packaged audio/catalogue/credit files match source SHA256 hashes; all 19 original recording hashes remain unchanged. Recording attribution, source and direct license links are included in `assets/audio/CREDITS.md`.
+- Hardware output, audible transitions and recording suitability remain for the user's playtest. The automatic tests do not establish speaker output or sound quality.
