@@ -501,7 +501,10 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
         movement_script: vec![],
         late_join: true,
         baseline_scene: BaselineScene::Walk,
-        run_ticks: 600,
+        // The server stops at tick 900 and a client joins late: on a slow machine
+        // 600 more ticks after joining ran past it ("connection lost"); the test
+        // needs only the first keyframes.
+        run_ticks: 240,
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_secs(60),
         log_json: dir.join("whole.jsonl"),
