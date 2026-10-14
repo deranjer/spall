@@ -506,7 +506,10 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
         baseline_scene: BaselineScene::Walk,
         run_ticks: 600,
         idle_grace: Duration::from_millis(500),
-        overall_timeout: Duration::from_secs(60),
+        // CI runs this beside a dozen other worlds on a few cores, with ticks of
+        // 50-90 ms: the clients' 600 ticks took over a minute and the old 60 s
+        // limit closed the connection under them.
+        overall_timeout: Duration::from_secs(240),
         log_json: dir.join("whole.jsonl"),
         summary_json: None,
         transport: TransportConfig::for_tests(),
