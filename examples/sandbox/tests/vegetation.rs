@@ -467,7 +467,10 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
         token,
     );
     config.custom_world = Some(world);
-    config.max_ticks = 900;
+    // A client joins late and then runs 600 ticks; the server must outlast it on a
+    // slow machine (on CI 900 ended before a slow join finished: "connection lost"
+    // in every run), so it runs 1500.
+    config.max_ticks = 1500;
     config.quiescence_ticks = 0;
     config.paced = true;
     config.fingerprint_out = Some(fp.clone());
