@@ -448,6 +448,37 @@ fn classify(
     }
 }
 
+/// Fresh water stands level, and a bank lower than the water beside it lets it
+/// run out: a river on a side slope, or a lake whose rim a river channel was cut
+/// through, left dry columns up to 40 cells below the surface next to the water,
+/// and the solver, started from this plan, spilled it over them in a curtain and
+/// went on draining the lake. Every dry column beside fresh water is raised to
+/// the highest water surface it touches (a levee), so the plan is at rest. The
+/// sea is left to the shore; wet neighbours at different levels (rapids and
+/// falls) are left as they are. Each raised column depends only on the
+/// original columns, not on the order they are visited.
+fn raise_banks(heights: &mut [u16], water: &[u16], n: usize) {
+    let fresh = u16::try_from(SEA_LEVEL + 1).unwrap_or(u16::MAX);
+    let wet = |heights: &[u16], i: usize| water[i] > heights[i];
+    let mut raise = vec![0u16; n * n];
+    for z in 1..n - 1 {
+        for x in 1..n - 1 {
+            let i = x + n * z;
+            if !wet(heights, i) || water[i] <= fresh {
+                continue;
+            }
+            for j in [i - 1, i + 1, i - n, i + n] {
+                if !wet(heights, j) && heights[j] < water[i] && raise[j] < water[i] {
+                    raise[j] = water[i];
+                }
+            }
+        }
+    }
+    for (h, &r) in heights.iter_mut().zip(&raise) {
+        *h = (*h).max(r);
+    }
+}
+
 pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
     let size = spec.size_cells;
     let n = size as usize;
@@ -516,6 +547,8 @@ pub(super) fn compute(spec: &WorldGenSpec) -> Result<ColumnMap, GenError> {
             });
         }
     });
+
+    raise_banks(&mut heights, &water_surface, n);
 
     let mut map = ColumnMap {
         size,

@@ -49,6 +49,20 @@ sandbox-server --serve ... --worldgen showcase --seed 1 [--worldgen-size 512]
   spawns and cave mouths are kept strictly inside it (water columns in the wall
   are dropped). The arena edge given in `size_cells` includes the wall.
 
+## Natural: banks at rest (version 6)
+Fresh water stands level, so a bank lower than the water beside it lets it run
+out. Through version 5 a river on a side slope, or a lake whose rim a river
+channel was cut through, left dry columns up to 40 cells below the surface next
+to the water (about 2,000-8,000 columns a world, 5-8 cells at the worst
+places that mattered), and the solver started from that plan spilled the water
+over them in a curtain and went on draining the lake. `raise_banks`
+(`columns/natural.rs`) runs after the heights and water surfaces are computed and
+raises every dry column beside fresh water (surface above sea level plus one) to
+the highest water surface it touches: a levee, one column wide, never lower than
+before. It depends only on the original columns, so it does not depend on
+visiting order. The sea is left to the shore, and wet neighbours at different
+levels (rapids and falls) are unchanged. The version is 6.
+
 ## Pipeline
 1. `columns.rs` (2D, cheap, previewable): layout weights from warped
    normalized coordinates -> height, `Biome`, basin weight, surface `Stack`.
