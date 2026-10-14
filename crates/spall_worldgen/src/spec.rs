@@ -13,7 +13,7 @@ pub const GEN_VERSION: u32 = 3;
 /// Generation version of [`Preset::Gallery`].
 pub const GALLERY_GEN_VERSION: u32 = 1;
 /// Generation version of [`Preset::Natural`].
-pub const NATURAL_GEN_VERSION: u32 = 6;
+pub const NATURAL_GEN_VERSION: u32 = 7;
 
 /// Edge of a brick in cells (mirrors `spall_core::BRICK_EDGE`).
 pub const BRICK: i64 = 32;
