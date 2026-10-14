@@ -774,6 +774,7 @@ fn run_interactive(args: Args) -> ExitCode {
             shots_dir: args.shots_dir.clone(),
             day_night_cycle: Some(args.environment.is_none()),
             view_distance_m: Some(args.view_distance),
+            biome_audio: sandbox::audio::config(),
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,

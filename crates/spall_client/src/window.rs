@@ -40,6 +40,7 @@ use yakui_wgpu::{SurfaceInfo as YakuiSurfaceInfo, YakuiWgpu};
 use yakui_winit::YakuiWinit;
 
 use crate::ClientError;
+use crate::audio::{AmbienceAudio, BiomeAudioConfig};
 use crate::day_night::environment_for_clock;
 use crate::interactive::{InteractiveSession, InteractiveView, LiveInput};
 use crate::net::{
@@ -157,6 +158,8 @@ pub struct InteractiveOptions {
     /// How far (metres) terrain and water are drawn; `None` keeps the
     /// default. Clamped to [`MIN_VIEW_DISTANCE_M`]..=[`MAX_VIEW_DISTANCE_M`].
     pub view_distance_m: Option<f32>,
+    /// Game-owned ambience catalogue indexed by stable biome code.
+    pub biome_audio: BiomeAudioConfig,
 }
 
 /// One step of a scripted screenshot tour (see [`parse_shots`]).
@@ -429,6 +432,12 @@ struct InteractiveApp {
     /// Material index of the debug overlay colour (one past the manifest).
     debug_material: u32,
     uncapped: bool,
+    ambience: Option<AmbienceAudio>,
+    biome_audio: BiomeAudioConfig,
+    ambience_field: Option<spall_ecology::cover::CoverField>,
+    ambience_grid: Option<spall_ecology::cover::CoverGrid>,
+    ambience_check_at: Instant,
+    ambience_track: Option<PathBuf>,
     /// When the last frame was requested, for the uncapped frame limiter.
     last_redraw: Instant,
     /// Scripted camera tour (`--shots`); empty for normal play.
@@ -1654,6 +1663,7 @@ impl InteractiveApp {
             lighting_index.clone(),
         )?;
         let body_worker = BodyWorker::spawn(session.clone())?;
+        let ambience = AmbienceAudio::start(0.2);
         Ok(Self {
             session,
             window: None,
@@ -1663,6 +1673,12 @@ impl InteractiveApp {
             render_materials,
             debug_material,
             uncapped: options.uncapped,
+            ambience,
+            biome_audio: options.biome_audio,
+            ambience_field: None,
+            ambience_grid: None,
+            ambience_check_at: Instant::now() - Duration::from_secs(1),
+            ambience_track: None,
             last_redraw: Instant::now(),
             script: options.shots.into(),
             shots_dir: options.shots_dir,
@@ -1725,6 +1741,75 @@ impl InteractiveApp {
 
     fn view_dir(&self) -> [f32; 3] {
         view_dir_from(self.yaw, self.pitch)
+    }
+
+    /// Refreshes the cached climate raster at 4 Hz, expanding it only when
+    /// the compressed replicated field changes (the visual frame itself is
+    /// replaced more often). Invalid, empty, non-finite, and out-of-world
+    /// samples resolve to silence.
+    fn update_ambience(&mut self) {
+        if self.ambience_check_at.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.ambience_check_at = Instant::now();
+        let field = self
+            .session
+            .vegetation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|frame| frame.field.clone());
+        if field != self.ambience_field {
+            self.ambience_grid = field.as_ref().and_then(|field| {
+                if field.is_empty() {
+                    None
+                } else {
+                    match field.expand() {
+                        Ok(grid) if grid.width() > 0 => Some(grid),
+                        Ok(_) => None,
+                        Err(error) => {
+                            tracing::warn!(%error, "invalid climate field for ambience lookup");
+                            None
+                        }
+                    }
+                }
+            });
+            self.ambience_field = field;
+        }
+
+        let position = self
+            .fly_eye
+            .map(|eye| [f64::from(eye.x), f64::from(eye.y), f64::from(eye.z)])
+            .or_else(|| {
+                self.session
+                    .view
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .map(|view| view.predicted.position_m)
+            });
+        let track = position.and_then(|position| {
+            let field = self.ambience_field.as_ref()?;
+            let grid = self.ambience_grid.as_ref()?;
+            let biome = crate::audio::biome_at(field, grid, position)?;
+            self.biome_audio.track(biome).cloned()
+        });
+        if track != self.ambience_track {
+            let sent = self
+                .ambience
+                .as_ref()
+                .map(|audio| audio.set_track(track.clone()));
+            match sent {
+                Some(Err(std::sync::mpsc::TrySendError::Full(_))) => return,
+                Some(Err(std::sync::mpsc::TrySendError::Disconnected(_))) => {
+                    tracing::warn!("ambience worker stopped; continuing without audio");
+                    self.ambience = None;
+                }
+                _ => {}
+            }
+            tracing::info!(track = ?track, "biome ambience selection changed");
+            self.ambience_track = track;
+        }
     }
 
     /// Switches between walking the authoritative player and a free
@@ -2378,6 +2463,7 @@ impl ApplicationHandler for InteractiveApp {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
+                self.update_ambience();
                 let handler_started = now;
                 self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);

@@ -3,6 +3,8 @@
 pub mod appearance;
 pub mod appearance_extensions;
 pub mod appearance_v3;
+#[cfg(feature = "client")]
+pub mod audio;
 pub mod content;
 pub mod editor_scene;
 /// Minimal game content (material catalog, player tools) that turns tool use

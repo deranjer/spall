@@ -1629,3 +1629,10 @@ exact hash, so an unfinished catalogue fails the run. Client summaries report
 `catalogue_complete_ms`, `catalogue_compressed_bytes`, `catalogue_pending_at_end` and the
 transactions still held at the end. The original `eng114-regional-1024m-impaired` still fails its
 30 s join by design of its transport profile; see reports/ENG-114-startup-streaming.md.
+# ENG-194 audio checks
+
+`cargo test -p spall_client audio::tests` covers crossfade boundaries,
+same-track reuse and invalid/out-of-world biome samples. The sandbox client
+tests verify every mapped biome file and decode initial samples from all 19
+packaged accepted recordings without requiring an audio device. The manual
+output-device playtest is documented in [ENG-194](reports/ENG-194-biome-audio.md).

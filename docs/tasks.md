@@ -438,6 +438,9 @@ persisted content manifests; (6) build survival inventory, gathering,
 crafting, and progression scenarios. Keep these as separate content work; do
 not fold UI/editor work into T25.
 
+**ENG-194 follow-up - biome ambience:** The sandbox owns a provenance-tracked audio catalogue and maps accepted nature recordings to the thirteen worldgen biomes. The client streams the selected replicated biome ambience with a bounded crossfade; weather remains catalogued for later work, and Snow/Scree are silent. See docs/reports/ENG-194-biome-audio.md.
+
+
 **Increment 2 (versioned server action catalog):** `spall_server::ToolCatalog`
 stores validated unique tool IDs, an explicit catalog version, allowed edit
 kind/material, maximum brush radius, and aim reach. The ordinary `serve`

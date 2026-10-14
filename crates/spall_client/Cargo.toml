@@ -23,6 +23,7 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", 
 tracing.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+rodio = { version = "0.21.1", default-features = false, features = ["playback", "symphonia-ogg", "symphonia-vorbis"] }
 glam.workspace = true
 bytemuck.workspace = true
 pollster = "0.4.0"

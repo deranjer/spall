@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "provenance_report": "docs/reports/ENG-194-biome-audio.md",
+  "source_archive": "artifacts/audio-research/download-audit.json",
+  "approved_original_count": 19,
+  "auditioned": false,
+  "weather_auto_play": false,
+  "assets": [
+    {"file":"biomes/meadow-pipit.ogg","kind":"biome","biomes":["Meadow"],"original":"terrestrial/meadow-pipit.ogg","creator":"Aubrey John Williams; British Library Board","license":"CC BY-SA 4.0","source":"https://commons.wikimedia.org/wiki/File:Meadow_Pipit_(Anthus_pratensis)_(W1CDR0001526_BD4).ogg","default":true},
+    {"file":"biomes/alpine-chiffchaff.ogg","kind":"biome","biomes":["Alpine"],"original":"terrestrial/Phylloscopus_collybita_-_Common_Chiffchaff_XC501590.mp3","creator":"Diana Doyle","license":"CC BY-SA 4.0","source":"https://commons.wikimedia.org/wiki/File:Phylloscopus_collybita_-_Common_Chiffchaff_XC501590.mp3","default":true},
+    {"file":"biomes/temperate-forest.ogg","kind":"biome","biomes":["TemperateForest"],"original":"terrestrial/forest-ambience-nille.ogg","creator":"nille","license":"Public domain dedication","source":"https://commons.wikimedia.org/wiki/File:20090610_0_ambience.ogg","default":true},
+    {"file":"biomes/pine-wind.ogg","kind":"biome","biomes":["BorealForest","PineForest"],"original":"terrestrial/pine-wind.ogg","creator":"W.carter","license":"CC BY-SA 4.0","source":"https://commons.wikimedia.org/wiki/File:Wind_in_Swedish_pine_forest_at_25_mps.ogg","default":true},
+    {"file":"biomes/dry-grass-wind.ogg","kind":"biome","biomes":["Steppe","Desert"],"original":"terrestrial/146436__felixblume__dry-grass-rustling-in-the-wind-in-the-desert-of-chile.wav","creator":"felix.blume","license":"CC0 1.0","source":"https://freesound.org/people/felix.blume/sounds/146436/","default":true},
+    {"file":"biomes/ocean-waves.ogg","kind":"biome","biomes":["Ocean"],"original":"terrestrial/232186__tec_studio__ocean-waves-mono.mp3","creator":"tec_studio","license":"CC0 1.0","source":"https://freesound.org/people/tec_studio/sounds/232186/","default":true},
+    {"file":"biomes/beach-waves.ogg","kind":"biome","biomes":["Beach"],"original":"terrestrial/59564__3bagbrew__beach_waves.mp3","creator":"3bagbrew","license":"CC0 1.0","source":"https://freesound.org/people/3bagbrew/sounds/59564/","default":true},
+    {"file":"biomes/riparian-stream.ogg","kind":"biome","biomes":["Riparian"],"original":"terrestrial/325182__kentspublicdomain__river-stream-creek-sound-of-waves-moving-water.wav","creator":"kentspublicdomain","license":"CC0 1.0","source":"https://freesound.org/people/kentspublicdomain/sounds/325182/","default":true},
+    {"file":"biomes/lake-ontario-waves.ogg","kind":"biome-alternate","biomes":["Riparian"],"original":"water-weather/lake-ontario-waves.ogg","creator":"Dsw4","license":"Public domain dedication","source":"https://commons.wikimedia.org/wiki/File:Waves.ogg","default":false},
+    {"file":"biomes/swamp-ambience.ogg","kind":"biome","biomes":["Swamp"],"original":"terrestrial/547690__ryankingart__swamp-ambience.mp3","creator":"RyanKingArt","license":"CC0 1.0","source":"https://freesound.org/people/RyanKingArt/sounds/547690/","default":true},
+    {"file":"biomes/swamp-camargue-sunset.ogg","kind":"biome-alternate","biomes":["Swamp"],"original":"terrestrial/781709__yannsauvin__ambience-swamp-camargue-france-at-sunset-ortf.wav","creator":"YannSauvin","license":"CC0 1.0","source":"https://freesound.org/people/YannSauvin/sounds/781709/","default":false},
+    {"file":"foley/gravel-footsteps.ogg","kind":"foley","biomes":["Scree"],"original":"terrestrial/walking-on-gravel.ogg","creator":"Secretlondon","license":"CC BY-SA 3.0","source":"https://commons.wikimedia.org/wiki/File:Walkingongravel.ogg","default":false},
+    {"file":"weather/light-rain.ogg","kind":"weather","original":"terrestrial/142936__andron827__lightrain_urban.mp3","creator":"Andron827","license":"CC0 1.0","source":"https://freesound.org/people/Andron827/sounds/142936/","default":false},
+    {"file":"weather/street-rain.ogg","kind":"weather","original":"terrestrial/380651__bonnyorbit__light-rain-on-street.wav","creator":"BonnyOrbit","license":"CC0 1.0","source":"https://freesound.org/people/BonnyOrbit/sounds/380651/","default":false},
+    {"file":"weather/heavy-rain.ogg","kind":"weather","original":"terrestrial/630424__kaleidacousticsaudio__rain-heavy_from-open-window.wav","creator":"KaleidacousticsAudio","license":"CC0 1.0","source":"https://freesound.org/people/KaleidacousticsAudio/sounds/630424/","default":false},
+    {"file":"weather/rain-on-leaves.ogg","kind":"weather","original":"terrestrial/584272__samsterbirdies__rain-on-leaves.flac","creator":"SamsterBirdies","license":"CC0 1.0","source":"https://freesound.org/people/SamsterBirdies/sounds/584272/","default":false},
+    {"file":"weather/distant-thunder.ogg","kind":"weather","original":"terrestrial/361401__richwise__distant-thunder.wav","creator":"richwise","license":"CC0 1.0","source":"https://freesound.org/people/richwise/sounds/361401/","default":false},
+    {"file":"weather/thunder-clap.ogg","kind":"weather","original":"terrestrial/465314__fission9__thunder.wav","creator":"Fission9","license":"CC0 1.0","source":"https://freesound.org/people/Fission9/sounds/465314/","default":false},
+    {"file":"weather/thunderstorm-bed.ogg","kind":"weather","original":"water-weather/rhumphries-thunderstorm.ogg","creator":"RHumphries","license":"CC BY 3.0","source":"https://commons.wikimedia.org/wiki/File:Rhumphries_-_rbh-thunder-storm.ogg","default":false}
+  ],
+  "excluded": [
+    {"name":"SnowFall.ogg","reason":"User identified it as music and rejected it; do not fetch or use."},
+    {"name":"Gentle wind; strong wind; synthetic indoor snowstorm","reason":"Not downloaded and rejected by the user's quality threshold; do not fetch or use."}
+  ]
+}

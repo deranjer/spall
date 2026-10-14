@@ -35,6 +35,16 @@ failed; see `docs/reports/ENG-103.md`). The vendored `salva3d` copy and its
 | naga | 30.0.1 | WGSL input, SPIR-V output | `MIT OR Apache-2.0` | direct shader validation and SPIR-V probe |
 | winit | 0.30.13 | default features | `Apache-2.0` | native window, resize, close event loop |
 
+## ENG-194 — streamed client ambience
+
+`spall_client` adds `rodio = 0.21.1` with `default-features = false` and
+`playback`, `symphonia-ogg`, and `symphonia-vorbis`. It opens the platform output device on a
+dedicated client thread and streams the sandbox's Vorbis ambience through two
+crossfading sinks. The sandbox owns the biome map and asset files; the engine
+accepts indexed paths and does not depend on the game package. `rodio` is
+`MIT OR Apache-2.0`; the Symphonia decoder is MPL-2.0 and cpal is
+`Apache-2.0 OR MIT`. No audio dependency enters headless server builds.
+
 Only the client package imports wgpu/winit. `sandbox-client` requires the
 `sandbox/client` feature, so building `sandbox-server` leaves the server
 package's active graph GPU/window-free. The server currently records the
