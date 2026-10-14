@@ -551,6 +551,9 @@ pub struct ClientSummary {
     pub water_frame_seq: u64,
     /// Water keyframes that failed to assemble or decode.
     pub water_keyframe_errors: u64,
+    /// Validated authoritative weather snapshots received, including late-join/reset refreshes.
+    #[serde(default)]
+    pub weather_snapshots_received: u64,
     /// Admin world-reset baselines installed as a replacement world.
     pub world_resets_installed: u64,
     /// Server answers to `admin_script` commands, in arrival order.
@@ -773,6 +776,7 @@ struct Counters {
     water_regions: AtomicU64,
     water_frame_seq: AtomicU64,
     water_errors: AtomicU64,
+    weather_snapshots: AtomicU64,
     world_resets: AtomicU64,
     /// Logical bricks in the installed late-join baseline (T17).
     baseline_bricks: AtomicU64,
@@ -1853,6 +1857,7 @@ async fn run_async(
             // reset baseline installs; it belongs to the old world and its
             // deltas have no base in the new one.
             let mut column_water_floor = 0_u64;
+            let mut weather_floor = 0_u64;
             let mut vegetation = spall_protocol::vegetation::VegetationAssembler::default();
             // The climate raster rides along with only some keyframes (it never changes
             // within a world); the last one received stands in for the rest.
@@ -1867,6 +1872,7 @@ async fn run_async(
                 profile.begin_record(match &received {
                     Ok(Some(WireRecord::VegetationSnapshot(_))) => "vegetation",
                     Ok(Some(WireRecord::ColumnWaterUpdate(_))) => "column-water",
+                    Ok(Some(WireRecord::WeatherSnapshot(_))) => "weather",
                     Ok(Some(WireRecord::TopologyTransaction(_))) => "transaction",
                     Ok(Some(WireRecord::BaselineBegin(_))) => "baseline-begin",
                     Ok(Some(WireRecord::BaselineEnd(_))) => "baseline-end",
@@ -1906,6 +1912,20 @@ async fn run_async(
                             Err(error) => {
                                 eprintln!("spall-client: rejected vegetation frame: {error}")
                             }
+                        }
+                    }
+                    Ok(Some(WireRecord::WeatherSnapshot(snapshot))) => {
+                        if snapshot.state.effective_tick < weather_floor {
+                            continue;
+                        }
+                        if let Err(error) = replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_weather(snapshot.state)
+                        {
+                            eprintln!("spall-client: rejected weather state: {error}");
+                        } else {
+                            counters.weather_snapshots.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Ok(Some(WireRecord::ColumnWaterUpdate(update))) => {
@@ -2024,6 +2044,7 @@ async fn run_async(
                             Ok(world) => {
                                 vegetation_floor = begin.checkpoint_tick.get();
                                 column_water_floor = begin.checkpoint_tick.get();
+                                weather_floor = begin.checkpoint_tick.get();
                                 vegetation =
                                     spall_protocol::vegetation::VegetationAssembler::default();
                                 cover_field = spall_ecology::cover::CoverField::default();
@@ -3508,6 +3529,7 @@ async fn run_async(
         water_regions_received: counters.water_regions.load(Ordering::Relaxed),
         water_frame_seq: counters.water_frame_seq.load(Ordering::Relaxed),
         water_keyframe_errors: counters.water_errors.load(Ordering::Relaxed),
+        weather_snapshots_received: counters.weather_snapshots.load(Ordering::Relaxed),
         world_resets_installed: counters.world_resets.load(Ordering::Relaxed),
         admin_statuses: admin_statuses
             .lock()

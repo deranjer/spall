@@ -231,6 +231,7 @@ pub(crate) fn capture_with_terrain_bricks(
             .map_err(|_| PersistError::BadField("vegetation capture"))?
             .unwrap_or_default(),
         column_water: sim.column_water().map(|w| w.canonical_state()),
+        weather: Some(sim.weather_state().clone()),
         tick: sim.current_tick().get(),
         journal_cursor,
         world_hash: world.world_hash().0,
@@ -558,6 +559,7 @@ pub fn restore_with_terrain_collider_mode(
     let mut durable_tick = cp.tick;
     let mut column_water_state = cp.column_water.clone();
     let mut vegetation_state = cp.vegetation.clone();
+    let mut weather_state = cp.weather.clone();
     let mut vegetation_clock = None;
 
     for record in &recovery.journal {
@@ -584,6 +586,14 @@ pub fn restore_with_terrain_collider_mode(
             JournalPayload::VegetationState(state) => {
                 vegetation_clock = None;
                 vegetation_state = state.clone();
+                last_seq = record.seq;
+                continue;
+            }
+            JournalPayload::WeatherState(state) => {
+                state
+                    .validate()
+                    .map_err(|_| PersistError::BadField("journal weather state"))?;
+                weather_state = Some(state.clone());
                 last_seq = record.seq;
                 continue;
             }
@@ -669,8 +679,18 @@ pub fn restore_with_terrain_collider_mode(
             .encode()
             .map_err(|_| PersistError::BadField("vegetation clock encode"))?;
     }
+    let had_weather_state = weather_state.is_some();
+    if let Some(state) = weather_state {
+        sim.restore_weather(state)
+            .map_err(|_| PersistError::BadField("weather recovery"))?;
+    }
     sim.restore_vegetation(&vegetation_state)
         .map_err(|_| PersistError::BadField("vegetation recovery"))?;
+    if !had_weather_state {
+        sim.initialize_legacy_weather(cfg.seed);
+    }
+    sim.validate_weather_clock_source()
+        .map_err(|_| PersistError::BadField("weather clock source"))?;
     if let Some(state) = &column_water_state {
         sim.restore_column_water(
             state,

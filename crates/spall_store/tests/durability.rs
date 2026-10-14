@@ -108,6 +108,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         meta: m,
         bodies: vec![],
         column_water: None,
+        weather: None,
         bricks: vec![
             StoredBrick {
                 volume_id: 1,
@@ -844,4 +845,48 @@ fn unsupported_save_versions_are_rejected_before_changing_rollback_journal_mode(
             "version rejection must not rewrite the SQLite journal-mode header"
         );
     }
+}
+
+#[test]
+fn weather_clock_checkpoint_and_journal_survive_restart_exactly() {
+    use spall_protocol::{WeatherClock, WeatherClockSource, WeatherState};
+    let scratch = Scratch::new("weather-restart");
+    let mut cp = checkpoint(120, 0);
+    let clock = WeatherClock {
+        time_ms: 987_654_321,
+        source: WeatherClockSource::ServerFallback,
+        start_season: 0,
+        season_ms: 900_000,
+    };
+    let state = WeatherState::for_clock(42, 3, 120, clock, 9);
+    cp.weather = Some(state.clone());
+    let mut writer = Writer::open(scratch.db()).unwrap();
+    writer.publish_checkpoint(&cp).unwrap();
+    let clock_next = WeatherState::for_clock(
+        42,
+        3,
+        121,
+        WeatherClock {
+            time_ms: 987_654_337,
+            source: WeatherClockSource::ServerFallback,
+            start_season: 0,
+            season_ms: 900_000,
+        },
+        9,
+    );
+    writer
+        .append_journal(&[JournalRecord {
+            seq: 1,
+            tick: 121,
+            payload: JournalPayload::WeatherState(clock_next.clone()),
+        }])
+        .unwrap();
+    drop(writer);
+    let recovered = recover(scratch.db()).unwrap();
+    assert_eq!(recovered.checkpoint.weather, Some(state));
+    assert_eq!(recovered.journal.len(), 1);
+    assert_eq!(
+        recovered.journal[0].payload,
+        JournalPayload::WeatherState(clock_next)
+    );
 }

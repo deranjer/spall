@@ -416,6 +416,8 @@ pub struct ReplicaWorld {
     /// would otherwise replay onto air.
     catalogue_pending: Option<spall_protocol::TransferId>,
     catalogue_deferred: Vec<TopologyTransaction>,
+    weather: Option<spall_protocol::WeatherState>,
+    weather_epoch_floor: u64,
 }
 
 /// A baseline being built off to the side while its segments arrive (`docs/protocol.md` late-join
@@ -680,6 +682,8 @@ impl ReplicaWorld {
             terrain_generation: 1,
             catalogue_pending: None,
             catalogue_deferred: Vec::new(),
+            weather: None,
+            weather_epoch_floor: 0,
         }
     }
 
@@ -711,6 +715,8 @@ impl ReplicaWorld {
             terrain_generation: 0,
             catalogue_pending: None,
             catalogue_deferred: Vec::new(),
+            weather: None,
+            weather_epoch_floor: 0,
         }
     }
 
@@ -800,11 +806,43 @@ impl ReplicaWorld {
         // included (G3-residency-hash.md lifecycle).
         self.evicted = staged.evicted;
         self.now_tick = staged.checkpoint_tick;
+        self.weather_epoch_floor = self
+            .weather
+            .as_ref()
+            .map_or(self.weather_epoch_floor, |old| {
+                old.world_epoch.saturating_add(1)
+            });
+        self.weather = None;
         // A replacement baseline supersedes any catalogue still arriving for the old one.
         self.catalogue_pending = None;
         self.catalogue_deferred.clear();
         self.bump_terrain_generation();
         Ok(())
+    }
+
+    /// Accept a bounded weather keyframe only when its tick and revision do not regress.
+    pub fn apply_weather(&mut self, state: spall_protocol::WeatherState) -> Result<(), String> {
+        state.validate().map_err(|e| e.to_string())?;
+        if state.effective_tick < self.now_tick {
+            return Err("stale weather tick".into());
+        }
+        if state.world_epoch < self.weather_epoch_floor {
+            return Err("stale weather epoch".into());
+        }
+        if let Some(old) = &self.weather
+            && (state.world_epoch < old.world_epoch
+                || (state.world_epoch == old.world_epoch
+                    && state.world_revision < old.world_revision)
+                || (state.world_epoch == old.world_epoch
+                    && state.effective_tick < old.effective_tick))
+        {
+            return Err("stale weather revision".into());
+        }
+        self.weather = Some(state);
+        Ok(())
+    }
+    pub fn weather(&self) -> Option<&spall_protocol::WeatherState> {
+        self.weather.as_ref()
     }
 
     /// Marks the baseline just installed as missing its distant terrain

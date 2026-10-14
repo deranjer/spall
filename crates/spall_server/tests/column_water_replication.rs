@@ -213,6 +213,14 @@ fn client_receives_column_water_late_joiner_converges_and_reset_reseeds() {
     assert!(client.admin_statuses[0].accepted);
     assert_eq!(server.world_resets, 1);
     assert_eq!(client.world_resets_installed, 1);
+    assert!(
+        client.weather_snapshots_received >= 2,
+        "weather keyframes should refresh across reset"
+    );
+    assert!(
+        late.weather_snapshots_received >= 1,
+        "late joiner should receive the current weather state"
+    );
     assert_eq!(server.total_solid_cells, pristine_solid_cells);
     assert_eq!(client.final_world_hash, server.final_world_hash);
 }

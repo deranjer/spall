@@ -155,6 +155,8 @@ pub struct Checkpoint {
     pub vegetation: Vec<u8>,
     /// Stacked-column water (schema 3 DTO) in its own additive checkpoint row.
     pub column_water: Option<spall_protocol::ColumnWaterState>,
+    /// Authoritative weather/fallback clock checkpoint; absent means deterministic legacy initialization.
+    pub weather: Option<spall_protocol::WeatherState>,
     pub tick: u64,
     /// Highest journal sequence this checkpoint already includes. Recovery
     /// replays the durable journal suffix strictly after this.
@@ -227,6 +229,8 @@ pub enum JournalPayload {
     /// Appended (ENG-167): changed column-water regions since the last water
     /// record, applied over the checkpoint's `column_water` on recovery.
     ColumnWaterDelta(spall_protocol::ColumnWaterDelta),
+    /// Appended versioned weather state and explicit weather clock source.
+    WeatherState(spall_protocol::WeatherState),
 }
 
 impl JournalPayload {
@@ -432,6 +436,7 @@ mod tests {
         let cp = Checkpoint {
             vegetation: Vec::new(),
             column_water: None,
+            weather: None,
             tick: 120,
             journal_cursor: 5,
             world_hash: [3; 32],

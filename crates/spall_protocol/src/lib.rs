@@ -31,6 +31,11 @@ pub mod records;
 pub mod segment;
 pub mod session;
 pub mod water;
+pub mod weather;
+pub use weather::{
+    WEATHER_PROFILE_MS, WEATHER_SCHEMA, WEATHER_TRANSITION_MS, WeatherClock, WeatherClockSource,
+    WeatherError, WeatherKind, WeatherSnapshot, WeatherState,
+};
 
 pub use input::{frame_input, player_entity, recent_input, session_player_entity};
 

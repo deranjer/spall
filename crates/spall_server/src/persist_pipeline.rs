@@ -596,6 +596,7 @@ mod tests {
             },
             bodies: vec![],
             column_water: None,
+            weather: None,
             bricks: vec![],
         }
     }

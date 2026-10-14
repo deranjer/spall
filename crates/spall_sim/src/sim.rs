@@ -72,6 +72,7 @@ pub struct SimulationConfig {
     /// tools keep the deterministic inline step).
     pub column_water_worker: bool,
     pub vegetation: Option<spall_ecology::living::LivingState>,
+    pub weather_seed: u64,
 }
 
 impl SimulationConfig {
@@ -89,6 +90,7 @@ impl SimulationConfig {
             column_water: None,
             column_water_worker: false,
             vegetation: None,
+            weather_seed: 0,
         }
     }
 }
@@ -131,6 +133,9 @@ pub struct Simulation {
     /// Sample points of each body for buoyancy, rebuilt when a body changes.
     buoyancy_cache: crate::world::BuoyancyCache,
     pub(crate) vegetation: Option<crate::vegetation::AuthoritativeVegetation>,
+    pub(crate) weather: spall_protocol::WeatherState,
+    pub(crate) weather_dirty: bool,
+    weather_seed: u64,
     /// The world a reset replaced, being freed on another thread (see [`Retiring`]).
     retiring: Retiring,
 }
@@ -187,6 +192,12 @@ impl Simulation {
         let column_water_setup = config.column_water;
         let column_water_worker = config.column_water_worker;
         let vegetation_setup = config.vegetation;
+        let has_vegetation = vegetation_setup.is_some();
+        let weather_start_season = vegetation_setup
+            .as_ref()
+            .map_or(0, |s| s.start_season as u8);
+        let weather_season_ms = vegetation_setup.as_ref().map_or(900_000, |s| s.season_ms);
+        let weather_seed = config.weather_seed;
         let world_span = crate::prof::Span::start("startup.world_and_collision");
         let world = SimWorld::new_with_terrain_collider_mode_and_origin(
             config.world,
@@ -206,6 +217,22 @@ impl Simulation {
             column_water_worker: false,
             buoyancy_cache: Default::default(),
             vegetation: None,
+            weather: spall_protocol::WeatherState::initial(
+                weather_seed,
+                1,
+                spall_protocol::WeatherClock {
+                    time_ms: 0,
+                    source: if has_vegetation {
+                        spall_protocol::WeatherClockSource::Vegetation
+                    } else {
+                        spall_protocol::WeatherClockSource::ServerFallback
+                    },
+                    start_season: weather_start_season,
+                    season_ms: weather_season_ms,
+                },
+            ),
+            weather_dirty: true,
+            weather_seed,
         };
         if let Some(setup) = column_water_setup {
             let _span = crate::prof::Span::start("startup.column_water");
@@ -252,6 +279,18 @@ impl Simulation {
             column_water_worker: false,
             buoyancy_cache: Default::default(),
             vegetation: None,
+            weather: spall_protocol::WeatherState::initial(
+                0,
+                1,
+                spall_protocol::WeatherClock {
+                    time_ms: tick.get().saturating_mul(1000) / 60,
+                    source: spall_protocol::WeatherClockSource::ServerFallback,
+                    start_season: 0,
+                    season_ms: 900_000,
+                },
+            ),
+            weather_dirty: false,
+            weather_seed: 0,
         };
         simulation.pipeline.warm_labels(&simulation.world);
         simulation
@@ -275,6 +314,8 @@ impl Simulation {
             pipeline,
             column_water,
             vegetation,
+            mut weather,
+            weather_seed,
             ..
         } = fresh;
         let (f_entity, f_volume, f_transaction, f_journal_seq) = world.registry().counters();
@@ -297,6 +338,10 @@ impl Simulation {
             water.start_worker();
         }
         let old_vegetation = std::mem::replace(&mut self.vegetation, vegetation);
+        weather.world_epoch = self.weather.world_epoch.saturating_add(1);
+        self.weather = weather;
+        self.weather_seed = weather_seed;
+        self.weather_dirty = true;
         // The replaced world goes away off the tick thread.
         self.retiring
             .retire((old_world, old_pipeline, old_column_water, old_vegetation));
@@ -507,6 +552,142 @@ impl Simulation {
         self.pipeline.submit_intent(intent, &self.world)
     }
 
+    /// Initializes the deterministic state for a legacy save with no weather checkpoint.
+    pub fn initialize_legacy_weather(&mut self, seed: u64) {
+        self.weather_seed = seed;
+        let source = if self.vegetation.is_some() {
+            spall_protocol::WeatherClockSource::Vegetation
+        } else {
+            spall_protocol::WeatherClockSource::ServerFallback
+        };
+        let time_ms = self
+            .vegetation
+            .as_ref()
+            .map_or(self.tick.get().saturating_mul(1000) / 60, |v| {
+                v.state.time_ms
+            });
+        self.weather = spall_protocol::WeatherState::for_clock(
+            seed,
+            self.weather.world_epoch,
+            self.tick.get(),
+            spall_protocol::WeatherClock {
+                time_ms,
+                source,
+                start_season: self
+                    .vegetation
+                    .as_ref()
+                    .map_or(self.weather.start_season, |v| v.state.start_season as u8),
+                season_ms: self
+                    .vegetation
+                    .as_ref()
+                    .map_or(self.weather.season_ms, |v| v.state.season_ms),
+            },
+            self.weather.world_revision,
+        );
+        self.weather_dirty = true;
+    }
+
+    /// Set the deterministic world seed before the first authoritative tick.
+    pub fn set_weather_seed(&mut self, seed: u64) {
+        self.weather_seed = seed;
+        self.weather = spall_protocol::WeatherState::for_clock(
+            seed,
+            self.weather.world_epoch,
+            self.tick.get(),
+            spall_protocol::WeatherClock {
+                time_ms: self.weather.clock_ms,
+                source: self.weather.clock_source,
+                start_season: self.weather.start_season,
+                season_ms: self.weather.season_ms,
+            },
+            self.weather.world_revision,
+        );
+        self.weather_dirty = true;
+    }
+
+    /// Current authoritative weather state. Clock source is fixed per world.
+    pub fn weather_state(&self) -> &spall_protocol::WeatherState {
+        &self.weather
+    }
+
+    /// Latest weather state owed to durable journal.
+    pub fn take_weather_journal(&mut self) -> Option<spall_protocol::WeatherState> {
+        if !std::mem::take(&mut self.weather_dirty) {
+            return None;
+        }
+        Some(self.weather.clone())
+    }
+
+    /// Verifies recovered weather still points at the world's frozen clock source.
+    pub fn validate_weather_clock_source(&self) -> Result<(), String> {
+        if self.weather.clock_source == spall_protocol::WeatherClockSource::Vegetation {
+            let Some(vegetation) = &self.vegetation else {
+                return Err("weather clock requires recovered vegetation".into());
+            };
+            if vegetation.state.start_season as u8 != self.weather.start_season
+                || vegetation.state.season_ms != self.weather.season_ms
+            {
+                return Err("weather and vegetation season clocks disagree".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Restores the explicit weather/fallback clock record from a checkpoint or journal.
+    pub fn restore_weather(&mut self, state: spall_protocol::WeatherState) -> Result<(), String> {
+        state.validate().map_err(|e| e.to_string())?;
+        self.weather_seed = state.weather_seed;
+        self.weather = state;
+        self.weather_dirty = false;
+        Ok(())
+    }
+
+    fn advance_weather(&mut self) {
+        let (time_ms, source, start_season, season_ms) = match self.weather.clock_source {
+            spall_protocol::WeatherClockSource::Vegetation => match self.vegetation.as_ref() {
+                Some(v) => (
+                    v.state.time_ms,
+                    spall_protocol::WeatherClockSource::Vegetation,
+                    v.state.start_season as u8,
+                    v.state.season_ms,
+                ),
+                None => (
+                    self.weather.clock_ms,
+                    spall_protocol::WeatherClockSource::Vegetation,
+                    self.weather.start_season,
+                    self.weather.season_ms,
+                ),
+            },
+            spall_protocol::WeatherClockSource::ServerFallback => (
+                self.tick.get().saturating_mul(1000) / 60,
+                spall_protocol::WeatherClockSource::ServerFallback,
+                self.weather.start_season,
+                self.weather.season_ms,
+            ),
+        };
+        let clock = spall_protocol::WeatherClock {
+            time_ms,
+            source,
+            start_season,
+            season_ms,
+        };
+        let next = spall_protocol::WeatherState::for_clock(
+            self.weather_seed,
+            self.weather.world_epoch,
+            self.tick.get(),
+            clock,
+            self.weather.world_revision,
+        );
+        let profile_changed = next.transition_id != self.weather.transition_id
+            || next.kind != self.weather.kind
+            || next.precipitation_q16 != self.weather.precipitation_q16
+            || next.gust_q16 != self.weather.gust_q16
+            || next.temperature_centi_c != self.weather.temperature_centi_c
+            || next.lightning_id != self.weather.lightning_id;
+        self.weather = next;
+        self.weather_dirty |= profile_changed;
+    }
+
     /// Advances one server tick: run the edit pipeline, then step physics and
     /// refresh extracted body state.
     pub fn tick(&mut self) -> Result<TickReport, TickError> {
@@ -570,6 +751,7 @@ impl Simulation {
         drop(water_span);
         let vegetation_span = crate::prof::Span::start("tick.vegetation");
         self.advance_vegetation(&report)?;
+        self.advance_weather();
         drop(vegetation_span);
         // Bodies float: buoyancy and drag from the column water, before the
         // physics step that integrates them.
@@ -1346,5 +1528,29 @@ mod retiring_tests {
         let mut retiring = Retiring::default();
         retiring.retire(Boom);
         retiring.finish();
+    }
+}
+
+#[cfg(test)]
+mod weather_clock_tests {
+    use super::*;
+    #[test]
+    fn no_vegetation_world_uses_tick_clock_and_reset_starts_new_epoch() {
+        let mut sim =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        assert_eq!(
+            sim.weather_state().clock_source,
+            spall_protocol::WeatherClockSource::ServerFallback
+        );
+        sim.tick().unwrap();
+        assert_eq!(sim.weather_state().clock_ms, 16);
+        assert_eq!(sim.weather_state().effective_tick, 1);
+        let prior_epoch = sim.weather_state().world_epoch;
+        let fresh =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        sim.replace_world(fresh).unwrap();
+        assert_eq!(sim.weather_state().world_epoch, prior_epoch + 1);
+        assert_eq!(sim.weather_state().clock_ms, 0);
+        sim.wait_for_retired();
     }
 }

@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS checkpoint_vegetation (
     state BLOB NOT NULL,
     crc BLOB NOT NULL
 );
+CREATE TABLE checkpoint_weather (
+    tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
+    state BLOB NOT NULL,
+    crc BLOB NOT NULL
+);
 CREATE TABLE checkpoint_column_water (
     tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
     state BLOB NOT NULL,
@@ -112,6 +117,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
                 tx.execute("INSERT INTO checkpoint_vegetation (tick,state,crc) SELECT tick,?,? FROM checkpoints",rusqlite::params![&empty,crate::db::crc16(&empty).as_slice()])?;
                 tx.commit()?;
             }
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS checkpoint_weather (tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE, state BLOB NOT NULL, crc BLOB NOT NULL);")?;
             // Additive auxiliary table: does not alter any versioned world DTO.
             conn.execute_batch("CREATE TABLE IF NOT EXISTS game_outbox (event_id BLOB PRIMARY KEY CHECK (length(event_id) = 32), journal_seq INTEGER NOT NULL, payload BLOB NOT NULL) WITHOUT ROWID;")?;
             Ok(())

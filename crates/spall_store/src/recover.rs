@@ -280,6 +280,7 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
     Ok(Checkpoint {
         vegetation: load_vegetation(conn, tick)?,
         column_water: load_column_water(conn, tick)?,
+        weather: load_weather(conn, tick)?,
         tick: tick as u64,
         journal_cursor: journal_cursor as u64,
         world_hash,
@@ -353,4 +354,40 @@ fn load_vegetation(conn: &Connection, tick: i64) -> Result<Vec<u8>, StoreError> 
         ));
     }
     Ok(bytes)
+}
+
+fn load_weather(
+    conn: &Connection,
+    tick: i64,
+) -> Result<Option<spall_protocol::WeatherState>, StoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_weather')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    let row: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT state,crc FROM checkpoint_weather WHERE tick=?",
+            [tick],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((blob, crc)) = row else {
+        return Err(StoreError::Corrupt("weather checkpoint row missing".into()));
+    };
+    if crc.as_slice() != crc16(&blob).as_slice() {
+        return Err(StoreError::Corrupt(
+            "weather checkpoint checksum mismatch".into(),
+        ));
+    }
+    let state: Option<spall_protocol::WeatherState> = dto::decode(&blob)?;
+    if let Some(state) = &state {
+        state
+            .validate()
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    }
+    Ok(state)
 }

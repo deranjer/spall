@@ -3209,11 +3209,12 @@ async fn serve_async(
                                 }
                                 sim.wait_for_retired();
                                 let freed_ms = started.elapsed().as_millis() as u64;
-                                let fresh = scene.simulation_with_materials(
+                                let mut fresh = scene.simulation_with_materials(
                                     terrain_collider_mode,
                                     reset_materials.clone(),
                                     custom_world.as_ref(),
                                 );
+                                fresh.set_weather_seed(config.seed);
                                 let built_ms = started.elapsed().as_millis() as u64;
                                 if let Err(e) = sim.replace_world(fresh) {
                                     return SimResult::error(
@@ -3806,6 +3807,21 @@ async fn serve_async(
                 }
             }
             drop(span_serve_vegetation);
+            // Weather keyframes are tiny, bounded and supersedable. One-second cadence also
+            // supplies the current state to late joiners and immediately after world reset.
+            if tick.get().is_multiple_of(60) {
+                let record = WireRecord::WeatherSnapshot(spall_protocol::WeatherSnapshot {
+                    state: sim.weather_state().clone(),
+                });
+                let records = Arc::new(vec![record]);
+                for session in lj.live_sessions().collect::<Vec<_>>() {
+                    send_to(
+                        &clients_for_sim,
+                        session,
+                        Outbound::Water(Arc::clone(&records)),
+                    );
+                }
+            }
             let span_serve_water_fanout = spall_sim::prof::Span::start("serve.water_fanout");
             if let Some(column_water) = sim.column_water() {
                 let frame = column_water.frame();
@@ -5658,6 +5674,7 @@ fn setup_persistence_with_game_content(
         if let Some(setup) = game_setup.take() {
             setup(&mut sim)?;
         }
+        sim.set_weather_seed(cfg.seed);
         return Ok(Persistence {
             sim,
             pipeline: None,
@@ -5689,6 +5706,7 @@ fn setup_persistence_with_game_content(
             if let Some(setup) = game_setup.take() {
                 setup(&mut sim)?;
             }
+            sim.set_weather_seed(cfg.seed);
             let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
             writer
                 .publish_checkpoint(&checkpoint)
@@ -5762,6 +5780,15 @@ fn tick_journal_batch(
             seq: seq.0,
             tick,
             payload: spall_store::JournalPayload::ColumnWaterDelta(delta),
+        });
+        *journalled_through = seq.0;
+    }
+    if let Some(state) = sim.take_weather_journal() {
+        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
+        batch.push(spall_store::JournalRecord {
+            seq: seq.0,
+            tick,
+            payload: spall_store::JournalPayload::WeatherState(state),
         });
         *journalled_through = seq.0;
     }
