@@ -4,6 +4,10 @@
 `META`/`MTRL`/`PALT`/`VOXL`/`LAYR`/`HASH` reading and writing; `PART`,
 `STRC`, `ANIM`, and the MagicaVoxel bridge remain pending. Existing v1.0
 static assets remain readable and are written as v1.1 when saved.
+The CPU-only `spall_asset` consumer additionally decodes static assets,
+`PART` and `ANIM` for the animal foundations; it explicitly rejects `STRC`
+and `LAYR`. This does not enable animated imports in the editor or shipped
+game runtime.
 **Version:** 1.1  
 **File extension:** `.spvox`  
 **Magic:** `SPVX`
@@ -239,7 +243,11 @@ parts: count × {
 Part IDs are non-zero and unique. `parent_id = 0` is allowed only for root
 part `1`; all other parents must precede their children. Names are non-empty
 and unique among siblings. Part records are canonical in parent-before-child,
-then ascending `part_id` order.
+then ascending `part_id` order: emit root `1`, then repeatedly emit the
+smallest remaining ID whose parent has already been emitted. IDs need not
+increase globally, and a child may have a smaller ID than its parent.
+For example, root `1`, its children `3` and `9`, and child `2` of `9` are
+stored as `1, 3, 9, 2`.
 
 Parts describe an authored assembly. They do not create engine entities or
 physics bodies. Until a game feature gives a particular part collision or
@@ -388,9 +396,14 @@ clips: clip_count × {
 
 Animation time is 60 ticks per second. Keys in a track have strictly
 increasing ticks in `0..=duration_ticks`; a key with no fields is invalid.
-Translation, rotation, and scale use exactly the `PART` encodings. Translation
-and scale interpolate linearly; rotation interpolation uses the shortest-path
-normalized spherical interpolation. Visibility is a `u8` value of `0` or `1`
+Translation, rotation, and scale use exactly the `PART` encodings. A key's
+interpolation applies to the interval beginning at that key. Step mode holds
+every field; in either non-step mode translation and scale interpolate
+linearly. Mode `2` additionally interpolates rotation using shortest-path
+normalized spherical interpolation; rotation holds in modes `0` and `1`.
+Fields are sampled independently between keys that carry that field, retain
+the part's rest value before their first key, and hold their last value after
+their final key. Visibility is a `u8` value of `0` or `1`
 and always steps. Clip names are unique, tracks are sorted by `part_id`, and
 events are sorted by `(tick, name)`.
 

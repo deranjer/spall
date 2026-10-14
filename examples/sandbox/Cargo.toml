@@ -33,6 +33,7 @@ client = [
 ]
 
 [dependencies]
+spall_asset.workspace = true
 blake3.workspace = true
 clap.workspace = true
 ron.workspace = true
