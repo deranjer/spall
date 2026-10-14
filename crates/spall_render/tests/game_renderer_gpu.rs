@@ -414,6 +414,76 @@ fn terrain_and_moving_bodies_cast_shadows() {
     );
 }
 
+/// Foliage shadows live in the cascades' retained depth, which is redrawn when
+/// the foliage changes and not otherwise: a shadow follows foliage in and out
+/// on the very next frame, and stays across frames that change nothing.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn foliage_shadows_follow_the_foliage_through_the_retained_depth() {
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored test");
+    let environment = EnvironmentPreset::Daylight.environment();
+    let (terrain, bodies) = scene();
+    let target = OffscreenTarget::new(&ctx.device, SIZE.0, SIZE.1);
+    let mut renderer = GameRenderer::new(
+        &ctx.device,
+        &ctx.queue,
+        COLOR_FORMAT,
+        &materials(),
+        SIZE,
+        None,
+    );
+    renderer.set_terrain(&ctx.device, &ctx.queue, &terrain);
+    let cam = camera();
+    let frame = |renderer: &mut GameRenderer| {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        renderer.render(
+            &ctx.device,
+            &ctx.queue,
+            &mut encoder,
+            target.color_view(),
+            &cam,
+            &environment,
+            DebugView::Shaded,
+        );
+        target.copy_to_readback(&mut encoder);
+        ctx.queue.submit([encoder.finish()]);
+        target.read_rgba(&ctx).expect("readback")
+    };
+    let at = |p: Vec3| {
+        let ndc = cam.project(p).expect("in front of the camera");
+        (
+            ((ndc[0] * 0.5 + 0.5) * SIZE.0 as f32) as u32,
+            ((0.5 - ndc[1] * 0.5) * SIZE.1 as f32) as u32,
+        )
+    };
+    let sun = environment.sun_dir;
+    let ground = |p: Vec3| p - sun * (p.y / sun.y);
+    let shadow = at(ground(Vec3::new(-2.5, 1.6, 1.0)));
+    let shade = |image: &[u8]| luma(image, shadow.0, shadow.1);
+
+    let none = frame(&mut renderer);
+    renderer.set_vegetation(&ctx.device, &ctx.queue, &bodies);
+    let with = frame(&mut renderer);
+    let again = frame(&mut renderer);
+    renderer.set_vegetation(&ctx.device, &ctx.queue, &[]);
+    let gone = frame(&mut renderer);
+    assert!(
+        shade(&with) < shade(&none) * 0.8,
+        "foliage shadow missing: {} vs {}",
+        shade(&with),
+        shade(&none)
+    );
+    assert_eq!(with, again, "a frame that changes nothing changes nothing");
+    assert!(
+        (shade(&gone) - shade(&none)).abs() < shade(&none) * 0.05,
+        "the shadow outlived the foliage: {} vs {}",
+        shade(&gone),
+        shade(&none)
+    );
+}
+
 /// Material identity reaches the shader: an emissive material glows in the
 /// direct pass and its neighbours do not.
 #[test]
@@ -660,6 +730,48 @@ fn daylight_skybox_has_a_sun_and_varied_voxel_clouds() {
         colors.len() > 25,
         "cloud and sky variation: {} colors",
         colors.len()
+    );
+}
+
+#[test]
+#[ignore = "requires a working GPU adapter; captures the night sky's stars"]
+fn night_stars_are_soft_discs_that_move_smoothly_with_the_camera() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let environment = EnvironmentPreset::Night.environment();
+    let mut camera = Camera::looking_along(
+        Vec3::ZERO,
+        Vec3::new(0.3, 0.8, 0.5),
+        82_f32.to_radians(),
+        SIZE.0 as f32 / SIZE.1 as f32,
+    );
+    let mut frames = Vec::new();
+    for step in 0..2 {
+        let pixels = render_game_from(
+            &ctx,
+            &camera,
+            &environment,
+            DebugView::Shaded,
+            &[],
+            &[],
+            &materials(),
+        );
+        save_png(&format!("skybox-night-{step}.png"), &pixels);
+        frames.push(pixels);
+        // A turn of a fifth of a pixel: stars that are single-pixel samples
+        // flicker; soft discs only change a little.
+        camera.look(0.0004, 0.0);
+    }
+    let lit = |pixels: &[u8]| pixels.chunks_exact(4).filter(|p| p[2] > 60).count();
+    assert!(lit(&frames[0]) > 8, "stars visible: {}", lit(&frames[0]));
+    let changed = frames[0]
+        .chunks_exact(4)
+        .zip(frames[1].chunks_exact(4))
+        .filter(|(a, b)| a[2].abs_diff(b[2]) > 40)
+        .count();
+    assert!(
+        changed * 4 < lit(&frames[0]),
+        "{changed} pixels jumped of {} lit",
+        lit(&frames[0])
     );
 }
 

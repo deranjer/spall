@@ -136,7 +136,35 @@ pub fn build_brick_mesh(
     generation: Generation,
     topology_epoch: TopologyEpoch,
 ) -> Result<VolumeMesh, MeshError> {
-    let cells = crate::sample::ResidentCells::one_brick(coord)?;
+    build_brick_mesh_lod(volume, coord, 1, 0, generation, topology_epoch)
+}
+
+/// [`build_brick_mesh`] at a level of detail: `stride` is how many cells wide a
+/// block of the mesh is (1 for full detail; 2, 4 or 8 for coarser meshes of a
+/// quarter, a sixteenth, a sixty-fourth of the cells). A coarse block is solid
+/// when at least a quarter of its cells are. `closed_sides` (see
+/// [`ClosedSides`]) are the brick sides, bit `2 * axis + positive`, whose
+/// neighbour is read as open air so the mesh closes its own skin there; the
+/// caller sets them toward a neighbour meshed at a different level, so the seam
+/// cannot crack. The token covers the same bricks at every level.
+pub fn build_brick_mesh_lod(
+    volume: &Volume,
+    coord: spall_core::BrickCoord,
+    stride: i64,
+    closed_sides: u8,
+    generation: Generation,
+    topology_epoch: TopologyEpoch,
+) -> Result<VolumeMesh, MeshError> {
+    assert!(
+        matches!(stride, 1 | 2 | 4 | 8),
+        "stride must be 1, 2, 4 or 8"
+    );
+    let cells = if stride == 1 {
+        crate::sample::ResidentCells::one_brick(coord)?
+    } else {
+        crate::sample::ResidentCells::coarse_brick(coord, stride)?
+    };
+    let cell_m = volume.cell_size().metres() * stride as f64;
     // Air has no surface. A completely solid brick enclosed by six completely
     // solid neighbours has no surface either. Keep exact revision/halo tokens
     // so a later excavation or residency change still invalidates the result.
@@ -175,7 +203,7 @@ pub fn build_brick_mesh(
         });
     if hidden {
         return Ok(VolumeMesh {
-            mesh: Mesh::from_quads(&[], volume.cell_size().metres()),
+            mesh: Mesh::from_quads(&[], cell_m),
             quads: Vec::new(),
             stats: MeshStats {
                 strategy: MeshStrategy::Greedy,
@@ -189,10 +217,23 @@ pub fn build_brick_mesh(
             token: build_token(volume, &[coord], generation, topology_epoch),
         });
     }
-    let padded = crate::sample::PaddedBrick::new(volume, coord);
-    let sampler = VolumeSampler::with_padded(volume, padded.as_ref());
+    let closed = (closed_sides != 0).then(|| crate::sample::ClosedSides {
+        sides: closed_sides,
+        bounds: cells.boxes()[0],
+    });
+    let padded;
+    let coarse;
+    let sampler = if stride == 1 {
+        padded = crate::sample::PaddedBrick::new(volume, coord);
+        VolumeSampler::with_padded(volume, padded.as_ref())
+    } else {
+        coarse = crate::sample::CoarseBrick::new(volume, coord, stride)
+            .ok_or(MeshError::CoordinateOverflow { coord })?;
+        VolumeSampler::with_coarse(volume, &coarse)
+    }
+    .closing(closed);
     let quads = emit_greedy(&sampler, &cells);
-    let mesh = Mesh::from_quads(&quads, volume.cell_size().metres());
+    let mesh = Mesh::from_quads(&quads, cell_m);
     let mut exposed_unit_faces = 0u64;
     let mut unresolved_halo_faces = 0u64;
     for_each_exposed_face(&sampler, &cells, |face| {
@@ -208,7 +249,7 @@ pub fn build_brick_mesh(
             quad_count: quads.len(),
             vertex_count: mesh.vertices.len(),
             triangle_count: mesh.triangle_count(),
-            surface_area_m2: exposed_unit_faces as f64 * volume.cell_size().metres().powi(2),
+            surface_area_m2: exposed_unit_faces as f64 * cell_m.powi(2),
             exposed_unit_faces,
             unresolved_halo_faces,
         },
@@ -280,6 +321,198 @@ mod tests {
     use spall_voxel::{Brick, EditPlan};
 
     const STONE: MaterialId = MaterialId(1);
+
+    /// A brick of rolling ground: solid below a height that varies by a few
+    /// cells, with a one-cell pimple pattern on top, so the surface is not a
+    /// plane and greedy meshing cannot merge it into a few quads.
+    fn rolling_brick() -> Brick {
+        let mut brick = Brick::uniform(MaterialId::AIR, Revision(1));
+        for z in 0..32u8 {
+            for x in 0..32u8 {
+                let height = 12 + ((x as i32 * 3 + z as i32 * 5) % 7) + ((x as i32 ^ z as i32) & 1);
+                for y in 0..32u8 {
+                    if i32::from(y) < height {
+                        brick.set_cell(spall_core::LocalCell::new(x, y, z).unwrap(), STONE);
+                    }
+                }
+            }
+        }
+        brick
+    }
+
+    fn rolling_volume() -> Volume {
+        let mut volume = Volume::new(vid(), CellSizeCode::Quarter);
+        for z in -1..=1 {
+            for x in -1..=1 {
+                volume
+                    .insert_brick(BrickCoord::new(x, 0, z), rolling_brick())
+                    .unwrap();
+                volume
+                    .insert_brick(
+                        BrickCoord::new(x, 1, z),
+                        Brick::uniform(MaterialId::AIR, Revision(1)),
+                    )
+                    .unwrap();
+                volume
+                    .insert_brick(
+                        BrickCoord::new(x, -1, z),
+                        Brick::uniform(STONE, Revision(1)),
+                    )
+                    .unwrap();
+            }
+        }
+        volume
+    }
+
+    #[test]
+    fn a_coarse_mesh_has_far_fewer_triangles_over_the_same_ground() {
+        let volume = rolling_volume();
+        let at = BrickCoord::new(0, 0, 0);
+        let fine = build_brick_mesh(&volume, at, gen1(), TopologyEpoch::START).unwrap();
+        let half = build_brick_mesh_lod(&volume, at, 2, 0, gen1(), TopologyEpoch::START).unwrap();
+        let quarter =
+            build_brick_mesh_lod(&volume, at, 4, 0, gen1(), TopologyEpoch::START).unwrap();
+        assert!(
+            fine.stats.triangle_count > 2000,
+            "{}",
+            fine.stats.triangle_count
+        );
+        assert!(
+            half.stats.triangle_count * 3 < fine.stats.triangle_count * 2,
+            "{} against {}",
+            half.stats.triangle_count,
+            fine.stats.triangle_count
+        );
+        assert!(quarter.stats.triangle_count * 2 < half.stats.triangle_count * 2 + 1);
+        assert!(quarter.stats.triangle_count < half.stats.triangle_count);
+        // The same ground: every mesh lies inside the brick's 8 m box and the
+        // surface heights agree to within the coarse block.
+        for mesh in [&fine, &half, &quarter] {
+            for v in &mesh.mesh.vertices {
+                assert!(
+                    v.position[0] >= -1e-4 && v.position[0] <= 8.0 + 1e-4,
+                    "{:?}",
+                    v.position
+                );
+                assert!(v.position[2] >= -1e-4 && v.position[2] <= 8.0 + 1e-4);
+            }
+        }
+        // The ground level, averaged over the upward faces by area, agrees to
+        // within a coarse block or so (this ground varies by seven cells over a
+        // few, a harsher surface than most terrain; coarse ground rises).
+        let level = |m: &VolumeMesh, cell_m: f32| {
+            let (mut sum, mut area) = (0.0f32, 0.0f32);
+            for q in m.quads.iter().filter(|q| q.dir == FaceDir::PosY) {
+                let a = (q.u_len * q.v_len) as f32;
+                sum += q.plane as f32 * cell_m * a;
+                area += a;
+            }
+            sum / area
+        };
+        let (lf, lh, lq) = (level(&fine, 0.25), level(&half, 0.5), level(&quarter, 1.0));
+        assert!((lf - lh).abs() <= 0.75, "ground {lf} {lh} {lq}");
+        assert!((lf - lq).abs() <= 1.0, "ground {lf} {lh} {lq}");
+    }
+
+    #[test]
+    fn a_coarse_mesh_depends_on_the_same_bricks_as_a_fine_one() {
+        let mut volume = rolling_volume();
+        let at = BrickCoord::new(0, 0, 0);
+        let coarse = build_brick_mesh_lod(&volume, at, 2, 0, gen1(), TopologyEpoch::START).unwrap();
+        let fine = build_brick_mesh(&volume, at, gen1(), TopologyEpoch::START).unwrap();
+        assert_eq!(coarse.token.reads(), fine.token.reads());
+        // Editing the neighbour changes what the coarse mesh read.
+        let mut current = MapWorld::new(gen1());
+        for z in -1..=1 {
+            for x in -1..=1 {
+                for y in -1..=1 {
+                    current.set_brick(vid(), BrickCoord::new(x, y, z), Revision(1));
+                }
+            }
+        }
+        assert!(!coarse.is_stale(&current));
+        volume
+            .insert_brick(BrickCoord::new(1, 0, 0), Brick::uniform(STONE, Revision(2)))
+            .unwrap();
+        current.set_brick(vid(), BrickCoord::new(1, 0, 0), Revision(2));
+        assert!(coarse.is_stale(&current));
+    }
+
+    #[test]
+    fn a_closed_side_emits_the_faces_an_open_neighbour_would_hide() {
+        // Two solid bricks: the shared seam is interior and emits nothing...
+        let mut volume = Volume::new(vid(), CellSizeCode::Quarter);
+        for x in 0..=1 {
+            volume
+                .insert_brick(BrickCoord::new(x, 0, 0), Brick::uniform(STONE, Revision(1)))
+                .unwrap();
+        }
+        let at = BrickCoord::new(0, 0, 0);
+        let seam = |m: &VolumeMesh| {
+            m.quads
+                .iter()
+                .filter(|q| q.dir == FaceDir::PosX && q.plane == 32)
+                .count()
+        };
+        let open = build_brick_mesh_lod(&volume, at, 1, 0, gen1(), TopologyEpoch::START).unwrap();
+        assert_eq!(seam(&open), 0);
+        // ...until its +x side is closed (bit 3 = +x of axis 0 is bit 1).
+        let closed =
+            build_brick_mesh_lod(&volume, at, 1, 0b000010, gen1(), TopologyEpoch::START).unwrap();
+        assert_eq!(seam(&closed), 1, "one merged quad closes the +x seam");
+        // The other sides are unchanged, and a coarse mesh closes its seam too,
+        // at the coarse plane (32 cells is 16 coarse cells).
+        let coarse =
+            build_brick_mesh_lod(&volume, at, 2, 0b000010, gen1(), TopologyEpoch::START).unwrap();
+        assert!(
+            coarse
+                .quads
+                .iter()
+                .any(|q| q.dir == FaceDir::PosX && q.plane == 16),
+            "{:?}",
+            coarse
+                .quads
+                .iter()
+                .map(|q| (q.dir, q.plane))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_coarse_block_is_solid_when_a_quarter_of_its_cells_are() {
+        // A slab filling the bottom 5 of 32 layers: at stride 4 the blocks of
+        // layers 4 to 7 hold one layer of four, a quarter, so they are solid and
+        // the slab's top is at 8 cells, 2 m (a flat top rises by at most a
+        // quarter block).
+        let mut brick = Brick::uniform(MaterialId::AIR, Revision(1));
+        for z in 0..32u8 {
+            for x in 0..32u8 {
+                for y in 0..5u8 {
+                    brick.set_cell(spall_core::LocalCell::new(x, y, z).unwrap(), STONE);
+                }
+            }
+        }
+        let mut volume = Volume::new(vid(), CellSizeCode::Quarter);
+        volume
+            .insert_brick(BrickCoord::new(0, 0, 0), brick)
+            .unwrap();
+        let mesh = build_brick_mesh_lod(
+            &volume,
+            BrickCoord::new(0, 0, 0),
+            4,
+            0,
+            gen1(),
+            TopologyEpoch::START,
+        )
+        .unwrap();
+        let top = mesh
+            .mesh
+            .vertices
+            .iter()
+            .map(|v| v.position[1])
+            .fold(f32::MIN, f32::max);
+        assert!((top - 2.0).abs() < 1e-4, "top at {top} m");
+    }
 
     #[test]
     fn enclosed_brick_cache_invalidates_when_a_resident_neighbour_is_cut() {

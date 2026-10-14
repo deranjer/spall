@@ -541,6 +541,15 @@ impl Simulation {
             .collect();
         let water_span = crate::prof::Span::start("tick.water");
         if let Some(water) = &mut self.column_water {
+            let players: Vec<[f64; 2]> = self
+                .world
+                .players()
+                .map(|player| {
+                    let (lo, hi) = player.capsule_aabb_m();
+                    [0.5 * (lo[0] + hi[0]), 0.5 * (lo[2] + hi[2])]
+                })
+                .collect();
+            water.set_focus(&players);
             let reloaded: Vec<spall_core::BrickCoord> = report
                 .reloaded_bricks
                 .iter()

@@ -232,8 +232,25 @@ struct Published {
     steady_regions: usize,
     allocated_regions: usize,
     skipped_s: f64,
+    /// Terrain changes the worker applied since the tick last looked.
+    refresh: RefreshMetrics,
     /// A worker that panicked, so the tick can fail loudly.
     failure: Option<String>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct RefreshMetrics {
+    time: Duration,
+    columns_remapped: usize,
+    relocated_m3: f64,
+}
+
+/// A committed terrain change waiting for the water: the terrain as it was then,
+/// the regions whose bricks were edited, and those whose bricks became resident.
+struct PendingTerrain {
+    source: Arc<VolumeTerrain<Arc<Volume>>>,
+    edited: Vec<RegionKey>,
+    reloaded: Vec<RegionKey>,
 }
 
 struct Owed {
@@ -246,7 +263,16 @@ struct Owed {
 
 struct Shared {
     setup: ColumnWaterSetup,
+    /// Terrain changes queued by the tick and applied by whoever steps next
+    /// (the worker, or the tick itself without one): refreshing a region costs
+    /// time in proportion to every region the water holds, tens to hundreds of
+    /// milliseconds in a large world, and a tick that did it waited for the step
+    /// in flight first, so a walk that made bricks resident stalled the server.
+    pending_terrain: Mutex<Vec<PendingTerrain>>,
     gated_rate: AtomicU8,
+    /// Where the players are (metres, x and z): the water far from every one
+    /// steps less often (see `ColumnConfig::throttle_from_cells`).
+    focus: Mutex<Vec<[f64; 2]>>,
     core: Mutex<Core>,
     owed: Mutex<Owed>,
     wake: Condvar,
@@ -478,6 +504,19 @@ impl Shared {
     /// frame. On the worker thread, or inline in the tick.
     fn advance(&self) {
         let mut core = lock(&self.core);
+        let pending: Vec<PendingTerrain> = std::mem::take(&mut *lock(&self.pending_terrain));
+        let mut refresh = RefreshMetrics::default();
+        for change in pending {
+            let started = Instant::now();
+            let report = core.world.replace_terrain(change.source, &change.edited);
+            core.world.notify_resident(&change.reloaded);
+            core.edit_pending = true;
+            refresh.time += started.elapsed();
+            refresh.columns_remapped += report.columns_changed;
+            refresh.relocated_m3 += report.relocated_volume * CELL_SIZE_M.powi(3);
+        }
+        let focus = lock(&self.focus).clone();
+        core.world.set_focus(&focus);
         let started = Instant::now();
         let mut steps = 0u32;
         let mut last_step = None;
@@ -555,6 +594,9 @@ impl Shared {
         if let Some(frame) = new_frame {
             published.frame = frame;
         }
+        published.refresh.time += refresh.time;
+        published.refresh.columns_remapped += refresh.columns_remapped;
+        published.refresh.relocated_m3 += refresh.relocated_m3;
         published.steps += steps;
         if last_step.is_some() {
             published.last_step = last_step;
@@ -599,6 +641,19 @@ impl Shared {
             }
         }
     }
+}
+
+/// Threads for the water worker's pool: `SPALL_WATER_THREADS`, or half the
+/// cores, at least two and at most eight.
+fn water_pool_threads() -> usize {
+    std::env::var("SPALL_WATER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+            (cores / 2).clamp(2, 8)
+        })
 }
 
 impl AuthoritativeColumnWater {
@@ -681,6 +736,8 @@ impl AuthoritativeColumnWater {
         let shared = Shared {
             setup,
             gated_rate: AtomicU8::new(0),
+            pending_terrain: Mutex::new(Vec::new()),
+            focus: Mutex::new(Vec::new()),
             core: Mutex::new(Core {
                 world,
                 regions: BTreeMap::new(),
@@ -713,6 +770,7 @@ impl AuthoritativeColumnWater {
                 steady_regions: 0,
                 allocated_regions: 0,
                 skipped_s: 0.0,
+                refresh: RefreshMetrics::default(),
                 failure: None,
             }),
         };
@@ -746,12 +804,77 @@ impl AuthoritativeColumnWater {
             return;
         }
         let shared = Arc::clone(&self.shared);
+        // The step is data-parallel, and on rayon's global pool it takes every
+        // core for its few milliseconds, twenty times a second: a client on the
+        // same machine then loses its render thread to it and drops frames in
+        // bursts. A pool of its own, half the cores, leaves the rest
+        // for the render and driver threads (`SPALL_WATER_THREADS` overrides).
+        let threads = water_pool_threads();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("spall-water-{index}"))
+            .build()
+            .expect("column water thread pool starts");
         self.worker = Some(
             std::thread::Builder::new()
                 .name("spall-column-water".into())
-                .spawn(move || shared.run_worker())
+                .spawn(move || pool.install(|| shared.run_worker()))
                 .expect("column water worker thread starts"),
         );
+    }
+
+    /// A line saying why the active regions are awake: how many carry which
+    /// flow, and how many hold a spring or a drain. For `SPALL_WATER_DIAG=1`.
+    pub fn diag_summary(&self) -> String {
+        let core = lock(&self.shared.core);
+        let diag = core.world.active_regions_diag();
+        let setup = &self.shared.setup;
+        let exchange: BTreeSet<RegionKey> = setup
+            .sources
+            .iter()
+            .chain(setup.gated_sources.iter().flatten())
+            .chain(&setup.sinks)
+            .chain(setup.discharges.iter().map(|d| &d.cell))
+            .map(|c| spall_fluid::columns::region_of(c.x, c.z))
+            .collect();
+        let bands = [0.1f32, 1.0, 10.0, 100.0];
+        let mut count = [0usize; 5];
+        let mut with_exchange = [0usize; 5];
+        let (mut quiet, mut steady, mut resting) = (0usize, 0usize, 0usize);
+        for d in &diag {
+            let b = bands.iter().take_while(|edge| d.max_flow >= **edge).count();
+            count[b] += 1;
+            if exchange.contains(&d.key) {
+                with_exchange[b] += 1;
+            }
+            quiet += usize::from(d.quiet_steps > 0);
+            steady += usize::from(d.steady);
+            resting += usize::from(d.resting);
+        }
+        format!(
+            "{} active | max flow <0.1: {} ({} with a spring/drain), 0.1-1: {} ({}), 1-10: {} ({}), 10-100: {} ({}), >=100: {} ({}) | counting quiet {} | steady {} | resting {} | regions with a spring or drain {}",
+            diag.len(),
+            count[0],
+            with_exchange[0],
+            count[1],
+            with_exchange[1],
+            count[2],
+            with_exchange[2],
+            count[3],
+            with_exchange[3],
+            count[4],
+            with_exchange[4],
+            quiet,
+            steady,
+            resting,
+            exchange.len()
+        )
+    }
+
+    /// Tells the water where the players are (metres, x and z), so the water far
+    /// from all of them can be stepped less often. No points: nothing is far.
+    pub fn set_focus(&self, points_m: &[[f64; 2]]) {
+        *lock(&self.shared.focus) = points_m.to_vec();
     }
 
     pub fn has_worker(&self) -> bool {
@@ -838,19 +961,13 @@ impl AuthoritativeColumnWater {
             .collect();
         let terrain_changed = !edited_keys.is_empty() || !reloaded_keys.is_empty();
         if terrain_changed {
-            // Waits for a step in flight: the refresh must see a whole world.
-            let started = Instant::now();
-            let mut core = lock(&self.shared.core);
-            let report = core.world.replace_terrain(
-                terrain_source(terrain, &self.shared.setup),
-                &edited_keys.iter().copied().collect::<Vec<_>>(),
-            );
-            core.world.notify_resident(&reloaded_keys);
-            core.edit_pending = true;
-            drop(core);
-            metrics.boundary_refresh = started.elapsed();
-            metrics.columns_remapped = report.columns_changed;
-            metrics.relocated_m3 = report.relocated_volume * CELL_SIZE_M.powi(3);
+            // Applied by the next step (see `Shared::pending_terrain`); the
+            // terrain is captured now, so the refresh sees this commit.
+            lock(&self.shared.pending_terrain).push(PendingTerrain {
+                source: terrain_source(terrain, &self.shared.setup),
+                edited: edited_keys.iter().copied().collect(),
+                reloaded: reloaded_keys.clone(),
+            });
         }
         {
             let mut owed = lock(&self.shared.owed);
@@ -870,6 +987,10 @@ impl AuthoritativeColumnWater {
         if let Some(message) = &published.failure {
             return Err(ColumnWaterError::Worker(message.clone()));
         }
+        let refresh = std::mem::take(&mut published.refresh);
+        metrics.boundary_refresh = refresh.time;
+        metrics.columns_remapped = refresh.columns_remapped;
+        metrics.relocated_m3 = refresh.relocated_m3;
         metrics.steps = std::mem::take(&mut published.steps);
         metrics.stepped = metrics.steps > 0;
         metrics.step = published.last_step.take();

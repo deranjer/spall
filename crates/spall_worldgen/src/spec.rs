@@ -13,7 +13,7 @@ pub const GEN_VERSION: u32 = 3;
 /// Generation version of [`Preset::Gallery`].
 pub const GALLERY_GEN_VERSION: u32 = 1;
 /// Generation version of [`Preset::Natural`].
-pub const NATURAL_GEN_VERSION: u32 = 5;
+pub const NATURAL_GEN_VERSION: u32 = 6;
 
 /// Edge of a brick in cells (mirrors `spall_core::BRICK_EDGE`).
 pub const BRICK: i64 = 32;
@@ -156,6 +156,9 @@ pub struct WorldGenSpec {
     /// Vertical extent in bricks; the preset's own unless overridden with
     /// [`Self::with_height_bricks`].
     pub height_bricks: i64,
+    /// Whether the world has water: `false` generates the same terrain with
+    /// every lake, river and sea left dry (see [`Self::dry`]).
+    pub water: bool,
 }
 
 impl WorldGenSpec {
@@ -167,7 +170,17 @@ impl WorldGenSpec {
             palette,
             volume_id: VolumeId::new(1).expect("nonzero volume id"),
             height_bricks: preset.height_bricks(),
+            water: true,
         }
+    }
+
+    /// The same world with its water left out: the lake, river and sea basins
+    /// stay as they are, empty, and nothing is placed on them as wet. For
+    /// measuring what the water costs and for dry-world play.
+    #[must_use]
+    pub fn dry(mut self) -> Self {
+        self.water = false;
+        self
     }
 
     /// Overrides the world height (measurement probes and tests).

@@ -30,7 +30,7 @@ fn filled(w: &GeneratedWorld, x: i64, y: i64, z: i64) -> Option<MaterialId> {
 
 #[test]
 fn natural_has_its_own_version_and_height() {
-    assert_eq!(Preset::Natural.gen_version(), 5);
+    assert_eq!(Preset::Natural.gen_version(), 6);
     assert_eq!(Preset::Showcase.gen_version(), 3);
     assert_eq!(spec(1, SIZE).height_bricks, 16);
     assert_eq!(spec(1, SIZE).height_cells(), 512);
@@ -73,6 +73,59 @@ fn water_sits_above_the_ground_and_never_in_the_border() {
     }
 }
 
+/// Fresh water stands level, so no bank beside it may be lower than its surface:
+/// the solver, started from this plan, would spill the water over it and drain
+/// the lake (version 6 raises such banks; before, a river on a side slope or a
+/// lake with a channel cut through its rim left them up to 40 cells low).
+#[test]
+fn fresh_water_has_no_lower_dry_bank() {
+    for seed in 1..=4 {
+        let c = columns(seed, 1024);
+        let n = 1024i64;
+        let mut wet = 0;
+        for z in 40..n - 40 {
+            for x in 40..n - 40 {
+                if !c.is_water(x, z) || c.water_surface(x, z) <= SEA_LEVEL + 1 {
+                    continue;
+                }
+                wet += 1;
+                for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let (nx, nz) = (x + dx, z + dz);
+                    if !c.is_water(nx, nz) {
+                        assert!(
+                            c.height(nx, nz) >= c.water_surface(x, z),
+                            "seed {seed}: water at ({x},{z}) stands {} over a dry bank of {} at ({nx},{nz})",
+                            c.water_surface(x, z),
+                            c.height(nx, nz)
+                        );
+                    }
+                }
+            }
+        }
+        assert!(wet > 1000, "seed {seed} has fresh water to check: {wet}");
+    }
+}
+
+#[test]
+fn a_dry_world_has_the_same_ground_and_no_water() {
+    let wet = generate(&spec(3, SIZE)).expect("wet world");
+    let dry = generate(&spec(3, SIZE).dry()).expect("dry world");
+    assert!(wet.water.cell_count() > 0, "the seed has water to remove");
+    assert_eq!(dry.water.cell_count(), 0);
+    assert!(dry.water.springs.is_empty() && dry.water.sinks.is_empty());
+    let (wet_columns, dry_columns) = (&wet.columns, &dry.columns);
+    for z in (0..SIZE as i64).step_by(7) {
+        for x in (0..SIZE as i64).step_by(7) {
+            assert_eq!(wet_columns.height(x, z), dry_columns.height(x, z));
+            assert!(!dry_columns.is_water(x, z));
+        }
+    }
+    assert_eq!(
+        wet.terrain.resident_brick_count(),
+        dry.terrain.resident_brick_count()
+    );
+}
+
 #[test]
 fn heights_stay_under_the_wall() {
     for seed in 1..=6 {
@@ -88,7 +141,7 @@ fn heights_stay_under_the_wall() {
 fn generated_worlds_hold_water_only_in_air_and_keep_a_dry_spawn() {
     for seed in [1, 2, 5] {
         let w = generate(&spec(seed, SIZE)).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-        assert_eq!(w.version, 5);
+        assert_eq!(w.version, 6);
         for c in w.water.cells().step_by(37) {
             assert_eq!(
                 filled(&w, c.x, c.y, c.z),

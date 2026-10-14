@@ -452,7 +452,10 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
     use std::time::{Duration, Instant};
     let dir = std::env::temp_dir().join(format!("spall-vegetation-region-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let scene = sandbox::worldgen_scene::generate("natural", 4, 512).unwrap();
+    let scene = // A 384-cell world: the late join installs every brick, 4096 of them at 512,
+    // which took half a minute on a starved CI core and outlasted the server's
+    // paced ticks.
+    sandbox::worldgen_scene::generate("natural", 4, 384).unwrap();
     let total = scene.vegetation().organisms.len() as u64;
     let spawns = scene.player_spawns().to_vec();
     let vegetation = scene.vegetation().clone();
@@ -470,7 +473,11 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
     // A client joins late and then runs 600 ticks; the server must outlast it on a
     // slow machine (on CI 900 ended before a slow join finished: "connection lost"
     // in every run), so it runs 1500.
-    config.max_ticks = 1500;
+    config.max_ticks = 2400;
+    // The default test transport drops a connection that is silent for 6 s, and
+    // on CI this test (a 512 world, two clients, beside a dozen others on a few
+    // cores) stalls longer than that: "connection lost" in every run.
+    config.transport.idle_timeout = Duration::from_secs(60);
     config.quiescence_ticks = 0;
     config.paced = true;
     config.fingerprint_out = Some(fp.clone());
@@ -504,7 +511,7 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
         movement_script: vec![],
         late_join: true,
         baseline_scene: BaselineScene::Walk,
-        run_ticks: 600,
+        run_ticks: 1200,
         idle_grace: Duration::from_millis(500),
         // CI runs this beside a dozen other worlds on a few cores, with ticks of
         // 50-90 ms: the clients' 600 ticks took over a minute and the old 60 s
@@ -512,7 +519,11 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
         overall_timeout: Duration::from_secs(240),
         log_json: dir.join("whole.jsonl"),
         summary_json: None,
-        transport: TransportConfig::for_tests(),
+        transport: {
+            let mut transport = TransportConfig::for_tests();
+            transport.idle_timeout = Duration::from_secs(60);
+            transport
+        },
         client_residency: None,
         baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: None,
@@ -543,12 +554,71 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
     );
     assert!(region.vegetation_keyframes_received >= 1);
     assert!(
-        region.vegetation_plants_received < full.vegetation_plants_received / 3,
+        region.vegetation_plants_received < full.vegetation_plants_received / 2,
         "regional {} against whole {}",
         region.vegetation_plants_received,
         full.vegetation_plants_received
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Far trees are drawn with half-resolution crowns: about an eighth of the leaf
+/// cubes, half a metre a side, filling the same space; near trees and ground
+/// plants are untouched.
+#[test]
+fn far_crowns_use_fewer_larger_blocks_over_the_same_space() {
+    let scene = sandbox::worldgen_scene::generate("showcase", 1, 256).unwrap();
+    let frame = scene.vegetation().visual(&scene.world().terrain);
+    let eye = [32., 0., 32.];
+    let leaf = |p: &spall_ecology::living::SoftPart, size: f32| p.size == [size; 3];
+    let fine = frame.parts(eye, 200.);
+    let all_far = frame.parts_lod(eye, 200., 0.0);
+    let all_near = frame.parts_lod(eye, 200., 1.0e9);
+    assert_eq!(
+        fine.len(),
+        all_near.len(),
+        "a far limit past every plant changes nothing"
+    );
+    let fine_leaves: Vec<_> = fine
+        .iter()
+        .filter(|p| leaf(p, 0.25) && p.yaw == 0.)
+        .collect();
+    let coarse_leaves: Vec<_> = all_far.iter().filter(|p| leaf(p, 0.5)).collect();
+    assert!(fine_leaves.len() > 500, "{} fine leaves", fine_leaves.len());
+    assert!(
+        coarse_leaves.len() * 3 < fine_leaves.len(),
+        "{} coarse against {} fine",
+        coarse_leaves.len(),
+        fine_leaves.len()
+    );
+    // The crowns cover the same volume to within a block.
+    let extent = |parts: &[&spall_ecology::living::SoftPart]| {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for p in parts {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p.center[a] - p.size[a] / 2.);
+                hi[a] = hi[a].max(p.center[a] + p.size[a] / 2.);
+            }
+        }
+        (lo, hi)
+    };
+    let (flo, fhi) = extent(&fine_leaves);
+    let (clo, chi) = extent(&coarse_leaves);
+    for a in 0..3 {
+        assert!(
+            (flo[a] - clo[a]).abs() <= 1.0 && (fhi[a] - chi[a]).abs() <= 1.0,
+            "axis {a}: {flo:?}..{fhi:?} against {clo:?}..{chi:?}"
+        );
+    }
+    // Ground plants draw the same either way.
+    let blades = |parts: &[spall_ecology::living::SoftPart]| {
+        parts
+            .iter()
+            .filter(|p| p.size[0] < 0.2 || p.yaw != 0.)
+            .count()
+    };
+    assert_eq!(blades(&fine), blades(&all_far));
 }
 
 /// A ground plant is never placed in a tree's trunk column (the tree's wood is

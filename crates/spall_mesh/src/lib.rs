@@ -43,11 +43,13 @@ pub mod mesh;
 pub mod sample;
 
 pub use ao::ao_factor;
-pub use build::{MeshOptions, VolumeMesh, build_brick_mesh, build_volume_mesh};
+pub use build::{
+    MeshOptions, VolumeMesh, build_brick_mesh, build_brick_mesh_lod, build_volume_mesh,
+};
 pub use culled::emit_culled;
 pub use enumerate::{ExposedFace, for_each_exposed_face};
 pub use face::{FACE_DIRS, FaceDir};
 pub use greedy::emit_greedy;
 pub use lod::{HeightfieldSeamPatch, LodSeamError, stitch_heightfield_edge};
 pub use mesh::{FaceQuad, Mesh, MeshStats, MeshStrategy, Vertex, mesh_digest, mesh_digest_hex};
-pub use sample::{CellBox, MeshError, Occupancy, ResidentCells, VolumeSampler};
+pub use sample::{CellBox, ClosedSides, MeshError, Occupancy, ResidentCells, VolumeSampler};

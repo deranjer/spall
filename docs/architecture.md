@@ -418,6 +418,16 @@ Each of the four sun cascades is a light-space box around a sphere centred on th
 
 The renderer's camera-local lighting cache relights in slices: sky visibility once, then the bounce in interleaved strides sized from measured GPU cost, and a camera recentre scrolls the cache and relights only the entered strip. This changes cost, not the cache contract above (derived, camera-local, never authoritative). Editor world-generation previews are drawn from the same `ColumnMap` the server builds; layers are diagnostics, not a second generator (`docs/worldgen.md`).
 
+### Occlusion culling, distance fog and the frame limiter (client renderer)
+
+About four in five terrain chunks inside the camera's frustum show no pixel (underground shells, the far side of hills). The camera pass skips chunks judged hidden by GPU occlusion queries (`spall_render::occlusion`): after the opaque pass, the bounding boxes of up to 192 chunks a frame are drawn against that pass's depth, each inside an occlusion query; the counts are read back asynchronously over three slots, and each chunk keeps a verdict. A chunk with no verdict (new, edited, back in the frustum, or after the camera jumps) is drawn; a visible chunk is drawn and re-tested every 16 frames; a hidden chunk is skipped and re-tested every few frames, and drawn anyway once its verdict is 90 frames old. The test is exact (the box covers the chunk), so it can only draw too much, never leave a hole, apart from the few frames a newly uncovered chunk waits for its next test. The sun cascades are not culled this way. Measured on the 4096-cell natural world at 1928x931: 61% of chunks culled, standing frame 10.6 -> 7.3 ms, scripted walk median 10.5 -> 9.6 ms. `SPALL_NO_OCCLUSION=1` turns it off.
+
+Distance fog fades the outer third of the view radius (62% to 97%) into the sky's horizon colour, in terrain, water and foliage, so chunks that stop being drawn at the edge do not pop (`SPALL_NO_FOG=1` off). The uncapped frame loop is limited to `SPALL_MAX_FPS` (default 240, 0 for none): without vsync the loading screen ran at 3,000+ frames a second and starved the rest of the PC. Terrain level of detail beyond the near chunks is not implemented.
+
+Lighting sweeps (`spall_render::sky_visibility`) were found to spend most of their GPU time in thin slices. A sweep is cut into 128/N-layer slices so no frame carries it all; a slice of one layer has too few active threads to hide memory latency and costs about what a four-layer slice does, but the cost model (cost proportional to layers) kept asking for more slices, so a walk's recentre sweeps ran at 128 slices, about four times the GPU work of 32. The slice count is now capped at 32 (four layers, a full workgroup row): in a dense-forest walk at 1928x931 the median frame went from 16.8 to 14.2 ms (three runs each) and sweep steps fell by two thirds. The bounce also casts fewer rays for cells far from the camera (at most 42 beyond 16 m, 18 beyond 32 m): 90th-percentile frame 18.9 -> 17.9 ms, the median within noise; a lamp 45 m away lights the floor at about 70% of its near brightness.
+
+Lighting quality (`spall_render::sky_visibility::LightingQuality`, client key `F7`, menu button, `SPALL_LIGHTING=off|low|medium|high`, scripted step `lighting:low`) sets how much of the camera-local lighting cache is computed; it changes the cache, never the world. Off: flat ambient light, no cache. Low: skylight visibility only (no bounce), re-centred after 16 m of drift, sun relit every 12 degrees. Medium: bounce with 42 rays per cell, 12 m drift, 8 degrees. High (default): bounce with all 66 rays, 8 m drift, 5 degrees. Measured on a scripted walk through the dense forest of the 4096-cell natural world at 1928x931, where a lighting sweep step ran in about two frames out of three: Off 8.8-11.7 ms a frame, High 12.9-14.8, Low 12.6-13.4, Medium 12.0-17.1 across runs (run-to-run noise is about 1.5 ms, so Low and Medium are not clearly separated from High; Off and Low's missing bounce are). The bounce slice cost did not fall with the ray count; the cost per sweep step is dominated by the sky pass and the slice dispatch, not the rays.
+
 ### ENG-122 reconstructed support diagnostic (2026-10-04)
 
 The opt-in `MacGridWorld::set_cut_surface_support` backend constructs PLIC
@@ -457,6 +467,162 @@ final-state stability gate; it remains unaccepted (see the checkpoint below). Th
 memory and local momentum-accuracy gates remain open. No default promotion
 follows from the passing motion gates. See docs/reports/ENG-122.md for the
 regularized inertia, unchanged gates and precise integration blocker.
+
+### Terrain level of detail (client renderer)
+
+Chunks far from the camera are meshed from a strided sample of their bricks
+(`spall_mesh::build_brick_mesh_lod`): blocks of 2 cells beyond 40 m, 4 cells
+beyond 72 m (3D distance from the camera to the chunk centre; 6 m hysteresis so
+a chunk standing on a line does not flip). A block is solid when at least a
+quarter of its cells are, so a two-cell trunk survives however it is aligned
+and flat ground rises by at most a quarter block; the fog (62%-97% of the view
+radius) hides the change. The coarse mesh reads exactly the bricks the fine one
+does, so its staleness token is unchanged. A chunk whose neighbour is meshed at
+another level closes that side (the neighbour reads as open air there), so each
+chunk carries its own skin and no crack opens at the seam.
+
+The client keeps each chunk's level and closed sides with its cached mesh and
+rebuilds when either changes. A walk crosses a shell of hundreds of chunks at
+once, and each change is a rebuild, an upload and (through the closed sides)
+rebuilds of the neighbours, so at most 24 chunks whose bricks are unchanged
+change level per rebuild pass, nearest first; the rest keep the level they
+have and catch up on the next passes. Such an upload is flagged detail-only and
+the renderer neither invalidates the cached shadow cascades for it, nor does a
+change that misses a cascade's box (the cascades are invalidated per change
+bounds now, not by one global generation). `SPALL_NO_TERRAIN_LOD=1` turns the
+levels off.
+
+Measured on the natural 4096 world, forest walk at 1928x931 (release, one GPU,
+same session): 104 fps median with levels against 87 without (frame 9.7 ms
+against 11.1 ms), terrain triangles 4.1M to 1.1M. Without the per-pass budget
+and the shadow change the same walk ran 51-56 fps against 62-78: every level
+change forced a shadow redraw and the worker rebuilt about 1000 chunks per 8 m
+walked. Standing: 8.1 ms to 7.5 ms in the open and 8.1 ms to 7.1 ms in forest.
+The runs are noisy by a few ms; GPU capture and other hardware are unrun.
+
+The shadow cascades follow the sun in steps of half a degree (`SHADOW_SUN_STEP_DEG`
+in `pipeline.rs`): the day clock moves it a tenth of a degree a second, and
+reframing the maps for each of those slid the texel grid across the terrain and
+made shadows on slopes shimmer once a second. Held for several seconds they stay
+still and their cached terrain depth stays valid.
+
+Foliage shadows are cached like the terrain's: each cascade keeps a merged
+layer (the terrain depth plus the foliage drawn over a copy of it) that is
+redrawn only when the terrain depth was redrawn or the foliage instances
+changed, and the moving casters are drawn over it each frame. Before, every
+frame redrew all the foliage in each cascade, about 1.8 ms of GPU time at a
+forest lake. Measured on that walk (natural 4096, seed 4, 1928x931, release):
+median frame 6.6 ms to 5.4 ms, shadow GPU 1.9 ms to 0.1 ms, p90 and the worst
+frame per second unchanged. Costs 3 more 2048x2048 depth layers.
+
+Water frame spikes (found with `SPALL_WATER_TRACE=1`, which logs client water
+work over half a millisecond on the frame trace's clock, and `SPALL_NO_WATER=1`,
+which generates the world dry). On the lake walk a dry world had 2-8 frames over
+20 ms and the wet one 250-270, with the median unchanged. The cause was not the
+client's water upload (2 of 46 slow frames contained 2 ms of it) but the
+server's water step: it ran on rayon's global pool, taking every core for its
+3-10 ms, twenty times a second, and the client's render and driver threads lost
+their cores (acquire and submit stalls). The water worker now has a pool of its
+own, half the cores (at most 8, `SPALL_WATER_THREADS` overrides): 50-60 slow
+frames at 4 or 8 threads, 11 at 1 thread but then the water falls minutes
+behind real time. Separately the client eased the water surface every frame
+(about 0.8 ms of the main thread at 200 fps, 8.5 s over the walk): it now eases
+at 60 Hz (1.8 s). What remains over a dry world is not in the water traces; the
+frames show acquire and submit stalls.
+
+Slow frames at the lake (`SPALL_FRAME_CSV=1` prints one line per client frame:
+clock, handler, acquire and submit milliseconds, water rectangles uploaded;
+`SPALL_FRAME_TRACE=1` now also prints GPU pass times over 5 ms and terrain
+uploads over 1 ms). Over about 20,000 frames of the lake walk, 5% took over 8 ms
+and about 1.2% over 16 ms (a dry world: 2.9% and 0.14%). Two causes, neither the
+client's water or terrain uploads: (1) the bounce lighting sweep, in 2.7% of
+frames, each carrying a slice of median 5 ms GPU (p90 10, worst 66) that makes
+the next frame wait 7 ms for the swapchain: 41% of the frames over 8 ms and
+25% of those over 16; (2) the server's water step competing for cores with the
+render and driver threads: the frames over 16 ms with no sweep fell from 347 to
+133 to 27 to 1 going from 8 water threads to 4, 2 and a dry world, but runs
+vary by about half a percentage point, and fewer threads let the water fall
+behind (2 threads: 48 s behind real time in 130 s). Not established: lowering the
+server's process priority (`SPALL_SERVER_PRIORITY=low` in `xtask play`).
+
+The water field's recentre no longer stalls a frame on its upload. A replacement
+field (`GameRenderer::replace_water_field`) goes to a second texture 64 rows a
+frame (16 frames for 1024 rows) while the old field keeps drawing, then swaps;
+rectangle updates in the meantime are for the new field. A recentre used to cost
+about 25 ms in one frame (2-7 ms CPU rebuild, 21 ms upload); it is now 8 ms
+(5.5-6.3 ms of it the CPU rebuild in `ColumnSurface::recentre`, still in one
+frame) and a millisecond a frame for 16 frames. The first install of a field is
+still immediate (17 ms once).
+
+Water far from every player steps less often, and catches up when one returns
+(`ColumnConfig::throttle_from_cells`, `catch_up_substeps`; the server sets
+them for generated worlds, `SPALL_WATER_THROTTLE=off` turns them off). The sim
+tells the water where the players are each tick (`ColumnWorld::set_focus`). An
+active region farther than 160, 320 or 640 m from the nearest player steps one
+step in 2, 4 or 8; on the others it rests: it exchanges water with its
+neighbours through its edge, as a sleeping region does, but does not
+redistribute, so far water runs in slow motion and no water is made or lost.
+The time a region rested is its debt (`region_owed_s`); once a region is near
+again it spends up to 24 substeps a step, nearest and largest debt first, four
+regions a step, stepped alone for up to 4 s of its debt, until it has caught up.
+A region that is quiet for its sleep count still sleeps (counted in steps it was
+stepped), and a draining lake is never quiet, so it never sleeps early; with no
+player nothing is throttled. Tests (`tests/column_throttle.rs`): a far lake
+drains late but finishes and conserves volume to 1e-9; no focus, a focus on the
+lake, or the bands off change nothing bit for bit; after 40 s far and 40 s near,
+a lake is at the level of one never throttled (29.17 against 29.17 cells; one
+that stayed far was at 29.54) and its debt went from 35 s to 0.2 s. At the lake
+walk (natural 4096, two runs each): frames over 16 ms 0.56% and 0.41% with it
+against 1.58% and 0.91% without (a dry world: 0.14%), the water's lag behind
+real time 3 s against 10 s at 130 s, and 190 of about 260 active regions resting.
+More regions stay active (they go quiet at a slower pace), which costs memory
+bandwidth rather than CPU. A catch-up hitch when a player arrives at a far lake
+has not been measured in the game.
+
+Debug report (`F9`, or "Copy debug report" in the `F10` menu): copies a plain
+text report to the clipboard (Windows `clip`, `pbcopy`, `xclip`) and saves it to
+`spall-debug-report.txt` in the system temp directory. It holds the build (git
+commit and branch when built, command line), the player's position, cell and
+region, camera mode, window size, the last 2400 frames' handler time (mean,
+p50/p90/p99, worst, share over 8/16/33 ms), the HUD's last line one field per
+line (GPU passes, chunks, tris, lighting sweep, corrections), lighting settings
+and time of day, resident and drawn chunks, the client's water field, the end of
+the server's stderr log (when launched by `xtask play`, which sets
+`SPALL_SERVER_LOG`; it carries the water status and slow-tick lines), the view
+radius, fog, LOD constants and every `SPALL_*`/`RAYON*`/`WGPU*` environment
+variable. A `report` step in `--shots` triggers it from a scripted run.
+
+Water terrain refreshes run on the water worker. Refreshing a region's terrain
+(a committed edit, or bricks becoming resident as a player walks) costs time in
+proportion to every region the water holds, not the one refreshed (a probe in
+debug: 30 ms at 196 regions, 163 ms at 784, 627 ms at 3025), and the tick did it
+under the core lock after waiting for the step in flight: during a 7.7-minute
+walk the server's ticks reached 0.4, 2.4, 2.2 and 4.9 s in `tick.water`. The tick
+now captures the terrain and queues it (`pending_terrain`); the next step applies
+it, and the refresh figures reach the tick's metrics a tick later. The same walk
+afterwards: worst slow ticks 326 ms and 305 ms (the first is the opening tick),
+none in the seconds. Active regions grow along the walk with or without the
+far-water throttle (100 to 438 with it, 93 to 382 without, over about 480 s of
+water time); with it the water ended 8 s behind real time, without it 26 s. The
+status line's `last step 0.0 ms ... (0 resting)` lines are ticks with no new step
+(the metrics are taken once), not a stalled worker. Why regions stay active along
+a walk (live rivers and their springs, regions woken as bricks come resident) is
+not investigated.
+
+Why water regions stay awake (`SPALL_WATER_DIAG=1` prints, with each water
+status line, how many active regions carry which largest flow and how many hold
+a spring or drain). Standing still on a 4096 world, active regions climbed from
+100 to about 360 in 500 s of water time and stayed near 330, with no walking.
+Of them 200-270 carried a largest flow of 0.1-1 cells^3/s, just over the 0.1
+sleep threshold; only 27 regions in the world hold a spring or drain and at most
+9 awake ones did, so it is currents in channels, not the springs. The steady-flow
+sleep (`SPALL_WATER_STEADY_STEPS=40`) never froze a single region (steady 0 all
+run). Raising the threshold to 0.5 (`SPALL_WATER_SLEEP_FLOW`, now the generated
+worlds' default): active regions stayed 53-78 standing and 51-83 walking the lake
+for 508 s, a step about 1 ms (before 14-40), the water 1.9-2.5 s behind real time
+(before 5-8 s). Flows under 0.5 cells^3/s (8 mL/s through the busiest pipe) stop
+being stepped until something disturbs them, so the slowest creeping on slopes
+and in channels freezes; rivers (1-100) keep running. Not looked at in game.
 
 ### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
 
