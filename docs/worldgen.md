@@ -63,6 +63,22 @@ before. It depends only on the original columns, so it does not depend on
 visiting order. The sea is left to the shore, and wet neighbours at different
 levels (rapids and falls) are unchanged. The version is 6.
 
+## Natural caves: varied entrances (version 7)
+Through version 6 every cave mouth in every preset was the same round tube of
+radius 7 cells ending in a sphere of 16, eight to a world, placed on any dry
+land. A natural world now gives each mouth its own shape (`natural_mouths` in
+`caves.rs`): a small round tube (3.8-6.2 cells), a wide low gallery (9-14.5 wide,
+3.6-5.6 high), a tall arch (5.5-9 wide, 8-12 high), a round bore (6-11) or a great
+cavern mouth (12-17 wide, 8-13 high), widening at the opening by 15-100%, with
+walls that waver by a slow 3D noise, one to three bends on the way down (shallow
+first), a drop and a length that vary, and one or two chambers of 9-23 cells. A
+4096 world has 16 mouths (one per 256 cells of arena edge, 8 to 24). A mouth
+opens at least 28 cells from any river or lake, and no point of its path or
+chambers is within 14 cells of water or under it. The showcase and the gallery
+keep the original tube and sphere, so their versions and golden digest stand.
+Generation time rises about 4%. Flooded caves are not generated: the water plan
+holds surface columns only, so a cave below a lake would need its own water.
+
 ## Pipeline
 1. `columns.rs` (2D, cheap, previewable): layout weights from warped
    normalized coordinates -> height, `Biome`, basin weight, surface `Stack`.
