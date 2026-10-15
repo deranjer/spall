@@ -65,15 +65,15 @@ fn journal_tick(sim: &mut Simulation, through: &mut u64) -> Vec<JournalRecord> {
         });
         *through = seq;
     }
-    for (key, state) in sim.take_snow_journal_tiles().unwrap() {
+    for tile_state in sim.take_snow_journal_tiles().unwrap() {
         let seq = sim.reserve_journal_seq().unwrap().0;
         records.push(JournalRecord {
             seq,
             tick,
             payload: JournalPayload::SnowTileState {
                 world_epoch: sim.weather_state().world_epoch,
-                tile: [key.0, key.1, key.2],
-                state,
+                tile: tile_state.tile,
+                state: tile_state.state,
             },
         });
         *through = seq;
@@ -209,13 +209,23 @@ fn checkpoint_and_geometry_journal_preserve_q32_snow_but_clear_temporary_tracks(
     let recovered = writer.recover().unwrap();
     let mut pre_snow = recovered.clone();
     for record in &mut pre_snow.journal {
-        if let JournalPayload::Topology { transaction, participants } = &mut record.payload {
+        if let JournalPayload::Topology {
+            transaction,
+            participants,
+        } = &mut record.payload
+        {
             transaction[..2].copy_from_slice(&6u16.to_le_bytes());
-            for motion in participants { motion[..2].copy_from_slice(&6u16.to_le_bytes()); }
+            for motion in participants {
+                motion[..2].copy_from_slice(&6u16.to_le_bytes());
+            }
         }
     }
-    let (pre_snow_restart, _) = restore(&pre_snow).expect("unchanged pre-snow topology layouts remain recoverable");
-    assert_eq!(pre_snow_restart.world().world_hash(), sim.world().world_hash());
+    let (pre_snow_restart, _) =
+        restore(&pre_snow).expect("unchanged pre-snow topology layouts remain recoverable");
+    assert_eq!(
+        pre_snow_restart.world().world_hash(),
+        sim.world().world_hash()
+    );
     let (mut restarted, _) = restore(&recovered).unwrap();
     assert_eq!(restarted.current_tick(), sim.current_tick());
     assert_eq!(restarted.world().world_hash(), sim.world().world_hash());
