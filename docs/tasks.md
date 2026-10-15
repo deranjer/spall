@@ -1841,3 +1841,23 @@ Coordinator owns F10/audio/window/common docs/build/launch. Luna Medium workers
 implemented separate server/protocol and client/render slices in isolated worktrees.
 Canonical plan: weather.md; exact combined checks and launch evidence:
 reports/ENG-198-integrated-weather-playtest.md. WX3/WX4 remain unassigned.
+
+### ENG-201..ENG-205 - Animated animal foundations and world integration
+
+User authorized Luna 6 Medium implementation workers on 2026-10-14.
+Independent assignments: ENG-201 / A0 CPU SPVX assembly decoder and transform
+sampling; ENG-202 / A1 articulated trout, crow and deer fixtures; ENG-203 / A2
+live terrain/water habitat candidate validation. ENG-201/202/203 are reviewed
+and done, including cross-fixture decoding and live generated-world checks.
+Frozen scope, dependencies and acceptance: docs/animals.md.
+A1 uses the existing binary format; A2 uses current world snapshots. No live
+animal spawning, navigation, multiplayer animation or persistence gate is claimed.
+ENG-204 / A3 implements CPU articulated render extraction and the bounded GPU
+animal preview. The coordinator recovered the preview worker's files after its
+usage limit, fixed camera/framing and refined the source assets after visual
+review. ENG-204 is done for its bounded source preview scope; the report records
+the exact checks and concurrent-build caveat.
+Next unblocked: ENG-205 / A4, the missing authoritative creature tick/lifecycle,
+collision/damage/ownership, wire and durable-recovery contracts before live
+population. Exact preview commands and limitations: docs/animals.md and
+reports/ENG-204-animal-preview.md.

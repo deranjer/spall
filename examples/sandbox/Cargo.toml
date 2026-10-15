@@ -19,6 +19,11 @@ path = "src/bin/sandbox-capture.rs"
 required-features = ["client"]
 
 [[example]]
+name = "animal-preview"
+path = "examples/animal_preview.rs"
+required-features = ["client"]
+
+[[example]]
 name = "ecology-clearing"
 path = "examples/ecology_clearing.rs"
 

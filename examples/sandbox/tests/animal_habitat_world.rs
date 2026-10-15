@@ -92,10 +92,10 @@ fn generated_habitats_accept_each_category_and_reject_lost_water_or_support() {
                 let candidate = CandidateEnvelope {
                     center_m: DVec3::new(
                         (x as f64 + 0.5) * 0.25,
-                        (y + 1) as f64 * 0.25 + 1.1875 * 0.5,
+                        (y + 1) as f64 * 0.25 + 1.0625 * 0.5,
                         (z as f64 + 0.5) * 0.25,
                     ),
-                    size_m: DVec3::new(0.875, 1.1875, 0.1875),
+                    size_m: DVec3::new(0.875, 1.0625, 0.3125),
                 };
                 validate_candidate(terrain, None, AnimalHabitat::Land, candidate, limits)
                     .ok()

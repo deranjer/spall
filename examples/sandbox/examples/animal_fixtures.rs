@@ -12,7 +12,7 @@ const CELL_SIZE_CM: u8 = 1; // SPVX code 1 = 6.25 cm.
 const PALETTE: [[u8; 3]; 5] = [
     [76, 129, 170],
     [205, 179, 123],
-    [44, 67, 49],
+    [35, 38, 44],
     [120, 91, 55],
     [224, 220, 191],
 ];
@@ -140,37 +140,51 @@ fn anim(name: &'static str, duration: u32, tracks: Vec<Track>) -> Clip {
 
 fn trout() -> Animal {
     let mut body = part(1, 0, "body", [0, 0, 0]);
-    for x in -4i32..=4 {
-        let (w, h) = if x.abs() <= 1 {
-            (1, 2)
-        } else if x.abs() <= 3 {
-            (2, 1)
-        } else {
-            (1, 0)
+    for x in -4i32..=6 {
+        let (w, h) = match x {
+            -4 | 5 | 6 => (0, 0),
+            -3 | -2 | 3 | 4 => (1, 1),
+            _ => (1, 2),
         };
         for z in -w..=w {
             for y in -h..=h {
-                let tint = if y == h && x.abs() < 3 {
-                    1
+                let tint = if x == 4 && y == 1 && z != 0 {
+                    3 // Contrasting eyes on both sides of the head.
                 } else if y == -h && x.abs() < 3 {
                     2
                 } else {
-                    0
+                    1
                 };
                 voxel(&mut body, x, y, z, "stone", tint);
             }
         }
     }
-    cuboid(&mut body, [5, 6, 0, 0, -1, 1], "stone", 1); // blunt, distinct head/muzzle
     let mut tail = part(2, 1, "tail_peduncle_and_fork", [-4, 0, 0]);
-    cuboid(&mut tail, [-2, 0, 0, 0, -1, 1], "stone", 0);
-    cuboid(&mut tail, [-4, -3, -2, 2, 0, 0], "moss", 3); // vertically forked caudal fin
+    cuboid(&mut tail, [-2, 0, 0, 0, -1, 1], "stone", 1);
+    for y in -2i32..=2 {
+        voxel(&mut tail, -3, y, 0, "moss", 3);
+        if y.abs() >= 1 {
+            voxel(&mut tail, -4, y, 0, "moss", 3);
+        }
+    }
     let mut dorsal = part(3, 1, "dorsal_fin", [-1, 2, 0]);
-    cuboid(&mut dorsal, [-1, 1, 0, 2, -1, 1], "moss", 3);
+    for x in -1i32..=1 {
+        for y in 0..=2 - x.abs() {
+            voxel(&mut dorsal, x, y, 0, "moss", 3);
+        }
+    }
     let mut pectoral = part(4, 1, "pectoral_fin_near", [1, 0, 1]);
-    cuboid(&mut pectoral, [-1, 1, -1, 0, 0, 2], "moss", 3);
+    for z in 0..=2 {
+        for x in -1..=1 - z {
+            voxel(&mut pectoral, x, -1, z, "moss", 3);
+        }
+    }
     let mut far = part(5, 1, "pectoral_fin_far", [1, 0, -1]);
-    cuboid(&mut far, [-1, 1, -1, 0, -2, 0], "moss", 3);
+    for z in 0..=2 {
+        for x in -1..=1 - z {
+            voxel(&mut far, x, -1, -z, "moss", 3);
+        }
+    }
     let idle = anim(
         "idle",
         120,
@@ -218,7 +232,7 @@ fn crow() -> Animal {
             }
         }
     }
-    cuboid(&mut head, [3, 4, 0, 0, -1, 1], "wood", 5);
+    cuboid(&mut head, [3, 4, 0, 0, 0, 0], "wood", 3);
     voxel(&mut head, 1, 1, 1, "snow", 5);
     voxel(&mut head, 1, 1, -1, "snow", 5);
     let mut near = part(3, 1, "wing_near", [0, 1, 1]);
@@ -286,12 +300,12 @@ fn crow() -> Animal {
 fn deer() -> Animal {
     let mut body = part(1, 0, "torso", [0, 0, 0]);
     for x in -4i32..=4 {
-        let half = if x.abs() < 3 { 1 } else { 0 };
-        cuboid(&mut body, [x, x, -1, 1, -half, half], "wood", 4);
+        let half = if x.abs() < 3 { 2 } else { 1 };
+        cuboid(&mut body, [x, x, -1, 2, -half, half], "wood", 4);
     }
     let mut neck = part(2, 1, "neck", [3, 1, 0]);
-    cuboid(&mut neck, [0, 2, 0, 4, -1, 1], "wood", 4);
-    let mut head = part(3, 2, "head", [1, 4, 0]);
+    cuboid(&mut neck, [0, 1, 0, 2, -1, 1], "wood", 4);
+    let mut head = part(3, 2, "head", [1, 2, 0]);
     for x in 0..=2 {
         for y in 0..=2 {
             for z in -1i32..=1 {
@@ -317,48 +331,49 @@ fn deer() -> Animal {
         }
         voxel(&mut antlers, 1, 4, side, "snow", 5);
     }
-    let mut front = part(5, 1, "forelegs", [2, -1, 0]);
-    for z in [-1, 1] {
-        cuboid(&mut front, [-1, 0, -5, -1, z, z], "wood", 4);
-        cuboid(&mut front, [-1, 1, -6, -6, z, z], "dirt", 4);
+    let mut legs = Vec::new();
+    for (id, name, x, z) in [
+        (5, "foreleg_near", 2, 2),
+        (6, "foreleg_far", 2, -2),
+        (7, "hindleg_near", -3, 2),
+        (8, "hindleg_far", -3, -2),
+    ] {
+        let mut leg = part(id, 1, name, [x, -1, z]);
+        cuboid(&mut leg, [-1, 0, -5, -1, 0, 0], "wood", 4);
+        cuboid(&mut leg, [-1, 1, -6, -6, 0, 0], "dirt", 3);
+        legs.push(leg);
     }
-    let mut hind = part(6, 1, "hindlegs", [-3, -1, 0]);
-    for z in [-1, 1] {
-        cuboid(&mut hind, [-1, 0, -5, -1, z, z], "wood", 4);
-        cuboid(&mut hind, [-1, 1, -6, -6, z, z], "dirt", 4);
-    }
-    let mut tail = part(7, 1, "tail", [-4, 1, 0]);
+    let mut tail = part(9, 1, "tail", [-4, 1, 0]);
     cuboid(&mut tail, [-1, 0, -1, 0, -1, 1], "wood", 4);
     cuboid(&mut tail, [-1, 0, -2, -2, -1, 1], "snow", 5);
     let idle = anim(
         "idle",
         120,
-        vec![translate_track(
+        vec![rot_track(
+            3,
             1,
-            &[
-                (0, [0, 0, 0]),
-                (30, [0, 12, 0]),
-                (60, [0, 0, 0]),
-                (90, [0, 12, 0]),
-                (120, [0, 0, 0]),
-            ],
+            &[(0, -5.0), (30, 0.0), (60, 5.0), (90, 0.0), (120, -5.0)],
         )],
     );
     let walk = anim(
         "walk",
         48,
-        vec![
-            rot_track(
-                5,
-                2,
-                &[(0, -24.0), (12, 24.0), (24, -24.0), (36, 24.0), (48, -24.0)],
-            ),
-            rot_track(
-                6,
-                2,
-                &[(0, 24.0), (12, -24.0), (24, 24.0), (36, -24.0), (48, 24.0)],
-            ),
-        ],
+        (5..=8)
+            .map(|id| {
+                let phase = if id == 5 || id == 8 { 1.0 } else { -1.0 };
+                rot_track(
+                    id,
+                    2,
+                    &[
+                        (0, -20.0 * phase),
+                        (12, 0.0),
+                        (24, 20.0 * phase),
+                        (36, 0.0),
+                        (48, -20.0 * phase),
+                    ],
+                )
+            })
+            .collect(),
     );
     Animal {
         name: "Deer",
@@ -366,9 +381,9 @@ fn deer() -> Animal {
             0x5a, 0x87, 0x10, 0x03, 0x20, 0x26, 0x40, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x03,
         ],
-        parts: vec![body, neck, head, antlers, front, hind, tail],
+        parts: [vec![body, neck, head, antlers], legs, vec![tail]].concat(),
         clips: vec![idle, walk],
-        extent: [-5, 8, -7, 11, -1, 1],
+        extent: [-5, 8, -7, 9, -2, 2],
     }
 }
 
@@ -604,7 +619,7 @@ fn validate(a: &Animal, bytes: &[u8]) -> Result<(), String> {
     let expected_parts: &[u32] = match a.name {
         "Trout" => &[2],
         "Crow" => &[3, 4],
-        "Deer" => &[5, 6],
+        "Deer" => &[5, 6, 7, 8],
         _ => unreachable!(),
     };
     if clip.tracks.iter().map(|t| t.part).collect::<Vec<_>>() != expected_parts

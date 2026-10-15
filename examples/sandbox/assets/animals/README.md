@@ -45,7 +45,7 @@ manifest's ordinary material appearance. Palette entries are:
 | ---: | --- | --- |
 | 1 | `#4C81AA` | Trout back |
 | 2 | `#CDB37B` | Trout underside |
-| 3 | `#2C4331` | Dark fins and crow plumage |
+| 3 | `#23262C` | Dark fins, eyes, hooves and charcoal crow plumage |
 | 4 | `#785B37` | Warm fur and legs |
 | 5 | `#E0DCBF` | Light beak, eyes, and antlers |
 
@@ -54,9 +54,9 @@ hex form):
 
 | Asset | UUID | Rest bounds, cells (X × Y × Z) | Envelope, metres (X × Y × Z) | Authored cells | Parts |
 | --- | --- | ---: | ---: | ---: |
-| Trout | `5a871001-2026-4001-8000-000000000001` | 15 × 7 × 7 | 0.9375 × 0.4375 × 0.4375 m | 199 | 5 |
-| Crow | `5a871002-2026-4001-8000-000000000002` | 14 × 10 × 13 | 0.875 × 0.625 × 0.8125 m | 221 | 6 |
-| Deer | `5a871003-2026-4001-8000-000000000003` | 14 × 19 × 3 | 0.875 × 1.1875 × 0.1875 m | 221 | 7 |
+| Trout | `5a871001-2026-4001-8000-000000000001` | 15 × 7 × 7 | 0.9375 × 0.4375 × 0.4375 m | 136 | 5 |
+| Crow | `5a871002-2026-4001-8000-000000000002` | 14 × 10 × 13 | 0.875 × 0.625 × 0.8125 m | 217 | 6 |
+| Deer | `5a871003-2026-4001-8000-000000000003` | 14 × 17 × 5 | 0.875 × 1.0625 × 0.3125 m | 285 | 9 |
 
 The bounds and cell counts are measured directly from the generated authored
 cells and parent/rest translations. They describe asset-local bounds, not a
@@ -71,10 +71,21 @@ cell grid. All rest rotations are identity, all rest scales are unit, and all
 | --- | --- | --- |
 | Trout | Body/root; rear tail peduncle and forked caudal fin; dorsal fin; near/far pectoral fins | `idle` gently bobs the body over 120 ticks; `swim` yaws the tail joint through a 60-tick cycle. |
 | Crow | Torso/root; head and beak; independently hinged near/far wings; tail fan; legs/feet | `idle` gently lifts the torso over 120 ticks; `flap` alternates the two wings in opposition over 48 ticks. |
-| Deer | Torso/root; neck; head/muzzle; branched antlers; forelegs; hindlegs; raised tail with pale underside | `idle` gently lifts the torso over 120 ticks; `walk` swings forelegs and hindlegs in opposing phase over 48 ticks. |
+| Deer | Torso/root; neck; head/muzzle; branched antlers; four independently hinged legs; raised tail with pale underside | `idle` turns the head over 120 ticks; `walk` swings diagonal leg pairs in opposing phase over 48 ticks. |
 
 The main directional features are modeled as actual occupied voxels: trout
 torso, taper, fins and fork; crow head, tapered beak, paired broad wings, fan
 tail and feet; deer long neck, muzzle, branching antlers, four lower limbs and
 tail. Clip intent is stored as part transforms only. It remains unexecuted by
-the sandbox until a later importer/runtime task implements it.
+the shipped world runtime. The sandbox's CPU `animal_visual` bridge now samples
+the clips and preserves articulated geometry for rendering. Run the bounded
+production-renderer preview with:
+
+```powershell
+cargo run -p sandbox --features client --example animal-preview -- --bounded --out .local/animal-preview
+```
+
+It writes 24 pose captures, three contact sheets and `summary.json` recording
+the actual adapter/backend. Each animal has a fixed camera and floor across
+its clips. Captures demonstrate source rendering and sampled motion, not
+navigation, creature physics, world spawning or multiplayer.

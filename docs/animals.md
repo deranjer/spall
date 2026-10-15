@@ -66,3 +66,40 @@ current water draining, ground destruction, obstacles, two-client late join,
 reconnect and save/load must work before claiming populated-world support.
 Ocean ray, gull and fox broaden the next content pass. No population capacity,
 frame-time or navigation performance is accepted without measurement.
+
+## Implemented evidence (2026-10-14)
+
+ENG-201/202/203 are reviewed and accepted for their bounded foundation scopes.
+The independent decoder reads all three authored animals; sampled joint motion
+and loop endpoints pass CPU tests. The generated gallery seed-1/256-cell test
+finds aquatic, flying and land candidates using live terrain/column water, then
+rejects the fish after draining a column and the deer after removing support.
+Dormant-ocean reads match eager water without waking or allocating regions.
+
+ENG-204 adds sandbox `animal_visual`, preserving per-part geometry, source
+materials/tints, joint transforms, parent visibility, pivot and 6.25 cm scale.
+Unit scale is required; expansion is capped before allocation. Its bounded
+production-renderer example writes 24 poses and three contact sheets:
+
+```powershell
+cargo run -p sandbox --features client --example animal-preview -- --bounded --out .local/animal-preview
+```
+
+Visual review on RTX 4080 SUPER / D3D12 prompted thinner fish fins and eyes,
+charcoal crow plumage and a wider deer with four independent leg hinges.
+Camera and floor are fixed per animal so root motion is not cancelled by the
+preview. This is source animation/rendering evidence, not running creatures
+in a world. Exact commands, results and limits: `reports/ENG-204-animal-preview.md`.
+
+Next unblocked ticket ENG-205/A4 freezes the missing authoritative creature
+lifecycle and game-facing tick contract before population implementation.
+Current body-spawn and committed-edit APIs do not provide an animated actor
+lifecycle.
+`InitialGameWorldSetup` runs only at fresh-world creation, and the existing
+`SimWorld::spawn_body` path bypasses committed topology creation (the server
+uses it before client baselines). It cannot safely stand in for animal births,
+deaths or spawning during play.
+Creature collision/hits, editable ownership after damage/death,
+replicated asset/clip state, durable recovery and streaming/reset identity all
+need an explicit shared contract. The preview must not become a local-only
+population shortcut.

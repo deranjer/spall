@@ -17,7 +17,7 @@ fn animals() -> [(Asset, &'static str, &'static str); 3] {
         (
             decode(include_bytes!("../assets/animals/deer.spvox")).unwrap(),
             "walk",
-            "forelegs",
+            "foreleg_near",
         ),
     ]
 }

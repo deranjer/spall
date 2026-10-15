@@ -1,6 +1,7 @@
 //! Game-owned configuration belongs here.
 
 pub mod animal_habitat;
+pub mod animal_visual;
 pub mod appearance;
 pub mod appearance_extensions;
 pub mod appearance_v3;

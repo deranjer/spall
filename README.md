@@ -17,6 +17,11 @@ for measured costs and limits.
 
 The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It creates versioned RON project/scene documents and canonical `.spvox` voxel assets, and never adds egui to the game runtime dependency graph. On Windows, `tools/package-portable.ps1` builds a portable editor + sandbox folder; use File > Generate World to choose a seed, world size, and starting season, preview the map, then launch it in the FPS-HUD-enabled sandbox.
 
+Animated animal source fixtures (trout, crow and deer) have a bounded renderer
+preview: `cargo run -p sandbox --features client --example animal-preview -- --bounded`.
+It writes pose captures under `.local/animal-preview`; live animal population is
+pending the authoritative lifecycle work in [the animal plan](docs/animals.md).
+
 Generated-world play loads nearby terrain at startup and streams surrounding bricks as the player
 moves. Distant terrain retains exact revision/hash records; the authoritative server still generates
 the whole world. Check Uncapped before launching to measure rendering throughput without VSync where

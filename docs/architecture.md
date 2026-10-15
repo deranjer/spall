@@ -8,6 +8,7 @@ Arrows below mean "depends on". Create crates when their first task needs them; 
 
 ```text
 spall_core       IDs, coordinates, ticks, units, material definitions
+spall_asset      CPU SPVX assemblies and transform clips; no GPU/network/physics
 spall_voxel   -> spall_core                     storage, sampling, edits, queries
 spall_jobs    -> spall_core                     bounded scheduling, result tokens
 spall_mesh    -> spall_voxel, spall_jobs        surface generation, no GPU
