@@ -13,6 +13,7 @@ pub mod replica;
 pub mod residency;
 pub mod segmented;
 pub mod sky;
+pub mod snow;
 pub mod tick_accumulator;
 pub mod weather;
 pub mod window;

@@ -22,6 +22,7 @@ use crate::instances::{CubeInstance, InstanceSet, unit_cube};
 use crate::pipeline::{CASCADE_COUNT, DEPTH_FORMAT, DebugView, HDR_FORMAT, ScenePipeline};
 use crate::scene::Material;
 use crate::sky_visibility::SkyVisibility;
+use crate::snow::{SnowFootprintMark, SnowSurfacePatch, build_snow_vertices};
 use crate::target::OffscreenTarget;
 use crate::upload::{GpuMesh, UploadBudget};
 use crate::vertex::GpuVertex;
@@ -283,6 +284,11 @@ pub struct GameRenderer {
     vegetation_last: Vec<CubeInstance>,
     vegetation_generation: u64,
     transparent: InstanceSet,
+    snow_pipeline: wgpu::RenderPipeline,
+    snow_vertices: wgpu::Buffer,
+    snow_vertex_capacity: u64,
+    snow_vertex_count: u32,
+    snow_cpu_vertices: Vec<crate::snow::SnowVertex>,
     weather_pipeline: wgpu::RenderPipeline,
     weather_overlay_pipeline: wgpu::RenderPipeline,
     weather_bind_group: wgpu::BindGroup,
@@ -394,6 +400,7 @@ impl GameRenderer {
         let weather_pipeline = create_weather_pipeline(device, &weather_bind_layout);
         let weather_overlay_pipeline =
             create_weather_overlay_pipeline(device, &weather_bind_layout);
+        let snow_pipeline = create_snow_pipeline(device, &weather_bind_layout);
         let (vertices, indices) = unit_cube();
         Self {
             pipeline,
@@ -429,6 +436,16 @@ impl GameRenderer {
             vegetation_last: Vec::new(),
             vegetation_generation: 0,
             transparent: InstanceSet::new(),
+            snow_pipeline,
+            snow_vertices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spall-snow-vertices"),
+                size: std::mem::size_of::<crate::snow::SnowVertex>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            snow_vertex_capacity: std::mem::size_of::<crate::snow::SnowVertex>() as u64,
+            snow_vertex_count: 0,
+            snow_cpu_vertices: Vec::new(),
             weather_pipeline,
             weather_overlay_pipeline,
             weather_bind_group,
@@ -771,6 +788,42 @@ impl GameRenderer {
         Ok(())
     }
 
+    /// Replace bounded camera-local winter surface geometry. Call when a full
+    /// authoritative snow tile snapshot changes, not once per rendered frame.
+    pub fn set_snow_patches(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        patches: &[SnowSurfacePatch],
+        footprints: &[SnowFootprintMark],
+    ) -> Result<(), crate::snow::SnowRenderError> {
+        if let Err(error) = build_snow_vertices(patches, footprints, &mut self.snow_cpu_vertices) {
+            self.snow_vertex_count = 0;
+            return Err(error);
+        }
+        let needed =
+            (self.snow_cpu_vertices.len() * std::mem::size_of::<crate::snow::SnowVertex>()) as u64;
+        if needed == 0 {
+            self.snow_vertex_count = 0;
+            return Ok(());
+        }
+        if needed > self.snow_vertex_capacity {
+            self.snow_vertex_capacity = needed.next_power_of_two();
+            self.snow_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spall-snow-vertices"),
+                size: self.snow_vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(
+            &self.snow_vertices,
+            0,
+            bytemuck::cast_slice(&self.snow_cpu_vertices),
+        );
+        self.snow_vertex_count = self.snow_cpu_vertices.len() as u32;
+        Ok(())
+    }
     /// Current shelter/exposure and blend values supplied by the client policy.
     pub fn weather_lighting(&self) -> WeatherLighting {
         self.weather_lighting
@@ -897,6 +950,7 @@ impl GameRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         camera: &Camera,
+        environment: &Environment,
     ) {
         let view_projection = camera.view_projection();
         let effects = self.weather_lighting;
@@ -906,7 +960,7 @@ impl GameRenderer {
                 effects.visibility,
                 effects.storm_dimming,
                 effects.lightning_flash,
-                effects.exposure,
+                crate::snow::environment_brightness(environment),
             ],
         };
         queue.write_buffer(&self.weather_camera, 0, bytemuck::bytes_of(&uniform));
@@ -1012,7 +1066,7 @@ impl GameRenderer {
     ) {
         let mut camera = *camera;
         camera.aspect = self.target.width as f32 / self.target.height as f32;
-        self.update_weather_geometry(device, queue, &camera);
+        self.update_weather_geometry(device, queue, &camera, environment);
         self.timed_slot = self.timer.as_mut().and_then(PassTimer::begin_frame);
         if let (Some(timer), Some(sky)) = (self.timer.as_mut(), self.sky.as_ref()) {
             for cost in timer.slice_costs.drain(..) {
@@ -1326,6 +1380,35 @@ impl GameRenderer {
             self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies, &self.overlay]);
             self.draw_vegetation(&mut pass, &camera.frustum());
         }
+        if self.snow_vertex_count > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("spall-game-snow-surface-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.target.hdr_view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.target.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.snow_pipeline);
+            pass.set_bind_group(0, &self.weather_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.snow_vertices.slice(..));
+            pass.draw(0..self.snow_vertex_count, 0..1);
+        }
         let water_grid_cells = if self.water_grid {
             self.pipeline.water_field_dim()
         } else {
@@ -1605,6 +1688,59 @@ fn create_weather_bind_group(
     (group, layout)
 }
 
+fn create_snow_pipeline(
+    device: &wgpu::Device,
+    bind_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("spall-snow-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/snow.wgsl").into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("spall-snow-pipeline-layout"),
+        bind_group_layouts: &[Some(bind_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("spall-snow-surface-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_snow"),
+            buffers: &[Some(crate::snow::SnowVertex::LAYOUT)],
+            compilation_options: Default::default(),
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_snow"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
 fn create_weather_pipeline(
     device: &wgpu::Device,
     bind_layout: &wgpu::BindGroupLayout,
