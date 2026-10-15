@@ -139,6 +139,9 @@ pub struct Simulation {
     pub(crate) weather_dirty: bool,
     weather_seed: u64,
     pub(crate) snow: crate::snow::SnowState,
+    snow_priority_tiles: Vec<(i32, i32)>,
+    snow_priority_players: Vec<(i32, i32)>,
+    snow_priority_refreshed_tick: u64,
     /// Per-player stride credit; proposals are validated by the snow owner.
     motion_footprints: crate::footprints::MotionFootprints,
     footfall_candidates: Vec<crate::footprints::FootfallCandidate>,
@@ -240,6 +243,9 @@ impl Simulation {
             weather_dirty: true,
             weather_seed,
             snow: crate::snow::SnowState::new(),
+            snow_priority_tiles: Vec::new(),
+            snow_priority_players: Vec::new(),
+            snow_priority_refreshed_tick: 0,
             motion_footprints: crate::footprints::MotionFootprints::new(),
             footfall_candidates: Vec::new(),
         };
@@ -301,6 +307,9 @@ impl Simulation {
             weather_dirty: false,
             weather_seed: 0,
             snow: crate::snow::SnowState::new(),
+            snow_priority_tiles: Vec::new(),
+            snow_priority_players: Vec::new(),
+            snow_priority_refreshed_tick: 0,
             motion_footprints: crate::footprints::MotionFootprints::new(),
             footfall_candidates: Vec::new(),
         };
@@ -1315,17 +1324,27 @@ impl Simulation {
             let (tile_x, tile_z) = (tile_x as i32, tile_z as i32);
             player_tiles.push((tile_x, tile_z));
         }
-        let mut priority = Vec::new();
-        for &(x, z) in &player_tiles {
-            if !(min_tile_x..=max_tile_x).contains(&x) || !(min_tile_z..=max_tile_z).contains(&z) {
-                continue;
+        player_tiles.retain(|(x, z)| {
+            (min_tile_x..=max_tile_x).contains(x) && (min_tile_z..=max_tile_z).contains(z)
+        });
+        // Cache interleaved player-center/ring order. Rebuild only when a
+        // player changes snow tile or once a second, never by allocating a
+        // 96 m ring on every authoritative tick.
+        if self.snow_priority_players != player_tiles
+            || self.tick.get() <= 1
+            || self
+                .tick
+                .get()
+                .saturating_sub(self.snow_priority_refreshed_tick)
+                >= 60
+        {
+            self.snow_priority_players.clone_from(&player_tiles);
+            self.snow_priority_refreshed_tick = self.tick.get();
+            self.snow_priority_tiles.clear();
+            for &(x, z) in &player_tiles {
+                self.snow.enqueue_scan((x, z), 0);
+                self.snow_priority_tiles.push((x, z));
             }
-            self.snow.enqueue_scan((x, z), 0);
-            priority.push((x, z));
-        }
-        // Refresh the bounded 96 m discovery window once a second. Center
-        // tiles stay prioritized every tick; outer work then advances fairly.
-        if self.tick.get() <= 1 || self.tick.get().is_multiple_of(60) {
             for radius in 1i32..=24 {
                 for &(tile_x, tile_z) in &player_tiles {
                     for dz in -radius..=radius {
@@ -1342,6 +1361,7 @@ impl Simulation {
                                     continue;
                                 }
                                 self.snow.enqueue_scan((x, z), 0);
+                                self.snow_priority_tiles.push((x, z));
                             }
                         }
                     }
@@ -1369,7 +1389,9 @@ impl Simulation {
                 }
             }
         }
-        let work = self.snow.take_scan_batch(&priority, 16, self.tick.get());
+        let work = self
+            .snow
+            .take_scan_batch(&self.snow_priority_tiles, 16, self.tick.get());
         let water = self.column_water.as_ref().map(|w| w.frame());
         let water_sampler = water.as_ref().map(|frame| frame.sampler());
         for ((tile_x, tile_z), birth_tick) in work {

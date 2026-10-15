@@ -303,7 +303,15 @@ impl SnowState {
             z_bounds.is_none_or(|(min_z, max_z)| (min_z..=max_z).contains(&key.1))
         };
         let mut page = Vec::with_capacity(limit.saturating_add(1).min(17));
-        let start = after.map_or(lower, std::ops::Bound::Excluded);
+        // A player may move between pages, making the previous cursor sort
+        // after the new upper bound. Restart within the new interest instead
+        // of constructing an inverted BTreeMap range.
+        let valid_after = after.filter(|(x, z, _)| {
+            bounds.is_none_or(|[min_x, max_x, min_z, max_z]| {
+                (min_x..=max_x).contains(x) && (min_z..=max_z).contains(z)
+            })
+        });
+        let start = valid_after.map_or(lower, std::ops::Bound::Excluded);
         for (key, _) in self
             .tiles
             .range((start, upper))
@@ -1171,6 +1179,11 @@ mod tests {
             }
         }
         assert_eq!(seen, (0..11).collect::<Vec<_>>());
+        let (moved_page, moved_cursor) =
+            state.snapshot_page(Some([0, 0, 0, 0]), Some((10, 0, 0)), 3, 1, 0, 0);
+        assert_eq!(moved_page.len(), 1);
+        assert_eq!(moved_page[0].tile_x, 0);
+        assert!(moved_cursor.is_none());
     }
 
     #[test]

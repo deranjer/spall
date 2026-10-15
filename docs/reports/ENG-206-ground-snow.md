@@ -21,6 +21,12 @@ world-clamped 96 m radius once per second. Each query is capped at 128 vertical
 bricks and skips uniform empty/full bricks. Regional snapshot fanout sends at
 most four full replacement frames per client every six ticks; empty tile frames
 are retained as tombstones. Client residency is bounded to 4096 frames / 16 MiB.
+The 96 m query ring is cached and interleaved across players, then prioritized
+ahead of the distant resident seed; it is rebuilt only when a player changes
+tile or on the one-second refresh. Snapshot delivery alternates a four-frame
+player-center page with a four-frame regional page, retaining bounded outer
+coverage without lexical-center starvation. A cursor outside a moved client's
+new interest restarts safely at that interest's first key.
 
 Footprints are transient, server-validated terrain contacts. They require at
 least 2 mm of snow, are capped at 64 per layer and 4096 globally, and expire at
