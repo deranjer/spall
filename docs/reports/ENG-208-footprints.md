@@ -77,3 +77,10 @@ voxel volumes, while generated terrain uses an unbounded sparse volume with
 explicit generation extents. That integration correction and final GPU/1 km
 acceptance remain in progress; the passing bounded fixtures alone do not
 establish generated-world availability.
+
+Final generated-world acceptance is recorded in
+`ENG-207-snow-playtest.md`: nearest-first delivery, actual 1024 m winter coating,
+and a second live client's visibly rendered boot marks were inspected. This
+supersedes the earlier integration-in-progress notes above. Remaining matched
+performance, impaired-link/destruction and conservative undiscovered-edit limits
+are explicitly retained in that report.

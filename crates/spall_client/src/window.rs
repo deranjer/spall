@@ -6779,6 +6779,13 @@ impl WorldRenderer {
             }
             if self.screenshot_request.is_some() {
                 let snow = self.snow_presentation.stats();
+                let track_contacts: Vec<_> = self
+                    .snow_frames
+                    .iter()
+                    .flat_map(|frame| &frame.footprints)
+                    .take(16)
+                    .map(|mark| (mark.contact_cell, mark.offset_mm, mark.strength_q8))
+                    .collect();
                 tracing::info!(
                     frames = snow.frames_considered,
                     faces = snow.rendered_faces,
@@ -6789,6 +6796,7 @@ impl WorldRenderer {
                     stale = snow.revision_mismatches,
                     hidden = snow.hidden_or_unknown_faces,
                     enabled = self.ground_snow_enabled,
+                    ?track_contacts,
                     "snow capture presentation"
                 );
             }

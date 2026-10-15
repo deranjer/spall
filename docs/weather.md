@@ -238,3 +238,11 @@ to rain/snow appearing too sideways. Normal precipitation will use one shared
 fall/drift velocity for particle motion and ribbon orientation; blizzard and
 wind-only cues retain stronger wind response. Surface storage and revision
 contracts are frozen before dependent footprint/render implementation begins.
+
+WX3/WX4 implementation and generated-world visual integration were reviewed on
+2026-10-15. F10 controls snow visibility independently of precipitation, and
+two real clients share server-validated tracks. Exact final checks, 1024 m
+captures, live launch and remaining profiling/streaming limits are in
+reports/ENG-207-snow-playtest.md. ENG-207's precipitation correction is accepted;
+ENG-206/208 remain open for the documented combined acceptance follow-ups under
+ENG-195. No matched performance or impaired-link snow gate is claimed.

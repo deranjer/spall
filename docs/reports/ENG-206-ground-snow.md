@@ -18,8 +18,8 @@ continuation across batching and restart. Known snow work catches up a fair
 16 tile layers per simulation tick. Geometry discovery processes at most 16
 tile queries per tick, prioritizes every live player's center, and refreshes a
 world-clamped 96 m radius once per second. Each query is capped at 128 vertical
-bricks and skips uniform empty/full bricks. Regional snapshot fanout sends at
-most four full replacement frames per client every six ticks; empty tile frames
+bricks and skips uniform empty/full bricks. Snapshot fanout alternates bounded
+nearest and regional pages every six ticks; empty tile frames
 are retained as tombstones. Client residency is bounded to 4096 frames / 16 MiB.
 The 96 m query ring is cached and interleaved across players, then prioritized
 ahead of the distant resident seed; it is rebuilt only when a player changes
@@ -59,7 +59,7 @@ clear tracks.
 
 ## Verification
 
-- `cargo test -p spall_sim snow --lib`: **17 passed**, including policy/query,
+- `cargo test -p spall_sim snow --lib`: **16 passed** in the integrated checkout, including policy/query,
   unknown retry and saved queue birth, page bound/cycle, cold/warm exactness,
   roof exposure, restart continuation, owner-key/overlap corruption rejection,
   tombstones, and footprint refill/melt.
@@ -79,7 +79,7 @@ clear tracks.
 ## Measured results and remaining risks
 
 The focused test counts and successful builds above are measured. The 16-layer
-per-tick, 96 m radius, four-frame/six-tick fanout, 4096-frame/16 MiB client cache,
+per-tick, 96 m radius, alternating 16/4-frame fanout, 4096-frame/16 MiB client cache,
 and 1 ms/tick / 8 KiB/s targets are limits or targets, not measured 1 km costs.
 No per-tick all-world brick enumeration remains; resident coordinates are
 enumerated once, and nearby scans are clamped to the explicit world cell region.

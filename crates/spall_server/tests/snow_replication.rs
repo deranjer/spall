@@ -313,13 +313,12 @@ fn assert_reset_cleared(
 fn client_config(
     dir: &std::path::Path,
     name: &str,
-    connect_addr: SocketAddr,
-    fingerprint: Fingerprint,
-    token: JoinToken,
+    server: (SocketAddr, Fingerprint, JoinToken),
     movement_script: Vec<MovementStep>,
     admin_script: Vec<(u64, AdminCommand)>,
     handle: ReplicaHandle,
 ) -> ClientNetConfig {
+    let (connect_addr, fingerprint, token) = server;
     ClientNetConfig {
         connect_addr,
         server_fingerprint: fingerprint,
@@ -389,9 +388,7 @@ fn two_quic_clients_share_authoritative_snow_footprints_and_reset_epoch() {
     let first_cfg = client_config(
         &dir,
         "first-client",
-        connect_addr,
-        fingerprint,
-        token,
+        (connect_addr, fingerprint, token),
         vec![MovementStep {
             from_tick: FIRST_PATH.0,
             to_tick: FIRST_PATH.1,
@@ -413,9 +410,7 @@ fn two_quic_clients_share_authoritative_snow_footprints_and_reset_epoch() {
     let late_cfg = client_config(
         &dir,
         "late-client",
-        connect_addr,
-        fingerprint,
-        token,
+        (connect_addr, fingerprint, token),
         vec![MovementStep {
             from_tick: LATE_CLIENT_PATH.0,
             to_tick: LATE_CLIENT_PATH.1,

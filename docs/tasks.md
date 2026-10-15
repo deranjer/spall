@@ -1891,3 +1891,13 @@ Contracts: weather.md. Evidence: reports/ENG-206-ground-snow.md and
 reports/ENG-208-footprints.md. Tickets remain in progress until generated-world
 graphics and final integration gates pass. Snow adds no collision or voxel mass;
 moving-body accumulation is outside this phase.
+
+ENG-206/207/208 integration reviewed on 2026-10-15: ground coating, shared
+footprints, nearest-first publication, exact restart and F10 controls are
+implemented. ENG-207 precipitation/presentation correction is accepted. Actual
+1024 m coating and a second live client's boot marks were visually inspected.
+ENG-206/208 remain in progress for documented topology-history, impaired-link,
+destruction and matched performance follow-ups under ENG-195; no provisional
+performance target is accepted. Final evidence and live-world path:
+reports/ENG-207-snow-playtest.md. Next unblocked weather work: ENG-195 combined
+acceptance (T25 integration), independently of the animal prototype work.

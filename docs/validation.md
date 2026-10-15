@@ -1646,3 +1646,15 @@ cargo xtask play --release --worldgen natural --worldgen-size 4096 --season wint
 (1024 m edge). Scripted captures use weather:auto|clear|rain|storm|snow|wind|blizzard
 through the same admin path; menu captures the actual F10 panel. Ground snow and
 footprints are later phases and must not be reported as available in this run.
+
+## ENG-206/207/208 - Ground snow and footprints
+
+Current integration adds actual ground snow, shared footprints and the separate
+F10 visibility toggle. Run `cargo test -p spall_sim snow --lib` and
+`cargo test -p spall_server --test snow_replication --test snow_persistence` for
+exposure/climate/paging, two-client paths/reset, and exact SQLite recovery.
+The release 1024 m winter world is `cargo xtask play --release --worldgen natural
+--worldgen-size 4096 --season winter`. Choose Snow in F10, wait for accumulation,
+walk, then choose Clear to retain cold snow while inspecting tracks. Ground snow
+is a non-colliding coating; tracks clear on restart. Exact evidence, capture
+locations and unmeasured performance gates: reports/ENG-207-snow-playtest.md.
