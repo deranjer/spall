@@ -750,6 +750,27 @@ impl Simulation {
         )
     }
 
+    pub fn snow_nearest_snapshot_page(
+        &mut self,
+        tile_bounds: [i32; 4],
+        center: (i32, i32),
+        after: Option<crate::snow::SnowSnapshotCursor>,
+        limit: usize,
+    ) -> (
+        Vec<spall_protocol::SnowSurfaceFrame>,
+        Option<crate::snow::SnowSnapshotCursor>,
+    ) {
+        self.snow.nearest_snapshot_page(
+            tile_bounds,
+            center,
+            after,
+            limit,
+            self.weather.world_epoch,
+            self.weather.world_revision,
+            self.tick.get(),
+        )
+    }
+
     /// Verifies recovered weather still points at the world's frozen clock source.
     pub fn validate_weather_clock_source(&self) -> Result<(), String> {
         if self.weather.clock_source == spall_protocol::WeatherClockSource::Vegetation {

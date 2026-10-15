@@ -23,10 +23,12 @@ most four full replacement frames per client every six ticks; empty tile frames
 are retained as tombstones. Client residency is bounded to 4096 frames / 16 MiB.
 The 96 m query ring is cached and interleaved across players, then prioritized
 ahead of the distant resident seed; it is rebuilt only when a player changes
-tile or on the one-second refresh. Snapshot delivery alternates a four-frame
-player-center page with a four-frame regional page, retaining bounded outer
-coverage without lexical-center starvation. A cursor outside a moved client's
-new interest restarts safely at that interest's first key.
+tile or on the one-second refresh. Snapshot delivery alternates a bounded
+16-frame nearest-first page (deterministic Chebyshev rings around the player)
+with a four-frame regional page, retaining bounded outer coverage without
+lexical-center starvation or sorting world-wide snow keys. The nearest cursor
+contains its center and restarts safely if the player moves; a regional cursor
+outside the new interest also restarts at its first key.
 
 Footprints are transient, server-validated terrain contacts. They require at
 least 2 mm of snow, are capped at 64 per layer and 4096 globally, and expire at
@@ -57,7 +59,7 @@ clear tracks.
 
 ## Verification
 
-- `cargo test -p spall_sim snow --lib`: **16 passed**, including policy/query,
+- `cargo test -p spall_sim snow --lib`: **17 passed**, including policy/query,
   unknown retry and saved queue birth, page bound/cycle, cold/warm exactness,
   roof exposure, restart continuation, owner-key/overlap corruption rejection,
   tombstones, and footprint refill/melt.
@@ -66,6 +68,7 @@ clear tracks.
 - `cargo check -p spall_server -p spall_client`: **passed**.
 - `cargo test -p spall_sim snow_query --lib`: **6 passed**, including querying
   an unbounded sparse Volume only within an explicit terrain region.
+- `cargo test -p spall_sim nearest_snapshot_pages_walk_outward_and_reset_on_center_move --lib`: **1 passed**.
 - `cargo clippy -p spall_sim -p spall_server -p spall_client --all-targets -- -D warnings`: **passed**.
 - `cargo fmt --all` and `git diff --check`: **passed**.
 - Full `cargo xtask check`, the two-client snow replication scenario, 1 km live-world

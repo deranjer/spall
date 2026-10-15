@@ -25,6 +25,12 @@ pub struct SnowTileJournalState {
     pub state: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnowSnapshotCursor {
+    pub center: (i32, i32),
+    pub key: (i32, i32, i32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct DepthTransform {
     bias: i128,
@@ -328,6 +334,112 @@ impl SnowState {
             .filter_map(|(x, z, y)| self.frame(x, z, y, world_epoch, world_revision, tick))
             .collect();
         (frames, next)
+    }
+
+    /// Bounded nearest-first page for the current regional interest. It visits
+    /// tile coordinates on deterministic Chebyshev rings around the player,
+    /// avoiding a sort over all world snow surfaces on each network tick.
+    pub fn nearest_snapshot_page(
+        &mut self,
+        bounds: [i32; 4],
+        center: (i32, i32),
+        after: Option<SnowSnapshotCursor>,
+        limit: usize,
+        world_epoch: u64,
+        world_revision: u64,
+        tick: u64,
+    ) -> (Vec<SnowSurfaceFrame>, Option<SnowSnapshotCursor>) {
+        let [min_x, max_x, min_z, max_z] = bounds;
+        if min_x > max_x || min_z > max_z || limit == 0 {
+            return (Vec::new(), None);
+        }
+        let center = (center.0.clamp(min_x, max_x), center.1.clamp(min_z, max_z));
+        let max_radius = [min_x, max_x]
+            .into_iter()
+            .flat_map(|x| [min_z, max_z].into_iter().map(move |z| (x, z)))
+            .map(|(x, z)| x.abs_diff(center.0).max(z.abs_diff(center.1)))
+            .max()
+            .unwrap_or(0);
+        let after = after.filter(|cursor| {
+            cursor.center == center
+                && (min_x..=max_x).contains(&cursor.key.0)
+                && (min_z..=max_z).contains(&cursor.key.1)
+                && self.tiles.contains_key(&cursor.key)
+        });
+        let start_radius = after.map_or(0, |key| {
+            key.key
+                .0
+                .abs_diff(center.0)
+                .max(key.key.1.abs_diff(center.1))
+        });
+        let mut keys = Vec::with_capacity(limit.saturating_add(1));
+        let mut past_cursor = after.is_none();
+        'rings: for radius in start_radius..=max_radius {
+            let mut ring = Vec::with_capacity(if radius == 0 {
+                1
+            } else {
+                (radius as usize).saturating_mul(8)
+            });
+            if radius == 0 {
+                ring.push(center);
+            } else {
+                let r = i32::try_from(radius).unwrap_or(i32::MAX);
+                for dx in -r..=r {
+                    ring.push((center.0.saturating_add(dx), center.1.saturating_sub(r)));
+                }
+                for dz in (-r + 1)..=r {
+                    ring.push((center.0.saturating_add(r), center.1.saturating_add(dz)));
+                }
+                for dx in (-r..r).rev() {
+                    ring.push((center.0.saturating_add(dx), center.1.saturating_add(r)));
+                }
+                for dz in ((-r + 1)..r).rev() {
+                    ring.push((center.0.saturating_sub(r), center.1.saturating_add(dz)));
+                }
+            }
+            for (x, z) in ring {
+                if !(min_x..=max_x).contains(&x) || !(min_z..=max_z).contains(&z) {
+                    continue;
+                }
+                if !past_cursor {
+                    if after.is_some_and(|cursor| cursor.key.0 == x && cursor.key.1 == z) {
+                        past_cursor = true;
+                    } else {
+                        continue;
+                    }
+                }
+                let tile_lower = (x, z, i32::MIN);
+                let tile_upper = (x, z, i32::MAX);
+                for (key, _) in self.tiles.range((
+                    std::ops::Bound::Included(tile_lower),
+                    std::ops::Bound::Included(tile_upper),
+                )) {
+                    if after.is_some_and(|cursor| {
+                        cursor.key.0 == x && cursor.key.1 == z && key.2 <= cursor.key.2
+                    }) {
+                        continue;
+                    }
+                    keys.push(*key);
+                    if keys.len() > limit {
+                        break 'rings;
+                    }
+                }
+            }
+        }
+        let has_more = keys.len() > limit;
+        keys.truncate(limit);
+        let last = keys.last().copied();
+        let frames = keys
+            .into_iter()
+            .filter_map(|(x, z, y)| self.frame(x, z, y, world_epoch, world_revision, tick))
+            .collect();
+        (
+            frames,
+            has_more
+                .then_some(last)
+                .flatten()
+                .map(|key| SnowSnapshotCursor { center, key }),
+        )
     }
 
     pub fn mark_geometry_changed(&mut self, key: (i32, i32, i32)) {
@@ -1184,6 +1296,42 @@ mod tests {
         assert_eq!(moved_page.len(), 1);
         assert_eq!(moved_page[0].tile_x, 0);
         assert!(moved_cursor.is_none());
+    }
+
+    #[test]
+    fn nearest_snapshot_pages_walk_outward_and_reset_on_center_move() {
+        let mut state = SnowState::new();
+        for x in -3..=3 {
+            for z in -3..=3 {
+                state.reconcile(x, z, 0, 1, mask(&[0]), 0);
+            }
+        }
+        let mut cursor = None;
+        let mut distances = Vec::new();
+        let mut keys = Vec::new();
+        for _ in 0..20 {
+            let (page, next) =
+                state.nearest_snapshot_page([-3, 3, -3, 3], (0, 0), cursor, 3, 1, 0, 0);
+            assert!(page.len() <= 3);
+            for frame in &page {
+                distances.push(frame.tile_x.abs().max(frame.tile_z.abs()));
+                keys.push((frame.tile_x, frame.tile_z, frame.top_cell_y));
+            }
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(keys.len(), 49);
+        assert_eq!(keys[0], (0, 0, 0));
+        assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(keys.iter().copied().collect::<BTreeSet<_>>().len(), 49);
+
+        let (_, old_center_cursor) =
+            state.nearest_snapshot_page([-3, 3, -3, 3], (0, 0), None, 1, 1, 0, 0);
+        let (moved, _) =
+            state.nearest_snapshot_page([-3, 3, -3, 3], (1, 1), old_center_cursor, 1, 1, 0, 0);
+        assert_eq!((moved[0].tile_x, moved[0].tile_z), (1, 1));
     }
 
     #[test]

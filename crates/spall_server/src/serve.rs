@@ -2847,7 +2847,8 @@ async fn serve_async(
             crate::column_water_replication::ColumnWaterPublisher,
         > = HashMap::new();
         let mut snow_page_cursor: HashMap<u64, Option<(i32, i32, i32)>> = HashMap::new();
-        let mut snow_center_page_cursor: HashMap<u64, Option<(i32, i32, i32)>> = HashMap::new();
+        let mut snow_center_page_cursor: HashMap<u64, spall_sim::snow::SnowSnapshotCursor> =
+            HashMap::new();
         let mut water_keyframes_sent = 0u64;
         let mut water_bytes_queued = 0u64;
         let mut pending_admin: Vec<(SessionId, spall_protocol::AdminRequest)> = Vec::new();
@@ -3842,7 +3843,7 @@ async fn serve_async(
                         continue;
                     }
                     let center_page = (tick.get() / 6).is_multiple_of(2);
-                    let (page_bounds, cursor) = if center_page {
+                    if center_page {
                         let Some(player) = sim.player_state(session_player_entity(session)) else {
                             continue;
                         };
@@ -3852,35 +3853,47 @@ async fn serve_async(
                         else {
                             continue;
                         };
-                        (
-                            [x, x, z, z],
-                            snow_center_page_cursor
-                                .get(&session.raw())
-                                .copied()
-                                .flatten(),
-                        )
-                    } else {
-                        (
+                        let center = (x, z);
+                        let (frames, next) = sim.snow_nearest_snapshot_page(
                             bounds,
-                            snow_page_cursor.get(&session.raw()).copied().flatten(),
-                        )
-                    };
-                    let (frames, next) = sim.snow_snapshot_page(Some(page_bounds), cursor, 4);
-                    if center_page {
-                        snow_center_page_cursor.insert(session.raw(), next);
-                    } else {
-                        snow_page_cursor.insert(session.raw(), next);
-                    }
-                    if !frames.is_empty() {
-                        let records = frames
-                            .into_iter()
-                            .map(WireRecord::SnowSurfaceFrame)
-                            .collect();
-                        send_to(
-                            &clients_for_sim,
-                            session,
-                            Outbound::Water(Arc::new(records)),
+                            center,
+                            snow_center_page_cursor.get(&session.raw()).copied(),
+                            16,
                         );
+                        if let Some(next) = next {
+                            snow_center_page_cursor.insert(session.raw(), next);
+                        } else {
+                            snow_center_page_cursor.remove(&session.raw());
+                        }
+                        if !frames.is_empty() {
+                            let records = frames
+                                .into_iter()
+                                .map(WireRecord::SnowSurfaceFrame)
+                                .collect();
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Water(Arc::new(records)),
+                            );
+                        }
+                    } else {
+                        let (frames, next) = sim.snow_snapshot_page(
+                            Some(bounds),
+                            snow_page_cursor.get(&session.raw()).copied().flatten(),
+                            4,
+                        );
+                        snow_page_cursor.insert(session.raw(), next);
+                        if !frames.is_empty() {
+                            let records = frames
+                                .into_iter()
+                                .map(WireRecord::SnowSurfaceFrame)
+                                .collect();
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Water(Arc::new(records)),
+                            );
+                        }
                     }
                 }
             }
