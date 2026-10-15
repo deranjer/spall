@@ -1,7 +1,7 @@
 # Weather, snow cover and winter dormancy — ENG-195
 
 Planning baseline: 2026-10-14. Implementation authorized later the same day.
-**ENG-195 in progress; no accepted weather gates.** Follow-up to the T25
+**ENG-195 in progress; WX0–WX2 integrated and tested, WX3/WX4 now authorized.** Follow-up to the T25
 game-system handoff.
 
 ## Existing foundation
@@ -135,7 +135,8 @@ history, not durable gameplay evidence. Moving-body/vehicle tracks are deferred.
 ENG-195 tracks the overall scope. ENG-196 (WX0) and ENG-197 (WX1) are integrated
 into the local test branch. ENG-198 owns the combined F10/audio/1 km playtest;
 ENG-199 supplies authorized overrides and ENG-200 supplies bounded screen effects.
-WX3 snow coating and WX4 footprints remain unassigned. Combined checks and launch
+ENG-206 owns WX3 snow coating; ENG-207 owns the precipitation angle correction
+and snow presentation. WX4 follows the frozen snow surface contract. Combined checks and launch
 evidence are recorded in `docs/reports/ENG-198-integrated-weather-playtest.md`.
 
 ### Frozen clock boundary for independent WX0/WX1 work
@@ -155,6 +156,49 @@ The WX0 worker owns weather policy/protocol/sim/server/store/client ingress;
 WX1 owns ecology living/cover and vegetation-specific consumers. Shared-file
 changes require coordinator agreement. Neither worker edits audio or shared
 planning files. Coordinator owns review, integration, status and work logs.
+
+### Frozen WX3/WX4 surface contract (2026-10-15)
+
+ENG-206 owns authoritative policy, persistence and snapshot ingress; ENG-207
+owns the native renderer and client surface conversion. ENG-208 owns validated
+movement-driven footfall policy and combined integration. Workers use isolated
+worktrees; the coordinator owns common docs, window/menu wiring and review.
+
+Snow uses 16×16 quarter-metre-cell tiles (4 m), with separate solid-cell Y
+layers and disjoint 256-bit exposed-face cohorts. The server supplies the masks,
+actual terrain brick revisions, stable cohort IDs and quantized depths. Clients
+derive exact +Y face geometry only where the matching committed geometry is
+known. They do not infer authority from local residency or sky exposure.
+Surviving faces retain their snow across unrelated edits; newly exposed faces
+start at zero, and removed/occluded faces lose the coating and tracks.
+
+Depth is Q16 metres, capped at 0.125 m, with additional Q32 fractional progress
+retained by the owner and save. Cold Snow/Blizzard accumulates at 2 mm/s times
+precipitation intensity when temperature is at most 0°C. Positive temperature
+melts at 1 mm/s times `clamp(temperature / 20°C, 0, 1)`. Rates are deliberately
+visible within a short test session. The first slice uses WX0's uniform
+authoritative temperature; regional climate modulation remains deferred.
+Exact catch-up composes ordered clamped-add interval transforms, preserving
+both saturation and snow/melt ordering. Separate accumulated snow/melt totals
+are insufficient. History can be compacted only after all affected cohorts have
+consumed it; state is never discarded to disguise a processing cap.
+
+Wire protocol 7 adds version-1 `SnowSurfaceFrame` records: full replacements
+for one tile/Y layer, including empty tombstones and current transient marks.
+Epoch and snapshot sequence fence resets and stale frames. Up to 256 disjoint
+cohorts and 64 marks fit one control record; regional delivery bounds transport,
+while the authoritative fair scheduler advances independently of viewers.
+
+Footfall candidates use server capsule travel, a 0.65 m stride, alternating
+9 cm lateral offsets and a six-tick minimum step interval. Airborne movement,
+teleports, movement-epoch changes and observation gaps clear stride credit.
+The owner validates the actual contact cell, exposed-face bit, revision and
+at least 2 mm of snow before admitting a mark. Marks have a five-minute TTL,
+64-per-layer and 4096-global oldest-first caps, and fade as snowfall refills
+them or snow melts. They are shared live history and clear on restart.
+
+These are implementation contracts, not acceptance evidence. Runtime, recovery,
+network and GPU results are recorded in the ENG-206/207/208 reports as delivered.
 
 | Slice | Dependencies | Required evidence |
 |---|---|---|
@@ -187,5 +231,10 @@ the first pass. Full-world destruction and multiplayer remain mandatory.
 WX0 settles climate offsets/snowline, weather frequency/duration, clock ownership
 and compatibility. WX3 settles surface storage and distant catch-up from measured
 costs. WX4 settles visual track density/TTL. Next scoped work: **ENG-195 / WX0**
-contract and integration audit (now integrated). Current work is ENG-198 / WX2
-combined validation; next scope after that is WX3 snow coating, then WX4 footprints.
+contract and integration audit (now integrated). ENG-198 / WX2 combined validation
+is accepted with the limitations recorded in its report. The user authorized
+WX3 snow coating and then WX4 footprints on 2026-10-14, and requested a correction
+to rain/snow appearing too sideways. Normal precipitation will use one shared
+fall/drift velocity for particle motion and ribbon orientation; blizzard and
+wind-only cues retain stronger wind response. Surface storage and revision
+contracts are frozen before dependent footprint/render implementation begins.
