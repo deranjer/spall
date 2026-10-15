@@ -1878,3 +1878,16 @@ the audit only; runtime interfaces remain proposed pending physical gates.
 Next unblocked: ENG-209 exact articulated collision/source-cell query prototype.
 Focused asset/sandbox regression checks passed (13 + 23 + 3 tests). Corpse
 aggregate physics, live population, multiplayer and recovery remain unproven.
+
+### ENG-206 / ENG-207 / ENG-208 - Ground snow, precipitation and footprints
+
+User authorized implementation on 2026-10-14 and continuation on 2026-10-15.
+ENG-206 owns authoritative thin terrain snow, exposure, bounded discovery and
+recovery. ENG-207 owns downward precipitation and snow presentation. ENG-208
+owns validated grounded footsteps, shared replication and F10 controls.
+The coordinator integrates two isolated Luna Medium assignments and owns
+storage, protocol compatibility, window wiring and combined verification.
+Contracts: weather.md. Evidence: reports/ENG-206-ground-snow.md and
+reports/ENG-208-footprints.md. Tickets remain in progress until generated-world
+graphics and final integration gates pass. Snow adds no collision or voxel mass;
+moving-body accumulation is outside this phase.

@@ -54,3 +54,26 @@ rain falls mostly downward and regular snow appears as compact flakes. This
 bounded capture tour exited successfully. Snow accumulation, actual shared
 tracks and runtime recovery still await the ENG-206 server integration at this
 point; these focused results do not substitute for that acceptance.
+
+## Integrated recovery and multiplayer checks (2026-10-15)
+
+`cargo test -p spall_server --test snow_persistence` passes the actual simulation
+to SQLite checkpoint/journal to reconstructed simulation scenario. Exact Q32
+snow continuation survives geometry changes and ordered weather changes;
+temporary tracks clear on restart. The same scenario replays unchanged saved
+topology records with the earlier wire-6 header and rejects a foreign snow epoch.
+
+`cargo test -p spall_server --test snow_replication -- --nocapture` passes in
+20.39 seconds in the integrated checkout. Two real QUIC clients see 16 shared
+surfaces and eight shared imprint IDs from separate walking paths (X cells
+15/16 and 43/44); reset clears both replicas. The late joiner's movement steps
+use its own local tick clock, placing the second walk before the server reset.
+The earlier failed assertion exposed a fixture timing error, not a reason to
+weaken the two-path requirement. Evidence: `.local/runs/eng198-checks/`
+`snow-restart-final.log` and `snow-network-final.log`.
+
+The natural-world graphics run exposed that initial discovery required bounded
+voxel volumes, while generated terrain uses an unbounded sparse volume with
+explicit generation extents. That integration correction and final GPU/1 km
+acceptance remain in progress; the passing bounded fixtures alone do not
+establish generated-world availability.

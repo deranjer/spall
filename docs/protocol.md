@@ -690,3 +690,19 @@ Weather overrides require the existing admin authorization and persist through
 checkpoint/restart; world reset clears them. Per-weather stream fences allow
 weather older than motion while refusing stale weather/reset records. See
 reports/ENG-196-weather-foundation.md and reports/ENG-199-weather-controls.md.
+
+### ENG-206/208 - Ground snow and footprints
+
+Current wire schema/protocol 7 adds `SnowSurfaceFrame` (tag 25), versioned
+separately as snow schema 1. Frames replace one 4 m tile/Y layer, carrying
+disjoint exposed-face cohorts, terrain revisions, quantized depth and bounded
+transient footprints. Empty frames remove old layers. Epoch, sequence and
+effective-tick fences prevent stale snow after reset; client cache residency is
+bounded. Server-authoritative grounded travel creates tracks; clients never
+submit imprint positions. See weather.md for rates, caps and exposure rules.
+
+Canonical checkpoints retain exact fractional snow depth and climate cursors;
+geometry journal entries preserve exact cohort changes. Footprints clear on
+restart. Storage recovery accepts the unchanged topology/motion layouts from
+saved wire headers 5 and 6 through an explicit storage-only migration. Live
+traffic still requires protocol 7; unknown saved schemas remain rejected.
