@@ -33,6 +33,11 @@ CREATE TABLE checkpoint_weather (
     state BLOB NOT NULL,
     crc BLOB NOT NULL
 );
+CREATE TABLE checkpoint_snow (
+    tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
+    state BLOB NOT NULL,
+    crc BLOB NOT NULL
+);
 CREATE TABLE checkpoint_column_water (
     tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
     state BLOB NOT NULL,
@@ -118,6 +123,23 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
                 tx.commit()?;
             }
             conn.execute_batch("CREATE TABLE IF NOT EXISTS checkpoint_weather (tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE, state BLOB NOT NULL, crc BLOB NOT NULL);")?;
+            let has_snow: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_snow')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !has_snow {
+                // Old checkpoints gain an explicit None row atomically with
+                // table creation; missing rows in an existing table are corruption.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch("CREATE TABLE checkpoint_snow (tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE, state BLOB NOT NULL, crc BLOB NOT NULL);")?;
+                let absent = crate::dto::encode(&Option::<Vec<u8>>::None)?;
+                tx.execute(
+                    "INSERT INTO checkpoint_snow (tick,state,crc) SELECT tick,?,? FROM checkpoints",
+                    rusqlite::params![&absent, crate::db::crc16(&absent).as_slice()],
+                )?;
+                tx.commit()?;
+            }
             // Additive auxiliary table: does not alter any versioned world DTO.
             conn.execute_batch("CREATE TABLE IF NOT EXISTS game_outbox (event_id BLOB PRIMARY KEY CHECK (length(event_id) = 32), journal_seq INTEGER NOT NULL, payload BLOB NOT NULL) WITHOUT ROWID;")?;
             Ok(())

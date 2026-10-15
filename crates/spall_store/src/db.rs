@@ -396,6 +396,16 @@ impl Writer {
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         }
         let weather_blob = dto::encode(&checkpoint.weather)?;
+        if checkpoint
+            .snow
+            .as_ref()
+            .is_some_and(|state| state.len() > 64 * 1024 * 1024)
+        {
+            return Err(StoreError::Corrupt(
+                "snow checkpoint exceeds byte limit".into(),
+            ));
+        }
+        let snow_blob = dto::encode(&checkpoint.snow)?;
         if column_blob.len() > dto::MAX_STORED_COLUMN_WATER_BYTES {
             return Err(StoreError::Corrupt(
                 "column water checkpoint exceeds byte limit".into(),
@@ -438,6 +448,19 @@ impl Writer {
                 ],
             )?;
             payload_bytes += weather_blob.len() as u64;
+            tx.execute(
+                "DELETE FROM checkpoint_snow WHERE tick = ?",
+                [checkpoint.tick as i64],
+            )?;
+            tx.execute(
+                "INSERT INTO checkpoint_snow (tick,state,crc) VALUES (?,?,?)",
+                params![
+                    checkpoint.tick as i64,
+                    &snow_blob,
+                    crc16(&snow_blob).as_slice()
+                ],
+            )?;
+            payload_bytes += snow_blob.len() as u64;
             // A re-published tick starts clean.
             tx.execute(
                 "DELETE FROM checkpoint_column_water WHERE tick = ?",

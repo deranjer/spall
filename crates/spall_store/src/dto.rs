@@ -157,6 +157,9 @@ pub struct Checkpoint {
     pub column_water: Option<spall_protocol::ColumnWaterState>,
     /// Authoritative weather/fallback clock checkpoint; absent means deterministic legacy initialization.
     pub weather: Option<spall_protocol::WeatherState>,
+    /// Versioned canonical thin snow; transient footprints are excluded by the owner.
+    /// None is the deterministic default for checkpoints predating snow support.
+    pub snow: Option<Vec<u8>>,
     pub tick: u64,
     /// Highest journal sequence this checkpoint already includes. Recovery
     /// replays the durable journal suffix strictly after this.
@@ -437,6 +440,7 @@ mod tests {
             vegetation: Vec::new(),
             column_water: None,
             weather: None,
+            snow: None,
             tick: 120,
             journal_cursor: 5,
             world_hash: [3; 32],

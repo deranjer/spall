@@ -26,6 +26,69 @@ struct Scratch {
 }
 
 #[test]
+fn snow_checkpoint_round_trips_and_republication_clears_the_previous_blob() {
+    let scratch = Scratch::new("snow-checkpoint");
+    let mut cp = checkpoint(10, 0);
+    // Storage treats owner-versioned snow as opaque bytes; simulation validates it.
+    cp.snow = Some(vec![1, 0, 13, 21, 34]);
+    let mut writer = Writer::open(scratch.db()).unwrap();
+    writer.publish_checkpoint(&cp).unwrap();
+    assert_eq!(writer.recover().unwrap().checkpoint, cp);
+    cp.snow = None;
+    writer.publish_checkpoint(&cp).unwrap();
+    drop(writer);
+    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
+}
+
+#[test]
+fn legacy_snow_table_backfill_is_atomic_and_missing_existing_rows_are_corruption() {
+    let scratch = Scratch::new("snow-upgrade");
+    let cp = checkpoint(0, 0);
+    let mut writer = Writer::open(scratch.db()).unwrap();
+    writer.publish_checkpoint(&cp).unwrap();
+    drop(writer);
+    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+    conn.execute_batch("DROP TABLE checkpoint_snow").unwrap();
+    drop(conn);
+    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
+    drop(Writer::open(scratch.db()).unwrap());
+    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
+    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+    conn.execute("DELETE FROM checkpoint_snow", []).unwrap();
+    drop(conn);
+    drop(Writer::open(scratch.db()).unwrap());
+    assert!(
+        recover(scratch.db()).is_err(),
+        "opening must not erase missing-row evidence"
+    );
+}
+
+#[test]
+fn corrupt_snow_payload_uses_the_prior_complete_world_checkpoint() {
+    let scratch = Scratch::new("snow-corruption");
+    let mut old = checkpoint(10, 0);
+    old.snow = Some(vec![1, 0, 8]);
+    let mut new = checkpoint(20, 0);
+    new.snow = Some(vec![1, 0, 16]);
+    let mut writer = Writer::open(scratch.db()).unwrap();
+    writer.publish_checkpoint(&old).unwrap();
+    writer.publish_checkpoint(&new).unwrap();
+    drop(writer);
+    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+    conn.execute("UPDATE checkpoint_snow SET state=x'0000' WHERE tick=20", [])
+        .unwrap();
+    drop(conn);
+    let recovered = recover(scratch.db()).unwrap();
+    assert_eq!(recovered.checkpoint, old);
+    assert!(
+        recovered
+            .corruption
+            .iter()
+            .any(|report| report.detail.contains("snow checkpoint checksum"))
+    );
+}
+
+#[test]
 fn legacy_schema_two_vegetation_backfill_preserves_world_and_detects_missing_rows() {
     let scratch = Scratch::new("vegetation-upgrade");
     let cp = checkpoint(0, 0);
@@ -109,6 +172,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         bodies: vec![],
         column_water: None,
         weather: None,
+        snow: None,
         bricks: vec![
             StoredBrick {
                 volume_id: 1,

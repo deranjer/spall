@@ -342,6 +342,7 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
         vegetation: load_vegetation(conn, tick)?,
         column_water: load_column_water(conn, tick)?,
         weather: load_weather(conn, tick)?,
+        snow: load_snow(conn, tick)?,
         tick: tick as u64,
         journal_cursor: journal_cursor as u64,
         world_hash,
@@ -415,6 +416,49 @@ fn load_vegetation(conn: &Connection, tick: i64) -> Result<Vec<u8>, StoreError> 
         ));
     }
     Ok(bytes)
+}
+
+fn load_snow(conn: &Connection, tick: i64) -> Result<Option<Vec<u8>>, StoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_snow')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    // Check the SQLite length before copying a potentially corrupt large BLOB.
+    let len: Option<i64> = conn
+        .query_row(
+            "SELECT length(state) FROM checkpoint_snow WHERE tick=?",
+            [tick],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(len) = len else {
+        return Err(StoreError::Corrupt("snow checkpoint row missing".into()));
+    };
+    if !(0..=64 * 1024 * 1024 + 16).contains(&len) {
+        return Err(StoreError::Corrupt("snow checkpoint byte limit".into()));
+    }
+    let (blob, crc): (Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT state,crc FROM checkpoint_snow WHERE tick=?",
+        [tick],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if crc.as_slice() != crc16(&blob).as_slice() {
+        return Err(StoreError::Corrupt(
+            "snow checkpoint checksum mismatch".into(),
+        ));
+    }
+    let state: Option<Vec<u8>> = dto::decode(&blob)?;
+    if state
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > 64 * 1024 * 1024)
+    {
+        return Err(StoreError::Corrupt("snow checkpoint byte limit".into()));
+    }
+    Ok(state)
 }
 
 fn load_weather(
