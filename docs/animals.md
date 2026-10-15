@@ -12,6 +12,7 @@ validation. It does not claim that animals spawn in the shipped game.
 | A1 | ENG-202 | Deterministic articulated trout, crow and deer fixtures | Existing SPVX v1.1 contract |
 | A2 | ENG-203 | Sandbox live terrain/water habitat candidate validation | Existing terrain and column-water snapshots |
 | A3 | ENG-204 | Articulated render extraction and bounded GPU preview | Reviewed A0/A1 contracts |
+| A4 | ENG-205 | Authoritative creature lifecycle and world integration contract | Accepted A0-A3 foundations |
 
 These assignments are independently ready. A1 writes the frozen binary format,
 not an invented animation interface. A2 consumes existing world queries and
@@ -91,7 +92,7 @@ Camera and floor are fixed per animal so root motion is not cancelled by the
 preview. This is source animation/rendering evidence, not running creatures
 in a world. Exact commands, results and limits: `reports/ENG-204-animal-preview.md`.
 
-Next unblocked ticket ENG-205/A4 freezes the missing authoritative creature
+ENG-205/A4 is in progress to freeze the missing authoritative creature
 lifecycle and game-facing tick contract before population implementation.
 Current body-spawn and committed-edit APIs do not provide an animated actor
 lifecycle.
@@ -103,3 +104,13 @@ Creature collision/hits, editable ownership after damage/death,
 replicated asset/clip state, durable recovery and streaming/reset identity all
 need an explicit shared contract. The preview must not become a local-only
 population shortcut.
+
+The user authorized a Luna worker for ENG-205 after the preview closeout.
+One Luna 6 Medium worker audits the cross-cutting lifecycle contract in a
+dedicated `animal-lifecycle` worktree, starting from `71540f8`. It owns a new
+`docs/animal-lifecycle.md` proposal and ticket-specific evidence; the coordinator
+retains shared-doc integration and Loopira status/log ownership. The audit
+must map existing APIs and freeze identity, source-part/cell ownership,
+tick-boundary ordering, collision/hits, births/deaths, durable state and
+baseline/interest/reset semantics before dependent runtime implementation.
+Implementation slices may fan out only after that shared contract is reviewed.
