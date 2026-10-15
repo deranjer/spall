@@ -13,6 +13,7 @@ validation. It does not claim that animals spawn in the shipped game.
 | A2 | ENG-203 | Sandbox live terrain/water habitat candidate validation | Existing terrain and column-water snapshots |
 | A3 | ENG-204 | Articulated render extraction and bounded GPU preview | Reviewed A0/A1 contracts |
 | A4 | ENG-205 | Authoritative creature lifecycle and world integration contract | Accepted A0-A3 foundations |
+| A4-P | ENG-209 | Exact articulated collision and source-cell query feasibility | Accepted source assets; independent of runtime lifecycle APIs |
 
 These assignments are independently ready. A1 writes the frozen binary format,
 not an invented animation interface. A2 consumes existing world queries and
@@ -114,3 +115,20 @@ must map existing APIs and freeze identity, source-part/cell ownership,
 tick-boundary ordering, collision/hits, births/deaths, durable state and
 baseline/interest/reset semantics before dependent runtime implementation.
 Implementation slices may fan out only after that shared contract is reviewed.
+
+## Lifecycle review and collision prerequisite (2026-10-15)
+
+ENG-205 review requires one assembly owner with distinct part-local source
+volumes, preserving overlapping source coordinates and stable part/cell
+provenance. Moving part transforms must not rewrite source cells. Death needs
+an atomic ownership transfer and a separately reviewed editable multi-volume
+corpse representation; the existing one-volume dynamic body path is insufficient.
+
+ENG-209 is in progress in an isolated `animal-collision` worktree at the
+accepted animal baseline `7208ffc`. A Luna 6 Medium worker measures a candidate:
+one Rapier kinematic root carrying exact per-part voxel or merged-cuboid
+colliders. The bounded CPU gate covers current-pose queries, source-cell hit
+identity, stale update isolation, geometry edits, real contacts, and the actual
+trout/crow/deer geometries. It introduces no runtime creature lifecycle API.
+No representation or population capacity is accepted at dispatch. Dynamic
+corpse ownership, locomotion, multiplayer and recovery remain separate work.

@@ -1861,3 +1861,12 @@ Next unblocked: ENG-205 / A4, the missing authoritative creature tick/lifecycle,
 collision/damage/ownership, wire and durable-recovery contracts before live
 population. Exact preview commands and limitations: docs/animals.md and
 reports/ENG-204-animal-preview.md.
+
+ENG-205 contract review continued on 2026-10-15: separate part-local source
+volumes under one assembly owner replace the proposed overlapping single grid.
+Exact articulated collision and source-cell query feasibility is ENG-209 / A4-P,
+now in progress in an isolated Luna 6 Medium worktree at 7208ffc. It measures
+one existing-Rapier-world kinematic root with exact per-part colliders; it does
+not implement live actors or accept population capacity. Corpse aggregate
+ownership/physics is a separate prerequisite. Canonical status: docs/animals.md;
+ENG-205 remains under review until corrections are integrated.
