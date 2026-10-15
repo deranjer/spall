@@ -49,3 +49,48 @@ No population throughput target was accepted. The workload timings describe one 
 - The query API tests one assembly only and does not replace world-level ray ordering or occlusion.
 - Precision at the 1,000 m admission envelope and whole-world coordinate rebasing are untested.
 - No many-animal/population performance target was run or accepted.
+
+## Coordinator integration and acceptance (2026-10-15)
+
+Integrated prototype commit `c46b7c6` follows the reviewed ENG-205 lifecycle
+audit. Accepted scope is the bounded experimental geometry/query adapter and
+measured contact diagnostics, not a shipping creature rig. ENG-210 is the next
+unblocked movement/response feasibility ticket; the editable multi-volume
+corpse representation remains a separate prerequisite. Live actors, durable
+recovery, multiplayer, far-origin precision and population acceptance remain
+unproven.
+
+Changed implementation files: `crates/spall_physics/src/articulated.rs`,
+`src/world.rs`, `src/lib.rs`, `tests/articulated_review.rs`,
+`examples/sandbox/examples/animal_collision_probe.rs` and its Cargo example
+registration. Three report/evidence files record the adapter and workload.
+Shared `docs/animals.md`, `docs/animal-lifecycle.md` and `docs/tasks.md` now
+reflect the measured limits and ENG-210 dependency.
+
+Exact checks on the integrated checkout:
+
+```powershell
+cargo test -p spall_physics -p spall_asset -p sandbox --lib --test articulated_review --test animal_assets --test animal_habitat_world
+cargo clippy -p spall_physics --all-targets -- -D warnings
+cargo clippy -p sandbox --example animal-collision-probe -- -D warnings
+cargo fmt --package spall_physics --check
+rustfmt --edition 2024 --check examples/sandbox/examples/animal_collision_probe.rs
+cargo build -p sandbox --release --example animal-collision-probe
+.\target\release\examples\animal-collision-probe.exe --bounded
+git diff --check
+```
+
+The combined suite passed 118 tests: 71 physics unit, 8 independent collision
+review, 13 asset, 23 sandbox library, and 3 authored/live-habitat integration
+tests. One existing manual physics timing diagnostic was ignored. The first
+strict probe lint found a manual range check and an eight-argument diagnostic
+helper; the coordinator used an inclusive range and bundled topology/pose
+tokens, then reran lint successfully and rebuilt/reran the complete release
+matrix. Its final committed JSON/table contain that integrated-checkout run:
+six cases, 38,520 oracle checks, 66 guaranteed misses, zero mismatches/timed
+misses. Formatting and whitespace checks passed. Compiler cache hard-link
+warnings used file-copy fallback and did not fail checks.
+
+No full-workspace `xtask check`, GPU, server/client actor, recovery, or
+population gate was run for ENG-209. Earlier preview-wide validation remains
+separately recorded in ENG-204 and is not acceptance of these later gates.

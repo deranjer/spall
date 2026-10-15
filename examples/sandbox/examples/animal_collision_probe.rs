@@ -53,6 +53,11 @@ struct RefCell {
     rotation: Quat,
 }
 
+struct AssemblyTokens {
+    topology: u64,
+    pose: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RayCase {
     part_id: u32,
@@ -340,8 +345,10 @@ fn run_case(
         root_translation,
         &mut validation_world,
         validation_id,
-        pose_token,
-        TOPOLOGY_TOKEN,
+        AssemblyTokens {
+            topology: TOPOLOGY_TOKEN,
+            pose: pose_token,
+        },
         &samples.last().ok_or("no sampled phases")?.locals,
     )?;
     ray_checks += rebuild_checks;
@@ -679,7 +686,7 @@ fn reference_hit_cells(
             let o = local_origin[axis];
             let d = local_direction[axis];
             if d.abs() < 1.0e-8 {
-                if o < -CELL_M * 0.5 || o > CELL_M * 0.5 {
+                if !(-CELL_M * 0.5..=CELL_M * 0.5).contains(&o) {
                     far = -1.0;
                     break;
                 }
@@ -788,11 +795,11 @@ fn check_source_cell_removal(
     root: Vec3,
     world: &mut PhysicsWorld,
     id: ArticulatedBodyId,
-    pose_token: u64,
-    initial_topology: u64,
+    tokens: AssemblyTokens,
     locals: &[(u32, PartTransform)],
 ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
-    let mut topology = initial_topology;
+    let mut topology = tokens.topology;
+    let pose_token = tokens.pose;
     let mut revisions = vec![1u64; animal.parts.len()];
     let mut checks = 0;
     let mut misses = 0;

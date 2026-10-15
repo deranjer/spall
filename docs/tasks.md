@@ -1901,3 +1901,13 @@ destruction and matched performance follow-ups under ENG-195; no provisional
 performance target is accepted. Final evidence and live-world path:
 reports/ENG-207-snow-playtest.md. Next unblocked weather work: ENG-195 combined
 acceptance (T25 integration), independently of the animal prototype work.
+
+ENG-209 / A4-P accepted on 2026-10-15 for the exact articulated geometry/query
+prototype, integrated as c46b7c6. All six actual-animal/collider cases pass:
+38,520 oracle ray checks and 66 guaranteed misses, zero mismatches. Integrated
+focused checks pass 118 tests (one manual timing diagnostic ignored), strict
+physics/probe Clippy and formatting. Reports: ENG-209-articulated-collision.md
+and ENG-209-animal-workload.md, with committed JSON measurements.
+Next unblocked: ENG-210 / A4-R, backlog movement/collision-response rig gate.
+ENG-209 does not accept limb surface-velocity response or fixed-terrain solver
+blocking; editable corpse aggregates and runtime/network/recovery remain gated.

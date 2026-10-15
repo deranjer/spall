@@ -104,8 +104,8 @@ adapter objects; only the simulation owner applies a result at a tick boundary
 after checking creature generation, topology revision, clip/pose epoch,
 and collider revision. A stale result is discarded.
 
-**Next feasibility candidate (ENG-209; not an accepted runtime interface):**
-measure one Rapier kinematic root with one exact collider per source part,
+**Measured feasibility candidate (ENG-209; not an accepted runtime interface):**
+ENG-209 measures one Rapier kinematic root with one exact collider per source part,
 using the existing `NativeVoxels` or exact `MergedCuboids` representation for
 that part. Apply the authored part pose locally under the root. This is one
 physics root and one collider per part, never one rigid body per voxel. Measure
@@ -341,6 +341,15 @@ habitat candidate tests are not lifecycle, collision, or population acceptance.
 
 ## Implementation slices after coordinator review
 
+ENG-209 is now reviewed and integrated for exact geometry and source-cell
+queries; [its report](reports/ENG-209-articulated-collision.md) records the
+remaining physical limits. Local animated collider motion has inadequate
+surface-velocity response in the probe comparison, and prescribed root motion
+does not receive fixed-terrain solver blocking. ENG-210 is the next unblocked
+movement/rig feasibility slice. Both its reviewed outcome and the separate
+corpse aggregate decision are prerequisites to runtime actor interfaces; the
+host/transaction slices below remain proposed.
+
 1. **Geometry/query feasibility (ENG-209):** measure the selected kinematic
    root/per-part collider candidate and exact query-to-source-cell mapping.
    This ticket has no lifecycle/runtime interface dependency and does not
@@ -373,7 +382,6 @@ habitat candidate tests are not lifecycle, collision, or population acceptance.
    destruction scenario with measured CPU and two-client results. GPU and
    population performance work stay separate and cannot be inferred from it.
 
-ENG-209 is the first ready feasibility slice and is deliberately independent of
-runtime lifecycle interfaces. Runtime actors must not start before its measured
-result, the separate corpse aggregate decision, and source provenance format
-have been reviewed.
+ENG-209 was deliberately independent of runtime lifecycle interfaces. Runtime
+actors must not start before ENG-210's movement/rig result, the separate corpse
+aggregate decision, and source provenance format have been reviewed.

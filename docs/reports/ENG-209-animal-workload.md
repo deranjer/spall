@@ -14,12 +14,12 @@ The table reports microseconds per operation. `pose + rays + step` includes one 
 
 | Animal | Representation | Cells / parts | Colliders / primitives | Initial attach p50 / p95 / p99 | Grid rebuild p50 / p95 / p99 | Pose + rays + step p50 / p95 / p99 |
 |---|---|---:|---:|---:|---:|---:|
-| Trout | NativeVoxels | 136 / 5 | 5 / 5 | 19.6 / 20.7 / 24.3 | 2.9 / 7.9 / 8.0 | 6.3 / 6.6 / 8.6 |
-| Trout | MergedCuboids | 136 / 5 | 5 / 17 | 5.9 / 7.0 / 9.2 | 1.2 / 2.3 / 2.4 | 5.8 / 6.1 / 6.3 |
-| Crow | NativeVoxels | 217 / 6 | 6 / 6 | 23.1 / 24.5 / 27.8 | 3.8 / 5.0 / 5.1 | 7.6 / 7.9 / 9.1 |
-| Crow | MergedCuboids | 217 / 6 | 6 / 14 | 6.3 / 6.6 / 9.1 | 1.3 / 1.6 / 1.7 | 6.7 / 7.1 / 9.3 |
-| Deer | NativeVoxels | 285 / 9 | 9 / 9 | 33.8 / 34.3 / 42.1 | 3.1 / 9.6 / 9.8 | 11.9 / 12.6 / 15.8 |
-| Deer | MergedCuboids | 285 / 9 | 9 / 21 | 9.3 / 10.5 / 17.4 | 1.0 / 2.1 / 2.2 | 10.4 / 11.0 / 13.0 |
+| Trout | NativeVoxels | 136 / 5 | 5 / 5 | 19.8 / 22.7 / 27.6 | 2.9 / 7.9 / 8.0 | 6.3 / 6.7 / 7.1 |
+| Trout | MergedCuboids | 136 / 5 | 5 / 17 | 5.9 / 6.0 / 8.2 | 1.2 / 2.4 / 2.5 | 7.1 / 7.3 / 10.0 |
+| Crow | NativeVoxels | 217 / 6 | 6 / 6 | 23.1 / 25.4 / 36.1 | 3.8 / 4.9 / 5.1 | 7.5 / 7.9 / 10.3 |
+| Crow | MergedCuboids | 217 / 6 | 6 / 14 | 6.2 / 6.6 / 7.6 | 1.3 / 1.4 / 1.5 | 6.6 / 6.9 / 8.2 |
+| Deer | NativeVoxels | 285 / 9 | 9 / 9 | 33.7 / 34.4 / 41.0 | 3.1 / 9.5 / 9.6 | 11.8 / 13.9 / 23.4 |
+| Deer | MergedCuboids | 285 / 9 | 9 / 21 | 9.5 / 10.2 / 15.6 | 1.0 / 2.2 / 2.3 | 10.4 / 11.1 / 11.3 |
 
 These values describe this machine and workload, not an acceptance threshold or a multi-body scene estimate. The structured results, including exact sampled clip ticks and per-case counts, are in [ENG-209-animal-workload.json](ENG-209-animal-workload.json).
 
@@ -43,3 +43,6 @@ cargo run -p sandbox --release --example animal-collision-probe -- --bounded
 ```
 
 The final run exited 0 after the physics adapter was frozen, including its live-volume ownership and numeric admission guards, direct slice-sweep exclusions, and post-step part-pose refresh. The executable decodes the included real assets; asset decoding and world construction are outside the operation timing. Pose timing excludes clip sampling and ray generation, which are prepared before the timed interval. Live grid-rebuild timing starts after cloning an already materialized source grid; it includes adapter validation, shape construction and installation, but not canonical volume edits or occupancy extraction. Initial attachment includes source-grid cloning and adapter attachment. The release run is deliberately bounded and CPU-only. These results establish fixture-level exactness and provide diagnostic timing evidence; they do not establish target-scale performance.
+
+
+Coordinator closeout (2026-10-15): the integrated checkout reran the release build and exact bounded executable after probe lint cleanup. It exited 0 with 38520 oracle checks and 66 guaranteed miss checks, and zero mismatches or timed misses. This table and JSON contain that integrated-checkout rerun; timing scope and limits above are unchanged.

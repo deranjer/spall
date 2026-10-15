@@ -14,6 +14,7 @@ validation. It does not claim that animals spawn in the shipped game.
 | A3 | ENG-204 | Articulated render extraction and bounded GPU preview | Reviewed A0/A1 contracts |
 | A4 | ENG-205 | Authoritative creature lifecycle and world integration contract | Accepted A0-A3 foundations |
 | A4-P | ENG-209 | Exact articulated collision and source-cell query feasibility | Accepted source assets; independent of runtime lifecycle APIs |
+| A4-R | ENG-210 | Articulated movement and collision-response rig feasibility | Reviewed ENG-209 measurements |
 
 These assignments are independently ready. A1 writes the frozen binary format,
 not an invented animation interface. A2 consumes existing world queries and
@@ -126,7 +127,7 @@ provenance. Moving part transforms must not rewrite source cells. Death needs
 an atomic ownership transfer and a separately reviewed editable multi-volume
 corpse representation; the existing one-volume dynamic body path is insufficient.
 
-ENG-209 is in progress in an isolated `animal-collision` worktree at the
+ENG-209 was implemented in an isolated `animal-collision` worktree at the
 accepted animal baseline `7208ffc`. A Luna 6 Medium worker measures a candidate:
 one Rapier kinematic root carrying exact per-part voxel or merged-cuboid
 colliders. The bounded CPU gate covers current-pose queries, source-cell hit
@@ -142,5 +143,33 @@ ping-pong phase recovery, and monotonic identity/reset rules. This closes the
 audit, not live creature support. Focused regression command
 `cargo test -p spall_asset -p sandbox --lib --test animal_assets --test animal_habitat_world`
 passed: 13 asset tests, 23 sandbox library tests and 3 integration tests.
-ENG-209 is the next unblocked implementation prerequisite; editable physical
-corpse assembly remains a separate gate before runtime lifecycle work.
+ENG-209 closeout follows below; editable physical corpse assembly remains a
+separate gate before runtime lifecycle work.
+
+## Exact animated collision prototype accepted (2026-10-15)
+
+ENG-209 is integrated as `c46b7c6` and accepted for its bounded experimental
+geometry/query scope. The existing Rapier world holds one kinematic root with
+exact per-part colliders and separate source-volume identity. Tokened pose and
+topology updates reject stale/invalid work before mutation. A post-step collider
+pose-cache bug found by the full animal workload is fixed and covered by an
+independent regression. No production creature lifecycle interface is accepted.
+
+The final release matrix passes all six trout/crow/deer and collider combinations:
+38,520 source-cell oracle checks and 66 guaranteed misses, with zero mismatches.
+The integrated focused suite passes 118 tests, with one manual timing test
+ignored. Strict physics and probe Clippy, formatting and whitespace checks pass.
+Exact commands, contact diagnostics and limits:
+[adapter report](reports/ENG-209-articulated-collision.md),
+[workload report](reports/ENG-209-animal-workload.md), and its committed JSON.
+
+Geometry/query success does not resolve movement physics. Local limb animation
+produces much weaker dynamic-probe impulses than the same root-driven path.
+Prescribed kinematic root motion crosses fixed terrain under the current
+collision defaults; the separate character query sweep blocks that wall.
+Contact manifolds do not supply validated source-cell damage provenance.
+
+Next unblocked: ENG-210 / A4-R, currently backlog, to measure a reviewed movement
+and collision-response rig against these exact counterexamples. Editable
+multi-volume corpses remain a separate prerequisite. Live spawning, navigation,
+multiplayer/recovery, far-origin precision and population capacity are unproven.
