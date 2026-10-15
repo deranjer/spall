@@ -418,6 +418,10 @@ pub struct ReplicaWorld {
     catalogue_deferred: Vec<TopologyTransaction>,
     weather: Option<spall_protocol::WeatherState>,
     weather_epoch_floor: u64,
+    snow: BTreeMap<(i32, i32, i32), spall_protocol::SnowSurfaceFrame>,
+    snow_versions: BTreeMap<(i32, i32, i32), (u64, u64)>,
+    snow_epoch_floor: u64,
+    snow_generation: u64,
 }
 
 /// A baseline being built off to the side while its segments arrive (`docs/protocol.md` late-join
@@ -684,6 +688,10 @@ impl ReplicaWorld {
             catalogue_deferred: Vec::new(),
             weather: None,
             weather_epoch_floor: 0,
+            snow: BTreeMap::new(),
+            snow_versions: BTreeMap::new(),
+            snow_epoch_floor: 0,
+            snow_generation: 0,
         }
     }
 
@@ -717,6 +725,10 @@ impl ReplicaWorld {
             catalogue_deferred: Vec::new(),
             weather: None,
             weather_epoch_floor: 0,
+            snow: BTreeMap::new(),
+            snow_versions: BTreeMap::new(),
+            snow_epoch_floor: 0,
+            snow_generation: 0,
         }
     }
 
@@ -816,6 +828,10 @@ impl ReplicaWorld {
             })
             .saturating_add(1);
         self.weather = None;
+        self.snow_epoch_floor = self.snow_epoch_floor.saturating_add(1);
+        self.snow.clear();
+        self.snow_versions.clear();
+        self.snow_generation = self.snow_generation.saturating_add(1);
         // A replacement baseline supersedes any catalogue still arriving for the old one.
         self.catalogue_pending = None;
         self.catalogue_deferred.clear();
@@ -838,11 +854,61 @@ impl ReplicaWorld {
         {
             return Err("stale weather revision".into());
         }
+        self.snow_epoch_floor = self.snow_epoch_floor.max(state.world_epoch);
+        self.snow
+            .retain(|_, frame| frame.world_epoch >= self.snow_epoch_floor);
         self.weather = Some(state);
         Ok(())
     }
     pub fn weather(&self) -> Option<&spall_protocol::WeatherState> {
         self.weather.as_ref()
+    }
+
+    /// Installs one atomic terrain snow tile/Y replacement. This stream has
+    /// its own sequence per key so a delayed climate tile cannot be rejected
+    /// merely because a newer motion frame advanced the replica tick.
+    pub fn apply_snow_frame(
+        &mut self,
+        frame: spall_protocol::SnowSurfaceFrame,
+    ) -> Result<(), String> {
+        frame.validate().map_err(|error| error.to_string())?;
+        if frame.world_epoch < self.snow_epoch_floor {
+            return Err("stale snow world epoch".into());
+        }
+        let key = (frame.tile_x, frame.tile_z, frame.top_cell_y);
+        if let Some((epoch, seq)) = self.snow_versions.get(&key)
+            && (frame.world_epoch < *epoch
+                || (frame.world_epoch == *epoch && frame.snapshot_seq <= *seq))
+        {
+            return Err("stale snow tile sequence".into());
+        }
+        self.snow_versions
+            .insert(key, (frame.world_epoch, frame.snapshot_seq));
+        if frame.surfaces.is_empty() && frame.footprints.is_empty() {
+            self.snow.remove(&key);
+        } else {
+            self.snow.insert(key, frame);
+        }
+        self.snow_generation = self.snow_generation.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn snow_frames(&self) -> impl Iterator<Item = &spall_protocol::SnowSurfaceFrame> {
+        self.snow.values()
+    }
+
+    pub fn snow_frame(
+        &self,
+        tile_x: i32,
+        tile_z: i32,
+        top_cell_y: i32,
+    ) -> Option<&spall_protocol::SnowSurfaceFrame> {
+        self.snow.get(&(tile_x, tile_z, top_cell_y))
+    }
+
+    /// Changes only when an atomic snow frame or full world replacement lands.
+    pub fn snow_generation(&self) -> u64 {
+        self.snow_generation
     }
 
     /// Marks the baseline just installed as missing its distant terrain
@@ -2723,6 +2789,29 @@ mod tests {
         replica
             .apply_weather(delayed)
             .expect("motion tick must not fence the independent weather stream");
+        let frame = |world_epoch, snapshot_seq, effective_tick| spall_protocol::SnowSurfaceFrame {
+            schema: spall_protocol::SNOW_SCHEMA,
+            world_epoch,
+            world_revision: 0,
+            effective_tick,
+            snapshot_seq,
+            tile_x: -1,
+            tile_z: 0,
+            top_cell_y: 2,
+            surfaces: vec![],
+            footprints: vec![],
+        };
+        assert!(replica.apply_snow_frame(frame(1, 1, 1)).is_err());
+        replica
+            .apply_snow_frame(frame(2, 4, 2))
+            .expect("current epoch snow tile is accepted");
+        assert!(replica.apply_snow_frame(frame(2, 4, 2)).is_err());
+        replica
+            .apply_snow_frame(frame(2, 5, 2))
+            .expect("new tile sequence may have an older effective tick");
+        replica.install_baseline_world(&world).unwrap();
+        assert!(replica.apply_snow_frame(frame(2, 6, 3)).is_err());
+        assert_eq!(replica.snow_frames().count(), 0);
     }
 
     #[test]
