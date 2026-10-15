@@ -26,6 +26,39 @@ struct Scratch {
 }
 
 #[test]
+fn snow_geometry_journal_is_bounded_versioned_and_keeps_exact_owner_bytes() {
+    let scratch = Scratch::new("snow-tile-journal");
+    let mut writer = Writer::open(scratch.db()).unwrap();
+    writer.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+    let mut record = JournalRecord {
+        seq: 1,
+        tick: 1,
+        payload: JournalPayload::SnowTileState {
+            world_epoch: 1,
+            tile: [-1, 2, 3],
+            state: vec![2, 0, 7],
+        },
+    };
+    assert!(writer.append_journal(&[record.clone()]).is_err());
+    record.payload = JournalPayload::SnowTileState {
+        world_epoch: 1,
+        tile: [-1, 2, 3],
+        state: vec![1, 0, 0, 255, 129, 3],
+    };
+    writer.append_journal(&[record.clone()]).unwrap();
+    drop(writer);
+    let recovered = recover(scratch.db()).unwrap();
+    assert_eq!(recovered.durable_through, 1);
+    assert_eq!(recovered.journal, vec![record]);
+    let oversized = JournalPayload::SnowTileState {
+        world_epoch: 1,
+        tile: [0; 3],
+        state: vec![1; 64 * 1024 + 1],
+    };
+    assert!(oversized.validate_auxiliary_bounds().is_err());
+}
+
+#[test]
 fn snow_checkpoint_round_trips_and_republication_clears_the_previous_blob() {
     let scratch = Scratch::new("snow-checkpoint");
     let mut cp = checkpoint(10, 0);

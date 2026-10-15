@@ -218,6 +218,7 @@ impl Writer {
                     got: u64::MAX,
                 })?;
         for (offset, r) in records.iter().enumerate() {
+            r.payload.validate_auxiliary_bounds()?;
             let expect = start
                 .checked_add(offset as u64)
                 .ok_or(StoreError::JournalGap {

@@ -45,6 +45,8 @@ pub enum DtoError {
     Codec(#[from] CodecError),
     #[error("bulk split baseline: {0}")]
     Baseline(#[from] BaselineDecodeError),
+    #[error("invalid versioned snow tile journal state")]
+    SnowTileBounds,
 }
 
 /// Encode a save record to its postcard bytes.
@@ -234,9 +236,30 @@ pub enum JournalPayload {
     ColumnWaterDelta(spall_protocol::ColumnWaterDelta),
     /// Appended versioned weather state and explicit weather clock source.
     WeatherState(spall_protocol::WeatherState),
+    /// Appended: exact owner-versioned tile/Y cohort state after geometry or
+    /// exposure changes. Includes Q32 depth/credit; excludes temporary tracks.
+    SnowTileState {
+        world_epoch: u64,
+        tile: [i32; 3],
+        state: Vec<u8>,
+    },
 }
 
 impl JournalPayload {
+    /// The store checks the version/size envelope; simulation validates the
+    /// canonical cohort contents while replaying this ordered journal entry.
+    pub fn validate_auxiliary_bounds(&self) -> Result<(), DtoError> {
+        if let Self::SnowTileState {
+            world_epoch, state, ..
+        } = self
+            && (*world_epoch == 0
+                || state.len() > 64 * 1024
+                || !state.starts_with(&1u16.to_le_bytes()))
+        {
+            return Err(DtoError::SnowTileBounds);
+        }
+        Ok(())
+    }
     /// Build a `Topology` payload from live protocol records.
     pub fn topology(
         transaction: &TopologyTransaction,

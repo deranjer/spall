@@ -260,6 +260,12 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
                     break;
                 }
             };
+            if let Err(error) = decoded.validate_auxiliary_bounds() {
+                corruption.push(CorruptionReport::new(format!(
+                    "journal seq {seq} has invalid auxiliary state: {error}"
+                )));
+                break;
+            }
             journal.push(JournalRecord {
                 seq,
                 tick,
