@@ -469,6 +469,7 @@ struct InteractiveApp {
     thunder_event: Option<(u64, u64)>,
     pending_thunder: Option<(Instant, PathBuf)>,
     weather_effects_enabled: bool,
+    ground_snow_enabled: bool,
     reduced_weather_flashes: bool,
     weather_exposure: f32,
     /// When the last frame was requested, for the uncapped frame limiter.
@@ -1723,6 +1724,7 @@ impl InteractiveApp {
             thunder_event: None,
             pending_thunder: None,
             weather_effects_enabled: true,
+            ground_snow_enabled: true,
             reduced_weather_flashes: false,
             weather_exposure: 1.0,
             last_redraw: Instant::now(),
@@ -2714,6 +2716,7 @@ impl ApplicationHandler for InteractiveApp {
                 };
                 renderer.weather_state = self.latest_weather.clone();
                 renderer.weather_effects_enabled = self.weather_effects_enabled;
+                renderer.ground_snow_enabled = self.ground_snow_enabled;
                 renderer.reduced_weather_flashes = self.reduced_weather_flashes;
                 renderer.scene.set_terrain_meshes_visible(self.show_terrain);
                 let terrain_upload_started = Instant::now();
@@ -2746,6 +2749,11 @@ impl ApplicationHandler for InteractiveApp {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
                 if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
+                    let snow_generation = replica.snow_generation();
+                    if renderer.snow_generation != Some(snow_generation) {
+                        renderer.snow_frames = replica.snow_frames().cloned().collect();
+                        renderer.snow_generation = Some(snow_generation);
+                    }
                     let generation = replica.terrain_generation();
                     if renderer.vegetation_terrain.as_ref().map(|(g, _)| *g) != Some(generation)
                         && let Some(volume) = replica.terrain_volume()
@@ -3028,6 +3036,12 @@ impl ApplicationHandler for InteractiveApp {
                                 .unwrap_or_else(|| "Follow local biome".into());
                             menu.weather_muted = self.weather_muted;
                             menu.weather_effects_enabled = self.weather_effects_enabled;
+                            menu.ground_snow_enabled = self.ground_snow_enabled;
+                            let snow = renderer.snow_presentation.stats();
+                            menu.snow = format!(
+                                "Nearby snow: {} faces | up to {} mm | {} tracks",
+                                snow.rendered_faces, snow.max_depth_mm, snow.footprints,
+                            );
                             menu.reduced_weather_flashes = self.reduced_weather_flashes;
                             menu
                         });
@@ -3149,6 +3163,9 @@ impl ApplicationHandler for InteractiveApp {
                 if menu_actions.toggle_weather_effects {
                     self.weather_effects_enabled = !self.weather_effects_enabled;
                 }
+                if menu_actions.toggle_ground_snow {
+                    self.ground_snow_enabled = !self.ground_snow_enabled;
+                }
                 if menu_actions.toggle_weather_flashes {
                     self.reduced_weather_flashes = !self.reduced_weather_flashes;
                 }
@@ -3169,6 +3186,10 @@ impl ApplicationHandler for InteractiveApp {
                     self.pending_thunder = None;
                     if let Some(renderer) = &mut self.renderer {
                         renderer.weather_presentation.reset();
+                        renderer.snow_frames.clear();
+                        renderer.snow_generation = None;
+                        renderer.snow_upload_key = None;
+                        renderer.snow_presentation = crate::snow::SnowPresentation::new();
                     }
                     if self.fly_eye.is_some() {
                         self.fly_eye = None;
@@ -4892,6 +4913,8 @@ fn admin_menu_view(
         nature_selection: String::new(),
         weather_muted: false,
         weather_effects_enabled: true,
+        ground_snow_enabled: true,
+        snow: String::new(),
         reduced_weather_flashes: false,
     }
 }
@@ -4980,6 +5003,8 @@ pub(super) struct AdminMenuView {
     pub nature_selection: String,
     pub weather_muted: bool,
     pub weather_effects_enabled: bool,
+    pub ground_snow_enabled: bool,
+    pub snow: String,
     pub reduced_weather_flashes: bool,
     pub flying: bool,
     /// Server's reply to the last admin command, or "waiting" while pending.
@@ -5011,6 +5036,7 @@ pub(super) struct AdminMenuActions {
     pub nature_volume_delta: f32,
     pub weather_volume_delta: f32,
     pub toggle_weather_effects: bool,
+    pub toggle_ground_snow: bool,
     pub toggle_weather_flashes: bool,
     pub toggle_flight: bool,
     pub reset_world: bool,
@@ -5169,9 +5195,19 @@ fn admin_menu_panel(
                             actions.toggle_weather_flashes = true;
                         }
                     });
+                    if yakui::button(if view.ground_snow_enabled {
+                        "Ground snow and tracks: on"
+                    } else {
+                        "Ground snow and tracks: off"
+                    })
+                    .clicked
+                    {
+                        actions.toggle_ground_snow = true;
+                    }
+                    muted(12.0, view.snow.clone());
                     muted(
                         12.0,
-                        "Snow cover and footprints are planned for a later update.",
+                        "Snow builds below freezing. Walk to leave tracks; fly to inspect them.",
                     );
                     section("Movement");
                     muted(
@@ -5816,6 +5852,11 @@ pub(super) struct WorldRenderer {
     weather_render_at: Instant,
     weather_exposure: f32,
     weather_effects_enabled: bool,
+    ground_snow_enabled: bool,
+    snow_frames: Vec<spall_protocol::SnowSurfaceFrame>,
+    snow_generation: Option<u64>,
+    snow_presentation: crate::snow::SnowPresentation,
+    snow_upload_key: Option<(u64, u64, [i64; 3], bool)>,
     reduced_weather_flashes: bool,
     environment: Environment,
     day_cycle_enabled: bool,
@@ -6271,7 +6312,12 @@ impl WorldRenderer {
             weather_render_at: Instant::now(),
             weather_exposure: 1.0,
             weather_effects_enabled: true,
+            ground_snow_enabled: true,
             reduced_weather_flashes: false,
+            snow_frames: Vec::new(),
+            snow_generation: None,
+            snow_presentation: crate::snow::SnowPresentation::new(),
+            snow_upload_key: None,
             day_clock_label: "Waiting for server time".to_owned(),
             device,
             queue,
@@ -6701,6 +6747,50 @@ impl WorldRenderer {
                 self.scene
                     .set_weather_particles(&[], spall_render::WeatherLighting::default())
                     .map_err(|error| ClientError::Render(error.to_string()))?;
+            }
+            let terrain_stamp = self
+                .vegetation_terrain
+                .as_ref()
+                .map_or(0, |(_, v)| v.state_stamp());
+            let snow_key = (
+                self.snow_generation.unwrap_or(0),
+                terrain_stamp,
+                camera.position.to_array().map(|v| (v / 8.0).floor() as i64),
+                self.ground_snow_enabled,
+            );
+            if self.snow_upload_key != Some(snow_key) {
+                if self.ground_snow_enabled
+                    && let Some((_, terrain)) = &self.vegetation_terrain
+                {
+                    let (patches, tracks) = self.snow_presentation.update(
+                        &self.snow_frames,
+                        terrain,
+                        camera.position.to_array(),
+                    );
+                    self.scene
+                        .set_snow_patches(&self.device, &self.queue, patches, tracks)
+                        .map_err(|error| ClientError::Render(error.to_string()))?;
+                } else {
+                    self.scene
+                        .set_snow_patches(&self.device, &self.queue, &[], &[])
+                        .map_err(|error| ClientError::Render(error.to_string()))?;
+                }
+                self.snow_upload_key = Some(snow_key);
+            }
+            if self.screenshot_request.is_some() {
+                let snow = self.snow_presentation.stats();
+                tracing::info!(
+                    frames = snow.frames_considered,
+                    faces = snow.rendered_faces,
+                    patches = snow.patches,
+                    tracks = snow.footprints,
+                    max_depth_mm = snow.max_depth_mm,
+                    capped = snow.cap_limited_surfaces,
+                    stale = snow.revision_mismatches,
+                    hidden = snow.hidden_or_unknown_faces,
+                    enabled = self.ground_snow_enabled,
+                    "snow capture presentation"
+                );
             }
             self.scene.render(
                 &self.device,

@@ -31,3 +31,26 @@ passed. Evidence: `.local/runs/eng198-checks/footfall-policy.log`.
 This initial policy acceptance does not claim snow contact, shared network
 replication, recovery, or GPU footprint acceptance. Integration evidence follows
 after the ENG-206 snow dependency is delivered.
+
+## Coordinator integration in progress
+
+The window consumes `ReplicaWorld::snow_generation()` and clones the immutable
+snow frames only when publication changes. Snow geometry is rebuilt/uploaded
+when snow generation, committed terrain stamp, camera's 8 m bucket, or the local
+visibility toggle changes. The F10 ground-snow/track toggle is separate from
+precipitation effects and never edits authoritative snow. Nearby face, maximum
+depth and track counts appear in the menu and structured screenshot diagnostics.
+
+`cargo check -p spall_client` and strict client/render/store all-target/all-feature
+clippy passed after moving two test-only imports and simplifying the greedy mask
+loop. The protocol suite passed 69 unit tests plus three layered-frame scenarios;
+transport unit tests passed 25/25. Four snow storage durability scenarios passed:
+exact owner-byte recovery/republication, legacy table backfill/missing-row safety,
+checksum fallback, and bounded versioned geometry journal envelopes. Canonical
+Q32 tile journal data avoids losing fractional depth when an exposure mask changes.
+
+Actual release angle captures in `.local/runs/eng207-angle/shots/` were reviewed:
+rain falls mostly downward and regular snow appears as compact flakes. This
+bounded capture tour exited successfully. Snow accumulation, actual shared
+tracks and runtime recovery still await the ENG-206 server integration at this
+point; these focused results do not substitute for that acceptance.

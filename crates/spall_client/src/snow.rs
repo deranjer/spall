@@ -3,10 +3,10 @@
 //! replica; absent/failed bricks, stale revisions, and unknown above-cells are
 //! never treated as exposed air.
 
-use spall_core::{BrickCoord, GlobalCell};
+use spall_core::GlobalCell;
 use spall_protocol::snow::{
-    SNOW_MAX_DEPTH_Q16, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_SCHEMA, SNOW_TILE_CELLS, SnowFootprint,
-    SnowSurface, SnowSurfaceFrame,
+    SNOW_MAX_DEPTH_Q16, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_SCHEMA, SNOW_TILE_CELLS, SnowSurface,
+    SnowSurfaceFrame,
 };
 use spall_render::{SnowFootprintMark, SnowSurfacePatch};
 use spall_voxel::{Sample, Volume};
@@ -296,12 +296,9 @@ fn face_valid(mask: &[u64; 4], cell: [i32; 3], tile_min_x: i64, tile_min_z: i64)
 fn greedy_rectangles(mask: [u64; 4]) -> Vec<(usize, usize, usize, usize)> {
     let mut remaining = mask;
     let mut result = Vec::new();
-    loop {
-        let Some(index) = (0..4).find_map(|word| {
-            (remaining[word] != 0).then_some(word * 64 + remaining[word].trailing_zeros() as usize)
-        }) else {
-            break;
-        };
+    while let Some(index) = (0..4).find_map(|word| {
+        (remaining[word] != 0).then_some(word * 64 + remaining[word].trailing_zeros() as usize)
+    }) {
         let x = index % 16;
         let z = index / 16;
         let mut width = 0;
@@ -365,7 +362,8 @@ mod tests {
 #[cfg(test)]
 mod presentation_tests {
     use super::*;
-    use spall_core::{CellSizeCode, LocalCell, MaterialId, Revision, VolumeId};
+    use spall_core::{BrickCoord, CellSizeCode, LocalCell, MaterialId, Revision, VolumeId};
+    use spall_protocol::SnowFootprint;
     use spall_voxel::Brick;
 
     fn surface(top_cell_y: i32, depth_q16: u16) -> SnowSurface {
