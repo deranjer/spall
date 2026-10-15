@@ -91,7 +91,7 @@ impl WeatherPresentation {
 
     /// Advance smooth presentation and rebuild at most [`MAX_WEATHER_PARTICLES`]
     /// deterministic ribbons. Exposure uses only a 5x5 set of sky columns and
-    /// at most 32 m of vertical committed-voxel samples per column.
+    /// at most 8 m of vertical committed-voxel samples per column.
     pub fn update<'a>(
         &'a mut self,
         state: &WeatherState,

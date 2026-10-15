@@ -111,7 +111,32 @@ join diagnostic so a future stall reports failure.
 
 `cargo fmt --all -- --check` and final
 `cargo clippy -p spall_client --all-targets --all-features -- -D warnings` pass,
-including the final pointer handoff changes. The combined full-workspace result
-is recorded below once that run finishes. Concurrent animal foundation commits
+including the final pointer handoff changes. Concurrent animal foundation commits
 were integrated by another session while checks ran; this report accepts only
 the weather/audio integration and does not claim animal-system validation.
+
+The full workspace run reached the protocol golden-byte test and exposed its
+stale version-5 header. The fixture now explicitly expects version 6, retaining
+the stable-byte assertion; `cargo test -p spall_protocol --lib` passes all 68
+tests. The subsequent `cargo xtask check` passes formatting but is blocked by
+`clippy::nonminimal_bool` at `examples/sandbox/src/animal_visual.rs:109`, an
+uncommitted animal preview change from the other session. That file was left
+untouched. Logs are `protocol-final.log`, `workspace-check-complete.log` and
+`workspace-check-final.log` under `.local/runs/eng198-checks/`. A full workspace
+pass is not claimed.
+
+Final independent integration run:
+`cargo test -p spall_store -p spall_server -p spall_protocol -p spall_client -p spall_ecology --all-features`
+passes: 482 tests passed, 5 existing tests ignored, zero failures. This includes
+the server's actual QUIC late-join/reset weather scenario and store weather
+override/migration recovery checks. Output is `weather-integration-final.log`.
+The ignored tests are not counted as validated performance gates. Weather GPU
+captures were inspected, but dedicated worst-case GPU budget and subjective
+audio listening gates remain unmeasured. Next unblocked planned slice:
+ENG-195 / WX3, ground snow accumulation, followed by WX4 footprints.
+
+The live client recorded its normal `stopped` event at 2026-10-14 23:23:54 UTC;
+the launcher and owned server have also exited. It was left running at handoff
+and later closed during validation, before the one-hour limit. No crash or
+audio/shader failure is recorded at shutdown. The saved world and captures
+remain in `.local/runs/eng198-live/`; no replacement session was started.
