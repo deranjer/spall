@@ -232,6 +232,10 @@ pub(crate) fn capture_with_terrain_bricks(
             .unwrap_or_default(),
         column_water: sim.column_water().map(|w| w.canonical_state()),
         weather: Some(sim.weather_state().clone()),
+        snow: Some(
+            sim.snow_state_bytes()
+                .map_err(|_| PersistError::BadField("snow capture"))?,
+        ),
         tick: sim.current_tick().get(),
         journal_cursor,
         world_hash: world.world_hash().0,
@@ -560,6 +564,13 @@ pub fn restore_with_terrain_collider_mode(
     let mut column_water_state = cp.column_water.clone();
     let mut vegetation_state = cp.vegetation.clone();
     let mut weather_state = cp.weather.clone();
+    let mut snow = cp
+        .snow
+        .as_deref()
+        .map(spall_sim::snow::SnowState::from_canonical_bytes)
+        .transpose()
+        .map_err(|_| PersistError::BadField("snow checkpoint"))?
+        .unwrap_or_default();
     let mut vegetation_clock = None;
 
     for record in &recovery.journal {
@@ -574,6 +585,27 @@ pub fn restore_with_terrain_collider_mode(
             });
         }
         durable_tick = record.tick;
+        let mut replay_weather = weather_state.clone();
+        if let Some(state) = &mut replay_weather {
+            match &record.payload {
+                JournalPayload::WeatherState(next) => {
+                    if record.tick > 0 {
+                        snow.advance(state, record.tick.saturating_sub(1))
+                            .map_err(|_| PersistError::BadField("snow climate replay"))?;
+                    }
+                    next.validate()
+                        .map_err(|_| PersistError::BadField("journal weather state"))?;
+                    snow.advance(next, record.tick)
+                        .map_err(|_| PersistError::BadField("snow climate replay"))?;
+                    replay_weather = Some(next.clone());
+                }
+                _ => {
+                    snow.advance(state, record.tick)
+                        .map_err(|_| PersistError::BadField("snow climate replay"))?;
+                }
+            }
+        }
+        weather_state = replay_weather;
         // A giant-split record (T17 increment 2) carries the same marker
         // transaction plus an out-of-band `BaselineWorld`; ordinary topology
         // records replay with `None`.
@@ -593,7 +625,22 @@ pub fn restore_with_terrain_collider_mode(
                 state
                     .validate()
                     .map_err(|_| PersistError::BadField("journal weather state"))?;
-                weather_state = Some(state.clone());
+                last_seq = record.seq;
+                continue;
+            }
+            JournalPayload::SnowTileState {
+                world_epoch,
+                tile,
+                state,
+            } => {
+                if weather_state
+                    .as_ref()
+                    .is_some_and(|weather| weather.world_epoch != *world_epoch)
+                {
+                    return Err(PersistError::BadField("snow tile world epoch"));
+                }
+                snow.restore_tile_canonical_bytes((tile[0], tile[1], tile[2]), state)
+                    .map_err(|_| PersistError::BadField("journal snow tile"))?;
                 last_seq = record.seq;
                 continue;
             }
@@ -684,6 +731,8 @@ pub fn restore_with_terrain_collider_mode(
         sim.restore_weather(state)
             .map_err(|_| PersistError::BadField("weather recovery"))?;
     }
+    sim.restore_snow_state(&snow.to_canonical_bytes().map_err(|_| PersistError::BadField("snow recovery encode"))?)
+        .map_err(|_| PersistError::BadField("snow recovery"))?;
     sim.restore_vegetation(&vegetation_state)
         .map_err(|_| PersistError::BadField("vegetation recovery"))?;
     if !had_weather_state {

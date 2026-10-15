@@ -605,6 +605,7 @@ mod tests {
         use spall_store::{STORE_SCHEMA_VERSION, StoredWorldMeta};
         Checkpoint {
             vegetation: Vec::new(),
+            snow: None,
             tick: 1,
             journal_cursor: 0,
             world_hash: [0; 32],

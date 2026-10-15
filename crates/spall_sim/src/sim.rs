@@ -104,6 +104,8 @@ pub enum TickError {
     TickExhausted,
     #[error("authoritative water tick failed: {0}")]
     Water(String),
+    #[error("authoritative snow tick failed: {0}")]
+    Snow(String),
 }
 
 /// What one [`Simulation::apply_contact_damage`] pass did: the pure
@@ -136,6 +138,10 @@ pub struct Simulation {
     pub(crate) weather: spall_protocol::WeatherState,
     pub(crate) weather_dirty: bool,
     weather_seed: u64,
+    pub(crate) snow: crate::snow::SnowState,
+    /// Per-player stride credit; proposals are validated by the snow owner.
+    motion_footprints: crate::footprints::MotionFootprints,
+    footfall_candidates: Vec<crate::footprints::FootfallCandidate>,
     /// The world a reset replaced, being freed on another thread (see [`Retiring`]).
     retiring: Retiring,
 }
@@ -233,6 +239,9 @@ impl Simulation {
             ),
             weather_dirty: true,
             weather_seed,
+            snow: crate::snow::SnowState::new(),
+            motion_footprints: crate::footprints::MotionFootprints::new(),
+            footfall_candidates: Vec::new(),
         };
         if let Some(setup) = column_water_setup {
             let _span = crate::prof::Span::start("startup.column_water");
@@ -291,6 +300,9 @@ impl Simulation {
             ),
             weather_dirty: false,
             weather_seed: 0,
+            snow: crate::snow::SnowState::new(),
+            motion_footprints: crate::footprints::MotionFootprints::new(),
+            footfall_candidates: Vec::new(),
         };
         simulation.pipeline.warm_labels(&simulation.world);
         simulation
@@ -316,6 +328,7 @@ impl Simulation {
             vegetation,
             mut weather,
             weather_seed,
+            snow,
             ..
         } = fresh;
         let (f_entity, f_volume, f_transaction, f_journal_seq) = world.registry().counters();
@@ -342,9 +355,17 @@ impl Simulation {
         self.weather = weather;
         self.weather_seed = weather_seed;
         self.weather_dirty = true;
+        let old_snow = std::mem::replace(&mut self.snow, snow);
+        self.motion_footprints.clear();
+        self.footfall_candidates.clear();
         // The replaced world goes away off the tick thread.
-        self.retiring
-            .retire((old_world, old_pipeline, old_column_water, old_vegetation));
+        self.retiring.retire((
+            old_world,
+            old_pipeline,
+            old_column_water,
+            old_vegetation,
+            old_snow,
+        ));
         Ok(())
     }
 
@@ -641,6 +662,61 @@ impl Simulation {
         Some(self.weather.clone())
     }
 
+    pub fn snow_state(&self) -> &crate::snow::SnowState {
+        &self.snow
+    }
+
+    pub fn snow_state_bytes(&self) -> Result<Vec<u8>, String> {
+        self.snow.to_canonical_bytes()
+    }
+
+    pub fn restore_snow_state(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.snow = crate::snow::SnowState::from_canonical_bytes(bytes)?;
+        Ok(())
+    }
+
+    pub fn take_snow_frames(&mut self) -> Vec<spall_protocol::SnowSurfaceFrame> {
+        self.snow.take_changed_frames(
+            self.weather.world_epoch,
+            self.weather.world_revision,
+            self.tick.get(),
+        )
+    }
+
+    pub fn take_snow_journal_tiles(
+        &mut self,
+    ) -> Result<Vec<((i32, i32, i32), Vec<u8>)>, String> {
+        self.snow
+            .take_geometry_changed_keys()
+            .into_iter()
+            .map(|key| Ok((key, self.snow.tile_canonical_bytes(key)?)))
+            .collect()
+    }
+
+    pub fn snow_snapshot_frames(
+        &mut self,
+        tile_bounds: Option<[i32; 4]>,
+    ) -> Vec<spall_protocol::SnowSurfaceFrame> {
+        let keys = self.snow.tile_keys();
+        keys.into_iter()
+            .filter(|(x, z, _)| {
+                tile_bounds.is_none_or(|[min_x, max_x, min_z, max_z]| {
+                    (min_x..=max_x).contains(x) && (min_z..=max_z).contains(z)
+                })
+            })
+            .filter_map(|(x, z, y)| {
+                self.snow.frame(
+                    x,
+                    z,
+                    y,
+                    self.weather.world_epoch,
+                    self.weather.world_revision,
+                    self.tick.get(),
+                )
+            })
+            .collect()
+    }
+
     /// Verifies recovered weather still points at the world's frozen clock source.
     pub fn validate_weather_clock_source(&self) -> Result<(), String> {
         if self.weather.clock_source == spall_protocol::WeatherClockSource::Vegetation {
@@ -781,6 +857,10 @@ impl Simulation {
         let vegetation_span = crate::prof::Span::start("tick.vegetation");
         self.advance_vegetation(&report)?;
         self.advance_weather();
+        self.snow
+            .advance(&self.weather, self.tick.get())
+            .map_err(TickError::Snow)?;
+        self.refresh_snow_from_report(&report);
         drop(vegetation_span);
         // Bodies float: buoyancy and drag from the column water, before the
         // physics step that integrates them.
@@ -1139,6 +1219,15 @@ impl Simulation {
         self.world.advance_players(TICK_DT_S, &boxes, &|x, y, z| {
             sampler.as_ref().and_then(|s| s.sample_at_m(x, y, z))
         });
+        self.motion_footprints
+            .retain_players(self.world.players().map(|player| player.entity));
+        self.footfall_candidates.clear();
+        self.footfall_candidates.extend(
+            self.world
+                .players()
+                .filter_map(|player| self.motion_footprints.observe(player, self.tick.get())),
+        );
+        self.stamp_snow_candidates();
         if std::env::var_os("SPALL_DEBUG_PLAYER").is_some() {
             for p in self.world.players() {
                 eprintln!(
@@ -1146,6 +1235,220 @@ impl Simulation {
                     self.tick.0, p.state.position_m, p.state.grounded, p.state.velocity_m_s
                 );
             }
+        }
+    }
+
+    /// Server-authoritative stride proposals produced after capsule movement.
+    /// The snow subsystem revalidates each proposal against exact terrain state.
+    pub fn take_footfall_candidates(&mut self) -> Vec<crate::footprints::FootfallCandidate> {
+        std::mem::take(&mut self.footfall_candidates)
+    }
+
+    fn refresh_snow_from_report(&mut self, report: &TickReport) {
+        use std::collections::BTreeSet;
+        use spall_core::CellSizeCode;
+
+        let terrain = &self.world.terrain().volume;
+        if terrain.cell_size() != CellSizeCode::Quarter {
+            return;
+        }
+        let Some(bounds) = terrain.bounds() else {
+            return;
+        };
+        let min_y = bounds.min.y.saturating_mul(32);
+        let max_y = bounds.max.y.saturating_mul(32).saturating_add(31);
+        if max_y.saturating_sub(min_y) > 4096 {
+            return;
+        }
+        self.snow
+            .seed_resident_discovery(&terrain.resident_brick_coords());
+        let mut priority = Vec::new();
+        for player in self.world.players() {
+            let tile_x = (player.state.position_m[0] / 4.0).floor();
+            let tile_z = (player.state.position_m[2] / 4.0).floor();
+            if tile_x < f64::from(i32::MIN)
+                || tile_x > f64::from(i32::MAX)
+                || tile_z < f64::from(i32::MIN)
+                || tile_z > f64::from(i32::MAX)
+            {
+                continue;
+            }
+            let (tile_x, tile_z) = (tile_x as i32, tile_z as i32);
+            for radius in 0i32..=24 {
+                for dz in -radius..=radius {
+                    for dx in -radius..=radius {
+                        if dx.abs().max(dz.abs()) != radius {
+                            continue;
+                        }
+                        if let (Some(x), Some(z)) =
+                            (tile_x.checked_add(dx), tile_z.checked_add(dz))
+                        {
+                            self.snow.enqueue_scan((x, z), 0);
+                            priority.push((x, z));
+                        }
+                    }
+                }
+            }
+        }
+        let mut affected = BTreeSet::new();
+        for brick in report.committed.iter().flat_map(|(_, committed)| {
+            committed
+                .topology
+                .before
+                .iter()
+                .chain(&committed.topology.after)
+                .filter(|brick| brick.volume == terrain.id())
+                .map(|brick| brick.coord)
+        }) {
+            for dz in 0..2 {
+                for dx in 0..2 {
+                    let tx = brick.x.saturating_mul(2).saturating_add(dx);
+                    let tz = brick.z.saturating_mul(2).saturating_add(dz);
+                    if let (Ok(tx), Ok(tz)) = (i32::try_from(tx), i32::try_from(tz)) {
+                        affected.insert((tx, tz));
+                    self.snow.enqueue_scan((tx, tz), self.tick.get());
+                    }
+                }
+            }
+        }
+        let work = self.snow.take_scan_batch(&priority, 16);
+        for ((tile_x, tile_z), birth_tick) in work {
+            let was_scanned = self.snow.tile_scanned((tile_x, tile_z));
+            let edited_tile = affected.contains(&(tile_x, tile_z));
+            let x0 = i64::from(tile_x) * 16;
+            let z0 = i64::from(tile_z) * 16;
+            let water = self.column_water.as_ref().map(|w| w.frame());
+            let water_sampler = water.as_ref().map(|frame| frame.sampler());
+            let mut layers = BTreeSet::new();
+            let mut masks = std::collections::BTreeMap::<i32, ([u64; 4], u64)>::new();
+            let mut uncertain = false;
+            'columns: for dz in 0..16i64 {
+                for dx in 0..16i64 {
+                    let mut found = None;
+                    for y in (min_y..=max_y).rev() {
+                        let cell = GlobalCell::new(x0 + dx, y, z0 + dz);
+                        match terrain.sample(cell) {
+                            Ok(Sample::Empty { .. }) => {}
+                            Ok(Sample::Filled(_)) => {
+                                let (brick, _) = cell.split();
+                                let Some(revision) = terrain
+                                    .brick_revision(brick)
+                                    .ok()
+                                    .flatten()
+                                    .map(|revision| revision.get())
+                                else {
+                                    uncertain = true;
+                                    continue 'columns;
+                                };
+                                found = Some((y, revision));
+                                break;
+                            }
+                            Ok(Sample::Unknown(_)) | Err(_) => {
+                                uncertain = true;
+                                continue 'columns;
+                            }
+                        }
+                    }
+                    if let Some((y, revision)) = found {
+                        let top_m = (y + 1) as f64 * 0.25;
+                        if water_sampler
+                            .as_ref()
+                            .and_then(|sampler| {
+                                sampler.sample_at_m(
+                                    (x0 + dx) as f64 * 0.25 + 0.125,
+                                    top_m + 0.01,
+                                    (z0 + dz) as f64 * 0.25 + 0.125,
+                                )
+                            })
+                            .is_some_and(|surface| surface.surface_y > top_m + 0.02)
+                        {
+                            continue;
+                        }
+                        let bit = dz as usize * 16 + dx as usize;
+                        let entry = masks.entry(i32::try_from(y).unwrap_or(i32::MAX)).or_default();
+                        if entry.1 != 0 && entry.1 != revision {
+                            uncertain = true;
+                            continue;
+                        }
+                        entry.1 = revision;
+                        entry.0[bit / 64] |= 1u64 << (bit % 64);
+                    }
+                }
+            }
+            if uncertain {
+                self.snow.retry_scan((tile_x, tile_z), birth_tick);
+                continue;
+            }
+            layers.extend(masks.keys().copied());
+            let prior = self.snow.tile_layers(tile_x, tile_z);
+            let tick = self.tick.get();
+            for (y, (mask, revision)) in masks {
+                if was_scanned || edited_tile || birth_tick > 0 {
+                    self.snow.reconcile(tile_x, tile_z, y, revision, mask, tick);
+                    if edited_tile || birth_tick > 0 {
+                        self.snow.mark_geometry_changed((tile_x, tile_z, y));
+                    }
+                } else {
+                    self.snow.discover_initial(tile_x, tile_z, y, revision, mask);
+                }
+            }
+            if was_scanned {
+                for (_, _, y) in prior {
+                    if !layers.contains(&y) {
+                        self.snow.reconcile(tile_x, tile_z, y, 0, [0; 4], tick);
+                        self.snow.mark_geometry_changed((tile_x, tile_z, y));
+                    }
+                }
+            }
+            self.snow.mark_tile_scanned((tile_x, tile_z));
+        }
+    }
+
+    fn stamp_snow_candidates(&mut self) {
+        let cell_m = 0.25;
+        let terrain = &self.world.terrain().volume;
+        if terrain.cell_size() != spall_core::CellSizeCode::Quarter {
+            return;
+        }
+        let water = self.column_water.as_ref().map(|w| w.frame());
+        let water_sampler = water.as_ref().map(|frame| frame.sampler());
+        let candidates = std::mem::take(&mut self.footfall_candidates);
+        for candidate in candidates {
+            let x = (candidate.position_m[0] / cell_m).floor() as i64;
+            let z = (candidate.position_m[2] / cell_m).floor() as i64;
+            let y = (candidate.position_m[1] / cell_m).floor() as i64 - 1;
+            let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(x), i32::try_from(y), i32::try_from(z))
+            else {
+                continue;
+            };
+            let cell = GlobalCell::new(i64::from(x), i64::from(y), i64::from(z));
+            if !matches!(terrain.sample(cell), Ok(Sample::Filled(_))) {
+                continue;
+            }
+            let top_m = (f64::from(y) + 1.0) * cell_m;
+            if water_sampler
+                .as_ref()
+                .and_then(|sampler| {
+                    sampler.sample_at_m(
+                        candidate.position_m[0],
+                        top_m + 0.01,
+                        candidate.position_m[2],
+                    )
+                })
+                .is_some_and(|surface| surface.surface_y > top_m + 0.02)
+            {
+                continue;
+            }
+            let (brick, _) = cell.split();
+            let Some(revision) = terrain
+                .brick_revision(brick)
+                .ok()
+                .flatten()
+                .map(|revision| revision.get())
+            else {
+                continue;
+            };
+            self.snow.stamp(candidate, [x, y, z], revision, self.tick.get());
         }
     }
 

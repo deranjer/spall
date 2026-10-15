@@ -21,14 +21,15 @@ spall_protocol.workspace = true
 spall_structure.workspace = true
 spall_voxel.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+postcard.workspace = true
 
 # Offline scenario binary only.
-serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [features]
 # Pulls in the JSON serialisation used by the offline `sim-scenario` binary.
-scenario = ["dep:serde", "dep:serde_json"]
+scenario = ["dep:serde_json"]
 
 [dev-dependencies]
 glam = { workspace = true }

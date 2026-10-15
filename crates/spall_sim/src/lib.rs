@@ -54,6 +54,7 @@ pub mod registry;
 pub mod replication;
 pub mod schedule;
 pub mod sim;
+pub mod snow;
 pub mod snow_query;
 pub mod stage;
 pub mod transfer;

@@ -3335,6 +3335,7 @@ name = "spall_sim"
 version = "0.1.0"
 dependencies = [
  "glam 0.33.6",
+ "postcard",
  "rayon",
  "serde",
  "serde_json",

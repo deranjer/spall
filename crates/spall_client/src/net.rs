@@ -1873,6 +1873,7 @@ async fn run_async(
                     Ok(Some(WireRecord::VegetationSnapshot(_))) => "vegetation",
                     Ok(Some(WireRecord::ColumnWaterUpdate(_))) => "column-water",
                     Ok(Some(WireRecord::WeatherSnapshot(_))) => "weather",
+                    Ok(Some(WireRecord::SnowSurfaceFrame(_))) => "snow",
                     Ok(Some(WireRecord::TopologyTransaction(_))) => "transaction",
                     Ok(Some(WireRecord::BaselineBegin(_))) => "baseline-begin",
                     Ok(Some(WireRecord::BaselineEnd(_))) => "baseline-end",
@@ -1926,6 +1927,18 @@ async fn run_async(
                             eprintln!("spall-client: rejected weather state: {error}");
                         } else {
                             counters.weather_snapshots.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(Some(WireRecord::SnowSurfaceFrame(frame))) => {
+                        if frame.effective_tick < weather_floor {
+                            continue;
+                        }
+                        if let Err(error) = replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_snow_frame(frame)
+                        {
+                            eprintln!("spall-client: rejected snow frame: {error}");
                         }
                     }
                     Ok(Some(WireRecord::ColumnWaterUpdate(update))) => {

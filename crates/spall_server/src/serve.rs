@@ -3824,6 +3824,45 @@ async fn serve_async(
                         Outbound::Water(Arc::clone(&records)),
                     );
                 }
+                let changed = sim.take_snow_frames();
+                for session in lj.live_sessions().collect::<Vec<_>>() {
+                    let bounds = lj.snow_interest(&sim, session);
+                    if water_backlogged(&clients_for_sim, session) {
+                        continue;
+                    }
+                    let in_bounds = |frame: &spall_protocol::SnowSurfaceFrame| {
+                        bounds.is_none_or(|[min_x, max_x, min_z, max_z]| {
+                            (min_x..=max_x).contains(&frame.tile_x)
+                                && (min_z..=max_z).contains(&frame.tile_z)
+                        })
+                    };
+                    let mut by_key = std::collections::BTreeMap::new();
+                    for frame in changed.iter().filter(|frame| in_bounds(frame)) {
+                        by_key.insert(
+                            (frame.tile_x, frame.tile_z, frame.top_cell_y),
+                            frame.clone(),
+                        );
+                    }
+                    // Snapshot frames are newer than any changed frame for the
+                    // same layer, so this also preserves strict per-key order.
+                    for frame in sim.snow_snapshot_frames(bounds) {
+                        by_key.insert(
+                            (frame.tile_x, frame.tile_z, frame.top_cell_y),
+                            frame,
+                        );
+                    }
+                    let records: Vec<_> = by_key
+                        .into_values()
+                        .map(WireRecord::SnowSurfaceFrame)
+                        .collect();
+                    for page in records.chunks(4) {
+                        send_to(
+                            &clients_for_sim,
+                            session,
+                            Outbound::Water(Arc::new(page.to_vec())),
+                        );
+                    }
+                }
             }
             let span_serve_water_fanout = spall_sim::prof::Span::start("serve.water_fanout");
             if let Some(column_water) = sim.column_water() {
@@ -5016,6 +5055,21 @@ impl LateJoin {
         ))
     }
 
+    fn snow_interest(&self, sim: &Simulation, session: SessionId) -> Option<[i32; 4]> {
+        let radius = self.links.get(&session.raw())?.region_radius?;
+        let player = sim.player_state(session_player_entity(session))?;
+        let tile = |meters: f64| (meters / 4.0).floor() as i64;
+        let x = tile(player.position_m[0]);
+        let z = tile(player.position_m[2]);
+        let radius_tiles = i64::from(radius).saturating_mul(2).saturating_add(2);
+        Some([
+            i32::try_from(x.saturating_sub(radius_tiles)).ok()?,
+            i32::try_from(x.saturating_add(radius_tiles)).ok()?,
+            i32::try_from(z.saturating_sub(radius_tiles)).ok()?,
+            i32::try_from(z.saturating_add(radius_tiles)).ok()?,
+        ])
+    }
+
     fn snapshot_for_session(
         &self,
         sim: &Simulation,
@@ -5829,6 +5883,19 @@ fn tick_journal_batch(
             seq: seq.0,
             tick,
             payload: spall_store::JournalPayload::WeatherState(state),
+        });
+        *journalled_through = seq.0;
+    }
+    for (key, state) in sim.take_snow_journal_tiles().map_err(|e| e.to_string())? {
+        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
+        batch.push(spall_store::JournalRecord {
+            seq: seq.0,
+            tick,
+            payload: spall_store::JournalPayload::SnowTileState {
+                world_epoch: sim.weather_state().world_epoch,
+                tile: [key.0, key.1, key.2],
+                state,
+            },
         });
         *journalled_through = seq.0;
     }
