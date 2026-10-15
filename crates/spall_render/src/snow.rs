@@ -137,8 +137,9 @@ fn append_footprint(mark: &SnowFootprintMark, output: &mut Vec<SnowVertex>) {
     // recorded heading. Clipping to the authoritative contact cell prevents
     // footprints from drawing over a roof edge or a neighbouring unknown cell.
     let (sin, cos) = mark.heading_rad.sin_cos();
-    let (side_x, side_z) = (cos, -sin);
-    let (forward_x, forward_z) = (sin, cos);
+    // Player yaw zero faces -Z, with positive yaw turning toward +X.
+    let (side_x, side_z) = (cos, sin);
+    let (forward_x, forward_z) = (sin, -cos);
     let length = 0.18;
     let width = if mark.foot == 0 { 0.082 } else { 0.074 };
     let local = [
@@ -320,6 +321,39 @@ mod tests {
                 && vertex.position[2] >= -0.125 - f32::EPSILON
                 && vertex.position[2] <= 0.125 + f32::EPSILON
         }));
+    }
+
+    #[test]
+    fn boot_toes_follow_the_authoritative_walking_heading() {
+        for (heading, direction) in [
+            (0.0, [0.0, -1.0]),
+            (std::f32::consts::FRAC_PI_2, [1.0, 0.0]),
+            (std::f32::consts::PI, [0.0, 1.0]),
+        ] {
+            let mut vertices = Vec::new();
+            build_snow_vertices(
+                &[],
+                &[SnowFootprintMark {
+                    centre: [0.0; 3],
+                    cell_centre_xz: [0.0; 2],
+                    heading_rad: heading,
+                    foot: 0,
+                    strength: 1.0,
+                }],
+                &mut vertices,
+            )
+            .unwrap();
+            // The asymmetric boot has more area toward its toes than its heel.
+            let toe_bias = vertices
+                .iter()
+                .map(|vertex| vertex.position[0] * direction[0] + vertex.position[2] * direction[1])
+                .sum::<f32>()
+                / vertices.len() as f32;
+            assert!(
+                toe_bias > 0.005,
+                "boot points away from walking heading {heading}: {toe_bias}"
+            );
+        }
     }
 }
 

@@ -274,6 +274,15 @@ fn validate_surface_faces(
         }
         match (volume.sample(solid), volume.sample(above)) {
             (Ok(Sample::Filled(_)), Ok(Sample::Empty { .. })) => valid[index / 64] |= bit,
+            (Ok(Sample::Filled(_)), Err(spall_voxel::AccessError::OutOfBounds { .. }))
+                if volume.bounds().is_some_and(|bounds| {
+                    i128::from(above.y) > i128::from(bounds.max.y) * 32 + 31
+                }) =>
+            {
+                // The declared world ceiling is known exterior sky. An absent
+                // in-bounds brick is still unknown and takes the default path.
+                valid[index / 64] |= bit;
+            }
             _ => hidden_or_unknown += 1,
         }
     }
@@ -450,6 +459,23 @@ mod presentation_tests {
             patches.is_empty(),
             "unloaded support cell cannot receive snow"
         );
+    }
+
+    #[test]
+    fn declared_world_ceiling_is_known_sky_unlike_an_absent_in_bounds_brick() {
+        let bounds =
+            spall_voxel::BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(0, 0, 0))
+                .unwrap();
+        let mut volume = Volume::bounded(VolumeId::new(1).unwrap(), CellSizeCode::Quarter, bounds);
+        let mut brick = Brick::uniform(MaterialId::AIR, Revision(1));
+        brick.set_cell(LocalCell::new(0, 31, 0).unwrap(), MaterialId(3));
+        volume
+            .insert_brick(BrickCoord::new(0, 0, 0), brick)
+            .unwrap();
+        let mut presentation = SnowPresentation::new();
+        let (patches, _) = presentation.update(&[frame(31, 132)], &volume, [0.5, 8.0, 0.5]);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].centre[1], 8.0);
     }
 
     #[test]
