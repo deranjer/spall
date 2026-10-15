@@ -22,6 +22,14 @@ preview: `cargo run -p sandbox --features client --example animal-preview -- --b
 It writes pose captures under `.local/animal-preview`; live animal population is
 pending the authoritative lifecycle work in [the animal plan](docs/animals.md).
 
+Visit the small animated zoo with
+`cargo run -p sandbox --features client --example animal-zoo`.
+Press **1/2/3** for trout/crow/deer or **0** for the whole zoo; **WASD** moves,
+**Q/E** moves vertically, and clicking enables mouse look. **Space** pauses,
+**Tab** switches idle/action, and **Esc** releases the mouse or closes the window.
+This is an authored animation showroom with a free camera; live creature
+behavior and physical world integration remain separate gates.
+
 Generated-world play loads nearby terrain at startup and streams surrounding bricks as the player
 moves. Distant terrain retains exact revision/hash records; the authoritative server still generates
 the whole world. Check Uncapped before launching to measure rendering throughput without VSync where

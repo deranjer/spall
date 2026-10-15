@@ -15,6 +15,7 @@ validation. It does not claim that animals spawn in the shipped game.
 | A4 | ENG-205 | Authoritative creature lifecycle and world integration contract | Accepted A0-A3 foundations |
 | A4-P | ENG-209 | Exact articulated collision and source-cell query feasibility | Accepted source assets; independent of runtime lifecycle APIs |
 | A4-R | ENG-210 | Articulated movement and collision-response rig feasibility | Reviewed ENG-209 measurements |
+| Zoo | ENG-211 | Interactive aquarium, aviary and paddock showroom | Accepted A0-A3 assets and render bridge; independent of runtime actors |
 
 These assignments are independently ready. A1 writes the frozen binary format,
 not an invented animation interface. A2 consumes existing world queries and
@@ -24,6 +25,18 @@ Luna 6 at Medium reasoning (the user's explicit model choice), and do not push
 or integrate their own work. Coordinator owns shared docs and Loopira updates.
 
 ## Frozen boundaries
+
+The interactive zoo is a visual inspection scene using the production renderer
+and all three source assets at their original cell scale. Launch with
+`cargo run -p sandbox --features client --example animal-zoo`. Controls:
+0 overview, 1 trout, 2 crow, 3 deer; WASD move, Q/E vertical, Shift faster;
+click for mouse look; Space pause; Tab idle/action; Esc release/exit.
+The free camera has no collision. The aquarium water and aviary are display
+geometry, and specimens play authored clips without navigation, contact response,
+spawning, damage, persistence or replication. This does not accept ENG-210.
+For bounded evidence use `-- --capture --out .local/animal-zoo` (12 images),
+or `-- --frames 90` (native presentation, resize and display-mode smoke).
+See [ENG-211 evidence](reports/ENG-211-animal-zoo.md).
 
 - Engine-owned asset parsing/sampling is CPU-only and has no game species,
   graphics, window, network or physics dependencies. Existing static importers

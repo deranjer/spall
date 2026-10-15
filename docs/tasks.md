@@ -1911,3 +1911,15 @@ and ENG-209-animal-workload.md, with committed JSON measurements.
 Next unblocked: ENG-210 / A4-R, backlog movement/collision-response rig gate.
 ENG-209 does not accept limb surface-velocity response or fixed-terrain solver
 blocking; editable corpse aggregates and runtime/network/recovery remain gated.
+
+## ENG-211: interactive animal zoo (2026-10-15, accepted)
+
+User-requested visual showroom, independent of the authoritative creature runtime.
+The animal-zoo client example shows all current source species (trout/crow/deer)
+in aquarium/aviary/paddock exhibits with free camera, focus shortcuts, pause and
+idle/action controls. Production renderer and original SPVX cells/clips are used.
+Measured: 2 scenario tests pass; strict example Clippy, formatting and diff checks
+pass; 12 GPU captures on RTX 4080 SUPER/DX12; native smoke presents 90 frames and
+resizes successfully. See docs/reports/ENG-211-animal-zoo.md for exact checks.
+No actor authority, navigation, physics response, population or persistence is
+accepted here. Next unblocked animal task remains ENG-210.

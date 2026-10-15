@@ -77,6 +77,12 @@ image.workspace = true
 serde_json.workspace = true
 spall_jobs.workspace = true
 wgpu.workspace = true
+winit.workspace = true
+
+[[example]]
+name = "animal-zoo"
+path = "examples/animal_zoo.rs"
+required-features = ["client"]
 
 [[example]]
 name = "vegetation-gallery"
