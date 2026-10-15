@@ -690,6 +690,7 @@ impl SnowState {
                         })
                     });
                 }
+                marks.retain(|mark| mark.strength_q8 > 0);
                 if marks.len() != before {
                     changed.push(*key);
                 }
@@ -698,14 +699,14 @@ impl SnowState {
             for key in changed {
                 self.changed.insert(key);
             }
-            let active: BTreeSet<_> = self
-                .footprints
-                .values()
-                .flatten()
-                .map(|mark| mark.id)
-                .collect();
-            self.footprint_credits.retain(|id, _| active.contains(id));
         }
+        let active: BTreeSet<_> = self
+            .footprints
+            .values()
+            .flatten()
+            .map(|mark| mark.id)
+            .collect();
+        self.footprint_credits.retain(|id, _| active.contains(id));
         Ok(())
     }
 
