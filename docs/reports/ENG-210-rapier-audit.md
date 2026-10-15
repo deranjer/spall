@@ -1,5 +1,9 @@
 # ENG-210 Rapier rig candidate audit
 
+Historical candidate-selection snapshot from before implementation. The
+prototype measurements and current gate result supersede its unrun-work note;
+see [ENG-210-articulated-rig.md](ENG-210-articulated-rig.md).
+
 ## Decision
 
 Carry forward a bounded **one kinematic rigid body per authored source part**

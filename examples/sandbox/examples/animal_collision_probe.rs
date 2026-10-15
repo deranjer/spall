@@ -100,14 +100,19 @@ struct CaseResult {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
-    if args.as_slice() != ["--bounded"] {
-        return Err("usage: animal-collision-probe --bounded".into());
+    let kinematic_parts = args.iter().any(|arg| arg == "--kinematic-parts");
+    if args.iter().filter(|arg| *arg == "--bounded").count() != 1
+        || args
+            .iter()
+            .any(|arg| arg != "--bounded" && arg != "--kinematic-parts")
+    {
+        return Err("usage: animal-collision-probe --bounded [--kinematic-parts]".into());
     }
     let mut results = Vec::new();
     for (name, bytes) in ANIMALS {
         let animal = load_animal(decode(bytes)?)?;
         for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
-            results.push(run_case(name, &animal, representation)?);
+            results.push(run_case(name, &animal, representation, kinematic_parts)?);
         }
     }
     let mismatch_count = results
@@ -115,7 +120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|result| result.ray_mismatches)
         .sum::<usize>();
     let output = serde_json::json!({
-        "scenario": "eng209_actual_animal_collision_bounded",
+        "scenario": if kinematic_parts { "eng210_actual_animal_kinematic_parts_bounded" } else { "eng209_actual_animal_collision_bounded" },
+        "rig": if kinematic_parts { "one_position_kinematic_body_per_source_part" } else { "single_position_kinematic_root_with_part_colliders" },
         "physics": "same spall_physics PhysicsWorld Rapier adapter",
         "source": "authored SPVX trout/crow/deer, exact 6.25 cm cells, all clips/phases",
         "hardware": hardware(),
@@ -237,6 +243,7 @@ fn run_case(
     name: &str,
     animal: &Animal,
     representation: Representation,
+    kinematic_parts: bool,
 ) -> Result<CaseResult, Box<dyn std::error::Error>> {
     let mut samples = pose_samples(animal)?;
     let root_translation = -animal.pivot_m;
@@ -272,6 +279,7 @@ fn run_case(
             representation,
             root_translation,
             &mut elapsed,
+            kinematic_parts,
         )?;
         if iteration >= WARMUP {
             attachment_times.push(elapsed[0]);
@@ -291,6 +299,7 @@ fn run_case(
         representation,
         root_translation,
         &mut ignored,
+        kinematic_parts,
     )?;
     let mut pose_token = 0u64;
     for sample in &samples {
@@ -304,6 +313,9 @@ fn run_case(
                 parts: sample.locals.clone(),
             },
         )?;
+        if kinematic_parts {
+            validation_world.step();
+        }
         for ray in &sample.rays {
             let expected = reference_hit_cells(&sample.ref_cells, ray.origin, ray.direction, 8.0);
             let actual = validation_world.raycast_articulated(
@@ -369,6 +381,7 @@ fn run_case(
         representation,
         root_translation,
         &mut ignored,
+        kinematic_parts,
     )?;
     let edit_targets = animal
         .parts
@@ -400,6 +413,9 @@ fn run_case(
                 parts: sample.locals.clone(),
             },
         )?;
+        if kinematic_parts {
+            world.step();
+        }
         for ray in &timed_rays {
             if let Err(error) =
                 world.raycast_articulated(id, ray.origin.to_array(), ray.direction.to_array(), 8.0)
@@ -422,7 +438,9 @@ fn run_case(
                 ray_mismatches += 1;
             }
         }
-        world.step();
+        if !kinematic_parts {
+            world.step();
+        }
         if iteration >= WARMUP {
             operation_times.push(before.elapsed());
         }
@@ -472,7 +490,7 @@ fn run_case(
             .iter()
             .map(|sample| format!("{}@{}", sample.clip, sample.tick))
             .collect(),
-        body_count: world.body_count(),
+        body_count: world.articulated_rigid_body_count(id),
         collider_count: world.articulated_collider_count(id),
         collider_primitives: primitives,
         repeats: REPEATS,
@@ -495,6 +513,7 @@ fn rebuild(
     representation: Representation,
     root_translation: Vec3,
     times: &mut Vec<Duration>,
+    kinematic_parts: bool,
 ) -> Result<ArticulatedBodyId, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let sources = animal
@@ -522,13 +541,23 @@ fn rebuild(
             })
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-    let id = world.add_articulated_body(
-        root_translation.to_array(),
-        Quat::IDENTITY.to_array(),
-        TOPOLOGY_TOKEN,
-        sources,
-        representation,
-    )?;
+    let id = if kinematic_parts {
+        world.add_articulated_kinematic_parts(
+            root_translation.to_array(),
+            Quat::IDENTITY.to_array(),
+            TOPOLOGY_TOKEN,
+            sources,
+            representation,
+        )?
+    } else {
+        world.add_articulated_body(
+            root_translation.to_array(),
+            Quat::IDENTITY.to_array(),
+            TOPOLOGY_TOKEN,
+            sources,
+            representation,
+        )?
+    };
     times.push(start.elapsed());
     Ok(id)
 }

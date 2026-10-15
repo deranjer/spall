@@ -113,6 +113,17 @@ pub struct SourceCellHit {
     pub pose_token: u64,
 }
 
+/// Result of the experimental assembly-root sweep. The sweep moves a sphere
+/// enclosing every current source part, so it is conservative and may reject
+/// clearances an exact articulated shape cast would allow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArticulatedMove {
+    pub requested_translation_m: [f32; 3],
+    pub applied_translation_m: [f32; 3],
+    pub fraction: f32,
+    pub blocked: bool,
+}
+
 /// Compose a child-local transform with its parent's assembly-local transform.
 pub(crate) fn compose(parent: PartTransform, local: PartTransform) -> PartTransform {
     let p = parent.rotation_xyzw;

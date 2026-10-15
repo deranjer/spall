@@ -34,7 +34,8 @@ pub mod report;
 pub mod world;
 
 pub use articulated::{
-    ArticulatedBodyId, ArticulatedError, ArticulatedPose, PartTransform, SourceCellHit, SourcePart,
+    ArticulatedBodyId, ArticulatedError, ArticulatedMove, ArticulatedPose, PartTransform,
+    SourceCellHit, SourcePart,
 };
 pub use character::{
     CharacterMove, CharacterParams, CharacterState, PlayerInput, WaterSample, step_character,
