@@ -2847,6 +2847,7 @@ async fn serve_async(
             crate::column_water_replication::ColumnWaterPublisher,
         > = HashMap::new();
         let mut snow_page_cursor: HashMap<u64, Option<(i32, i32, i32)>> = HashMap::new();
+        let mut snow_center_page_cursor: HashMap<u64, Option<(i32, i32, i32)>> = HashMap::new();
         let mut water_keyframes_sent = 0u64;
         let mut water_bytes_queued = 0u64;
         let mut pending_admin: Vec<(SessionId, spall_protocol::AdminRequest)> = Vec::new();
@@ -3149,6 +3150,7 @@ async fn serve_async(
                         player_principals.remove(&session.raw());
                         column_water_sent.remove(&session.raw());
                         snow_page_cursor.remove(&session.raw());
+                        snow_center_page_cursor.remove(&session.raw());
                     }
                 }
             }
@@ -3258,6 +3260,7 @@ async fn serve_async(
                                 body_stable_ticks = 0;
                                 column_water_sent.clear();
                                 snow_page_cursor.clear();
+                                snow_center_page_cursor.clear();
                                 if let Some(drops) = playground_drops.as_mut() {
                                     *drops = playground_drop_schedules(&sim);
                                 }
@@ -3828,9 +3831,9 @@ async fn serve_async(
                     );
                 }
             }
-            // Snow keyframes are sent as bounded per-session pages. This keeps
-            // far-world discovery and late joins bounded without dropping dirty
-            // layers or building an unbounded vector for one client.
+            // Alternate a bounded player-center page with a bounded regional
+            // page. This gives the visible tile prompt coverage while the
+            // independent regional cursor continues to visit outer tiles.
             if tick.get().is_multiple_of(6) {
                 for session in lj.live_sessions().collect::<Vec<_>>() {
                     let bounds = lj.snow_interest(&sim, session);
@@ -3838,9 +3841,36 @@ async fn serve_async(
                     if water_backlogged(&clients_for_sim, session) {
                         continue;
                     }
-                    let cursor = snow_page_cursor.get(&session.raw()).copied().flatten();
-                    let (frames, next) = sim.snow_snapshot_page(Some(bounds), cursor, 4);
-                    snow_page_cursor.insert(session.raw(), next);
+                    let center_page = (tick.get() / 6).is_multiple_of(2);
+                    let (page_bounds, cursor) = if center_page {
+                        let Some(player) = sim.player_state(session_player_entity(session)) else {
+                            continue;
+                        };
+                        let tile = |meters: f64| (meters / 4.0).floor();
+                        let (x, z) = (tile(player.position_m[0]), tile(player.position_m[2]));
+                        let (Ok(x), Ok(z)) = (i32::try_from(x as i64), i32::try_from(z as i64))
+                        else {
+                            continue;
+                        };
+                        (
+                            [x, x, z, z],
+                            snow_center_page_cursor
+                                .get(&session.raw())
+                                .copied()
+                                .flatten(),
+                        )
+                    } else {
+                        (
+                            bounds,
+                            snow_page_cursor.get(&session.raw()).copied().flatten(),
+                        )
+                    };
+                    let (frames, next) = sim.snow_snapshot_page(Some(page_bounds), cursor, 4);
+                    if center_page {
+                        snow_center_page_cursor.insert(session.raw(), next);
+                    } else {
+                        snow_page_cursor.insert(session.raw(), next);
+                    }
                     if !frames.is_empty() {
                         let records = frames
                             .into_iter()
