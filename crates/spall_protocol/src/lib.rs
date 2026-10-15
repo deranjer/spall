@@ -30,6 +30,7 @@ pub mod limits;
 pub mod records;
 pub mod segment;
 pub mod session;
+pub mod snow;
 pub mod water;
 pub mod weather;
 pub use weather::{
@@ -72,6 +73,11 @@ pub use records::{
 pub use session::{
     GenerationExhausted, PlayerId, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,
     StaleSession, StreamKind, StreamSeq,
+};
+pub use snow::{
+    SNOW_FOOTPRINT_TTL_TICKS, SNOW_MAX_DEPTH_Q16, SNOW_MAX_FOOTPRINTS_PER_FRAME,
+    SNOW_MAX_SURFACES_PER_FRAME, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_SCHEMA, SNOW_TILE_CELLS,
+    SnowFootprint, SnowSurface, SnowSurfaceFrame, SnowSurfaceId,
 };
 pub use water::{AdminCommand, AdminRequest, AdminStatus, WaterCodecError};
 
