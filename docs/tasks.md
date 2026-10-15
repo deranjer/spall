@@ -1870,3 +1870,11 @@ one existing-Rapier-world kinematic root with exact per-part colliders; it does
 not implement live actors or accept population capacity. Corpse aggregate
 ownership/physics is a separate prerequisite. Canonical status: docs/animals.md;
 ENG-205 remains under review until corrections are integrated.
+
+ENG-205 audit accepted and integrated on 2026-10-15 as 33d73df + bf56e76.
+The reviewed lifecycle proposal and reports/ENG-205-contract-audit.md define
+ownership, clock, identity, recovery and prerequisite decisions. This closes
+the audit only; runtime interfaces remain proposed pending physical gates.
+Next unblocked: ENG-209 exact articulated collision/source-cell query prototype.
+Focused asset/sandbox regression checks passed (13 + 23 + 3 tests). Corpse
+aggregate physics, live population, multiplayer and recovery remain unproven.

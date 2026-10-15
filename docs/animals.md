@@ -93,8 +93,10 @@ Camera and floor are fixed per animal so root motion is not cancelled by the
 preview. This is source animation/rendering evidence, not running creatures
 in a world. Exact commands, results and limits: `reports/ENG-204-animal-preview.md`.
 
-ENG-205/A4 is in progress to freeze the missing authoritative creature
-lifecycle and game-facing tick contract before population implementation.
+ENG-205/A4 is accepted for its lifecycle audit and prerequisite map, with the
+reviewed [lifecycle proposal](animal-lifecycle.md) and
+[audit evidence](reports/ENG-205-contract-audit.md). Runtime interfaces remain
+proposed until the physical representation gates are reviewed.
 Current body-spawn and committed-edit APIs do not provide an animated actor
 lifecycle.
 `InitialGameWorldSetup` runs only at fresh-world creation, and the existing
@@ -132,3 +134,13 @@ identity, stale update isolation, geometry edits, real contacts, and the actual
 trout/crow/deer geometries. It introduces no runtime creature lifecycle API.
 No representation or population capacity is accepted at dispatch. Dynamic
 corpse ownership, locomotion, multiplayer and recovery remain separate work.
+
+ENG-205 review is integrated as `bf56e76` (following `33d73df`). It fixes
+part-local ownership, exact frozen corpse poses, admission limits including
+retained corpses, 60 Hz simulation/animation versus 20 Hz motion snapshots,
+ping-pong phase recovery, and monotonic identity/reset rules. This closes the
+audit, not live creature support. Focused regression command
+`cargo test -p spall_asset -p sandbox --lib --test animal_assets --test animal_habitat_world`
+passed: 13 asset tests, 23 sandbox library tests and 3 integration tests.
+ENG-209 is the next unblocked implementation prerequisite; editable physical
+corpse assembly remains a separate gate before runtime lifecycle work.
