@@ -27,6 +27,7 @@ spall_client = { path = "../spall_client" }
 spall_fluid = { path = "../spall_fluid" }
 rusqlite = { workspace = true }
 postcard = { workspace = true }
+spall_worldgen = { path = "../spall_worldgen" }
 
 [[bin]]
 name = "crash-bench"
