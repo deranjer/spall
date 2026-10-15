@@ -1,6 +1,9 @@
 # ENG-205 authoritative animal lifecycle contract audit
 
-Date: 2026-10-14. This is an API/source audit and proposed contract only. No
+Date: 2026-10-15. This is an API/source audit and proposed contract only. Source
+line references are anchored to inspected baseline commit `71540f8`
+(`Render articulated animal fixtures and validate their habitats`), not moving
+main. No
 runtime implementation, game acceptance, lifecycle test, GPU gate, or
 population performance result is claimed. The detailed contract is
 [`animal-lifecycle.md`](../animal-lifecycle.md).
@@ -10,9 +13,10 @@ population performance result is claimed. The detailed contract is
 The reviewed foundations provide a place to initialize bodies in a fresh world,
 observe committed player cuts, simulate ordinary voxel bodies, and replicate/
 persist those bodies. They do not provide a generic animal actor lifecycle.
-ENG-205 can freeze shared invariants, but runtime work needs a coordinator
-decision on exact articulated collision and source-cell provenance before
-interfaces should be added.
+ENG-205 records the shared invariants and prerequisite map, not a frozen runtime
+interface. Runtime work needs measured collision and corpse representation
+gates plus review of source-cell provenance before shared interfaces should be
+added.
 
 ## Source evidence: current behavior
 
@@ -75,17 +79,19 @@ interfaces should be added.
   checkpoint/journal path; `STORE_SCHEMA_VERSION` is independently checked.
   There is no creature state/provenance section or creature lifecycle journal
   payload. Existing game progression outbox data cannot stand in for it.
-- `examples/sandbox/src/animal_habitat.rs:1-10, 109-119, 203-246` validates a
-  bounded candidate against a current terrain view and, for aquatic animals,
-  a live water query. It rejects unknown terrain and unavailable/exhausted
-  water queries; this is candidate validation, not movement or a lifecycle.
+- `examples/sandbox/src/animal_habitat.rs:1-10, 34-50, 91-119, 203-246`
+  validates a bounded candidate against a current terrain view and, for
+  aquatic animals, a live water query. It returns candidate rejections for
+  unknown terrain, unavailable water, or shallow/dry columns. It does not
+  expose a persistent `KnownWet` / `KnownDry` / `Unknown` state nor decide
+  movement, stranded behavior, or lifecycle.
   `examples/sandbox/src/animal_visual.rs:1-18, 50-120` expands and composes
   render cells from part hierarchy/transforms, retaining source material/tint
   identity under a fixed expansion cap; those are render cells.
 
 ## Format and existing animal scope
 
-`docs/spvox-format.md` sections 5.2 and 5.7 define `PART` hierarchy and
+`docs/spvox-format.md` sections 5.4 and 5.7 define `PART` hierarchy and
 `ANIM` transform clips at 60 ticks/second. The format explicitly leaves
 server-authoritative collision changes and per-frame voxel topology deltas out
 of v1. Hierarchy/animation does not define joints, collision, or damage.
@@ -106,50 +112,97 @@ mutable actor lifecycle.
 
 The server owns actor creation, location, damage, death, material mapping,
 source-cell ownership, collision, and consequences. Sandbox owns species and
-behavior data behind a statically linked game interface. Actor identity is
-stable and never reused; source identity is `(creature, generation, part,
-local cell)`. Live cells have one actor-volume owner; death is one atomic,
-journalled owner transfer into ordinary editable voxel bodies, with material,
-revision, and provenance preserved. Client clip sampling and poses remain
-presentation only. Unknown or stale world/water/job data cannot authorize a
-move or lifecycle event. IDs, topology, and actor state cross baseline,
-interest, reset, and save/recovery through explicit bounded versioned records.
+behavior data behind a statically linked game interface. Creature IDs are
+never reused in a persistent world; v1 generation remains 1 through damage and
+corpse transfer. `world_epoch` separately namespaces reset and never resets
+the allocator. One assembly owner binds each bounded part ID to a distinct,
+independently revisioned source volume; multiple volumes do not imply multiple
+physics bodies. Cell identity includes the assembly key, source part, and
+part-local coordinate. Death transfers the bindings atomically to a retained
+corpse assembly without revoxelizing. Its editable physical aggregate is
+unresolved and separately gated. Per-part sampled pose and effective render
+visibility are bounded state; death freezes clip time and preserves the exact
+part poses. Hidden art cells remain physically/topologically present.
 
-The stated first proof is one trout, crow, and deer in generated habitat;
-two-client late join/reconnect; save and abrupt restart; water drain and ground
-removal; then damage, death, and further body destruction with per-cell
-conservation. GPU and population-scale gates are independent and unrun.
+The selected **next feasibility candidate** is ENG-209: one Rapier kinematic
+root with one exact existing voxel/cuboid collider per source part, pose-updated
+locally, with query-to-source-cell provenance measured. ENG-209 is geometry and
+query only, has no lifecycle/runtime-interface dependency, and its assignment
+does not accept the candidate for shipping. Because the root is kinematic, deer
+gravity/velocity must be game-integrated and displacement checked through
+Rapier sweeps; dynamic solver contacts/pushing remain for the feasibility and
+integration decisions. A separate corpse gate must decide how the current
+one-volume-per-body API can own/edit an articulated multi-volume corpse without
+exploding it into per-part bodies or inventing joints.
+
+V1 admission limits are 256 assembly records per world (living plus retained
+corpse), 256 parts per assembly, 65,536 part bindings per world, 250,000 cells
+per assembly, 32 KiB per encoded assembly record, 8 MiB actor-state bytes/256
+records per baseline, and 64 KiB per reliable lifecycle event. Pose fields are
+explicit finite `[f64;3]` root-relative metres plus normalized `[f32;4]`
+quaternion, unit scale implicit; acceptance normalizes once and replay/death
+preserve accepted bits. These bound memory and wire admission; they are not
+performance acceptance. At capacity, births are rejected; corpses are never
+deleted to make room. Capacity frees only after every source cell is removed
+and removal is durably ordered. Identical replay at the same event key is
+idempotent; divergent duplicate bytes are an error. Unknown water freezes
+movement; known dry/drained water permits only a species-owned stranded/
+reselection response, never automatic death. The current habitat candidate API
+does not yet supply that tri-state lifecycle result.
+
+Animation runs at SPVX's 60 ticks/second. The inspected simulation uses
+`TICK_DT_S = 1/60` and the server handshake advertises `server_tick_hz=60`
+(`spall_sim/src/sim.rs:56`, `spall_server/src/serve.rs:1436-1437`); 20 Hz is
+motion snapshot cadence only. The DTO carries unfolded `clip_phase_tick`,
+subtick remainder and `clip_epoch`; once/loop/ping-pong sampling folds phase at
+sample time so ping-pong direction is retained. V1 pins simulation to 60 Hz;
+another tick rate requires version review. Creature reset remains refused
+until atomic checkpoint/journal replacement, epoch invalidation, and
+replace-world baseline barriers are designed and implemented. The allocator
+continues monotonically across epochs.
+
+The target proof is one trout, crow, and deer in generated habitat; two-client
+late join/reconnect; save and abrupt restart; water drain and ground removal;
+then damage, death, and further corpse destruction with per-cell conservation.
+Death/continued destruction is blocked on the separate corpse aggregate gate.
+GPU and population-scale gates are independent and unrun.
 
 ## Integration decisions still needed
 
-1. Select and measure the exact Rapier representation for deforming articulated
-   voxel collision and part/cell hit provenance. Current adapter has one
-   occupancy-derived body representation and no game-authored physical joints.
-   This needs a feasibility result and coordinator acceptance before runtime
-   code. No envelope or frozen-rest approximation is accepted as exact.
-2. Review the `CreatureId` allocator, world-epoch reset semantics, source
-   provenance storage, and the proposed schema/bounds before changing shared
-   protocol/store interfaces. In particular, reset is not currently available
-   for persisted worlds, and schema migration policy must be explicit.
-3. Freeze how species assets/policies are catalogued, authenticated by content
-   hash, and made available to server and clients. Existing SPVX material
-   mapping is project/game-owned; no biological profile is established by the
-   fixtures.
+1. ENG-209 measures the one-kinematic-root, exact per-part collider candidate
+   and query provenance only. It does not accept a runtime interface.
+2. Separately decide the corpse aggregate representation and prove atomic
+   ownership/editing of distinct part volumes while preserving exact float
+   pose and provenance; current ordinary body storage is one volume per body.
+3. Review persisted part provenance, `CreatureId` allocation, generation 1,
+   world-epoch reset semantics, and baseline/journal schema migration before
+   shared protocol/store changes. Current reset is unavailable for persisted
+   worlds.
+4. Freeze how server/client builds obtain assets and species policy by exact
+   SPVX UUID/hash. Resolve portable SPVX material names through the explicit
+   game `MaterialManifest`; fixture wood/stone visuals do not define density.
+5. Add lifecycle-level wet/dry/unknown water state. Existing habitat validation
+   is only a bounded candidate accept/reject query.
+6. Decide whether kinematic sweep contacts satisfy deer support and actor
+   pushing; kinematic roots do not receive Rapier dynamic gravity.
 
 ## Dependency-ordered next slices
 
-1. Coordinator reviews and freezes the host API, actor IDs/epoch, DTO caps,
-   source provenance format, and collision feasibility workload.
-2. Implement engine host/identity and tick invalidation seam; sandbox supplies
+1. ENG-209 geometry/query feasibility, with no lifecycle/runtime interface
+   dependency.
+2. Corpse aggregate feasibility and ownership/provenance review.
+3. Coordinator freezes host API, actor IDs/epoch, bounded DTO/corpse retention
+   rules, and the measured representation outcomes.
+4. Implement engine host/identity and tick invalidation seam; sandbox supplies
    species policies. Ownership: `spall_core`, `spall_protocol`, `spall_sim`,
    `spall_server`, sandbox. No runtime birth until the transaction path is
    included.
-3. Implement lifecycle/topology transactions and source-cell provenance,
+5. Implement lifecycle/topology transactions and source-cell provenance,
    including atomic alive-to-corpse transfer, replay, and baseline install.
-4. Implement the selected Rapier actor representation, exact query mapping,
+6. Implement the selected Rapier actor representation, exact query mapping,
    versioned jobs, and bounded trout/crow/deer locomotion against post-edit
    terrain/current water.
-5. Implement durable checkpoint/journal state, interest/late-join/reconnect/
+7. Implement durable checkpoint/journal state, interest/late-join/reconnect/
    reset assembly, then CPU and two-client save/restart/damage/destruction
    scenarios. GPU capture and population performance remain separate gates.
 

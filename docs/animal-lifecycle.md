@@ -16,67 +16,82 @@ game behavior implementation/configuration, following the existing
 framework.
 
 One persistent creature has a stable `CreatureId` (`u64`, nonzero, never reused
-within a `WorldId`) and a monotonically increasing `generation` (`u32`) for
-reset/replacement epochs. The pair identifies one incarnation. A `CreatureId`
-is distinct from runtime `EntityId`, source `VolumeId`, `WorldId`, player IDs,
-SPVX UUIDs, and asset filenames. Creation assigns it on the authoritative
-simulation thread from a persisted creature allocator. A candidate key is
-`(WorldId, CreatureId, generation)`; world reset also advances a persisted
-`world_epoch` before new candidates may be admitted. Runtime ECS, Rapier, and
-asset handles never enter these records.
+within the persistent `WorldId`). `generation` (`u32`) identifies an actor
+incarnation and remains constant through alive, damage, and corpse ownership
+transitions. V1 assigns generation 1 and never recycles the creature ID; any
+future same-ID reincarnation requires an explicit format decision. A
+`world_epoch` is a separate reset namespace incremented on replace-world reset
+and never substitutes for, or resets, the creature allocator. The complete
+network key is `(WorldId, world_epoch, CreatureId, generation)`. Runtime ECS,
+Rapier, and asset handles never enter persistent records.
 
-The game supplies a bounded `SpeciesKey` (ASCII portable key, 1–63 bytes),
-`AssetId` (SPVX UUID plus logical content hash), `clip_id` (asset clip-table
-index or an explicit game clip key), and `material_mapping_version` (game
-catalog version/hash). Runtime resolution checks all of these against the
-current asset and material manifest. SPVX part IDs and exact source cells are
-the authored source identity; a cell identity is
-`(CreatureId, generation, source_part_id, source_cell_xyz)` with integer local
-cell coordinates. Expansion into render geometry is derived data. Colors/tints
-are visual only. Source fixture materials such as stone or wood do not imply
-biological density, hardness, collision, or damage rules.
+The game supplies a bounded `SpeciesKey` (ASCII portable key, 1–63 bytes), an
+`AssetIdentity` consisting of the SPVX UUID and logical content hash, a
+`clip_name` (1–255 UTF-8 bytes resolved against that exact asset identity),
+and the explicit `MaterialManifest` hash plus a game mapping version/hash.
+There is no overloaded numeric `AssetId` and no clip-index-or-name ambiguity.
+Runtime resolution checks every reference against the validated asset and
+material manifest. SPVX part IDs and exact source cells are the authored source
+identity; a cell identity is `(WorldId, world_epoch, CreatureId, generation,
+source_part_id, source_cell_xyz)` with integer part-local coordinates.
+Expansion into render geometry is derived data. Colors/tints are visual only.
+Source fixture materials such as stone or wood do not imply biological
+density, hardness, collision, or damage rules.
 
 Species policy is game-owned and versioned. Its bounded definition includes
-spawn eligibility, source-to-world material mapping, mass density by material,
-damage thresholds/rules, body envelope and movement bounds, habitat query
-budget, support/water tolerances, locomotion constants, animation mapping,
-and an explicit collision profile. Every numeric field has finite/range
-validation; keys and arrays have fixed caps. Unknown species, asset hash,
-clip, material mapping, or policy version rejects creation or recovery before
-publication. No silent fallback to a default species or material.
+spawn eligibility, explicit SPVX portable-material-key to validated
+`MaterialManifest` material-ID mapping, damage thresholds/rules, movement
+bounds, habitat query budget, support/water tolerances, locomotion constants,
+animation mapping, and an explicit collision profile. Physics density,
+hardness, and other material properties come from that validated manifest;
+the animal contract does not introduce a competing density catalog. Every
+numeric field has finite/range validation; keys and arrays have fixed caps.
+Unknown species, asset hash, clip, material mapping, or policy version rejects
+creation or recovery before publication. No silent fallback to a default
+species or material.
 
 ## Cell ownership, damage, and death
 
-An alive creature owns exactly one authoritative voxel volume. Its exact source
-cell records, source-part identity, mapped material IDs, per-cell damage state,
-brick revisions, and actor generation are authoritative server data. Animated
-SPVX transforms do not change voxel topology or ownership. `PART` hierarchy is
+An alive creature is one authoritative assembly owner with a bounded,
+canonical `part_id -> source VolumeId` binding table. Every bound part has a
+distinct source volume, its own brick revisions, and an explicit part-local
+cell coordinate space; one aggregate topology revision advances whenever any
+part topology changes. Multiple source volumes do not imply multiple physics
+bodies. Each cell is owned exactly once by its source volume and identified by
+the assembly key plus part ID and part-local coordinate. `PART` hierarchy is
 not a structural joint, collision rig, bond graph, or damage rule. `ANIM` is
-not client authority. Source-part identity must be retained as a structural
-metadata layer through brick partitioning, damage cuts, splits, baselines,
-checkpoints, and journal replay.
+not client authority. Animated SPVX transforms do not rewrite source topology
+or the mapping. Source-part identity and its binding must survive damage,
+baselines, checkpoints, and journal replay.
 
-Every hit is resolved by the server against a versioned actor/source-volume
-revision. A hit proposal names `CreatureId`, generation, source `VolumeId`,
-source cell or bounded impact ray, expected brick revisions, and input/action
-identity. Server-side geometry resolves the actual part/cell and material;
-claimed part/material/damage is never trusted. A stale generation or revision
-rejects without side effects. Damage changes remain ordered topology/lifecycle
-transactions and use the same server tool/structural rules as other editable
-voxel volumes.
+Every hit is resolved by the server against a versioned assembly and source
+volume revision. A hit proposal names the creature key, source part and volume,
+source cell or bounded impact ray, expected brick revisions, aggregate topology
+revision, and input/action identity. Server-side geometry resolves the actual
+part/cell and material; claimed part/material/damage is never trusted. A stale
+generation or revision rejects without side effects. Damage changes remain
+ordered topology/lifecycle transactions and use the same server tool/structural
+rules as other editable voxel volumes.
 
-Death is a transaction, not a visual flag. A transaction either (a) changes
-alive cells and leaves one living owner, or (b) changes state to `Corpse` and
-atomically transfers every surviving source cell to one or more ordinary
-editable voxel body volumes, preserving material, revision, exact cell
-position, and source provenance. Within the transaction, each cell has one
-owner before and one owner after. Source cells are removed as child volumes
-are created; there is no frame in which a cell is duplicated or lost. Empty
-animal volumes retire through the ordinary empty-volume path. Corpse bodies
-then use existing tool edits, structural split transactions, motion, baseline,
-checkpoint, and journal paths. A corpse transition emits a reliable lifecycle
-record and ordered topology transaction(s); recipients hold subsequent state
-until all dependencies and bulk geometry arrive.
+Death is a transaction, not a visual flag. It changes the assembly owner from
+`AliveCreature` to `CorpseAssembly` and transfers every surviving per-part
+volume binding atomically. It preserves exact part-local cell coordinates,
+materials, brick revisions, source-part IDs, and the authoritative part/root
+poses; it does not revoxelize or copy cells. Each cell has one assembly owner
+before and after the transaction. The CreatureId and generation remain attached
+to provenance even after the living actor record retires. Empty source volumes
+retire only through the ordered topology transaction.
+
+**Separate corpse feasibility gate:** the current ordinary dynamic-body model
+owns one `Volume` per body and does not represent a multi-volume articulated
+corpse aggregate. Do not convert each part into an independent body, infer
+joints, or claim that existing `spawn_body` handles corpse transfer. A
+reviewed corpse aggregate/ownership representation must define how those same
+source volumes remain editable and physically represented. Until it passes,
+the death transaction may be specified and tested at the ownership/serialization
+layer, but live death-to-physics and corpse destruction acceptance remain
+blocked. Any later transfer into ordinary body records must be atomic and
+preserve source identity and pose without revoxelization.
 
 ## Collision and feasibility gate
 
@@ -89,41 +104,37 @@ adapter objects; only the simulation owner applies a result at a tick boundary
 after checking creature generation, topology revision, clip/pose epoch,
 and collider revision. A stale result is discarded.
 
-**Coordinator decision required before runtime implementation:** the current
-adapter builds colliders from one occupancy grid per body, and SPVX v1 does not
-specify a physical joint graph. An exact articulated voxel animal may require
-an explicit game-owned part/joint rig and a Rapier adapter representation
-whose query/contact results preserve source-cell provenance. The adapter does
-not currently expose that actor contract. Select and measure that representation
-before claiming animal collision or damage. A single body envelope, frozen
-rest-pose hit map, deforming render-only animation, hidden anchor, or
-per-voxel rigid-body workaround cannot be reported as exact articulated
-collision. If feasibility fails, stop at this gate and report the measured
-candidate and workload; do not substitute an approximate topology under the
-same acceptance name.
-
-After that gate is passed, species-defined physical parts may share one actor
-identity and one transaction/lifecycle owner while Rapier owns the explicitly
-chosen aggregate. Engine actor identity is not tied to collider count. Static
-source-part/cell identity survives any internal collider decomposition.
+**Next feasibility candidate (ENG-209; not an accepted runtime interface):**
+measure one Rapier kinematic root with one exact collider per source part,
+using the existing `NativeVoxels` or exact `MergedCuboids` representation for
+that part. Apply the authored part pose locally under the root. This is one
+physics root and one collider per part, never one rigid body per voxel. Measure
+geometry agreement and query-to-source-cell mapping for rotated/moving parts.
+No live actors may be implemented until the measured candidate and source
+provenance are reviewed. The corpse aggregate is a separate feasibility gate;
+passing ENG-209 alone does not resolve it. No envelope, frozen-rest hit map,
+hidden anchor, implicit joints, or per-voxel rigid-body workaround counts as
+exact articulated collision.
 
 ## Tick and worker contract
 
 The current `Simulation::tick` order is: increment tick; run staged edits and
 publish validated commits; apply committed terrain changes to water boundaries
 and step/publish current column water; advance vegetation and weather; apply
-buoyancy from the current water frame; step Rapier; advance players. Animal
-integration must make its ordering explicit with the host:
+buoyancy from the current water frame; step Rapier; advance players. The animal
+insertion contract is:
 
-1. Drain bounded lifecycle, movement, and damage intents admitted for this
-   server tick; validate stable identity, policy, expected actor/terrain/water
-   epochs, and budgets.
-2. Apply completed immutable worker results only when every token matches the
-   current world epoch, creature generation, source topology revision, terrain
-   revision stamp, water frame revision, and requested movement/pose epoch.
-   Otherwise discard and resubmit within a bounded budget.
-3. Commit terrain edits already selected by the canonical edit pipeline, then
-   update/step authoritative column water against the post-commit terrain.
+1. Commit canonical terrain edits and publish the resulting current water
+   frame, following the existing simulation order.
+2. Only after those commits and that water publication, drain completed
+   immutable movement/collision worker results. Apply a result only when its
+   world epoch, creature generation, per-part revisions, aggregate topology
+   revision, terrain revision stamp, water frame revision, clip/pose epoch,
+   and requested movement epoch all still match. Otherwise discard it.
+3. Validate bounded lifecycle, movement, and damage intents against this
+   post-edit terrain and current water. Validate stable identity, policy, and
+   budgets. A move job computed from pre-edit terrain can never install before
+   this validation point.
 4. Validate each creature's movement against the post-commit terrain snapshot
    and just-published water frame. Advance a bounded species-owned locomotion
    state, apply actor motion/collision changes on the owner thread, then step
@@ -138,18 +149,24 @@ Rapier step is active. Worker snapshots own their data and never borrow live
 world state. If terrain or water advances during a worker job, its captured
 epoch/revisions no longer match and its result cannot apply.
 
+Water queries return distinct `KnownWet`, `KnownDry`, or `Unknown` results.
 `Unknown` terrain, missing body/source volume, exhausted query budget, stale
-water frame, or unavailable water is not empty space or dry ground. It freezes
-the affected move, retains the last valid stable state, and requests a bounded
-retry or interest/residency load. It cannot cause a spawn, teleport, damage,
-death, or destructive topology edit. Water drain invalidates a trout's current
-habitat after the new water frame; the fish stops and performs a bounded
-reselection, then transitions only through a server-authored move/death rule.
-Ground removal invalidates deer support after the commit; the deer must use
-Rapier gravity/contact and a bounded grounded relocation policy, never a hidden
-support anchor. Crow movement is bounded waypoint/steering flight using the
-same current occupancy queries and adapter. These are the first three simple
-behaviors; no general pathfinder or planner is implied.
+water frame, or unavailable water freezes the affected move, retains the last
+valid stable state, and requests a bounded retry or interest/residency load.
+It cannot cause a spawn, teleport, damage, death, or destructive topology edit.
+A current `KnownDry` result after water drains invalidates a trout's current
+habitat; the fish stops and performs bounded reselection or an explicit
+species-owned stranded behavior. Known dry is not an automatic death. Ground
+removal invalidates deer support after the commit. The kinematic-root candidate
+does not receive Rapier dynamic gravity. For that candidate, the game-owned
+deer locomotion integrates bounded velocity/gravity and submits displacement
+through exact Rapier sweeps; grounded/support state comes from adapter queries
+and a bounded grounded relocation policy, never a hidden support anchor.
+ENG-209 must measure this sweep/query path; whether dynamic solver contacts or
+responsive actor pushing are required remains a separate integration decision.
+Crow movement is bounded waypoint/steering flight using the same current
+occupancy queries and adapter. These are the first three simple behaviors; no
+general pathfinder or planner is implied.
 
 Habitat candidate validation can reuse sandbox `animal_habitat`'s live,
 bounded occupancy and water query, but that validator alone is not movement,
@@ -169,38 +186,97 @@ Rust enum layout, native-endian structs, ECS or Rapier handles. Proposed
 canonical `CreatureRecord` fields are:
 
 ```text
-schema:u16, world_epoch:u64, creature_id:u64, generation:u32,
-state_tag:u8, species_key:bounded_utf8, species_version:u32,
-asset_uuid:[u8;16], asset_hash:[u8;32], clip_key:bounded_utf8,
-material_mapping_hash:[u8;32], source_volume_id:u64,
-source_topology_revision:u64, source_part_count:u16,
-source_cell_count:u32, root_pose:{translation_m:[f64;3], rotation:[f32;4]},
+schema:u16, world_id:u128, world_epoch:u64, creature_id:u64, generation:u32,
+state_tag:u8, species_key:utf8[1..=63], species_version:u32,
+asset_identity:{spvx_uuid:[u8;16], logical_hash:[u8;32]},
+material_manifest_hash:[u8;32], material_mapping_version:u32,
+material_mapping_hash:[u8;32], clip_name:utf8[1..=255],
+clip_phase_tick:u64, clip_subtick_remainder:u32, clip_epoch:u64, clip_mode:u8,
+source_part_count:u16,
+part_volumes:count × {part_id:u32, source_volume_id:u64,
+  topology_revision:u64, root_relative_pose:PartPoseV1,
+  effective_render_visible:u8},
+aggregate_topology_revision:u64, total_source_cell_count:u32, state_revision:u64,
+root_pose:{translation_m:[f64;3], rotation_xyzw:[f32;4]},
 linear_velocity_m_s:[f32;3], angular_velocity_rad_s:[f32;3],
-animation_tick:u32, locomotion_tag:u8, state_revision:u64
+pose_epoch:u64, locomotion_tag:u8
 ```
 
-This record stores actor metadata and root motion. Source geometry/materials
-remain in the ordinary `BaselineVolume`/brick payload; do not duplicate whole
-SPVX assets into every state record or treat authored files as mutable saves.
-Bounds must be frozen with the first implementing ticket: max 256 live actors
-per world, 1,024 UTF-8 bytes per variable record, max 1,024 source parts and
-250,000 source cells per actor (matching current visual bridge hard limit),
-max 16,384 actor records per baseline, max 1 MiB decoded actor-state section
-per baseline part, and max 64 KiB for one reliable lifecycle record. Larger
-state uses a bounded bulk baseline transfer. Product/population capacity remains
-unaccepted; these are admission safety limits pending measurement.
+The `part_volumes` array is strictly ascending by `part_id`; each part ID and
+source `VolumeId` occurs once, and each bound source volume belongs to exactly
+one creature/corpse assembly. The binding topology revision and aggregate
+topology revision are checked together before a result can apply.
+
+`PartPoseV1` is a runtime composed transform, not an authored SPVX transform:
+finite root-relative translation `[f64; 3]` in metres and a normalized
+quaternion `[f32; 4]`; scale is implicitly unit. Normalize once before a pose is
+accepted into authoritative state. The bounded pose section stores each part's
+composed root-relative pose plus effective inherited render visibility. On
+death, `clip_mode` becomes `Frozen`, `clip_epoch` advances, clip advancement
+stops, and the reliable lifecycle record/checkpoint stores the final accepted
+part poses and visibility with the root pose. Serialize every field using the
+versioned DTO encoding, never a native struct or SPVX quantized transform. On
+replay, preserve the accepted float bit patterns; do not renormalize or
+requantize and shift the corpse pose. During living animation, clients
+reconstruct part poses from the validated exact asset and clip name/tick;
+per-part poses are not repeated in every motion datagram. Visibility is
+render-only: hidden authored cells remain in source volumes, collision, damage
+ownership, and persistence. Visibility never removes or disables voxel
+topology.
+
+V1 safety limits are fixed: at most 256 creature assembly records per world,
+counting both living actors and retained corpses; at most 256 source parts/pose
+bindings and 250,000 source cells per assembly; at most 32,768 encoded bytes
+per creature record; at most 256 creature records and 8 MiB total encoded
+creature-state bytes per baseline transfer; and at most 65,536 encoded bytes per reliable
+lifecycle record. Total source-part bindings per world are at most 65,536.
+These are bounded-admission safety limits, not a performance target or accepted
+population capacity. At the cap, new births are rejected even after death; the
+server never deletes a gameplay corpse to make room. Capacity is released only
+after legitimate retirement, when all source cells are authoritatively removed
+and that removal is durably ordered. Baselines and checkpoints include every
+retained corpse under the same 256 record cap. Exceeding a cap rejects
+admission/transfer explicitly; it does not truncate. Larger products require a
+separately versioned contract.
 
 Reliable ordered records are required for `CreatureCreated`,
 `CreatureStateChanged`, `CreatureDied`, `CreatureRemoved`, source-volume
 ownership/topology changes, and actor baseline manifest parts. A lifecycle
 record carries `world_epoch`, creature ID/generation, monotonically increasing
 state revision, server tick, transaction/dependency sequence, and the relevant
-source volume/revision. Repeating an already-applied revision is idempotent;
-gaps hold later records and request repair/baseline. Motion datagrams may carry
-only an existing actor reference plus `server_tick`, `state_revision`, root
-pose/velocity, `clip_key`, and animation tick. Clip time and pose are
-presentation; they never authorize topology, collision, damage, or lifecycle.
-Clients interpolate received poses and sample the validated asset. Missing
+part/source-volume revisions. Replaying an identical record at an already-
+applied revision is idempotent. The same key/revision with different canonical
+bytes is a protocol error and requests repair/disconnect; it is not silently
+treated as a duplicate. Gaps hold later records and request repair/baseline.
+Motion datagrams may carry
+only an existing actor reference plus `world_epoch`, creature ID/generation,
+`server_tick`, `state_revision`, `pose_epoch`, root pose/velocity, `clip_name`,
+`clip_epoch`, `clip_phase_tick`, and `clip_subtick_remainder`. SPVX clip time is
+60 Hz; current `spall_sim::TICK_DT_S` is 1/60 s and the server handshake
+advertises `server_tick_hz=60` (`spall_server/src/serve.rs`), so an unpaused
+clip advances one phase tick per server tick. Motion snapshots are 20 Hz and do
+not set the simulation/animation clock. V1 pins simulation ticks to 60 Hz and
+requires `clip_subtick_remainder=0`; any other tick rate requires a versioned
+clock-contract review. A future rate must use an integer accumulator and persist
+its remainder; it may not truncate a fractional clip rate.
+
+`clip_phase_tick` is unfolded monotonic time rather than the sampled key tick.
+Fold integer phase before converting it to the sampler's numeric time:
+`once` clamps to duration, `loop` uses phase modulo duration, and `ping-pong`
+folds modulo `2 * duration` around the duration endpoint. A zero-duration clip
+uses phase zero without modulo, following the existing sampler's empty-time
+handling. Integer folding preserves ping-pong direction and avoids precision
+loss for large phases while leaving the stored clock unfolded.
+A clip switch resets phase and subtick remainder, increments `clip_epoch`, and
+discards stale samples from the earlier clip. Phase increment is checked; on
+`u64` exhaustion the clip freezes and emits a bounded diagnostic rather than
+wrapping. A creature death freezes the last accepted unfolded phase in the
+reliable state record and stores exact sampled part poses. Root pose has its
+own increasing `pose_epoch`. Replicated snapshots and client interpolation are
+presentation only; they never authorize topology, collision, damage, or
+lifecycle. Server-sampled poses drive candidate per-part colliders and
+authoritative hit queries. Clients interpolate received poses and sample the
+validated asset. Missing
 assets can use a bounded placeholder presentation while lifecycle/source
 topology stays authoritative; this does not replace server collision.
 
@@ -213,24 +289,28 @@ keyframes. An actor cannot become visible as alive before its source geometry
 and asset identity validate. Interest entry uses the same manifest+volume
 baseline dependency; interest exit only drops local presentation/cache and
 never destroys server state. Reconnect follows late join and does not create
-new actors. A reset increments epoch, invalidates pending work and queued
-requests, sends a replace-world baseline, and does not reuse IDs or replay old
-epoch actors. Reset is unavailable with a persisted world in the current host;
-creature reset/reseed semantics must be resolved in the integration design.
+new actors. The current host refuses reset for persisted worlds. With creature
+state enabled, every reset is refused until an atomic replacement path can
+publish a new world epoch, durably establish the replacement checkpoint and
+journal boundary, invalidate outstanding jobs/requests, and deliver the
+replace-world baseline barrier. The monotonic creature allocator is not reset
+across epochs. Reset cannot reseed or duplicate actors from generated habitat
+data.
 
 ## Durable recovery
 
 Creature state and topology must share the existing ordered journal sequence
 and checkpoint cut. Add a versioned creature checkpoint section/table and
 versioned journal payloads for creation, state changes, death/removal and source
-ownership transfers. The durable writer remains the sole writer; each record is
-idempotent by world epoch, stable creature ID, generation, state revision and
-journal sequence. Recovery verifies world ID, manifest/assets/policy versions,
+ownership transfers. The durable writer remains the sole writer. Replaying an
+identical event at the same world epoch, creature ID/generation, state revision
+and journal sequence is idempotent; a divergent payload at that key is a
+recovery error. Recovery verifies world ID, manifest/assets/policy versions,
 schema, actor-to-volume ownership uniqueness, and topology hashes before
 publishing the rebuilt Simulation. The allocator persists `next_creature_id`
 and `world_epoch` with existing next entity/volume/transaction/journal
-counters. Replay must reject duplicates, ownerless source cells, double-owned
-cells, missing volume references, and events after the durable prefix.
+counters. Replay rejects ownerless source cells, double-owned cells, missing
+volume references, divergent duplicates, and events after the durable prefix.
 
 The existing progression/outbox database is for progression effects; it is not
 an actor store. Existing `InitialGameWorldSetup` is only invoked for new worlds,
@@ -247,9 +327,10 @@ IDs/state/topology after late join and reconnect. Save, abrupt restart, and
 recovery preserve identity without a second spawn. Drain the occupied water
 column and remove the deer support terrain; current-state invalidation changes
 server behavior. Damage the actor, kill it, and continue editing/destroying the
-corpse as ordinary voxel bodies while proving per-cell conservation and exact
-source provenance across damage, death, splits, late join, and restart. Reset
-must invalidate old actors and prevent ID reuse. Unknown/unloaded terrain and
+corpse aggregate after its separate representation gate, proving per-cell
+conservation and exact source provenance across damage, death, edits, late
+join, and restart. Reset must invalidate old actors and prevent ID reuse.
+Unknown/unloaded terrain and
 exhausted budgets must not authorize movement or spawn. These CPU and two-client
 save/restart/damage/destruction scenarios are required before live animal
 support is claimed.
@@ -260,30 +341,39 @@ habitat candidate tests are not lifecycle, collision, or population acceptance.
 
 ## Implementation slices after coordinator review
 
-1. **Host contract and IDs:** engine-owned bounded actor DTOs, persisted actor
+1. **Geometry/query feasibility (ENG-209):** measure the selected kinematic
+   root/per-part collider candidate and exact query-to-source-cell mapping.
+   This ticket has no lifecycle/runtime interface dependency and does not
+   accept the representation for shipping.
+2. **Corpse aggregate feasibility:** determine an editable physical
+   representation that atomically owns the existing per-part volumes and
+   preserves pose/provenance without revoxelization or per-part auto-explosion.
+   This is separate from ENG-209.
+3. **Host contract and IDs:** engine-owned bounded actor DTOs, persisted actor
    ID/world epoch counters, a host-side statically linked game behavior hook,
    and invalidation tokens. Likely files: `spall_core` IDs, `spall_protocol`
    DTO definitions, `spall_sim` host state/tick seam, `spall_server` setup and
-   restore. Prerequisite: coordinator accepts collision policy and bounds.
-2. **Atomic lifecycle/topology:** creation/removal and alive-to-corpse source
+   restore. Prerequisite: reviewed feasibility conclusions and accepted bounds.
+4. **Atomic lifecycle/topology:** creation/removal and alive-to-corpse source
    ownership transactions, provenance metadata on voxel cells, replication
    application and canonical hashes. Likely files: `spall_voxel`, `spall_sim`
    commit/replay, `spall_protocol` topology records, `spall_server` fanout.
-   Prerequisite: slice 1 plus reviewed provenance storage format/version.
-3. **Collision and movement gate:** Rapier aggregate/query adapter with exact
+   Prerequisite: slice 3 plus reviewed provenance storage format/version.
+5. **Collision and movement gate:** Rapier aggregate/query adapter with exact
    source provenance, versioned collision builds, explicit species rig and
    trout/crow/deer bounded locomotion using current habitat queries.
    Likely files: `spall_physics`, `spall_sim`, sandbox species module.
-   Prerequisite: the measured representation decision above.
-4. **Durable/streamed state:** checkpoint/replay schema, journal events,
+   Prerequisite: ENG-209 gate and slice 4.
+6. **Durable/streamed state:** checkpoint/replay schema, journal events,
    baseline/interest/reconnect/reset dependencies, two-client scenarios.
    Likely files: `spall_store`, `spall_server::persist`, protocol baseline,
-   server/client assembly, acceptance fixtures. Prerequisite: slices 1–3 and
+   server/client assembly, acceptance fixtures. Prerequisite: slices 3–5 and
    explicit schema migrations; no in-place reinterpretation of old saves.
-5. **Integrated proof:** generated habitat fixture and fault/restart/damage/
+7. **Integrated proof:** generated habitat fixture and fault/restart/damage/
    destruction scenario with measured CPU and two-client results. GPU and
    population performance work stay separate and cannot be inferred from it.
 
-The first ready slice is contract review plus a small collision feasibility
-ticket if the coordinator confirms the representation. Runtime actors must not
-start before that shared decision and provenance format are frozen.
+ENG-209 is the first ready feasibility slice and is deliberately independent of
+runtime lifecycle interfaces. Runtime actors must not start before its measured
+result, the separate corpse aggregate decision, and source provenance format
+have been reviewed.
