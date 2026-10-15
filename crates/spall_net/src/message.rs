@@ -47,6 +47,7 @@ pub enum WireRecord {
     ControlProbe(spall_protocol::ControlProbe),
     ColumnWaterUpdate(spall_protocol::ColumnWaterUpdate),
     WeatherSnapshot(spall_protocol::WeatherSnapshot),
+    SnowSurfaceFrame(spall_protocol::SnowSurfaceFrame),
 }
 
 impl WireRecord {
@@ -73,6 +74,7 @@ impl WireRecord {
             Self::ControlProbe(_) => WireTag::ControlProbe,
             Self::ColumnWaterUpdate(_) => WireTag::ColumnWaterUpdate,
             Self::WeatherSnapshot(_) => WireTag::WeatherSnapshot,
+            Self::SnowSurfaceFrame(_) => WireTag::SnowSurfaceFrame,
         }
     }
 
@@ -100,6 +102,7 @@ impl WireRecord {
             Self::ControlProbe(r) => encode_control(r),
             Self::ColumnWaterUpdate(r) => encode_control(r),
             Self::WeatherSnapshot(r) => encode_control(r),
+            Self::SnowSurfaceFrame(r) => encode_control(r),
         }
     }
 
@@ -136,6 +139,7 @@ impl WireRecord {
             WireTag::ControlProbe => Self::ControlProbe(decode_control(bytes)?),
             WireTag::ColumnWaterUpdate => Self::ColumnWaterUpdate(decode_control(bytes)?),
             WireTag::WeatherSnapshot => Self::WeatherSnapshot(decode_control(bytes)?),
+            WireTag::SnowSurfaceFrame => Self::SnowSurfaceFrame(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,
