@@ -2,11 +2,16 @@
 //! terms only. Rapier handles never leave this module; callers address bodies
 //! by an opaque [`BodyId`].
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use rapier3d::control::CharacterCollision;
 use rapier3d::prelude::*;
 
+use crate::articulated::{
+    ArticulatedBodyId, ArticulatedPose, MAX_ARTICULATED_PARTS, PartTransform, SourceCellHit,
+    SourcePart, compose, normalize, rotate,
+};
 use crate::collider::{Representation, build_collider};
 use crate::mass::BodyMassProperties;
 use crate::occupancy::OccupancyGrid;
@@ -244,6 +249,26 @@ struct Entry {
     restitution: f32,
 }
 
+struct ArticulatedPartEntry {
+    part_id: u32,
+    parent_id: Option<u32>,
+    volume_id: spall_core::VolumeId,
+    source_revision: u64,
+    grid: OccupancyGrid,
+    cell_m: f32,
+    local_pose: PartTransform,
+    assembly_pose: PartTransform,
+    collider: ColliderHandle,
+    primitives: usize,
+}
+
+struct ArticulatedEntry {
+    topology_token: u64,
+    pose_token: u64,
+    pending_root_pose_token: Option<u64>,
+    parts: Vec<ArticulatedPartEntry>,
+}
+
 /// `solver_groups` for [`PhysicsWorld::set_query_only`]: membership *and*
 /// filter both zeroed, so Rapier's interaction test — `(a.memberships &
 /// b.filter) != 0` (`And` mode additionally requires the symmetric term too)
@@ -264,6 +289,128 @@ fn grid_origin_offset_m(grid: &OccupancyGrid, cell_m: f32) -> [f32; 3] {
         o.y as f32 * cell_m,
         o.z as f32 * cell_m,
     ]
+}
+
+fn articulated_grid_range_valid(grid: &OccupancyGrid, cell_m: f32) -> bool {
+    use crate::articulated::MAX_ARTICULATED_GEOMETRY_EXTENT_M;
+    if !cell_m.is_finite() || cell_m <= 0.0 {
+        return false;
+    }
+    let origin = grid.origin();
+    let dims = grid.dims();
+    let origins = [origin.x, origin.y, origin.z];
+    (0..3).all(|axis| {
+        let end = origins[axis].checked_add(i64::from(dims[axis]) - 1);
+        let Some(end) = end else {
+            return false;
+        };
+        if origins[axis] < i32::MIN as i64 || end > i32::MAX as i64 {
+            return false;
+        }
+        let start_m = origins[axis] as f64 * f64::from(cell_m);
+        let end_m = (end as f64 + 1.0) * f64::from(cell_m);
+        let extent_m = f64::from(dims[axis]) * f64::from(cell_m);
+        start_m.is_finite()
+            && end_m.is_finite()
+            && extent_m.is_finite()
+            && start_m.abs() <= MAX_ARTICULATED_GEOMETRY_EXTENT_M
+            && end_m.abs() <= MAX_ARTICULATED_GEOMETRY_EXTENT_M
+            && extent_m <= MAX_ARTICULATED_GEOMETRY_EXTENT_M
+    })
+}
+
+fn articulated_translation_in_range(translation_m: [f32; 3]) -> bool {
+    const LIMIT_M: f32 = 1_000.0;
+    translation_m
+        .iter()
+        .all(|value| value.is_finite() && value.abs() <= LIMIT_M)
+}
+
+fn flatten_source_parts(
+    parts: &[SourcePart],
+) -> Result<Vec<PartTransform>, crate::articulated::ArticulatedError> {
+    use crate::articulated::ArticulatedError;
+    let mut flattened: HashMap<u32, PartTransform> = HashMap::with_capacity(parts.len());
+    let mut locals: Vec<_> = parts
+        .iter()
+        .map(|part| (part.part_id, part.parent_id, part.local_transform))
+        .collect();
+    let mut progressed = true;
+    while !locals.is_empty() && progressed {
+        progressed = false;
+        let mut index = 0;
+        while index < locals.len() {
+            let (part_id, parent_id, local) = locals[index];
+            let world = if let Some(parent_id) = parent_id {
+                let Some(parent) = flattened.get(&parent_id).copied() else {
+                    index += 1;
+                    continue;
+                };
+                compose(parent, local)
+            } else {
+                local
+            };
+            if !world.is_valid() {
+                return Err(ArticulatedError::InvalidTransform);
+            }
+            flattened.insert(part_id, world);
+            locals.remove(index);
+            progressed = true;
+        }
+    }
+    if !locals.is_empty() {
+        return Err(ArticulatedError::Hierarchy);
+    }
+    Ok(parts.iter().map(|part| flattened[&part.part_id]).collect())
+}
+
+fn flatten_local_poses(
+    parts: &[ArticulatedPartEntry],
+    locals: &[(u32, PartTransform)],
+) -> Result<Vec<PartTransform>, crate::articulated::ArticulatedError> {
+    use crate::articulated::ArticulatedError;
+    let mut by_id = HashMap::with_capacity(locals.len());
+    for (part_id, pose) in locals {
+        let pose = pose
+            .normalized()
+            .ok_or(ArticulatedError::InvalidTransform)?;
+        if by_id.insert(*part_id, pose).is_some() {
+            return Err(ArticulatedError::StalePose);
+        }
+    }
+    if by_id.len() != parts.len() || parts.iter().any(|part| !by_id.contains_key(&part.part_id)) {
+        return Err(ArticulatedError::StalePose);
+    }
+    let mut flattened: HashMap<u32, PartTransform> = HashMap::with_capacity(parts.len());
+    let mut pending = parts.iter().collect::<Vec<_>>();
+    let mut progressed = true;
+    while !pending.is_empty() && progressed {
+        progressed = false;
+        let mut index = 0;
+        while index < pending.len() {
+            let part = pending[index];
+            let local = by_id[&part.part_id];
+            let world = if let Some(parent_id) = part.parent_id {
+                let Some(parent) = flattened.get(&parent_id).copied() else {
+                    index += 1;
+                    continue;
+                };
+                compose(parent, local)
+            } else {
+                local
+            };
+            if !world.is_valid() {
+                return Err(ArticulatedError::InvalidTransform);
+            }
+            flattened.insert(part.part_id, world);
+            pending.remove(index);
+            progressed = true;
+        }
+    }
+    if !pending.is_empty() {
+        return Err(ArticulatedError::Hierarchy);
+    }
+    Ok(parts.iter().map(|part| flattened[&part.part_id]).collect())
 }
 
 /// Builds the Rapier mass properties for `props` in the body-local frame the
@@ -314,6 +461,7 @@ pub struct PhysicsWorld {
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
     entries: Vec<Entry>,
+    articulated: HashMap<BodyId, ArticulatedEntry>,
     step_count: u64,
     /// Collider handles added/rebuilt/removed since the last [`Self::step`]
     /// or [`Self::sync_queries`] — see [`Self::sync_queries`]'s doc for why
@@ -406,10 +554,842 @@ impl PhysicsWorld {
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
             entries: Vec::new(),
+            articulated: HashMap::new(),
             step_count: 0,
             pending_modified: Vec::new(),
             pending_removed: Vec::new(),
         }
+    }
+
+    /// Adds one position-controlled assembly root and one exact collider per
+    /// source part. Parent transforms are flattened into assembly-local poses;
+    /// source grids remain separate even when their integer coordinates overlap.
+    pub fn add_articulated_body(
+        &mut self,
+        translation_m: [f32; 3],
+        rotation_xyzw: [f32; 4],
+        topology_token: u64,
+        parts: Vec<SourcePart>,
+        representation: Representation,
+    ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
+        use crate::articulated::{
+            ArticulatedError, MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_SOLID_CELLS,
+        };
+        if parts.is_empty() || parts.len() > MAX_ARTICULATED_PARTS {
+            return Err(ArticulatedError::PartCount);
+        }
+        if !articulated_translation_in_range(translation_m)
+            || !(PartTransform {
+                translation_m: [0.0; 3],
+                rotation_xyzw,
+            })
+            .is_valid()
+            || representation == Representation::SmoothConvex
+        {
+            return Err(ArticulatedError::InvalidTransform);
+        }
+        let rotation_xyzw = normalize(rotation_xyzw);
+        let already_owned_volumes: std::collections::BTreeSet<_> = self
+            .articulated
+            .values()
+            .flat_map(|assembly| assembly.parts.iter().map(|part| part.volume_id))
+            .collect();
+        let mut sorted = parts;
+        sorted.sort_by_key(|part| part.part_id);
+        let mut ids = std::collections::BTreeSet::new();
+        let mut volume_ids = std::collections::BTreeSet::new();
+        let mut roots = 0usize;
+        let mut dense_cells = 0u64;
+        let mut solid_cells = 0u64;
+        let cell_m = sorted[0].cell_m;
+        for part in &mut sorted {
+            if part.part_id == 0 || !ids.insert(part.part_id) {
+                return Err(ArticulatedError::DuplicatePart);
+            }
+            if !volume_ids.insert(part.volume_id) || already_owned_volumes.contains(&part.volume_id)
+            {
+                return Err(ArticulatedError::DuplicateVolume);
+            }
+            if part.parent_id.is_none() {
+                roots += 1;
+            }
+            if !part.local_transform.is_valid()
+                || !part.cell_m.is_finite()
+                || part.cell_m <= 0.0
+                || (part.cell_m - cell_m).abs() > 1.0e-7
+            {
+                return Err(ArticulatedError::InvalidTransform);
+            }
+            if !articulated_translation_in_range(part.local_transform.translation_m)
+                || !articulated_grid_range_valid(&part.grid, part.cell_m)
+            {
+                return Err(ArticulatedError::GeometryRange);
+            }
+            part.local_transform = part
+                .local_transform
+                .normalized()
+                .ok_or(ArticulatedError::InvalidTransform)?;
+            let dims = part.grid.dims();
+            let dense = u64::from(dims[0])
+                .checked_mul(u64::from(dims[1]))
+                .and_then(|v| v.checked_mul(u64::from(dims[2])))
+                .ok_or(ArticulatedError::WorkBudget)?;
+            dense_cells = dense_cells
+                .checked_add(dense)
+                .ok_or(ArticulatedError::WorkBudget)?;
+            solid_cells = solid_cells
+                .checked_add(part.grid.solid_count())
+                .ok_or(ArticulatedError::WorkBudget)?;
+            if part.grid.solid_count() == 0 {
+                return Err(ArticulatedError::EmptyPart(part.part_id));
+            }
+            if dense_cells > MAX_ARTICULATED_DENSE_CELLS
+                || solid_cells > MAX_ARTICULATED_SOLID_CELLS
+            {
+                return Err(ArticulatedError::WorkBudget);
+            }
+        }
+        if roots != 1
+            || sorted
+                .iter()
+                .any(|part| part.parent_id.is_some_and(|parent| !ids.contains(&parent)))
+        {
+            return Err(ArticulatedError::Hierarchy);
+        }
+        let flattened = flatten_source_parts(&sorted)?;
+        if flattened
+            .iter()
+            .any(|pose| !articulated_translation_in_range(pose.translation_m))
+        {
+            return Err(ArticulatedError::GeometryRange);
+        }
+        let builds: Vec<_> = sorted
+            .iter()
+            .map(|part| build_collider(&part.grid, cell_m, representation))
+            .collect();
+        let primitive_count = builds.iter().map(|build| build.primitives).sum::<usize>();
+        if builds
+            .iter()
+            .any(|build| build.primitives > crate::collider::MERGED_CUBOID_PRIMITIVE_BUDGET)
+            || primitive_count > 65_536
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        let collider_poses: Vec<_> = sorted
+            .iter()
+            .zip(&flattened)
+            .map(|(part, pose)| {
+                let origin = part.grid.origin();
+                let origin_m = [
+                    origin.x as f32 * cell_m,
+                    origin.y as f32 * cell_m,
+                    origin.z as f32 * cell_m,
+                ];
+                let offset = rotate(pose.rotation_xyzw, origin_m);
+                let translation = [
+                    pose.translation_m[0] + offset[0],
+                    pose.translation_m[1] + offset[1],
+                    pose.translation_m[2] + offset[2],
+                ];
+                (translation, pose.rotation_xyzw)
+            })
+            .collect();
+        if collider_poses.iter().any(|(translation, rotation)| {
+            !translation.iter().all(|v| v.is_finite())
+                || !rotation.iter().all(|v| v.is_finite())
+                || !rotation.iter().map(|v| v * v).sum::<f32>().is_finite()
+        }) {
+            return Err(ArticulatedError::InvalidTransform);
+        }
+        if collider_poses.iter().any(|(local_translation, _)| {
+            let rotated = rotate(rotation_xyzw, *local_translation);
+            !articulated_translation_in_range(*local_translation)
+                || !articulated_translation_in_range([
+                    translation_m[0] + rotated[0],
+                    translation_m[1] + rotated[1],
+                    translation_m[2] + rotated[2],
+                ])
+        }) {
+            return Err(ArticulatedError::GeometryRange);
+        }
+
+        let root_rotation = Rotation::from_xyzw(
+            rotation_xyzw[0],
+            rotation_xyzw[1],
+            rotation_xyzw[2],
+            rotation_xyzw[3],
+        );
+        let root = self.bodies.insert(
+            RigidBodyBuilder::kinematic_position_based()
+                .translation(Vector::new(
+                    translation_m[0],
+                    translation_m[1],
+                    translation_m[2],
+                ))
+                .rotation(root_rotation.to_scaled_axis())
+                .build(),
+        );
+        let id = BodyId((u64::from(self.id_namespace) << 32) | self.entries.len() as u64);
+        let mut built_parts = Vec::with_capacity(sorted.len());
+        for (((part, pose), (local_translation, local_rotation_xyzw)), build) in sorted
+            .into_iter()
+            .zip(flattened)
+            .zip(collider_poses)
+            .zip(builds)
+        {
+            let local_rotation = Rotation::from_xyzw(
+                local_rotation_xyzw[0],
+                local_rotation_xyzw[1],
+                local_rotation_xyzw[2],
+                local_rotation_xyzw[3],
+            );
+            let collider = ColliderBuilder::new(build.collider.shared_shape().clone())
+                .density(0.0)
+                .position(Pose::new(
+                    Vector::new(
+                        local_translation[0],
+                        local_translation[1],
+                        local_translation[2],
+                    ),
+                    local_rotation.to_scaled_axis(),
+                ))
+                .build();
+            let handle = self
+                .colliders
+                .insert_with_parent(collider, root, &mut self.bodies);
+            self.pending_modified.push(handle);
+            built_parts.push(ArticulatedPartEntry {
+                part_id: part.part_id,
+                parent_id: part.parent_id,
+                volume_id: part.volume_id,
+                source_revision: part.source_revision,
+                grid: part.grid,
+                cell_m,
+                local_pose: part.local_transform,
+                assembly_pose: pose,
+                collider: handle,
+                primitives: build.primitives,
+            });
+        }
+        let primary = built_parts[0].collider;
+        let first_origin = built_parts[0].grid.origin();
+        self.entries.push(Entry {
+            body: root,
+            collider: primary,
+            cell_m,
+            representation,
+            density: 0.0,
+            collider_offset_m: [
+                first_origin.x as f32 * cell_m,
+                first_origin.y as f32 * cell_m,
+                first_origin.z as f32 * cell_m,
+            ],
+            mass_properties: None,
+            retired: false,
+            dormant: false,
+            query_only: false,
+            restitution: 0.0,
+        });
+        for part in &built_parts {
+            self.tag_collider(part.collider, id);
+        }
+        self.articulated.insert(
+            id,
+            ArticulatedEntry {
+                topology_token,
+                pose_token: 0,
+                pending_root_pose_token: None,
+                parts: built_parts,
+            },
+        );
+        Ok(ArticulatedBodyId(id))
+    }
+
+    /// Atomically installs a complete sampled part-pose set after validating
+    /// both version tokens and all transforms. Invalid/stale updates do not
+    /// mutate any collider or token.
+    pub fn update_articulated_pose(
+        &mut self,
+        id: ArticulatedBodyId,
+        update: ArticulatedPose,
+    ) -> Result<(), crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        let id = id.0;
+        let current = self
+            .articulated
+            .get(&id)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        if update.topology_token != current.topology_token
+            || current.pending_root_pose_token.is_some()
+            || update.base_pose_token != current.pose_token
+            || update.pose_token <= current.pose_token
+            || update.parts.len() != current.parts.len()
+            || update
+                .parts
+                .iter()
+                .zip(&current.parts)
+                .any(|((part_id, pose), part)| {
+                    *part_id != part.part_id || pose.normalized().is_none()
+                })
+        {
+            return Err(ArticulatedError::StalePose);
+        }
+        if update
+            .parts
+            .iter()
+            .any(|(_, pose)| !articulated_translation_in_range(pose.translation_m))
+        {
+            return Err(ArticulatedError::GeometryRange);
+        }
+        let locals: Vec<_> = update
+            .parts
+            .iter()
+            .map(|(id, pose)| {
+                pose.normalized()
+                    .map(|pose| (*id, pose))
+                    .ok_or(ArticulatedError::InvalidTransform)
+            })
+            .collect::<Result<_, _>>()?;
+        let flattened = flatten_local_poses(&current.parts, &locals)?;
+        if flattened.iter().any(|pose| !pose.is_valid()) {
+            return Err(ArticulatedError::InvalidTransform);
+        }
+        if flattened
+            .iter()
+            .any(|pose| !articulated_translation_in_range(pose.translation_m))
+        {
+            return Err(ArticulatedError::GeometryRange);
+        }
+        let prepared: Vec<_> = current
+            .parts
+            .iter()
+            .zip(locals.iter().zip(flattened.iter()))
+            .map(|(part, ((part_id, local), world))| {
+                let origin = part.grid.origin();
+                let origin_m = [
+                    origin.x as f32 * part.cell_m,
+                    origin.y as f32 * part.cell_m,
+                    origin.z as f32 * part.cell_m,
+                ];
+                let offset = rotate(world.rotation_xyzw, origin_m);
+                let translation = [
+                    world.translation_m[0] + offset[0],
+                    world.translation_m[1] + offset[1],
+                    world.translation_m[2] + offset[2],
+                ];
+                (*part_id == part.part_id && articulated_translation_in_range(translation))
+                    .then_some((*local, *world, translation))
+            })
+            .collect();
+        if prepared.len() != current.parts.len() || prepared.iter().any(Option::is_none) {
+            return Err(ArticulatedError::InvalidTransform);
+        }
+        let root = self.bodies[self.entries[entry_index(id, self.id_namespace)].body].position();
+        if prepared.iter().flatten().any(|(_, _, local_translation)| {
+            let world_offset = root.transform_vector(Vector::new(
+                local_translation[0],
+                local_translation[1],
+                local_translation[2],
+            ));
+            let world = root.translation + world_offset;
+            !articulated_translation_in_range([world.x, world.y, world.z])
+        }) {
+            return Err(ArticulatedError::InvalidTransform);
+        }
+        let assembly = self
+            .articulated
+            .get_mut(&id)
+            .expect("validated assembly exists");
+        for (part, prepared) in assembly
+            .parts
+            .iter_mut()
+            .zip(prepared.into_iter().flatten())
+        {
+            let (local, world, translation) = prepared;
+            let rotation = Rotation::from_xyzw(
+                world.rotation_xyzw[0],
+                world.rotation_xyzw[1],
+                world.rotation_xyzw[2],
+                world.rotation_xyzw[3],
+            );
+            let collider_local = Pose::new(
+                Vector::new(translation[0], translation[1], translation[2]),
+                rotation.to_scaled_axis(),
+            );
+            let collider = &mut self.colliders[part.collider];
+            collider.set_position_wrt_parent(collider_local);
+            // Rapier propagates collider-local changes during its next step.
+            // Queries at this tick boundary need the installed pose now, even
+            // when the unchanged parent is no longer in its modified-body list.
+            // Preserve the native dirty flags for the real solver/broad phase.
+            collider.set_position(*root * collider_local);
+            part.local_pose = local.normalized().expect("validated local pose");
+            part.assembly_pose = world;
+            self.pending_modified.push(part.collider);
+        }
+        assembly.pose_token = update.pose_token;
+        Ok(())
+    }
+
+    /// Rebuilds one source-part shape after an authoritative cell edit. The
+    /// new collider is fully prepared and budget-checked before removing the
+    /// old shape; stale topology/revision tokens leave the old shape untouched.
+    pub fn rebuild_articulated_part_grid(
+        &mut self,
+        id: ArticulatedBodyId,
+        expected_topology_token: u64,
+        new_topology_token: u64,
+        part_id: u32,
+        expected_source_revision: u64,
+        new_source_revision: u64,
+        new_grid: OccupancyGrid,
+    ) -> Result<Duration, crate::articulated::ArticulatedError> {
+        use crate::articulated::{
+            ArticulatedError, MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_SOLID_CELLS,
+        };
+        let id = id.0;
+        let assembly = self
+            .articulated
+            .get(&id)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        let part_index = assembly
+            .parts
+            .iter()
+            .position(|part| part.part_id == part_id)
+            .ok_or(ArticulatedError::StaleTopology)?;
+        let part = &assembly.parts[part_index];
+        if assembly.topology_token != expected_topology_token
+            || assembly.pending_root_pose_token.is_some()
+            || new_topology_token <= expected_topology_token
+            || part.source_revision != expected_source_revision
+            || new_source_revision <= expected_source_revision
+        {
+            return Err(ArticulatedError::StaleTopology);
+        }
+        if !articulated_grid_range_valid(&new_grid, part.cell_m) {
+            return Err(ArticulatedError::GeometryRange);
+        }
+        let dims = new_grid.dims();
+        let dense = u64::from(dims[0])
+            .checked_mul(u64::from(dims[1]))
+            .and_then(|v| v.checked_mul(u64::from(dims[2])))
+            .ok_or(ArticulatedError::WorkBudget)?;
+        let old_dense = u64::from(part.grid.dims()[0])
+            .checked_mul(u64::from(part.grid.dims()[1]))
+            .and_then(|v| v.checked_mul(u64::from(part.grid.dims()[2])))
+            .ok_or(ArticulatedError::WorkBudget)?;
+        let dense_total = assembly
+            .parts
+            .iter()
+            .try_fold(0u64, |sum, part| {
+                let dims = part.grid.dims();
+                sum.checked_add(
+                    u64::from(dims[0])
+                        .checked_mul(u64::from(dims[1]))?
+                        .checked_mul(u64::from(dims[2]))?,
+                )
+            })
+            .ok_or(ArticulatedError::WorkBudget)?;
+        let solid_total = assembly
+            .parts
+            .iter()
+            .try_fold(0u64, |sum, part| sum.checked_add(part.grid.solid_count()))
+            .ok_or(ArticulatedError::WorkBudget)?;
+        let new_dense_total = dense_total
+            .checked_sub(old_dense)
+            .and_then(|v| v.checked_add(dense))
+            .ok_or(ArticulatedError::WorkBudget)?;
+        let new_solid_total = solid_total
+            .checked_sub(part.grid.solid_count())
+            .and_then(|v| v.checked_add(new_grid.solid_count()))
+            .ok_or(ArticulatedError::WorkBudget)?;
+        if new_dense_total > MAX_ARTICULATED_DENSE_CELLS
+            || new_solid_total > MAX_ARTICULATED_SOLID_CELLS
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        if new_grid.solid_count() == 0 {
+            return Err(ArticulatedError::EmptyPart(part_id));
+        }
+        let representation = self.entries[entry_index(id, self.id_namespace)].representation;
+        let start = Instant::now();
+        let built = build_collider(&new_grid, part.cell_m, representation);
+        if built.primitives > crate::collider::MERGED_CUBOID_PRIMITIVE_BUDGET
+            || assembly
+                .parts
+                .iter()
+                .map(|part| part.primitives)
+                .sum::<usize>()
+                - part.primitives
+                + built.primitives
+                > 65_536
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        let origin = new_grid.origin();
+        let origin_m = [
+            origin.x as f32 * part.cell_m,
+            origin.y as f32 * part.cell_m,
+            origin.z as f32 * part.cell_m,
+        ];
+        let offset = rotate(part.assembly_pose.rotation_xyzw, origin_m);
+        let translation = [
+            part.assembly_pose.translation_m[0] + offset[0],
+            part.assembly_pose.translation_m[1] + offset[1],
+            part.assembly_pose.translation_m[2] + offset[2],
+        ];
+        if !translation.iter().all(|value| value.is_finite()) {
+            return Err(ArticulatedError::InvalidTransform);
+        }
+        let root = self.bodies[self.entries[entry_index(id, self.id_namespace)].body].position();
+        let world_offset =
+            root.transform_vector(Vector::new(translation[0], translation[1], translation[2]));
+        let world_position = root.translation + world_offset;
+        if !world_position.x.is_finite()
+            || !world_position.y.is_finite()
+            || !world_position.z.is_finite()
+        {
+            return Err(ArticulatedError::InvalidTransform);
+        }
+        let rotation = Rotation::from_xyzw(
+            part.assembly_pose.rotation_xyzw[0],
+            part.assembly_pose.rotation_xyzw[1],
+            part.assembly_pose.rotation_xyzw[2],
+            part.assembly_pose.rotation_xyzw[3],
+        );
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
+        let (body, query_only, restitution) = (entry.body, entry.query_only, entry.restitution);
+        let mut collider = ColliderBuilder::new(built.collider.shared_shape().clone())
+            .density(0.0)
+            .position(Pose::new(
+                Vector::new(translation[0], translation[1], translation[2]),
+                rotation.to_scaled_axis(),
+            ))
+            .build();
+        if query_only {
+            collider.set_solver_groups(query_only_solver_groups());
+        }
+        collider.set_restitution(restitution);
+        collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
+
+        let old_handle = part.collider;
+        self.colliders
+            .remove(old_handle, &mut self.islands, &mut self.bodies, true);
+        let new_handle = self
+            .colliders
+            .insert_with_parent(collider, body, &mut self.bodies);
+        self.tag_collider(new_handle, id);
+        self.pending_removed.push(old_handle);
+        self.pending_modified.push(new_handle);
+        let assembly = self
+            .articulated
+            .get_mut(&id)
+            .expect("assembly validated above");
+        let part = &mut assembly.parts[part_index];
+        part.grid = new_grid;
+        part.source_revision = new_source_revision;
+        part.collider = new_handle;
+        part.primitives = built.primitives;
+        assembly.topology_token = new_topology_token;
+        if part_index == 0 {
+            self.entries[entry_index(id, self.id_namespace)].collider = new_handle;
+        }
+        Ok(start.elapsed())
+    }
+
+    /// Moves the single kinematic assembly root after validating every
+    /// transformed source-part collider pose. Part-local sampled poses stay
+    /// unchanged and all attached colliders are refreshed together.
+    pub fn set_articulated_root_pose(
+        &mut self,
+        id: ArticulatedBodyId,
+        topology_token: u64,
+        base_pose_token: u64,
+        pose_token: u64,
+        translation_m: [f32; 3],
+        rotation_xyzw: [f32; 4],
+    ) -> Result<(), crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        let body_id = id.0;
+        let rotation = PartTransform {
+            translation_m: [0.0; 3],
+            rotation_xyzw,
+        }
+        .normalized()
+        .ok_or(ArticulatedError::InvalidRootPose)?;
+        if !articulated_translation_in_range(translation_m) {
+            return Err(ArticulatedError::InvalidRootPose);
+        }
+        let assembly = self
+            .articulated
+            .get(&body_id)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        if assembly.topology_token != topology_token
+            || assembly.pose_token != base_pose_token
+            || pose_token <= base_pose_token
+        {
+            return Err(ArticulatedError::StalePose);
+        }
+        if assembly.pending_root_pose_token.is_some() {
+            return Err(ArticulatedError::PendingRootPose);
+        }
+        for part in &assembly.parts {
+            let origin = part.grid.origin();
+            let origin_m = [
+                origin.x as f32 * part.cell_m,
+                origin.y as f32 * part.cell_m,
+                origin.z as f32 * part.cell_m,
+            ];
+            let collider_offset = rotate(part.assembly_pose.rotation_xyzw, origin_m);
+            let part_local = [
+                part.assembly_pose.translation_m[0] + collider_offset[0],
+                part.assembly_pose.translation_m[1] + collider_offset[1],
+                part.assembly_pose.translation_m[2] + collider_offset[2],
+            ];
+            let rotated = rotate(rotation.rotation_xyzw, part_local);
+            if (0..3).any(|axis| !(translation_m[axis] + rotated[axis]).is_finite()) {
+                return Err(ArticulatedError::InvalidRootPose);
+            }
+        }
+        let body = self.entries[entry_index(body_id, self.id_namespace)].body;
+        self.bodies[body].set_translation(
+            Vector::new(translation_m[0], translation_m[1], translation_m[2]),
+            true,
+        );
+        self.bodies[body].set_rotation(
+            Rotation::from_xyzw(
+                rotation.rotation_xyzw[0],
+                rotation.rotation_xyzw[1],
+                rotation.rotation_xyzw[2],
+                rotation.rotation_xyzw[3],
+            ),
+            true,
+        );
+        self.pending_modified
+            .extend(assembly.parts.iter().map(|part| part.collider));
+        self.articulated
+            .get_mut(&body_id)
+            .expect("validated assembly exists")
+            .pose_token = pose_token;
+        Ok(())
+    }
+
+    /// Schedules an authored root movement for the next Rapier fixed step. Its
+    /// pose token becomes visible only after the solver installs that target.
+    pub fn set_next_articulated_root_pose(
+        &mut self,
+        id: ArticulatedBodyId,
+        topology_token: u64,
+        base_pose_token: u64,
+        pose_token: u64,
+        translation_m: [f32; 3],
+        rotation_xyzw: [f32; 4],
+    ) -> Result<(), crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        let body_id = id.0;
+        let rotation = PartTransform {
+            translation_m: [0.0; 3],
+            rotation_xyzw,
+        }
+        .normalized()
+        .ok_or(ArticulatedError::InvalidRootPose)?;
+        if !articulated_translation_in_range(translation_m) {
+            return Err(ArticulatedError::InvalidRootPose);
+        }
+        let assembly = self
+            .articulated
+            .get(&body_id)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        if assembly.topology_token != topology_token
+            || assembly.pose_token != base_pose_token
+            || pose_token <= base_pose_token
+        {
+            return Err(ArticulatedError::StalePose);
+        }
+        if assembly.pending_root_pose_token.is_some() {
+            return Err(ArticulatedError::PendingRootPose);
+        }
+        for part in &assembly.parts {
+            let origin = part.grid.origin();
+            let origin_m = [
+                origin.x as f32 * part.cell_m,
+                origin.y as f32 * part.cell_m,
+                origin.z as f32 * part.cell_m,
+            ];
+            let collider_offset = rotate(part.assembly_pose.rotation_xyzw, origin_m);
+            let part_local = [
+                part.assembly_pose.translation_m[0] + collider_offset[0],
+                part.assembly_pose.translation_m[1] + collider_offset[1],
+                part.assembly_pose.translation_m[2] + collider_offset[2],
+            ];
+            let rotated = rotate(rotation.rotation_xyzw, part_local);
+            if (0..3).any(|axis| !(translation_m[axis] + rotated[axis]).is_finite()) {
+                return Err(ArticulatedError::InvalidRootPose);
+            }
+        }
+        let body = self.entries[entry_index(body_id, self.id_namespace)].body;
+        self.bodies[body].set_next_kinematic_position(Pose::new(
+            Vector::new(translation_m[0], translation_m[1], translation_m[2]),
+            Rotation::from_xyzw(
+                rotation.rotation_xyzw[0],
+                rotation.rotation_xyzw[1],
+                rotation.rotation_xyzw[2],
+                rotation.rotation_xyzw[3],
+            )
+            .to_scaled_axis(),
+        ));
+        self.articulated
+            .get_mut(&body_id)
+            .expect("validated assembly exists")
+            .pending_root_pose_token = Some(pose_token);
+        Ok(())
+    }
+
+    /// Retires the kinematic root and all of its attached source-part colliders.
+    pub fn retire_articulated_body(&mut self, id: ArticulatedBodyId) {
+        self.retire_body(id.0);
+    }
+
+    /// Number of exact source-part colliders installed for an assembly.
+    pub fn articulated_collider_count(&self, id: ArticulatedBodyId) -> usize {
+        self.articulated
+            .get(&id.0)
+            .map_or(0, |assembly| assembly.parts.len())
+    }
+
+    /// Casts against the live Rapier shape of every source part and maps the
+    /// selected TOI back to the exact occupied source cell. TOIs within 10 µm
+    /// tie by the smallest stable part ID.
+    pub fn raycast_articulated(
+        &mut self,
+        id: ArticulatedBodyId,
+        origin_m: [f32; 3],
+        direction: [f32; 3],
+        max_toi_m: f32,
+    ) -> Result<SourceCellHit, crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        let id = id.0;
+        let norm = direction.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if !origin_m.iter().all(|v| v.is_finite())
+            || !norm.is_finite()
+            || norm <= 1.0e-6
+            || !max_toi_m.is_finite()
+            || max_toi_m <= 0.0
+        {
+            return Err(ArticulatedError::Miss);
+        }
+        if !self.articulated.contains_key(&id) {
+            return Err(ArticulatedError::Miss);
+        }
+        self.sync_queries();
+        let direction = Vector::new(
+            direction[0] / norm,
+            direction[1] / norm,
+            direction[2] / norm,
+        );
+        let ray = rapier3d::parry::query::Ray::new(
+            Vector::new(origin_m[0], origin_m[1], origin_m[2]),
+            direction,
+        );
+        let hit_tois: HashMap<_, _> = {
+            let queries = self.broad_phase.as_query_pipeline(
+                self.narrow_phase.query_dispatcher(),
+                &self.bodies,
+                &self.colliders,
+                QueryFilter::default(),
+            );
+            queries
+                .intersect_ray(ray, max_toi_m, true)
+                .filter(|(handle, _, _)| {
+                    self.articulated[&id]
+                        .parts
+                        .iter()
+                        .any(|part| part.collider == *handle)
+                })
+                .map(|(handle, _, intersection)| (handle, intersection.time_of_impact))
+                .collect()
+        };
+        let assembly = self.articulated.get(&id).ok_or(ArticulatedError::Miss)?;
+        let root_pose =
+            *self.bodies[self.entries[entry_index(id, self.id_namespace)].body].position();
+        let mut best: Option<(f32, u32, SourceCellHit)> = None;
+        for part in &assembly.parts {
+            let Some(toi) = hit_tois.get(&part.collider).copied() else {
+                continue;
+            };
+            let collider = self
+                .colliders
+                .get(part.collider)
+                .ok_or(ArticulatedError::Miss)?;
+            let local_pose = *collider
+                .position_wrt_parent()
+                .ok_or(ArticulatedError::Miss)?;
+            let collider_pose = root_pose * local_pose;
+            let world_hit = ray.point_at(toi);
+            let local = collider_pose.inverse_transform_point(world_hit);
+            let cell_coord = [
+                local.x / part.cell_m,
+                local.y / part.cell_m,
+                local.z / part.cell_m,
+            ];
+            let dims = part.grid.dims();
+            let mut candidates: [Vec<i64>; 3] = std::array::from_fn(|axis| {
+                let value = cell_coord[axis];
+                let nearest = value.round();
+                let tolerance =
+                    (1.0e-5 / part.cell_m).max(4.0 * f32::EPSILON * value.abs().max(1.0));
+                if (value - nearest).abs() <= tolerance {
+                    vec![nearest as i64 - 1, nearest as i64]
+                } else {
+                    vec![value.floor() as i64]
+                }
+            });
+            for (axis, values) in candidates.iter_mut().enumerate() {
+                values.retain(|value| *value >= 0 && *value < i64::from(dims[axis]));
+            }
+            let grid_origin = part.grid.origin();
+            let mut cells = Vec::new();
+            for &x in &candidates[0] {
+                for &y in &candidates[1] {
+                    for &z in &candidates[2] {
+                        if part.grid.is_solid(x as u32, y as u32, z as u32) {
+                            cells.push([x, y, z]);
+                        }
+                    }
+                }
+            }
+            cells.sort_unstable();
+            let Some(idx) = cells.first().copied() else {
+                continue;
+            };
+            let source = [
+                grid_origin.x + idx[0],
+                grid_origin.y + idx[1],
+                grid_origin.z + idx[2],
+            ];
+            if source
+                .iter()
+                .any(|v| *v < i32::MIN as i64 || *v > i32::MAX as i64)
+            {
+                continue;
+            }
+            let hit = SourceCellHit {
+                part_id: part.part_id,
+                volume_id: part.volume_id,
+                source_revision: part.source_revision,
+                cell: [source[0] as i32, source[1] as i32, source[2] as i32],
+                toi_m: toi,
+                topology_token: assembly.topology_token,
+                pose_token: assembly.pose_token,
+            };
+            if best.is_none_or(|(old_toi, old_part, _)| {
+                toi < old_toi - 1.0e-5
+                    || ((toi - old_toi).abs() <= 1.0e-5 && part.part_id < old_part)
+            }) {
+                best = Some((toi, part.part_id, hit));
+            }
+        }
+        best.map(|(_, _, hit)| hit).ok_or(ArticulatedError::Miss)
     }
 
     /// Builds a Rapier rigid body + attached collider from `spec` and inserts
@@ -548,6 +1528,12 @@ impl PhysicsWorld {
         grid: &OccupancyGrid,
         rep: Representation,
     ) -> Duration {
+        // An articulated body owns several source colliders. Rebuilding only
+        // its compatibility/primary handle would leave stale child shapes.
+        assert!(
+            !self.articulated.contains_key(&id),
+            "single-grid rebuild is invalid for ArticulatedBodyId; use rebuild_articulated_part_grid"
+        );
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "rebuild_collider on a retired body");
         if entry.retired {
@@ -613,6 +1599,10 @@ impl PhysicsWorld {
     /// its collider is already massless); otherwise the shape's own mass would
     /// be added on top of `props`.
     pub fn set_mass_properties(&mut self, id: BodyId, props: BodyMassProperties) {
+        assert!(
+            !self.articulated.contains_key(&id),
+            "mass properties are not supported by kinematic articulated assemblies"
+        );
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "set_mass_properties on a retired body");
         if entry.retired {
@@ -640,9 +1630,17 @@ impl PhysicsWorld {
         }
         entry.restitution = restitution.clamp(0.0, 1.0);
         if !entry.dormant {
-            let collider = &mut self.colliders[entry.collider];
-            collider.set_restitution(entry.restitution);
-            collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
+            if let Some(assembly) = self.articulated.get(&id) {
+                for part in &assembly.parts {
+                    let collider = &mut self.colliders[part.collider];
+                    collider.set_restitution(entry.restitution);
+                    collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
+                }
+            } else {
+                let collider = &mut self.colliders[entry.collider];
+                collider.set_restitution(entry.restitution);
+                collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
+            }
         }
     }
 
@@ -659,6 +1657,7 @@ impl PhysicsWorld {
         }
         entry.retired = true;
         let body = entry.body;
+        self.articulated.remove(&id);
         self.bodies.remove(
             body,
             &mut self.islands,
@@ -688,6 +1687,12 @@ impl PhysicsWorld {
     /// pose / velocity and passes them back on reactivation. Idempotent; a no-op
     /// on a retired body.
     pub fn deactivate_body(&mut self, id: BodyId) {
+        // Dormancy snapshots currently own one grid/collider and cannot restore
+        // a per-part assembly without losing its stable source IDs.
+        assert!(
+            !self.articulated.contains_key(&id),
+            "articulated assemblies do not support single-grid dormancy; use retire_articulated_body"
+        );
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired || entry.dormant {
             return;
@@ -723,6 +1728,10 @@ impl PhysicsWorld {
         linvel_m_s: [f32; 3],
         angvel_rad_s: [f32; 3],
     ) {
+        assert!(
+            !self.articulated.contains_key(&id),
+            "single-grid reactivation is invalid for ArticulatedBodyId; use an articulated lifecycle operation"
+        );
         let entry = &self.entries[entry_index(id, self.id_namespace)];
         if entry.retired || !entry.dormant {
             return;
@@ -770,6 +1779,10 @@ impl PhysicsWorld {
     /// nothing collides with the obsolete solid shape in the meantime. A no-op
     /// on a retired body.
     pub fn remove_collider(&mut self, id: BodyId) {
+        assert!(
+            !self.articulated.contains_key(&id),
+            "single-grid collider removal is invalid for ArticulatedBodyId; use retire_articulated_body"
+        );
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
@@ -815,9 +1828,14 @@ impl PhysicsWorld {
             return;
         }
         entry.query_only = true;
-        let collider = entry.collider;
-        if let Some(c) = self.colliders.get_mut(collider) {
-            c.set_solver_groups(query_only_solver_groups());
+        if let Some(assembly) = self.articulated.get(&id) {
+            for part in &assembly.parts {
+                if let Some(collider) = self.colliders.get_mut(part.collider) {
+                    collider.set_solver_groups(query_only_solver_groups());
+                }
+            }
+        } else if let Some(collider) = self.colliders.get_mut(entry.collider) {
+            collider.set_solver_groups(query_only_solver_groups());
         }
     }
 
@@ -906,6 +1924,11 @@ impl PhysicsWorld {
         );
         let pipeline = start.elapsed();
         self.step_count += 1;
+        for assembly in self.articulated.values_mut() {
+            if let Some(pose_token) = assembly.pending_root_pose_token.take() {
+                assembly.pose_token = pose_token;
+            }
+        }
         StepTiming {
             step_index: self.step_count,
             pipeline,
@@ -980,11 +2003,18 @@ impl PhysicsWorld {
         dt_s: f32,
         exclude: &[BodyId],
     ) -> crate::character::CharacterMove {
-        let handles: Vec<ColliderHandle> = exclude
-            .iter()
-            .filter(|id| !self.entries[entry_index(*id, self.id_namespace)].retired)
-            .map(|id| self.entries[entry_index(id, self.id_namespace)].collider)
-            .collect();
+        let mut handles = Vec::new();
+        for id in exclude {
+            let entry = &self.entries[entry_index(*id, self.id_namespace)];
+            if entry.retired || entry.dormant {
+                continue;
+            }
+            if let Some(assembly) = self.articulated.get(id) {
+                handles.extend(assembly.parts.iter().map(|part| part.collider));
+            } else {
+                handles.push(entry.collider);
+            }
+        }
         self.sweep_character_impl(
             params,
             position_m,
@@ -1496,8 +2526,15 @@ impl PhysicsWorld {
     /// split child at its parent's transform so world geometry is unchanged at
     /// the split instant.
     pub fn set_body_pose(&mut self, id: BodyId, translation_m: [f32; 3], rotation: [f32; 4]) {
-        let entry = &self.entries[entry_index(id, self.id_namespace)];
-        let rb = &mut self.bodies[entry.body];
+        assert!(
+            !self.articulated.contains_key(&id),
+            "use set_articulated_root_pose for an articulated body"
+        );
+        let (body, primary) = {
+            let entry = &self.entries[entry_index(id, self.id_namespace)];
+            (entry.body, entry.collider)
+        };
+        let rb = &mut self.bodies[body];
         rb.set_translation(
             Vector::new(translation_m[0], translation_m[1], translation_m[2]),
             true,
@@ -1509,7 +2546,12 @@ impl PhysicsWorld {
         // A query-only mirror (for example, client-predicted collision against
         // replicated debris) may move without ever stepping this PhysicsWorld.
         // Mark its collider so `sync_queries` refits the broad-phase AABB.
-        self.pending_modified.push(entry.collider);
+        if let Some(assembly) = self.articulated.get(&id) {
+            self.pending_modified
+                .extend(assembly.parts.iter().map(|part| part.collider));
+        } else {
+            self.pending_modified.push(primary);
+        }
     }
 
     /// Applies a linear impulse (N·s) to a body at its centre of mass and wakes
@@ -1517,6 +2559,10 @@ impl PhysicsWorld {
     /// impulse or an impact from an adjacent edit — for the sleep/wake
     /// feasibility scenario. No-op for `Fixed` bodies.
     pub fn apply_impulse(&mut self, id: BodyId, impulse_n_s: [f32; 3]) {
+        assert!(
+            !self.articulated.contains_key(&id),
+            "kinematic articulated roots do not accept impulses"
+        );
         let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_impulse(
             Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
@@ -1529,6 +2575,10 @@ impl PhysicsWorld {
     /// body's installed inertia tensor — the direct motion check for
     /// mixed-material inertia. No-op for `Fixed` bodies.
     pub fn apply_torque_impulse(&mut self, id: BodyId, torque_impulse_n_m_s: [f32; 3]) {
+        assert!(
+            !self.articulated.contains_key(&id),
+            "kinematic articulated roots do not accept impulses"
+        );
         let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_torque_impulse(
             Vector::new(
@@ -1551,6 +2601,10 @@ impl PhysicsWorld {
         impulse_n_s: [f32; 3],
         point_world_m: [f32; 3],
     ) {
+        assert!(
+            !self.articulated.contains_key(&id),
+            "kinematic articulated roots do not accept impulses"
+        );
         let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_impulse_at_point(
             Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
@@ -1562,6 +2616,10 @@ impl PhysicsWorld {
     /// Sets a body's linear and angular velocity, m/s and rad/s. Used to hand a
     /// split child its inherited velocity.
     pub fn set_body_velocity(&mut self, id: BodyId, linvel_m_s: [f32; 3], angvel_rad_s: [f32; 3]) {
+        assert!(
+            !self.articulated.contains_key(&id),
+            "use set_articulated_root_pose to move a kinematic articulated root"
+        );
         let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.set_linvel(
             Vector::new(linvel_m_s[0], linvel_m_s[1], linvel_m_s[2]),
@@ -1663,6 +2721,528 @@ mod tests {
         ))
         .unwrap();
         OccupancyGrid::from_region(&v, GlobalCell::new(0, 0, 0), GlobalCell::new(7, 3, 3)).unwrap()
+    }
+
+    fn one_cell_grid(origin: GlobalCell) -> OccupancyGrid {
+        OccupancyGrid::from_solid_mask(origin, [1, 1, 1], vec![true], vec![fixtures::STONE])
+            .unwrap()
+    }
+
+    fn one_part(grid: OccupancyGrid, volume: u64, revision: u64) -> crate::articulated::SourcePart {
+        crate::articulated::SourcePart {
+            part_id: 7,
+            parent_id: None,
+            volume_id: VolumeId::new(volume).unwrap(),
+            source_revision: revision,
+            grid,
+            cell_m: 0.25,
+            local_transform: crate::articulated::PartTransform::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn articulated_topology_rebuild_installs_new_source_occupancy_atomically() {
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0, -9.81, 0.0],
+            ..PhysicsConfig::default()
+        });
+        let body = world
+            .add_articulated_body(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                3,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 70, 1)],
+                Representation::NativeVoxels,
+            )
+            .unwrap();
+        let hit = world
+            .raycast_articulated(body, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 2.0)
+            .unwrap();
+        assert_eq!(hit.source_revision, 1);
+        assert!(
+            world
+                .rebuild_articulated_part_grid(
+                    body,
+                    3,
+                    4,
+                    7,
+                    1,
+                    2,
+                    one_cell_grid(GlobalCell::new(4, 0, 0)),
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            world.raycast_articulated(body, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 2.0),
+            Err(crate::articulated::ArticulatedError::Miss)
+        ));
+        let moved = world
+            .raycast_articulated(body, [0.5, 0.125, 0.125], [1.0, 0.0, 0.0], 2.0)
+            .unwrap();
+        assert_eq!(moved.source_revision, 2);
+        assert_eq!(moved.topology_token, 4);
+
+        let stale = world.rebuild_articulated_part_grid(
+            body,
+            3,
+            5,
+            7,
+            2,
+            3,
+            one_cell_grid(GlobalCell::new(8, 0, 0)),
+        );
+        assert_eq!(
+            stale.unwrap_err(),
+            crate::articulated::ArticulatedError::StaleTopology
+        );
+        let still_current = world
+            .raycast_articulated(body, [0.5, 0.125, 0.125], [1.0, 0.0, 0.0], 2.0)
+            .unwrap();
+        assert_eq!(still_current.source_revision, 2);
+        assert_eq!(still_current.topology_token, 4);
+    }
+
+    #[test]
+    fn articulated_rejects_unrepresentable_source_and_shape_bounds_without_mutation() {
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        let body = world
+            .add_articulated_body(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 72, 1)],
+                Representation::NativeVoxels,
+            )
+            .unwrap();
+        let out_of_source_range = one_cell_grid(GlobalCell::new(i32::MAX as i64 + 1, 0, 0));
+        assert_eq!(
+            world
+                .rebuild_articulated_part_grid(body, 1, 2, 7, 1, 2, out_of_source_range)
+                .unwrap_err(),
+            crate::articulated::ArticulatedError::GeometryRange
+        );
+        let preserved = world
+            .raycast_articulated(body, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 2.0)
+            .unwrap();
+        assert_eq!(preserved.source_revision, 1);
+        assert_eq!(preserved.topology_token, 1);
+
+        let mut impossible_scale = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 73, 1);
+        impossible_scale.cell_m = f32::MAX;
+        assert_eq!(
+            world
+                .add_articulated_body(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![impossible_scale],
+                    Representation::NativeVoxels,
+                )
+                .unwrap_err(),
+            crate::articulated::ArticulatedError::GeometryRange
+        );
+    }
+
+    #[test]
+    fn articulated_rebuild_enforces_aggregate_dense_budget_before_mutation() {
+        fn sparse_grid(dims: [u32; 3]) -> OccupancyGrid {
+            let count = (u64::from(dims[0]) * u64::from(dims[1]) * u64::from(dims[2])) as usize;
+            let mut solid = vec![false; count];
+            let mut material = vec![MaterialId::AIR; count];
+            solid[0] = true;
+            material[0] = fixtures::STONE;
+            OccupancyGrid::from_solid_mask(GlobalCell::new(0, 0, 0), dims, solid, material).unwrap()
+        }
+        let mut root_part = one_part(sparse_grid([128, 128, 116]), 77, 1);
+        root_part.part_id = 1;
+        let mut child = one_part(sparse_grid([128, 128, 116]), 78, 1);
+        child.part_id = 2;
+        child.parent_id = Some(1);
+        child.local_transform.translation_m[0] = 0.5;
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        let body = world
+            .add_articulated_body(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![root_part, child],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let hit_before = world
+            .raycast_articulated(body, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 2.0)
+            .unwrap();
+        let result =
+            world.rebuild_articulated_part_grid(body, 1, 2, 1, 1, 2, sparse_grid([128, 128, 135]));
+        assert_eq!(
+            result.unwrap_err(),
+            crate::articulated::ArticulatedError::WorkBudget
+        );
+        let hit_after = world
+            .raycast_articulated(body, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 2.0)
+            .unwrap();
+        assert_eq!(hit_after.source_revision, hit_before.source_revision);
+        assert_eq!(hit_after.topology_token, hit_before.topology_token);
+        assert_eq!(world.articulated_collider_count(body), 2);
+    }
+
+    #[test]
+    fn articulated_source_volume_has_one_live_assembly_owner() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let first = world
+            .add_articulated_body(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 79, 1)],
+                Representation::NativeVoxels,
+            )
+            .unwrap();
+        let duplicate = world.add_articulated_body(
+            [2.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            1,
+            vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 79, 1)],
+            Representation::NativeVoxels,
+        );
+        assert_eq!(
+            duplicate.unwrap_err(),
+            crate::articulated::ArticulatedError::DuplicateVolume
+        );
+        assert_eq!(world.articulated_collider_count(first), 1);
+        world.retire_articulated_body(first);
+        assert!(
+            world
+                .add_articulated_body(
+                    [2.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 79, 2)],
+                    Representation::NativeVoxels,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn direct_character_sweep_exclusion_covers_every_source_part_collider() {
+        let dims = [1, 4, 1];
+        let child_grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            dims,
+            vec![true; 4],
+            vec![fixtures::STONE; 4],
+        )
+        .unwrap();
+        let mut root_part = one_part(child_grid.clone(), 82, 1);
+        root_part.part_id = 1;
+        root_part.local_transform.translation_m[0] = -5.0;
+        let mut child_part = one_part(child_grid, 83, 1);
+        child_part.part_id = 2;
+        child_part.parent_id = Some(1);
+        child_part.local_transform.translation_m[0] = 7.0;
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        let assembly = world
+            .add_articulated_body(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![root_part, child_part],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        world.sync_queries();
+        let movement = world.sweep_character_excluding(
+            crate::character::CharacterParams::DEFAULT,
+            [0.0, 0.0, 0.125],
+            [4.0, 0.0, 0.0],
+            1.0 / 60.0,
+            &[assembly.0],
+        );
+        assert!(
+            movement.translation_m[0] > 3.99,
+            "excluded assembly's non-primary child collider blocked the direct sweep: {movement:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_single_collider_lifecycle_calls_explicitly_reject_articulated_owners() {
+        let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let assembly = world
+            .add_articulated_body(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![one_part(grid.clone(), 84, 1)],
+                Representation::NativeVoxels,
+            )
+            .unwrap();
+        let owner = assembly.0;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.remove_collider(owner)))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.rebuild_collider(
+                owner,
+                &grid,
+                Representation::NativeVoxels
+            )))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.deactivate_body(owner)))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.reactivate_body(
+                owner,
+                &grid,
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0; 3],
+                [0.0; 3]
+            )))
+            .is_err()
+        );
+        assert_eq!(world.articulated_collider_count(assembly), 1);
+        assert!(!world.is_retired(owner));
+    }
+
+    #[test]
+    fn diagnostic_bounded_root_motion_vs_part_local_motion() {
+        fn run(root_motion: bool, representation: Representation) -> (f32, f32, usize) {
+            let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                ..PhysicsConfig::default()
+            });
+            let mut part = one_part(grid.clone(), if root_motion { 74 } else { 75 }, 1);
+            if !root_motion {
+                part.local_transform.translation_m[0] = -0.75;
+            }
+            let animal = world
+                .add_articulated_body(
+                    if root_motion {
+                        [-0.75, 0.0, 0.0]
+                    } else {
+                        [0.0; 3]
+                    },
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![part],
+                    representation,
+                )
+                .unwrap();
+            let probe = world.add_body(BodySpec {
+                kind: BodyKind::Dynamic { ccd: false },
+                representation,
+                grid,
+                cell_m: 0.25,
+                density_kg_m3: 1_000.0,
+                mass_properties: None,
+                translation_m: [0.0; 3],
+                linvel_m_s: [0.0; 3],
+            });
+            let mut impulse_sum = 0.0f32;
+            let mut contact_steps = 0usize;
+            for tick in 1..=60u64 {
+                let x = -0.75 + tick as f32 * 0.01;
+                if root_motion {
+                    world
+                        .set_next_articulated_root_pose(
+                            animal,
+                            1,
+                            tick - 1,
+                            tick,
+                            [x, 0.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        )
+                        .unwrap();
+                } else {
+                    world
+                        .update_articulated_pose(
+                            animal,
+                            ArticulatedPose {
+                                topology_token: 1,
+                                base_pose_token: tick - 1,
+                                pose_token: tick,
+                                parts: vec![(
+                                    7,
+                                    PartTransform {
+                                        translation_m: [x, 0.0, 0.0],
+                                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                                    },
+                                )],
+                            },
+                        )
+                        .unwrap();
+                }
+                world.step();
+                for contact in world
+                    .contact_impulses()
+                    .into_iter()
+                    .filter(|c| c.bodies.contains(&probe))
+                {
+                    impulse_sum += contact.normal_impulse_n_s;
+                    contact_steps += 1;
+                }
+            }
+            let state = world.body_state(probe);
+            (state.translation_m[0], impulse_sum, contact_steps)
+        }
+
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let root = run(true, representation);
+            let part = run(false, representation);
+            println!(
+                "bounded 60-step root motion {representation:?}: probe_x={}, impulse_sum={}, contact_steps={}; part-local: probe_x={}, impulse_sum={}, contact_steps={}",
+                root.0, root.1, root.2, part.0, part.1, part.2
+            );
+            assert!(
+                root.1 > 0.0,
+                "root-driven motion should produce a real Rapier response for {representation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_fast_one_tick_root_target_contacts_without_probe_response() {
+        let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        let animal = world
+            .add_articulated_body(
+                [-0.5, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![one_part(grid.clone(), 76, 1)],
+                Representation::NativeVoxels,
+            )
+            .unwrap();
+        let probe = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::NativeVoxels,
+            grid,
+            cell_m: 0.25,
+            density_kg_m3: 1_000.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        world
+            .set_next_articulated_root_pose(animal, 1, 0, 1, [0.0; 3], [0.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        world.step();
+        let state = world.body_state(probe);
+        let impulse: f32 = world
+            .contact_impulses()
+            .into_iter()
+            .filter(|contact| contact.bodies.contains(&probe))
+            .map(|contact| contact.normal_impulse_n_s)
+            .sum();
+        println!(
+            "fast one-tick 0.5m root target over 16.67ms: contact_pairs={}, probe_vx={}, probe_x={}, impulse_sum={impulse}",
+            world.contact_pair_count(),
+            state.linvel_m_s[0],
+            state.translation_m[0]
+        );
+        assert!(world.contact_pair_count() > 0);
+        assert!(state.linvel_m_s[0].abs() < 1.0e-6);
+        assert_eq!(impulse, 0.0);
+    }
+
+    #[test]
+    fn diagnostic_kinematic_root_crosses_fixed_terrain_but_character_sweep_blocks() {
+        let assembly_grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+        let terrain_grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [1, 8, 1],
+            vec![true; 8],
+            vec![fixtures::STONE; 8],
+        )
+        .unwrap();
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: terrain_grid,
+            cell_m: 0.25,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        let animal = world
+            .add_articulated_body(
+                [-1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![one_part(assembly_grid, 85, 1)],
+                Representation::NativeVoxels,
+            )
+            .unwrap();
+        for tick in 1..=120u64 {
+            world
+                .set_next_articulated_root_pose(
+                    animal,
+                    1,
+                    tick - 1,
+                    tick,
+                    [-1.0 + (tick as f32 / 60.0), 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                )
+                .unwrap();
+            world.step();
+        }
+        let root_x = world.body_state(animal.0).translation_m[0];
+        println!(
+            "2m root path through 0.25m fixed terrain over 2s: root_x={root_x}, contact_pairs={}, max_penetration={}m",
+            world.contact_pair_count(),
+            world.max_penetration_m()
+        );
+        assert!(
+            (root_x - 1.0).abs() < 0.001,
+            "kinematic target teleports through the fixed obstacle"
+        );
+        assert_eq!(
+            world.contact_pair_count(),
+            0,
+            "default Rapier active collision types omit kinematic-fixed pairs"
+        );
+
+        world.retire_articulated_body(animal);
+        world.sync_queries();
+        let movement = world.sweep_character_excluding(
+            crate::character::CharacterParams::DEFAULT,
+            [-1.0, 0.0, 0.125],
+            [2.0, 0.0, 0.0],
+            1.0 / 60.0,
+            &[],
+        );
+        println!(
+            "character query sweep through the same fixed terrain: moved_x={}",
+            movement.translation_m[0]
+        );
+        assert!(
+            movement.translation_m[0] < 1.5,
+            "query-based locomotion sweep should see and stop at terrain"
+        );
     }
 
     fn pushed_cube_speed(density_kg_m3: f64) -> (f32, f32) {

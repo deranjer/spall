@@ -19,6 +19,7 @@
 //! No GPU, window, or network dependency. This crate does not run the server
 //! tick; body/collider ownership and the authoritative edit path are T08.
 
+pub mod articulated;
 pub mod character;
 pub mod collider;
 pub mod coordinates;
@@ -32,6 +33,9 @@ pub mod region_set;
 pub mod report;
 pub mod world;
 
+pub use articulated::{
+    ArticulatedBodyId, ArticulatedError, ArticulatedPose, PartTransform, SourceCellHit, SourcePart,
+};
 pub use character::{
     CharacterMove, CharacterParams, CharacterState, PlayerInput, WaterSample, step_character,
     step_character_in_water,

@@ -27,6 +27,10 @@ required-features = ["client"]
 name = "ecology-clearing"
 path = "examples/ecology_clearing.rs"
 
+[[example]]
+name = "animal-collision-probe"
+path = "examples/animal_collision_probe.rs"
+
 [features]
 default = []
 client = [
