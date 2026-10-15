@@ -29,7 +29,7 @@ pub struct WeatherPresentation {
     particles: Vec<WeatherParticle>,
     last_camera: Option<Vec3>,
     last_epoch: Option<u64>,
-    phase_seconds: f32,
+    phase_seconds: f64,
     exposure_cache_key: Option<(i64, i64, i64, u64)>,
     exposure_grid: [bool; GRID_SIDE * GRID_SIDE],
     precipitation: f32,
@@ -113,7 +113,7 @@ impl WeatherPresentation {
         }
         self.last_camera = Some(position);
         self.last_epoch = Some(state.world_epoch);
-        self.phase_seconds = (self.phase_seconds + dt_seconds.clamp(0.0, 0.1)).rem_euclid(256.0);
+        self.phase_seconds += f64::from(dt_seconds.clamp(0.0, 0.1));
         let cell_m = volume.cell_size().metres() as f32;
         let cache_key = (
             (position.x / cell_m).floor() as i64,
@@ -179,32 +179,40 @@ impl WeatherPresentation {
         let desired = if self.precipitation > 0.005 {
             let scale = if snow { 1.0 } else { 1.25 };
             (self.precipitation * MAX_WEATHER_PARTICLES as f32 * scale).ceil() as usize
-        } else if self.wind > 0.08 {
+        } else if state.kind == WeatherKind::HighWind && self.wind > 0.08 {
             (self.wind * 180.0).ceil() as usize
         } else {
             0
         }
         .min(MAX_WEATHER_PARTICLES);
-        let wx = f32::from(state.wind_x_q15) / 32767.0;
-        let wz = f32::from(state.wind_z_q15) / 32767.0;
+        let wind_direction = Vec3::new(
+            f32::from(state.wind_x_q15) / 32767.0,
+            0.0,
+            f32::from(state.wind_z_q15) / 32767.0,
+        )
+        .normalize_or_zero();
+        let is_wind_cue = state.kind == WeatherKind::HighWind && self.precipitation <= 0.005;
+        let velocity = precipitation_velocity(state.kind, self.wind, wind_direction);
+        let fall_speed = -velocity.y;
         self.particles.clear();
         self.particles
             .reserve(desired.saturating_sub(self.particles.capacity()));
         for index in 0..desired {
             let h = hash(state.weather_seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let phase = unit(h) * 64.0;
-            let speed = if snow {
-                1.2 + self.wind * 3.5
+            let y = if fall_speed > 0.0 {
+                position.y + 20.0
+                    - (self.phase_seconds * f64::from(fall_speed) + f64::from(phase))
+                        .rem_euclid(24.0) as f32
             } else {
-                12.0 + self.wind * 15.0
+                position.y + (unit(hash(h ^ 0x0F0F)) * 16.0 - 8.0)
             };
-            let y = position.y + 20.0 - (self.phase_seconds * speed + phase).rem_euclid(24.0);
             let side_x = (unit(hash(h ^ 0xA5A5)) * 40.0 - 20.0
-                + self.phase_seconds * wx * (0.15 + self.wind) * 1.5)
+                + (self.phase_seconds * f64::from(velocity.x)).rem_euclid(40.0) as f32)
                 .rem_euclid(40.0)
                 - 20.0;
             let side_z = (unit(hash(h ^ 0x5A5A)) * 40.0 - 20.0
-                + self.phase_seconds * wz * (0.15 + self.wind) * 1.5)
+                + (self.phase_seconds * f64::from(velocity.z)).rem_euclid(40.0) as f32)
                 .rem_euclid(40.0)
                 - 20.0;
             let xz = Vec3::new(position.x + side_x, 0.0, position.z + side_z);
@@ -212,12 +220,6 @@ impl WeatherPresentation {
                 continue;
             }
             let centre = Vec3::new(position.x + side_x, y, position.z + side_z);
-            let direction = if snow {
-                Vec3::new(wx * (0.28 + self.wind), -1.0, wz * (0.28 + self.wind))
-            } else {
-                Vec3::new(wx * (0.2 + self.wind), -1.0, wz * (0.2 + self.wind))
-            };
-            let is_wind_cue = self.precipitation <= 0.005;
             let colour = if is_wind_cue {
                 [0.72, 0.78, 0.81, 0.24]
             } else if snow {
@@ -227,18 +229,22 @@ impl WeatherPresentation {
             };
             self.particles.push(WeatherParticle {
                 centre: centre.to_array(),
-                direction: direction.normalize_or_zero().to_array(),
+                direction: velocity.normalize_or_zero().to_array(),
                 length_m: if is_wind_cue {
                     0.8
+                } else if blizzard {
+                    0.18 + self.wind * 0.08
                 } else if snow {
-                    0.12 + self.wind * 0.08
+                    0.08
                 } else {
                     0.9 + self.wind * 0.45
                 },
                 width_m: if is_wind_cue {
                     0.07
+                } else if blizzard {
+                    0.035
                 } else if snow {
-                    0.035 + self.wind * 0.025
+                    0.07
                 } else {
                     0.018
                 },
@@ -274,6 +280,25 @@ impl WeatherPresentation {
             lighting,
         }
     }
+}
+
+/// World-space velocity shared by particle drift and the visible ribbon axis.
+/// Normal precipitation remains distinctly downward; blizzards carry a
+/// stronger crosswind while retaining a fall component, and wind-only cues
+/// stay horizontal.
+fn precipitation_velocity(kind: WeatherKind, gust: f32, wind: Vec3) -> Vec3 {
+    let gust = gust.clamp(0.0, 1.0);
+    if kind == WeatherKind::HighWind {
+        return wind * (2.0 + gust * 6.0);
+    }
+    let (fall, drift) = match kind {
+        WeatherKind::Rain => (13.0, gust * 1.8),
+        WeatherKind::Storm => (13.0, gust * 2.8),
+        WeatherKind::Snow => (2.5, gust * 0.45),
+        WeatherKind::Blizzard => (2.5, gust * 2.2),
+        WeatherKind::Clear | WeatherKind::HighWind => (0.0, 0.0),
+    };
+    Vec3::new(wind.x * drift, -fall, wind.z * drift)
 }
 
 fn sky_exposure_grid(camera: Vec3, volume: &Volume) -> [bool; GRID_SIDE * GRID_SIDE] {
@@ -517,6 +542,49 @@ mod tests {
             frame = p.update(&clear, &camera(), 0.1, &v);
         }
         assert_eq!(frame.lighting.wind, 0.0);
+        assert!(frame.particles.is_empty());
+    }
+
+    #[test]
+    fn precipitation_velocity_matches_downward_fall_and_wind_drift() {
+        let cardinal = Vec3::X;
+        let diagonal = Vec3::new(1.0, 0.0, 1.0).normalize();
+        let rain = precipitation_velocity(WeatherKind::Rain, 0.9, cardinal);
+        let snow = precipitation_velocity(WeatherKind::Snow, 0.9, diagonal);
+        let blizzard = precipitation_velocity(WeatherKind::Blizzard, 0.9, diagonal);
+        let slope = |velocity: Vec3| velocity.x.hypot(velocity.z) / -velocity.y;
+
+        assert!(rain.y < 0.0 && rain.x > 0.0 && rain.z == 0.0);
+        assert!(
+            rain.y / rain.length() < -0.99,
+            "normal rain must read as falling: {rain:?}"
+        );
+        assert!(
+            slope(rain) < 0.13,
+            "normal rain has only modest slant: {rain:?}"
+        );
+        assert!(snow.y < 0.0 && snow.x > 0.0 && snow.z > 0.0);
+        assert!(
+            snow.y / snow.length() < -0.98,
+            "normal snow stays downward: {snow:?}"
+        );
+        assert!(slope(blizzard) > slope(snow));
+        assert!(
+            slope(blizzard) < 0.8,
+            "blizzard still falls, not flat: {blizzard:?}"
+        );
+
+        let wind_only = precipitation_velocity(WeatherKind::HighWind, 0.9, diagonal);
+        assert_eq!(wind_only.y, 0.0);
+        assert!(wind_only.x > 0.0 && wind_only.z > 0.0);
+    }
+
+    #[test]
+    fn clear_weather_does_not_turn_background_gust_into_sideways_precipitation() {
+        let v = known_air();
+        let mut p = WeatherPresentation::new();
+        let clear = state(WeatherKind::Clear, 0);
+        let frame = p.update(&clear, &camera(), 0.1, &v);
         assert!(frame.particles.is_empty());
     }
 }
