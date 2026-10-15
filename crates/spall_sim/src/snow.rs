@@ -19,6 +19,12 @@ const SNOW_UPDATE_TILES_PER_TICK: usize = 16;
 const SNOW_STATE_SCHEMA: u16 = 1;
 const MAX_SNOW_STATE_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnowTileJournalState {
+    pub tile: [i32; 3],
+    pub state: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct DepthTransform {
     bias: i128,
@@ -74,6 +80,12 @@ struct ClimateSegment {
     delta_q32_per_tick: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingSnowScan {
+    birth_tick: u64,
+    retry_after_tick: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Cohort {
     id: SnowSurfaceId,
@@ -89,11 +101,13 @@ struct Cohort {
 pub struct SnowState {
     tiles: BTreeMap<(i32, i32, i32), Vec<Cohort>>,
     scanned_tiles: BTreeSet<(i32, i32)>,
-    pending_scans: BTreeMap<(i32, i32), u64>,
+    pending_scans: BTreeMap<(i32, i32), PendingSnowScan>,
     scan_cursor: Option<(i32, i32)>,
     resident_discovery_seeded: bool,
     #[serde(skip)]
     footprints: BTreeMap<(i32, i32, i32), Vec<SnowFootprint>>,
+    #[serde(skip)]
+    footprint_credits: BTreeMap<u64, u64>,
     snapshot_seq: u64,
     #[serde(skip)]
     next_footprint_id: u64,
@@ -131,6 +145,10 @@ impl SnowState {
         self.scanned_tiles.contains(&tile)
     }
 
+    pub fn needs_resident_discovery_seed(&self) -> bool {
+        !self.resident_discovery_seeded
+    }
+
     pub fn mark_tile_scanned(&mut self, tile: (i32, i32)) {
         self.scanned_tiles.insert(tile);
         self.pending_scans.remove(&tile);
@@ -142,8 +160,26 @@ impl SnowState {
         }
         self.pending_scans
             .entry(tile)
-            .and_modify(|existing| *existing = (*existing).max(birth_tick))
-            .or_insert(birth_tick);
+            .and_modify(|existing| {
+                existing.birth_tick = existing.birth_tick.max(birth_tick);
+                // Repeated proximity prioritization must not defeat unknown-tile
+                // backoff. A real geometry edit explicitly resets it below.
+                if birth_tick > 0 {
+                    existing.retry_after_tick = 0;
+                }
+            })
+            .or_insert(PendingSnowScan {
+                birth_tick,
+                retry_after_tick: 0,
+            });
+        self.dirty = true;
+    }
+
+    pub fn enqueue_edited_scan(&mut self, tile: (i32, i32), birth_tick: u64) {
+        self.enqueue_scan(tile, birth_tick.max(1));
+        if let Some(pending) = self.pending_scans.get_mut(&tile) {
+            pending.retry_after_tick = 0;
+        }
     }
 
     pub fn seed_resident_discovery(&mut self, bricks: &[spall_core::BrickCoord]) {
@@ -169,26 +205,55 @@ impl SnowState {
         &mut self,
         priority: &[(i32, i32)],
         limit: usize,
+        tick: u64,
     ) -> Vec<((i32, i32), u64)> {
         let mut selected = Vec::new();
         for tile in priority {
             if selected.len() == limit {
                 break;
             }
-            if let Some(birth) = self.pending_scans.remove(tile) {
-                selected.push((*tile, birth));
+            if self
+                .pending_scans
+                .get(tile)
+                .is_some_and(|pending| pending.retry_after_tick <= tick)
+                && let Some(pending) = self.pending_scans.remove(tile)
+            {
+                selected.push((*tile, pending.birth_tick));
             }
         }
-        let mut rest: Vec<_> = self.pending_scans.keys().copied().collect();
-        if let Some(cursor) = self.scan_cursor {
-            rest.sort_by_key(|key| (*key <= cursor, *key));
+        let cursor = self.scan_cursor;
+        let ready =
+            |(_, pending): &(&(i32, i32), &PendingSnowScan)| pending.retry_after_tick <= tick;
+        let mut rest = Vec::new();
+        if let Some(cursor) = cursor {
+            rest.extend(
+                self.pending_scans
+                    .range((
+                        std::ops::Bound::Excluded(cursor),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .filter(ready)
+                    .take(limit.saturating_sub(selected.len()))
+                    .map(|(key, _)| *key),
+            );
+        }
+        if rest.len() + selected.len() < limit {
+            let wrapped_count = limit.saturating_sub(selected.len() + rest.len());
+            let upper = cursor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included);
+            rest.extend(
+                self.pending_scans
+                    .range((std::ops::Bound::Unbounded, upper))
+                    .filter(ready)
+                    .take(wrapped_count)
+                    .map(|(key, _)| *key),
+            );
         }
         for tile in rest {
             if selected.len() == limit {
                 break;
             }
-            if let Some(birth) = self.pending_scans.remove(&tile) {
-                selected.push((tile, birth));
+            if let Some(pending) = self.pending_scans.remove(&tile) {
+                selected.push((tile, pending.birth_tick));
             }
         }
         if let Some((tile, _)) = selected.last() {
@@ -197,8 +262,14 @@ impl SnowState {
         selected
     }
 
-    pub fn retry_scan(&mut self, tile: (i32, i32), birth_tick: u64) {
-        self.pending_scans.entry(tile).or_insert(birth_tick);
+    pub fn retry_scan(&mut self, tile: (i32, i32), birth_tick: u64, tick: u64) {
+        let pending = self.pending_scans.entry(tile).or_insert(PendingSnowScan {
+            birth_tick,
+            retry_after_tick: tick.saturating_add(60),
+        });
+        pending.birth_tick = pending.birth_tick.max(birth_tick);
+        pending.retry_after_tick = pending.retry_after_tick.max(tick.saturating_add(60));
+        self.dirty = true;
     }
 
     pub fn tile_layers(&self, tile_x: i32, tile_z: i32) -> Vec<(i32, i32, i32)> {
@@ -209,12 +280,56 @@ impl SnowState {
             .collect()
     }
 
+    pub fn snapshot_page(
+        &mut self,
+        bounds: Option<[i32; 4]>,
+        after: Option<(i32, i32, i32)>,
+        limit: usize,
+        world_epoch: u64,
+        world_revision: u64,
+        tick: u64,
+    ) -> (Vec<SnowSurfaceFrame>, Option<(i32, i32, i32)>) {
+        let (lower, upper, z_bounds) = bounds.map_or_else(
+            || (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, None),
+            |[min_x, max_x, min_z, max_z]| {
+                (
+                    std::ops::Bound::Included((min_x, i32::MIN, i32::MIN)),
+                    std::ops::Bound::Included((max_x, i32::MAX, i32::MAX)),
+                    Some((min_z, max_z)),
+                )
+            },
+        );
+        let in_z = |(key, _): &(&(i32, i32, i32), &Vec<Cohort>)| {
+            z_bounds.is_none_or(|(min_z, max_z)| (min_z..=max_z).contains(&key.1))
+        };
+        let mut page = Vec::with_capacity(limit.saturating_add(1).min(17));
+        let start = after.map_or(lower, std::ops::Bound::Excluded);
+        for (key, _) in self
+            .tiles
+            .range((start, upper))
+            .filter(in_z)
+            .take(limit.saturating_add(1))
+        {
+            page.push(*key);
+        }
+        let has_more = page.len() > limit;
+        page.truncate(limit);
+        let next = has_more.then(|| page.last().copied()).flatten();
+        let frames = page
+            .into_iter()
+            .filter_map(|(x, z, y)| self.frame(x, z, y, world_epoch, world_revision, tick))
+            .collect();
+        (frames, next)
+    }
+
     pub fn mark_geometry_changed(&mut self, key: (i32, i32, i32)) {
         self.geometry_changed.insert(key);
     }
 
     pub fn take_geometry_changed_keys(&mut self) -> Vec<(i32, i32, i32)> {
-        std::mem::take(&mut self.geometry_changed).into_iter().collect()
+        std::mem::take(&mut self.geometry_changed)
+            .into_iter()
+            .collect()
     }
 
     /// Exact persistence bytes for one geometry journal event, including Q32
@@ -244,12 +359,23 @@ impl SnowState {
         if cohorts.len() > 256 {
             return Err("snow tile journal contains too many cohorts".into());
         }
+        let mut occupied = [0u64; 4];
+        let mut ids = BTreeSet::new();
         for cohort in &cohorts {
-            if cohort.climate_through_tick > self.climate_through_tick
+            if cohort.generation == 0
+                || cohort.id != surface_id(key.0, key.1, key.2, cohort.generation)
+                || !ids.insert(cohort.id)
+                || cohort.climate_through_tick > self.climate_through_tick
                 || cohort.depth_q32 > MAX_DEPTH_Q32
                 || cohort.mask.iter().all(|word| *word == 0)
             {
                 return Err("snow tile journal has invalid cohort state".into());
+            }
+            for (seen, mask) in occupied.iter_mut().zip(cohort.mask) {
+                if *seen & mask != 0 {
+                    return Err("snow tile journal cohort masks overlap".into());
+                }
+                *seen |= mask;
             }
         }
         if let Some(old) = self.tiles.remove(&key) {
@@ -257,12 +383,10 @@ impl SnowState {
                 self.remove_cursor(cohort.climate_through_tick);
             }
         }
-        if !cohorts.is_empty() {
-            for cohort in &cohorts {
-                self.add_cursor(cohort.climate_through_tick);
-            }
-            self.tiles.insert(key, cohorts);
+        for cohort in &cohorts {
+            self.add_cursor(cohort.climate_through_tick);
         }
+        self.tiles.insert(key, cohorts);
         self.footprints.remove(&key);
         self.changed.insert(key);
         self.dirty = true;
@@ -318,25 +442,28 @@ impl SnowState {
         {
             return Err("snow state climate transform is out of bounds".into());
         }
-        let mut prior_end = 0;
+        let mut prior_end = None;
         for segment in &self.climate {
             if segment.start_tick == 0
                 || segment.start_tick > segment.end_tick
                 || segment.end_tick > self.climate_through_tick
-                || segment.start_tick <= prior_end
+                || prior_end.is_some_and(|end: u64| segment.start_tick != end.saturating_add(1))
                 || segment.delta_q32_per_tick.unsigned_abs() > 150_000
             {
                 return Err("snow climate history is invalid".into());
             }
-            prior_end = segment.end_tick;
+            prior_end = Some(segment.end_tick);
         }
-        for cohorts in self.tiles.values() {
+        let mut ids = BTreeSet::new();
+        for (key, cohorts) in &self.tiles {
             if cohorts.len() > 256 {
                 return Err("snow tile has more than 256 cohorts".into());
             }
             let mut occupied = [0u64; 4];
             for cohort in cohorts {
                 if cohort.generation == 0
+                    || cohort.id != surface_id(key.0, key.1, key.2, cohort.generation)
+                    || !ids.insert(cohort.id)
                     || cohort.depth_q32 > MAX_DEPTH_Q32
                     || cohort.climate_through_tick > self.climate_through_tick
                     || cohort.mask.iter().all(|word| *word == 0)
@@ -365,6 +492,27 @@ impl SnowState {
         exposed: [u64; 4],
         tick: u64,
     ) {
+        self.reconcile_at(
+            tile_x,
+            tile_z,
+            top_cell_y,
+            geometry_revision,
+            exposed,
+            tick,
+            tick,
+        );
+    }
+
+    pub fn reconcile_at(
+        &mut self,
+        tile_x: i32,
+        tile_z: i32,
+        top_cell_y: i32,
+        geometry_revision: u64,
+        exposed: [u64; 4],
+        exposure_birth_tick: u64,
+        current_tick: u64,
+    ) {
         let key = (tile_x, tile_z, top_cell_y);
         self.catch_up_key(key);
         let old = self.tiles.remove(&key).unwrap_or_default();
@@ -391,18 +539,14 @@ impl SnowState {
                 mask: remaining,
                 generation,
                 depth_q32: 0,
-                climate_through_tick: tick,
+                climate_through_tick: exposure_birth_tick,
                 geometry_revision,
             });
-            self.add_cursor(tick);
+            self.add_cursor(exposure_birth_tick);
         }
         next.sort_by_key(|c| c.id);
-        if next.is_empty() {
-            self.footprints.remove(&key);
-        } else {
-            self.tiles.insert(key, next);
-            self.prune_footprints(key, tick);
-        }
+        self.tiles.insert(key, next);
+        self.prune_footprints(key, current_tick);
         self.changed.insert(key);
         self.dirty = true;
     }
@@ -518,6 +662,50 @@ impl SnowState {
         });
         self.changed.extend(expired);
         self.dirty |= before != self.footprints.values().map(Vec::len).sum::<usize>();
+        if delta != 0 {
+            let effect_q32 = i128::from(delta)
+                .unsigned_abs()
+                .saturating_mul(u128::from(steps));
+            let effect_q32 = effect_q32.min(u128::from(u64::MAX)) as u64;
+            let mut changed = Vec::new();
+            self.footprints.retain(|key, marks| {
+                for mark in marks.iter_mut() {
+                    let credit = self.footprint_credits.entry(mark.id).or_default();
+                    *credit = credit.saturating_add(effect_q32);
+                    let lost = (*credit / (Q32_PER_METRE / 500)).min(u64::from(mark.strength_q8));
+                    if lost > 0 {
+                        mark.strength_q8 = mark.strength_q8.saturating_sub(lost as u8);
+                        *credit %= Q32_PER_METRE / 500;
+                        changed.push(*key);
+                    }
+                }
+                let before = marks.len();
+                if delta < 0 {
+                    marks.retain(|mark| {
+                        self.tiles.get(key).is_some_and(|cohorts| {
+                            cohorts.iter().any(|cohort| {
+                                cohort.id == mark.surface_id
+                                    && cohort.depth_q32 >= Q32_PER_METRE / 500
+                            })
+                        })
+                    });
+                }
+                if marks.len() != before {
+                    changed.push(*key);
+                }
+                !marks.is_empty()
+            });
+            for key in changed {
+                self.changed.insert(key);
+            }
+            let active: BTreeSet<_> = self
+                .footprints
+                .values()
+                .flatten()
+                .map(|mark| mark.id)
+                .collect();
+            self.footprint_credits.retain(|id, _| active.contains(id));
+        }
         Ok(())
     }
 
@@ -566,6 +754,7 @@ impl SnowState {
             return false;
         }
         marks.push(mark);
+        self.footprint_credits.insert(mark.id, 0);
         marks.sort_by_key(|m| m.id);
         if marks.len() > 64 {
             marks.remove(0);
@@ -698,10 +887,18 @@ impl SnowState {
     }
 
     fn prune_history(&mut self) {
-        let minimum = self
+        let mut minimum = self
             .cursor_counts
             .first_key_value()
             .map_or(self.climate_through_tick, |(tick, _)| *tick);
+        minimum = minimum.min(
+            self.pending_scans
+                .values()
+                .map(|pending| pending.birth_tick)
+                .filter(|tick| *tick > 0)
+                .min()
+                .unwrap_or(self.climate_through_tick),
+        );
         while self
             .climate
             .front()
@@ -746,6 +943,13 @@ impl SnowState {
         if marks.is_empty() {
             self.footprints.remove(&key);
         }
+        let active: BTreeSet<_> = self
+            .footprints
+            .values()
+            .flatten()
+            .map(|mark| mark.id)
+            .collect();
+        self.footprint_credits.retain(|id, _| active.contains(id));
     }
 }
 
@@ -924,6 +1128,83 @@ mod tests {
         }
         let expected = reference.frame(0, 0, 0, 1, 0, 40).unwrap().surfaces[0].depth_q16;
         assert_eq!(lagging, expected, "climate spans retain operation order");
+    }
+
+    #[test]
+    fn pending_discovery_retains_birth_and_unknown_retry_backoff() {
+        let mut state = SnowState::new();
+        state.enqueue_scan((4, 0), 0);
+        state.enqueue_edited_scan((9, 0), 12);
+        let first = state.take_scan_batch(&[(4, 0), (9, 0)], 1, 20);
+        assert_eq!(first, vec![((4, 0), 0)]);
+        state.retry_scan((4, 0), 0, 20);
+        state.enqueue_scan((4, 0), 0);
+        let restored =
+            SnowState::from_canonical_bytes(&state.to_canonical_bytes().unwrap()).unwrap();
+        assert!(restored.pending_scans.contains_key(&(9, 0)));
+        assert_eq!(restored.pending_scans[&(9, 0)].birth_tick, 12);
+        assert!(
+            !state
+                .take_scan_batch(&[(4, 0)], 1, 79)
+                .iter()
+                .any(|(tile, _)| *tile == (4, 0))
+        );
+        assert_eq!(state.take_scan_batch(&[(4, 0)], 1, 80), vec![((4, 0), 0)]);
+    }
+
+    #[test]
+    fn snapshot_pages_are_bounded_and_cycle_through_keys() {
+        let mut state = SnowState::new();
+        for x in 0..11 {
+            state.reconcile(x, 0, 0, 1, mask(&[0]), 0);
+        }
+        let mut cursor = None;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let (page, next) = state.snapshot_page(Some([0, 10, 0, 0]), cursor, 3, 1, 0, 0);
+            assert!(page.len() <= 3);
+            seen.extend(page.iter().map(|frame| frame.tile_x));
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen, (0..11).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fresh_snow_fades_marks_even_at_depth_cap_and_warm_melt_removes_them() {
+        let mut snow = SnowState::new();
+        snow.reconcile(0, 0, 7, 2, mask(&[0]), 0);
+        let cold = weather(WeatherKind::Snow, -800);
+        for tick in 1..=20_000 {
+            snow.advance(&cold, tick).unwrap();
+        }
+        let candidate = crate::footprints::FootfallCandidate {
+            player: EntityId::new(1).unwrap(),
+            position_m: [0.125, 2.0, 0.125],
+            heading_q15: 0,
+            foot: 0,
+            tick: 20_000,
+        };
+        assert!(snow.stamp(candidate, [0, 7, 0], 2, 20_000));
+        let before = snow.frame(0, 0, 7, 1, 0, 20_000).unwrap().footprints[0].strength_q8;
+        for tick in 20_001..=20_600 {
+            snow.advance(&cold, tick).unwrap();
+        }
+        let covered = snow.frame(0, 0, 7, 1, 0, 20_600).unwrap();
+        assert_eq!(covered.surfaces[0].depth_q16, SNOW_MAX_DEPTH_Q16);
+        assert!(covered.footprints[0].strength_q8 < before);
+        let warm = weather(WeatherKind::Rain, 2_000);
+        for tick in 20_601..=29_000 {
+            snow.advance(&warm, tick).unwrap();
+        }
+        assert!(
+            snow.frame(0, 0, 7, 1, 0, 29_000)
+                .unwrap()
+                .footprints
+                .is_empty()
+        );
     }
 
     #[test]

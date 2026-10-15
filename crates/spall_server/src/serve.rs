@@ -2846,6 +2846,7 @@ async fn serve_async(
             u64,
             crate::column_water_replication::ColumnWaterPublisher,
         > = HashMap::new();
+        let mut snow_page_cursor: HashMap<u64, Option<(i32, i32, i32)>> = HashMap::new();
         let mut water_keyframes_sent = 0u64;
         let mut water_bytes_queued = 0u64;
         let mut pending_admin: Vec<(SessionId, spall_protocol::AdminRequest)> = Vec::new();
@@ -3147,6 +3148,7 @@ async fn serve_async(
                         lj.on_gone(session);
                         player_principals.remove(&session.raw());
                         column_water_sent.remove(&session.raw());
+                        snow_page_cursor.remove(&session.raw());
                     }
                 }
             }
@@ -3255,6 +3257,7 @@ async fn serve_async(
                                 prev_body_y.clear();
                                 body_stable_ticks = 0;
                                 column_water_sent.clear();
+                                snow_page_cursor.clear();
                                 if let Some(drops) = playground_drops.as_mut() {
                                     *drops = playground_drop_schedules(&sim);
                                 }
@@ -3824,42 +3827,29 @@ async fn serve_async(
                         Outbound::Water(Arc::clone(&records)),
                     );
                 }
-                let changed = sim.take_snow_frames();
+            }
+            // Snow keyframes are sent as bounded per-session pages. This keeps
+            // far-world discovery and late joins bounded without dropping dirty
+            // layers or building an unbounded vector for one client.
+            if tick.get().is_multiple_of(6) {
                 for session in lj.live_sessions().collect::<Vec<_>>() {
                     let bounds = lj.snow_interest(&sim, session);
+                    let Some(bounds) = bounds else { continue };
                     if water_backlogged(&clients_for_sim, session) {
                         continue;
                     }
-                    let in_bounds = |frame: &spall_protocol::SnowSurfaceFrame| {
-                        bounds.is_none_or(|[min_x, max_x, min_z, max_z]| {
-                            (min_x..=max_x).contains(&frame.tile_x)
-                                && (min_z..=max_z).contains(&frame.tile_z)
-                        })
-                    };
-                    let mut by_key = std::collections::BTreeMap::new();
-                    for frame in changed.iter().filter(|frame| in_bounds(frame)) {
-                        by_key.insert(
-                            (frame.tile_x, frame.tile_z, frame.top_cell_y),
-                            frame.clone(),
-                        );
-                    }
-                    // Snapshot frames are newer than any changed frame for the
-                    // same layer, so this also preserves strict per-key order.
-                    for frame in sim.snow_snapshot_frames(bounds) {
-                        by_key.insert(
-                            (frame.tile_x, frame.tile_z, frame.top_cell_y),
-                            frame,
-                        );
-                    }
-                    let records: Vec<_> = by_key
-                        .into_values()
-                        .map(WireRecord::SnowSurfaceFrame)
-                        .collect();
-                    for page in records.chunks(4) {
+                    let cursor = snow_page_cursor.get(&session.raw()).copied().flatten();
+                    let (frames, next) = sim.snow_snapshot_page(Some(bounds), cursor, 4);
+                    snow_page_cursor.insert(session.raw(), next);
+                    if !frames.is_empty() {
+                        let records = frames
+                            .into_iter()
+                            .map(WireRecord::SnowSurfaceFrame)
+                            .collect();
                         send_to(
                             &clients_for_sim,
                             session,
-                            Outbound::Water(Arc::new(page.to_vec())),
+                            Outbound::Water(Arc::new(records)),
                         );
                     }
                 }
@@ -5056,12 +5046,12 @@ impl LateJoin {
     }
 
     fn snow_interest(&self, sim: &Simulation, session: SessionId) -> Option<[i32; 4]> {
-        let radius = self.links.get(&session.raw())?.region_radius?;
+        let radius = self.links.get(&session.raw())?.region_radius.unwrap_or(11);
         let player = sim.player_state(session_player_entity(session))?;
         let tile = |meters: f64| (meters / 4.0).floor() as i64;
         let x = tile(player.position_m[0]);
         let z = tile(player.position_m[2]);
-        let radius_tiles = i64::from(radius).saturating_mul(2).saturating_add(2);
+        let radius_tiles = radius.saturating_mul(2).saturating_add(2);
         Some([
             i32::try_from(x.saturating_sub(radius_tiles)).ok()?,
             i32::try_from(x.saturating_add(radius_tiles)).ok()?,
@@ -5886,15 +5876,15 @@ fn tick_journal_batch(
         });
         *journalled_through = seq.0;
     }
-    for (key, state) in sim.take_snow_journal_tiles().map_err(|e| e.to_string())? {
+    for snow_tile in sim.take_snow_journal_tiles().map_err(|e| e.to_string())? {
         let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
         batch.push(spall_store::JournalRecord {
             seq: seq.0,
             tick,
             payload: spall_store::JournalPayload::SnowTileState {
                 world_epoch: sim.weather_state().world_epoch,
-                tile: [key.0, key.1, key.2],
-                state,
+                tile: snow_tile.tile,
+                state: snow_tile.state,
             },
         });
         *journalled_through = seq.0;

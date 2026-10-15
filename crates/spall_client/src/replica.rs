@@ -26,6 +26,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
+const MAX_SNOW_CACHE_FRAMES: usize = 4_096;
+const MAX_SNOW_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+fn snow_frame_bytes(frame: &spall_protocol::SnowSurfaceFrame) -> usize {
+    64 + frame.surfaces.len() * 66 + frame.footprints.len() * 60
+}
+
 use spall_core::{
     BrickCoord, CellSizeCode, EntityId, GlobalCell, MaterialId, Pose, Revision, TransactionId,
     VolumeId,
@@ -419,8 +426,10 @@ pub struct ReplicaWorld {
     weather: Option<spall_protocol::WeatherState>,
     weather_epoch_floor: u64,
     snow: BTreeMap<(i32, i32, i32), spall_protocol::SnowSurfaceFrame>,
-    snow_versions: BTreeMap<(i32, i32, i32), (u64, u64)>,
+    snow_lru: VecDeque<(i32, i32, i32)>,
+    snow_cache_bytes: usize,
     snow_epoch_floor: u64,
+    snow_sequence_floor: u64,
     snow_generation: u64,
 }
 
@@ -689,8 +698,10 @@ impl ReplicaWorld {
             weather: None,
             weather_epoch_floor: 0,
             snow: BTreeMap::new(),
-            snow_versions: BTreeMap::new(),
+            snow_lru: VecDeque::new(),
+            snow_cache_bytes: 0,
             snow_epoch_floor: 0,
+            snow_sequence_floor: 0,
             snow_generation: 0,
         }
     }
@@ -726,8 +737,10 @@ impl ReplicaWorld {
             weather: None,
             weather_epoch_floor: 0,
             snow: BTreeMap::new(),
-            snow_versions: BTreeMap::new(),
+            snow_lru: VecDeque::new(),
+            snow_cache_bytes: 0,
             snow_epoch_floor: 0,
+            snow_sequence_floor: 0,
             snow_generation: 0,
         }
     }
@@ -830,7 +843,9 @@ impl ReplicaWorld {
         self.weather = None;
         self.snow_epoch_floor = self.snow_epoch_floor.saturating_add(1);
         self.snow.clear();
-        self.snow_versions.clear();
+        self.snow_lru.clear();
+        self.snow_cache_bytes = 0;
+        self.snow_sequence_floor = 0;
         self.snow_generation = self.snow_generation.saturating_add(1);
         // A replacement baseline supersedes any catalogue still arriving for the old one.
         self.catalogue_pending = None;
@@ -842,7 +857,8 @@ impl ReplicaWorld {
     /// Accept a bounded weather keyframe only when its tick and revision do not regress.
     pub fn apply_weather(&mut self, state: spall_protocol::WeatherState) -> Result<(), String> {
         state.validate().map_err(|e| e.to_string())?;
-        if state.world_epoch < self.weather_epoch_floor {
+        if state.world_epoch < self.weather_epoch_floor || state.world_epoch < self.snow_epoch_floor
+        {
             return Err("stale weather epoch".into());
         }
         if let Some(old) = &self.weather
@@ -854,9 +870,26 @@ impl ReplicaWorld {
         {
             return Err("stale weather revision".into());
         }
-        self.snow_epoch_floor = self.snow_epoch_floor.max(state.world_epoch);
-        self.snow
-            .retain(|_, frame| frame.world_epoch >= self.snow_epoch_floor);
+        if state.world_epoch > self.snow_epoch_floor {
+            self.snow_epoch_floor = state.world_epoch;
+            self.snow.clear();
+            self.snow_lru.clear();
+            self.snow_cache_bytes = 0;
+            self.snow_sequence_floor = 0;
+            self.snow_generation = self.snow_generation.saturating_add(1);
+        } else {
+            let stale: Vec<_> = self
+                .snow
+                .iter()
+                .filter_map(|(key, frame)| {
+                    (frame.world_epoch < self.snow_epoch_floor).then_some(*key)
+                })
+                .collect();
+            for key in stale {
+                self.remove_snow_key(key);
+                self.snow_generation = self.snow_generation.saturating_add(1);
+            }
+        }
         self.weather = Some(state);
         Ok(())
     }
@@ -875,19 +908,36 @@ impl ReplicaWorld {
         if frame.world_epoch < self.snow_epoch_floor {
             return Err("stale snow world epoch".into());
         }
-        let key = (frame.tile_x, frame.tile_z, frame.top_cell_y);
-        if let Some((epoch, seq)) = self.snow_versions.get(&key)
-            && (frame.world_epoch < *epoch
-                || (frame.world_epoch == *epoch && frame.snapshot_seq <= *seq))
-        {
-            return Err("stale snow tile sequence".into());
+        if frame.world_epoch > self.snow_epoch_floor {
+            self.snow_epoch_floor = frame.world_epoch;
+            self.snow.clear();
+            self.snow_lru.clear();
+            self.snow_cache_bytes = 0;
+            self.snow_sequence_floor = 0;
+            self.snow_generation = self.snow_generation.saturating_add(1);
         }
-        self.snow_versions
-            .insert(key, (frame.world_epoch, frame.snapshot_seq));
+        if frame.snapshot_seq <= self.snow_sequence_floor {
+            return Err("stale snow stream sequence".into());
+        }
+        let key = (frame.tile_x, frame.tile_z, frame.top_cell_y);
+        self.snow_sequence_floor = frame.snapshot_seq;
+        self.remove_snow_key(key);
         if frame.surfaces.is_empty() && frame.footprints.is_empty() {
-            self.snow.remove(&key);
+            // The reliable ordered stream sequence is the tombstone fence.
         } else {
+            self.snow_cache_bytes = self
+                .snow_cache_bytes
+                .saturating_add(snow_frame_bytes(&frame));
+            self.snow_lru.push_back(key);
             self.snow.insert(key, frame);
+            while self.snow.len() > MAX_SNOW_CACHE_FRAMES
+                || self.snow_cache_bytes > MAX_SNOW_CACHE_BYTES
+            {
+                let Some(oldest) = self.snow_lru.pop_front() else {
+                    break;
+                };
+                self.remove_snow_key(oldest);
+            }
         }
         self.snow_generation = self.snow_generation.saturating_add(1);
         Ok(())
@@ -909,6 +959,13 @@ impl ReplicaWorld {
     /// Changes only when an atomic snow frame or full world replacement lands.
     pub fn snow_generation(&self) -> u64 {
         self.snow_generation
+    }
+
+    fn remove_snow_key(&mut self, key: (i32, i32, i32)) {
+        if let Some(old) = self.snow.remove(&key) {
+            self.snow_cache_bytes = self.snow_cache_bytes.saturating_sub(snow_frame_bytes(&old));
+        }
+        self.snow_lru.retain(|candidate| *candidate != key);
     }
 
     /// Marks the baseline just installed as missing its distant terrain
@@ -2812,6 +2869,44 @@ mod tests {
         replica.install_baseline_world(&world).unwrap();
         assert!(replica.apply_snow_frame(frame(2, 6, 3)).is_err());
         assert_eq!(replica.snow_frames().count(), 0);
+    }
+
+    #[test]
+    fn snow_replica_cache_is_bounded_and_future_epoch_fences_old_tiles() {
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let make_frame = |epoch: u64, sequence: u64, tile_x: i32| {
+            let mut mask = [0; 4];
+            mask[0] = 1;
+            spall_protocol::SnowSurfaceFrame {
+                schema: spall_protocol::SNOW_SCHEMA,
+                world_epoch: epoch,
+                world_revision: 0,
+                effective_tick: 1,
+                snapshot_seq: sequence,
+                tile_x,
+                tile_z: 0,
+                top_cell_y: 0,
+                surfaces: vec![spall_protocol::SnowSurface {
+                    id: spall_protocol::SnowSurfaceId([sequence as u8; 16]),
+                    top_cell_y: 0,
+                    geometry_revision: 1,
+                    exposure_generation: 1,
+                    exposed_faces: mask,
+                    depth_q16: spall_protocol::SNOW_MIN_FOOTPRINT_DEPTH_Q16,
+                }],
+                footprints: vec![],
+            }
+        };
+        replica.apply_snow_frame(make_frame(2, 1, 0)).unwrap();
+        replica.apply_snow_frame(make_frame(3, 2, 0)).unwrap();
+        assert!(replica.apply_snow_frame(make_frame(2, 3, 1)).is_err());
+        for sequence in 3..=u64::try_from(MAX_SNOW_CACHE_FRAMES + 1).unwrap() {
+            replica
+                .apply_snow_frame(make_frame(3, sequence, sequence as i32))
+                .unwrap();
+        }
+        assert!(replica.snow_frames().count() <= MAX_SNOW_CACHE_FRAMES);
+        assert!(replica.snow_cache_bytes <= MAX_SNOW_CACHE_BYTES);
     }
 
     #[test]

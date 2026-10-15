@@ -731,8 +731,12 @@ pub fn restore_with_terrain_collider_mode(
         sim.restore_weather(state)
             .map_err(|_| PersistError::BadField("weather recovery"))?;
     }
-    sim.restore_snow_state(&snow.to_canonical_bytes().map_err(|_| PersistError::BadField("snow recovery encode"))?)
-        .map_err(|_| PersistError::BadField("snow recovery"))?;
+    sim.restore_snow_state(
+        &snow
+            .to_canonical_bytes()
+            .map_err(|_| PersistError::BadField("snow recovery encode"))?,
+    )
+    .map_err(|_| PersistError::BadField("snow recovery"))?;
     sim.restore_vegetation(&vegetation_state)
         .map_err(|_| PersistError::BadField("vegetation recovery"))?;
     if !had_weather_state {

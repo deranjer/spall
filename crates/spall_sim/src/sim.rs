@@ -685,11 +685,16 @@ impl Simulation {
 
     pub fn take_snow_journal_tiles(
         &mut self,
-    ) -> Result<Vec<((i32, i32, i32), Vec<u8>)>, String> {
+    ) -> Result<Vec<crate::snow::SnowTileJournalState>, String> {
         self.snow
             .take_geometry_changed_keys()
             .into_iter()
-            .map(|key| Ok((key, self.snow.tile_canonical_bytes(key)?)))
+            .map(|key| {
+                Ok(crate::snow::SnowTileJournalState {
+                    tile: [key.0, key.1, key.2],
+                    state: self.snow.tile_canonical_bytes(key)?,
+                })
+            })
             .collect()
     }
 
@@ -715,6 +720,25 @@ impl Simulation {
                 )
             })
             .collect()
+    }
+
+    pub fn snow_snapshot_page(
+        &mut self,
+        tile_bounds: Option<[i32; 4]>,
+        after: Option<(i32, i32, i32)>,
+        limit: usize,
+    ) -> (
+        Vec<spall_protocol::SnowSurfaceFrame>,
+        Option<(i32, i32, i32)>,
+    ) {
+        self.snow.snapshot_page(
+            tile_bounds,
+            after,
+            limit,
+            self.weather.world_epoch,
+            self.weather.world_revision,
+            self.tick.get(),
+        )
     }
 
     /// Verifies recovered weather still points at the world's frozen clock source.
@@ -1245,24 +1269,45 @@ impl Simulation {
     }
 
     fn refresh_snow_from_report(&mut self, report: &TickReport) {
-        use std::collections::BTreeSet;
         use spall_core::CellSizeCode;
+        use std::collections::BTreeSet;
 
         let terrain = &self.world.terrain().volume;
-        if terrain.cell_size() != CellSizeCode::Quarter {
+        if terrain.cell_size() != CellSizeCode::Quarter || terrain.bounds().is_none() {
             return;
         }
-        let Some(bounds) = terrain.bounds() else {
+        let bounds = terrain.bounds().expect("checked above");
+        let Ok(min_tile_x) = i32::try_from(bounds.min.x.saturating_mul(2)) else {
             return;
         };
-        let min_y = bounds.min.y.saturating_mul(32);
-        let max_y = bounds.max.y.saturating_mul(32).saturating_add(31);
-        if max_y.saturating_sub(min_y) > 4096 {
+        let Ok(max_tile_x) = i32::try_from(
+            bounds
+                .max
+                .x
+                .saturating_add(1)
+                .saturating_mul(2)
+                .saturating_sub(1),
+        ) else {
             return;
+        };
+        let Ok(min_tile_z) = i32::try_from(bounds.min.z.saturating_mul(2)) else {
+            return;
+        };
+        let Ok(max_tile_z) = i32::try_from(
+            bounds
+                .max
+                .z
+                .saturating_add(1)
+                .saturating_mul(2)
+                .saturating_sub(1),
+        ) else {
+            return;
+        };
+        if self.snow.needs_resident_discovery_seed() {
+            self.snow
+                .seed_resident_discovery(&terrain.resident_brick_coords());
         }
-        self.snow
-            .seed_resident_discovery(&terrain.resident_brick_coords());
-        let mut priority = Vec::new();
+        let mut player_tiles = Vec::new();
         for player in self.world.players() {
             let tile_x = (player.state.position_m[0] / 4.0).floor();
             let tile_z = (player.state.position_m[2] / 4.0).floor();
@@ -1274,17 +1319,36 @@ impl Simulation {
                 continue;
             }
             let (tile_x, tile_z) = (tile_x as i32, tile_z as i32);
-            for radius in 0i32..=24 {
-                for dz in -radius..=radius {
-                    for dx in -radius..=radius {
-                        if dx.abs().max(dz.abs()) != radius {
-                            continue;
-                        }
-                        if let (Some(x), Some(z)) =
-                            (tile_x.checked_add(dx), tile_z.checked_add(dz))
-                        {
-                            self.snow.enqueue_scan((x, z), 0);
-                            priority.push((x, z));
+            player_tiles.push((tile_x, tile_z));
+        }
+        let mut priority = Vec::new();
+        for &(x, z) in &player_tiles {
+            if !(min_tile_x..=max_tile_x).contains(&x) || !(min_tile_z..=max_tile_z).contains(&z) {
+                continue;
+            }
+            self.snow.enqueue_scan((x, z), 0);
+            priority.push((x, z));
+        }
+        // Refresh the bounded 96 m discovery window once a second. Center
+        // tiles stay prioritized every tick; outer work then advances fairly.
+        if self.tick.get() <= 1 || self.tick.get().is_multiple_of(60) {
+            for radius in 1i32..=24 {
+                for &(tile_x, tile_z) in &player_tiles {
+                    for dz in -radius..=radius {
+                        for dx in -radius..=radius {
+                            if dx.abs().max(dz.abs()) != radius {
+                                continue;
+                            }
+                            if let (Some(x), Some(z)) =
+                                (tile_x.checked_add(dx), tile_z.checked_add(dz))
+                            {
+                                if !(min_tile_x..=max_tile_x).contains(&x)
+                                    || !(min_tile_z..=max_tile_z).contains(&z)
+                                {
+                                    continue;
+                                }
+                                self.snow.enqueue_scan((x, z), 0);
+                            }
                         }
                     }
                 }
@@ -1306,90 +1370,83 @@ impl Simulation {
                     let tz = brick.z.saturating_mul(2).saturating_add(dz);
                     if let (Ok(tx), Ok(tz)) = (i32::try_from(tx), i32::try_from(tz)) {
                         affected.insert((tx, tz));
-                    self.snow.enqueue_scan((tx, tz), self.tick.get());
+                        self.snow.enqueue_edited_scan((tx, tz), self.tick.get());
                     }
                 }
             }
         }
-        let work = self.snow.take_scan_batch(&priority, 16);
+        let work = self.snow.take_scan_batch(&priority, 16, self.tick.get());
+        let water = self.column_water.as_ref().map(|w| w.frame());
+        let water_sampler = water.as_ref().map(|frame| frame.sampler());
         for ((tile_x, tile_z), birth_tick) in work {
             let was_scanned = self.snow.tile_scanned((tile_x, tile_z));
             let edited_tile = affected.contains(&(tile_x, tile_z));
-            let x0 = i64::from(tile_x) * 16;
-            let z0 = i64::from(tile_z) * 16;
-            let water = self.column_water.as_ref().map(|w| w.frame());
-            let water_sampler = water.as_ref().map(|frame| frame.sampler());
             let mut layers = BTreeSet::new();
             let mut masks = std::collections::BTreeMap::<i32, ([u64; 4], u64)>::new();
-            let mut uncertain = false;
-            'columns: for dz in 0..16i64 {
-                for dx in 0..16i64 {
-                    let mut found = None;
-                    for y in (min_y..=max_y).rev() {
-                        let cell = GlobalCell::new(x0 + dx, y, z0 + dz);
-                        match terrain.sample(cell) {
-                            Ok(Sample::Empty { .. }) => {}
-                            Ok(Sample::Filled(_)) => {
-                                let (brick, _) = cell.split();
-                                let Some(revision) = terrain
-                                    .brick_revision(brick)
-                                    .ok()
-                                    .flatten()
-                                    .map(|revision| revision.get())
-                                else {
-                                    uncertain = true;
-                                    continue 'columns;
-                                };
-                                found = Some((y, revision));
-                                break;
-                            }
-                            Ok(Sample::Unknown(_)) | Err(_) => {
-                                uncertain = true;
-                                continue 'columns;
-                            }
-                        }
+            let geometry = match crate::snow_query::query_snow_tile(terrain, tile_x, tile_z) {
+                Ok(geometry) => geometry,
+                Err(crate::snow_query::SnowTileQueryError::OutsideBounds) => {
+                    self.snow.mark_tile_scanned((tile_x, tile_z));
+                    continue;
+                }
+                Err(
+                    crate::snow_query::SnowTileQueryError::UnsupportedCellSize
+                    | crate::snow_query::SnowTileQueryError::MissingBounds
+                    | crate::snow_query::SnowTileQueryError::VerticalSpan
+                    | crate::snow_query::SnowTileQueryError::CoordinateRange,
+                ) => {
+                    self.snow.mark_tile_scanned((tile_x, tile_z));
+                    continue;
+                }
+                Err(_) => {
+                    self.snow
+                        .retry_scan((tile_x, tile_z), birth_tick, self.tick.get());
+                    continue;
+                }
+            };
+            let x0 = i64::from(tile_x) * 16;
+            let z0 = i64::from(tile_z) * 16;
+            for (y, layer) in geometry.layers {
+                let mut mask = layer.exposed_faces;
+                for bit in 0..256usize {
+                    if mask[bit / 64] & (1u64 << (bit % 64)) == 0 {
+                        continue;
                     }
-                    if let Some((y, revision)) = found {
-                        let top_m = (y + 1) as f64 * 0.25;
-                        if water_sampler
-                            .as_ref()
-                            .and_then(|sampler| {
-                                sampler.sample_at_m(
-                                    (x0 + dx) as f64 * 0.25 + 0.125,
-                                    top_m + 0.01,
-                                    (z0 + dz) as f64 * 0.25 + 0.125,
-                                )
-                            })
-                            .is_some_and(|surface| surface.surface_y > top_m + 0.02)
-                        {
-                            continue;
-                        }
-                        let bit = dz as usize * 16 + dx as usize;
-                        let entry = masks.entry(i32::try_from(y).unwrap_or(i32::MAX)).or_default();
-                        if entry.1 != 0 && entry.1 != revision {
-                            uncertain = true;
-                            continue;
-                        }
-                        entry.1 = revision;
-                        entry.0[bit / 64] |= 1u64 << (bit % 64);
+                    let dx = (bit % 16) as i64;
+                    let dz = (bit / 16) as i64;
+                    let top_m = (f64::from(y) + 1.0) * 0.25;
+                    if water_sampler
+                        .as_ref()
+                        .and_then(|sampler| {
+                            sampler.sample_at_m(
+                                (x0 + dx) as f64 * 0.25 + 0.125,
+                                top_m + 0.01,
+                                (z0 + dz) as f64 * 0.25 + 0.125,
+                            )
+                        })
+                        .is_some_and(|surface| surface.surface_y > top_m + 0.02)
+                    {
+                        mask[bit / 64] &= !(1u64 << (bit % 64));
                     }
                 }
-            }
-            if uncertain {
-                self.snow.retry_scan((tile_x, tile_z), birth_tick);
-                continue;
+                if mask.iter().any(|word| *word != 0) {
+                    masks.insert(y, (mask, layer.geometry_revision));
+                }
             }
             layers.extend(masks.keys().copied());
             let prior = self.snow.tile_layers(tile_x, tile_z);
             let tick = self.tick.get();
+            let birth = if birth_tick == 0 { tick } else { birth_tick };
             for (y, (mask, revision)) in masks {
                 if was_scanned || edited_tile || birth_tick > 0 {
-                    self.snow.reconcile(tile_x, tile_z, y, revision, mask, tick);
+                    self.snow
+                        .reconcile_at(tile_x, tile_z, y, revision, mask, birth, tick);
                     if edited_tile || birth_tick > 0 {
                         self.snow.mark_geometry_changed((tile_x, tile_z, y));
                     }
                 } else {
-                    self.snow.discover_initial(tile_x, tile_z, y, revision, mask);
+                    self.snow
+                        .discover_initial(tile_x, tile_z, y, revision, mask);
                 }
             }
             if was_scanned {
@@ -1426,6 +1483,9 @@ impl Simulation {
                 continue;
             }
             let top_m = (f64::from(y) + 1.0) * cell_m;
+            if (candidate.position_m[1] - top_m).abs() > 0.045 {
+                continue;
+            }
             if water_sampler
                 .as_ref()
                 .and_then(|sampler| {
@@ -1448,7 +1508,8 @@ impl Simulation {
             else {
                 continue;
             };
-            self.snow.stamp(candidate, [x, y, z], revision, self.tick.get());
+            self.snow
+                .stamp(candidate, [x, y, z], revision, self.tick.get());
         }
     }
 
