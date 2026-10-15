@@ -43,6 +43,7 @@ pub mod commit;
 pub mod contact_damage;
 pub mod dormancy;
 pub mod fixtures;
+pub mod footprints;
 pub mod intent;
 pub mod journal;
 pub mod player;
