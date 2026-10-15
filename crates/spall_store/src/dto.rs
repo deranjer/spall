@@ -59,6 +59,25 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, DtoError>
     Ok(postcard::from_bytes(bytes)?)
 }
 
+/// Saved topology/motion layouts did not change when weather controls (6) and
+/// snow frames (7) were added. Migrate only those known journal families;
+/// live transport negotiation and all other record layouts remain strict.
+fn decode_saved_record<R: spall_protocol::Record>(bytes: &[u8]) -> Result<R, CodecError> {
+    if bytes.len() >= spall_protocol::codec::HEADER_LEN
+        && bytes.len() <= spall_protocol::limits::MAX_CONTROL_RECORD
+        && matches!(
+            R::TAG,
+            spall_protocol::WireTag::TopologyTransaction | spall_protocol::WireTag::MotionSnapshot
+        )
+        && matches!(u16::from_le_bytes([bytes[0], bytes[1]]), 5 | 6)
+    {
+        let mut migrated = bytes.to_vec();
+        migrated[..2].copy_from_slice(&R::SCHEMA_VERSION.to_le_bytes());
+        return decode_control(&migrated);
+    }
+    decode_control(bytes)
+}
+
 /// Required world metadata (`docs/protocol.md` "Persistence"): schema version,
 /// world identity, seed, generator version, material manifest hash, cell-size
 /// codes, next-ID counters, and structural algorithm versions. The
@@ -306,10 +325,10 @@ impl JournalPayload {
             return None;
         };
         Some((|| {
-            let tx = decode_control::<TopologyTransaction>(transaction)?;
+            let tx = decode_saved_record::<TopologyTransaction>(transaction)?;
             let parts = participants
                 .iter()
-                .map(|b| decode_control::<MotionSnapshot>(b))
+                .map(|b| decode_saved_record::<MotionSnapshot>(b))
                 .collect::<Result<Vec<_>, _>>()?;
             let world = BaselineWorld::decode_compressed(baseline)?;
             Ok((tx, parts, world))
@@ -339,10 +358,10 @@ impl JournalPayload {
             return None;
         };
         Some((|| {
-            let tx = decode_control::<TopologyTransaction>(transaction)?;
+            let tx = decode_saved_record::<TopologyTransaction>(transaction)?;
             let parts = participants
                 .iter()
-                .map(|b| decode_control::<MotionSnapshot>(b))
+                .map(|b| decode_saved_record::<MotionSnapshot>(b))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((tx, parts))
         })())
@@ -356,7 +375,7 @@ impl JournalPayload {
         Some(
             snapshots
                 .iter()
-                .map(|b| decode_control::<MotionSnapshot>(b).map_err(DtoError::from))
+                .map(|b| decode_saved_record::<MotionSnapshot>(b).map_err(DtoError::from))
                 .collect(),
         )
     }
@@ -394,6 +413,71 @@ mod tests {
         assert_eq!(tx, a_tx());
         assert!(parts.is_empty());
         assert!(payload.as_pose_batch().is_none());
+    }
+
+    #[test]
+    fn pre_snow_saved_topology_and_poses_migrate_without_relaxing_live_wire_versions() {
+        let motion = MotionSnapshot {
+            server_tick: Tick(9),
+            snapshot_seq: spall_protocol::SnapshotSeq(1),
+            acked_input: spall_protocol::InputSeq(0),
+            body: spall_core::EntityId::new(1).unwrap(),
+            topology_revision: spall_core::Revision(1),
+            pose: spall_core::Pose {
+                translation_m: [0.0; 3],
+                rotation: spall_core::QuantizedQuat {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    w: 32767,
+                },
+            },
+            linear_velocity: [0.0; 3],
+            angular_velocity: [0.0; 3],
+            sleeping: true,
+        };
+        for version in [5u16, 6] {
+            let mut tx = encode_control(&a_tx()).unwrap();
+            let mut pose = encode_control(&motion).unwrap();
+            tx[..2].copy_from_slice(&version.to_le_bytes());
+            pose[..2].copy_from_slice(&version.to_le_bytes());
+            assert!(decode_control::<TopologyTransaction>(&tx).is_err());
+            assert!(decode_control::<MotionSnapshot>(&pose).is_err());
+            let journal = JournalPayload::Topology {
+                transaction: tx.clone(),
+                participants: vec![pose.clone()],
+            };
+            assert_eq!(
+                journal.as_topology().unwrap().unwrap(),
+                (a_tx(), vec![motion])
+            );
+            let batch = JournalPayload::PoseBatch {
+                snapshots: vec![pose.clone()],
+            };
+            assert_eq!(batch.as_pose_batch().unwrap().unwrap(), vec![motion]);
+            let world = a_baseline_world();
+            let bulk = JournalPayload::TopologyBulkSplit {
+                transaction: tx,
+                participants: vec![pose],
+                baseline: world.encode_compressed(),
+            };
+            assert_eq!(
+                bulk.as_topology_bulk_split().unwrap().unwrap(),
+                (a_tx(), vec![motion], world)
+            );
+        }
+        for version in [2u16, 8] {
+            let mut tx = encode_control(&a_tx()).unwrap();
+            tx[..2].copy_from_slice(&version.to_le_bytes());
+            let journal = JournalPayload::Topology {
+                transaction: tx,
+                participants: vec![],
+            };
+            assert!(
+                journal.as_topology().unwrap().is_err(),
+                "unsupported saved schema {version}"
+            );
+        }
     }
 
     fn a_baseline_world() -> BaselineWorld {
