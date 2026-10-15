@@ -1272,35 +1272,29 @@ impl Simulation {
         use spall_core::CellSizeCode;
         use std::collections::BTreeSet;
 
-        let terrain = &self.world.terrain().volume;
-        if terrain.cell_size() != CellSizeCode::Quarter || terrain.bounds().is_none() {
+        let terrain_body = self.world.terrain();
+        let terrain = &terrain_body.volume;
+        if terrain.cell_size() != CellSizeCode::Quarter {
             return;
         }
-        let bounds = terrain.bounds().expect("checked above");
-        let Ok(min_tile_x) = i32::try_from(bounds.min.x.saturating_mul(2)) else {
+        // Volume may be intentionally unbounded for sparse natural worlds;
+        // collider_region is the durable worldgen extent and therefore the
+        // authoritative limit for sky exposure scans.
+        let (region_min, region_max) = terrain_body.collider_region;
+        let min_tile_x_raw = region_min.x.div_euclid(16);
+        let max_tile_x_raw = region_max.x.div_euclid(16);
+        let min_tile_z_raw = region_min.z.div_euclid(16);
+        let max_tile_z_raw = region_max.z.div_euclid(16);
+        let Ok(min_tile_x) = i32::try_from(min_tile_x_raw) else {
             return;
         };
-        let Ok(max_tile_x) = i32::try_from(
-            bounds
-                .max
-                .x
-                .saturating_add(1)
-                .saturating_mul(2)
-                .saturating_sub(1),
-        ) else {
+        let Ok(max_tile_x) = i32::try_from(max_tile_x_raw) else {
             return;
         };
-        let Ok(min_tile_z) = i32::try_from(bounds.min.z.saturating_mul(2)) else {
+        let Ok(min_tile_z) = i32::try_from(min_tile_z_raw) else {
             return;
         };
-        let Ok(max_tile_z) = i32::try_from(
-            bounds
-                .max
-                .z
-                .saturating_add(1)
-                .saturating_mul(2)
-                .saturating_sub(1),
-        ) else {
+        let Ok(max_tile_z) = i32::try_from(max_tile_z_raw) else {
             return;
         };
         if self.snow.needs_resident_discovery_seed() {
@@ -1383,7 +1377,9 @@ impl Simulation {
             let edited_tile = affected.contains(&(tile_x, tile_z));
             let mut layers = BTreeSet::new();
             let mut masks = std::collections::BTreeMap::<i32, ([u64; 4], u64)>::new();
-            let geometry = match crate::snow_query::query_snow_tile(terrain, tile_x, tile_z) {
+            let geometry = match crate::snow_query::query_snow_tile_in_region(
+                terrain, tile_x, tile_z, region_min, region_max,
+            ) {
                 Ok(geometry) => geometry,
                 Err(crate::snow_query::SnowTileQueryError::OutsideBounds) => {
                     self.snow.mark_tile_scanned((tile_x, tile_z));

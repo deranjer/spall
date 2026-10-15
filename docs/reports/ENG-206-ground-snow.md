@@ -35,7 +35,12 @@ clear tracks.
   footprint fill/melt/TTL/caps, and strict versioned canonical cohort checks.
 - `crates/spall_sim/src/sim.rs`: guarded one-time resident seeding, bounded
   world-clamped nearby discovery, all-player center priority, topology birth
-  handling, exact terrain/water/contact validation, and frame paging API.
+  handling, exact terrain/water/contact validation, and frame paging API; snow
+  scans use the explicit terrain collider cell region for sparse unbounded
+  worldgen volumes; an
+  opt-in `SPALL_DEBUG_SNOW_STAMPS` diagnostic reports candidate rejection causes.
+- `crates/spall_sim/src/snow_query.rs`: bounded sky-down query using either a
+  bounded Volume extent or the explicit authoritative terrain cell region.
 - `crates/spall_server/src/serve.rs`: bounded per-session snow interest pages,
   including non-regional clients.
 - `crates/spall_server/src/persist.rs`: ordered exact snow tile replay and
@@ -46,12 +51,15 @@ clear tracks.
 
 ## Verification
 
-- `cargo test -p spall_sim snow --lib`: **14 passed**, including policy/query,
+- `cargo test -p spall_sim snow --lib`: **16 passed**, including policy/query,
   unknown retry and saved queue birth, page bound/cycle, cold/warm exactness,
-  roof exposure, restart continuation, tombstones, and footprint refill/melt.
+  roof exposure, restart continuation, owner-key/overlap corruption rejection,
+  tombstones, and footprint refill/melt.
 - `cargo test -p spall_client delayed_weather_uses_its_own_stream_and_reset_fences_without_prior_weather --lib`: **1 passed**.
 - `cargo test -p spall_client snow_replica_cache_is_bounded_and_future_epoch_fences_old_tiles --lib`: **1 passed**.
 - `cargo check -p spall_server -p spall_client`: **passed**.
+- `cargo test -p spall_sim snow_query --lib`: **6 passed**, including querying
+  an unbounded sparse Volume only within an explicit terrain region.
 - `cargo clippy -p spall_sim -p spall_server -p spall_client --all-targets -- -D warnings`: **passed**.
 - `cargo fmt --all` and `git diff --check`: **passed**.
 - Full `cargo xtask check`, the two-client snow replication scenario, 1 km live-world
@@ -65,7 +73,7 @@ The focused test counts and successful builds above are measured. The 16-layer
 per-tick, 96 m radius, four-frame/six-tick fanout, 4096-frame/16 MiB client cache,
 and 1 ms/tick / 8 KiB/s targets are limits or targets, not measured 1 km costs.
 No per-tick all-world brick enumeration remains; resident coordinates are
-enumerated once, and nearby scans are clamped to bounded-world tile limits.
+enumerated once, and nearby scans are clamped to the explicit world cell region.
 
 If several geometry edits to an undiscovered tile queue before its query slot,
 the pending entry keeps the newest birth tick and the latest authoritative mask.

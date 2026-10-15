@@ -2,7 +2,7 @@
 //! One tile lies within one brick XZ column. Air/full occupancy skips whole
 //! bricks; mixed bricks use immutable local reads instead of global hash lookups.
 
-use spall_core::{BrickCoord, CellSizeCode, LocalCell};
+use spall_core::{BrickCoord, CellSizeCode, GlobalCell, LocalCell};
 use spall_voxel::Volume;
 use std::collections::BTreeMap;
 
@@ -39,26 +39,68 @@ pub fn query_snow_tile(
     tile_x: i32,
     tile_z: i32,
 ) -> Result<SnowTileGeometry, SnowTileQueryError> {
+    let bounds = volume.bounds().ok_or(SnowTileQueryError::MissingBounds)?;
+    let cell_min = |axis: i64| {
+        axis.checked_mul(32)
+            .ok_or(SnowTileQueryError::CoordinateRange)
+    };
+    let cell_max = |axis: i64| {
+        axis.checked_mul(32)
+            .and_then(|value| value.checked_add(31))
+            .ok_or(SnowTileQueryError::CoordinateRange)
+    };
+    let min = GlobalCell::new(
+        cell_min(bounds.min.x)?,
+        cell_min(bounds.min.y)?,
+        cell_min(bounds.min.z)?,
+    );
+    let max = GlobalCell::new(
+        cell_max(bounds.max.x)?,
+        cell_max(bounds.max.y)?,
+        cell_max(bounds.max.z)?,
+    );
+    query_snow_tile_in_region(volume, tile_x, tile_z, min, max)
+}
+
+/// Query against an explicit, authoritative terrain cell region. This supports
+/// natural worlds whose sparse Volume is intentionally unbounded while their
+/// worldgen/collider contract supplies the finite sky and ground extent.
+pub fn query_snow_tile_in_region(
+    volume: &Volume,
+    tile_x: i32,
+    tile_z: i32,
+    min: GlobalCell,
+    max: GlobalCell,
+) -> Result<SnowTileGeometry, SnowTileQueryError> {
     if volume.cell_size() != CellSizeCode::Quarter {
         return Err(SnowTileQueryError::UnsupportedCellSize);
     }
-    let bounds = volume.bounds().ok_or(SnowTileQueryError::MissingBounds)?;
-    if bounds.max.y.saturating_sub(bounds.min.y) >= 128 {
+    if min.x > max.x || min.y > max.y || min.z > max.z {
+        return Err(SnowTileQueryError::OutsideBounds);
+    }
+    let min_brick = BrickCoord::new(
+        min.x.div_euclid(32),
+        min.y.div_euclid(32),
+        min.z.div_euclid(32),
+    );
+    let max_brick = BrickCoord::new(
+        max.x.div_euclid(32),
+        max.y.div_euclid(32),
+        max.z.div_euclid(32),
+    );
+    if max_brick.y.saturating_sub(min_brick.y) >= 128 {
         return Err(SnowTileQueryError::VerticalSpan);
     }
     let bx = i64::from(tile_x.div_euclid(2));
     let bz = i64::from(tile_z.div_euclid(2));
-    if !(bounds.min.x..=bounds.max.x).contains(&bx) || !(bounds.min.z..=bounds.max.z).contains(&bz)
-    {
+    if !(min_brick.x..=max_brick.x).contains(&bx) || !(min_brick.z..=max_brick.z).contains(&bz) {
         return Err(SnowTileQueryError::OutsideBounds);
     }
-    let min_y = bounds
-        .min
+    let min_y = min_brick
         .y
         .checked_mul(32)
         .ok_or(SnowTileQueryError::CoordinateRange)?;
-    let max_y = bounds
-        .max
+    let max_y = max_brick
         .y
         .checked_mul(32)
         .and_then(|y| y.checked_add(31))
@@ -67,9 +109,19 @@ pub fn query_snow_tile(
     i32::try_from(max_y).map_err(|_| SnowTileQueryError::CoordinateRange)?;
     let local_x = (tile_x.rem_euclid(2) * 16) as u8;
     let local_z = (tile_z.rem_euclid(2) * 16) as u8;
-    let mut pending = [u64::MAX; 4];
+    let mut pending = [0u64; 4];
+    for index in 0..256 {
+        let x = bx * 32 + i64::from(local_x) + (index % 16) as i64;
+        let z = bz * 32 + i64::from(local_z) + (index / 16) as i64;
+        if (min.x..=max.x).contains(&x) && (min.z..=max.z).contains(&z) {
+            pending[index / 64] |= 1u64 << (index % 64);
+        }
+    }
     let mut result = SnowTileGeometry::default();
-    for by in (bounds.min.y..=bounds.max.y).rev() {
+    for by in (min_brick.y..=max_brick.y).rev() {
+        if min.y > by * 32 + 31 || max.y < by * 32 {
+            continue;
+        }
         if pending == [0; 4] {
             break;
         }
@@ -84,7 +136,7 @@ pub fn query_snow_tile(
                 continue;
             }
             32_768 => {
-                let y = (by * 32 + 31) as i32;
+                let y = (by * 32 + 31).clamp(min.y, max.y) as i32;
                 result.layers.insert(
                     y,
                     SnowLayerGeometry {
@@ -98,6 +150,10 @@ pub fn query_snow_tile(
             _ => {}
         }
         for ly in (0..32u8).rev() {
+            let global_y = by * 32 + i64::from(ly);
+            if !(min.y..=max.y).contains(&global_y) {
+                continue;
+            }
             if pending == [0; 4] {
                 break;
             }
@@ -115,7 +171,7 @@ pub fn query_snow_tile(
                 .expect("aligned tile fits its brick");
                 result.sampled_cells += 1;
                 if !brick.get(local).is_air() {
-                    let y = (by * 32 + i64::from(ly)) as i32;
+                    let y = global_y as i32;
                     let layer = result.layers.entry(y).or_insert(SnowLayerGeometry {
                         exposed_faces: [0; 4],
                         geometry_revision: brick.revision().get(),
@@ -219,6 +275,25 @@ mod tests {
         assert_eq!(result.visited_bricks, 1);
         assert_eq!(result.sampled_cells, 0);
         assert_eq!(result.layers[&511].exposed_faces, [u64::MAX; 4]);
+    }
+
+    #[test]
+    fn explicit_region_supports_unbounded_sparse_worldgen_volume() {
+        let mut volume = Volume::new(VolumeId::new(9).unwrap(), CellSizeCode::Quarter);
+        let mut sky = Brick::uniform(MaterialId::AIR, Revision(1));
+        sky.set_cell(LocalCell::new(0, 0, 0).unwrap(), MaterialId(1));
+        volume.insert_brick(BrickCoord::new(0, 1, 0), sky).unwrap();
+        let result = query_snow_tile_in_region(
+            &volume,
+            0,
+            0,
+            GlobalCell::new(0, 32, 0),
+            GlobalCell::new(15, 63, 15),
+        )
+        .unwrap();
+        assert_eq!(result.layers.len(), 1);
+        assert_eq!(result.layers[&32].exposed_faces[0], 1);
+        assert_eq!(result.layers[&32].geometry_revision, 1);
     }
 
     #[test]
