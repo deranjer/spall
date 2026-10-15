@@ -1923,3 +1923,18 @@ pass; 12 GPU captures on RTX 4080 SUPER/DX12; native smoke presents 90 frames an
 resizes successfully. See docs/reports/ENG-211-animal-zoo.md for exact checks.
 No actor authority, navigation, physics response, population or persistence is
 accepted here. Next unblocked animal task remains ENG-210.
+## ENG-210 / A4-R: articulated movement/response feasibility (2026-10-15)
+
+Assigned to an isolated Luna 6 Medium worker; coordinator owns review/integration.
+Prerequisite ENG-209 is accepted. This CPU-only pass selects and measures a
+concrete rig before production actor interfaces. Preserve original root/local
+0.6 m over 60 steps, fast 0.5 m one-step and fixed-wall counterexamples. Require
+bounded animated-part contact response, explicit exact/conservative terrain
+movement blocking, support removal/fall, stale-update isolation and justified
+source-cell damage attribution (never guess a manifold cell). Validate real
+trout/crow/deer geometry and all clips, retain exact per-part VolumeIds/cells,
+report complete update/query/step costs and body/collider/primitive counts.
+No per-voxel bodies, second solver, hidden anchors, approximate geometry claimed
+as exact, runtime actor/network/storage/UI or corpse gate acceptance. A bounded
+per-source-part body candidate is permitted under one conceptual assembly owner.
+Ticket remains in progress until coordinator review and required checks pass.
