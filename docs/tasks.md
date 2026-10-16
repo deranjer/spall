@@ -1995,3 +1995,12 @@ one-to-many component ownership; no revoxelization or per-part auto-explosion.
 Prove prepared/stale isolation, conservation, mass/motion/query identity and
 actual asset connectivity with independent CPU cases. Ambiguous geometry fails
 closed. Host/protocol/store/runtime interfaces depend on reviewed provenance.
+ENG-214 planner-only progress (2026-10-16): integrated 0b522a9/39cf525.
+Independent checks pass 120 physics/review tests, one existing manual timing
+test ignored. Seven review tests include 81 exact half-turn cell configurations.
+Strict physics lint, format/diff checks and sandbox probe compile pass.
+Nine actual-asset poses: trout 3 prepared, crow idle 1 prepared with seven
+components; crow flap 2 and deer 3 reject ambiguous connectivity. Physical
+split, continued fragment edits and actual asset pose acceptance remain open.
+Evidence: reports/ENG-214-planner-review.md and planner-survey JSON.
+Next unblocked remains ENG-214; no combined 1 km animal launch acceptance.
