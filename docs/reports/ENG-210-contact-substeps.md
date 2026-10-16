@@ -13,12 +13,17 @@ after the outer boundary, after all N solver steps.
 
 Before any authored pose or root target is staged, the world bounds the maximum
 surface travel of every changed kinematic part as origin displacement plus
-shortest-arc angle times its collider's local enclosing radius. A request is
-rejected with `WorkBudget` if that bound exceeds 2.5 cm per configured solver
-substep (with a 1 micrometre floating-point allowance). Root+clip combined
-updates preflight the complete set before mutating any target. This is an
-admission bound, not a claim that finite substeps exactly solve continuous
-collisions or provide a population-performance guarantee.
+shortest-arc angle times the maximum distance from its body origin to an
+occupied source-cell corner. The bound is computed from the authoritative
+integer grid origin, solid cell indices, cell size, and flattened part transform;
+it excludes Rapier voxel-shape storage padding. A request is rejected with
+`WorkBudget` if that bound exceeds 2.5 cm per configured solver substep (with a
+1 micrometre floating-point allowance). The occupied-corner radius is cached
+per part and refreshed only after the revision-checked collider rebuild is
+ready. Root+clip combined updates preflight the complete set before mutating
+any target. This is an admission bound, not a claim that finite substeps
+exactly solve continuous collisions or provide a population-performance
+guarantee.
 
 ## Preserved original failure and candidate result
 
@@ -57,7 +62,7 @@ actual-asset run is retained at
 
 ## Actual authored assets and admission limit
 
-The bounded release probe ran all authored clips/phases for trout, crow and
+The first bounded release probe ran all authored clips/phases for trout, crow and
 deer with 64 substeps, both Native Voxels and Merged Cuboids, root yaw 10°,
 and the existing independent continuous-clearance oracle. All 48 transitions
 were admitted and clear by the oracle; blocked transitions and representation
@@ -68,16 +73,17 @@ live body/collider counts were trout 5/136/6 bodies/5 colliders, crow
 Native Voxels used 5, 6 and 9 primitives respectively. Full transition +
 query + step costs are retained per case in
 [`ENG-210-animal-contact-substep-workload-64.json`](ENG-210-animal-contact-substep-workload-64.json).
+That historical run used Rapier's padded local AABB for admission and is
+superseded by the occupied-cell-corner bound and rebound measurements below.
 Its p50/p95 microseconds by representation were trout native 2214.6/2362.9,
 merged 1628.9/1716.0; crow native 2485.0/2622.7, merged 2797.8/3008.2; deer
 native 4292.5/5293.9, merged 5150.4/5298.3. The probe has 100 repeats and 10
 warmups per phase. These are one-animal measurements; no population target is
 agreed.
 
-The 64-step setting is necessary for the sampled authored poses under this
-admission rule. Contextualized release runs rejected earlier: 20 substeps first
-rejected the Crow `flap` sampled pose at tick 0; 32 substeps rejected Crow
-`flap` tick 12. Exact command output is kept in
+Under that superseded padded-AABB rule, contextualized release runs rejected:
+20 substeps first rejected the Crow `flap` sampled pose at tick 0; 32 substeps
+rejected Crow `flap` tick 12. Exact historical command output remains in
 [`ENG-210-contact-substeps-20-attempt.txt`](ENG-210-contact-substeps-20-attempt.txt)
 and [`ENG-210-contact-substeps-32-attempt.txt`](ENG-210-contact-substeps-32-attempt.txt).
 This is explicit bounded rejection, not a slower or shortened successful
@@ -98,21 +104,49 @@ blocking, source-cell damage resolution, and population costs remain separate
 gates. No runtime lifecycle, corpse aggregate, networking, storage or UI was
 implemented.
 
-A separate fast-angular impulse case remains unproven. The configured
-conservative bound rejects a 90-degree part-local turn for the one-cell probe
-fixture: its Rapier local AABB bound is 3.464 m, so `radius × angle` is 5.44 m,
-above the 1.60 m budget at 64 substeps. A 20-degree turn is admitted, but the
-attempted probe placement did not contact the moving collider and is not
-response evidence. The authored 10-degree root-yaw transition matrix is
-validated for sweep/query parity and admission, but it does not measure a
-dynamic impact. Thus the translation result does not close the angular-contact
-gate; the next experiment needs a contact fixture whose actual native and
-merged collision envelopes are independently verified before measuring solver
-response.
+A separate fast-angular case uses a 0.25 m source cell rotating 90 degrees
+about its part origin in one 16.6667 ms outer tick, with a 0.0625 m dynamic
+probe. Independent source-cell box intervals prove the probe starts separated
+on X and overlaps the rotated source cell on X, Y, and Z. The exact occupied
+corner radius is 0.433013 m, giving a 0.6802 m angular surface path, below the
+1.60 m budget at 64 substeps. Both exact collider representations produce
+finite solver response: Native Voxels accumulates 4.089305 N·s in one contact
+pair/substep observation, probe velocity `[-16.749792, 2.2452207, -0.11118442]`
+m/s and kinetic energy 34.86437 J; Merged Cuboids accumulates 4.4816613 N·s
+across two pair/substep observations, velocity `[-18.356884, 2.2770295,
+-0.38509393]` m/s and kinetic energy 41.785686 J. Probe mass is 0.24414061 kg.
+The prescribed kinematic turn injects work, so energy is not conserved. The
+test also checks that the authored source query/token remains unchanged before
+the outer step and publishes token 1 after it.
+
+The source-corner helper is separately checked with a negative grid origin,
+off-center occupied cell, and flattened nested transform. The topology rebuild
+regression checks that a source revision from origin 0 to origin 4 atomically
+updates the cached root radius from 0.433013 m to 1.299038 m. A 20-step
+gravity test keeps an unrelated dynamic body in the same world: across 20
+internal steps it receives `vy=-0.16350019 m/s`, matching one outer `dt` at
+`-9.81 m/s²`, with one outer step/token publication.
+
+With the tighter physical bound, the earlier 20/32 rejection evidence is
+superseded. The 20-step run still explicitly rejects Crow `flap` tick 12; raw
+output is in
+[`ENG-210-contact-substeps-20-rebound-attempt.txt`](ENG-210-contact-substeps-20-rebound-attempt.txt).
+The 32-step release run now admits all 48 authored transitions, with zero
+representation disagreements and the full 38,520 ray/66 miss checks passing.
+The 64-step run also admits all 48. Updated complete results are in
+[`ENG-210-animal-contact-substep-workload-32-rebound.json`](ENG-210-animal-contact-substep-workload-32-rebound.json)
+and [`ENG-210-animal-contact-substep-workload-64-rebound.json`](ENG-210-animal-contact-substep-workload-64-rebound.json).
+Per-case p50/p95 µs at 32 substeps: trout native 1511.7/2003.2, merged
+1988.4/2260.5; crow native 1976.1/3573.5, merged 2732.3/2807.1; deer native
+3290.6/3507.4, merged 5061.7/5247.1. At 64: trout native 2757.5/3851.3,
+merged 1669.5/1815.7; crow native 2521.1/2805.1, merged 2774.5/2894.1; deer
+native 4404.7/4648.7, merged 5168.4/5479.5. A new default-one-step run is
+retained at
+[`ENG-210-animal-contact-substep-workload-default-rebound.json`](ENG-210-animal-contact-substep-workload-default-rebound.json).
 
 Checks run:
 
-- `cargo test -p spall_physics --lib --test articulated_review` — 83 passed,
+- `cargo test -p spall_physics --lib --test articulated_review` — 86 passed,
   1 existing ignored; all 8 review cases passed.
 - `cargo test -p spall_physics articulated_part_body_fast_single_step_contact_is_measured_without_sweep -- --nocapture`
   — original fast-case failure measured for CCD off/on and both representations.

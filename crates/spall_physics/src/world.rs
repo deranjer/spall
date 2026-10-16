@@ -280,9 +280,63 @@ struct ArticulatedPartEntry {
     cell_m: f32,
     local_pose: PartTransform,
     assembly_pose: PartTransform,
+    /// Physical occupied-cell corner radius measured from the part-body origin.
+    part_surface_radius_m: f32,
+    /// Physical occupied-cell corner radius measured from the assembly root.
+    root_surface_radius_m: f32,
     body: RigidBodyHandle,
     collider: ColliderHandle,
     primitives: usize,
+}
+
+/// Maximum Euclidean distance from `body_origin` to any corner of an occupied
+/// source cell. Unlike Rapier's `Voxels::compute_local_aabb`, this uses the
+/// authoritative cell coordinates and exact cell size, so broad-phase storage
+/// padding cannot inflate or shrink the admitted physical surface travel.
+fn source_surface_radius_m(
+    grid: &OccupancyGrid,
+    cell_m: f32,
+    body_origin_m: [f32; 3],
+    part_pose: Option<PartTransform>,
+) -> f32 {
+    let origin = grid.origin();
+    let mut radius_sq = 0.0_f64;
+    for [x, y, z] in grid.solid_indices() {
+        let global = [
+            origin.x + i64::from(x),
+            origin.y + i64::from(y),
+            origin.z + i64::from(z),
+        ];
+        let lo = global.map(|coord| coord as f64 * f64::from(cell_m));
+        let hi = global.map(|coord| (coord + 1) as f64 * f64::from(cell_m));
+        for mask in 0..8 {
+            let corner = [
+                if mask & 1 == 0 { lo[0] } else { hi[0] },
+                if mask & 2 == 0 { lo[1] } else { hi[1] },
+                if mask & 4 == 0 { lo[2] } else { hi[2] },
+            ];
+            let local = if let Some(pose) = part_pose {
+                let rotated = rotate(
+                    pose.rotation_xyzw,
+                    [corner[0] as f32, corner[1] as f32, corner[2] as f32],
+                );
+                [
+                    f64::from(pose.translation_m[0] + rotated[0] - body_origin_m[0]),
+                    f64::from(pose.translation_m[1] + rotated[1] - body_origin_m[1]),
+                    f64::from(pose.translation_m[2] + rotated[2] - body_origin_m[2]),
+                ]
+            } else {
+                [
+                    corner[0] - f64::from(body_origin_m[0]),
+                    corner[1] - f64::from(body_origin_m[1]),
+                    corner[2] - f64::from(body_origin_m[2]),
+                ]
+            };
+            let squared = local.iter().map(|value| value * value).sum::<f64>();
+            radius_sq = radius_sq.max(squared);
+        }
+    }
+    radius_sq.sqrt() as f32
 }
 
 struct ArticulatedEntry {
@@ -819,6 +873,9 @@ impl PhysicsWorld {
             .zip(collider_poses)
             .zip(builds)
         {
+            let part_surface_radius_m = source_surface_radius_m(&part.grid, cell_m, [0.0; 3], None);
+            let root_surface_radius_m =
+                source_surface_radius_m(&part.grid, cell_m, [0.0; 3], Some(pose));
             let local_rotation = Rotation::from_xyzw(
                 local_rotation_xyzw[0],
                 local_rotation_xyzw[1],
@@ -894,6 +951,8 @@ impl PhysicsWorld {
                 cell_m,
                 local_pose: part.local_transform,
                 assembly_pose: pose,
+                part_surface_radius_m,
+                root_surface_radius_m,
                 body: part_body,
                 collider: handle,
                 primitives: build.primitives,
@@ -1198,6 +1257,9 @@ impl PhysicsWorld {
         if new_grid.solid_count() == 0 {
             return Err(ArticulatedError::EmptyPart(part_id));
         }
+        let part_surface_radius_m = source_surface_radius_m(&new_grid, part.cell_m, [0.0; 3], None);
+        let root_surface_radius_m =
+            source_surface_radius_m(&new_grid, part.cell_m, [0.0; 3], Some(part.assembly_pose));
         let representation = self.entries[entry_index(id, self.id_namespace)].representation;
         let start = Instant::now();
         let built = build_collider(&new_grid, part.cell_m, representation);
@@ -1289,6 +1351,8 @@ impl PhysicsWorld {
         let part = &mut assembly.parts[part_index];
         part.grid = new_grid;
         part.source_revision = new_source_revision;
+        part.part_surface_radius_m = part_surface_radius_m;
+        part.root_surface_radius_m = root_surface_radius_m;
         part.collider = new_handle;
         part.primitives = built.primitives;
         assembly.topology_token = new_topology_token;
@@ -2798,17 +2862,16 @@ impl PhysicsWorld {
                 .to_scaled_axis()
                 .length();
             let radius = self
-                .colliders
-                .iter()
-                .filter(|(_, collider)| collider.parent() == Some(*body_handle))
-                .map(|(_, collider)| {
-                    let local_pose = collider
-                        .position_wrt_parent()
-                        .copied()
-                        .unwrap_or_else(Pose::identity);
-                    let local_aabb = collider.shape().compute_local_aabb();
-                    (local_pose.translation + local_pose.rotation * local_aabb.center()).length()
-                        + local_aabb.half_extents().length()
+                .articulated
+                .values()
+                .flat_map(|assembly| {
+                    assembly.parts.iter().filter_map(move |part| {
+                        (part.body == *body_handle).then_some(if assembly.kinematic_part_bodies {
+                            part.part_surface_radius_m
+                        } else {
+                            part.root_surface_radius_m
+                        })
+                    })
                 })
                 .fold(0.0_f32, f32::max);
             let maximum_surface_travel = translation + angle * radius;
@@ -3794,6 +3857,8 @@ mod tests {
             .raycast_articulated(body, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 2.0)
             .unwrap();
         assert_eq!(hit.source_revision, 1);
+        let old_radius = world.articulated[&body.0].parts[0].root_surface_radius_m;
+        assert!((old_radius - (3.0_f32.sqrt() * 0.25)).abs() < 1.0e-6);
         assert!(
             world
                 .rebuild_articulated_part_grid(
@@ -3816,6 +3881,10 @@ mod tests {
             .unwrap();
         assert_eq!(moved.source_revision, 2);
         assert_eq!(moved.topology_token, 4);
+        let rebuilt_radius = world.articulated[&body.0].parts[0].root_surface_radius_m;
+        assert!(
+            (rebuilt_radius - (1.25_f32.powi(2) + 2.0 * 0.25_f32.powi(2)).sqrt()).abs() < 1.0e-6
+        );
 
         let stale = world.rebuild_articulated_part_grid(
             body,
@@ -3835,6 +3904,38 @@ mod tests {
             .unwrap();
         assert_eq!(still_current.source_revision, 2);
         assert_eq!(still_current.topology_token, 4);
+    }
+
+    #[test]
+    fn occupied_source_corner_radius_handles_negative_off_center_nested_geometry() {
+        let grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(-2, 1, -1),
+            [2, 1, 1],
+            vec![false, true],
+            vec![fixtures::STONE; 2],
+        )
+        .unwrap();
+        let local_radius = source_surface_radius_m(&grid, 0.25, [0.0; 3], None);
+        assert!((local_radius - 0.375_f32.sqrt()).abs() < 1.0e-6);
+        let parent = PartTransform {
+            translation_m: [1.0, 0.0, 0.0],
+            rotation_xyzw: [
+                0.0,
+                0.0,
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ],
+        };
+        let child = PartTransform {
+            translation_m: [0.0, 1.0, 0.0],
+            rotation_xyzw: PartTransform::IDENTITY.rotation_xyzw,
+        };
+        let flattened = compose(parent, child);
+        let root_radius = source_surface_radius_m(&grid, 0.25, [0.0; 3], Some(flattened));
+        assert!(
+            (root_radius - 0.375_f32.sqrt()).abs() < 1.0e-6,
+            "radius={root_radius}"
+        );
     }
 
     #[test]
@@ -4834,6 +4935,169 @@ mod tests {
                 assert!(animal_hit.toi_m > 0.0);
             }
         }
+    }
+
+    #[test]
+    fn articulated_substeps_produce_contact_response_for_fast_angular_target() {
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                solver_substeps: 64,
+                ..Default::default()
+            });
+            let animal = world
+                .add_articulated_kinematic_parts(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![one_part(grid.clone(), 185, 1)],
+                    representation,
+                )
+                .unwrap();
+            let probe_lo = [-0.15625_f32, 0.21875, 0.09375];
+            let probe_hi = [
+                probe_lo[0] + 0.0625,
+                probe_lo[1] + 0.0625,
+                probe_lo[2] + 0.0625,
+            ];
+            let intervals_overlap = |a0: f32, a1: f32, b0: f32, b1: f32| a0 < b1 && b0 < a1;
+            // Independent source-cell boxes: initially x-disjoint; after the
+            // exact 90-degree rigid rotation, source and probe overlap on all
+            // three axes. This verifies the fixture intersects geometrically.
+            assert!(!intervals_overlap(probe_lo[0], probe_hi[0], 0.0, 0.25));
+            assert!(intervals_overlap(probe_lo[0], probe_hi[0], -0.25, 0.0));
+            assert!(intervals_overlap(probe_lo[1], probe_hi[1], 0.0, 0.25));
+            assert!(intervals_overlap(probe_lo[2], probe_hi[2], 0.0, 0.25));
+            // The probe begins wholly outside the source cell at x < 0. A
+            // 90-degree part-local turn carries the source cell across it.
+            let probe = world.add_body(BodySpec {
+                kind: BodyKind::Dynamic { ccd: false },
+                representation,
+                grid: one_cell_grid(GlobalCell::new(0, 0, 0)),
+                cell_m: 0.0625,
+                density_kg_m3: 1_000.0,
+                mass_properties: None,
+                translation_m: [-0.15625, 0.21875, 0.09375],
+                linvel_m_s: [0.0; 3],
+            });
+            let half_angle = std::f32::consts::FRAC_PI_4;
+            let before = world
+                .raycast_articulated(animal, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 1.0)
+                .unwrap();
+            world
+                .update_articulated_pose(
+                    animal,
+                    ArticulatedPose {
+                        topology_token: 1,
+                        base_pose_token: 0,
+                        pose_token: 1,
+                        parts: vec![(
+                            7,
+                            PartTransform {
+                                rotation_xyzw: [0.0, 0.0, half_angle.sin(), half_angle.cos()],
+                                ..PartTransform::IDENTITY
+                            },
+                        )],
+                    },
+                )
+                .unwrap();
+            let staged = world
+                .raycast_articulated(animal, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 1.0)
+                .unwrap();
+            assert_eq!(staged, before, "pending angular pose stays unpublished");
+            let timing = world.step();
+            let state = world.body_state(probe);
+            println!(
+                "substep angular candidate {representation:?} angle_deg=90 dt={} substeps={} impulse_n_s={} impulse_pair_substeps={} probe_v={:?} mass_kg={} energy_j={}",
+                1.0 / 60.0,
+                timing.substeps,
+                timing.normal_impulse_n_s,
+                timing.impulse_pair_substeps,
+                state.linvel_m_s,
+                state.mass_kg,
+                0.5 * state.mass_kg * state.linvel_m_s.iter().map(|v| v * v).sum::<f32>(),
+            );
+            assert_eq!(timing.substeps, 64);
+            assert!(timing.normal_impulse_n_s.is_finite() && timing.normal_impulse_n_s > 0.0);
+            assert!(state.is_finite());
+            assert!(
+                state
+                    .linvel_m_s
+                    .iter()
+                    .any(|component| component.abs() > 1.0e-3)
+            );
+            assert_eq!(world.steps_run(), 1);
+            let hit = world
+                .raycast_articulated(animal, [-0.2, 0.125, 0.125], [1.0, 0.0, 0.0], 1.0)
+                .unwrap();
+            assert_eq!(hit.pose_token, 1);
+        }
+    }
+
+    #[test]
+    fn articulated_substeps_advance_unrelated_world_dynamics_by_one_outer_dt() {
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0, -9.81, 0.0],
+            solver_substeps: 20,
+            ..Default::default()
+        });
+        let animal = world
+            .add_articulated_kinematic_parts(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 186, 1)],
+                Representation::NativeVoxels,
+            )
+            .unwrap();
+        let unrelated = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::NativeVoxels,
+            grid: one_cell_grid(GlobalCell::new(0, 0, 0)),
+            cell_m: 0.25,
+            density_kg_m3: 1_000.0,
+            mass_properties: None,
+            translation_m: [10.0, 10.0, 10.0],
+            linvel_m_s: [0.0; 3],
+        });
+        world
+            .update_articulated_pose(
+                animal,
+                ArticulatedPose {
+                    topology_token: 1,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![(
+                        7,
+                        PartTransform {
+                            translation_m: [0.1, 0.0, 0.0],
+                            ..PartTransform::IDENTITY
+                        },
+                    )],
+                },
+            )
+            .unwrap();
+        let timing = world.step();
+        let state = world.body_state(unrelated);
+        let expected_vy = -9.81 / 60.0;
+        println!(
+            "unrelated dynamic gravity substeps={} outer_dt={} vy={} expected_vy={} y={} steps={}",
+            timing.substeps,
+            1.0 / 60.0,
+            state.linvel_m_s[1],
+            expected_vy,
+            state.translation_m[1],
+            world.steps_run(),
+        );
+        assert_eq!(timing.substeps, 20);
+        assert_eq!(world.steps_run(), 1);
+        assert!((state.linvel_m_s[1] - expected_vy).abs() < 1.0e-5);
+        assert!(state.translation_m[1] < 10.0);
+        let hit = world
+            .raycast_articulated(animal, [0.5, 0.125, 0.125], [-1.0, 0.0, 0.0], 1.0)
+            .unwrap();
+        assert_eq!(hit.pose_token, 1);
     }
 
     #[test]
