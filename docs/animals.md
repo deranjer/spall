@@ -182,7 +182,14 @@ Prescribed kinematic root motion crosses fixed terrain under the current
 collision defaults; the separate character query sweep blocks that wall.
 Contact manifolds do not supply validated source-cell damage provenance.
 
-Next unblocked: ENG-210 / A4-R, currently backlog, to measure a reviewed movement
-and collision-response rig against these exact counterexamples. Editable
-multi-volume corpses remain a separate prerequisite. Live spawning, navigation,
-multiplayer/recovery, far-origin precision and population capacity are unproven.
+ENG-210 subsequently implements the bounded per-source-part kinematic rig,
+continuous occupied-cell transition queries, same-world solver substeps and
+qualified source-contact witnesses. The coordinator integration checks and
+limits are recorded in [ENG-210 integration](reports/ENG-210-integration.md).
+The original one-step counterexamples remain retained as diagnostic evidence;
+the new substep candidate does not make the default one-step solver continuous.
+
+Next prerequisite: ENG-212 editable multi-volume corpse aggregate feasibility.
+Live spawning, navigation, multiplayer/recovery, far-origin precision and
+population capacity remain unproven. The requested 1 km weather/animal launch
+is held for fully simulated animals, rather than the visual zoo.

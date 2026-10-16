@@ -1938,3 +1938,29 @@ No per-voxel bodies, second solver, hidden anchors, approximate geometry claimed
 as exact, runtime actor/network/storage/UI or corpse gate acceptance. A bounded
 per-source-part body candidate is permitted under one conceptual assembly owner.
 Ticket remains in progress until coordinator review and required checks pass.
+## ENG-212: editable multi-volume corpse aggregate feasibility
+
+Next prerequisite for the requested 1 km weather + fully simulated animal run,
+after reviewed ENG-210 integration. CPU-only candidate must atomically retain
+all source-part VolumeIds/cells/materials/revisions/death poses in an editable
+physical aggregate without revoxelization, per-part auto-explosion, implicit
+PART joints, per-voxel bodies, hidden anchors or a second solver. Measure exact
+query provenance, dynamic fall/contact, mass/inertia/COM, surviving-cell pose
+and momentum through edits/removal, stale rebuild isolation and ownership
+conservation using actual trout/crow/deer and both exact representations.
+Cross-part fracture rules must be explicit, never inferred from hierarchy.
+No host/network/storage/UI implementation or population acceptance in this
+slice. Coordinator owns review, integration and Loopira; worker owns an isolated
+worktree and reviewable evidence/commits. Runtime actors remain dependent on
+reviewed movement, corpse and provenance contracts in animal-lifecycle.md.
+ENG-210 coordinator acceptance (2026-10-16): bounded CPU movement/response and
+source-contact witness feasibility integrated through aabc2d3, including the
+independently reviewed pending-pose/topology race fix. Combined integrated
+checks pass 233 tests, 7 ignored; workspace all-target/all-feature compilation,
+strict physics/probe lint, formatting and diff checks pass. Candidate32 and
+unchanged default release probes each pass 38,520 rays plus 66 misses with
+zero mismatches; candidate accepts 48 transitions with representation parity.
+Default solver remains one step. No production damage, population, corpse or
+live-world/network/recovery acceptance is implied. Evidence and exact commands:
+docs/reports/ENG-210-integration.md. Next unblocked: ENG-212; the user-requested
+1 km weather/fully simulated animal instance remains held for dependent gates.

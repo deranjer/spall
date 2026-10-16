@@ -341,14 +341,17 @@ habitat candidate tests are not lifecycle, collision, or population acceptance.
 
 ## Implementation slices after coordinator review
 
-ENG-209 is now reviewed and integrated for exact geometry and source-cell
-queries; [its report](reports/ENG-209-articulated-collision.md) records the
-remaining physical limits. Local animated collider motion has inadequate
-surface-velocity response in the probe comparison, and prescribed root motion
-does not receive fixed-terrain solver blocking. ENG-210 is the next unblocked
-movement/rig feasibility slice. Both its reviewed outcome and the separate
-corpse aggregate decision are prerequisites to runtime actor interfaces; the
-host/transaction slices below remain proposed.
+ENG-209 is reviewed and integrated for exact geometry and source-cell queries;
+[its report](reports/ENG-209-articulated-collision.md) retains the original
+single-root physical limits. ENG-210's bounded experimental per-source-part
+rig addresses those cases through explicit terrain transition queries and
+opt-in same-world solver substeps. Contact witnesses identify only geometrically
+proved source faces; ambiguous witnesses do not authorize a cell edit.
+[Coordinator integration evidence](reports/ENG-210-integration.md) defines the
+accepted scope and remaining limits. ENG-212 is the separate editable corpse
+aggregate feasibility slice. Its reviewed outcome and the provenance format
+remain prerequisites to runtime actor interfaces; the host/transaction slices
+below remain proposed.
 
 1. **Geometry/query feasibility (ENG-209):** measure the selected kinematic
    root/per-part collider candidate and exact query-to-source-cell mapping.
