@@ -987,10 +987,7 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                             [0.0, 32.0, 0.0],
                             PartTransform::IDENTITY.rotation_xyzw,
                             1,
-                            sources
-                                .iter()
-                                .map(|part| part.source.clone())
-                                .collect(),
+                            sources.iter().map(|part| part.source.clone()).collect(),
                             Representation::MergedCuboids,
                             |_| 1.0,
                         )?;
@@ -1000,29 +997,8 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                             None,
                         )?;
                         let live_plan = prepare_fracture(&live_snapshot)?;
-                        let split = physics.commit_dynamic_corpse_fracture(
-                            owner,
-                            &live_snapshot,
-                            &live_plan,
-                            |_| 1.0,
-                        )?;
-                        if split.components.len() != plan.components.len()
-                            || physics.articulated_rigid_body_count(owner)
-                                != plan.components.len()
-                        {
-                            return Err(format!(
-                                "fracture body count mismatch: {name} {}",
-                                sample.clip
-                            )
-                            .into());
-                        }
-                        let by_part = sources
-                            .iter()
-                            .map(|part| (part.source.part_id, part))
-                            .collect::<BTreeMap<_, _>>();
-                        let mut query_hits = 0usize;
-                        for cell in plan.components.iter().flat_map(|component| &component.cells) {
-                            let part = by_part[&cell.part_id];
+                        let mut baseline_rays = Vec::with_capacity(plan.source_cells.len());
+                        for cell in &plan.source_cells {
                             let pose = flattened[&cell.part_id];
                             let local_center = Vec3::new(
                                 (cell.cell[0] as f32 + 0.5) * CELL_M,
@@ -1034,31 +1010,75 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                                 + Vec3::from_array(pose.translation_m)
                                 + rotation * local_center;
                             let normal = rotation * Vec3::Z;
+                            let origin = world_center + normal * 2.0;
+                            let direction = -normal;
                             let hit = physics.raycast_articulated(
                                 owner,
-                                (world_center + normal * 2.0).to_array(),
-                                (-normal).to_array(),
+                                origin.to_array(),
+                                direction.to_array(),
                                 4.0,
                             )?;
-                            if hit.part_id != cell.part_id
-                                || hit.volume_id != cell.volume_id
-                                || hit.cell != cell.cell
-                                || hit.source_revision != cell.source_revision
+                            baseline_rays.push((origin.to_array(), direction.to_array(), hit));
+                        }
+                        let split = physics.commit_dynamic_corpse_fracture(
+                            owner,
+                            &live_snapshot,
+                            &live_plan,
+                            |_| 1.0,
+                        )?;
+                        if split.components.len() != plan.components.len()
+                            || physics.articulated_rigid_body_count(owner) != plan.components.len()
+                        {
+                            return Err(format!(
+                                "fracture body count mismatch: {name} {}",
+                                sample.clip
+                            )
+                            .into());
+                        }
+                        // Confirm every live component still owns exactly its
+                        // canonical source partition. A global nearest-hit ray
+                        // cannot select buried cells or distinguish overlapping
+                        // independent components, so surface queries use the
+                        // dedicated synthetic source-query regression instead.
+                        let mut recaptured = Vec::new();
+                        for (component_id, _) in &split.components {
+                            let component_snapshot = physics
+                                .capture_dynamic_corpse_fracture_snapshot(
+                                    owner,
+                                    0x454e_4732_3134,
+                                    Some(*component_id),
+                                )?;
+                            recaptured.extend(prepare_fracture(&component_snapshot)?.source_cells);
+                        }
+                        recaptured.sort_unstable();
+                        let mut expected = plan.source_cells.clone();
+                        expected.sort_unstable();
+                        if recaptured != expected {
+                            return Err(format!(
+                                "post-split source partition mismatch: {name} {}",
+                                sample.clip
+                            )
+                            .into());
+                        }
+                        for (origin, direction, baseline) in &baseline_rays {
+                            let after =
+                                physics.raycast_articulated(owner, *origin, *direction, 4.0)?;
+                            if after.part_id != baseline.part_id
+                                || after.volume_id != baseline.volume_id
+                                || after.cell != baseline.cell
+                                || after.source_revision != baseline.source_revision
+                                || (after.toi_m - baseline.toi_m).abs() > 1.0e-5
                             {
-                                return Err(format!(
-                                    "post-split source query mismatch: {name} part {} cell {:?} hit {:?}",
-                                    cell.part_id, cell.cell, hit
-                                )
-                                .into());
+                                return Err(format!("post-split nearest-hit baseline changed: {name} {} {:?} -> {:?}", sample.clip, baseline, after).into());
                             }
-                            query_hits += 1;
-                            let _ = part;
                         }
                         physical_split = Some(serde_json::json!({
                             "component_body_count":physics.articulated_rigid_body_count(owner),
                             "component_collider_count":physics.articulated_collider_count(owner),
                             "component_masses_kg":split.components.iter().map(|(_, mass)| mass).collect::<Vec<_>>(),
-                            "post_split_exact_source_query_hits":query_hits,
+                            "post_split_source_cells_recaptured":recaptured.len(),
+                            "post_split_source_partition_exact":true,
+                            "baseline_nearest_hit_rays_preserved":baseline_rays.len(),
                             "commit_elapsed_us":split.elapsed.as_secs_f64()*1e6,
                         }));
                     }
@@ -1088,7 +1108,7 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "scenario":"eng214_actual_animal_fracture_connectivity",
-            "scope":"bounded immutable CPU topology planning only; no runtime owner split or actor population acceptance",
+            "scope":"bounded CPU topology and physical corpse-component feasibility; no actor population acceptance",
             "cases":cases
         }))?
     );

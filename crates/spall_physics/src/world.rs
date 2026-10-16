@@ -437,7 +437,35 @@ struct ArticulatedEntry {
     source_generation: u64,
     fracture_owner_key: Option<u128>,
     next_component_serial: u64,
+    density_manifest: Option<HashMap<MaterialId, u64>>,
     parts: Vec<ArticulatedPartEntry>,
+}
+
+fn density_manifest(
+    parts: &[SourcePart],
+    density: &impl Fn(MaterialId) -> f64,
+) -> Result<HashMap<MaterialId, u64>, crate::articulated::ArticulatedError> {
+    let mut manifest = HashMap::new();
+    for part in parts {
+        part.grid.for_each_solid(|_, _, _, material| {
+            manifest
+                .entry(material)
+                .or_insert_with(|| density(material).to_bits());
+        });
+    }
+    if manifest.values().any(|bits| {
+        let value = f64::from_bits(*bits);
+        !value.is_finite() || value <= 0.0
+    }) {
+        return Err(crate::articulated::ArticulatedError::InvalidDensity);
+    }
+    Ok(manifest)
+}
+
+fn manifest_density(manifest: &HashMap<MaterialId, u64>, material: MaterialId) -> f64 {
+    manifest
+        .get(&material)
+        .map_or(f64::NAN, |bits| f64::from_bits(*bits))
 }
 
 /// Measurements from an atomic articulated-rig to corpse-owner transfer.
@@ -1100,10 +1128,36 @@ impl PhysicsWorld {
         representation: Representation,
         density: impl Fn(spall_core::MaterialId) -> f64,
     ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
+        use crate::articulated::{MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_SOLID_CELLS};
+        if parts.is_empty() || parts.len() > MAX_ARTICULATED_PARTS {
+            return Err(crate::articulated::ArticulatedError::PartCount);
+        }
+        let mut dense_preflight = 0_u64;
+        let mut solid_preflight = 0_u64;
+        for part in &parts {
+            let dims = part.grid.dims();
+            let dense = u64::from(dims[0])
+                .checked_mul(u64::from(dims[1]))
+                .and_then(|v| v.checked_mul(u64::from(dims[2])))
+                .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
+            dense_preflight = dense_preflight
+                .checked_add(dense)
+                .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
+            solid_preflight = solid_preflight
+                .checked_add(part.grid.solid_count())
+                .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
+        }
+        if dense_preflight > MAX_ARTICULATED_DENSE_CELLS
+            || solid_preflight > MAX_ARTICULATED_SOLID_CELLS
+        {
+            return Err(crate::articulated::ArticulatedError::WorkBudget);
+        }
+        let manifest = density_manifest(&parts, &density)?;
+        let stable_density = |material| manifest_density(&manifest, material);
         let mut invalid_density = false;
         for part in &parts {
             part.grid.for_each_solid(|_, _, _, material| {
-                let rho = density(material);
+                let rho = stable_density(material);
                 invalid_density |= !rho.is_finite() || rho <= 0.0;
             });
         }
@@ -1114,11 +1168,12 @@ impl PhysicsWorld {
             .iter()
             .map(|part| part.local_transform)
             .collect::<Vec<_>>();
-        let mass_properties = crate::mass::articulated_mass_properties(&parts, &poses, density)
-            .ok_or(crate::articulated::ArticulatedError::InvalidTransform)?
-            .to_body_properties();
+        let mass_properties =
+            crate::mass::articulated_mass_properties(&parts, &poses, stable_density)
+                .ok_or(crate::articulated::ArticulatedError::InvalidTransform)?
+                .to_body_properties();
         validate_body_mass_properties(mass_properties)?;
-        self.add_articulated_body_mode(
+        let owner = self.add_articulated_body_mode(
             translation_m,
             rotation_xyzw,
             topology_token,
@@ -1126,7 +1181,12 @@ impl PhysicsWorld {
             representation,
             false,
             Some(mass_properties),
-        )
+        )?;
+        self.articulated
+            .get_mut(&owner.0)
+            .expect("created owner")
+            .density_manifest = Some(manifest);
+        Ok(owner)
     }
 
     /// Converts the existing ENG-210 multi-body kinematic owner in place. It
@@ -1200,8 +1260,10 @@ impl PhysicsWorld {
             .iter()
             .map(|p| p.local_transform)
             .collect::<Vec<_>>();
+        let manifest = density_manifest(&source_parts, &density)?;
+        let stable_density = |material| manifest_density(&manifest, material);
         let mass64 =
-            crate::mass::articulated_mass_properties(&source_parts, &local_poses, &density)
+            crate::mass::articulated_mass_properties(&source_parts, &local_poses, stable_density)
                 .ok_or(ArticulatedError::InvalidDensity)?;
         let mass = mass64.to_body_properties();
         validate_body_mass_properties(mass)?;
@@ -1236,7 +1298,7 @@ impl PhysicsWorld {
             let s = part.cell_m;
             let mut density_error = false;
             part.grid.for_each_solid(|x, y, z, material| {
-                let rho = density(material);
+                let rho = stable_density(material);
                 if !rho.is_finite() || rho <= 0.0 {
                     density_error = true;
                     return;
@@ -1441,6 +1503,7 @@ impl PhysicsWorld {
         }
         assembly.kinematic_part_bodies = false;
         assembly.dynamic_corpse = true;
+        assembly.density_manifest = Some(manifest);
         let entry = &mut self.entries[entry_index];
         entry.body = root_body;
         entry.collider = replacement_handles[0];
@@ -1470,12 +1533,17 @@ impl PhysicsWorld {
             .ok_or(FractureError::StaleOwner)?;
         if !assembly.dynamic_corpse
             || corpse_key == 0
-            || self.fracture_owner_keys.get(&corpse_key).is_some_and(|owner| *owner != id.0)
+            || self
+                .fracture_owner_keys
+                .get(&corpse_key)
+                .is_some_and(|owner| *owner != id.0)
             || assembly
                 .fracture_owner_key
                 .is_some_and(|key| key != corpse_key)
             || component_key.is_some_and(|key| {
-                key.owner_key != corpse_key || key.serial == 0 || key.serial >= assembly.next_component_serial
+                key.owner_key != corpse_key
+                    || key.serial == 0
+                    || key.serial >= assembly.next_component_serial
             })
         {
             return Err(FractureError::StaleOwner);
@@ -1556,6 +1624,22 @@ impl PhysicsWorld {
             .articulated
             .get(&body_id)
             .ok_or(FractureError::StaleOwner)?;
+        let manifest = assembly
+            .density_manifest
+            .clone()
+            .ok_or(FractureError::InvalidMass)?;
+        if snapshot.parts.iter().any(|part| {
+            let mut mismatch = false;
+            part.source.grid.for_each_solid(|_, _, _, material| {
+                mismatch |= manifest
+                    .get(&material)
+                    .is_none_or(|bits| density(material).to_bits() != *bits);
+            });
+            mismatch
+        }) {
+            return Err(FractureError::InvalidMass);
+        }
+        let stable_density = |material| manifest_density(&manifest, material);
         let target = assembly
             .parts
             .iter()
@@ -1574,7 +1658,10 @@ impl PhysicsWorld {
             || self.articulated.iter().any(|(other_id, other)| {
                 *other_id != body_id && other.fracture_owner_key == Some(snapshot.token.corpse_key)
             })
-            || self.fracture_owner_keys.get(&snapshot.token.corpse_key).is_some_and(|owner| *owner != body_id)
+            || self
+                .fracture_owner_keys
+                .get(&snapshot.token.corpse_key)
+                .is_some_and(|owner| *owner != body_id)
         {
             return Err(FractureError::StaleOwner);
         }
@@ -1599,10 +1686,16 @@ impl PhysicsWorld {
         if component_ids.iter().any(|component| component.serial == 0) {
             return Err(FractureError::InvalidPlan);
         }
-        let live_components = assembly.parts.iter()
+        let live_components = assembly
+            .parts
+            .iter()
             .filter_map(|part| part.component_id)
-            .collect::<HashSet<_>>().len().max(1);
-        if live_components.checked_sub(1).and_then(|count| count.checked_add(plan.components.len()))
+            .collect::<HashSet<_>>()
+            .len()
+            .max(1);
+        if live_components
+            .checked_sub(1)
+            .and_then(|count| count.checked_add(plan.components.len()))
             .is_none_or(|count| count > crate::fracture::MAX_FRACTURE_COMPONENTS)
         {
             return Err(FractureError::WorkBudget);
@@ -1613,24 +1706,34 @@ impl PhysicsWorld {
         let query_only = entry.query_only;
         let old_body = target[0].body;
         let old_pose = *self.bodies[old_body].position();
-        let old_sources = target.iter().map(|part| SourcePart {
-            part_id: part.part_id,
-            parent_id: None,
-            volume_id: part.volume_id,
-            source_revision: part.source_revision,
-            grid: part.grid.clone(),
-            cell_m: part.cell_m,
-            local_transform: part.assembly_pose,
-        }).collect::<Vec<_>>();
-        let old_poses = old_sources.iter().map(|part| part.local_transform).collect::<Vec<_>>();
-        let old_mass = crate::mass::articulated_mass_properties(&old_sources, &old_poses, &density)
-            .ok_or(FractureError::InvalidMass)?.to_body_properties();
+        let old_sources = target
+            .iter()
+            .map(|part| SourcePart {
+                part_id: part.part_id,
+                parent_id: None,
+                volume_id: part.volume_id,
+                source_revision: part.source_revision,
+                grid: part.grid.clone(),
+                cell_m: part.cell_m,
+                local_transform: part.assembly_pose,
+            })
+            .collect::<Vec<_>>();
+        let old_poses = old_sources
+            .iter()
+            .map(|part| part.local_transform)
+            .collect::<Vec<_>>();
+        let old_mass =
+            crate::mass::articulated_mass_properties(&old_sources, &old_poses, stable_density)
+                .ok_or(FractureError::InvalidMass)?
+                .to_body_properties();
         validate_body_mass_properties(old_mass).map_err(|_| FractureError::InvalidMass)?;
         // Re-derive from the canonical source cells. Rapier's cached COM can
         // be uninitialized on a newly-created aggregate and is not a source
         // ownership oracle.
         let old_com = old_pose.transform_point(Vector::new(
-            old_mass.local_com_m[0], old_mass.local_com_m[1], old_mass.local_com_m[2],
+            old_mass.local_com_m[0],
+            old_mass.local_com_m[1],
+            old_mass.local_com_m[2],
         ));
         let old_linear = self.bodies[old_body].linvel();
         let old_angular = self.bodies[old_body].angvel();
@@ -1822,7 +1925,7 @@ impl PhysicsWorld {
                     collider,
                 });
             }
-            let mass = crate::mass::articulated_mass_properties(&sources, &poses, &density)
+            let mass = crate::mass::articulated_mass_properties(&sources, &poses, stable_density)
                 .ok_or(FractureError::InvalidMass)?
                 .to_body_properties();
             validate_body_mass_properties(mass).map_err(|_| FractureError::InvalidMass)?;
@@ -1846,6 +1949,44 @@ impl PhysicsWorld {
                 angular: old_angular,
                 shards,
             });
+        }
+
+        let mut total_parts = prepared
+            .iter()
+            .map(|child| child.shards.len())
+            .sum::<usize>();
+        let mut total_dense = derived_dense_count as u64;
+        let mut total_solid = plan.source_cells.len() as u64;
+        let mut total_primitives = primitive_count;
+        for part in assembly
+            .parts
+            .iter()
+            .filter(|part| part.component_id != snapshot.token.component_key)
+        {
+            total_parts = total_parts
+                .checked_add(1)
+                .ok_or(FractureError::WorkBudget)?;
+            let dims = part.grid.dims();
+            let dense = u64::from(dims[0])
+                .checked_mul(u64::from(dims[1]))
+                .and_then(|v| v.checked_mul(u64::from(dims[2])))
+                .ok_or(FractureError::WorkBudget)?;
+            total_dense = total_dense
+                .checked_add(dense)
+                .ok_or(FractureError::WorkBudget)?;
+            total_solid = total_solid
+                .checked_add(part.grid.solid_count())
+                .ok_or(FractureError::WorkBudget)?;
+            total_primitives = total_primitives
+                .checked_add(part.primitives)
+                .ok_or(FractureError::WorkBudget)?;
+        }
+        if total_parts > MAX_ARTICULATED_PARTS
+            || total_dense > crate::articulated::MAX_ARTICULATED_DENSE_CELLS
+            || total_solid > crate::articulated::MAX_ARTICULATED_SOLID_CELLS
+            || total_primitives > 65_536
+        {
+            return Err(FractureError::WorkBudget);
         }
 
         // All partitions, shapes, masses, transforms, and stable IDs are now
@@ -1923,7 +2064,8 @@ impl PhysicsWorld {
         assembly.kinematic_part_bodies = false;
         assembly.source_generation = next_source_generation;
         assembly.topology_token = next_topology_revision;
-        self.fracture_owner_keys.insert(snapshot.token.corpse_key, body_id);
+        self.fracture_owner_keys
+            .insert(snapshot.token.corpse_key, body_id);
         self.ccd_solver = CCDSolver::new();
         Ok(FractureCommitOutcome {
             elapsed: started.elapsed(),
@@ -2237,6 +2379,7 @@ impl PhysicsWorld {
                 source_generation: 1,
                 fracture_owner_key: None,
                 next_component_serial: 1,
+                density_manifest: None,
                 parts: built_parts,
             },
         );
@@ -2649,6 +2792,425 @@ impl PhysicsWorld {
         Ok(start.elapsed())
     }
 
+    /// Removes source cells from exactly one live fracture component. The
+    /// stable key is mandatory so a source part split across bodies cannot be
+    /// edited by accidental vector order. Additions and material replacement
+    /// remain unsupported until their incoming momentum policy is defined.
+    pub fn rebuild_dynamic_corpse_component_part_grid(
+        &mut self,
+        id: ArticulatedBodyId,
+        component_id: DerivedFractureComponentId,
+        expected_topology_token: u64,
+        new_topology_token: u64,
+        part_id: u32,
+        expected_source_revision: u64,
+        new_source_revision: u64,
+        new_grid: OccupancyGrid,
+        density: impl Fn(spall_core::MaterialId) -> f64,
+    ) -> Result<CorpseEditOutcome, crate::articulated::ArticulatedError> {
+        use crate::articulated::{
+            ArticulatedError, MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_SOLID_CELLS,
+        };
+        let started = Instant::now();
+        let assembly = self
+            .articulated
+            .get(&id.0)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        if !assembly.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
+        if assembly.fracture_owner_key != Some(component_id.owner_key)
+            || component_id.serial == 0
+            || component_id.serial >= assembly.next_component_serial
+            || assembly.topology_token != expected_topology_token
+            || assembly.pending_pose.is_some()
+            || assembly.pending_root_pose_token.is_some()
+            || new_topology_token <= expected_topology_token
+        {
+            return Err(ArticulatedError::StaleTopology);
+        }
+        let component = assembly
+            .parts
+            .iter()
+            .filter(|p| p.component_id == Some(component_id))
+            .collect::<Vec<_>>();
+        let target_index = assembly
+            .parts
+            .iter()
+            .position(|p| p.component_id == Some(component_id) && p.part_id == part_id)
+            .ok_or(ArticulatedError::StaleTopology)?;
+        let target = assembly.parts[target_index].clone();
+        if target.source_revision != expected_source_revision
+            || new_source_revision <= expected_source_revision
+        {
+            return Err(ArticulatedError::StaleTopology);
+        }
+        if !articulated_grid_range_valid(&new_grid, target.cell_m) {
+            return Err(ArticulatedError::GeometryRange);
+        }
+        let next_generation = assembly
+            .source_generation
+            .checked_add(1)
+            .ok_or(ArticulatedError::WorkBudget)?;
+        let manifest = assembly
+            .density_manifest
+            .as_ref()
+            .ok_or(ArticulatedError::InvalidDensity)?;
+        let mut callback_mismatch = false;
+        for part in &component {
+            part.grid.for_each_solid(|_, _, _, material| {
+                callback_mismatch |= manifest
+                    .get(&material)
+                    .is_none_or(|bits| density(material).to_bits() != *bits);
+            });
+        }
+        if callback_mismatch {
+            return Err(ArticulatedError::InvalidDensity);
+        }
+        let stable_density = |material| manifest_density(manifest, material);
+        // Admit the aggregate dense and solid workload before mass traversal,
+        // shape generation, or cloning any replacement grids.
+        let mut dense_preflight = 0_u64;
+        let mut solid_preflight = 0_u64;
+        for (index, part) in assembly.parts.iter().enumerate() {
+            let grid = if index == target_index {
+                &new_grid
+            } else {
+                &part.grid
+            };
+            if grid.solid_count() == 0 {
+                continue;
+            }
+            let d = grid.dims();
+            let dense = u64::from(d[0])
+                .checked_mul(u64::from(d[1]))
+                .and_then(|v| v.checked_mul(u64::from(d[2])))
+                .ok_or(ArticulatedError::WorkBudget)?;
+            dense_preflight = dense_preflight
+                .checked_add(dense)
+                .ok_or(ArticulatedError::WorkBudget)?;
+            solid_preflight = solid_preflight
+                .checked_add(grid.solid_count())
+                .ok_or(ArticulatedError::WorkBudget)?;
+        }
+        if dense_preflight > MAX_ARTICULATED_DENSE_CELLS
+            || solid_preflight > MAX_ARTICULATED_SOLID_CELLS
+            || assembly.parts.len() > MAX_ARTICULATED_PARTS
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        let old_origin = target.grid.origin();
+        let new_origin = new_grid.origin();
+        let new_dims = new_grid.dims();
+        let mut removed_mass = 0.0_f64;
+        let mut retained = 0_u64;
+        let mut invalid_density = false;
+        let mut unsupported = false;
+        target.grid.for_each_solid(|x, y, z, material| {
+            let Some(gx) = old_origin.x.checked_add(i64::from(x)) else {
+                unsupported = true;
+                return;
+            };
+            let Some(gy) = old_origin.y.checked_add(i64::from(y)) else {
+                unsupported = true;
+                return;
+            };
+            let Some(gz) = old_origin.z.checked_add(i64::from(z)) else {
+                unsupported = true;
+                return;
+            };
+            let (Some(lx), Some(ly), Some(lz)) = (
+                gx.checked_sub(new_origin.x),
+                gy.checked_sub(new_origin.y),
+                gz.checked_sub(new_origin.z),
+            ) else {
+                unsupported = true;
+                return;
+            };
+            let new_material = (lx >= 0
+                && ly >= 0
+                && lz >= 0
+                && lx < i64::from(new_dims[0])
+                && ly < i64::from(new_dims[1])
+                && lz < i64::from(new_dims[2]))
+            .then(|| new_grid.material(lx as u32, ly as u32, lz as u32))
+            .flatten();
+            match new_material {
+                Some(current) if current == material => retained += 1,
+                Some(_) => unsupported = true,
+                None => {
+                    let rho = stable_density(material);
+                    if !rho.is_finite() || rho <= 0.0 {
+                        invalid_density = true;
+                    } else {
+                        removed_mass += rho * f64::from(target.cell_m).powi(3);
+                    }
+                }
+            }
+        });
+        if invalid_density {
+            return Err(ArticulatedError::InvalidDensity);
+        }
+        if unsupported || new_grid.solid_count() != retained {
+            return Err(ArticulatedError::UnsupportedCorpseEdit);
+        }
+        let old_sources = component
+            .iter()
+            .map(|p| SourcePart {
+                part_id: p.part_id,
+                parent_id: None,
+                volume_id: p.volume_id,
+                source_revision: p.source_revision,
+                grid: p.grid.clone(),
+                cell_m: p.cell_m,
+                local_transform: p.assembly_pose,
+            })
+            .collect::<Vec<_>>();
+        let old_poses = old_sources
+            .iter()
+            .map(|p| p.local_transform)
+            .collect::<Vec<_>>();
+        let old_mass =
+            crate::mass::articulated_mass_properties(&old_sources, &old_poses, stable_density)
+                .ok_or(ArticulatedError::InvalidDensity)?
+                .to_body_properties();
+        validate_body_mass_properties(old_mass)?;
+        let mut new_sources = Vec::new();
+        for part in &component {
+            let grid = if part.part_id == part_id {
+                &new_grid
+            } else {
+                &part.grid
+            };
+            if grid.solid_count() == 0 {
+                continue;
+            }
+            new_sources.push(SourcePart {
+                part_id: part.part_id,
+                parent_id: None,
+                volume_id: part.volume_id,
+                source_revision: if part.part_id == part_id {
+                    new_source_revision
+                } else {
+                    part.source_revision
+                },
+                grid: grid.clone(),
+                cell_m: part.cell_m,
+                local_transform: part.assembly_pose,
+            });
+        }
+        let new_mass = if new_sources.is_empty() {
+            None
+        } else {
+            let poses = new_sources
+                .iter()
+                .map(|p| p.local_transform)
+                .collect::<Vec<_>>();
+            let mass =
+                crate::mass::articulated_mass_properties(&new_sources, &poses, stable_density)
+                    .ok_or(ArticulatedError::InvalidDensity)?
+                    .to_body_properties();
+            validate_body_mass_properties(mass)?;
+            Some(mass)
+        };
+        let mut primitive_total = 0_usize;
+        for (index, part) in assembly.parts.iter().enumerate() {
+            if index == target_index {
+                continue;
+            }
+            primitive_total = primitive_total
+                .checked_add(part.primitives)
+                .ok_or(ArticulatedError::WorkBudget)?;
+        }
+        let representation = self.entries[entry_index(id.0, self.id_namespace)].representation;
+        let built = (new_grid.solid_count() > 0)
+            .then(|| build_collider(&new_grid, target.cell_m, representation));
+        if let Some(built) = &built {
+            primitive_total = primitive_total
+                .checked_add(built.primitives)
+                .ok_or(ArticulatedError::WorkBudget)?;
+        }
+        if primitive_total > 65_536
+            || built
+                .as_ref()
+                .is_some_and(|b| b.primitives > crate::collider::MERGED_CUBOID_PRIMITIVE_BUDGET)
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        let body = target.body;
+        let pose = *self.bodies[body].position();
+        let old_com = pose.transform_point(Vector::new(
+            old_mass.local_com_m[0],
+            old_mass.local_com_m[1],
+            old_mass.local_com_m[2],
+        ));
+        let old_linear = self.bodies[body].linvel();
+        let angular = self.bodies[body].angvel();
+        let new_linear = if let Some(mass) = new_mass {
+            let new_com = pose.transform_point(Vector::new(
+                mass.local_com_m[0],
+                mass.local_com_m[1],
+                mass.local_com_m[2],
+            ));
+            old_linear + angular.cross(new_com - old_com)
+        } else {
+            old_linear
+        };
+        if ![new_linear.x, new_linear.y, new_linear.z]
+            .iter()
+            .all(|x| x.is_finite())
+        {
+            return Err(ArticulatedError::InvalidMassProperties);
+        }
+        let (new_handle, part_surface_radius_m, root_surface_radius_m) =
+            if let Some(ref built) = built {
+                let origin = new_grid.origin();
+                let origin_m = [
+                    origin.x as f32 * target.cell_m,
+                    origin.y as f32 * target.cell_m,
+                    origin.z as f32 * target.cell_m,
+                ];
+                let offset = rotate(target.assembly_pose.rotation_xyzw, origin_m);
+                let local = Pose::new(
+                    Vector::new(
+                        target.assembly_pose.translation_m[0] + offset[0],
+                        target.assembly_pose.translation_m[1] + offset[1],
+                        target.assembly_pose.translation_m[2] + offset[2],
+                    ),
+                    Rotation::from_xyzw(
+                        target.assembly_pose.rotation_xyzw[0],
+                        target.assembly_pose.rotation_xyzw[1],
+                        target.assembly_pose.rotation_xyzw[2],
+                        target.assembly_pose.rotation_xyzw[3],
+                    )
+                    .to_scaled_axis(),
+                );
+                let old_collider = self
+                    .colliders
+                    .get(target.collider)
+                    .ok_or(ArticulatedError::Hierarchy)?;
+                let mut collider = ColliderBuilder::new(built.collider.shared_shape().clone())
+                    .density(0.0)
+                    .position(local)
+                    .friction(old_collider.friction())
+                    .active_collision_types(old_collider.active_collision_types())
+                    .sensor(old_collider.is_sensor())
+                    .build();
+                collider.set_restitution(old_collider.restitution());
+                collider.set_restitution_combine_rule(old_collider.restitution_combine_rule());
+                collider.set_friction_combine_rule(old_collider.friction_combine_rule());
+                collider.set_collision_groups(old_collider.collision_groups());
+                collider.set_solver_groups(old_collider.solver_groups());
+                let handle = self
+                    .colliders
+                    .insert_with_parent(collider, body, &mut self.bodies);
+                self.tag_collider(handle, id.0);
+                (
+                    Some(handle),
+                    source_surface_radius_m(&new_grid, target.cell_m, [0.0; 3], None),
+                    source_surface_radius_m(
+                        &new_grid,
+                        target.cell_m,
+                        [0.0; 3],
+                        Some(target.assembly_pose),
+                    ),
+                )
+            } else {
+                (None, 0.0, 0.0)
+            };
+        let entry_idx = entry_index(id.0, self.id_namespace);
+        let entry_primary_removed = self.entries[entry_idx].collider == target.collider;
+        self.colliders
+            .remove(target.collider, &mut self.islands, &mut self.bodies, true);
+        self.pending_removed.push(target.collider);
+        let assembly = self.articulated.get_mut(&id.0).expect("validated corpse");
+        if let Some(handle) = new_handle {
+            self.pending_modified.push(handle);
+            let part = &mut assembly.parts[target_index];
+            part.grid = new_grid;
+            part.source_revision = new_source_revision;
+            part.collider = handle;
+            part.primitives = built.as_ref().map_or(0, |b| b.primitives);
+            part.part_surface_radius_m = part_surface_radius_m;
+            part.root_surface_radius_m = root_surface_radius_m;
+        } else {
+            assembly.parts.remove(target_index);
+        }
+        for part in &mut assembly.parts {
+            if part.volume_id == target.volume_id {
+                part.source_revision = new_source_revision;
+            }
+        }
+        assembly.topology_token = new_topology_token;
+        assembly.source_generation = next_generation;
+        let component_remains = assembly
+            .parts
+            .iter()
+            .any(|p| p.component_id == Some(component_id));
+        let owner_remains = !assembly.parts.is_empty();
+        if !owner_remains {
+            self.retire_articulated_body(id);
+            return Ok(CorpseEditOutcome::AggregateRetired {
+                elapsed: started.elapsed(),
+                removed_mass_kg: removed_mass,
+            });
+        }
+        if !component_remains {
+            self.bodies.remove(
+                body,
+                &mut self.islands,
+                &mut self.colliders,
+                &mut self.impulse_joints,
+                &mut self.multibody_joints,
+                true,
+            );
+            let replacement = assembly.parts.first().expect("owner remains");
+            let entry = &mut self.entries[entry_idx];
+            if entry.body == body {
+                entry.body = replacement.body;
+                entry.collider = replacement.collider;
+                entry.mass_properties = None;
+            }
+            self.ccd_solver = CCDSolver::new();
+            return Ok(CorpseEditOutcome::PartRetired {
+                elapsed: started.elapsed(),
+                removed_mass_kg: removed_mass,
+            });
+        }
+        let mass = new_mass.expect("remaining component has source cells");
+        self.bodies[body]
+            .set_additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]), true);
+        self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
+        self.bodies[body].set_position(pose, true);
+        self.bodies[body].set_linvel(new_linear, true);
+        self.bodies[body].set_angvel(angular, true);
+        let entry = &mut self.entries[entry_idx];
+        if entry.body == body {
+            if entry_primary_removed {
+                entry.collider = new_handle.unwrap_or_else(|| {
+                    assembly
+                        .parts
+                        .iter()
+                        .find(|p| p.body == body)
+                        .expect("surviving component shard")
+                        .collider
+                });
+            }
+            entry.mass_properties = Some(mass);
+        }
+        Ok(if new_handle.is_none() {
+            CorpseEditOutcome::PartRetired {
+                elapsed: started.elapsed(),
+                removed_mass_kg: removed_mass,
+            }
+        } else {
+            CorpseEditOutcome::Rebuilt {
+                elapsed: started.elapsed(),
+                removed_mass_kg: removed_mass,
+            }
+        })
+    }
+
     /// Edits dynamic-corpse source geometry with an open-system removal rule:
     /// removed cells leave carrying their instantaneous rigid-body velocity
     /// field, while the surviving body's world pose and angular velocity stay
@@ -2703,6 +3265,22 @@ impl PhysicsWorld {
             return Err(ArticulatedError::StaleTopology);
         }
         let original_parts = assembly.parts.clone();
+        let manifest = assembly
+            .density_manifest
+            .clone()
+            .ok_or(ArticulatedError::InvalidDensity)?;
+        let mut density_mismatch = false;
+        for part in &original_parts {
+            part.grid.for_each_solid(|_, _, _, material| {
+                density_mismatch |= manifest
+                    .get(&material)
+                    .is_none_or(|bits| density(material).to_bits() != *bits);
+            });
+        }
+        if density_mismatch {
+            return Err(ArticulatedError::InvalidDensity);
+        }
+        let stable_density = |material| manifest_density(&manifest, material);
         let mut removed_mass = 0.0;
         let mut invalid_density = false;
         let mut unsupported_edit = false;
@@ -2729,7 +3307,7 @@ impl PhysicsWorld {
                 Some(current) if current == material => retained_cells += 1,
                 Some(_) => unsupported_edit = true,
                 None => {
-                    let rho = density(material);
+                    let rho = stable_density(material);
                     if !rho.is_finite() || rho <= 0.0 {
                         invalid_density = true;
                     } else {
@@ -2777,7 +3355,7 @@ impl PhysicsWorld {
                 .iter()
                 .map(|p| p.local_transform)
                 .collect::<Vec<_>>();
-            let mass = crate::mass::articulated_mass_properties(&remaining, &poses, &density)
+            let mass = crate::mass::articulated_mass_properties(&remaining, &poses, stable_density)
                 .ok_or(ArticulatedError::InvalidDensity)?
                 .to_body_properties();
             validate_body_mass_properties(mass)?;
@@ -2833,7 +3411,7 @@ impl PhysicsWorld {
             .iter()
             .map(|p| p.local_transform)
             .collect::<Vec<_>>();
-        let mass = crate::mass::articulated_mass_properties(&sources, &poses, &density)
+        let mass = crate::mass::articulated_mass_properties(&sources, &poses, stable_density)
             .ok_or(ArticulatedError::InvalidDensity)?
             .to_body_properties();
         validate_body_mass_properties(mass)?;
@@ -3851,7 +4429,10 @@ impl PhysicsWorld {
         id: ArticulatedBodyId,
         component_id: DerivedFractureComponentId,
     ) -> Result<BodyState, FractureError> {
-        let assembly = self.articulated.get(&id.0).ok_or(FractureError::StaleOwner)?;
+        let assembly = self
+            .articulated
+            .get(&id.0)
+            .ok_or(FractureError::StaleOwner)?;
         if !assembly.dynamic_corpse {
             return Err(FractureError::StaleOwner);
         }
@@ -3894,10 +4475,17 @@ impl PhysicsWorld {
         linear_m_s: [f32; 3],
         angular_rad_s: [f32; 3],
     ) -> Result<(), FractureError> {
-        if !linear_m_s.iter().chain(&angular_rad_s).all(|v| v.is_finite()) {
+        if !linear_m_s
+            .iter()
+            .chain(&angular_rad_s)
+            .all(|v| v.is_finite())
+        {
             return Err(FractureError::InvalidPlan);
         }
-        let assembly = self.articulated.get(&id.0).ok_or(FractureError::StaleOwner)?;
+        let assembly = self
+            .articulated
+            .get(&id.0)
+            .ok_or(FractureError::StaleOwner)?;
         if !assembly.dynamic_corpse {
             return Err(FractureError::StaleOwner);
         }
@@ -3908,8 +4496,12 @@ impl PhysicsWorld {
             {
                 return Err(FractureError::StaleOwner);
             }
-            assembly.parts.iter().find(|p| p.component_id == Some(key))
-                .map(|part| part.body).ok_or(FractureError::StaleOwner)?
+            assembly
+                .parts
+                .iter()
+                .find(|p| p.component_id == Some(key))
+                .map(|part| part.body)
+                .ok_or(FractureError::StaleOwner)?
         } else {
             if assembly.parts.iter().any(|p| p.component_id.is_some()) {
                 return Err(FractureError::StaleOwner);
@@ -3917,8 +4509,14 @@ impl PhysicsWorld {
             self.entries[entry_index(id.0, self.id_namespace)].body
         };
         let rb = self.bodies.get_mut(body).ok_or(FractureError::StaleOwner)?;
-        rb.set_linvel(Vector::new(linear_m_s[0], linear_m_s[1], linear_m_s[2]), true);
-        rb.set_angvel(Vector::new(angular_rad_s[0], angular_rad_s[1], angular_rad_s[2]), true);
+        rb.set_linvel(
+            Vector::new(linear_m_s[0], linear_m_s[1], linear_m_s[2]),
+            true,
+        );
+        rb.set_angvel(
+            Vector::new(angular_rad_s[0], angular_rad_s[1], angular_rad_s[2]),
+            true,
+        );
         Ok(())
     }
 
@@ -4061,7 +4659,8 @@ impl PhysicsWorld {
                 best = Some((toi, part.part_id, hit.cell, component_serial, hit));
             }
         }
-        best.map(|(_, _, _, _, hit)| hit).ok_or(ArticulatedError::Miss)
+        best.map(|(_, _, _, _, hit)| hit)
+            .ok_or(ArticulatedError::Miss)
     }
 
     /// Builds a Rapier rigid body + attached collider from `spec` and inserts
@@ -5233,11 +5832,14 @@ impl PhysicsWorld {
             .map(|i| BodyId((u64::from(self.id_namespace) << 32) | i as u64))
             .or_else(|| {
                 self.articulated.iter().find_map(|(id, assembly)| {
-                (assembly.kinematic_part_bodies
-                    || assembly.parts.iter().any(|part| part.component_id.is_some()))
-                        .then(|| assembly.parts.iter().any(|part| part.body == handle))
-                        .filter(|owned| *owned)
-                        .map(|_| *id)
+                    (assembly.kinematic_part_bodies
+                        || assembly
+                            .parts
+                            .iter()
+                            .any(|part| part.component_id.is_some()))
+                    .then(|| assembly.parts.iter().any(|part| part.body == handle))
+                    .filter(|owned| *owned)
+                    .map(|_| *id)
                 })
             })
     }
