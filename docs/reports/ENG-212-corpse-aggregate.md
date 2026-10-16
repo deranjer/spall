@@ -37,16 +37,20 @@ sampled instantaneous motions. It does not conserve energy imposed by a
 prescribed animation clip: kinematic motors may have added or removed energy
 before the death pose, and those actuator impulses are not reconstructed.
 
-An edit uses a declared open-system rule. Removed source material leaves with
-its instantaneous rigid-body velocity field; the remaining aggregate keeps its
-world pose and twist. Mass and inertia are rebuilt from the surviving cells
-before shape mutation, while the prior twist is explicitly restored afterward.
-The path makes no closed-system momentum claim across destructive removal and
-does not infer energy from COM/tensor changes. Empty source parts retire only
-their collider and ownership record. Removing the final part retires the single
-aggregate body. `PART` hierarchy is pose structure only: there are no inferred
-cross-part bonds or fracture connectivity. Fracture remains gated on an
-explicit separate connectivity/bond policy and source-volume ownership rule.
+An edit uses a declared removal-only open-system rule. Removed source material
+leaves with its instantaneous rigid-body velocity field. The body origin and
+angular velocity stay fixed, while COM linear velocity changes by
+`omega × (new_COM - old_COM)` so every surviving point keeps its world velocity.
+The API returns the exact old-minus-new source-cell mass. Additions and material
+replacement are rejected until an incoming momentum policy exists; the adapter
+does not silently count them as removed material or manufacture their momentum.
+Mass and inertia are rebuilt before shape mutation. An empty leaf part retires
+only its collider and source ownership. A parent part with surviving descendants
+is rejected before mutation because reparenting/frozen-pose metadata has not
+been defined. Removing the final part retires the aggregate body. `PART`
+hierarchy is pose structure only: there are no inferred cross-part bonds or
+fracture connectivity. Selective fracture remains gated on an explicit
+connectivity/bond policy and source-volume ownership rule.
 
 ## Authored-animal measurements
 
@@ -62,12 +66,12 @@ results are in [ENG-212-corpse-candidate.json](ENG-212-corpse-candidate.json).
 
 | Animal / representation | Colliders / primitives | Living attach μs | Transfer μs | Edit μs | Mean step μs |
 |---|---:|---:|---:|---:|---:|
-| Trout / Native Voxels | 5 / 5 | 27.0–78.4 | 16.9–32.2 | 21.4–29.5 | 3.50–12.75 |
-| Trout / Merged Cuboids | 5 / 17 | 16.4–20.9 | 12.8–25.2 | 15.3–19.5 | 1.84–2.98 |
-| Crow / Native Voxels | 6 / 6 | 34.5–39.2 | 17.1–25.3 | 13.9–17.1 | 3.63–13.94 |
-| Crow / Merged Cuboids | 6 / 14 | 16.3–19.2 | 18.6–24.3 | 13.1–15.2 | 2.15–4.56 |
-| Deer / Native Voxels | 9 / 9 | 46.9–53.0 | 21.1–24.2 | 30.5–37.0 | 19.00–38.39 |
-| Deer / Merged Cuboids | 9 / 21 | 25.5–30.7 | 20.5–34.1 | 19.9–21.1 | 3.76–4.77 |
+| Trout / Native Voxels | 5 / 5 | 28.8–69.5 | 17.8–34.1 | 25.4–34.5 | 3.59–13.19 |
+| Trout / Merged Cuboids | 5 / 17 | 20.1–23.2 | 14.7–29.1 | 17.1–22.3 | 1.90–3.12 |
+| Crow / Native Voxels | 6 / 6 | 35.5–41.4 | 17.7–23.1 | 15.2–23.2 | 3.67–14.32 |
+| Crow / Merged Cuboids | 6 / 14 | 16.9–22.7 | 22.4–25.4 | 14.0–17.5 | 2.18–4.70 |
+| Deer / Native Voxels | 9 / 9 | 47.6–55.0 | 22.0–24.8 | 31.2–42.6 | 20.95–38.61 |
+| Deer / Merged Cuboids | 9 / 21 | 28.2–30.3 | 23.6–32.6 | 20.0–21.6 | 3.87–4.77 |
 
 Across all 18 cases, every converted owner retained one dynamic body and all
 source-part colliders; every source query identity check passed; every edit
@@ -83,20 +87,24 @@ target exists.
 Focused adapter regressions cover stale and pending transfer rejection leaving
 the three-body source rig intact, successful one-body transfer with nonzero
 sampled motion, post-transfer source queries, dynamic pose-update rejection,
-invalid-density edit rejection before mutation, both collider representations,
-source-cell edit and stale edit, empty-part removal and final aggregate
-retirement. A rotated/off-center negative-origin source fixture checks
-nonzero products of inertia. It does not independently establish every
-analytic tensor entry at arbitrary orientations; the analytic mass oracle and
-more extensive transformed random fixtures remain follow-up evidence.
+invalid-density edit rejection before mutation, additions/material changes
+rejected before mutation, both collider representations, exact mass deltas,
+asymmetric rotating-body point-velocity and remaining/removed momentum checks,
+empty leaf removal, final aggregate retirement, and rejected parent removal
+with child query identity intact. A coordinator-added independent closed-form
+oracle checks mass, COM, and every entry of the 3×3 inertia tensor for a rotated
+negative-origin box plus a nested mixed-density cube under reversed input
+order.
 
 ## Remaining gate
 
-Cross-part fracture/connectivity is deliberately not inferred from `PART`.
-ENG-212 proves a frozen compound with intact source-part colliders and
-whole-owner retirement, not selective detachment of bonded or unbonded parts.
-If lifecycle requires cross-part fracture, the next decision must define
-connectivity/bond semantics and stable ownership transfer before implementation.
+The bounded frozen-compound physics candidate is feasible and does not infer
+cross-part bonds from `PART`. Its acceptance does not accept full-destruction
+connectivity or selective detachment: disconnected source regions remain under
+the same compound owner until an explicit connectivity and split-ownership
+policy exists. The next launch prerequisite is to define connectivity/bond
+semantics, stable multi-volume split ownership, and what happens to disconnected
+cells. No hidden anchors or topology inferred from hierarchy are used.
 No protocol, storage, UI, host lifecycle, weather-combined run, 1 km workload,
 GPU capture, or population acceptance was performed. Those remain beyond this
 bounded physics candidate and must be gated separately.
@@ -104,9 +112,9 @@ bounded physics candidate and must be gated separately.
 ## Checks
 
 - `cargo check -p spall_physics` — passed.
-- `cargo test -p spall_physics --test articulated_review -- --nocapture` — 11 scenarios passed across both representations.
-- `cargo test -p spall_physics --all-targets` — 90 passed, 1 ignored; rerun passed after adding the pending-pose regression.
+- `cargo test -p spall_physics --test articulated_review -- --nocapture` — 13 scenarios passed across both representations.
+- `cargo test -p spall_physics --all-targets` — 90 passed, 1 ignored; 13 articulated regressions and the independent tensor oracle also passed.
 - `cargo check -p sandbox --example animal-collision-probe` — passed.
 - `cargo run --quiet -p sandbox --release --example animal-collision-probe -- --corpse-bounded` — 18 live-rig transfer/edit cases completed and raw JSON saved.
 - `cargo fmt --package spall_physics --package sandbox -- --check` — passed.
-- `cargo clippy -p spall_physics --all-targets -- -D warnings` — passed.
+- `cargo clippy -p spall_physics --all-targets -- -D warnings` — currently blocked by `needless_range_loop` in the separately committed coordinator test `tests/corpse_mass_review.rs:17`. `--lib` and `--test articulated_review` strict clippy checks pass.

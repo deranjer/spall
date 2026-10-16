@@ -46,6 +46,30 @@ fn world() -> PhysicsWorld {
     })
 }
 
+fn cross64(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn point_velocity(state: spall_physics::BodyState, com: [f64; 3], point: [f64; 3]) -> [f64; 3] {
+    let omega = state.angvel_rad_s.map(f64::from);
+    let arm = std::array::from_fn(|i| point[i] - com[i]);
+    let spin = cross64(omega, arm);
+    std::array::from_fn(|i| f64::from(state.linvel_m_s[i]) + spin[i])
+}
+
+fn assert_vec_close(actual: [f64; 3], expected: [f64; 3], tolerance: f64) {
+    for axis in 0..3 {
+        assert!(
+            (actual[axis] - expected[axis]).abs() <= tolerance,
+            "axis {axis}: actual={actual:?}, expected={expected:?}"
+        );
+    }
+}
+
 #[test]
 fn living_rig_transfer_is_atomic_conserves_sampled_motion_and_dynamic_pose_apis_reject() {
     for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
@@ -158,6 +182,270 @@ fn living_rig_transfer_is_atomic_conserves_sampled_motion_and_dynamic_pose_apis_
 }
 
 #[test]
+fn removals_preserve_asymmetric_rotating_velocity_field_and_account_exact_delta_momentum() {
+    for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+        for remove_whole_child in [false, true] {
+            let mut world = world();
+            let source = vec![
+                part(
+                    1,
+                    None,
+                    [0, 0, 0],
+                    vec![true, true, true],
+                    PartTransform::IDENTITY,
+                ),
+                part(
+                    2,
+                    Some(1),
+                    [0, 0, 0],
+                    vec![true],
+                    PartTransform {
+                        translation_m: [4.0, 0.0, 0.0],
+                        ..PartTransform::IDENTITY
+                    },
+                ),
+            ];
+            let id = world
+                .add_articulated_kinematic_parts(
+                    [0.0; 3],
+                    PartTransform::IDENTITY.rotation_xyzw,
+                    1,
+                    source.clone(),
+                    representation,
+                )
+                .unwrap();
+            world.step();
+            let death_child = PartTransform {
+                translation_m: [4.0, 1.0, 0.0],
+                ..source[1].local_transform
+            };
+            world
+                .update_articulated_pose_with_swept_root_pose(
+                    id,
+                    ArticulatedPose {
+                        topology_token: 1,
+                        base_pose_token: 0,
+                        pose_token: 1,
+                        parts: vec![(1, PartTransform::IDENTITY), (2, death_child)],
+                    },
+                    PartTransform::IDENTITY,
+                )
+                .unwrap();
+            world.step();
+            world
+                .transfer_articulated_to_dynamic_corpse(id, 1, 1, |_| 1_000.0)
+                .unwrap();
+            let old_state = world.articulated_body_state(id);
+            assert!(
+                old_state.angvel_rad_s[2].abs() > 1e-4,
+                "test requires rotation: {old_state:?}"
+            );
+            let old_sources = vec![
+                source[0].clone(),
+                SourcePart {
+                    local_transform: death_child,
+                    ..source[1].clone()
+                },
+            ];
+            let old_poses = old_sources
+                .iter()
+                .map(|p| p.local_transform)
+                .collect::<Vec<_>>();
+            let old_mass =
+                articulated_mass_properties(&old_sources, &old_poses, |_| 1_000.0).unwrap();
+            let old_com = old_mass.com_m;
+
+            let (edited_part, edited_grid) = if remove_whole_child {
+                (
+                    2,
+                    OccupancyGrid::from_solid_mask(
+                        GlobalCell::new(0, 0, 0),
+                        [1, 1, 1],
+                        vec![false],
+                        vec![MaterialId::AIR],
+                    )
+                    .unwrap(),
+                )
+            } else {
+                (
+                    1,
+                    OccupancyGrid::from_solid_mask(
+                        GlobalCell::new(0, 0, 0),
+                        [3, 1, 1],
+                        vec![true, true, false],
+                        vec![MaterialId(1); 3],
+                    )
+                    .unwrap(),
+                )
+            };
+            // Additions and material replacement have no declared momentum source.
+            let added = OccupancyGrid::from_solid_mask(
+                GlobalCell::new(0, 0, 0),
+                [4, 1, 1],
+                vec![true; 4],
+                vec![MaterialId(1); 4],
+            )
+            .unwrap();
+            assert_eq!(
+                world
+                    .rebuild_dynamic_corpse_part_grid(id, 1, 2, 1, 7, 8, added, |_| 1_000.0)
+                    .unwrap_err(),
+                spall_physics::ArticulatedError::UnsupportedCorpseEdit
+            );
+            let replacement = OccupancyGrid::from_solid_mask(
+                GlobalCell::new(0, 0, 0),
+                [3, 1, 1],
+                vec![true; 3],
+                vec![MaterialId(1), MaterialId(2), MaterialId(1)],
+            )
+            .unwrap();
+            assert_eq!(
+                world
+                    .rebuild_dynamic_corpse_part_grid(id, 1, 2, 1, 7, 8, replacement, |m| {
+                        if m == MaterialId(1) { 1_000.0 } else { 2_000.0 }
+                    })
+                    .unwrap_err(),
+                spall_physics::ArticulatedError::UnsupportedCorpseEdit
+            );
+            assert_eq!(
+                world.articulated_body_state(id).angvel_rad_s,
+                old_state.angvel_rad_s
+            );
+
+            let (remaining_points, removed_points): (Vec<[f64; 3]>, Vec<[f64; 3]>) =
+                if remove_whole_child {
+                    (
+                        vec![[0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [2.5, 0.5, 0.5]],
+                        vec![[4.5, 1.5, 0.5]],
+                    )
+                } else {
+                    (
+                        vec![[0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [4.5, 1.5, 0.5]],
+                        vec![[2.5, 0.5, 0.5]],
+                    )
+                };
+            let new_sources = if remove_whole_child {
+                vec![SourcePart {
+                    source_revision: 8,
+                    ..source[0].clone()
+                }]
+            } else {
+                vec![
+                    SourcePart {
+                        grid: edited_grid.clone(),
+                        source_revision: 8,
+                        ..source[0].clone()
+                    },
+                    SourcePart {
+                        local_transform: death_child,
+                        ..source[1].clone()
+                    },
+                ]
+            };
+            let new_poses = new_sources
+                .iter()
+                .map(|p| p.local_transform)
+                .collect::<Vec<_>>();
+            let new_mass =
+                articulated_mass_properties(&new_sources, &new_poses, |_| 1_000.0).unwrap();
+            let old_momentum = |points: &[[f64; 3]]| {
+                points
+                    .iter()
+                    .map(|p| point_velocity(old_state, old_com, *p).map(|v| v * 1_000.0))
+                    .fold([0.0; 3], |mut sum, p| {
+                        for i in 0..3 {
+                            sum[i] += p[i];
+                        }
+                        sum
+                    })
+            };
+            let expected_remaining_p = old_momentum(&remaining_points);
+            let expected_removed_p = old_momentum(&removed_points);
+            let old_total_p =
+                old_momentum(&[remaining_points.clone(), removed_points.clone()].concat());
+            assert_vec_close(
+                old_total_p,
+                std::array::from_fn(|i| expected_remaining_p[i] + expected_removed_p[i]),
+                1e-5,
+            );
+            let angular_at_origin = |points: &[[f64; 3]]| {
+                let omega = old_state.angvel_rad_s.map(f64::from);
+                points.iter().fold([0.0; 3], |mut total, point| {
+                    let p = point_velocity(old_state, old_com, *point).map(|v| v * 1_000.0);
+                    let orbital = cross64(*point, p);
+                    for i in 0..3 {
+                        total[i] += orbital[i] + (1_000.0 / 6.0) * omega[i];
+                    }
+                    total
+                })
+            };
+            let old_total_l =
+                angular_at_origin(&[remaining_points.clone(), removed_points.clone()].concat());
+            let partitioned_l = std::array::from_fn(|i| {
+                angular_at_origin(&remaining_points)[i] + angular_at_origin(&removed_points)[i]
+            });
+            assert_vec_close(old_total_l, partitioned_l, 1e-7);
+
+            let edit = world
+                .rebuild_dynamic_corpse_part_grid(id, 1, 2, edited_part, 7, 8, edited_grid, |_| {
+                    1_000.0
+                })
+                .unwrap();
+            let removed_mass = match edit {
+                spall_physics::CorpseEditOutcome::Rebuilt {
+                    removed_mass_kg, ..
+                }
+                | spall_physics::CorpseEditOutcome::PartRetired {
+                    removed_mass_kg, ..
+                } => removed_mass_kg,
+                other => panic!("unexpected edit result {other:?}"),
+            };
+            assert!(
+                (removed_mass - 1_000.0).abs() < 1e-6,
+                "must report old-minus-new mass exactly"
+            );
+            let new_state = world.articulated_body_state(id);
+            let new_com = [new_mass.com_m[0], new_mass.com_m[1], new_mass.com_m[2]];
+            for point in &remaining_points {
+                assert_vec_close(
+                    point_velocity(new_state, new_com, *point),
+                    point_velocity(old_state, old_com, *point),
+                    2e-5,
+                );
+            }
+            let actual_remaining_p = new_state
+                .linvel_m_s
+                .map(|v| f64::from(v) * new_mass.mass_kg);
+            assert_vec_close(actual_remaining_p, expected_remaining_p, 5e-2);
+            let mut expected_l = [0.0; 3];
+            for point in &remaining_points {
+                let arm = std::array::from_fn(|i| point[i] - new_com[i]);
+                let momentum = point_velocity(old_state, old_com, *point).map(|v| v * 1_000.0);
+                let orbital = cross64(arm, momentum);
+                for i in 0..3 {
+                    expected_l[i] +=
+                        orbital[i] + (1_000.0 / 6.0) * f64::from(old_state.angvel_rad_s[i]);
+                }
+            }
+            let omega = new_state.angvel_rad_s.map(f64::from);
+            let actual_l = new_mass
+                .inertia_com
+                .map(|row| row[0] * omega[0] + row[1] * omega[1] + row[2] * omega[2]);
+            assert_vec_close(actual_l, expected_l, 5e-2);
+            let expected_remaining_l_origin =
+                std::array::from_fn(|i| expected_l[i] + cross64(new_com, expected_remaining_p)[i]);
+            let actual_remaining_l_origin =
+                std::array::from_fn(|i| actual_l[i] + cross64(new_com, actual_remaining_p)[i]);
+            assert_vec_close(actual_remaining_l_origin, expected_remaining_l_origin, 5e-2);
+            assert!(
+                expected_removed_p.iter().any(|v| v.abs() > 1e-6),
+                "removed material carries its pre-edit momentum"
+            );
+        }
+    }
+}
+
+#[test]
 fn empty_source_parts_retire_atomically_without_moving_survivors_then_last_part_retires_body() {
     for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
         let mut world = world();
@@ -230,6 +518,73 @@ fn empty_source_parts_retire_atomically_without_moving_survivors_then_last_part_
         ));
         assert_eq!(world.articulated_rigid_body_count(id), 0);
         assert_eq!(world.articulated_collider_count(id), 0);
+    }
+}
+
+#[test]
+fn parent_part_retirement_with_surviving_child_is_rejected_before_ownership_or_queries_change() {
+    for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+        let mut world = world();
+        let source = vec![
+            part(1, None, [0, 0, 0], vec![true], PartTransform::IDENTITY),
+            part(
+                2,
+                Some(1),
+                [0, 0, 0],
+                vec![true],
+                PartTransform {
+                    translation_m: [4.0, 0.0, 0.0],
+                    ..PartTransform::IDENTITY
+                },
+            ),
+        ];
+        let id = world
+            .add_dynamic_corpse_aggregate(
+                [0.0, 0.0, 0.0],
+                PartTransform::IDENTITY.rotation_xyzw,
+                1,
+                source,
+                representation,
+                |_| 1_000.0,
+            )
+            .unwrap();
+        let root_before = world
+            .raycast_articulated(id, [0.5, 0.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        let child_before = world
+            .raycast_articulated(id, [4.5, 0.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        let empty = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [1, 1, 1],
+            vec![false],
+            vec![MaterialId::AIR],
+        )
+        .unwrap();
+        assert_eq!(
+            world
+                .rebuild_dynamic_corpse_part_grid(id, 1, 2, 1, 7, 8, empty, |_| 1_000.0)
+                .unwrap_err(),
+            spall_physics::ArticulatedError::CannotRetireParentWithSurvivors
+        );
+        assert_eq!(world.articulated_collider_count(id), 2);
+        assert_eq!(world.articulated_rigid_body_count(id), 1);
+        assert_eq!(
+            world
+                .raycast_articulated(id, [0.5, 0.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+                .unwrap(),
+            root_before
+        );
+        assert_eq!(
+            world
+                .raycast_articulated(id, [4.5, 0.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+                .unwrap(),
+            child_before
+        );
+        assert_eq!(
+            (child_before.part_id, child_before.volume_id),
+            (2, VolumeId::new(102).unwrap())
+        );
     }
 }
 

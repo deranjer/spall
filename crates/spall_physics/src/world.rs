@@ -810,6 +810,33 @@ fn validate_body_mass_properties(
     Ok(())
 }
 
+/// Preserve the rigid velocity field when an open-system edit changes COM.
+/// Rapier's linear velocity is the world velocity of COM, while the body's
+/// origin and angular velocity remain unchanged.
+fn corpse_edit_velocity(
+    body: &RigidBody,
+    root_pose: Pose,
+    new_mass: BodyMassProperties,
+) -> Result<(Vector, Vector), crate::articulated::ArticulatedError> {
+    let old_com = body.center_of_mass();
+    let new_com = root_pose.transform_point(Vector::new(
+        new_mass.local_com_m[0],
+        new_mass.local_com_m[1],
+        new_mass.local_com_m[2],
+    ));
+    let angular = body.angvel();
+    let linear = body.linvel() + angular.cross(new_com - old_com);
+    if ![
+        linear.x, linear.y, linear.z, angular.x, angular.y, angular.z,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        return Err(crate::articulated::ArticulatedError::InvalidTransform);
+    }
+    Ok((linear, angular))
+}
+
 /// The principal (eigenvalue) inertia triple of a symmetric tensor about the
 /// centre of mass — the diagonal in the frame where the tensor is diagonal.
 fn principal_inertia(inertia_com_kg_m2: [[f32; 3]; 3]) -> [f32; 3] {
@@ -2063,10 +2090,12 @@ impl PhysicsWorld {
         Ok(start.elapsed())
     }
 
-    /// Edits dynamic-corpse source geometry with an open-system rule: removed
-    /// cells leave carrying their instantaneous rigid-body velocity field;
-    /// the surviving body's pose and twist are preserved. This does not claim
-    /// closed-system momentum conservation across a destructive edit.
+    /// Edits dynamic-corpse source geometry with an open-system removal rule:
+    /// removed cells leave carrying their instantaneous rigid-body velocity
+    /// field, while the surviving body's world pose and angular velocity stay
+    /// fixed. Its COM linear velocity is adjusted to preserve the velocity
+    /// field at every surviving point. Additions and material replacement are
+    /// rejected until their incoming momentum policy is defined.
     pub fn rebuild_dynamic_corpse_part_grid(
         &mut self,
         id: ArticulatedBodyId,
@@ -2104,23 +2133,60 @@ impl PhysicsWorld {
         {
             return Err(ArticulatedError::StaleTopology);
         }
+        if new_grid.solid_count() == 0
+            && assembly
+                .parts
+                .iter()
+                .any(|part| part.parent_id == Some(part_id))
+        {
+            return Err(ArticulatedError::CannotRetireParentWithSurvivors);
+        }
         let original_parts = assembly.parts.clone();
         let mut removed_mass = 0.0;
-        let mut bad_density = false;
-        old.grid.for_each_solid(|_, _, _, material| {
-            let rho = density(material);
-            if !rho.is_finite() || rho <= 0.0 {
-                bad_density = true;
-            } else {
-                removed_mass += rho * f64::from(old.cell_m).powi(3);
+        let mut invalid_density = false;
+        let mut unsupported_edit = false;
+        let mut retained_cells = 0_u64;
+        let old_origin = old.grid.origin();
+        let new_origin = new_grid.origin();
+        let new_dims = new_grid.dims();
+        old.grid.for_each_solid(|x, y, z, material| {
+            let global = [
+                old_origin.x + i64::from(x),
+                old_origin.y + i64::from(y),
+                old_origin.z + i64::from(z),
+            ];
+            let local = [
+                global[0] - new_origin.x,
+                global[1] - new_origin.y,
+                global[2] - new_origin.z,
+            ];
+            let new_material = (0..3)
+                .all(|axis| local[axis] >= 0 && local[axis] < i64::from(new_dims[axis]))
+                .then(|| new_grid.material(local[0] as u32, local[1] as u32, local[2] as u32))
+                .flatten();
+            match new_material {
+                Some(current) if current == material => retained_cells += 1,
+                Some(_) => unsupported_edit = true,
+                None => {
+                    let rho = density(material);
+                    if !rho.is_finite() || rho <= 0.0 {
+                        invalid_density = true;
+                    } else {
+                        removed_mass += rho * f64::from(old.cell_m).powi(3);
+                    }
+                }
             }
         });
-        if bad_density {
+        if invalid_density {
             return Err(ArticulatedError::InvalidDensity);
         }
+        if unsupported_edit {
+            return Err(ArticulatedError::UnsupportedCorpseEdit);
+        }
+        if new_grid.solid_count() != retained_cells {
+            return Err(ArticulatedError::UnsupportedCorpseEdit);
+        }
         let pose = *self.bodies[self.entries[entry_index(id.0, self.id_namespace)].body].position();
-        let linear = self.bodies[self.entries[entry_index(id.0, self.id_namespace)].body].linvel();
-        let angular = self.bodies[self.entries[entry_index(id.0, self.id_namespace)].body].angvel();
         if new_grid.solid_count() == 0 {
             if original_parts.len() == 1 {
                 self.retire_articulated_body(id);
@@ -2151,12 +2217,13 @@ impl PhysicsWorld {
                 .ok_or(ArticulatedError::InvalidDensity)?
                 .to_body_properties();
             validate_body_mass_properties(mass)?;
+            let body = self.entries[entry_index(id.0, self.id_namespace)].body;
+            let (linear, angular) = corpse_edit_velocity(&self.bodies[body], pose, mass)?;
             let started = Instant::now();
             let old_handle = original_parts[index_part].collider;
             self.colliders
                 .remove(old_handle, &mut self.islands, &mut self.bodies, true);
             self.pending_removed.push(old_handle);
-            let body = self.entries[entry_index(id.0, self.id_namespace)].body;
             self.bodies[body]
                 .set_additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]), true);
             self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
@@ -2202,6 +2269,9 @@ impl PhysicsWorld {
             .ok_or(ArticulatedError::InvalidDensity)?
             .to_body_properties();
         validate_body_mass_properties(mass)?;
+        let index = entry_index(id.0, self.id_namespace);
+        let body = self.entries[index].body;
+        let (linear, angular) = corpse_edit_velocity(&self.bodies[body], pose, mass)?;
         let elapsed = self.rebuild_articulated_part_grid_impl(
             id,
             expected_topology_token,
@@ -2212,8 +2282,6 @@ impl PhysicsWorld {
             new_grid,
             true,
         )?;
-        let index = entry_index(id.0, self.id_namespace);
-        let body = self.entries[index].body;
         self.bodies[body]
             .set_additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]), true);
         self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);

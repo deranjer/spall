@@ -65,6 +65,12 @@ pub enum ArticulatedError {
     InvalidDensity,
     #[error("a dynamic corpse aggregate must retain at least one occupied source part")]
     EmptyAggregate,
+    #[error(
+        "corpse edits currently support removals only; additions/material changes need a momentum policy"
+    )]
+    UnsupportedCorpseEdit,
+    #[error("cannot retire a parent source part while descendants remain in the aggregate")]
+    CannotRetireParentWithSurvivors,
 }
 
 /// A unit-scale part-local transform in metres and `(x, y, z, w)` form.
