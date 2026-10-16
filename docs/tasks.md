@@ -2004,3 +2004,14 @@ components; crow flap 2 and deer 3 reject ambiguous connectivity. Physical
 split, continued fragment edits and actual asset pose acceptance remain open.
 Evidence: reports/ENG-214-planner-review.md and planner-survey JSON.
 Next unblocked remains ENG-214; no combined 1 km animal launch acceptance.
+
+ENG-214 physical split/edit progress (2026-10-16): integrated through f4ea2ed.
+One logical owner now supports atomic disjoint-source component bodies, stable
+lifetime IDs, immutable material density, keyed removals and re-splits after
+independent motion. Integrated checks pass 261 tests,7 ignored, workspace
+compile, scoped strict lint/format and release regressions. Crow idle retains
+217 source cells,7 bodies,11 colliders and217 nearest-hit baseline ray results.
+Five crow flap/deer poses still reject ambiguous contact; no assets changed.
+Evidence: reports/ENG-214-physical-review.md and physical-survey JSON.
+Next unblocked remains ENG-214 certified rotated geometry. No runtime animal
+lifecycle/network/recovery or combined1km launch acceptance is implied.

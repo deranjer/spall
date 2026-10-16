@@ -391,3 +391,20 @@ below remain proposed.
 ENG-209 was deliberately independent of runtime lifecycle interfaces. Runtime
 actors must not start before ENG-210's movement/rig result, the separate corpse
 aggregate decision, and source provenance format have been reviewed.
+
+ENG-214 bounded physical progress (2026-10-16) is integrated through f4ea2ed:
+one logical corpse owner can atomically partition source cells among physical
+components, preserving original VolumeIds/coordinates/materials/revisions.
+Stable component keys use a reserved logical owner key and monotonic serial;
+they never encode physics handles. Component-scoped snapshots and keyed
+removal/re-split operations keep independently moving frames separate. Material
+densities are bound at creation/transfer. Sibling source shards share the
+original volume revision, while topology/source-generation checks invalidate
+prepared work. These are reviewed CPU adapter semantics, not persisted or
+replicated actor DTOs. See reports/ENG-214-physical-review.md for measured
+conservation, motion, query/contact and retirement evidence.
+
+ENG-214 remains open: five actual crow/deer poses still reject ambiguous
+rotated-cell connectivity. Certified geometric classification and explicit
+asset review remain prerequisites; no hierarchy-derived bonds or source edits
+have bypassed this gate. Runtime/protocol/storage slices above are still pending.
