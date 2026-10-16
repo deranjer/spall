@@ -1411,7 +1411,9 @@ impl PhysicsWorld {
         {
             return Err(ArticulatedError::StalePose);
         }
-        if assembly.pending_root_pose_token.is_some() || assembly.pending_pose.is_some() {
+        if assembly.pending_root_pose_token.is_some()
+            || (assembly.pending_pose.is_some() && !allow_kinematic_part_rig)
+        {
             return Err(ArticulatedError::PendingRootPose);
         }
         for part in &assembly.parts {
@@ -1446,18 +1448,24 @@ impl PhysicsWorld {
             assembly
                 .parts
                 .iter()
-                .map(|part| {
+                .enumerate()
+                .map(|(index, part)| {
+                    let part_pose = assembly
+                        .pending_pose
+                        .as_ref()
+                        .map(|pending| pending.parts[index].2)
+                        .unwrap_or(part.assembly_pose);
                     let local = Pose::new(
                         Vector::new(
-                            part.assembly_pose.translation_m[0],
-                            part.assembly_pose.translation_m[1],
-                            part.assembly_pose.translation_m[2],
+                            part_pose.translation_m[0],
+                            part_pose.translation_m[1],
+                            part_pose.translation_m[2],
                         ),
                         Rotation::from_xyzw(
-                            part.assembly_pose.rotation_xyzw[0],
-                            part.assembly_pose.rotation_xyzw[1],
-                            part.assembly_pose.rotation_xyzw[2],
-                            part.assembly_pose.rotation_xyzw[3],
+                            part_pose.rotation_xyzw[0],
+                            part_pose.rotation_xyzw[1],
+                            part_pose.rotation_xyzw[2],
+                            part_pose.rotation_xyzw[3],
                         )
                         .to_scaled_axis(),
                     );
@@ -1513,7 +1521,6 @@ impl PhysicsWorld {
             || assembly.pose_token != base_pose_token
             || pose_token <= base_pose_token
             || assembly.pending_root_pose_token.is_some()
-            || assembly.pending_pose.is_some()
         {
             return Err(ArticulatedError::StalePose);
         }
@@ -1539,22 +1546,52 @@ impl PhysicsWorld {
                 }
             }
         }
-        let local_center =
-            std::array::from_fn::<_, 3, _>(|axis| 0.5 * (bounds_min[axis] + bounds_max[axis]));
-        let radius = (0..3)
-            .map(|axis| (0.5 * (bounds_max[axis] - bounds_min[axis])).powi(2))
-            .sum::<f32>()
-            .sqrt()
-            .max(0.001);
+        let (local_center, radius) = if let Some(pending) = &assembly.pending_pose {
+            let mut radius_squared = 0.0f32;
+            for (index, part) in assembly.parts.iter().enumerate() {
+                let origin = part.grid.origin();
+                let dims = part.grid.dims();
+                for corner in 0..8 {
+                    let source = [
+                        (origin.x as f32 + if corner & 1 == 0 { 0.0 } else { dims[0] as f32 })
+                            * part.cell_m,
+                        (origin.y as f32 + if corner & 2 == 0 { 0.0 } else { dims[1] as f32 })
+                            * part.cell_m,
+                        (origin.z as f32 + if corner & 4 == 0 { 0.0 } else { dims[2] as f32 })
+                            * part.cell_m,
+                    ];
+                    for pose in [part.assembly_pose, pending.parts[index].2] {
+                        let translation_len = pose
+                            .translation_m
+                            .iter()
+                            .map(|value| value * value)
+                            .sum::<f32>()
+                            .sqrt();
+                        let source_len =
+                            source.iter().map(|value| value * value).sum::<f32>().sqrt();
+                        // Translation interpolation stays in the endpoint
+                        // convex hull; this sum bounds every source corner
+                        // under any intermediate part rotation.
+                        radius_squared = radius_squared.max((translation_len + source_len).powi(2));
+                    }
+                }
+            }
+            ([0.0; 3], radius_squared.sqrt().max(0.001))
+        } else {
+            let center =
+                std::array::from_fn::<_, 3, _>(|axis| 0.5 * (bounds_min[axis] + bounds_max[axis]));
+            let radius = (0..3)
+                .map(|axis| (0.5 * (bounds_max[axis] - bounds_min[axis])).powi(2))
+                .sum::<f32>()
+                .sqrt()
+                .max(0.001);
+            (center, radius)
+        };
         let root = assembly.root_pose;
         let rotated_center = rotate(root.rotation_xyzw, local_center);
-        // A tiny upward query bias avoids treating a sphere exactly tangent
-        // to its support surface as an initial overlap. The accepted root pose
-        // remains unshifted; the clearance is part of the conservative sweep
-        // approximation and is bounded to 2 mm.
         let start = Pose::from_translation(Vector::from([
             root.translation_m[0] + rotated_center[0],
-            root.translation_m[1] + rotated_center[1] + 0.002,
+            root.translation_m[1] + rotated_center[1],
             root.translation_m[2] + rotated_center[2],
         ]));
         let displacement = Vector::from(requested_translation_m);
@@ -1573,31 +1610,50 @@ impl PhysicsWorld {
                 (fixed && !collider.is_sensor()).then_some(handle)
             })
             .collect();
-        let accepts_collider = |handle: ColliderHandle, _: &Collider| {
-            !excluded.contains(&handle) && terrain_colliders.contains(&handle)
-        };
-        let filter = QueryFilter::default().predicate(&accepts_collider);
         let hit = if displacement.length_squared() <= 1.0e-12 {
             None
         } else {
             let shape = Ball::new(radius);
-            let queries = self.broad_phase.as_query_pipeline(
-                self.narrow_phase.query_dispatcher(),
-                &self.bodies,
-                &self.colliders,
-                filter,
-            );
-            queries.cast_shape(
-                &start,
-                displacement,
-                &shape,
-                rapier3d::parry::query::ShapeCastOptions {
-                    max_time_of_impact: 1.0,
-                    target_distance: 0.0,
-                    stop_at_penetration: true,
-                    compute_impact_geometry_on_penetration: true,
-                },
-            )
+            let mut nearest: Option<(ColliderHandle, rapier3d::parry::query::ShapeCastHit)> = None;
+            for &terrain_handle in &terrain_colliders {
+                let only_terrain = |handle: ColliderHandle, _: &Collider| {
+                    handle == terrain_handle && !excluded.contains(&handle)
+                };
+                let filter = QueryFilter::default().predicate(&only_terrain);
+                let queries = self.broad_phase.as_query_pipeline(
+                    self.narrow_phase.query_dispatcher(),
+                    &self.bodies,
+                    &self.colliders,
+                    filter,
+                );
+                let Some(candidate) = queries.cast_shape(
+                    &start,
+                    displacement,
+                    &shape,
+                    rapier3d::parry::query::ShapeCastOptions {
+                        max_time_of_impact: 1.0,
+                        target_distance: 0.0,
+                        stop_at_penetration: true,
+                        compute_impact_geometry_on_penetration: true,
+                    },
+                ) else {
+                    continue;
+                };
+                // At exact support tangency Rapier may report TOI=0 for a
+                // tangent or separating request. Ignore only that contact;
+                // retain zero-time hits whose normal shows motion into terrain.
+                if candidate.1.time_of_impact <= 1.0e-6
+                    && candidate.1.normal1.dot(displacement) >= -1.0e-6
+                {
+                    continue;
+                }
+                if nearest.is_none_or(|(_, hit): (ColliderHandle, _)| {
+                    candidate.1.time_of_impact < hit.time_of_impact
+                }) {
+                    nearest = Some(candidate);
+                }
+            }
+            nearest
         };
         let blocked = hit.is_some();
         let fraction = hit.map_or(1.0, |(_, hit)| hit.time_of_impact.clamp(0.0, 1.0));
@@ -1622,6 +1678,103 @@ impl PhysicsWorld {
             fraction,
             blocked,
         })
+    }
+
+    /// Atomically stages one complete sampled pose and a swept root
+    /// translation for the same physics boundary. The sweep uses a root-
+    /// centered sphere enclosing old and proposed source geometry under any
+    /// interpolated part rotation/translation; this is conservative and may
+    /// overblock. It does not claim exact limb motion or terrain response for
+    /// arbitrary discontinuous authored pose changes.
+    pub fn update_articulated_pose_with_swept_root_translation(
+        &mut self,
+        id: ArticulatedBodyId,
+        update: ArticulatedPose,
+        requested_translation_m: [f32; 3],
+    ) -> Result<crate::articulated::ArticulatedMove, crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        if !requested_translation_m
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Err(ArticulatedError::InvalidRootPose);
+        }
+        if !articulated_translation_in_range(requested_translation_m) {
+            return Err(ArticulatedError::InvalidRootPose);
+        }
+        let assembly = self
+            .articulated
+            .get(&id.0)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        if !assembly.kinematic_part_bodies
+            || assembly.topology_token != update.topology_token
+            || assembly.pose_token != update.base_pose_token
+            || update.pose_token <= update.base_pose_token
+            || assembly.pending_root_pose_token.is_some()
+            || assembly.pending_pose.is_some()
+        {
+            return Err(ArticulatedError::StalePose);
+        }
+        if update.parts.len() != assembly.parts.len()
+            || update
+                .parts
+                .iter()
+                .zip(&assembly.parts)
+                .any(|((part_id, pose), part)| {
+                    *part_id != part.part_id || pose.normalized().is_none()
+                })
+        {
+            return Err(ArticulatedError::StalePose);
+        }
+        let locals = update
+            .parts
+            .iter()
+            .map(|(part_id, pose)| {
+                if !articulated_translation_in_range(pose.translation_m) {
+                    return Err(ArticulatedError::GeometryRange);
+                }
+                Ok((*part_id, pose.normalized().expect("validated transform")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let flattened = flatten_local_poses(&assembly.parts, &locals)?;
+        let root_target = std::array::from_fn::<_, 3, _>(|axis| {
+            assembly.root_pose.translation_m[axis] + requested_translation_m[axis]
+        });
+        if !articulated_translation_in_range(root_target) {
+            return Err(ArticulatedError::InvalidRootPose);
+        }
+        for (part, world_pose) in assembly.parts.iter().zip(flattened) {
+            if !articulated_translation_in_range(world_pose.translation_m) {
+                return Err(ArticulatedError::GeometryRange);
+            }
+            let origin = part.grid.origin();
+            let origin_m = [
+                origin.x as f32 * part.cell_m,
+                origin.y as f32 * part.cell_m,
+                origin.z as f32 * part.cell_m,
+            ];
+            let local_offset = rotate(world_pose.rotation_xyzw, origin_m);
+            let local_translation = std::array::from_fn::<_, 3, _>(|axis| {
+                world_pose.translation_m[axis] + local_offset[axis]
+            });
+            let world_offset = rotate(assembly.root_pose.rotation_xyzw, local_translation);
+            let world_translation =
+                std::array::from_fn::<_, 3, _>(|axis| root_target[axis] + world_offset[axis]);
+            if !articulated_translation_in_range(world_translation) {
+                return Err(ArticulatedError::GeometryRange);
+            }
+        }
+        // All pose, topology, and target coordinates have been validated
+        // before either half is staged; the root sweep then cannot fail on
+        // these inputs, and both targets commit at the same step boundary.
+        self.update_articulated_pose(id, update.clone())?;
+        self.sweep_articulated_root_translation(
+            id,
+            update.topology_token,
+            update.base_pose_token,
+            update.pose_token,
+            requested_translation_m,
+        )
     }
 
     /// Retires the kinematic root and all of its attached source-part colliders.
@@ -3689,6 +3842,23 @@ mod tests {
             translation_m: [0.0; 3],
             linvel_m_s: [0.0; 3],
         });
+        // Wall begins at x=.75, directly adjacent to the floor surface.
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: OccupancyGrid::from_solid_mask(
+                GlobalCell::new(3, 1, -4),
+                [1, 4, 8],
+                vec![true; 32],
+                vec![fixtures::STONE; 32],
+            )
+            .unwrap(),
+            cell_m: 0.25,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
         // The conservative sphere is tangent to the floor top at y=.25.
         let animal = world
             .add_articulated_kinematic_parts(
@@ -3708,6 +3878,20 @@ mod tests {
             .sweep_articulated_root_translation(animal, 1, 1, 2, [0.0, 0.2, 0.0])
             .unwrap();
         assert!(upward.fraction > 0.99, "grounded upward={upward:?}");
+        world.step();
+        let wall_adjacent_to_floor = world
+            .sweep_articulated_root_translation(animal, 1, 2, 3, [0.25, 0.0, 0.0])
+            .unwrap();
+        assert!(
+            wall_adjacent_to_floor.blocked,
+            "wall/floor={wall_adjacent_to_floor:?}"
+        );
+        world.step();
+        let downward = world
+            .sweep_articulated_root_translation(animal, 1, 3, 4, [0.0, -0.3, 0.0])
+            .unwrap();
+        assert!(downward.blocked, "movement into floor={downward:?}");
+        assert!(downward.fraction < 0.99, "movement into floor={downward:?}");
     }
 
     #[test]
@@ -3748,6 +3932,47 @@ mod tests {
     }
 
     #[test]
+    fn articulated_sweep_rejects_initial_penetration_and_allows_small_ledge_departure() {
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: one_cell_grid(GlobalCell::new(0, 0, 0)),
+            cell_m: 0.25,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        let animal = world
+            .add_articulated_kinematic_parts(
+                [0.0, 0.3, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 196, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let into_overlap = world
+            .sweep_articulated_root_translation(animal, 1, 0, 1, [0.0, -0.1, 0.0])
+            .unwrap();
+        assert!(into_overlap.blocked, "initial overlap={into_overlap:?}");
+        assert_eq!(into_overlap.fraction, 0.0);
+        world.step();
+        let ledge_departure = world
+            .sweep_articulated_root_translation(animal, 1, 1, 2, [0.5, 0.0, 0.0])
+            .unwrap();
+        assert!(
+            !ledge_departure.blocked,
+            "ledge departure={ledge_departure:?}"
+        );
+        assert_eq!(ledge_departure.fraction, 1.0);
+    }
+
+    #[test]
     fn articulated_conservative_sweep_blocks_wall_and_rejects_stale_updates() {
         let mut world = PhysicsWorld::new(PhysicsConfig {
             gravity_m_s2: [0.0; 3],
@@ -3760,7 +3985,7 @@ mod tests {
             vec![fixtures::STONE; 16],
         )
         .unwrap();
-        world.add_body(BodySpec {
+        let wall = world.add_body(BodySpec {
             kind: BodyKind::Fixed,
             representation: Representation::MergedCuboids,
             grid: wall_grid,
@@ -3843,6 +4068,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after.pose_token, 1);
+        world.remove_collider(wall);
+        let after_removal = world
+            .sweep_articulated_root_translation(animal, 1, 1, 2, [0.5, 0.0, 0.0])
+            .unwrap();
+        assert!(
+            !after_removal.blocked,
+            "after terrain removal={after_removal:?}"
+        );
+        assert_eq!(after_removal.fraction, 1.0);
+        world.step();
+        let unchanged_body = world.body_state(animal.0);
+        let unchanged_hit = world
+            .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+            .unwrap();
+        assert!(
+            world
+                .update_articulated_pose_with_swept_root_translation(
+                    animal,
+                    ArticulatedPose {
+                        topology_token: 1,
+                        base_pose_token: 2,
+                        pose_token: 3,
+                        parts: vec![(999, PartTransform::IDENTITY)],
+                    },
+                    [0.2, 0.0, 0.0],
+                )
+                .is_err()
+        );
+        let after_rejection_body = world.body_state(animal.0);
+        assert_eq!(
+            after_rejection_body.translation_m,
+            unchanged_body.translation_m
+        );
+        assert_eq!(after_rejection_body.rotation, unchanged_body.rotation);
+        assert_eq!(
+            world
+                .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+                .unwrap(),
+            unchanged_hit
+        );
+        let combined = world
+            .update_articulated_pose_with_swept_root_translation(
+                animal,
+                ArticulatedPose {
+                    topology_token: 1,
+                    base_pose_token: 2,
+                    pose_token: 3,
+                    parts: vec![(7, PartTransform::IDENTITY)],
+                },
+                [0.1, 0.0, 0.0],
+            )
+            .unwrap();
+        assert!(!combined.blocked);
+        let before_combined_step = world
+            .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+            .unwrap();
+        assert_eq!(before_combined_step.pose_token, 2);
+        world.step();
+        let after_combined_step = world
+            .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+            .unwrap();
+        assert_eq!(after_combined_step.pose_token, 3);
     }
 
     #[test]

@@ -136,26 +136,31 @@ replication, persistence, and population performance remain separate gates.
 
 Review found the earlier envelope radius used half of the squared AABB extent,
 which overestimated radius by sqrt(2). The radius now uses the Euclidean length
-of the three half-extents. Re-running the original 2m fixed-wall scenario clips
-to 0.15652314m (fraction 0.07826157); the previous 0.0668138m result is
-superseded and must not be used as the corrected measurement. This remains a
-conservative enclosing-sphere contract, not exact articulated clearance.
+of the three half-extents. Re-running the original 2m fixed-wall scenario with
+the final zero-offset support handling clips to 0.15852165m (fraction
+0.079260826). The earlier 0.0668138m radius-bug result and 0.15652314m
+biased-query result are superseded and must not be used as the final
+measurement. This remains a conservative enclosing-sphere contract, not exact
+articulated clearance.
 
-The root sweep now synchronizes pending broad-phase edits before casting and
+The root sweep synchronizes pending broad-phase edits before casting and
 filters blockers to fixed, non-sensor colliders. Dynamic and kinematic actors
-remain handled by the same Rapier solver after a move is scheduled. A new
-grounded-floor case showed exact sphere tangency caused a zero-time cast hit;
-the query sphere is biased upward by 2mm, while the applied root pose is not.
-With that explicit tolerance, grounded 0.25m lateral and 0.2m upward requests
-both pass at fraction >0.99. This small clearance can admit up to 2mm of
-vertical terrain overlap and is a limitation of the experiment.
+remain handled by the same Rapier solver after a move is scheduled. It casts
+against fixed terrain colliders individually so exact zero-time support hits
+can be classified by normal: tangent or separating motion is ignored, while
+motion into the surface remains blocked. There is no query-space offset. New
+cases cover grounded 0.25m lateral and 0.2m upward movement, downward motion
+into the floor, a wall adjacent to the floor, initial-overlap rejection, and
+departure from a one-cell ledge. The wall-removal case casts again immediately
+after collider removal without manual query synchronization.
 
-The API still cannot apply a sampled authored clip pose and swept root
-translation in the same physics boundary: each stages an independent pending
-pose token, and the second request is rejected until `step` commits the first.
-This is an integration blocker for combined locomotion, not a claim of
-continuous animated movement. The current scenarios verify either clip motion
-or root translation per boundary only.
+`update_articulated_pose_with_swept_root_translation` validates the complete
+sample and requested root target before staging either side, then commits the
+part poses and clipped root at the same physics boundary. Its combined sweep
+uses a root-centered sphere enclosing old and proposed source corners through
+interpolated part rotations/translations. This can overblock and is not exact
+clearance for discontinuous authored motion. A rejected malformed pose leaves
+the root transform, query hit, and pose token unchanged in the scenario test.
 
 ## Checks
 
@@ -165,6 +170,7 @@ Exact checks run in the assigned worktree:
 cargo test -p spall_physics --lib --test articulated_review
 cargo test -p spall_physics articulated_ -- --nocapture
 cargo test -p spall_physics articulated_sweep_allows_grounded_horizontal_and_upward_recovery -- --nocapture
+cargo test -p spall_physics articulated_sweep_rejects_initial_penetration_and_allows_small_ledge_departure -- --nocapture
 cargo test -p spall_physics diagnostic_kinematic_root_crosses_fixed_terrain_but_character_sweep_blocks -- --nocapture
 cargo clippy -p spall_physics --all-targets -- -D warnings
 cargo clippy -p sandbox --example animal-collision-probe -- -D warnings
@@ -176,13 +182,39 @@ cargo build -p sandbox --release --example animal-collision-probe
 .\target\release\examples\animal-collision-probe.exe --bounded
 ```
 
-The physics suite passed 75 tests with 1 existing ignored diagnostic, plus all
+The physics suite passed 78 tests with 1 existing ignored diagnostic, plus all
 8 independent `articulated_review` scenarios. The focused ENG-210 scenario run
-passed all 9 selected cases. Strict Clippy, formatting, whitespace, and the
-bounded release asset probe passed. GPU, network, storage, live actor, corpse
-transfer, and population target gates did not run.
+passed all selected cases, including unbiased support tangency, terrain removal
+freshness, and combined pose/root staging. Strict Clippy, formatting,
+whitespace, and the bounded release asset probe passed. GPU, network, storage,
+live actor, corpse transfer, and population target gates did not run.
 
 The final line reran the unchanged ENG-209 single-root mode against the new
 shared code and passed the same 38,520 ray / 66 miss matrix with zero
 mismatches or timed misses. Its raw output is saved in
 [ENG-210-eng209-regression.json](ENG-210-eng209-regression.json).
+
+### Follow-up boundary and terrain-query validation
+
+After the focused fixes, the full suite passed 78 physics unit tests plus 8
+review scenarios (1 existing ignored diagnostic). The updated candidate and
+default actual-asset probes were rerun with both authored clips and all sampled
+phases. Each mode reports 38,520 source-cell ray checks, 66 miss checks, zero
+mismatches, and zero timed misses. Candidate counts remain 5/6/9 source
+colliders and 6/7/10 rigid bodies for trout/crow/deer respectively; default
+uses one rigid body per animal. Raw files:
+[kinematic candidate](ENG-210-animal-workload-followup-kinematic.json) and
+[default path](ENG-210-animal-workload-followup-default.json).
+
+Candidate p50 attach / pose-query-step / source-rebuild times in microseconds:
+trout native 22.3 / 6.2 / 3.0, trout merged 6.0 / 5.7 / 1.1; crow native
+23.4 / 7.5 / 3.8, crow merged 6.4 / 6.8 / 1.3; deer native 34.3 / 11.6 / 3.1,
+deer merged 9.3 / 10.2 / 1.0. These are diagnostics, with no agreed population
+target. `cargo test -p spall_physics --lib --test articulated_review`, strict
+all-target physics Clippy, formatting, and diff checks passed. Release probe
+commands were `animal-collision-probe.exe --bounded --kinematic-parts` and
+`animal-collision-probe.exe --bounded`.
+
+The combined API only sweeps root translation. It does not block an authored
+part-pose transition that itself intersects terrain, nor does it sweep root
+rotation. Those remain explicit animation/rotation terrain-response gates.
