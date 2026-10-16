@@ -1,0 +1,232 @@
+{
+  "cases": [
+    {
+      "animal": "trout",
+      "candidate_pairs_tested": 4125,
+      "certified_cross_volume_edges": 62,
+      "clip": "idle",
+      "component_cell_counts": [
+        136
+      ],
+      "component_count": 1,
+      "physical_split": null,
+      "planner_elapsed_us": 174.5,
+      "sat_axes_tested": 0,
+      "source_cells": 136,
+      "source_ids_and_integer_coordinates_preserved": true,
+      "source_partition_conserved": true,
+      "source_parts": 5,
+      "tick": 0.0
+    },
+    {
+      "animal": "trout",
+      "candidate_pairs_tested": 4125,
+      "certified_cross_volume_edges": 62,
+      "clip": "swim",
+      "component_cell_counts": [
+        136
+      ],
+      "component_count": 1,
+      "physical_split": null,
+      "planner_elapsed_us": 128.60000000000002,
+      "sat_axes_tested": 0,
+      "source_cells": 136,
+      "source_ids_and_integer_coordinates_preserved": true,
+      "source_partition_conserved": true,
+      "source_parts": 5,
+      "tick": 0.0
+    },
+    {
+      "animal": "trout",
+      "candidate_pairs_tested": 4125,
+      "certified_cross_volume_edges": 62,
+      "clip": "swim",
+      "component_cell_counts": [
+        136
+      ],
+      "component_count": 1,
+      "physical_split": null,
+      "planner_elapsed_us": 118.6,
+      "sat_axes_tested": 0,
+      "source_cells": 136,
+      "source_ids_and_integer_coordinates_preserved": true,
+      "source_partition_conserved": true,
+      "source_parts": 5,
+      "tick": 60.0
+    },
+    {
+      "animal": "crow",
+      "candidate_pairs_tested": 19027,
+      "certified_cross_volume_edges": 40,
+      "clip": "idle",
+      "component_cell_counts": [
+        177,
+        5,
+        5,
+        5,
+        5,
+        10,
+        10
+      ],
+      "component_count": 7,
+      "physical_split": {
+        "baseline_nearest_hit_rays_preserved": 217,
+        "commit_elapsed_us": 607.4,
+        "component_body_count": 7,
+        "component_collider_count": 11,
+        "component_masses_kg": [
+          0.043212890625,
+          0.001220703125,
+          0.001220703125,
+          0.001220703125,
+          0.001220703125,
+          0.00244140625,
+          0.00244140625
+        ],
+        "post_split_source_cells_recaptured": 217,
+        "post_split_source_partition_exact": true
+      },
+      "planner_elapsed_us": 444.0,
+      "sat_axes_tested": 0,
+      "source_cells": 217,
+      "source_ids_and_integer_coordinates_preserved": true,
+      "source_partition_conserved": true,
+      "source_parts": 6,
+      "tick": 0.0
+    },
+    {
+      "animal": "crow",
+      "candidate_pairs_tested": 19027,
+      "certified_cross_volume_edges": 78,
+      "clip": "flap",
+      "component_cell_counts": [
+        177,
+        5,
+        5,
+        5,
+        5,
+        10,
+        10
+      ],
+      "component_count": 7,
+      "physical_split": {
+        "baseline_nearest_hit_rays_preserved": 217,
+        "commit_elapsed_us": 21327.100000000002,
+        "component_body_count": 7,
+        "component_collider_count": 11,
+        "component_masses_kg": [
+          0.043212890625,
+          0.001220703125,
+          0.001220703125,
+          0.001220703125,
+          0.001220703125,
+          0.00244140625,
+          0.00244140625
+        ],
+        "post_split_source_cells_recaptured": 217,
+        "post_split_source_partition_exact": true
+      },
+      "planner_elapsed_us": 21732.2,
+      "sat_axes_tested": 15582,
+      "source_cells": 217,
+      "source_ids_and_integer_coordinates_preserved": true,
+      "source_partition_conserved": true,
+      "source_parts": 6,
+      "tick": 0.0
+    },
+    {
+      "animal": "crow",
+      "candidate_pairs_tested": 19027,
+      "certified_cross_volume_edges": 78,
+      "clip": "flap",
+      "component_cell_counts": [
+        177,
+        5,
+        5,
+        5,
+        5,
+        10,
+        10
+      ],
+      "component_count": 7,
+      "physical_split": {
+        "baseline_nearest_hit_rays_preserved": 217,
+        "commit_elapsed_us": 21229.3,
+        "component_body_count": 7,
+        "component_collider_count": 11,
+        "component_masses_kg": [
+          0.043212890625,
+          0.001220703125,
+          0.001220703125,
+          0.001220703125,
+          0.001220703125,
+          0.00244140625,
+          0.00244140625
+        ],
+        "post_split_source_cells_recaptured": 217,
+        "post_split_source_partition_exact": true
+      },
+      "planner_elapsed_us": 21150.5,
+      "sat_axes_tested": 15582,
+      "source_cells": 217,
+      "source_ids_and_integer_coordinates_preserved": true,
+      "source_partition_conserved": true,
+      "source_parts": 6,
+      "tick": 48.0
+    },
+    {
+      "animal": "deer",
+      "candidate_pairs_tested": 28326,
+      "certified_cross_volume_edges": 147,
+      "clip": "idle",
+      "component_cell_counts": [
+        259,
+        13,
+        13
+      ],
+      "component_count": 3,
+      "physical_split": {
+        "baseline_nearest_hit_rays_preserved": 285,
+        "commit_elapsed_us": 33354.700000000004,
+        "component_body_count": 3,
+        "component_collider_count": 9,
+        "component_masses_kg": [
+          0.063232421875,
+          0.003173828125,
+          0.003173828125
+        ],
+        "post_split_source_cells_recaptured": 285,
+        "post_split_source_partition_exact": true
+      },
+      "planner_elapsed_us": 24582.1,
+      "sat_axes_tested": 14134,
+      "source_cells": 285,
+      "source_ids_and_integer_coordinates_preserved": true,
+      "source_partition_conserved": true,
+      "source_parts": 9,
+      "tick": 0.0
+    },
+    {
+      "animal": "deer",
+      "clip": "walk",
+      "planner_elapsed_us": 33560.2,
+      "rejected": "AmbiguousContact { left: SourceCellRef { volume_id: VolumeId(3001), part_id: 1, cell: [-4, -1, -1], material: MaterialId(1), source_revision: 1 }, right: SourceCellRef { volume_id: VolumeId(3008), part_id: 8, cell: [-1, -1, 0], material: MaterialId(1), source_revision: 1 }, axis_gap_m_bits: [4595923419731591168, 4589168020290535424, 4593671619917905920], required_gap_m_bits: 4609434218613702659 }",
+      "source_cells": 285,
+      "source_partition_conserved": false,
+      "source_parts": 9,
+      "tick": 0.0
+    },
+    {
+      "animal": "deer",
+      "clip": "walk",
+      "planner_elapsed_us": 28403.0,
+      "rejected": "AmbiguousContact { left: SourceCellRef { volume_id: VolumeId(3001), part_id: 1, cell: [-4, -1, -1], material: MaterialId(1), source_revision: 1 }, right: SourceCellRef { volume_id: VolumeId(3008), part_id: 8, cell: [-1, -1, 0], material: MaterialId(1), source_revision: 1 }, axis_gap_m_bits: [4595923419731591168, 4589168020290535424, 4593671619917905920], required_gap_m_bits: 4609434218613702659 }",
+      "source_cells": 285,
+      "source_partition_conserved": false,
+      "source_parts": 9,
+      "tick": 48.0
+    }
+  ],
+  "scenario": "eng214_actual_animal_fracture_connectivity",
+  "scope": "bounded CPU topology and physical corpse-component feasibility; no actor population acceptance"
+}

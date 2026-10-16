@@ -408,3 +408,18 @@ ENG-214 remains open: five actual crow/deer poses still reject ambiguous
 rotated-cell connectivity. Certified geometric classification and explicit
 asset review remain prerequisites; no hierarchy-derived bonds or source edits
 have bypassed this gate. Runtime/protocol/storage slices above are still pending.
+
+ENG-214 coordinator acceptance (2026-10-16), superseding the earlier open-gate
+status above: bounded source connectivity, atomic physical splits and keyed
+fragment editing/re-splitting are reviewed and integrated through8e620d1.
+All nine original trout/crow/deer poses now prepare exact source partitions.
+Canonical affine interval proofs and exact shared supporting planes with
+strict positive projected area certify connections; zero-area/uncertain
+contacts never gain a guessed weld. No authored cells or bonds were changed.
+The physical/source ownership semantics are accepted for the next host design;
+they are not a persisted/wire-format implementation. Evidence, independent
+rational oracle, retained historical failures and measured limits:
+reports/ENG-214-integration.md. The next implementation task is ENG-215
+(host identities, bounded DTOs, registry and scheduling seam). Atomic actor
+lifecycle transactions, species movement/habitat, actor replication/recovery
+and the combined fully simulated 1024m launch are still pending.

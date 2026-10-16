@@ -2015,3 +2015,30 @@ Five crow flap/deer poses still reject ambiguous contact; no assets changed.
 Evidence: reports/ENG-214-physical-review.md and physical-survey JSON.
 Next unblocked remains ENG-214 certified rotated geometry. No runtime animal
 lifecycle/network/recovery or combined1km launch acceptance is implied.
+
+ENG-214 coordinator closeout (2026-10-16): accepted bounded CPU connectivity
+and physical split/edit feasibility through8e620d1. All9 unchanged actual
+animal poses now prepare exact partitions. Certified positive-area shared
+faces resolve deer walk tangency without tolerances; conservative cachedAABBs
+reduce worst observed planning to0.96ms.268 integrated tests pass,7ignored,
+workspace compile/lint/format and release regressions pass. Exact rational
+oracle covers6372 volume/shared-face cases,32 safely ambiguous,0wrong results.
+Four physicalsplit cases preserve936 source records and nearest-hit baselines,
+and120 seeded steps retain finite states/exact provenance. No asset edits.
+Evidence: reports/ENG-214-integration.md and final-survey JSON. Earlier
+rejections/slow interval prototype are preserved as historical evidence.
+Next unblocked: ENG-215 authoritative host identities/state DTOs/scheduling.
+Runtime lifecycle/network/recovery and combined1km launch remain pending.
+
+## ENG-215: authoritative animal host identities and scheduling seam
+
+After accepted ENG-210/212/213/214, implement animal-lifecycle.md slice3.
+Engine-owned stable CreatureId/world-epoch/generation and checked allocator,
+versioned bounded actor/species/asset/material/clip/source bindings, validated
+owner-thread registry and statically linked game behavior scheduling seam.
+Review shared-interface design first. Preserve engine/game boundary and exact
+logical source ownership. No runtime birth/death transaction, actor network
+channel or durable schema changes until following slices; DTO roundtrip and
+counter snapshots alone are not launch acceptance. Required rejection,
+allocator/restore/reset, bounded scheduling and stale-intent invariant tests
+are recorded on ENG-215. Dedicated worktree; coordinator owns integration/log.
