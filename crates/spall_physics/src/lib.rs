@@ -54,6 +54,8 @@ pub use query_cache::{CharacterQueryCache, REBUILD_MARGIN_M, WINDOW_RADIUS_M, Wi
 pub use region_set::{PhysicsRegionSet, PhysicsRegionSetError, RegionalBodyState};
 pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
 pub use world::{
-    BodyId, BodyKind, BodySpec, BodyState, ColliderExclusion, ContactImpulse, PhysicsConfig,
-    PhysicsWorld, PreparedBodySpec, PreparedCollider, StepTiming,
+    ArticulatedContactWitness, BodyId, BodyKind, BodySpec, BodyState, CONTACT_WITNESS_VERSION,
+    ColliderExclusion, ContactCellAttribution, ContactImpulse, ContactWitnessUnattributed,
+    MAX_CONTACT_WITNESSES_PER_STEP, PhysicsConfig, PhysicsWorld, PreparedBodySpec,
+    PreparedCollider, SourceContactWitness, StepTiming,
 };

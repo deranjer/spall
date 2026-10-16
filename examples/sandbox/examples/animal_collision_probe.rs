@@ -15,8 +15,9 @@ use serde::Serialize;
 use spall_asset::{Asset, Part, Transform, decode, sample_clip};
 use spall_core::{GlobalCell, MaterialId, VolumeId};
 use spall_physics::{
-    ArticulatedBodyId, ArticulatedPose, BodyKind, BodySpec, OccupancyGrid, PartTransform,
-    PhysicsConfig, PhysicsWorld, Representation, SourcePart, build_collider,
+    ArticulatedBodyId, ArticulatedPose, BodyKind, BodySpec, ContactCellAttribution,
+    ContactWitnessUnattributed, OccupancyGrid, PartTransform, PhysicsConfig, PhysicsWorld,
+    Representation, SourcePart, build_collider,
 };
 
 const CELL_M: f32 = 0.0625;
@@ -123,6 +124,26 @@ struct TerrainTransitionCase {
     terrain_collider_count: usize,
 }
 
+#[derive(Serialize)]
+struct ContactWitnessResult {
+    animal: String,
+    representation: &'static str,
+    clip: String,
+    tick: f64,
+    source_part: u32,
+    source_cell: [i32; 3],
+    body_count: usize,
+    collider_count: usize,
+    solver_substeps: usize,
+    step_pipeline_us: f64,
+    witness_capture_us: f64,
+    retained_points: usize,
+    resolved_source_cells: usize,
+    positive_point_impulses: usize,
+    unattributed_reasons: BTreeMap<String, usize>,
+    overflow: u64,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
     let kinematic_parts = args.iter().any(|arg| arg == "--kinematic-parts");
@@ -147,9 +168,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let mut results = Vec::new();
+    let mut contact_witnesses = Vec::new();
     for (name, bytes) in ANIMALS {
         let animal = load_animal(decode(bytes)?)?;
         for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            contact_witnesses.push(run_contact_witness_case(name, &animal, representation)?);
             results.push(run_case(
                 name,
                 &animal,
@@ -178,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "transition_representation_disagreements": transition_representation_disagreements,
         "solver_substeps": solver_substeps,
         "hardware": hardware(),
+        "contact_witness_cases": contact_witnesses,
         "results": results,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
@@ -256,6 +280,141 @@ fn validate_transition_parity(
         }
     }
     Ok(disagreement_count)
+}
+
+fn run_contact_witness_case(
+    name: &str,
+    animal: &Animal,
+    representation: Representation,
+) -> Result<ContactWitnessResult, Box<dyn std::error::Error>> {
+    const PROBE_CELL_M: f32 = CELL_M / 4.0;
+    const SUBSTEPS: usize = 8;
+    let sample = pose_samples(animal)?
+        .into_iter()
+        .next()
+        .ok_or("no asset clip pose")?;
+    let root = -animal.pivot_m;
+    let cells = reference_cells(animal, &sample.locals, root)?;
+    let mut target = None;
+    for reference in cells {
+        let part = animal
+            .parts
+            .iter()
+            .find(|part| part.part.id == reference.part_id)
+            .ok_or("reference part missing")?;
+        let origin = part.grid.origin();
+        let local = [
+            i64::from(reference.cell[0]) - origin.x,
+            i64::from(reference.cell[1]) - origin.y,
+            i64::from(reference.cell[2]) - origin.z,
+        ];
+        if local
+            .iter()
+            .any(|coord| *coord < 0 || *coord > u32::MAX as i64)
+        {
+            continue;
+        }
+        let local = local.map(|coord| coord as u32);
+        if !part.grid.is_solid(local[0] + 1, local[1], local[2]) {
+            target = Some(reference);
+            break;
+        }
+    }
+    let target = target.ok_or("no exposed +X source face")?;
+    let normal = target.rotation * Vec3::X;
+    let face = target.center + normal * (CELL_M * 0.5);
+    let probe_center = face + normal * (PROBE_CELL_M * 0.5 + 0.002);
+    let probe_grid = OccupancyGrid::from_solid_mask(
+        GlobalCell::new(0, 0, 0),
+        [1, 1, 1],
+        vec![true],
+        vec![MaterialId(1)],
+    )?;
+    let mut world = PhysicsWorld::new(PhysicsConfig {
+        gravity_m_s2: [0.0; 3],
+        solver_substeps: SUBSTEPS,
+        ..PhysicsConfig::default()
+    });
+    let mut setup = Vec::new();
+    let rig = rebuild(&mut world, animal, representation, root, &mut setup, true)?;
+    world.update_articulated_pose(
+        rig,
+        ArticulatedPose {
+            topology_token: TOPOLOGY_TOKEN,
+            base_pose_token: 0,
+            pose_token: 1,
+            parts: sample.locals.clone(),
+        },
+    )?;
+    let probe = world.add_body(BodySpec {
+        kind: BodyKind::Dynamic { ccd: false },
+        representation,
+        grid: probe_grid,
+        cell_m: PROBE_CELL_M,
+        density_kg_m3: 1_000.0,
+        mass_properties: None,
+        translation_m: (probe_center - Vec3::splat(PROBE_CELL_M * 0.5)).to_array(),
+        linvel_m_s: (-normal).to_array(),
+    });
+    let timing = world.step();
+    let mut reasons = BTreeMap::new();
+    let mut retained = 0;
+    let mut resolved = 0;
+    let mut positive_impulses = 0;
+    for contact in world
+        .articulated_contact_witnesses()
+        .iter()
+        .filter(|contact| contact.bodies.contains(&probe))
+    {
+        for side in contact.source_sides.iter().flatten() {
+            if side.part_id != target.part_id {
+                continue;
+            }
+            retained += 1;
+            positive_impulses += usize::from(
+                side.normal_impulse_n_s
+                    .is_some_and(|impulse| impulse.is_finite() && impulse > 0.0),
+            );
+            match side.attribution {
+                ContactCellAttribution::Resolved { cell, .. } if cell == target.cell => {
+                    resolved += 1;
+                }
+                ContactCellAttribution::Resolved { .. } => {
+                    *reasons.entry("resolved_other_cell".to_owned()).or_insert(0) += 1;
+                }
+                ContactCellAttribution::Unattributed(reason) => {
+                    let name = match reason {
+                        ContactWitnessUnattributed::NonFinite => "non_finite",
+                        ContactWitnessUnattributed::Penetrating => "penetrating",
+                        ContactWitnessUnattributed::NotAxisAlignedFace => "non_axis_aligned",
+                        ContactWitnessUnattributed::FacePositionUncertain => "face_uncertain",
+                        ContactWitnessUnattributed::EdgeOrCorner => "edge_or_corner",
+                        ContactWitnessUnattributed::EmptySourceCell => "empty_source_cell",
+                        ContactWitnessUnattributed::InternalSharedFace => "internal_shared_face",
+                    };
+                    *reasons.entry(name.to_owned()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    Ok(ContactWitnessResult {
+        animal: name.to_owned(),
+        representation: representation.label(),
+        clip: sample.clip,
+        tick: sample.tick,
+        source_part: target.part_id,
+        source_cell: target.cell,
+        body_count: world.articulated_rigid_body_count(rig) + 1,
+        collider_count: world.articulated_collider_count(rig) + 1,
+        solver_substeps: timing.substeps,
+        step_pipeline_us: timing.pipeline.as_secs_f64() * 1.0e6,
+        witness_capture_us: timing.contact_witness_capture.as_secs_f64() * 1.0e6,
+        retained_points: retained,
+        resolved_source_cells: resolved,
+        positive_point_impulses: positive_impulses,
+        unattributed_reasons: reasons,
+        overflow: world.contact_witness_overflow(),
+    })
 }
 
 fn load_animal(asset: Asset) -> Result<Animal, Box<dyn std::error::Error>> {

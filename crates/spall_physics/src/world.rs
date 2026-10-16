@@ -191,6 +191,9 @@ pub struct StepTiming {
     pub step_index: u64,
     /// Wall-clock time inside `PhysicsPipeline::step`.
     pub pipeline: Duration,
+    /// Additional wall-clock time to snapshot and attribute articulated
+    /// solver-point witnesses across all outer-step substeps.
+    pub contact_witness_capture: Duration,
     /// Number of coordinated world-pipeline substeps used for this outer tick.
     pub substeps: usize,
     /// Sum of positive solver normal impulses across active contact pairs and
@@ -230,6 +233,68 @@ pub struct ContactImpulse {
     /// Solver manifold points do not identify an authoritative occupied voxel.
     /// Source-cell damage therefore remains unattributed at this layer.
     pub source_cells: [Option<[i32; 3]>; 2],
+}
+
+/// Versioned geometric source-cell witness captured from one solver contact
+/// at its actual kinematic substep. A resolved cell identifies the unique
+/// exposed voxel face containing the source-side witness; it does not imply
+/// that an application should apply damage to that cell.
+pub const CONTACT_WITNESS_VERSION: u16 = 1;
+/// Hard cap on retained per-step point witnesses. Overflow is reported rather
+/// than growing memory in proportion to hostile contact churn.
+pub const MAX_CONTACT_WITNESSES_PER_STEP: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactWitnessUnattributed {
+    NonFinite,
+    Penetrating,
+    NotAxisAlignedFace,
+    FacePositionUncertain,
+    EdgeOrCorner,
+    EmptySourceCell,
+    InternalSharedFace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactCellAttribution {
+    Resolved {
+        cell: [i32; 3],
+        material: spall_core::MaterialId,
+    },
+    Unattributed(ContactWitnessUnattributed),
+}
+
+/// One source side of a solver contact point. `pose_token` names the authored
+/// target pose for this outer tick; `substep_fraction` and the captured source
+/// witness preserve the intermediate physical pose without publishing a live
+/// query token mid-step. `normal_impulse_n_s` is Rapier's per-point solver
+/// impulse, not a share inferred from a pair aggregate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceContactWitness {
+    pub part_id: u32,
+    pub volume_id: spall_core::VolumeId,
+    pub source_revision: u64,
+    pub topology_token: u64,
+    pub pose_token: u64,
+    pub source_witness_world_m: [f32; 3],
+    pub source_outward_normal_world: [f32; 3],
+    pub separation_m: f32,
+    pub normal_impulse_n_s: Option<f32>,
+    pub attribution: ContactCellAttribution,
+}
+
+/// A solver point involving an articulated source collider, retained across
+/// all solver substeps of one outer step. It is published only after the whole
+/// tick; internal Rapier handles and intermediate query tokens never escape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArticulatedContactWitness {
+    pub version: u16,
+    pub outer_step: u64,
+    pub solver_substep: u16,
+    pub substep_fraction: f32,
+    pub bodies: [BodyId; 2],
+    pub world_contact_point_m: [f32; 3],
+    pub source_sides: [Option<SourceContactWitness>; 2],
 }
 
 struct Entry {
@@ -374,6 +439,119 @@ fn grid_origin_offset_m(grid: &OccupancyGrid, cell_m: f32) -> [f32; 3] {
         o.y as f32 * cell_m,
         o.z as f32 * cell_m,
     ]
+}
+
+/// Resolves only a finite, non-penetrating witness lying well inside one
+/// exterior axis-aligned voxel face. This deliberately leaves diagonal,
+/// shared, edge, corner, and penetrating contacts unattributed; no rounding or
+/// nearest-cell fallback is used.
+fn resolve_source_cell_witness(
+    grid: &OccupancyGrid,
+    cell_m: f32,
+    point: Vector,
+    outward_normal: Vector,
+    separation_m: f32,
+) -> ContactCellAttribution {
+    use ContactWitnessUnattributed as Why;
+    if !cell_m.is_finite()
+        || cell_m <= 0.0
+        || ![point.x, point.y, point.z]
+            .iter()
+            .all(|value| value.is_finite())
+        || ![outward_normal.x, outward_normal.y, outward_normal.z]
+            .iter()
+            .all(|value| value.is_finite())
+        || !separation_m.is_finite()
+    {
+        return ContactCellAttribution::Unattributed(Why::NonFinite);
+    }
+    // Rapier contacts with negative separation represent overlap. Even if a
+    // nearby face can be guessed, that witness does not uniquely establish
+    // which exposed source boundary generated the solver constraint.
+    if separation_m < -1.0e-5 {
+        return ContactCellAttribution::Unattributed(Why::Penetrating);
+    }
+    let normal_len = outward_normal.length();
+    if !normal_len.is_finite() || normal_len <= f32::EPSILON {
+        return ContactCellAttribution::Unattributed(Why::NonFinite);
+    }
+    let n = outward_normal / normal_len;
+    let Some(axis) = (0..3).max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs())) else {
+        return ContactCellAttribution::Unattributed(Why::NonFinite);
+    };
+    if n[axis].abs() < 0.9999 {
+        return ContactCellAttribution::Unattributed(Why::NotAxisAlignedFace);
+    }
+
+    // Explicit geometric tolerance: 10 micrometres or 1e-4 of a cell,
+    // whichever is larger. Witnesses closer than this to an edge are ambiguous.
+    let eps_m = (cell_m * 1.0e-4).max(1.0e-5);
+    let eps_cell = eps_m / cell_m;
+    let q = [point.x / cell_m, point.y / cell_m, point.z / cell_m];
+    let boundary = q[axis].round();
+    if (q[axis] - boundary).abs() > eps_cell {
+        return ContactCellAttribution::Unattributed(Why::FacePositionUncertain);
+    }
+    let mut cell = [0_i32; 3];
+    for tangent in 0..3 {
+        if tangent == axis {
+            continue;
+        }
+        let floor = q[tangent].floor();
+        let fraction = q[tangent] - floor;
+        if fraction <= eps_cell || 1.0 - fraction <= eps_cell {
+            return ContactCellAttribution::Unattributed(Why::EdgeOrCorner);
+        }
+        if floor < i32::MIN as f32 || floor > i32::MAX as f32 {
+            return ContactCellAttribution::Unattributed(Why::NonFinite);
+        }
+        cell[tangent] = floor as i32;
+    }
+    if boundary < i32::MIN as f32 || boundary > i32::MAX as f32 {
+        return ContactCellAttribution::Unattributed(Why::NonFinite);
+    }
+    let boundary = boundary as i32;
+    let outward_sign = if n[axis] > 0.0 { 1 } else { -1 };
+    cell[axis] = if outward_sign > 0 {
+        boundary - 1
+    } else {
+        boundary
+    };
+    if cell.iter().any(|&coord| coord < 0) {
+        return ContactCellAttribution::Unattributed(Why::EmptySourceCell);
+    }
+    let local = cell.map(|coord| coord as u32);
+    let Some(material) = grid.material(local[0], local[1], local[2]) else {
+        return ContactCellAttribution::Unattributed(Why::EmptySourceCell);
+    };
+    let mut neighbor = cell;
+    neighbor[axis] += outward_sign;
+    if neighbor.iter().all(|&coord| coord >= 0)
+        && grid.is_solid(neighbor[0] as u32, neighbor[1] as u32, neighbor[2] as u32)
+    {
+        return ContactCellAttribution::Unattributed(Why::InternalSharedFace);
+    }
+    let origin = grid.origin();
+    let Some(cell_x) = origin.x.checked_add(i64::from(cell[0])) else {
+        return ContactCellAttribution::Unattributed(Why::NonFinite);
+    };
+    let Some(cell_y) = origin.y.checked_add(i64::from(cell[1])) else {
+        return ContactCellAttribution::Unattributed(Why::NonFinite);
+    };
+    let Some(cell_z) = origin.z.checked_add(i64::from(cell[2])) else {
+        return ContactCellAttribution::Unattributed(Why::NonFinite);
+    };
+    let (Ok(cell_x), Ok(cell_y), Ok(cell_z)) = (
+        i32::try_from(cell_x),
+        i32::try_from(cell_y),
+        i32::try_from(cell_z),
+    ) else {
+        return ContactCellAttribution::Unattributed(Why::NonFinite);
+    };
+    ContactCellAttribution::Resolved {
+        cell: [cell_x, cell_y, cell_z],
+        material,
+    }
 }
 
 fn articulated_grid_range_valid(grid: &OccupancyGrid, cell_m: f32) -> bool {
@@ -549,6 +727,8 @@ pub struct PhysicsWorld {
     entries: Vec<Entry>,
     articulated: HashMap<BodyId, ArticulatedEntry>,
     step_count: u64,
+    articulated_contact_witnesses: Vec<ArticulatedContactWitness>,
+    contact_witness_overflow: u64,
     /// Collider handles added/rebuilt/removed since the last [`Self::step`]
     /// or [`Self::sync_queries`] — see [`Self::sync_queries`]'s doc for why
     /// this exists alongside `step`, not instead of it.
@@ -650,6 +830,8 @@ impl PhysicsWorld {
             entries: Vec::new(),
             articulated: HashMap::new(),
             step_count: 0,
+            articulated_contact_witnesses: Vec::new(),
+            contact_witness_overflow: 0,
             pending_modified: Vec::new(),
             pending_removed: Vec::new(),
         }
@@ -2906,8 +3088,11 @@ impl PhysicsWorld {
             })
             .collect::<Vec<_>>();
         let mut pipeline = Duration::ZERO;
+        let mut contact_witness_capture = Duration::ZERO;
         let mut normal_impulse_n_s = 0.0_f32;
         let mut impulse_pair_substeps = 0;
+        self.articulated_contact_witnesses.clear();
+        self.contact_witness_overflow = 0;
         self.params.dt = outer_dt / substeps as f32;
         for substep in 0..substeps {
             let fraction = (substep + 1) as f32 / substeps as f32;
@@ -2941,6 +3126,9 @@ impl PhysicsWorld {
                 &(),
             );
             pipeline += start.elapsed();
+            let capture_start = Instant::now();
+            self.capture_articulated_contact_witnesses(substep, substeps);
+            contact_witness_capture += capture_start.elapsed();
             for pair in self.narrow_phase.contact_pairs() {
                 let impulse = pair.total_impulse_magnitude();
                 if pair.has_any_active_contact() && impulse.is_finite() && impulse > 0.0 {
@@ -3003,6 +3191,7 @@ impl PhysicsWorld {
         StepTiming {
             step_index: self.step_count,
             pipeline,
+            contact_witness_capture,
             substeps,
             normal_impulse_n_s,
             impulse_pair_substeps,
@@ -3523,6 +3712,170 @@ impl PhysicsWorld {
         })
     }
 
+    /// Copies solver-point contact data before the next global solver substep
+    /// can recycle or discard it. The returned records contain no Rapier
+    /// handles; published query pose tokens are updated only after the complete
+    /// outer step.
+    fn capture_articulated_contact_witnesses(&mut self, substep: usize, substeps: usize) {
+        let mut captured = Vec::new();
+        let room =
+            MAX_CONTACT_WITNESSES_PER_STEP.saturating_sub(self.articulated_contact_witnesses.len());
+        let mut overflow = 0_u64;
+        let fraction = (substep + 1) as f32 / substeps as f32;
+        for pair in self.narrow_phase.contact_pairs() {
+            if !pair.has_any_active_contact() {
+                continue;
+            }
+            for manifold in pair.solver_manifolds() {
+                let (Some(rb1), Some(rb2)) = (manifold.data.rigid_body1, manifold.data.rigid_body2)
+                else {
+                    continue;
+                };
+                let (Some(body1), Some(body2)) = (self.body_id_of(rb1), self.body_id_of(rb2))
+                else {
+                    continue;
+                };
+                let Some(collider1) = self.colliders.get(pair.collider1) else {
+                    continue;
+                };
+                let Some(collider2) = self.colliders.get(pair.collider2) else {
+                    continue;
+                };
+                let normal = manifold.data.normal;
+                let normal_len = normal.length();
+                if !normal_len.is_finite() || normal_len <= f32::EPSILON {
+                    continue;
+                }
+                let normal = normal / normal_len;
+                let pose1 = collider1.position();
+                let pose2 = collider2.position();
+                for contact in &manifold.data.solver_contacts {
+                    let [contact_index] = contact.contact_indices();
+                    let Some(point) = manifold.points.get(contact_index as usize) else {
+                        continue;
+                    };
+                    // Solver anchors are COM-local and Rapier exposes the
+                    // matching world witness transform. This remains correct
+                    // for collider offsets and clustered compound subshapes.
+                    let (p1, p2) = manifold
+                        .data
+                        .solver_contact_world_points(contact, &self.bodies);
+                    let source_local1 = pose1.rotation.inverse() * (p1 - pose1.translation);
+                    let source_local2 = pose2.rotation.inverse() * (p2 - pose2.translation);
+                    if ![p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, point.dist]
+                        .iter()
+                        .all(|value| value.is_finite())
+                    {
+                        continue;
+                    }
+                    let impulse = point.data.impulse;
+                    let impulse = (impulse.is_finite() && impulse >= 0.0).then_some(impulse);
+                    let source_sides = [
+                        self.source_contact_witness(
+                            body1,
+                            pair.collider1,
+                            source_local1,
+                            p1,
+                            normal,
+                            point.dist,
+                            impulse,
+                        ),
+                        self.source_contact_witness(
+                            body2,
+                            pair.collider2,
+                            source_local2,
+                            p2,
+                            -normal,
+                            point.dist,
+                            impulse,
+                        ),
+                    ];
+                    if source_sides.iter().all(Option::is_none) {
+                        continue;
+                    }
+                    let record = ArticulatedContactWitness {
+                        version: CONTACT_WITNESS_VERSION,
+                        outer_step: self.step_count + 1,
+                        solver_substep: substep as u16,
+                        substep_fraction: fraction,
+                        bodies: [body1, body2],
+                        world_contact_point_m: [
+                            0.5 * (p1.x + p2.x),
+                            0.5 * (p1.y + p2.y),
+                            0.5 * (p1.z + p2.z),
+                        ],
+                        source_sides,
+                    };
+                    if captured.len() < room {
+                        captured.push(record);
+                    } else {
+                        overflow += 1;
+                    }
+                }
+            }
+        }
+        self.contact_witness_overflow += overflow;
+        self.articulated_contact_witnesses.extend(captured);
+    }
+
+    fn source_contact_witness(
+        &self,
+        body: BodyId,
+        collider_handle: ColliderHandle,
+        local_point: Vector,
+        world_point: Vector,
+        outward_world: Vector,
+        separation_m: f32,
+        impulse: Option<f32>,
+    ) -> Option<SourceContactWitness> {
+        let assembly = self.articulated.get(&body)?;
+        let part = assembly
+            .parts
+            .iter()
+            .find(|part| part.collider == collider_handle)?;
+        let collider = self.colliders.get(collider_handle)?;
+        let collider_pose = collider.position();
+        let local_normal = collider_pose.rotation.inverse() * outward_world;
+        let attribution = resolve_source_cell_witness(
+            &part.grid,
+            part.cell_m,
+            local_point,
+            local_normal,
+            separation_m,
+        );
+        Some(SourceContactWitness {
+            part_id: part.part_id,
+            volume_id: part.volume_id,
+            source_revision: part.source_revision,
+            topology_token: assembly.topology_token,
+            pose_token: assembly
+                .pending_pose
+                .as_ref()
+                .map(|pending| pending.pose_token)
+                .or(assembly.pending_root_pose_token)
+                .unwrap_or(assembly.pose_token),
+            source_witness_world_m: [world_point.x, world_point.y, world_point.z],
+            source_outward_normal_world: [outward_world.x, outward_world.y, outward_world.z],
+            separation_m,
+            normal_impulse_n_s: impulse,
+            attribution,
+        })
+    }
+
+    /// Geometric witness records retained from the last completed outer step.
+    /// Their authored pose token and substep fraction identify the source pose
+    /// that generated them; the records do not mutate or replace ray-query
+    /// provenance.
+    pub fn articulated_contact_witnesses(&self) -> &[ArticulatedContactWitness] {
+        &self.articulated_contact_witnesses
+    }
+
+    /// Number of source-bearing solver points omitted when the per-step
+    /// witness cap was reached.
+    pub fn contact_witness_overflow(&self) -> u64 {
+        self.contact_witness_overflow
+    }
+
     /// Every contact pair with a non-zero solved normal impulse this step, as
     /// [`ContactImpulse`] records in a deterministic order (by body-id pair).
     /// This is the T21 input surface: the caller thresholds these, applies
@@ -3835,6 +4188,80 @@ mod tests {
             grid,
             cell_m: 0.25,
             local_transform: crate::articulated::PartTransform::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn source_cell_witness_requires_a_unique_exterior_face_in_source_coordinates() {
+        let one = one_cell_grid(GlobalCell::new(-3, 2, 1));
+        for (point, normal) in [
+            (Vector::new(1.0, 0.4, 0.6), Vector::X),
+            (Vector::new(0.0, 0.4, 0.6), -Vector::X),
+        ] {
+            assert_eq!(
+                resolve_source_cell_witness(&one, 1.0, point, normal, 0.0),
+                ContactCellAttribution::Resolved {
+                    cell: [-3, 2, 1],
+                    material: fixtures::STONE,
+                }
+            );
+        }
+
+        let shared = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(-2, 0, 0),
+            [2, 1, 1],
+            vec![true, true],
+            vec![fixtures::STONE; 2],
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_source_cell_witness(&shared, 1.0, Vector::new(1.0, 0.5, 0.5), Vector::X, 0.0),
+            ContactCellAttribution::Unattributed(ContactWitnessUnattributed::InternalSharedFace)
+        );
+        let holed = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [2, 1, 1],
+            vec![true, false],
+            vec![fixtures::STONE, fixtures::STONE],
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_source_cell_witness(&holed, 1.0, Vector::new(1.0, 0.5, 0.5), Vector::X, 0.0),
+            ContactCellAttribution::Resolved {
+                cell: [0, 0, 0],
+                ..
+            }
+        ));
+        for (point, normal, separation, reason) in [
+            (
+                Vector::new(1.0, 0.0, 0.5),
+                Vector::X,
+                0.0,
+                ContactWitnessUnattributed::EdgeOrCorner,
+            ),
+            (
+                Vector::new(1.0, 0.00005, 0.5),
+                Vector::X,
+                0.0,
+                ContactWitnessUnattributed::EdgeOrCorner,
+            ),
+            (
+                Vector::new(1.0, 0.5, 0.5),
+                Vector::new(1.0, 1.0, 0.0),
+                0.0,
+                ContactWitnessUnattributed::NotAxisAlignedFace,
+            ),
+            (
+                Vector::new(1.0, 0.5, 0.5),
+                Vector::X,
+                -0.01,
+                ContactWitnessUnattributed::Penetrating,
+            ),
+        ] {
+            assert_eq!(
+                resolve_source_cell_witness(&one, 1.0, point, normal, separation),
+                ContactCellAttribution::Unattributed(reason)
+            );
         }
     }
 
@@ -4848,6 +5275,299 @@ mod tests {
             // Keep the original no-CCD result and measure the same exact
             // workload with candidate dynamic CCD enabled; neither is assumed
             // to provide a kinematic-part impact response.
+        }
+    }
+
+    #[test]
+    fn articulated_contact_witness_resolves_only_unique_source_face_contacts() {
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                solver_substeps: 4,
+                ..Default::default()
+            });
+            let mut root_part = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 186, 3);
+            root_part.local_transform.translation_m[0] = 3.0;
+            let nested_source = crate::articulated::SourcePart {
+                part_id: 8,
+                parent_id: Some(7),
+                volume_id: VolumeId::new(188).unwrap(),
+                source_revision: 10,
+                grid: one_cell_grid(GlobalCell::new(-2, 0, 0)),
+                cell_m: 0.25,
+                local_transform: PartTransform {
+                    translation_m: [-3.0, 0.0, 0.0],
+                    ..PartTransform::IDENTITY
+                },
+            };
+            let animal = world
+                .add_articulated_kinematic_parts(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    23,
+                    vec![root_part, nested_source],
+                    representation,
+                )
+                .unwrap();
+            let probe_grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+            let probe = world.add_body(BodySpec {
+                kind: BodyKind::Dynamic { ccd: false },
+                representation,
+                grid: probe_grid,
+                cell_m: 0.0625,
+                density_kg_m3: 1_000.0,
+                mass_properties: None,
+                translation_m: [-0.25, 0.09375, 0.09375],
+                linvel_m_s: [0.0; 3],
+            });
+            // Source cell at grid-local x=[0,.25] has its authored global cell
+            // at x=-2, and therefore world x=[-.5,-.25]. A small probe touches
+            // only the center of its +X face.
+            world
+                .update_articulated_pose(
+                    animal,
+                    ArticulatedPose {
+                        topology_token: 23,
+                        base_pose_token: 0,
+                        pose_token: 1,
+                        parts: vec![
+                            (
+                                7,
+                                PartTransform {
+                                    translation_m: [3.0, 0.0, 0.0],
+                                    ..PartTransform::IDENTITY
+                                },
+                            ),
+                            (
+                                8,
+                                PartTransform {
+                                    translation_m: [-2.995, 0.0, 0.0],
+                                    ..PartTransform::IDENTITY
+                                },
+                            ),
+                        ],
+                    },
+                )
+                .unwrap();
+            world.step();
+            let contacts = world
+                .articulated_contact_witnesses()
+                .iter()
+                .filter(|contact| contact.bodies.contains(&probe))
+                .collect::<Vec<_>>();
+            assert!(
+                !contacts.is_empty(),
+                "{representation:?} produced no per-substep witnesses"
+            );
+            assert!(
+                contacts
+                    .iter()
+                    .all(|contact| contact.version == CONTACT_WITNESS_VERSION)
+            );
+            assert!(contacts.iter().all(|contact| contact.outer_step == 1));
+            assert!(contacts.iter().all(|contact| contact.solver_substep < 4));
+            let resolved = contacts
+                .iter()
+                .flat_map(|contact| contact.source_sides.iter().flatten())
+                .filter(|side| matches!(side.attribution, ContactCellAttribution::Resolved { .. }))
+                .collect::<Vec<_>>();
+            let positive_point_impulses = resolved
+                .iter()
+                .filter(|side| side.normal_impulse_n_s.is_some_and(|impulse| impulse > 0.0))
+                .count();
+            println!(
+                "source witness candidate {representation:?}: point_records={} resolved={} positive_point_impulses={} overflow={} final_pair_records={}",
+                contacts.len(),
+                resolved.len(),
+                positive_point_impulses,
+                world.contact_witness_overflow(),
+                world.contact_impulses().len()
+            );
+            assert!(
+                !resolved.is_empty(),
+                "centered face contact should resolve without rounding: {:?}",
+                contacts
+            );
+            for side in resolved {
+                assert_eq!(side.part_id, 8);
+                assert_eq!(side.volume_id, VolumeId::new(188).unwrap());
+                assert_eq!(side.source_revision, 10);
+                assert_eq!(side.topology_token, 23);
+                assert_eq!(side.pose_token, 1);
+                assert_eq!(
+                    side.attribution,
+                    ContactCellAttribution::Resolved {
+                        cell: [-2, 0, 0],
+                        material: fixtures::STONE,
+                    }
+                );
+                assert!(
+                    side.normal_impulse_n_s
+                        .is_some_and(|impulse| impulse.is_finite())
+                );
+            }
+            assert!(positive_point_impulses > 0);
+            assert!(
+                world.contact_impulses().is_empty(),
+                "this fixture's point witnesses are transient, not current-final pair records"
+            );
+            assert!(
+                world
+                    .contact_impulses()
+                    .iter()
+                    .all(|pair| pair.source_cells == [None, None])
+            );
+
+            // Stale and pending authored updates cannot mutate the prior
+            // published witness snapshot or its query provenance.
+            let original_hit = world
+                .raycast_articulated(animal, [-0.6, 0.125, 0.125], [1.0, 0.0, 0.0], 1.0)
+                .unwrap();
+            let snapshot = world.articulated_contact_witnesses().to_vec();
+            assert!(
+                world
+                    .update_articulated_pose(
+                        animal,
+                        ArticulatedPose {
+                            topology_token: 23,
+                            base_pose_token: 0,
+                            pose_token: 2,
+                            parts: vec![
+                                (
+                                    7,
+                                    PartTransform {
+                                        translation_m: [3.0, 0.0, 0.0],
+                                        ..PartTransform::IDENTITY
+                                    }
+                                ),
+                                (
+                                    8,
+                                    PartTransform {
+                                        translation_m: [-3.0, 0.0, 0.0],
+                                        ..PartTransform::IDENTITY
+                                    }
+                                ),
+                            ],
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(world.articulated_contact_witnesses(), snapshot.as_slice());
+            assert_eq!(
+                world
+                    .raycast_articulated(animal, [-0.6, 0.125, 0.125], [1.0, 0.0, 0.0], 1.0)
+                    .unwrap(),
+                original_hit
+            );
+            world
+                .rebuild_articulated_part_grid(
+                    animal,
+                    23,
+                    24,
+                    8,
+                    10,
+                    11,
+                    one_cell_grid(GlobalCell::new(-2, 0, 0)),
+                )
+                .unwrap();
+            assert_eq!(world.articulated_contact_witnesses(), snapshot.as_slice());
+            assert!(
+                world
+                    .update_articulated_pose(
+                        animal,
+                        ArticulatedPose {
+                            topology_token: 23,
+                            base_pose_token: 1,
+                            pose_token: 2,
+                            parts: vec![
+                                (
+                                    7,
+                                    PartTransform {
+                                        translation_m: [3.0, 0.0, 0.0],
+                                        ..PartTransform::IDENTITY
+                                    }
+                                ),
+                                (
+                                    8,
+                                    PartTransform {
+                                        translation_m: [-2.995, 0.0, 0.0],
+                                        ..PartTransform::IDENTITY
+                                    }
+                                ),
+                            ],
+                        }
+                    )
+                    .is_err()
+            );
+            let replacement_hit = world
+                .raycast_articulated(animal, [-0.6, 0.125, 0.125], [1.0, 0.0, 0.0], 1.0)
+                .unwrap();
+            assert_eq!(replacement_hit.topology_token, 24);
+            assert_eq!(replacement_hit.source_revision, 11);
+            assert_eq!(replacement_hit.cell, [-2, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn articulated_contact_witness_resolves_source_when_it_is_pair_side_two() {
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                solver_substeps: 4,
+                ..Default::default()
+            });
+            let probe = world.add_body(BodySpec {
+                kind: BodyKind::Dynamic { ccd: false },
+                representation,
+                grid: one_cell_grid(GlobalCell::new(0, 0, 0)),
+                cell_m: 0.0625,
+                density_kg_m3: 1_000.0,
+                mass_properties: None,
+                translation_m: [0.25, 0.09375, 0.09375],
+                linvel_m_s: [0.0; 3],
+            });
+            let animal = world
+                .add_articulated_kinematic_parts(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    31,
+                    vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 190, 2)],
+                    representation,
+                )
+                .unwrap();
+            world
+                .update_articulated_pose(
+                    animal,
+                    ArticulatedPose {
+                        topology_token: 31,
+                        base_pose_token: 0,
+                        pose_token: 1,
+                        parts: vec![(
+                            7,
+                            PartTransform {
+                                translation_m: [0.005, 0.0, 0.0],
+                                ..PartTransform::IDENTITY
+                            },
+                        )],
+                    },
+                )
+                .unwrap();
+            world.step();
+            let source_sides = world
+                .articulated_contact_witnesses()
+                .iter()
+                .filter(|contact| contact.bodies.contains(&probe))
+                .filter_map(|contact| contact.source_sides[1])
+                .collect::<Vec<_>>();
+            assert!(
+                !source_sides.is_empty(),
+                "{representation:?} did not put source collider second"
+            );
+            assert!(source_sides.iter().all(|side| {
+                side.part_id == 7
+                    && side.volume_id == VolumeId::new(190).unwrap()
+                    && matches!(side.attribution, ContactCellAttribution::Resolved { cell: [0, 0, 0], material } if material == fixtures::STONE)
+            }));
         }
     }
 
