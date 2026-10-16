@@ -12,10 +12,10 @@ fn assert_close(actual: f64, expected: f64) {
 }
 fn check(actual: MassProperties, mass: f64, center: [f64; 3], inertia: [[f64; 3]; 3]) {
     assert_close(actual.mass_kg, mass);
-    for i in 0..3 {
-        assert_close(actual.com_m[i], center[i]);
-        for j in 0..3 {
-            assert_close(actual.inertia_com[i][j], inertia[i][j]);
+    for (i, expected_center) in center.iter().enumerate() {
+        assert_close(actual.com_m[i], *expected_center);
+        for (j, expected_entry) in inertia[i].iter().enumerate() {
+            assert_close(actual.inertia_com[i][j], *expected_entry);
         }
     }
 }
