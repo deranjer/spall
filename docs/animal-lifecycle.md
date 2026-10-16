@@ -348,9 +348,12 @@ rig addresses those cases through explicit terrain transition queries and
 opt-in same-world solver substeps. Contact witnesses identify only geometrically
 proved source faces; ambiguous witnesses do not authorize a cell edit.
 [Coordinator integration evidence](reports/ENG-210-integration.md) defines the
-accepted scope and remaining limits. ENG-212 is the separate editable corpse
-aggregate feasibility slice. Its reviewed outcome and the provenance format
-remain prerequisites to runtime actor interfaces; the host/transaction slices
+accepted scope and remaining limits. ENG-212's bounded editable compound and
+ENG-213's full-world locality are integrated, with combined evidence in
+`reports/ENG-212-213-integration.md`. ENG-214 must now establish explicit corpse
+connectivity and split ownership; a rigid compound alone does not accept
+disconnected material remaining anchored. That reviewed provenance decision
+remains a prerequisite to runtime actor interfaces; the host/transaction slices
 below remain proposed.
 
 1. **Geometry/query feasibility (ENG-209):** measure the selected kinematic
