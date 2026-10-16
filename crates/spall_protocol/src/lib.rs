@@ -24,6 +24,7 @@ pub mod canonical;
 pub mod codec;
 pub mod column_water;
 pub mod column_water_wire;
+pub mod creature;
 pub mod handshake;
 pub mod input;
 pub mod limits;
@@ -56,6 +57,16 @@ pub use codec::{
 };
 pub use column_water::{ColumnWaterDelta, ColumnWaterState};
 pub use column_water_wire::{ColumnWaterReplica, ColumnWaterUpdate};
+pub use creature::{
+    CREATURE_MATERIAL_MAPPING_FORMAT, CREATURE_STATE_SCHEMA, CreatureAssetCatalogEntry,
+    CreatureAssetIdentity, CreatureClipMode, CreatureLifecycleState, CreatureMaterialMappingEntry,
+    CreaturePartBinding, CreatureSpeciesCatalogEntry, CreatureStateError, CreatureStateV1,
+    CreatureValidationCatalog, MAX_CREATURE_ANGULAR_VELOCITY_RAD_S, MAX_CREATURE_ASSET_CLIPS,
+    MAX_CREATURE_ASSET_MATERIAL_KEYS, MAX_CREATURE_ASSET_PARTS, MAX_CREATURE_CATALOG_ASSETS,
+    MAX_CREATURE_CATALOG_SPECIES, MAX_CREATURE_CLIP_NAME_BYTES, MAX_CREATURE_LINEAR_VELOCITY_M_S,
+    MAX_CREATURE_POSITION_M, MAX_CREATURE_SOURCE_PARTS, MAX_CREATURE_SPECIES_KEY_BYTES,
+    MAX_CREATURE_STATE_BYTES, creature_material_mapping_hash,
+};
 pub use handshake::{
     AlgorithmVersions, Handshake, Incompatibility, NegotiatedLimits, PROTOCOL_VERSION,
     check_compatible,
