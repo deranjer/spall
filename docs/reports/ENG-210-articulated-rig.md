@@ -132,6 +132,31 @@ are not swept against terrain; and source-cell damage remains unattributed.
 Dynamic multi-volume corpse ownership, live lifecycle/runtime integration,
 replication, persistence, and population performance remain separate gates.
 
+### Focused sweep correction (supersedes earlier wall distance)
+
+Review found the earlier envelope radius used half of the squared AABB extent,
+which overestimated radius by sqrt(2). The radius now uses the Euclidean length
+of the three half-extents. Re-running the original 2m fixed-wall scenario clips
+to 0.15652314m (fraction 0.07826157); the previous 0.0668138m result is
+superseded and must not be used as the corrected measurement. This remains a
+conservative enclosing-sphere contract, not exact articulated clearance.
+
+The root sweep now synchronizes pending broad-phase edits before casting and
+filters blockers to fixed, non-sensor colliders. Dynamic and kinematic actors
+remain handled by the same Rapier solver after a move is scheduled. A new
+grounded-floor case showed exact sphere tangency caused a zero-time cast hit;
+the query sphere is biased upward by 2mm, while the applied root pose is not.
+With that explicit tolerance, grounded 0.25m lateral and 0.2m upward requests
+both pass at fraction >0.99. This small clearance can admit up to 2mm of
+vertical terrain overlap and is a limitation of the experiment.
+
+The API still cannot apply a sampled authored clip pose and swept root
+translation in the same physics boundary: each stages an independent pending
+pose token, and the second request is rejected until `step` commits the first.
+This is an integration blocker for combined locomotion, not a claim of
+continuous animated movement. The current scenarios verify either clip motion
+or root translation per boundary only.
+
 ## Checks
 
 Exact checks run in the assigned worktree:
@@ -139,6 +164,7 @@ Exact checks run in the assigned worktree:
 ```powershell
 cargo test -p spall_physics --lib --test articulated_review
 cargo test -p spall_physics articulated_ -- --nocapture
+cargo test -p spall_physics articulated_sweep_allows_grounded_horizontal_and_upward_recovery -- --nocapture
 cargo test -p spall_physics diagnostic_kinematic_root_crosses_fixed_terrain_but_character_sweep_blocks -- --nocapture
 cargo clippy -p spall_physics --all-targets -- -D warnings
 cargo clippy -p sandbox --example animal-collision-probe -- -D warnings

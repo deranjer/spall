@@ -1498,6 +1498,9 @@ impl PhysicsWorld {
         {
             return Err(ArticulatedError::InvalidRootPose);
         }
+        // Broad-phase query casts must observe edits/pose changes made since
+        // the last step, even when the caller has not explicitly synced.
+        self.sync_queries();
         let body_id = id.0;
         let assembly = self
             .articulated
@@ -1539,20 +1542,40 @@ impl PhysicsWorld {
         let local_center =
             std::array::from_fn::<_, 3, _>(|axis| 0.5 * (bounds_min[axis] + bounds_max[axis]));
         let radius = (0..3)
-            .map(|axis| 0.5 * (bounds_max[axis] - bounds_min[axis]).powi(2))
+            .map(|axis| (0.5 * (bounds_max[axis] - bounds_min[axis])).powi(2))
             .sum::<f32>()
             .sqrt()
             .max(0.001);
         let root = assembly.root_pose;
         let rotated_center = rotate(root.rotation_xyzw, local_center);
+        // A tiny upward query bias avoids treating a sphere exactly tangent
+        // to its support surface as an initial overlap. The accepted root pose
+        // remains unshifted; the clearance is part of the conservative sweep
+        // approximation and is bounded to 2 mm.
         let start = Pose::from_translation(Vector::from([
             root.translation_m[0] + rotated_center[0],
-            root.translation_m[1] + rotated_center[1],
+            root.translation_m[1] + rotated_center[1] + 0.002,
             root.translation_m[2] + rotated_center[2],
         ]));
         let displacement = Vector::from(requested_translation_m);
         let excluded: Vec<_> = assembly.parts.iter().map(|part| part.collider).collect();
-        let accepts_collider = |handle: ColliderHandle, _: &Collider| !excluded.contains(&handle);
+        // Root translation is explicitly a terrain sweep. Dynamic/kinematic
+        // bodies are handled by the shared Rapier solver after scheduling;
+        // sensors do not block locomotion.
+        let terrain_colliders: Vec<_> = self
+            .colliders
+            .iter()
+            .filter_map(|(handle, collider)| {
+                let fixed = collider
+                    .parent()
+                    .and_then(|parent| self.bodies.get(parent))
+                    .is_some_and(|body| body.is_fixed());
+                (fixed && !collider.is_sensor()).then_some(handle)
+            })
+            .collect();
+        let accepts_collider = |handle: ColliderHandle, _: &Collider| {
+            !excluded.contains(&handle) && terrain_colliders.contains(&handle)
+        };
         let filter = QueryFilter::default().predicate(&accepts_collider);
         let hit = if displacement.length_squared() <= 1.0e-12 {
             None
@@ -1570,7 +1593,7 @@ impl PhysicsWorld {
                 &shape,
                 rapier3d::parry::query::ShapeCastOptions {
                     max_time_of_impact: 1.0,
-                    target_distance: 0.002,
+                    target_distance: 0.0,
                     stop_at_penetration: true,
                     compute_impact_geometry_on_penetration: true,
                 },
@@ -3645,6 +3668,49 @@ mod tests {
     }
 
     #[test]
+    fn articulated_sweep_allows_grounded_horizontal_and_upward_recovery() {
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: OccupancyGrid::from_solid_mask(
+                GlobalCell::new(-4, 0, -4),
+                [8, 1, 8],
+                vec![true; 64],
+                vec![fixtures::STONE; 64],
+            )
+            .unwrap(),
+            cell_m: 0.25,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        // The conservative sphere is tangent to the floor top at y=.25.
+        let animal = world
+            .add_articulated_kinematic_parts(
+                [0.0, 0.34150636, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 194, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let lateral = world
+            .sweep_articulated_root_translation(animal, 1, 0, 1, [0.25, 0.0, 0.0])
+            .unwrap();
+        assert!(lateral.fraction > 0.99, "grounded lateral={lateral:?}");
+        world.step();
+        let upward = world
+            .sweep_articulated_root_translation(animal, 1, 1, 2, [0.0, 0.2, 0.0])
+            .unwrap();
+        assert!(upward.fraction > 0.99, "grounded upward={upward:?}");
+    }
+
+    #[test]
     fn articulated_conservative_sweep_blocks_wall_and_rejects_stale_updates() {
         let mut world = PhysicsWorld::new(PhysicsConfig {
             gravity_m_s2: [0.0; 3],
@@ -3676,7 +3742,6 @@ mod tests {
                 Representation::MergedCuboids,
             )
             .unwrap();
-        world.sync_queries();
         let turn = [
             0.0,
             0.0,
