@@ -226,6 +226,71 @@ all-target physics Clippy, formatting, and diff checks passed. Release probe
 commands were `animal-collision-probe.exe --bounded --kinematic-parts` and
 `animal-collision-probe.exe --bounded`.
 
-The combined API only sweeps root translation. It does not block an authored
-part-pose transition that itself intersects terrain, nor does it sweep root
-rotation. Those remain explicit animation/rotation terrain-response gates.
+### Nonlinear authored-pose and root-rotation transition gate
+
+The pinned Parry 0.30.2 query API re-exported by Rapier 0.35.3 provides
+`QueryPipeline::cast_shape_nonlinear`, backed by `NonlinearRigidMotion`. The
+new `update_articulated_pose_with_swept_root_pose` validates the complete part
+set and root transform before querying each exact source-part collider against
+current fixed, non-sensor terrain. The declared one-tick path is linear motion
+of each collider origin and shortest-arc rotation from its current world pose
+to the requested flattened part pose composed with the requested root pose.
+Any hit rejects the entire update without staging root/part bodies or tokens;
+an accepted update stages all of them for one shared physics boundary. This is
+a continuous cast for that explicitly defined independent-rigid-part path. It
+does not claim a joint-constrained interpolation between authored samples or
+solver-driven kinematic recoil. Dynamic and sensor colliders remain outside
+the terrain-blocking cast; dynamic interactions stay in the same Rapier solver.
+
+A new regression rotates an off-center source part 180 degrees through a fixed
+wall. The sweep rejects at an interior TOI and leaves pose token/query
+provenance at token 0. Removing the wall is visible without manual query sync;
+the same update then publishes root and part rotation together at token 1.
+Post-step broad-phase AABBs for transitioned articulated colliders are
+refreshed before tokens publish, so immediate queries see large rotations in
+the same boundary.
+
+The release probe now tests every adjacent sampled phase within each clip for
+trout, crow, and deer in both collider representations. Each independent case
+places a floor 2 cm below the lowest endpoint-cell face and a wall 2 cm beyond
+the highest endpoint-cell face, then combines the clip sample with a 10-degree
+root yaw. It verifies one source ray per part against the independent cell
+oracle after each accepted step. Across six animal/representation cases, 48
+clip transitions were measured: 46 accepted and two blocked. Both blocks are
+deer NativeVoxels walk transitions, 0→12 and 24→36 ticks, at part IDs 8 and 6,
+with TOI 0.454593 and 0.454594. Deer MergedCuboids accepted those same
+intervals, so representation-dependent nonlinear casting remains an explicit
+unresolved gate; this is conservative rejection evidence, not a claim that
+either path matches the other. All 38,520 independent source-cell rays and 66
+miss checks still passed with zero mismatches/timed misses in the candidate
+path. The default path rerun also passed the same ray/miss oracle.
+
+With terrain and one post-step source ray per part included, complete
+update/query/step p50/p95 costs were: trout native 133.5/234.9 µs, trout merged
+103.2/162.7 µs; crow native 132.0/190.6 µs, crow merged 94.9/103.2 µs; deer
+native 334.8/387.8 µs, deer merged 194.2/196.7 µs. Counts are 5/6/9 source
+parts, 6/7/10 candidate bodies, and 5/6/9 source colliders for trout/crow/deer;
+primitive totals remain native 5/6/9 and merged 17/14/21. These are bounded
+single-animal measurements, with no agreed population target. Raw results are
+in [kinematic transition workload](ENG-210-animal-transition-workload.json)
+and [default workload](ENG-210-animal-transition-workload-default.json).
+
+The original 0.5 m / one-step fast-impact test is unchanged. Adding CCD to the
+dynamic probe body did not change its result: NativeVoxels had one broad pair
+but zero positive-impulse pairs in both CCD modes; MergedCuboids had zero
+pairs/impulse in both modes. Thus pinned CCD did not resolve the kinematic
+target's zero-impulse gate. The prior 0.6 m / 60-step path response, fixed-wall
+root crossing, source-cell damage attribution, population target, live actors,
+and corpse transfer remain unaccepted. Manifold positions are still not used
+to guess damaged source cells.
+
+The final transition-gate check reran
+`cargo test -p spall_physics --lib --test articulated_review`: 81 passed, 1
+existing ignored diagnostic, and all 8 review scenarios passed. Strict
+`cargo clippy -p spall_physics --all-targets -- -D warnings`, strict sandbox
+probe Clippy, `cargo fmt --check`, and `git diff --check` passed. Focused runs
+also included
+`cargo test -p spall_physics nonlinear_pose_and_root_rotation_sweep_blocks_wall_then_accepts_after_removal`
+and the unchanged
+`cargo test -p spall_physics articulated_part_body_fast_single_step_contact_is_measured_without_sweep
+-- --nocapture` (which prints CCD-off/on measurements for both shapes).

@@ -124,6 +124,17 @@ pub struct ArticulatedMove {
     pub blocked: bool,
 }
 
+/// Result of sweeping one complete sampled assembly pose against current fixed
+/// terrain. A hit rejects the entire sample before any body or pose token is
+/// staged; it is not a partial interpolation or a solver contact response.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArticulatedTransition {
+    pub blocked: bool,
+    pub part_id: Option<u32>,
+    /// Earliest normalized time in the declared one-tick interpolation path.
+    pub time_of_impact: Option<f32>,
+}
+
 /// Compose a child-local transform with its parent's assembly-local transform.
 pub(crate) fn compose(parent: PartTransform, local: PartTransform) -> PartTransform {
     let p = parent.rotation_xyzw;

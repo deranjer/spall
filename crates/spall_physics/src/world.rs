@@ -1796,6 +1796,199 @@ impl PhysicsWorld {
         )
     }
 
+    /// Sweeps every exact source-part collider through its declared one-tick
+    /// world-space interpolation (linear translation and shortest-arc
+    /// rotation), including an optional root translation/rotation, against
+    /// current fixed terrain. Rapier/Parry nonlinear casts cover rotation; a
+    /// terrain hit rejects the complete sample without staging any body or
+    /// token. This contract intentionally does not claim joint-constrained
+    /// intermediate poses or solver-driven terrain response.
+    pub fn update_articulated_pose_with_swept_root_pose(
+        &mut self,
+        id: ArticulatedBodyId,
+        update: ArticulatedPose,
+        root_target: PartTransform,
+    ) -> Result<crate::articulated::ArticulatedTransition, crate::articulated::ArticulatedError>
+    {
+        use crate::articulated::{ArticulatedError, ArticulatedTransition};
+        if !root_target.is_valid() {
+            return Err(ArticulatedError::InvalidRootPose);
+        }
+        let root_target = root_target
+            .normalized()
+            .ok_or(ArticulatedError::InvalidRootPose)?;
+        if !articulated_translation_in_range(root_target.translation_m) {
+            return Err(ArticulatedError::InvalidRootPose);
+        }
+        let body_id = id.0;
+        let assembly = self
+            .articulated
+            .get(&body_id)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        if !assembly.kinematic_part_bodies
+            || assembly.topology_token != update.topology_token
+            || assembly.pose_token != update.base_pose_token
+            || update.pose_token <= update.base_pose_token
+            || assembly.pending_root_pose_token.is_some()
+            || assembly.pending_pose.is_some()
+        {
+            return Err(ArticulatedError::StalePose);
+        }
+        if update.parts.len() != assembly.parts.len()
+            || update
+                .parts
+                .iter()
+                .zip(&assembly.parts)
+                .any(|((part_id, pose), part)| {
+                    *part_id != part.part_id || pose.normalized().is_none()
+                })
+        {
+            return Err(ArticulatedError::StalePose);
+        }
+        let locals = update
+            .parts
+            .iter()
+            .map(|(part_id, pose)| {
+                if !articulated_translation_in_range(pose.translation_m) {
+                    return Err(ArticulatedError::GeometryRange);
+                }
+                Ok((*part_id, pose.normalized().expect("validated transform")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let flattened = flatten_local_poses(&assembly.parts, &locals)?;
+        let target_root = Pose::new(
+            Vector::from(root_target.translation_m),
+            Rotation::from_xyzw(
+                root_target.rotation_xyzw[0],
+                root_target.rotation_xyzw[1],
+                root_target.rotation_xyzw[2],
+                root_target.rotation_xyzw[3],
+            )
+            .to_scaled_axis(),
+        );
+        let mut targets = Vec::with_capacity(assembly.parts.len());
+        for (part, world_pose) in assembly.parts.iter().zip(flattened.iter()) {
+            let local = Pose::new(
+                Vector::from(world_pose.translation_m),
+                Rotation::from_xyzw(
+                    world_pose.rotation_xyzw[0],
+                    world_pose.rotation_xyzw[1],
+                    world_pose.rotation_xyzw[2],
+                    world_pose.rotation_xyzw[3],
+                )
+                .to_scaled_axis(),
+            );
+            let body_target = target_root * local;
+            let collider_local = self.colliders[part.collider]
+                .position_wrt_parent()
+                .copied()
+                .unwrap_or_else(Pose::identity);
+            let collider_target = body_target * collider_local;
+            if !articulated_translation_in_range([
+                body_target.translation.x,
+                body_target.translation.y,
+                body_target.translation.z,
+            ]) || !articulated_translation_in_range([
+                collider_target.translation.x,
+                collider_target.translation.y,
+                collider_target.translation.z,
+            ]) {
+                return Err(ArticulatedError::GeometryRange);
+            }
+            targets.push((
+                part.body,
+                part.collider,
+                *self.colliders[part.collider].position(),
+                collider_target,
+                body_target,
+            ));
+        }
+        let part_ids = assembly
+            .parts
+            .iter()
+            .map(|part| part.part_id)
+            .collect::<Vec<_>>();
+
+        // Query freshness is part of this gate: voxel edits/removals made since
+        // the previous step must affect this same transition decision.
+        self.sync_queries();
+        let terrain_colliders: Vec<_> = self
+            .colliders
+            .iter()
+            .filter_map(|(handle, collider)| {
+                let fixed = collider
+                    .parent()
+                    .and_then(|parent| self.bodies.get(parent))
+                    .is_some_and(|body| body.is_fixed());
+                (fixed && !collider.is_sensor()).then_some(handle)
+            })
+            .collect();
+        let mut earliest: Option<(u32, f32)> = None;
+        for (part_id, (_, collider_handle, start, end, _)) in part_ids.iter().zip(&targets) {
+            let delta = end.translation - start.translation;
+            let delta_rotation = end.rotation * start.rotation.inverse();
+            let motion = rapier3d::parry::query::NonlinearRigidMotion::new(
+                *start,
+                Vector::ZERO,
+                delta,
+                delta_rotation.to_scaled_axis(),
+            );
+            let shape = self.colliders[*collider_handle].shape();
+            for &terrain_handle in &terrain_colliders {
+                let only_terrain = |handle: ColliderHandle, _: &Collider| handle == terrain_handle;
+                let filter = QueryFilter::default().predicate(&only_terrain);
+                let queries = self.broad_phase.as_query_pipeline(
+                    self.narrow_phase.query_dispatcher(),
+                    &self.bodies,
+                    &self.colliders,
+                    filter,
+                );
+                let Some((_, hit)) = queries.cast_shape_nonlinear(&motion, shape, 0.0, 1.0, true)
+                else {
+                    continue;
+                };
+                if earliest.is_none_or(|(_, toi)| hit.time_of_impact < toi) {
+                    earliest = Some((*part_id, hit.time_of_impact));
+                }
+            }
+        }
+        if let Some((part_id, time_of_impact)) = earliest {
+            return Ok(ArticulatedTransition {
+                blocked: true,
+                part_id: Some(part_id),
+                time_of_impact: Some(time_of_impact),
+            });
+        }
+
+        // All input validation and continuous terrain casts succeeded. Stage
+        // root and part body targets together; both version tokens publish at
+        // the same following physics boundary.
+        let root_body = self.entries[entry_index(body_id, self.id_namespace)].body;
+        self.bodies[root_body].set_next_kinematic_position(target_root);
+        for (body, _, _, _, body_target) in &targets {
+            self.bodies[*body].set_next_kinematic_position(*body_target);
+        }
+        let pending = locals
+            .into_iter()
+            .zip(flattened)
+            .map(|((part_id, local), world)| (part_id, local, world))
+            .collect();
+        let assembly = self
+            .articulated
+            .get_mut(&body_id)
+            .expect("validated assembly exists");
+        assembly.pending_root_pose_token = Some(update.pose_token);
+        assembly.pending_pose = Some(PendingArticulatedPose {
+            pose_token: update.pose_token,
+            parts: pending,
+        });
+        Ok(ArticulatedTransition {
+            blocked: false,
+            part_id: None,
+            time_of_impact: None,
+        })
+    }
+
     /// Retires the kinematic root and all of its attached source-part colliders.
     pub fn retire_articulated_body(&mut self, id: ArticulatedBodyId) {
         let part_bodies = self
@@ -2516,6 +2709,28 @@ impl PhysicsWorld {
             &(),
         );
         let pipeline = start.elapsed();
+        // Rapier advances position-based kinematics after its broad-phase
+        // update. Refresh articulated shape AABBs now so queries immediately
+        // after this same published physics boundary see the committed pose,
+        // including large root rotations that leave the previous AABB.
+        let transitioned_colliders = self
+            .articulated
+            .values()
+            .filter(|assembly| {
+                assembly.pending_root_pose_token.is_some() || assembly.pending_pose.is_some()
+            })
+            .flat_map(|assembly| assembly.parts.iter().map(|part| part.collider))
+            .collect::<Vec<_>>();
+        if !transitioned_colliders.is_empty() {
+            self.bodies
+                .propagate_modified_body_positions_to_colliders(&mut self.colliders);
+            for handle in transitioned_colliders {
+                if let Some(collider) = self.colliders.get(handle) {
+                    self.broad_phase
+                        .set_aabb(&self.params, handle, collider.compute_aabb());
+                }
+            }
+        }
         self.step_count += 1;
         for (id, assembly) in &mut self.articulated {
             if let Some(pose_token) = assembly.pending_root_pose_token.take() {
@@ -4078,23 +4293,36 @@ mod tests {
         let hit_before = world
             .raycast_articulated(animal, [990.0, 0.125, 0.125], [1.0, 0.0, 0.0], 20.0)
             .unwrap();
+        let near_limit_update = ArticulatedPose {
+            topology_token: 1,
+            base_pose_token: 0,
+            pose_token: 1,
+            parts: vec![(
+                7,
+                PartTransform {
+                    translation_m: [9.6, 0.0, 0.0],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                },
+            )],
+        };
         assert!(
             world
                 .update_articulated_pose_with_swept_root_translation(
                     animal,
-                    ArticulatedPose {
-                        topology_token: 1,
-                        base_pose_token: 0,
-                        pose_token: 1,
-                        parts: vec![(
-                            7,
-                            PartTransform {
-                                translation_m: [9.6, 0.0, 0.0],
-                                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                            },
-                        )],
-                    },
+                    near_limit_update.clone(),
                     [0.5, 0.0, 0.0],
+                )
+                .is_err()
+        );
+        assert!(
+            world
+                .update_articulated_pose_with_swept_root_pose(
+                    animal,
+                    near_limit_update,
+                    PartTransform {
+                        translation_m: [990.5, 0.0, 0.0],
+                        ..PartTransform::IDENTITY
+                    },
                 )
                 .is_err()
         );
@@ -4274,68 +4502,140 @@ mod tests {
     #[test]
     fn articulated_part_body_fast_single_step_contact_is_measured_without_sweep() {
         for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
-            let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
-            let mut world = PhysicsWorld::new(PhysicsConfig {
-                gravity_m_s2: [0.0; 3],
-                ..Default::default()
-            });
-            let mut source = one_part(grid.clone(), 183, 1);
-            source.local_transform.translation_m[0] = -0.5;
-            let animal = world
-                .add_articulated_kinematic_parts(
-                    [0.0; 3],
-                    [0.0, 0.0, 0.0, 1.0],
-                    1,
-                    vec![source],
+            for ccd in [false, true] {
+                let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+                let mut world = PhysicsWorld::new(PhysicsConfig {
+                    gravity_m_s2: [0.0; 3],
+                    ..Default::default()
+                });
+                let mut source = one_part(grid.clone(), 183, 1);
+                source.local_transform.translation_m[0] = -0.5;
+                let animal = world
+                    .add_articulated_kinematic_parts(
+                        [0.0; 3],
+                        [0.0, 0.0, 0.0, 1.0],
+                        1,
+                        vec![source],
+                        representation,
+                    )
+                    .unwrap();
+                let probe = world.add_body(BodySpec {
+                    kind: BodyKind::Dynamic { ccd },
                     representation,
-                )
-                .unwrap();
-            let probe = world.add_body(BodySpec {
-                kind: BodyKind::Dynamic { ccd: false },
-                representation,
-                grid,
-                cell_m: 0.25,
-                density_kg_m3: 1_000.0,
-                mass_properties: None,
-                translation_m: [0.0; 3],
-                linvel_m_s: [0.0; 3],
-            });
-            world
-                .update_articulated_pose(
-                    animal,
-                    ArticulatedPose {
-                        topology_token: 1,
-                        base_pose_token: 0,
-                        pose_token: 1,
-                        parts: vec![(
-                            7,
-                            PartTransform {
-                                translation_m: [0.0, 0.0, 0.0],
-                                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                            },
-                        )],
-                    },
-                )
-                .unwrap();
-            world.step();
-            let broad_contact_pairs = world.contact_pair_count();
-            let contacts = world
-                .contact_impulses()
-                .into_iter()
-                .filter(|contact| contact.bodies.contains(&probe))
-                .collect::<Vec<_>>();
-            let pair_count = contacts.len();
-            let impulse = contacts
-                .iter()
-                .map(|contact| contact.normal_impulse_n_s)
-                .sum::<f32>();
-            println!(
-                "candidate unswept 0.5m one-step part target {representation:?}: contact_pairs={}, positive_impulse_pairs={}, impulse_sum={impulse}",
-                broad_contact_pairs, pair_count
-            );
-            // This is deliberately a measurement rather than an acceptance
-            // assumption; the original ENG-209 zero-impulse case stays intact.
+                    grid,
+                    cell_m: 0.25,
+                    density_kg_m3: 1_000.0,
+                    mass_properties: None,
+                    translation_m: [0.0; 3],
+                    linvel_m_s: [0.0; 3],
+                });
+                world
+                    .update_articulated_pose(
+                        animal,
+                        ArticulatedPose {
+                            topology_token: 1,
+                            base_pose_token: 0,
+                            pose_token: 1,
+                            parts: vec![(
+                                7,
+                                PartTransform {
+                                    translation_m: [0.0, 0.0, 0.0],
+                                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                                },
+                            )],
+                        },
+                    )
+                    .unwrap();
+                world.step();
+                let broad_contact_pairs = world.contact_pair_count();
+                let contacts = world
+                    .contact_impulses()
+                    .into_iter()
+                    .filter(|contact| contact.bodies.contains(&probe))
+                    .collect::<Vec<_>>();
+                let pair_count = contacts.len();
+                let impulse = contacts
+                    .iter()
+                    .map(|contact| contact.normal_impulse_n_s)
+                    .sum::<f32>();
+                println!(
+                    "original unswept 0.5m one-step part target {representation:?} dynamic_ccd={ccd}: contact_pairs={}, positive_impulse_pairs={}, impulse_sum={impulse}",
+                    broad_contact_pairs, pair_count
+                );
+            }
+            // Keep the original no-CCD result and measure the same exact
+            // workload with candidate dynamic CCD enabled; neither is assumed
+            // to provide a kinematic-part impact response.
         }
+    }
+
+    #[test]
+    fn nonlinear_pose_and_root_rotation_sweep_blocks_wall_then_accepts_after_removal() {
+        let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..Default::default()
+        });
+        let wall = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: 0.25,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [0.0, -0.125, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+        let mut part = one_part(grid, 189, 1);
+        part.local_transform.translation_m[0] = -0.5;
+        let animal = world
+            .add_articulated_kinematic_parts(
+                [0.0; 3],
+                PartTransform::IDENTITY.rotation_xyzw,
+                1,
+                vec![part],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let update = ArticulatedPose {
+            topology_token: 1,
+            base_pose_token: 0,
+            pose_token: 1,
+            parts: vec![(
+                7,
+                PartTransform {
+                    translation_m: [-0.5, 0.0, 0.0],
+                    ..PartTransform::IDENTITY
+                },
+            )],
+        };
+        let rotated_root = PartTransform {
+            translation_m: [0.0; 3],
+            rotation_xyzw: [0.0, 0.0, 1.0, 0.0],
+        };
+        let blocked = world
+            .update_articulated_pose_with_swept_root_pose(animal, update.clone(), rotated_root)
+            .unwrap();
+        assert!(blocked.blocked);
+        assert_eq!(blocked.part_id, Some(7));
+        assert!(blocked.time_of_impact.unwrap() < 1.0);
+        assert_eq!(world.body_state(animal.0).translation_m, [0.0; 3]);
+        let before = world
+            .raycast_articulated(animal, [-2.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+            .unwrap();
+        assert_eq!(before.pose_token, 0);
+
+        world.retire_body(wall);
+        let accepted = world
+            .update_articulated_pose_with_swept_root_pose(animal, update, rotated_root)
+            .unwrap();
+        assert!(!accepted.blocked);
+        world.step();
+        let after = world
+            .raycast_articulated(animal, [-2.0, 0.0, 0.0], [1.0, 0.0, 0.0], 4.0)
+            .unwrap();
+        assert_eq!(after.pose_token, 1);
+        assert_eq!(before.cell, after.cell);
     }
 
     #[test]

@@ -13,10 +13,10 @@ use std::{
 use glam::{Quat, Vec3};
 use serde::Serialize;
 use spall_asset::{Asset, Part, Transform, decode, sample_clip};
-use spall_core::{GlobalCell, VolumeId};
+use spall_core::{GlobalCell, MaterialId, VolumeId};
 use spall_physics::{
-    ArticulatedBodyId, ArticulatedPose, OccupancyGrid, PartTransform, PhysicsConfig, PhysicsWorld,
-    Representation, SourcePart, build_collider,
+    ArticulatedBodyId, ArticulatedPose, BodyKind, BodySpec, OccupancyGrid, PartTransform,
+    PhysicsConfig, PhysicsWorld, Representation, SourcePart, build_collider,
 };
 
 const CELL_M: f32 = 0.0625;
@@ -90,12 +90,35 @@ struct CaseResult {
     initial_attachment: Summary,
     source_cell_rebuild: Summary,
     pose_refresh_ray_step: Summary,
+    terrain_transition_sweeps: Option<TerrainTransitionSummary>,
     timed_ray_queries_per_pose: usize,
     ray_checks: usize,
     miss_checks: usize,
     ray_mismatches: usize,
     timed_ray_miss_count: usize,
     timed_ray_misses: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct TerrainTransitionSummary {
+    same_clip_transitions: usize,
+    accepted: usize,
+    blocked: usize,
+    complete_transition_query_step: Summary,
+    cases: Vec<TerrainTransitionCase>,
+}
+
+#[derive(Serialize)]
+struct TerrainTransitionCase {
+    clip: String,
+    from_tick: f64,
+    to_tick: f64,
+    blocked: bool,
+    hit_part_id: Option<u32>,
+    hit_time_of_impact: Option<f32>,
+    complete_update_query_step_us: f64,
+    source_part_count: usize,
+    terrain_collider_count: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -304,15 +327,35 @@ fn run_case(
     let mut pose_token = 0u64;
     for sample in &samples {
         pose_token += 1;
-        validation_world.update_articulated_pose(
-            validation_id,
-            ArticulatedPose {
-                topology_token: TOPOLOGY_TOKEN,
-                base_pose_token: pose_token - 1,
-                pose_token,
-                parts: sample.locals.clone(),
-            },
-        )?;
+        let update = ArticulatedPose {
+            topology_token: TOPOLOGY_TOKEN,
+            base_pose_token: pose_token - 1,
+            pose_token,
+            parts: sample.locals.clone(),
+        };
+        if kinematic_parts {
+            let transition = validation_world.update_articulated_pose_with_swept_root_pose(
+                validation_id,
+                update,
+                PartTransform {
+                    translation_m: root_translation.to_array(),
+                    ..PartTransform::IDENTITY
+                },
+            )?;
+            if transition.blocked {
+                return Err(format!(
+                    "terrain-free transition unexpectedly blocked animal={} clip={} tick={} part={:?} toi={:?}",
+                    animal.asset.name,
+                    sample.clip,
+                    sample.tick,
+                    transition.part_id,
+                    transition.time_of_impact,
+                )
+                .into());
+            }
+        } else {
+            validation_world.update_articulated_pose(validation_id, update)?;
+        }
         if kinematic_parts {
             validation_world.step();
         }
@@ -404,15 +447,31 @@ fn run_case(
         let timed_rays = representative_rays(&sample.ref_cells);
         timed_pose_token += 1;
         let before = Instant::now();
-        world.update_articulated_pose(
-            id,
-            ArticulatedPose {
-                topology_token,
-                base_pose_token: timed_pose_token - 1,
-                pose_token: timed_pose_token,
-                parts: sample.locals.clone(),
-            },
-        )?;
+        let update = ArticulatedPose {
+            topology_token,
+            base_pose_token: timed_pose_token - 1,
+            pose_token: timed_pose_token,
+            parts: sample.locals.clone(),
+        };
+        if kinematic_parts {
+            let transition = world.update_articulated_pose_with_swept_root_pose(
+                id,
+                update,
+                PartTransform {
+                    translation_m: root_translation.to_array(),
+                    ..PartTransform::IDENTITY
+                },
+            )?;
+            if transition.blocked {
+                return Err(format!(
+                    "timed terrain-free transition blocked animal={} clip={} tick={} part={:?}",
+                    animal.asset.name, sample.clip, sample.tick, transition.part_id
+                )
+                .into());
+            }
+        } else {
+            world.update_articulated_pose(id, update)?;
+        }
         if kinematic_parts {
             world.step();
         }
@@ -471,6 +530,16 @@ fn run_case(
             *revision += 1;
         }
     }
+    let terrain_transition_sweeps = if kinematic_parts {
+        Some(measure_terrain_transitions(
+            animal,
+            &samples,
+            representation,
+            root_translation,
+        )?)
+    } else {
+        None
+    };
     Ok(CaseResult {
         animal: name.to_owned(),
         representation: representation.label(),
@@ -498,12 +567,176 @@ fn run_case(
         initial_attachment: summarize(&attachment_times),
         source_cell_rebuild: summarize(&source_rebuild_times),
         pose_refresh_ray_step: summarize(&operation_times),
+        terrain_transition_sweeps,
         timed_ray_queries_per_pose: animal.parts.len(),
         ray_checks,
         miss_checks,
         ray_mismatches,
         timed_ray_miss_count,
         timed_ray_misses,
+    })
+}
+
+fn measure_terrain_transitions(
+    animal: &Animal,
+    samples: &[PoseSample],
+    representation: Representation,
+    root_translation: Vec3,
+) -> Result<TerrainTransitionSummary, Box<dyn std::error::Error>> {
+    let mut cases = Vec::new();
+    let mut elapsed = Vec::new();
+    let root_rotation = Quat::from_rotation_y(10.0_f32.to_radians());
+    for pair in samples
+        .windows(2)
+        .filter(|pair| pair[0].clip == pair[1].clip)
+    {
+        let from = &pair[0];
+        let to = &pair[1];
+        let target_cells = to
+            .ref_cells
+            .iter()
+            .map(|cell| RefCell {
+                center: root_translation + root_rotation * (cell.center - root_translation),
+                rotation: (root_rotation * cell.rotation).normalize(),
+                ..*cell
+            })
+            .collect::<Vec<_>>();
+        let pose_cells = from
+            .ref_cells
+            .iter()
+            .chain(&target_cells)
+            .copied()
+            .collect::<Vec<_>>();
+        let (min, max) = pose_cells.iter().fold(
+            (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+            |(min, max), cell| {
+                let x = cell.rotation * Vec3::X;
+                let y = cell.rotation * Vec3::Y;
+                let z = cell.rotation * Vec3::Z;
+                let half = Vec3::new(
+                    x.x.abs() + y.x.abs() + z.x.abs(),
+                    x.y.abs() + y.y.abs() + z.y.abs(),
+                    x.z.abs() + y.z.abs() + z.z.abs(),
+                ) * (CELL_M * 0.5);
+                (min.min(cell.center - half), max.max(cell.center + half))
+            },
+        );
+        if pose_cells.is_empty() {
+            return Err("asset clip has no occupied source cells".into());
+        }
+        let floor_top = min.y - 0.02;
+        let wall_x = max.x + 0.02;
+        let material = MaterialId(1);
+        let floor_grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [128, 1, 128],
+            vec![true; 128 * 128],
+            vec![material; 128 * 128],
+        )?;
+        let wall_grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [1, 128, 128],
+            vec![true; 128 * 128],
+            vec![material; 128 * 128],
+        )?;
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..Default::default()
+        });
+        let mut attachment = Vec::new();
+        let id = rebuild(
+            &mut world,
+            animal,
+            representation,
+            root_translation,
+            &mut attachment,
+            true,
+        )?;
+        world.update_articulated_pose(
+            id,
+            ArticulatedPose {
+                topology_token: TOPOLOGY_TOKEN,
+                base_pose_token: 0,
+                pose_token: 1,
+                parts: from.locals.clone(),
+            },
+        )?;
+        world.step();
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation,
+            grid: floor_grid,
+            cell_m: CELL_M,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [min.x - 4.0, floor_top - CELL_M, min.z - 4.0],
+            linvel_m_s: [0.0; 3],
+        });
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation,
+            grid: wall_grid,
+            cell_m: CELL_M,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [wall_x, floor_top, min.z - 4.0],
+            linvel_m_s: [0.0; 3],
+        });
+        let start = Instant::now();
+        let transition = world.update_articulated_pose_with_swept_root_pose(
+            id,
+            ArticulatedPose {
+                topology_token: TOPOLOGY_TOKEN,
+                base_pose_token: 1,
+                pose_token: 2,
+                parts: to.locals.clone(),
+            },
+            PartTransform {
+                translation_m: root_translation.to_array(),
+                rotation_xyzw: root_rotation.to_array(),
+            },
+        )?;
+        if !transition.blocked {
+            world.step();
+            for ray in representative_rays(&target_cells) {
+                let expected = reference_hit_cells(&target_cells, ray.origin, ray.direction, 8.0);
+                let actual = world.raycast_articulated(
+                    id,
+                    ray.origin.to_array(),
+                    ray.direction.to_array(),
+                    8.0,
+                );
+                if !same_hit(&actual, expected, TOPOLOGY_TOKEN, 2, 1) {
+                    return Err(format!(
+                        "terrain transition query mismatch animal={} clip={} tick={} part={} expected={expected:?} actual={actual:?}",
+                        animal.asset.name, to.clip, to.tick, ray.part_id
+                    )
+                    .into());
+                }
+            }
+        }
+        let duration = start.elapsed();
+        elapsed.push(duration);
+        cases.push(TerrainTransitionCase {
+            clip: to.clip.clone(),
+            from_tick: from.tick,
+            to_tick: to.tick,
+            blocked: transition.blocked,
+            hit_part_id: transition.part_id,
+            hit_time_of_impact: transition.time_of_impact,
+            complete_update_query_step_us: duration.as_secs_f64() * 1_000_000.0,
+            source_part_count: animal.parts.len(),
+            terrain_collider_count: 2,
+        });
+    }
+    let blocked = cases.iter().filter(|case| case.blocked).count();
+    let accepted = cases.len() - blocked;
+    Ok(TerrainTransitionSummary {
+        same_clip_transitions: cases.len(),
+        accepted,
+        blocked,
+        complete_transition_query_step: summarize(&elapsed),
+        cases,
     })
 }
 
