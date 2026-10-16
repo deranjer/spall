@@ -1796,10 +1796,10 @@ impl PhysicsWorld {
         )
     }
 
-    /// Sweeps every exact source-part collider through its declared one-tick
-    /// world-space interpolation (linear translation and shortest-arc
-    /// rotation), including an optional root translation/rotation, against
-    /// current fixed terrain. Each occupied source cell is swept as a Cuboid
+    /// Sweeps every exact occupied source cell in each source-part collider
+    /// through its declared one-tick world-space interpolation (linear
+    /// translation and shortest-arc rotation), including optional root motion,
+    /// against current fixed terrain. Each source cell is swept as a Cuboid
     /// query shape so Parry's translating-only moving-Voxels nonlinear cast
     /// path is not used for rotating NativeVoxels parts. A terrain hit rejects
     /// the complete sample without staging any body or token. This contract
