@@ -1388,6 +1388,7 @@ impl PhysicsWorld {
         let part = &assembly.parts[part_index];
         if assembly.topology_token != expected_topology_token
             || assembly.pending_root_pose_token.is_some()
+            || assembly.pending_pose.is_some()
             || new_topology_token <= expected_topology_token
             || part.source_revision != expected_source_revision
             || new_source_revision <= expected_source_revision
@@ -4331,6 +4332,118 @@ mod tests {
             .unwrap();
         assert_eq!(still_current.source_revision, 2);
         assert_eq!(still_current.topology_token, 4);
+    }
+
+    #[test]
+    fn articulated_source_rebuild_rejects_pose_staged_for_prior_topology() {
+        use crate::articulated::{ArticulatedError, ArticulatedPose, PartTransform};
+
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                solver_substeps: 4,
+                ..PhysicsConfig::default()
+            });
+            let body = world
+                .add_articulated_kinematic_parts(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    10,
+                    vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 71, 3)],
+                    representation,
+                )
+                .unwrap();
+            let initial_hit = world
+                .raycast_articulated(body, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 3.0)
+                .unwrap();
+            assert_eq!(
+                (initial_hit.topology_token, initial_hit.pose_token),
+                (10, 0)
+            );
+            let initial_colliders = world.articulated_collider_count(body);
+            let initial_bodies = world.articulated_rigid_body_count(body);
+
+            world
+                .update_articulated_pose(
+                    body,
+                    ArticulatedPose {
+                        topology_token: 10,
+                        base_pose_token: 0,
+                        pose_token: 1,
+                        parts: vec![(
+                            7,
+                            PartTransform {
+                                translation_m: [0.01, 0.0, 0.0],
+                                ..PartTransform::IDENTITY
+                            },
+                        )],
+                    },
+                )
+                .unwrap();
+            assert_eq!(world.articulated[&body.0].topology_token, 10);
+            assert_eq!(world.articulated[&body.0].pose_token, 0);
+            assert_eq!(
+                world.articulated[&body.0]
+                    .pending_pose
+                    .as_ref()
+                    .map(|pending| pending.pose_token),
+                Some(1)
+            );
+
+            let rejected = world.rebuild_articulated_part_grid(
+                body,
+                10,
+                11,
+                7,
+                3,
+                4,
+                one_cell_grid(GlobalCell::new(4, 0, 0)),
+            );
+            assert_eq!(rejected.unwrap_err(), ArticulatedError::StaleTopology);
+            assert_eq!(world.articulated_collider_count(body), initial_colliders);
+            assert_eq!(world.articulated_rigid_body_count(body), initial_bodies);
+            let assembly = &world.articulated[&body.0];
+            assert_eq!(assembly.topology_token, 10);
+            assert_eq!(assembly.pose_token, 0);
+            assert_eq!(assembly.parts[0].source_revision, 3);
+            assert_eq!(assembly.parts[0].grid.origin(), GlobalCell::new(0, 0, 0));
+            assert_eq!(
+                assembly
+                    .pending_pose
+                    .as_ref()
+                    .map(|pending| pending.pose_token),
+                Some(1)
+            );
+            let still_old = world
+                .raycast_articulated(body, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 3.0)
+                .unwrap();
+            assert_eq!((still_old.topology_token, still_old.pose_token), (10, 0));
+
+            world.step();
+            let applied = world
+                .raycast_articulated(body, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 3.0)
+                .unwrap();
+            assert_eq!((applied.topology_token, applied.pose_token), (10, 1));
+            assert!((applied.toi_m - 1.01).abs() < 1.0e-4);
+
+            world
+                .rebuild_articulated_part_grid(
+                    body,
+                    10,
+                    11,
+                    7,
+                    3,
+                    4,
+                    one_cell_grid(GlobalCell::new(4, 0, 0)),
+                )
+                .unwrap();
+            let rebuilt = world
+                .raycast_articulated(body, [0.0, 0.125, 0.125], [1.0, 0.0, 0.0], 3.0)
+                .unwrap();
+            assert_eq!(rebuilt.source_revision, 4);
+            assert_eq!((rebuilt.topology_token, rebuilt.pose_token), (11, 1));
+            assert_eq!(rebuilt.cell, [4, 0, 0]);
+        }
     }
 
     #[test]
