@@ -5,12 +5,16 @@
 //! independently; it does not call the production hit-mapping helper.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     env,
     time::{Duration, Instant},
 };
 
-use glam::{Quat, Vec3};
+use glam::{DVec3, Quat, Vec3};
+use sandbox::{
+    animal_habitat::{self, AnimalHabitat, CandidateEnvelope, ValidationLimits},
+    worldgen_scene,
+};
 use serde::Serialize;
 use spall_asset::{Asset, Part, Transform, decode, sample_clip};
 use spall_core::{GlobalCell, MaterialId, VolumeId};
@@ -19,6 +23,7 @@ use spall_physics::{
     ContactWitnessUnattributed, OccupancyGrid, PartTransform, PhysicsConfig, PhysicsWorld,
     Representation, SourcePart, build_collider,
 };
+use spall_sim::SimWorld;
 
 const CELL_M: f32 = 0.0625;
 const TOPOLOGY_TOKEN: u64 = 0x209;
@@ -146,6 +151,9 @@ struct ContactWitnessResult {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
+    if args.as_slice() == ["--generated-1km"] {
+        return run_generated_1km();
+    }
     let kinematic_parts = args.iter().any(|arg| arg == "--kinematic-parts");
     let solver_substeps = args
         .iter()
@@ -212,6 +220,322 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     Ok(())
+}
+
+fn run_generated_1km() -> Result<(), Box<dyn std::error::Error>> {
+    let generation_started = Instant::now();
+    let scene = worldgen_scene::generate("natural", 1, 4096)?;
+    let generation_ms = generation_started.elapsed().as_secs_f64() * 1.0e3;
+    eprintln!("generated 4096-cell natural seed-1 world in {generation_ms:.0} ms");
+    let physics_setup_started = Instant::now();
+    let mut sim = SimWorld::new(scene.world_setup())?;
+    eprintln!(
+        "built authoritative per-brick terrain physics in {:.0} ms",
+        physics_setup_started.elapsed().as_secs_f64() * 1.0e3
+    );
+    let terrain_collider_count = sim.terrain_brick_collider_count();
+    eprintln!("authoritative SimWorld reports {terrain_collider_count} terrain brick colliders");
+    let terrain = &scene.world().terrain;
+    eprintln!(
+        "generated water plan has {} wet columns",
+        scene.world().water.columns.len()
+    );
+    let water_started = Instant::now();
+    let water = GeneratedWaterQuery::from_plan(&scene.world().water.columns);
+    eprintln!(
+        "indexed generated initial water plan in {:.0} ms",
+        water_started.elapsed().as_secs_f64() * 1.0e3
+    );
+    let spawn = scene
+        .player_spawns()
+        .first()
+        .copied()
+        .ok_or("generated world has no land spawn")?;
+    let mut animals = Vec::new();
+    for (name, bytes) in ANIMALS {
+        animals.push((name, load_animal(decode(bytes)?)?));
+    }
+    let mut cases = Vec::new();
+    let mut habitat_centers = Vec::new();
+    for (name, animal) in &animals {
+        let center = generated_habitat_center(name, &scene, terrain, &water, spawn)?;
+        eprintln!("validated {name} habitat at {center:?}");
+        habitat_centers.push(center);
+        let samples = pose_samples(animal)?;
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let root = center - animal.pivot_m;
+            let mut discarded = Vec::new();
+            let id = rebuild(
+                sim.physics_mut(),
+                animal,
+                representation,
+                root,
+                &mut discarded,
+                true,
+            )?;
+            let mut pose_token = 0u64;
+            let mut query_us = Vec::new();
+            let mut step_us = Vec::new();
+            let mut candidate_counts = Vec::new();
+            let mut cast_counts = Vec::new();
+            let mut blocked = Vec::new();
+            let mut sample_pairs = Vec::new();
+            for sample in &samples {
+                let started = Instant::now();
+                let transition = sim
+                    .physics_mut()
+                    .update_articulated_pose_with_swept_root_pose(
+                        id,
+                        ArticulatedPose {
+                            topology_token: TOPOLOGY_TOKEN,
+                            base_pose_token: pose_token,
+                            pose_token: pose_token + 1,
+                            parts: sample.locals.clone(),
+                        },
+                        PartTransform {
+                            translation_m: root.to_array(),
+                            ..PartTransform::IDENTITY
+                        },
+                    )?;
+                query_us.push(started.elapsed().as_secs_f64() * 1.0e6);
+                candidate_counts.push(transition.terrain_candidates);
+                cast_counts.push(transition.cell_casts);
+                blocked.push(transition.blocked);
+                sample_pairs.push(format!("{}@{}", sample.clip, sample.tick));
+                if !transition.blocked {
+                    pose_token += 1;
+                    let step_started = Instant::now();
+                    sim.physics_mut().step();
+                    step_us.push(step_started.elapsed().as_secs_f64() * 1.0e6);
+                }
+            }
+            eprintln!(
+                "measured {name} {:?}: {} phases",
+                representation,
+                query_us.len()
+            );
+            sim.physics_mut().retire_articulated_body(id);
+            cases.push(serde_json::json!({
+                "animal": name,
+                "representation": representation.label(),
+                "root_center_m": center.to_array(),
+                "source_cells": animal.cell_count,
+                "source_parts": animal.parts.len(),
+                "sampled_clip_phases": sample_pairs,
+                "transition_count": query_us.len(),
+                "blocked_transition_count": blocked.iter().filter(|blocked| **blocked).count(),
+                "terrain_candidate_colliders_p50": percentile_us(&candidate_counts.iter().map(|v| *v as f64).collect::<Vec<_>>(), 0.5),
+                "terrain_candidate_colliders_max": candidate_counts.iter().copied().max().unwrap_or(0),
+                "exact_cell_casts_p50": percentile_us(&cast_counts.iter().map(|v| *v as f64).collect::<Vec<_>>(), 0.5),
+                "exact_cell_casts_max": cast_counts.iter().copied().max().unwrap_or(0),
+                "transition_query_us_p50": percentile_us(&query_us, 0.5),
+                "transition_query_us_p95": percentile_us(&query_us, 0.95),
+                "accepted_step_us_p50": percentile_us(&step_us, 0.5),
+                "accepted_step_us_p95": percentile_us(&step_us, 0.95),
+            }));
+        }
+    }
+    drop(sim);
+    let one_substep = generated_trio_step(&scene, &animals, &habitat_centers, 1)?;
+    let thirty_two_substeps = generated_trio_step(&scene, &animals, &habitat_centers, 32)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "scenario": "eng213_natural_seed1_4096_authoritative_full_world_physics",
+            "generated_world": {"preset":"natural", "seed":1, "edge_cells":4096, "edge_m":1024, "generation_ms":generation_ms},
+            "weather_cost_included": false,
+            "terrain": {"fixed_per_brick_collider_count":terrain_collider_count, "per_brick_colliders_built_by_authoritative_simworld":true},
+            "animals": cases,
+            "hardware": hardware(),
+            "global_step": {"one_substep":one_substep, "thirty_two_substeps":thirty_two_substeps},
+            "measurement_note":"Trout habitat uses the exact generated initial water plan at tick zero; no fluid solver or weather step is included. Each transition uses the actual generated authoritative per-brick terrain colliders and exact source-cell continuous casts."
+        }))?
+    );
+    Ok(())
+}
+
+fn generated_habitat_center(
+    name: &str,
+    scene: &worldgen_scene::GeneratedScene,
+    terrain: &spall_voxel::Volume,
+    water: &dyn animal_habitat::CurrentWaterQuery,
+    spawn: [f64; 3],
+) -> Result<Vec3, Box<dyn std::error::Error>> {
+    let limits = ValidationLimits::default();
+    match name {
+        "deer" => {
+            let size_m = DVec3::new(1.5, 1.5, 1.5);
+            for radius in 0..=16 {
+                for (dx, dz) in [
+                    (0.0, 0.0),
+                    (radius as f64 * 1.0, 0.0),
+                    (0.0, radius as f64 * 1.0),
+                    (-(radius as f64), 0.0),
+                    (0.0, -(radius as f64)),
+                ] {
+                    let center =
+                        DVec3::new(spawn[0] + dx, spawn[1] + size_m.y * 0.5, spawn[2] + dz);
+                    if animal_habitat::validate_candidate(
+                        terrain,
+                        None,
+                        AnimalHabitat::Land,
+                        CandidateEnvelope {
+                            center_m: center,
+                            size_m,
+                        },
+                        limits,
+                    )
+                    .is_ok()
+                    {
+                        return Ok(center.as_vec3());
+                    }
+                }
+            }
+            Err("could not find a currently supported deer habitat near generated spawn".into())
+        }
+        "crow" => {
+            let size_m = DVec3::new(1.5, 1.5, 1.5);
+            for height in [4.0, 8.0, 16.0, 32.0] {
+                let center = DVec3::new(spawn[0], spawn[1] + height, spawn[2]);
+                if animal_habitat::validate_candidate(
+                    terrain,
+                    None,
+                    AnimalHabitat::Flying,
+                    CandidateEnvelope {
+                        center_m: center,
+                        size_m,
+                    },
+                    limits,
+                )
+                .is_ok()
+                {
+                    return Ok(center.as_vec3());
+                }
+            }
+            Err("could not find a current clear flying envelope above generated spawn".into())
+        }
+        "trout" => {
+            let columns = &scene.world().water.columns;
+            let column = columns
+                .iter()
+                .max_by_key(|column| column.top - column.bed)
+                .ok_or("generated world has no water columns")?;
+            let size_m = DVec3::splat(0.5);
+            let x = (f64::from(column.x) + 0.5) * 0.25;
+            let z = (f64::from(column.z) + 0.5) * 0.25;
+            let center = DVec3::new(x, (f64::from(column.bed + column.top + 1)) * 0.125, z);
+            if animal_habitat::validate_candidate(
+                terrain,
+                Some(water),
+                AnimalHabitat::Aquatic,
+                CandidateEnvelope {
+                    center_m: center,
+                    size_m,
+                },
+                limits,
+            )
+            .is_ok()
+            {
+                return Ok(center.as_vec3());
+            }
+            Err("deepest generated water column did not validate as a clear trout habitat".into())
+        }
+        _ => Err(format!("no habitat policy for {name}").into()),
+    }
+}
+
+fn percentile_us(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut values = values.to_vec();
+    values.sort_by(f64::total_cmp);
+    values[((values.len() - 1) as f64 * percentile).round() as usize]
+}
+
+struct GeneratedWaterQuery {
+    spans: HashMap<(i64, i64), animal_habitat::WaterSpan>,
+}
+
+impl GeneratedWaterQuery {
+    fn from_plan(columns: &[spall_worldgen::WetColumn]) -> Self {
+        Self {
+            spans: columns
+                .iter()
+                .map(|column| {
+                    (
+                        (i64::from(column.x), i64::from(column.z)),
+                        animal_habitat::WaterSpan {
+                            floor_y: i64::from(column.bed),
+                            depth_cells: f64::from(column.top - column.bed),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl animal_habitat::CurrentWaterQuery for GeneratedWaterQuery {
+    fn visit_spans_in_column(
+        &self,
+        x: i64,
+        z: i64,
+        max_spans: usize,
+        visit: &mut dyn FnMut(animal_habitat::WaterSpan),
+    ) -> bool {
+        let Some(span) = self.spans.get(&(x, z)).copied() else {
+            return true;
+        };
+        if max_spans == 0 {
+            return false;
+        }
+        visit(span);
+        true
+    }
+}
+
+fn generated_trio_step(
+    scene: &worldgen_scene::GeneratedScene,
+    animals: &[(&str, Animal)],
+    centers: &[Vec3],
+    substeps: usize,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut setup = scene.world_setup();
+    setup.physics.solver_substeps = substeps;
+    let mut sim = SimWorld::new(setup)?;
+    let fixed_colliders = sim.terrain_brick_collider_count();
+    let mut rig_bodies = 0;
+    let mut rig_colliders = 0;
+    for ((_, animal), center) in animals.iter().zip(centers) {
+        let root = center - animal.pivot_m;
+        let mut ignored = Vec::new();
+        let id = rebuild(
+            sim.physics_mut(),
+            animal,
+            Representation::MergedCuboids,
+            root,
+            &mut ignored,
+            true,
+        )?;
+        rig_bodies += sim.physics().articulated_rigid_body_count(id);
+        rig_colliders += sim.physics().articulated_collider_count(id);
+    }
+    let total_bodies = sim.physics().body_count();
+    let started = Instant::now();
+    let timing = sim.physics_mut().step();
+    let wall_us = started.elapsed().as_secs_f64() * 1.0e6;
+    Ok(serde_json::json!({
+        "solver_substeps":substeps,
+        "fixed_terrain_colliders":fixed_colliders,
+        "simworld_body_entry_count":total_bodies,
+        "articulated_part_body_count":rig_bodies,
+        "articulated_part_collider_count":rig_colliders,
+        "dynamic_body_count":0,
+        "step_wall_us":wall_us,
+        "pipeline_us":timing.pipeline.as_secs_f64()*1.0e6,
+        "substeps_reported":timing.substeps
+    }))
 }
 
 fn validate_transition_parity(
@@ -1610,11 +1934,15 @@ fn hardware() -> serde_json::Value {
     })
 }
 
-fn name_salt(name: &str) -> u8 {
+fn name_salt(name: &str) -> u32 {
     match name {
         "trout" => 1,
         "crow" => 2,
         "deer" => 3,
-        _ => 9,
+        _ => {
+            let hash = blake3::hash(name.as_bytes());
+            u32::from_le_bytes(hash.as_bytes()[..4].try_into().expect("four-byte prefix"))
+                .saturating_add(1)
+        }
     }
 }

@@ -1,0 +1,247 @@
+{
+  "animals": [
+    {
+      "accepted_step_us_p50": 476.2,
+      "accepted_step_us_p95": 489941.69999999995,
+      "animal": "trout",
+      "blocked_transition_count": 0,
+      "exact_cell_casts_max": 0,
+      "exact_cell_casts_p50": 0.0,
+      "representation": "native_voxels",
+      "root_center_m": [
+        258.875,
+        26.375,
+        16.375
+      ],
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "swim@0",
+        "swim@15",
+        "swim@30",
+        "swim@45",
+        "swim@60"
+      ],
+      "source_cells": 136,
+      "source_parts": 5,
+      "terrain_candidate_colliders_max": 0,
+      "terrain_candidate_colliders_p50": 0.0,
+      "transition_count": 10,
+      "transition_query_us_p50": 8.0,
+      "transition_query_us_p95": 37716.5
+    },
+    {
+      "accepted_step_us_p50": 441.2,
+      "accepted_step_us_p95": 2051.7999999999997,
+      "animal": "trout",
+      "blocked_transition_count": 0,
+      "exact_cell_casts_max": 0,
+      "exact_cell_casts_p50": 0.0,
+      "representation": "merged_cuboids",
+      "root_center_m": [
+        258.875,
+        26.375,
+        16.375
+      ],
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "swim@0",
+        "swim@15",
+        "swim@30",
+        "swim@45",
+        "swim@60"
+      ],
+      "source_cells": 136,
+      "source_parts": 5,
+      "terrain_candidate_colliders_max": 0,
+      "terrain_candidate_colliders_p50": 0.0,
+      "transition_count": 10,
+      "transition_query_us_p50": 7.0,
+      "transition_query_us_p95": 14.5
+    },
+    {
+      "accepted_step_us_p50": 800.4000000000001,
+      "accepted_step_us_p95": 3844.7,
+      "animal": "crow",
+      "blocked_transition_count": 0,
+      "exact_cell_casts_max": 217,
+      "exact_cell_casts_p50": 217.0,
+      "representation": "native_voxels",
+      "root_center_m": [
+        461.125,
+        55.25,
+        537.125
+      ],
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "flap@0",
+        "flap@12",
+        "flap@24",
+        "flap@36",
+        "flap@48"
+      ],
+      "source_cells": 217,
+      "source_parts": 6,
+      "terrain_candidate_colliders_max": 1,
+      "terrain_candidate_colliders_p50": 1.0,
+      "transition_count": 10,
+      "transition_query_us_p50": 498989.0,
+      "transition_query_us_p95": 527296.0
+    },
+    {
+      "accepted_step_us_p50": 817.1,
+      "accepted_step_us_p95": 2335.2999999999997,
+      "animal": "crow",
+      "blocked_transition_count": 0,
+      "exact_cell_casts_max": 217,
+      "exact_cell_casts_p50": 217.0,
+      "representation": "merged_cuboids",
+      "root_center_m": [
+        461.125,
+        55.25,
+        537.125
+      ],
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "flap@0",
+        "flap@12",
+        "flap@24",
+        "flap@36",
+        "flap@48"
+      ],
+      "source_cells": 217,
+      "source_parts": 6,
+      "terrain_candidate_colliders_max": 1,
+      "terrain_candidate_colliders_p50": 1.0,
+      "transition_count": 10,
+      "transition_query_us_p50": 499151.69999999995,
+      "transition_query_us_p95": 533275.0
+    },
+    {
+      "accepted_step_us_p50": 831.8000000000001,
+      "accepted_step_us_p95": 2110.7999999999997,
+      "animal": "deer",
+      "blocked_transition_count": 0,
+      "exact_cell_casts_max": 570,
+      "exact_cell_casts_p50": 570.0,
+      "representation": "native_voxels",
+      "root_center_m": [
+        456.125,
+        52.0,
+        537.125
+      ],
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "walk@0",
+        "walk@12",
+        "walk@24",
+        "walk@36",
+        "walk@48"
+      ],
+      "source_cells": 285,
+      "source_parts": 9,
+      "terrain_candidate_colliders_max": 2,
+      "terrain_candidate_colliders_p50": 2.0,
+      "transition_count": 10,
+      "transition_query_us_p50": 1307761.3,
+      "transition_query_us_p95": 1377038.8
+    },
+    {
+      "accepted_step_us_p50": 804.5,
+      "accepted_step_us_p95": 2074.6,
+      "animal": "deer",
+      "blocked_transition_count": 0,
+      "exact_cell_casts_max": 570,
+      "exact_cell_casts_p50": 570.0,
+      "representation": "merged_cuboids",
+      "root_center_m": [
+        456.125,
+        52.0,
+        537.125
+      ],
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "walk@0",
+        "walk@12",
+        "walk@24",
+        "walk@36",
+        "walk@48"
+      ],
+      "source_cells": 285,
+      "source_parts": 9,
+      "terrain_candidate_colliders_max": 2,
+      "terrain_candidate_colliders_p50": 2.0,
+      "transition_count": 10,
+      "transition_query_us_p50": 1314832.2000000002,
+      "transition_query_us_p95": 1327792.8
+    }
+  ],
+  "generated_world": {
+    "edge_cells": 4096,
+    "edge_m": 1024,
+    "generation_ms": 9086.8225,
+    "preset": "natural",
+    "seed": 1
+  },
+  "global_step": {
+    "one_substep": {
+      "articulated_part_body_count": 23,
+      "articulated_part_collider_count": 20,
+      "dynamic_body_count": 0,
+      "fixed_terrain_colliders": 123892,
+      "pipeline_us": 484372.6,
+      "simworld_body_entry_count": 123896,
+      "solver_substeps": 1,
+      "step_wall_us": 485114.5,
+      "substeps_reported": 1
+    },
+    "thirty_two_substeps": {
+      "articulated_part_body_count": 23,
+      "articulated_part_collider_count": 20,
+      "dynamic_body_count": 0,
+      "fixed_terrain_colliders": 123892,
+      "pipeline_us": 484253.60000000003,
+      "simworld_body_entry_count": 123896,
+      "solver_substeps": 32,
+      "step_wall_us": 484981.5,
+      "substeps_reported": 32
+    }
+  },
+  "hardware": {
+    "arch": "x86_64",
+    "available_parallelism": 16,
+    "cpu_model": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "os": "windows",
+    "profile": "release"
+  },
+  "measurement_note": "Trout habitat uses the exact generated initial water plan at tick zero; no fluid solver or weather step is included. Each transition uses the actual generated authoritative per-brick terrain colliders and exact source-cell continuous casts.",
+  "scenario": "eng213_natural_seed1_4096_authoritative_full_world_physics",
+  "terrain": {
+    "fixed_per_brick_collider_count": 123892,
+    "per_brick_colliders_built_by_authoritative_simworld": true
+  },
+  "weather_cost_included": false
+}

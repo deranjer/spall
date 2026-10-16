@@ -2222,18 +2222,79 @@ impl PhysicsWorld {
         // Query freshness is part of this gate: voxel edits/removals made since
         // the previous step must affect this same transition decision.
         self.sync_queries();
-        let terrain_colliders: Vec<_> = self
-            .colliders
-            .iter()
-            .filter_map(|(handle, collider)| {
-                let fixed = collider
+        let mut earliest: Option<(u32, f32)> = None;
+        // Cull fixed terrain using a conservative bound for the complete
+        // declared part-origin path. Every cell corner stays within `radius`
+        // of its body origin: rotation preserves distance, while translation
+        // follows the segment between the two validated poses. This includes
+        // mid-arc orientations and off-center/negative-origin source grids.
+        // The exact nonlinear source-cell casts below remain authoritative.
+        let mut swept_bounds = Vec::with_capacity(targets.len());
+        for ((part_body, collider_handle, _, _, body_target), (_, grid, cell_m)) in
+            targets.iter().zip(&source_parts)
+        {
+            let body_start = *self.bodies[*part_body].position();
+            let collider_local = self.colliders[*collider_handle]
+                .position_wrt_parent()
+                .copied()
+                .unwrap_or_else(Pose::identity);
+            let half_diagonal = (3.0_f32).sqrt() * *cell_m * 0.5;
+            let radius = grid
+                .solid_indices()
+                .into_iter()
+                .map(|[x, y, z]| {
+                    let cell_center = Vector::new(
+                        (x as f32 + 0.5) * *cell_m,
+                        (y as f32 + 0.5) * *cell_m,
+                        (z as f32 + 0.5) * *cell_m,
+                    );
+                    let local_center = collider_local * Pose::from_translation(cell_center);
+                    local_center.translation.length_squared().sqrt() + half_diagonal
+                })
+                .fold(0.0_f32, f32::max);
+            if !radius.is_finite() {
+                return Err(ArticulatedError::GeometryRange);
+            }
+            let start = body_start.translation;
+            let end = body_target.translation;
+            // Outward rounding padding only adds candidates.
+            let margin = 1.0e-4_f32;
+            swept_bounds.push((
+                Vector::new(
+                    start.x.min(end.x) - radius - margin,
+                    start.y.min(end.y) - radius - margin,
+                    start.z.min(end.z) - radius - margin,
+                ),
+                Vector::new(
+                    start.x.max(end.x) + radius + margin,
+                    start.y.max(end.y) + radius + margin,
+                    start.z.max(end.z) + radius + margin,
+                ),
+            ));
+        }
+        let fixed_nonsensor = |_: ColliderHandle, collider: &Collider| {
+            !collider.is_sensor()
+                && collider
                     .parent()
                     .and_then(|parent| self.bodies.get(parent))
-                    .is_some_and(|body| body.is_fixed());
-                (fixed && !collider.is_sensor()).then_some(handle)
-            })
-            .collect();
-        let mut earliest: Option<(u32, f32)> = None;
+                    .is_some_and(|body| body.is_fixed())
+        };
+        let query = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            QueryFilter::default().predicate(&fixed_nonsensor),
+        );
+        let mut terrain_colliders = Vec::new();
+        for (min, max) in &swept_bounds {
+            let bounds = rapier3d::parry::bounding_volume::Aabb::new(*min, *max);
+            for (handle, _) in query.intersect_aabb_conservative(bounds) {
+                if !terrain_colliders.contains(&handle) {
+                    terrain_colliders.push(handle);
+                }
+            }
+        }
+        let terrain_candidate_count = terrain_colliders.len();
         // Parry 0.30.2 explicitly treats a moving `Voxels` shape as translation
         // only during nonlinear casts and builds an end AABB from endpoint
         // orientations. A rotating off-center source grid therefore is not a
@@ -2249,8 +2310,12 @@ impl PhysicsWorld {
             .map(|(_, grid, _)| grid.solid_count() as usize)
             .sum::<usize>();
         if total_cells.saturating_mul(terrain_colliders.len()) > MAX_TRANSITION_CELL_CASTS {
-            return Err(ArticulatedError::WorkBudget);
+            return Err(ArticulatedError::TerrainTransitionWorkBudget {
+                source_cells: total_cells,
+                terrain_candidates: terrain_colliders.len(),
+            });
         }
+        let mut cell_casts = 0usize;
         for ((part_id, (_, _, collider_start, _, body_target)), (body, grid, cell_m)) in
             part_ids.iter().zip(&targets).zip(&source_parts)
         {
@@ -2280,6 +2345,7 @@ impl PhysicsWorld {
                     angular_delta,
                 );
                 for &terrain_handle in &terrain_colliders {
+                    cell_casts += 1;
                     let only_terrain =
                         |handle: ColliderHandle, _: &Collider| handle == terrain_handle;
                     let filter = QueryFilter::default().predicate(&only_terrain);
@@ -2305,6 +2371,8 @@ impl PhysicsWorld {
                 blocked: true,
                 part_id: Some(part_id),
                 time_of_impact: Some(time_of_impact),
+                terrain_candidates: terrain_candidate_count,
+                cell_casts,
             });
         }
 
@@ -2333,6 +2401,8 @@ impl PhysicsWorld {
             blocked: false,
             part_id: None,
             time_of_impact: None,
+            terrain_candidates: terrain_candidate_count,
+            cell_casts,
         })
     }
 
@@ -6148,7 +6218,7 @@ mod tests {
             translation_m: [0.0, -0.125, 0.0],
             linvel_m_s: [0.0; 3],
         });
-        let mut part = one_part(grid, 189, 1);
+        let mut part = one_part(grid.clone(), 189, 1);
         part.local_transform.translation_m[0] = -0.5;
         let animal = world
             .add_articulated_kinematic_parts(
@@ -6198,6 +6268,120 @@ mod tests {
             .unwrap();
         assert_eq!(after.pose_token, 1);
         assert_eq!(before.cell, after.cell);
+
+        // A replacement obstacle at the same world location must re-enter
+        // the current candidate set; an edit that moves its solid cell away
+        // must remove it from the next sweep query.
+        let replacement_wall = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: 0.25,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [0.0, -0.125, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+        let reverse_update = ArticulatedPose {
+            topology_token: 1,
+            base_pose_token: 1,
+            pose_token: 2,
+            parts: vec![(
+                7,
+                PartTransform {
+                    translation_m: [-0.5, 0.0, 0.0],
+                    ..PartTransform::IDENTITY
+                },
+            )],
+        };
+        let replacement_hit = world
+            .update_articulated_pose_with_swept_root_pose(
+                animal,
+                reverse_update.clone(),
+                PartTransform::IDENTITY,
+            )
+            .unwrap();
+        assert!(
+            replacement_hit.blocked,
+            "replacement obstacle={replacement_hit:?}"
+        );
+        let moved_cell = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(8, 0, 0),
+            [1, 1, 1],
+            vec![true],
+            vec![fixtures::STONE],
+        )
+        .unwrap();
+        world.rebuild_collider(replacement_wall, &moved_cell, Representation::MergedCuboids);
+        let after_edit = world
+            .update_articulated_pose_with_swept_root_pose(
+                animal,
+                reverse_update,
+                PartTransform::IDENTITY,
+            )
+            .unwrap();
+        assert!(!after_edit.blocked, "edited obstacle={after_edit:?}");
+    }
+
+    #[test]
+    fn articulated_sweep_localizes_full_world_fixed_colliders_before_work_budget() {
+        // 285 exact source cells represent the authored deer workload. The
+        // legacy Cartesian loop exceeded its one-million cast budget above
+        // 3,508 fixed colliders, even when every collider was hundreds of
+        // metres from the declared transition.
+        let source_grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [285, 1, 1],
+            vec![true; 285],
+            vec![fixtures::STONE; 285],
+        )
+        .unwrap();
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        for index in 0..3_509 {
+            world.add_body(BodySpec {
+                kind: BodyKind::Fixed,
+                representation: Representation::MergedCuboids,
+                grid: one_cell_grid(GlobalCell::new(0, 0, 0)),
+                cell_m: 0.25,
+                density_kg_m3: 0.0,
+                mass_properties: None,
+                translation_m: [20.0 + index as f32 * 0.5, 100.0, 100.0],
+                linvel_m_s: [0.0; 3],
+            });
+        }
+        assert_eq!(world.colliders.len(), 3_509);
+        let animal = world
+            .add_articulated_kinematic_parts(
+                [250.0, 0.0, 0.0],
+                PartTransform::IDENTITY.rotation_xyzw,
+                1,
+                vec![one_part(source_grid, 213, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let transition = world
+            .update_articulated_pose_with_swept_root_pose(
+                animal,
+                ArticulatedPose {
+                    topology_token: 1,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![(7, PartTransform::IDENTITY)],
+                },
+                PartTransform {
+                    translation_m: [250.25, 0.0, 0.0],
+                    ..PartTransform::IDENTITY
+                },
+            )
+            .unwrap();
+        assert!(!transition.blocked);
+        world.step();
+        assert_eq!(world.body_state(animal.0).translation_m, [250.25, 0.0, 0.0]);
+        assert_eq!(transition.terrain_candidates, 0);
+        assert_eq!(transition.cell_casts, 0);
     }
 
     #[test]

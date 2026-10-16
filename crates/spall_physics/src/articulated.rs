@@ -36,6 +36,13 @@ pub enum ArticulatedError {
     EmptyPart(u32),
     #[error("articulated source geometry exceeds the bounded cell-work budget")]
     WorkBudget,
+    #[error(
+        "articulated terrain transition budget exceeded: {source_cells} cells × {terrain_candidates} current fixed terrain candidates"
+    )]
+    TerrainTransitionWorkBudget {
+        source_cells: usize,
+        terrain_candidates: usize,
+    },
     #[error("source coordinates exceed i32 hit provenance or the bounded finite collider extent")]
     GeometryRange,
     #[error("pose update topology/base token is stale, duplicated, or out of order")]
@@ -133,6 +140,10 @@ pub struct ArticulatedTransition {
     pub part_id: Option<u32>,
     /// Earliest normalized time in the declared one-tick interpolation path.
     pub time_of_impact: Option<f32>,
+    /// Current fixed nonsensor colliders retained by the swept-AABB broadphase.
+    pub terrain_candidates: usize,
+    /// Exact source-cell nonlinear casts actually issued for this transition.
+    pub cell_casts: usize,
 }
 
 /// Compose a child-local transform with its parent's assembly-local transform.
