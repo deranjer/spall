@@ -14,7 +14,9 @@ pub mod units;
 
 pub use coord::{BRICK_EDGE, BrickCoord, CELLS_PER_BRICK, CoordOverflow, GlobalCell, LocalCell};
 pub use ids::{
-    EntityId, IdAllocator, IdError, JournalSeq, Revision, Tick, TransactionId, VolumeId, WorldId,
+    CREATURE_ALLOCATOR_SCHEMA, CreatureAllocator, CreatureAllocatorSnapshotV1, CreatureGeneration,
+    CreatureId, CreatureKey, EntityId, IdAllocator, IdError, JournalSeq, Revision, Tick,
+    TransactionId, VolumeId, WorldEpoch, WorldId,
 };
 pub use input::{
     BUTTON_JUMP, PLAYER_ENTITY_BASE, PlayerInput, is_player_entity, player_entity_for,

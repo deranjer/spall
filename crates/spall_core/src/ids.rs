@@ -101,6 +101,169 @@ server_id!(
     /// Identity of one committed topology transaction.
     TransactionId
 );
+server_id!(
+    /// Stable identity of one creature across lifecycle transitions and world resets.
+    CreatureId
+);
+
+/// Reset namespace for creature state. It advances when the same persistent
+/// world replaces its live state; it never resets the creature ID allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WorldEpoch(u64);
+
+impl WorldEpoch {
+    pub const INITIAL: Self = Self(1);
+
+    pub const fn new(value: u64) -> Result<Self, IdError> {
+        if value == 0 {
+            Err(IdError::Reserved)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn checked_next(self) -> Result<Self, IdError> {
+        match self.0.checked_add(1) {
+            Some(next) => Ok(Self(next)),
+            None => Err(IdError::Exhausted),
+        }
+    }
+}
+
+/// Incarnation number carried with stable creature identity. V1 uses 1 and
+/// does not recycle an ID for a later incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CreatureGeneration(std::num::NonZeroU32);
+
+impl CreatureGeneration {
+    pub const INITIAL: Self = Self(std::num::NonZeroU32::MIN);
+
+    pub const fn new(value: u32) -> Result<Self, IdError> {
+        match std::num::NonZeroU32::new(value) {
+            Some(value) => Ok(Self(value)),
+            None => Err(IdError::Reserved),
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Stable network/persistence identity tuple. This type is an identity value,
+/// not a promise that creature persistence or replication is implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CreatureKey {
+    pub world_id: WorldId,
+    pub world_epoch: WorldEpoch,
+    pub creature_id: CreatureId,
+    pub generation: CreatureGeneration,
+}
+
+impl CreatureKey {
+    pub fn new(
+        world_id: WorldId,
+        world_epoch: WorldEpoch,
+        creature_id: CreatureId,
+        generation: CreatureGeneration,
+    ) -> Result<Self, IdError> {
+        if world_id.is_nil() {
+            return Err(IdError::Reserved);
+        }
+        Ok(Self {
+            world_id,
+            world_epoch,
+            creature_id,
+            generation,
+        })
+    }
+}
+
+pub const CREATURE_ALLOCATOR_SCHEMA: u16 = 1;
+
+/// Explicit in-memory capture/restore value for the creature counter.
+/// This is not a store/checkpoint schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatureAllocatorSnapshotV1 {
+    pub schema: u16,
+    pub world_id: WorldId,
+    pub world_epoch: u64,
+    pub next_creature_id: u64,
+}
+
+/// Checked, monotonic identity allocator scoped to one persistent world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatureAllocator {
+    world_id: WorldId,
+    world_epoch: WorldEpoch,
+    ids: IdAllocator,
+}
+
+impl CreatureAllocator {
+    pub fn new(world_id: WorldId) -> Result<Self, IdError> {
+        if world_id.is_nil() {
+            return Err(IdError::Reserved);
+        }
+        Ok(Self {
+            world_id,
+            world_epoch: WorldEpoch::INITIAL,
+            ids: IdAllocator::new(),
+        })
+    }
+
+    pub fn allocate(&mut self) -> Result<CreatureKey, IdError> {
+        let id = CreatureId::new(self.ids.allocate_raw()?)?;
+        CreatureKey::new(
+            self.world_id,
+            self.world_epoch,
+            id,
+            CreatureGeneration::INITIAL,
+        )
+    }
+
+    /// Advances reset identity without recycling any previously assigned ID.
+    pub fn advance_world_epoch(&mut self) -> Result<WorldEpoch, IdError> {
+        let next = self.world_epoch.checked_next()?;
+        self.world_epoch = next;
+        Ok(next)
+    }
+
+    pub const fn world_id(&self) -> WorldId {
+        self.world_id
+    }
+
+    pub const fn world_epoch(&self) -> WorldEpoch {
+        self.world_epoch
+    }
+
+    pub const fn next_creature_id(&self) -> u64 {
+        self.ids.peek()
+    }
+
+    pub const fn snapshot(&self) -> CreatureAllocatorSnapshotV1 {
+        CreatureAllocatorSnapshotV1 {
+            schema: CREATURE_ALLOCATOR_SCHEMA,
+            world_id: self.world_id,
+            world_epoch: self.world_epoch.get(),
+            next_creature_id: self.ids.peek(),
+        }
+    }
+
+    pub fn restore(snapshot: CreatureAllocatorSnapshotV1) -> Result<Self, IdError> {
+        if snapshot.schema != CREATURE_ALLOCATOR_SCHEMA || snapshot.world_id.is_nil() {
+            return Err(IdError::Reserved);
+        }
+        Ok(Self {
+            world_id: snapshot.world_id,
+            world_epoch: WorldEpoch::new(snapshot.world_epoch)?,
+            ids: IdAllocator::resume_at(snapshot.next_creature_id)?,
+        })
+    }
+}
 
 /// Monotonic allocator for one server id family. Persist [`IdAllocator::peek`]
 /// as the next-id counter; never reuse a value it has handed out.
@@ -222,6 +385,7 @@ mod tests {
         assert_eq!(EntityId::new(0), Err(IdError::Reserved));
         assert_eq!(VolumeId::new(0), Err(IdError::Reserved));
         assert_eq!(TransactionId::new(0), Err(IdError::Reserved));
+        assert_eq!(CreatureId::new(0), Err(IdError::Reserved));
         assert_eq!(EntityId::new(1).unwrap().get(), 1);
     }
 
@@ -263,5 +427,54 @@ mod tests {
         assert_eq!(WorldId::from_le_bytes(id.to_le_bytes()), id);
         assert_eq!(id.to_le_bytes()[0], 0x10);
         assert!(WorldId::NIL.is_nil());
+    }
+
+    #[test]
+    fn creature_allocator_keeps_ids_across_epoch_changes_and_restore() {
+        let world = WorldId::from_u128(0x1234);
+        let mut allocator = CreatureAllocator::new(world).unwrap();
+        let first = allocator.allocate().unwrap();
+        assert_eq!(first.creature_id.get(), 1);
+        assert_eq!(first.generation.get(), 1);
+        assert_eq!(allocator.advance_world_epoch().unwrap().get(), 2);
+        let second = allocator.allocate().unwrap();
+        assert_eq!(second.creature_id.get(), 2);
+        assert_eq!(second.world_epoch.get(), 2);
+        let mut restored = CreatureAllocator::restore(allocator.snapshot()).unwrap();
+        assert_eq!(restored.allocate().unwrap().creature_id.get(), 3);
+        assert_eq!(
+            CreatureAllocator::restore(CreatureAllocatorSnapshotV1 {
+                schema: CREATURE_ALLOCATOR_SCHEMA,
+                world_id: world,
+                world_epoch: 0,
+                next_creature_id: 1,
+            }),
+            Err(IdError::Reserved)
+        );
+    }
+
+    #[test]
+    fn creature_allocator_exhaustion_and_epoch_exhaustion_do_not_wrap() {
+        let world = WorldId::from_u128(0x1234);
+        let mut exhausted_id = CreatureAllocator::restore(CreatureAllocatorSnapshotV1 {
+            schema: CREATURE_ALLOCATOR_SCHEMA,
+            world_id: world,
+            world_epoch: 1,
+            next_creature_id: u64::MAX,
+        })
+        .unwrap();
+        assert_eq!(exhausted_id.allocate(), Err(IdError::Exhausted));
+        let mut exhausted_epoch = CreatureAllocator::restore(CreatureAllocatorSnapshotV1 {
+            schema: CREATURE_ALLOCATOR_SCHEMA,
+            world_id: world,
+            world_epoch: u64::MAX,
+            next_creature_id: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            exhausted_epoch.advance_world_epoch(),
+            Err(IdError::Exhausted)
+        );
+        assert_eq!(exhausted_epoch.world_epoch().get(), u64::MAX);
     }
 }
