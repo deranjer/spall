@@ -68,6 +68,8 @@ pub enum WorldError {
     WaterInitialization(String),
     #[error("vegetation initialization: {0}")]
     VegetationInitialization(String),
+    #[error("cannot replace a simulation with one carrying creature identity state")]
+    CreatureIdentityReplacement,
 }
 
 /// A terrain collider change: the revision it produced and the world box (min, max, metres) it

@@ -207,6 +207,12 @@ source `VolumeId` occurs once, and each bound source volume belongs to exactly
 one creature/corpse assembly. The binding topology revision and aggregate
 topology revision are checked together before a result can apply.
 
+For V1 validation, the game-owned species/version catalog entry pins one exact
+SPVX asset UUID and logical hash; a known asset cannot be substituted across
+species. V1 accepts generation 1 only. Decoders reject source-binding sequence
+lengths above 256 before allocating or reading any binding elements, in
+addition to the whole-record byte cap.
+
 `PartPoseV1` is a runtime composed transform, not an authored SPVX transform:
 finite root-relative translation `[f64; 3]` in metres and a normalized
 quaternion `[f32; 4]`; scale is implicitly unit. Normalize once before a pose is

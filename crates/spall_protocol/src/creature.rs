@@ -2,8 +2,9 @@
 //!
 //! These values are versioned and canonical-round-trippable, but are not a
 //! wire record, checkpoint section, journal event, or actor replication channel.
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::SeqAccess, de::Visitor};
 use spall_core::{CreatureKey, MaterialId, MaterialManifest, VolumeId};
+use std::fmt;
 use thiserror::Error;
 
 use crate::canonical::{CanonicalWriter, Hash32, content_manifest_hash};
@@ -57,7 +58,7 @@ pub enum CreatureClipMode {
 /// Versioned bounded actor state. Runtime ECS, physics, and asset handles are
 /// intentionally absent. Source bindings are sorted metadata, not a topology
 /// store. Durable and wire acceptance remain separate work.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CreatureStateV1 {
     pub schema: u16,
     pub key: CreatureKey,
@@ -100,6 +101,114 @@ pub struct CreatureSpeciesCatalogEntry<'a> {
     pub key: &'a str,
     pub version: u32,
     pub enabled: bool,
+    /// Species definitions are pinned to one exact source asset revision.
+    pub asset: CreatureAssetIdentity,
+}
+
+impl<'de> Deserialize<'de> for CreatureStateV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct CreatureStateWireV1 {
+            schema: u16,
+            key: CreatureKey,
+            state_revision: u64,
+            lifecycle: CreatureLifecycleState,
+            species_key: String,
+            species_version: u32,
+            asset: CreatureAssetIdentity,
+            material_manifest_hash: Hash32,
+            material_mapping_version: u32,
+            material_mapping_hash: Hash32,
+            clip_name: String,
+            clip_mode: CreatureClipMode,
+            clip_phase_tick: u64,
+            clip_subtick_remainder: u32,
+            clip_epoch: u64,
+            source_bindings: BoundedSourceBindings,
+            aggregate_topology_revision: u64,
+            pose_epoch: u64,
+            root_translation_m: [f64; 3],
+            root_rotation_xyzw: [f32; 4],
+            linear_velocity_m_s: [f32; 3],
+            angular_velocity_rad_s: [f32; 3],
+            locomotion_tag: u8,
+        }
+
+        let wire = CreatureStateWireV1::deserialize(deserializer)?;
+        Ok(Self {
+            schema: wire.schema,
+            key: wire.key,
+            state_revision: wire.state_revision,
+            lifecycle: wire.lifecycle,
+            species_key: wire.species_key,
+            species_version: wire.species_version,
+            asset: wire.asset,
+            material_manifest_hash: wire.material_manifest_hash,
+            material_mapping_version: wire.material_mapping_version,
+            material_mapping_hash: wire.material_mapping_hash,
+            clip_name: wire.clip_name,
+            clip_mode: wire.clip_mode,
+            clip_phase_tick: wire.clip_phase_tick,
+            clip_subtick_remainder: wire.clip_subtick_remainder,
+            clip_epoch: wire.clip_epoch,
+            source_bindings: wire.source_bindings.0,
+            aggregate_topology_revision: wire.aggregate_topology_revision,
+            pose_epoch: wire.pose_epoch,
+            root_translation_m: wire.root_translation_m,
+            root_rotation_xyzw: wire.root_rotation_xyzw,
+            linear_velocity_m_s: wire.linear_velocity_m_s,
+            angular_velocity_rad_s: wire.angular_velocity_rad_s,
+            locomotion_tag: wire.locomotion_tag,
+        })
+    }
+}
+
+struct BoundedSourceBindings(Vec<CreaturePartBinding>);
+
+impl<'de> Deserialize<'de> for BoundedSourceBindings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BindingsVisitor;
+
+        impl<'de> Visitor<'de> for BindingsVisitor {
+            type Value = BoundedSourceBindings;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "at most {MAX_CREATURE_SOURCE_PARTS} source bindings"
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if seq
+                    .size_hint()
+                    .is_some_and(|hint| hint > MAX_CREATURE_SOURCE_PARTS)
+                {
+                    return Err(serde::de::Error::custom("source binding limit exceeded"));
+                }
+                let mut bindings =
+                    Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_CREATURE_SOURCE_PARTS));
+                while let Some(binding) = seq.next_element()? {
+                    if bindings.len() == MAX_CREATURE_SOURCE_PARTS {
+                        return Err(serde::de::Error::custom("source binding limit exceeded"));
+                    }
+                    bindings.push(binding);
+                }
+                Ok(BoundedSourceBindings(bindings))
+            }
+        }
+
+        deserializer.deserialize_seq(BindingsVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +292,9 @@ impl CreatureStateV1 {
         self.key
             .validate()
             .map_err(|_| CreatureStateError::Identity)?;
+        if self.key.generation.get() != 1 {
+            return Err(CreatureStateError::Identity);
+        }
         if self.state_revision == 0
             || self.species_version == 0
             || self.material_mapping_version == 0
@@ -269,6 +381,7 @@ impl CreatureStateV1 {
                 entry.key == self.species_key
                     && entry.version == self.species_version
                     && entry.enabled
+                    && entry.asset == self.asset
             })
             .count();
         if species_matches != 1 {
@@ -402,7 +515,7 @@ mod tests {
         .unwrap()
     }
 
-    fn catalog<'a>(
+    fn make_catalog<'a>(
         materials: &'a MaterialManifest,
         asset: &'a [CreatureAssetCatalogEntry<'a>],
         species: &'a [CreatureSpeciesCatalogEntry<'a>],
@@ -474,13 +587,17 @@ mod tests {
             key: "deer",
             version: 1,
             enabled: true,
+            asset: CreatureAssetIdentity {
+                uuid: [3; 16],
+                logical_hash: Hash32([4; 32]),
+            },
         }];
         let mapping = [CreatureMaterialMappingEntry {
             portable_key: "flesh",
             material_id: MaterialId(1),
         }];
         let mapping_hash = creature_material_mapping_hash(&mapping).unwrap();
-        let catalog = catalog(&materials, &asset, &species, &mapping, mapping_hash);
+        let catalog = make_catalog(&materials, &asset, &species, &mapping, mapping_hash);
         let mut state = valid_state();
         state.material_manifest_hash = content_manifest_hash(&materials);
         state.material_mapping_hash = mapping_hash;
@@ -504,13 +621,17 @@ mod tests {
             key: "deer",
             version: 1,
             enabled: true,
+            asset: CreatureAssetIdentity {
+                uuid: [3; 16],
+                logical_hash: Hash32([4; 32]),
+            },
         }];
         let mapping = [CreatureMaterialMappingEntry {
             portable_key: "flesh",
             material_id: MaterialId(1),
         }];
         let mapping_hash = creature_material_mapping_hash(&mapping).unwrap();
-        let catalog = catalog(&materials, &asset, &species, &mapping, mapping_hash);
+        let catalog = make_catalog(&materials, &asset, &species, &mapping, mapping_hash);
         let mut state = valid_state();
         state.material_manifest_hash = content_manifest_hash(&materials);
         state.material_mapping_hash = mapping_hash;
@@ -542,13 +663,17 @@ mod tests {
             key: "deer",
             version: 1,
             enabled: true,
+            asset: CreatureAssetIdentity {
+                uuid: [3; 16],
+                logical_hash: Hash32([4; 32]),
+            },
         }];
         let mapping = [CreatureMaterialMappingEntry {
             portable_key: "flesh",
             material_id: MaterialId(1),
         }];
         let mapping_hash = creature_material_mapping_hash(&mapping).unwrap();
-        let catalog = catalog(&materials, &asset, &species, &mapping, mapping_hash);
+        let catalog = make_catalog(&materials, &asset, &species, &mapping, mapping_hash);
         let mut state = valid_state();
         state.material_manifest_hash = content_manifest_hash(&materials);
         state.material_mapping_hash = mapping_hash;
@@ -561,6 +686,61 @@ mod tests {
         bad = state.clone();
         bad.species_key = "unknown".into();
         assert_eq!(bad.validate(&catalog), Err(CreatureStateError::Reference));
+        let other_assets = [
+            CreatureAssetCatalogEntry {
+                uuid: [3; 16],
+                logical_hash: Hash32([4; 32]),
+                part_ids: &[1],
+                clip_names: &["walk"],
+                portable_material_keys: &["flesh"],
+            },
+            CreatureAssetCatalogEntry {
+                uuid: [5; 16],
+                logical_hash: Hash32([6; 32]),
+                part_ids: &[1],
+                clip_names: &["walk"],
+                portable_material_keys: &["flesh"],
+            },
+        ];
+        let other_species = [
+            CreatureSpeciesCatalogEntry {
+                key: "deer",
+                version: 1,
+                enabled: true,
+                asset: CreatureAssetIdentity {
+                    uuid: [3; 16],
+                    logical_hash: Hash32([4; 32]),
+                },
+            },
+            CreatureSpeciesCatalogEntry {
+                key: "trout",
+                version: 1,
+                enabled: true,
+                asset: CreatureAssetIdentity {
+                    uuid: [5; 16],
+                    logical_hash: Hash32([6; 32]),
+                },
+            },
+        ];
+        let other_catalog = make_catalog(
+            &materials,
+            &other_assets,
+            &other_species,
+            &mapping,
+            mapping_hash,
+        );
+        bad = state.clone();
+        bad.asset = CreatureAssetIdentity {
+            uuid: [5; 16],
+            logical_hash: Hash32([6; 32]),
+        };
+        assert_eq!(
+            bad.validate(&other_catalog),
+            Err(CreatureStateError::Reference)
+        );
+        bad = state.clone();
+        bad.key.generation = spall_core::CreatureGeneration::new(2).unwrap();
+        assert_eq!(bad.validate(&catalog), Err(CreatureStateError::Identity));
         bad = state.clone();
         bad.root_translation_m[0] = f64::INFINITY;
         assert_eq!(bad.validate(&catalog), Err(CreatureStateError::Limit));
@@ -568,5 +748,28 @@ mod tests {
             CreatureStateV1::decode(&vec![0; MAX_CREATURE_STATE_BYTES + 1], &catalog),
             Err(CreatureStateError::Limit)
         );
+    }
+
+    #[test]
+    fn source_binding_decoder_rejects_oversized_declared_length_before_reading_elements() {
+        struct OversizedSequence;
+
+        impl<'de> serde::de::SeqAccess<'de> for OversizedSequence {
+            type Error = serde::de::value::Error;
+
+            fn next_element_seed<T>(&mut self, _seed: T) -> Result<Option<T::Value>, Self::Error>
+            where
+                T: serde::de::DeserializeSeed<'de>,
+            {
+                panic!("oversized sequence elements must not be requested")
+            }
+
+            fn size_hint(&self) -> Option<usize> {
+                Some(MAX_CREATURE_SOURCE_PARTS + 1)
+            }
+        }
+
+        let deserializer = serde::de::value::SeqAccessDeserializer::new(OversizedSequence);
+        assert!(BoundedSourceBindings::deserialize(deserializer).is_err());
     }
 }

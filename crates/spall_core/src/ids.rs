@@ -171,7 +171,7 @@ impl CreatureKey {
         creature_id: CreatureId,
         generation: CreatureGeneration,
     ) -> Result<Self, IdError> {
-        if world_id.is_nil() {
+        if world_id.is_nil() || world_epoch.get() == 0 {
             return Err(IdError::Reserved);
         }
         Ok(Self {
@@ -485,5 +485,19 @@ mod tests {
             Err(IdError::Exhausted)
         );
         assert_eq!(exhausted_epoch.world_epoch().get(), u64::MAX);
+    }
+
+    #[test]
+    fn creature_key_constructor_rejects_a_deserialized_zero_epoch() {
+        let zero_epoch: WorldEpoch = serde_json::from_str("0").unwrap();
+        assert_eq!(
+            CreatureKey::new(
+                WorldId::from_u128(1),
+                zero_epoch,
+                CreatureId::new(1).unwrap(),
+                CreatureGeneration::INITIAL,
+            ),
+            Err(IdError::Reserved)
+        );
     }
 }

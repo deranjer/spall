@@ -410,6 +410,9 @@ impl Simulation {
     /// Players are not carried over; the caller re-adds them. Staged edits of
     /// the old world are dropped.
     pub fn replace_world(&mut self, fresh: Simulation) -> Result<(), crate::world::WorldError> {
+        if fresh.creatures.is_some() {
+            return Err(crate::world::WorldError::CreatureIdentityReplacement);
+        }
         if let Some(creatures) = &self.creatures {
             creatures.preview_reset_epoch()?;
         }

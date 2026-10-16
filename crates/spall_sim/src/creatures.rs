@@ -421,6 +421,10 @@ pub(crate) mod tests {
                     key: "deer",
                     version: 1,
                     enabled: true,
+                    asset: CreatureAssetIdentity {
+                        uuid: [8; 16],
+                        logical_hash: spall_protocol::Hash32([9; 32]),
+                    },
                 }],
                 mapping: [CreatureMaterialMappingEntry {
                     portable_key: "fur",
