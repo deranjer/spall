@@ -37,12 +37,14 @@ pub enum ArticulatedError {
     #[error("articulated source geometry exceeds the bounded cell-work budget")]
     WorkBudget,
     #[error(
-        "articulated terrain transition budget exceeded: {source_cells} cells × {terrain_candidates} current fixed terrain candidates"
+        "articulated terrain transition budget exceeded: {source_cells} cells × at least {terrain_candidates_at_least} current fixed terrain candidates"
     )]
     TerrainTransitionWorkBudget {
         source_cells: usize,
-        terrain_candidates: usize,
+        terrain_candidates_at_least: usize,
     },
+    #[error("unsupported exact terrain transition cast for articulated part {part_id}")]
+    UnsupportedTerrainTransitionCast { part_id: u32 },
     #[error("source coordinates exceed i32 hit provenance or the bounded finite collider extent")]
     GeometryRange,
     #[error("pose update topology/base token is stale, duplicated, or out of order")]

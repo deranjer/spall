@@ -2,7 +2,7 @@
 //! terms only. Rapier handles never leave this module; callers address bodies
 //! by an opaque [`BodyId`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use rapier3d::control::CharacterCollision;
@@ -15,6 +15,21 @@ use crate::articulated::{
 use crate::collider::{Representation, build_collider};
 use crate::mass::BodyMassProperties;
 use crate::occupancy::OccupancyGrid;
+
+const MAX_TRANSITION_CELL_CASTS: usize = 1_000_000;
+
+fn transition_candidate_limit(source_cells: usize) -> usize {
+    MAX_TRANSITION_CELL_CASTS / source_cells.max(1)
+}
+
+fn require_supported_transition_cast<T>(
+    part_id: u32,
+    result: Result<Option<T>, rapier3d::parry::query::Unsupported>,
+) -> Result<Option<T>, crate::articulated::ArticulatedError> {
+    result.map_err(
+        |_| crate::articulated::ArticulatedError::UnsupportedTerrainTransitionCast { part_id },
+    )
+}
 
 /// Opaque, stable identifier for a body in a [`PhysicsWorld`]. The high 32 bits
 /// namespace bodies across coordinated physics regions; the low 32 bits are the
@@ -2218,6 +2233,11 @@ impl PhysicsWorld {
             .iter()
             .map(|part| (part.body, part.grid.clone(), part.cell_m))
             .collect::<Vec<_>>();
+        let total_cells = source_parts
+            .iter()
+            .map(|(_, grid, _)| grid.solid_count() as usize)
+            .sum::<usize>();
+        let candidate_limit = transition_candidate_limit(total_cells);
 
         // Query freshness is part of this gate: voxel edits/removals made since
         // the previous step must affect this same transition decision.
@@ -2288,11 +2308,19 @@ impl PhysicsWorld {
             &self.colliders,
             QueryFilter::default().predicate(&fixed_nonsensor),
         );
-        let mut terrain_colliders = Vec::new();
+        let mut terrain_colliders = Vec::with_capacity(candidate_limit.min(4096));
+        let mut seen_candidates = HashSet::with_capacity(candidate_limit.min(4096));
         for (min, max) in &swept_bounds {
             let bounds = rapier3d::parry::bounding_volume::Aabb::new(*min, *max);
             for (handle, _) in query.intersect_aabb_conservative(bounds) {
-                if !terrain_colliders.contains(&handle) {
+                if !seen_candidates.contains(&handle) {
+                    if seen_candidates.len() == candidate_limit {
+                        return Err(ArticulatedError::TerrainTransitionWorkBudget {
+                            source_cells: total_cells,
+                            terrain_candidates_at_least: candidate_limit.saturating_add(1),
+                        });
+                    }
+                    seen_candidates.insert(handle);
                     terrain_colliders.push(handle);
                 }
             }
@@ -2308,17 +2336,6 @@ impl PhysicsWorld {
         // Their center follows the same linear part-origin / shortest-arc
         // rotation path as the kinematic body, so their union is the source
         // grid at every time (up to Parry's documented iterative TOI tolerance).
-        const MAX_TRANSITION_CELL_CASTS: usize = 1_000_000;
-        let total_cells = source_parts
-            .iter()
-            .map(|(_, grid, _)| grid.solid_count() as usize)
-            .sum::<usize>();
-        if total_cells.saturating_mul(terrain_colliders.len()) > MAX_TRANSITION_CELL_CASTS {
-            return Err(ArticulatedError::TerrainTransitionWorkBudget {
-                source_cells: total_cells,
-                terrain_candidates: terrain_colliders.len(),
-            });
-        }
         let mut cell_casts = 0usize;
         let casts_started = Instant::now();
         for ((part_id, (_, _, collider_start, _, body_target)), (body, grid, cell_m)) in
@@ -2363,7 +2380,7 @@ impl PhysicsWorld {
                         Vector::ZERO,
                         Vector::ZERO,
                     );
-                    let Ok(Some(hit)) = rapier3d::parry::query::cast_shapes_nonlinear(
+                    let cast_result = rapier3d::parry::query::cast_shapes_nonlinear(
                         &motion,
                         &cell_shape,
                         &stationary,
@@ -2371,7 +2388,9 @@ impl PhysicsWorld {
                         0.0,
                         1.0,
                         true,
-                    ) else {
+                    );
+                    let Some(hit) = require_supported_transition_cast(*part_id, cast_result)?
+                    else {
                         continue;
                     };
                     if earliest.is_none_or(|(_, toi)| hit.time_of_impact < toi) {
@@ -4233,6 +4252,37 @@ mod tests {
     const CELL_M: f64 = 0.25;
     const STONE_RHO: f64 = 1000.0;
     const DIRT_RHO: f64 = 3000.0;
+
+    #[test]
+    fn transition_cast_errors_reject_but_supported_clear_casts_remain_clear() {
+        assert_eq!(
+            require_supported_transition_cast(
+                7,
+                Ok::<Option<usize>, rapier3d::parry::query::Unsupported>(None),
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            require_supported_transition_cast(
+                7,
+                Err::<Option<usize>, _>(rapier3d::parry::query::Unsupported,)
+            ),
+            Err(
+                crate::articulated::ArticulatedError::UnsupportedTerrainTransitionCast {
+                    part_id: 7,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn transition_candidate_budget_is_derived_from_the_exact_cast_cap() {
+        assert_eq!(transition_candidate_limit(0), MAX_TRANSITION_CELL_CASTS);
+        assert_eq!(transition_candidate_limit(1), 1_000_000);
+        assert_eq!(transition_candidate_limit(217), 4_608);
+        assert_eq!(transition_candidate_limit(285), 3_508);
+        assert_eq!(transition_candidate_limit(1_000_001), 0);
+    }
 
     fn mix_density(m: MaterialId) -> f64 {
         if m == fixtures::STONE {
