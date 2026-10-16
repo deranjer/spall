@@ -48,8 +48,9 @@ pub use collider::{
 };
 pub use coordinates::PhysicsOrigin;
 pub use fracture::{
-    FRACTURE_PLAN_VERSION, FractureComponent, FractureError, FracturePartSnapshot,
-    FractureSnapshot, FractureSnapshotToken, PreparedFracturePlan, SourceCellRef, prepare_fracture,
+    DerivedFractureComponentId, FRACTURE_PLAN_VERSION, FractureComponent, FractureError,
+    FracturePartSnapshot, FractureSnapshot, FractureSnapshotToken, PreparedFracturePlan,
+    SourceCellRef, prepare_fracture,
 };
 pub use mass::{
     BodyMassProperties, MassProperties, analytic_mass_properties, articulated_mass_properties,
@@ -63,6 +64,7 @@ pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_f
 pub use world::{
     ArticulatedContactWitness, BodyId, BodyKind, BodySpec, BodyState, CONTACT_WITNESS_VERSION,
     ColliderExclusion, ContactCellAttribution, ContactImpulse, ContactWitnessUnattributed,
-    CorpseEditOutcome, CorpseTransferOutcome, MAX_CONTACT_WITNESSES_PER_STEP, PhysicsConfig,
-    PhysicsWorld, PreparedBodySpec, PreparedCollider, SourceContactWitness, StepTiming,
+    CorpseEditOutcome, CorpseTransferOutcome, FractureCommitOutcome,
+    MAX_CONTACT_WITNESSES_PER_STEP, PhysicsConfig, PhysicsWorld, PreparedBodySpec,
+    PreparedCollider, SourceContactWitness, StepTiming,
 };

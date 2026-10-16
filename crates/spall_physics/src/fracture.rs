@@ -15,6 +15,7 @@ pub const FRACTURE_PLAN_VERSION: u16 = 1;
 pub const MAX_FRACTURE_SOURCE_CELLS: usize = 1_000_000;
 pub const MAX_FRACTURE_PARTS: usize = 256;
 pub const MAX_FRACTURE_DENSE_CELLS: usize = MAX_FRACTURE_SOURCE_CELLS;
+pub const MAX_FRACTURE_COMPONENTS: usize = 256;
 /// All cross-volume cell pairs examined, including broadphase rejects.
 pub const MAX_FRACTURE_CELL_PAIR_TESTS: usize = 1_000_000;
 
@@ -42,6 +43,9 @@ pub struct FractureSnapshotToken {
     pub topology_revision: u64,
     pub pose_epoch: u64,
     pub source_generation: u64,
+    /// `None` selects the initial unsplit logical owner. Once fractured, a
+    /// snapshot names exactly one independently moving physical component.
+    pub component_key: Option<DerivedFractureComponentId>,
 }
 
 /// Complete read-only snapshot consumed by [`prepare_fracture`].
@@ -55,6 +59,15 @@ pub struct FractureSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FractureComponent {
     pub cells: Vec<SourceCellRef>,
+}
+
+/// Stable transaction-owned identity for one derived physical component.
+/// `serial` is allocated monotonically by the logical corpse owner and is
+/// never a Rapier handle or source VolumeId.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DerivedFractureComponentId {
+    pub owner_key: u128,
+    pub serial: u64,
 }
 
 /// Versioned immutable one-to-many ownership proposal. Component keys are
@@ -77,6 +90,12 @@ pub enum FractureError {
     InvalidSnapshot,
     #[error("fracture source cell or cross-volume pair budget exceeded")]
     WorkBudget,
+    #[error("prepared fracture plan is stale, forged, or does not cover the selected owner cells")]
+    InvalidPlan,
+    #[error("fracture owner topology, pose, or source generation changed before commit")]
+    StaleOwner,
+    #[error("fracture component mass properties are invalid")]
+    InvalidMass,
     #[error(
         "cross-volume source-cell geometry is too close to classify safely: {left:?} / {right:?}"
     )]
@@ -344,6 +363,9 @@ pub fn prepare_fracture(
     let mut groups = BTreeMap::<usize, Vec<SourceCellRef>>::new();
     for (index, cell) in cells.iter().copied().enumerate() {
         groups.entry(union.root(index)).or_default().push(cell);
+    }
+    if groups.len() > MAX_FRACTURE_COMPONENTS {
+        return Err(FractureError::WorkBudget);
     }
     let mut components = groups
         .into_values()
@@ -614,6 +636,7 @@ mod tests {
                 topology_revision: 11,
                 pose_epoch: 13,
                 source_generation: 17,
+                component_key: None,
             },
             parts,
         }

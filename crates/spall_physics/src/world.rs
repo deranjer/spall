@@ -7,12 +7,17 @@ use std::time::{Duration, Instant};
 
 use rapier3d::control::CharacterCollision;
 use rapier3d::prelude::*;
+use spall_core::{GlobalCell, MaterialId};
 
 use crate::articulated::{
     ArticulatedBodyId, ArticulatedPose, MAX_ARTICULATED_PARTS, PartTransform, SourceCellHit,
     SourcePart, compose, normalize, rotate,
 };
 use crate::collider::{Representation, build_collider};
+use crate::fracture::{
+    DerivedFractureComponentId, FRACTURE_PLAN_VERSION, FractureError, FracturePartSnapshot,
+    FractureSnapshot, FractureSnapshotToken, PreparedFracturePlan, SourceCellRef, prepare_fracture,
+};
 use crate::mass::BodyMassProperties;
 use crate::occupancy::OccupancyGrid;
 
@@ -368,6 +373,7 @@ struct ArticulatedPartEntry {
     body: RigidBodyHandle,
     collider: ColliderHandle,
     primitives: usize,
+    component_id: Option<DerivedFractureComponentId>,
 }
 
 /// Maximum Euclidean distance from `body_origin` to any corner of an occupied
@@ -428,6 +434,9 @@ struct ArticulatedEntry {
     pending_pose: Option<PendingArticulatedPose>,
     kinematic_part_bodies: bool,
     dynamic_corpse: bool,
+    source_generation: u64,
+    fracture_owner_key: Option<u128>,
+    next_component_serial: u64,
     parts: Vec<ArticulatedPartEntry>,
 }
 
@@ -440,6 +449,17 @@ pub struct CorpseTransferOutcome {
     pub linear_momentum_kg_m_s: [f64; 3],
     pub angular_momentum_about_com_kg_m2_s: [f64; 3],
 }
+
+/// Measurements from one all-or-nothing physical corpse component split.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FractureCommitOutcome {
+    pub elapsed: Duration,
+    pub source_cells: usize,
+    pub components: Vec<(DerivedFractureComponentId, f64)>,
+}
+
+/// Bounded live diagnostics for one stable physical fracture component.
+/// Rapier handles remain private to the adapter.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CorpseEditOutcome {
@@ -455,6 +475,49 @@ pub enum CorpseEditOutcome {
         elapsed: Duration,
         removed_mass_kg: f64,
     },
+}
+
+fn fracture_snapshots_equal(a: &FractureSnapshot, b: &FractureSnapshot) -> bool {
+    if a.token != b.token || a.parts.len() != b.parts.len() {
+        return false;
+    }
+    a.parts.iter().zip(&b.parts).all(|(left, right)| {
+        if left.source.part_id != right.source.part_id
+            || left.source.parent_id != right.source.parent_id
+            || left.source.volume_id != right.source.volume_id
+            || left.source.source_revision != right.source.source_revision
+            || left.source.cell_m.to_bits() != right.source.cell_m.to_bits()
+            || left.source.grid.origin() != right.source.grid.origin()
+            || left.source.grid.dims() != right.source.grid.dims()
+            || left.root_local_pose.translation_m.map(f32::to_bits)
+                != right.root_local_pose.translation_m.map(f32::to_bits)
+            || left.root_local_pose.rotation_xyzw.map(f32::to_bits)
+                != right.root_local_pose.rotation_xyzw.map(f32::to_bits)
+        {
+            return false;
+        }
+        let mut left_cells = Vec::new();
+        let mut right_cells = Vec::new();
+        let left_origin = left.source.grid.origin();
+        let right_origin = right.source.grid.origin();
+        left.source.grid.for_each_solid(|x, y, z, material| {
+            left_cells.push((
+                left_origin.x + i64::from(x),
+                left_origin.y + i64::from(y),
+                left_origin.z + i64::from(z),
+                material,
+            ));
+        });
+        right.source.grid.for_each_solid(|x, y, z, material| {
+            right_cells.push((
+                right_origin.x + i64::from(x),
+                right_origin.y + i64::from(y),
+                right_origin.z + i64::from(z),
+                material,
+            ));
+        });
+        left_cells == right_cells
+    })
 }
 
 fn solve_symmetric3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
@@ -865,6 +928,9 @@ pub struct PhysicsWorld {
     ccd_solver: CCDSolver,
     entries: Vec<Entry>,
     articulated: HashMap<BodyId, ArticulatedEntry>,
+    /// Logical fracture keys are never reusable during this world lifetime,
+    /// including after their owner is retired.
+    fracture_owner_keys: HashMap<u128, BodyId>,
     step_count: u64,
     articulated_contact_witnesses: Vec<ArticulatedContactWitness>,
     contact_witness_overflow: u64,
@@ -968,6 +1034,7 @@ impl PhysicsWorld {
             ccd_solver: CCDSolver::new(),
             entries: Vec::new(),
             articulated: HashMap::new(),
+            fracture_owner_keys: HashMap::new(),
             step_count: 0,
             articulated_contact_witnesses: Vec::new(),
             contact_witness_overflow: 0,
@@ -1389,6 +1456,482 @@ impl PhysicsWorld {
         })
     }
 
+    /// Captures one live physical component for bounded immutable fracture
+    /// planning. After the initial split every capture targets one child ID.
+    pub fn capture_dynamic_corpse_fracture_snapshot(
+        &self,
+        id: ArticulatedBodyId,
+        corpse_key: u128,
+        component_key: Option<DerivedFractureComponentId>,
+    ) -> Result<FractureSnapshot, FractureError> {
+        let assembly = self
+            .articulated
+            .get(&id.0)
+            .ok_or(FractureError::StaleOwner)?;
+        if !assembly.dynamic_corpse
+            || corpse_key == 0
+            || self.fracture_owner_keys.get(&corpse_key).is_some_and(|owner| *owner != id.0)
+            || assembly
+                .fracture_owner_key
+                .is_some_and(|key| key != corpse_key)
+            || component_key.is_some_and(|key| {
+                key.owner_key != corpse_key || key.serial == 0 || key.serial >= assembly.next_component_serial
+            })
+        {
+            return Err(FractureError::StaleOwner);
+        }
+        let selected = assembly
+            .parts
+            .iter()
+            .filter(|part| part.component_id == component_key)
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(FractureError::InvalidSnapshot);
+        }
+        let mut part_ids = HashSet::new();
+        let mut volume_ids = HashSet::new();
+        if selected
+            .iter()
+            .any(|part| !part_ids.insert(part.part_id) || !volume_ids.insert(part.volume_id))
+        {
+            return Err(FractureError::InvalidSnapshot);
+        }
+        Ok(FractureSnapshot {
+            token: FractureSnapshotToken {
+                corpse_key,
+                topology_revision: assembly.topology_token,
+                pose_epoch: self.step_count,
+                source_generation: assembly.source_generation,
+                component_key,
+            },
+            parts: selected
+                .into_iter()
+                .map(|part| FracturePartSnapshot {
+                    source: SourcePart {
+                        part_id: part.part_id,
+                        parent_id: None,
+                        volume_id: part.volume_id,
+                        source_revision: part.source_revision,
+                        grid: part.grid.clone(),
+                        cell_m: part.cell_m,
+                        local_transform: part.assembly_pose,
+                    },
+                    root_local_pose: part.assembly_pose,
+                })
+                .collect(),
+        })
+    }
+
+    /// Atomically replaces exactly one frozen physical component with its
+    /// prepared connected components. Source volumes stay under this one
+    /// logical owner; each collider shard preserves original cell provenance.
+    pub fn commit_dynamic_corpse_fracture(
+        &mut self,
+        id: ArticulatedBodyId,
+        snapshot: &FractureSnapshot,
+        plan: &PreparedFracturePlan,
+        density: impl Fn(spall_core::MaterialId) -> f64,
+    ) -> Result<FractureCommitOutcome, FractureError> {
+        let started = Instant::now();
+        let body_id = id.0;
+        let current = self.capture_dynamic_corpse_fracture_snapshot(
+            id,
+            snapshot.token.corpse_key,
+            snapshot.token.component_key,
+        )?;
+        if snapshot.token != current.token || !fracture_snapshots_equal(snapshot, &current) {
+            return Err(FractureError::StaleOwner);
+        }
+        if plan.version != FRACTURE_PLAN_VERSION
+            || plan.token != snapshot.token
+            || plan.components.len() < 2
+        {
+            return Err(FractureError::InvalidPlan);
+        }
+        let canonical = prepare_fracture(snapshot)?;
+        if canonical.source_cells != plan.source_cells || canonical.components != plan.components {
+            return Err(FractureError::InvalidPlan);
+        }
+        let assembly = self
+            .articulated
+            .get(&body_id)
+            .ok_or(FractureError::StaleOwner)?;
+        let target = assembly
+            .parts
+            .iter()
+            .filter(|part| part.component_id == snapshot.token.component_key)
+            .cloned()
+            .collect::<Vec<_>>();
+        if assembly.pending_pose.is_some()
+            || assembly.pending_root_pose_token.is_some()
+            || target.len() != snapshot.parts.len()
+            || target.iter().zip(&snapshot.parts).any(|(part, snapshot)| {
+                part.part_id != snapshot.source.part_id || part.body != target[0].body
+            })
+            || assembly
+                .fracture_owner_key
+                .is_some_and(|key| key != snapshot.token.corpse_key)
+            || self.articulated.iter().any(|(other_id, other)| {
+                *other_id != body_id && other.fracture_owner_key == Some(snapshot.token.corpse_key)
+            })
+            || self.fracture_owner_keys.get(&snapshot.token.corpse_key).is_some_and(|owner| *owner != body_id)
+        {
+            return Err(FractureError::StaleOwner);
+        }
+        let next_serial = assembly
+            .next_component_serial
+            .checked_add(plan.components.len() as u64)
+            .ok_or(FractureError::WorkBudget)?;
+        let next_source_generation = assembly
+            .source_generation
+            .checked_add(1)
+            .ok_or(FractureError::WorkBudget)?;
+        let next_topology_revision = assembly
+            .topology_token
+            .checked_add(1)
+            .ok_or(FractureError::WorkBudget)?;
+        let component_ids = (0..plan.components.len())
+            .map(|offset| DerivedFractureComponentId {
+                owner_key: snapshot.token.corpse_key,
+                serial: assembly.next_component_serial + offset as u64,
+            })
+            .collect::<Vec<_>>();
+        if component_ids.iter().any(|component| component.serial == 0) {
+            return Err(FractureError::InvalidPlan);
+        }
+        let live_components = assembly.parts.iter()
+            .filter_map(|part| part.component_id)
+            .collect::<HashSet<_>>().len().max(1);
+        if live_components.checked_sub(1).and_then(|count| count.checked_add(plan.components.len()))
+            .is_none_or(|count| count > crate::fracture::MAX_FRACTURE_COMPONENTS)
+        {
+            return Err(FractureError::WorkBudget);
+        }
+        let entry_idx = entry_index(body_id, self.id_namespace);
+        let entry = &self.entries[entry_idx];
+        let representation = entry.representation;
+        let query_only = entry.query_only;
+        let old_body = target[0].body;
+        let old_pose = *self.bodies[old_body].position();
+        let old_sources = target.iter().map(|part| SourcePart {
+            part_id: part.part_id,
+            parent_id: None,
+            volume_id: part.volume_id,
+            source_revision: part.source_revision,
+            grid: part.grid.clone(),
+            cell_m: part.cell_m,
+            local_transform: part.assembly_pose,
+        }).collect::<Vec<_>>();
+        let old_poses = old_sources.iter().map(|part| part.local_transform).collect::<Vec<_>>();
+        let old_mass = crate::mass::articulated_mass_properties(&old_sources, &old_poses, &density)
+            .ok_or(FractureError::InvalidMass)?.to_body_properties();
+        validate_body_mass_properties(old_mass).map_err(|_| FractureError::InvalidMass)?;
+        // Re-derive from the canonical source cells. Rapier's cached COM can
+        // be uninitialized on a newly-created aggregate and is not a source
+        // ownership oracle.
+        let old_com = old_pose.transform_point(Vector::new(
+            old_mass.local_com_m[0], old_mass.local_com_m[1], old_mass.local_com_m[2],
+        ));
+        let old_linear = self.bodies[old_body].linvel();
+        let old_angular = self.bodies[old_body].angvel();
+
+        struct PreparedShard {
+            part: ArticulatedPartEntry,
+            collider: Collider,
+        }
+        struct PreparedChild {
+            component_id: DerivedFractureComponentId,
+            mass: BodyMassProperties,
+            linear: Vector,
+            angular: Vector,
+            shards: Vec<PreparedShard>,
+        }
+        let mut prepared = Vec::with_capacity(plan.components.len());
+        let mut primitive_count = 0usize;
+        let mut derived_dense_count = 0usize;
+        for (component_index, component) in plan.components.iter().enumerate() {
+            let refs = component.cells.iter().copied().collect::<HashSet<_>>();
+            if refs.len() != component.cells.len() || refs.is_empty() {
+                return Err(FractureError::InvalidPlan);
+            }
+            let mut sources = Vec::new();
+            let mut poses = Vec::new();
+            let mut shards = Vec::new();
+            for (part_index, old_part) in target.iter().enumerate() {
+                let source = &snapshot.parts[part_index].source;
+                let origin = old_part.grid.origin();
+                let mut owned = Vec::new();
+                old_part.grid.for_each_solid(|x, y, z, material| {
+                    let coord = [
+                        origin.x.checked_add(i64::from(x)),
+                        origin.y.checked_add(i64::from(y)),
+                        origin.z.checked_add(i64::from(z)),
+                    ];
+                    let Ok(cx) = i32::try_from(coord[0].unwrap_or(i64::MIN)) else {
+                        return;
+                    };
+                    let Ok(cy) = i32::try_from(coord[1].unwrap_or(i64::MIN)) else {
+                        return;
+                    };
+                    let Ok(cz) = i32::try_from(coord[2].unwrap_or(i64::MIN)) else {
+                        return;
+                    };
+                    let cell = SourceCellRef {
+                        volume_id: old_part.volume_id,
+                        part_id: old_part.part_id,
+                        cell: [cx, cy, cz],
+                        material,
+                        source_revision: old_part.source_revision,
+                    };
+                    if refs.contains(&cell) {
+                        owned.push((x, y, z, material));
+                    }
+                });
+                if owned.is_empty() {
+                    continue;
+                }
+                let min = std::array::from_fn::<_, 3, _>(|axis| {
+                    owned
+                        .iter()
+                        .map(|cell| [cell.0, cell.1, cell.2][axis])
+                        .min()
+                        .unwrap()
+                });
+                let max = std::array::from_fn::<_, 3, _>(|axis| {
+                    owned
+                        .iter()
+                        .map(|cell| [cell.0, cell.1, cell.2][axis])
+                        .max()
+                        .unwrap()
+                });
+                let dims = [
+                    max[0] - min[0] + 1,
+                    max[1] - min[1] + 1,
+                    max[2] - min[2] + 1,
+                ];
+                let dense = (dims[0] as usize)
+                    .checked_mul(dims[1] as usize)
+                    .and_then(|v| v.checked_mul(dims[2] as usize))
+                    .ok_or(FractureError::WorkBudget)?;
+                derived_dense_count = derived_dense_count
+                    .checked_add(dense)
+                    .ok_or(FractureError::WorkBudget)?;
+                if derived_dense_count > crate::fracture::MAX_FRACTURE_DENSE_CELLS {
+                    return Err(FractureError::WorkBudget);
+                }
+                let mut mask = vec![false; dense];
+                let mut materials = vec![MaterialId::AIR; dense];
+                for (x, y, z, material) in owned {
+                    let local = [x - min[0], y - min[1], z - min[2]];
+                    let index = local[0] as usize
+                        + dims[0] as usize
+                            * (local[1] as usize + dims[1] as usize * local[2] as usize);
+                    mask[index] = true;
+                    materials[index] = material;
+                }
+                let cropped_origin = GlobalCell::new(
+                    origin.x + i64::from(min[0]),
+                    origin.y + i64::from(min[1]),
+                    origin.z + i64::from(min[2]),
+                );
+                let grid = OccupancyGrid::from_solid_mask(cropped_origin, dims, mask, materials)
+                    .map_err(|_| FractureError::InvalidPlan)?;
+                let source_part = SourcePart {
+                    part_id: source.part_id,
+                    parent_id: None,
+                    volume_id: source.volume_id,
+                    source_revision: source.source_revision,
+                    grid: grid.clone(),
+                    cell_m: source.cell_m,
+                    local_transform: snapshot.parts[part_index].root_local_pose,
+                };
+                sources.push(source_part);
+                poses.push(snapshot.parts[part_index].root_local_pose);
+                let built = build_collider(&grid, old_part.cell_m, representation);
+                primitive_count = primitive_count
+                    .checked_add(built.primitives)
+                    .ok_or(FractureError::WorkBudget)?;
+                if built.primitives > crate::collider::MERGED_CUBOID_PRIMITIVE_BUDGET
+                    || primitive_count > 65_536
+                {
+                    return Err(FractureError::WorkBudget);
+                }
+                let old_collider = self
+                    .colliders
+                    .get(old_part.collider)
+                    .ok_or(FractureError::StaleOwner)?;
+                let origin = grid.origin();
+                let origin_m = [
+                    origin.x as f32 * old_part.cell_m,
+                    origin.y as f32 * old_part.cell_m,
+                    origin.z as f32 * old_part.cell_m,
+                ];
+                let pose = snapshot.parts[part_index].root_local_pose;
+                let offset = rotate(pose.rotation_xyzw, origin_m);
+                let local = Pose::new(
+                    Vector::new(
+                        pose.translation_m[0] + offset[0],
+                        pose.translation_m[1] + offset[1],
+                        pose.translation_m[2] + offset[2],
+                    ),
+                    Rotation::from_xyzw(
+                        pose.rotation_xyzw[0],
+                        pose.rotation_xyzw[1],
+                        pose.rotation_xyzw[2],
+                        pose.rotation_xyzw[3],
+                    )
+                    .to_scaled_axis(),
+                );
+                let mut collider = ColliderBuilder::new(built.collider.shared_shape().clone())
+                    .density(0.0)
+                    .position(local)
+                    .friction(old_collider.friction())
+                    .active_collision_types(old_collider.active_collision_types())
+                    .sensor(old_collider.is_sensor())
+                    .build();
+                collider.set_restitution(old_collider.restitution());
+                collider.set_restitution_combine_rule(old_collider.restitution_combine_rule());
+                collider.set_friction_combine_rule(old_collider.friction_combine_rule());
+                collider.set_collision_groups(old_collider.collision_groups());
+                collider.set_solver_groups(if query_only {
+                    query_only_solver_groups()
+                } else {
+                    old_collider.solver_groups()
+                });
+                let part_surface_radius_m =
+                    source_surface_radius_m(&grid, old_part.cell_m, [0.0; 3], None);
+                let root_surface_radius_m =
+                    source_surface_radius_m(&grid, old_part.cell_m, [0.0; 3], Some(pose));
+                shards.push(PreparedShard {
+                    part: ArticulatedPartEntry {
+                        part_id: old_part.part_id,
+                        parent_id: None,
+                        volume_id: old_part.volume_id,
+                        source_revision: old_part.source_revision,
+                        grid,
+                        cell_m: old_part.cell_m,
+                        local_pose: pose,
+                        assembly_pose: pose,
+                        part_surface_radius_m,
+                        root_surface_radius_m,
+                        body: old_body,
+                        collider: old_part.collider,
+                        primitives: built.primitives,
+                        component_id: Some(component_ids[component_index]),
+                    },
+                    collider,
+                });
+            }
+            let mass = crate::mass::articulated_mass_properties(&sources, &poses, &density)
+                .ok_or(FractureError::InvalidMass)?
+                .to_body_properties();
+            validate_body_mass_properties(mass).map_err(|_| FractureError::InvalidMass)?;
+            let com = old_pose.transform_point(Vector::new(
+                mass.local_com_m[0],
+                mass.local_com_m[1],
+                mass.local_com_m[2],
+            ));
+            let linear = old_linear + old_angular.cross(com - old_com);
+            if shards.is_empty()
+                || !linear.x.is_finite()
+                || !linear.y.is_finite()
+                || !linear.z.is_finite()
+            {
+                return Err(FractureError::InvalidMass);
+            }
+            prepared.push(PreparedChild {
+                component_id: component_ids[component_index],
+                mass,
+                linear,
+                angular: old_angular,
+                shards,
+            });
+        }
+
+        // All partitions, shapes, masses, transforms, and stable IDs are now
+        // validated. Only infallible Rapier insert/remove operations follow.
+        let old_colliders = target.iter().map(|part| part.collider).collect::<Vec<_>>();
+        let old_bodies = target.iter().map(|part| part.body).collect::<HashSet<_>>();
+        let entry_body_was_replaced = old_bodies.contains(&self.entries[entry_idx].body);
+        let mut committed = Vec::with_capacity(prepared.len());
+        for child in prepared {
+            let child_linear = child.linear;
+            let child_angular = child.angular;
+            let body = self.bodies.insert(
+                RigidBodyBuilder::dynamic()
+                    .pose(old_pose)
+                    .additional_mass_properties(rapier_mass_properties(child.mass, [0.0; 3]))
+                    .linvel(child.linear)
+                    .angvel(child.angular)
+                    .build(),
+            );
+            let mut parts = Vec::with_capacity(child.shards.len());
+            for shard in child.shards {
+                let handle =
+                    self.colliders
+                        .insert_with_parent(shard.collider, body, &mut self.bodies);
+                self.tag_collider(handle, body_id);
+                self.pending_modified.push(handle);
+                let mut part = shard.part;
+                part.body = body;
+                part.collider = handle;
+                parts.push(part);
+            }
+            self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
+            // Collider insertion/recomputation may shift Rapier's COM and
+            // adjust the body's origin velocity. Install the prepared COM
+            // velocity field only after the final mass frame is known.
+            self.bodies[body].set_linvel(child_linear, true);
+            self.bodies[body].set_angvel(child_angular, true);
+            committed.push((child.component_id, child.mass, body, parts));
+        }
+        for collider in old_colliders {
+            self.colliders
+                .remove(collider, &mut self.islands, &mut self.bodies, true);
+            self.pending_removed.push(collider);
+        }
+        for body in old_bodies {
+            self.bodies.remove(
+                body,
+                &mut self.islands,
+                &mut self.colliders,
+                &mut self.impulse_joints,
+                &mut self.multibody_joints,
+                true,
+            );
+        }
+        if entry_body_was_replaced {
+            self.entries[entry_idx].body = committed[0].2;
+            self.entries[entry_idx].collider = committed[0].3[0].collider;
+            self.entries[entry_idx].mass_properties = Some(committed[0].1);
+        }
+        let assembly = self
+            .articulated
+            .get_mut(&body_id)
+            .expect("validated assembly");
+        assembly
+            .parts
+            .retain(|part| part.component_id != snapshot.token.component_key);
+        let mut outcomes = Vec::with_capacity(committed.len());
+        for (component_id, mass, _, parts) in committed {
+            assembly.parts.extend(parts);
+            outcomes.push((component_id, f64::from(mass.mass_kg)));
+        }
+        assembly.fracture_owner_key = Some(snapshot.token.corpse_key);
+        assembly.next_component_serial = next_serial;
+        assembly.dynamic_corpse = true;
+        assembly.kinematic_part_bodies = false;
+        assembly.source_generation = next_source_generation;
+        assembly.topology_token = next_topology_revision;
+        self.fracture_owner_keys.insert(snapshot.token.corpse_key, body_id);
+        self.ccd_solver = CCDSolver::new();
+        Ok(FractureCommitOutcome {
+            elapsed: started.elapsed(),
+            source_cells: plan.source_cells.len(),
+            components: outcomes,
+        })
+    }
+
     fn add_articulated_body_mode(
         &mut self,
         translation_m: [f32; 3],
@@ -1653,6 +2196,7 @@ impl PhysicsWorld {
                 body: part_body,
                 collider: handle,
                 primitives: build.primitives,
+                component_id: None,
             });
         }
         let primary = built_parts[0].collider;
@@ -1690,9 +2234,19 @@ impl PhysicsWorld {
                 pending_pose: None,
                 kinematic_part_bodies,
                 dynamic_corpse: dynamic_mass.is_some(),
+                source_generation: 1,
+                fracture_owner_key: None,
+                next_component_serial: 1,
                 parts: built_parts,
             },
         );
+        if let Some(mass) = dynamic_mass {
+            let pose = *self.bodies[root].position();
+            self.bodies[root]
+                .set_additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]), true);
+            self.bodies[root].recompute_mass_properties_from_colliders(&self.colliders);
+            self.bodies[root].set_position(pose, true);
+        }
         Ok(ArticulatedBodyId(id))
     }
 
@@ -2037,6 +2591,10 @@ impl PhysicsWorld {
         let entry = &self.entries[entry_index(id, self.id_namespace)];
         let (mut body, query_only, restitution) = (entry.body, entry.query_only, entry.restitution);
         let kinematic_part_bodies = assembly.kinematic_part_bodies;
+        let next_source_generation = assembly
+            .source_generation
+            .checked_add(1)
+            .ok_or(ArticulatedError::WorkBudget)?;
         if kinematic_part_bodies {
             body = part.body;
         }
@@ -2084,6 +2642,7 @@ impl PhysicsWorld {
         part.collider = new_handle;
         part.primitives = built.primitives;
         assembly.topology_token = new_topology_token;
+        assembly.source_generation = next_source_generation;
         if part_index == 0 {
             self.entries[entry_index(id, self.id_namespace)].collider = new_handle;
         }
@@ -2114,6 +2673,16 @@ impl PhysicsWorld {
             .ok_or(ArticulatedError::Hierarchy)?;
         if !assembly.dynamic_corpse {
             return Err(ArticulatedError::DynamicCorpsePose);
+        }
+        if assembly
+            .parts
+            .iter()
+            .any(|part| part.component_id.is_some())
+        {
+            // The legacy operation addresses a whole source part, which may
+            // span multiple independently moving fragments. It must not pick
+            // one shard by vector order and silently leave siblings untouched.
+            return Err(ArticulatedError::UnsupportedCorpseEdit);
         }
         if assembly.topology_token != expected_topology_token
             || assembly.pending_pose.is_some()
@@ -3196,15 +3765,28 @@ impl PhysicsWorld {
 
     /// Retires the kinematic root and all of its attached source-part colliders.
     pub fn retire_articulated_body(&mut self, id: ArticulatedBodyId) {
+        let entry_body = self
+            .entries
+            .get(entry_index(id.0, self.id_namespace))
+            .map(|entry| entry.body);
         let part_bodies = self
             .articulated
             .get(&id.0)
-            .filter(|assembly| assembly.kinematic_part_bodies)
+            .filter(|assembly| {
+                assembly.kinematic_part_bodies
+                    || assembly
+                        .parts
+                        .iter()
+                        .any(|part| part.component_id.is_some())
+            })
             .map(|assembly| {
                 assembly
                     .parts
                     .iter()
                     .map(|part| part.body)
+                    .filter(|body| Some(*body) != entry_body)
+                    .collect::<HashSet<_>>()
+                    .into_iter()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -3238,6 +3820,17 @@ impl PhysicsWorld {
         self.articulated.get(&id.0).map_or(0, |assembly| {
             if assembly.kinematic_part_bodies {
                 assembly.parts.len() + 1
+            } else if assembly
+                .parts
+                .iter()
+                .any(|part| part.component_id.is_some())
+            {
+                assembly
+                    .parts
+                    .iter()
+                    .map(|part| part.body)
+                    .collect::<HashSet<_>>()
+                    .len()
             } else {
                 1
             }
@@ -3249,6 +3842,84 @@ impl PhysicsWorld {
     /// aggregate exposes its dynamic owner body.
     pub fn articulated_body_state(&self, id: ArticulatedBodyId) -> BodyState {
         self.body_state(id.0)
+    }
+
+    /// Returns live state for a currently owned stable fracture component.
+    /// Retired, foreign-owner, and never-allocated keys fail closed.
+    pub fn fracture_component_state(
+        &self,
+        id: ArticulatedBodyId,
+        component_id: DerivedFractureComponentId,
+    ) -> Result<BodyState, FractureError> {
+        let assembly = self.articulated.get(&id.0).ok_or(FractureError::StaleOwner)?;
+        if !assembly.dynamic_corpse {
+            return Err(FractureError::StaleOwner);
+        }
+        if assembly.fracture_owner_key != Some(component_id.owner_key)
+            || component_id.serial == 0
+            || component_id.serial >= assembly.next_component_serial
+        {
+            return Err(FractureError::StaleOwner);
+        }
+        let mut bodies = assembly
+            .parts
+            .iter()
+            .filter(|part| part.component_id == Some(component_id))
+            .map(|part| part.body);
+        let body = bodies.next().ok_or(FractureError::StaleOwner)?;
+        if bodies.any(|other| other != body) {
+            return Err(FractureError::InvalidPlan);
+        }
+        let rb = self.bodies.get(body).ok_or(FractureError::StaleOwner)?;
+        let t = rb.translation();
+        let q = rb.rotation();
+        let lv = rb.linvel();
+        let av = rb.angvel();
+        Ok(BodyState {
+            translation_m: [t.x, t.y, t.z],
+            rotation: [q.x, q.y, q.z, q.w],
+            linvel_m_s: [lv.x, lv.y, lv.z],
+            angvel_rad_s: [av.x, av.y, av.z],
+            sleeping: rb.is_sleeping(),
+            mass_kg: rb.mass(),
+        })
+    }
+
+    /// Sets a feasibility-test velocity on the unsplit corpse (`None`) or one
+    /// explicitly keyed live component. This never exposes Rapier handles.
+    pub fn set_dynamic_corpse_component_velocity(
+        &mut self,
+        id: ArticulatedBodyId,
+        component_key: Option<DerivedFractureComponentId>,
+        linear_m_s: [f32; 3],
+        angular_rad_s: [f32; 3],
+    ) -> Result<(), FractureError> {
+        if !linear_m_s.iter().chain(&angular_rad_s).all(|v| v.is_finite()) {
+            return Err(FractureError::InvalidPlan);
+        }
+        let assembly = self.articulated.get(&id.0).ok_or(FractureError::StaleOwner)?;
+        if !assembly.dynamic_corpse {
+            return Err(FractureError::StaleOwner);
+        }
+        let body = if let Some(key) = component_key {
+            if assembly.fracture_owner_key != Some(key.owner_key)
+                || key.serial == 0
+                || key.serial >= assembly.next_component_serial
+            {
+                return Err(FractureError::StaleOwner);
+            }
+            assembly.parts.iter().find(|p| p.component_id == Some(key))
+                .map(|part| part.body).ok_or(FractureError::StaleOwner)?
+        } else {
+            if assembly.parts.iter().any(|p| p.component_id.is_some()) {
+                return Err(FractureError::StaleOwner);
+            }
+            self.entries[entry_index(id.0, self.id_namespace)].body
+        };
+        let rb = self.bodies.get_mut(body).ok_or(FractureError::StaleOwner)?;
+        rb.set_linvel(Vector::new(linear_m_s[0], linear_m_s[1], linear_m_s[2]), true);
+        rb.set_angvel(Vector::new(angular_rad_s[0], angular_rad_s[1], angular_rad_s[2]), true);
+        Ok(())
     }
 
     /// Casts against the live Rapier shape of every source part and maps the
@@ -3306,7 +3977,7 @@ impl PhysicsWorld {
         let assembly = self.articulated.get(&id).ok_or(ArticulatedError::Miss)?;
         let root_pose =
             *self.bodies[self.entries[entry_index(id, self.id_namespace)].body].position();
-        let mut best: Option<(f32, u32, SourceCellHit)> = None;
+        let mut best: Option<(f32, u32, [i32; 3], u64, SourceCellHit)> = None;
         for part in &assembly.parts {
             let Some(toi) = hit_tois.get(&part.collider).copied() else {
                 continue;
@@ -3315,7 +3986,7 @@ impl PhysicsWorld {
                 .colliders
                 .get(part.collider)
                 .ok_or(ArticulatedError::Miss)?;
-            let collider_pose = if assembly.kinematic_part_bodies {
+            let collider_pose = if assembly.kinematic_part_bodies || part.component_id.is_some() {
                 *collider.position()
             } else {
                 let local_pose = *collider
@@ -3380,14 +4051,17 @@ impl PhysicsWorld {
                 topology_token: assembly.topology_token,
                 pose_token: assembly.pose_token,
             };
-            if best.is_none_or(|(old_toi, old_part, _)| {
+            let component_serial = part.component_id.map_or(0, |key| key.serial);
+            if best.is_none_or(|(old_toi, old_part, old_cell, old_component, _)| {
                 toi < old_toi - 1.0e-5
-                    || ((toi - old_toi).abs() <= 1.0e-5 && part.part_id < old_part)
+                    || ((toi - old_toi).abs() <= 1.0e-5
+                        && (part.part_id, hit.cell, component_serial)
+                            < (old_part, old_cell, old_component))
             }) {
-                best = Some((toi, part.part_id, hit));
+                best = Some((toi, part.part_id, hit.cell, component_serial, hit));
             }
         }
-        best.map(|(_, _, hit)| hit).ok_or(ArticulatedError::Miss)
+        best.map(|(_, _, _, _, hit)| hit).ok_or(ArticulatedError::Miss)
     }
 
     /// Builds a Rapier rigid body + attached collider from `spec` and inserts
@@ -4559,8 +5233,8 @@ impl PhysicsWorld {
             .map(|i| BodyId((u64::from(self.id_namespace) << 32) | i as u64))
             .or_else(|| {
                 self.articulated.iter().find_map(|(id, assembly)| {
-                    assembly
-                        .kinematic_part_bodies
+                (assembly.kinematic_part_bodies
+                    || assembly.parts.iter().any(|part| part.component_id.is_some()))
                         .then(|| assembly.parts.iter().any(|part| part.body == handle))
                         .filter(|owned| *owned)
                         .map(|_| *id)

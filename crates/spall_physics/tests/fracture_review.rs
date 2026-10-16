@@ -14,6 +14,7 @@ fn snapshot(origin: GlobalCell, mask: Vec<bool>, revision: u64) -> FractureSnaps
     FractureSnapshot {
         token: FractureSnapshotToken {
             corpse_key: 42,
+            component_key: None,
             topology_revision: revision,
             pose_epoch: 1,
             source_generation: 1,
