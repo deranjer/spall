@@ -59,6 +59,12 @@ pub struct PhysicsConfig {
     pub dt_s: f32,
     /// Constraint solver iterations per step.
     pub solver_iterations: usize,
+    /// Number of coordinated solver substeps per outer physics tick (1–64).
+    /// Every dynamic body advances the same total `dt_s`; position-based
+    /// kinematics are interpolated across these substeps. Values above one
+    /// enable a 2.5 cm per-substep swept-surface admission limit for
+    /// articulated pose updates.
+    pub solver_substeps: usize,
     /// Skip rapier's CCD solver pass entirely (`max_ccd_substeps = 0`). Callers
     /// that never enable per-body CCD should set this: rapier's CCD broad-phase
     /// BVH can retain a stale proxy for a collider that was removed and
@@ -74,6 +80,7 @@ impl Default for PhysicsConfig {
             gravity_m_s2: [0.0, -9.81, 0.0],
             dt_s: 1.0 / 60.0,
             solver_iterations: 4,
+            solver_substeps: 1,
             disable_ccd: false,
         }
     }
@@ -184,6 +191,15 @@ pub struct StepTiming {
     pub step_index: u64,
     /// Wall-clock time inside `PhysicsPipeline::step`.
     pub pipeline: Duration,
+    /// Number of coordinated world-pipeline substeps used for this outer tick.
+    pub substeps: usize,
+    /// Sum of positive solver normal impulses across active contact pairs and
+    /// internal substeps (N·s). This is an outer-tick total, not a unique-pair
+    /// count and not an energy/work estimate.
+    pub normal_impulse_n_s: f32,
+    /// Number of active contact-pair/substep observations contributing a
+    /// positive normal impulse.
+    pub impulse_pair_substeps: usize,
 }
 
 /// The solved normal impulse over one contact pair after a step — the raw
@@ -466,6 +482,7 @@ pub struct PhysicsWorld {
     id_namespace: u32,
     gravity: Vector,
     params: IntegrationParameters,
+    solver_substeps: usize,
     pipeline: PhysicsPipeline,
     islands: IslandManager,
     broad_phase: DefaultBroadPhase,
@@ -490,6 +507,9 @@ pub struct PhysicsWorld {
 const CARRY_MARGIN_M: f32 = 0.05;
 /// Slowest horizontal character speed (m/s) that still carries bodies.
 const CARRY_MIN_SPEED_M_S: f32 = 0.1;
+/// Largest admitted kinematic surface displacement within one configured
+/// solver substep for the bounded articulated-contact experiment.
+const MAX_KINEMATIC_SURFACE_TRAVEL_PER_SUBSTEP_M: f32 = 0.025;
 
 /// A prebuilt set of bodies whose colliders are left out of character queries (see
 /// [`PhysicsWorld::exclusion_for`]). Colliders carry their owning body's id, so the set stays
@@ -543,6 +563,10 @@ impl PhysicsWorld {
     /// Creates an empty region-local world whose body IDs are disjoint from
     /// worlds using another namespace. Namespace zero preserves `new` IDs.
     pub fn new_in_namespace(cfg: PhysicsConfig, id_namespace: u32) -> Self {
+        assert!(
+            (1..=64).contains(&cfg.solver_substeps),
+            "solver_substeps must be in 1..=64"
+        );
         let mut params = IntegrationParameters {
             dt: cfg.dt_s,
             ..Default::default()
@@ -559,6 +583,7 @@ impl PhysicsWorld {
                 cfg.gravity_m_s2[2],
             ),
             params,
+            solver_substeps: cfg.solver_substeps,
             pipeline: PhysicsPipeline::new(),
             islands: IslandManager::new(),
             broad_phase: DefaultBroadPhase::new(),
@@ -1028,6 +1053,7 @@ impl PhysicsWorld {
             }) {
                 return Err(ArticulatedError::GeometryRange);
             }
+            self.validate_kinematic_surface_travel(&targets)?;
             for (body, pose) in targets {
                 self.bodies[body].set_next_kinematic_position(pose);
             }
@@ -1476,6 +1502,9 @@ impl PhysicsWorld {
             Vec::new()
         };
         let body = self.entries[entry_index(body_id, self.id_namespace)].body;
+        let mut all_targets = vec![(body, root_target)];
+        all_targets.extend(part_targets.iter().copied());
+        self.validate_kinematic_surface_travel(&all_targets)?;
         self.bodies[body].set_next_kinematic_position(root_target);
         for (part_body, target) in part_targets {
             self.bodies[part_body].set_next_kinematic_position(target);
@@ -1762,6 +1791,13 @@ impl PhysicsWorld {
         if !articulated_translation_in_range(root_target) {
             return Err(ArticulatedError::InvalidRootPose);
         }
+        let root_body = self.entries[entry_index(id.0, self.id_namespace)].body;
+        let root_start = *self.bodies[root_body].position();
+        let root_target_pose = Pose::new(
+            Vector::from(root_target),
+            root_start.rotation.to_scaled_axis(),
+        );
+        let mut scheduled_targets = vec![(root_body, root_target_pose)];
         for (part, world_pose) in assembly.parts.iter().zip(flattened) {
             if !articulated_translation_in_range(world_pose.translation_m) {
                 return Err(ArticulatedError::GeometryRange);
@@ -1782,7 +1818,19 @@ impl PhysicsWorld {
             if !articulated_translation_in_range(world_translation) {
                 return Err(ArticulatedError::GeometryRange);
             }
+            let local_pose = Pose::new(
+                Vector::from(world_pose.translation_m),
+                Rotation::from_xyzw(
+                    world_pose.rotation_xyzw[0],
+                    world_pose.rotation_xyzw[1],
+                    world_pose.rotation_xyzw[2],
+                    world_pose.rotation_xyzw[3],
+                )
+                .to_scaled_axis(),
+            );
+            scheduled_targets.push((part.body, root_target_pose * local_pose));
         }
+        self.validate_kinematic_surface_travel(&scheduled_targets)?;
         // All pose, topology, and target coordinates have been validated
         // before either half is staged; the root sweep then cannot fail on
         // these inputs, and both targets commit at the same step boundary.
@@ -1905,6 +1953,14 @@ impl PhysicsWorld {
                 body_target,
             ));
         }
+        let root_body = self.entries[entry_index(body_id, self.id_namespace)].body;
+        let mut scheduled_targets = vec![(root_body, target_root)];
+        scheduled_targets.extend(
+            targets
+                .iter()
+                .map(|(body, _, _, _, body_target)| (*body, *body_target)),
+        );
+        self.validate_kinematic_surface_travel(&scheduled_targets)?;
         let part_ids = assembly
             .parts
             .iter()
@@ -2008,7 +2064,6 @@ impl PhysicsWorld {
         // All input validation and continuous terrain casts succeeded. Stage
         // root and part body targets together; both version tokens publish at
         // the same following physics boundary.
-        let root_body = self.entries[entry_index(body_id, self.id_namespace)].body;
         self.bodies[root_body].set_next_kinematic_position(target_root);
         for (body, _, _, _, body_target) in &targets {
             self.bodies[*body].set_next_kinematic_position(*body_target);
@@ -2727,6 +2782,44 @@ impl PhysicsWorld {
         self.pending_removed.clear();
     }
 
+    fn validate_kinematic_surface_travel(
+        &self,
+        targets: &[(RigidBodyHandle, Pose)],
+    ) -> Result<(), crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        if self.solver_substeps == 1 {
+            return Ok(());
+        }
+        for (body_handle, target) in targets {
+            let body = &self.bodies[*body_handle];
+            let start = *body.position();
+            let translation = (target.translation - start.translation).length();
+            let angle = (target.rotation * start.rotation.inverse())
+                .to_scaled_axis()
+                .length();
+            let radius = self
+                .colliders
+                .iter()
+                .filter(|(_, collider)| collider.parent() == Some(*body_handle))
+                .map(|(_, collider)| {
+                    let local_pose = collider
+                        .position_wrt_parent()
+                        .copied()
+                        .unwrap_or_else(Pose::identity);
+                    let local_aabb = collider.shape().compute_local_aabb();
+                    (local_pose.translation + local_pose.rotation * local_aabb.center()).length()
+                        + local_aabb.half_extents().length()
+                })
+                .fold(0.0_f32, f32::max);
+            let maximum_surface_travel = translation + angle * radius;
+            let admitted = self.solver_substeps as f32 * MAX_KINEMATIC_SURFACE_TRAVEL_PER_SUBSTEP_M;
+            if maximum_surface_travel > admitted + 1.0e-6 {
+                return Err(ArticulatedError::WorkBudget);
+            }
+        }
+        Ok(())
+    }
+
     /// Advances the world by one fixed step.
     pub fn step(&mut self) -> StepTiming {
         // The pipeline's own broad-phase pass reads Rapier's native
@@ -2738,22 +2831,62 @@ impl PhysicsWorld {
         // `sync_queries` exists at all is the caller that doesn't.
         self.pending_modified.clear();
         self.pending_removed.clear();
-        let start = Instant::now();
-        self.pipeline.step(
-            self.gravity,
-            &self.params,
-            &mut self.islands,
-            &mut self.broad_phase,
-            &mut self.narrow_phase,
-            &mut self.bodies,
-            &mut self.colliders,
-            &mut self.impulse_joints,
-            &mut self.multibody_joints,
-            &mut self.ccd_solver,
-            &(),
-            &(),
-        );
-        let pipeline = start.elapsed();
+        let outer_dt = self.params.dt;
+        let substeps = self.solver_substeps;
+        let kinematic_targets = self
+            .bodies
+            .iter()
+            .filter_map(|(handle, body)| {
+                let start = *body.position();
+                let target = *body.next_position();
+                (body.is_kinematic() && start != target).then_some((handle, start, target))
+            })
+            .collect::<Vec<_>>();
+        let mut pipeline = Duration::ZERO;
+        let mut normal_impulse_n_s = 0.0_f32;
+        let mut impulse_pair_substeps = 0;
+        self.params.dt = outer_dt / substeps as f32;
+        for substep in 0..substeps {
+            let fraction = (substep + 1) as f32 / substeps as f32;
+            for (handle, start, target) in &kinematic_targets {
+                let substep_target = if substep + 1 == substeps {
+                    *target
+                } else {
+                    let translation =
+                        start.translation + (target.translation - start.translation) * fraction;
+                    let angular_delta = target.rotation * start.rotation.inverse();
+                    let rotation =
+                        Rotation::from_scaled_axis(angular_delta.to_scaled_axis() * fraction)
+                            * start.rotation;
+                    Pose::new(translation, rotation.to_scaled_axis())
+                };
+                self.bodies[*handle].set_next_kinematic_position(substep_target);
+            }
+            let start = Instant::now();
+            self.pipeline.step(
+                self.gravity,
+                &self.params,
+                &mut self.islands,
+                &mut self.broad_phase,
+                &mut self.narrow_phase,
+                &mut self.bodies,
+                &mut self.colliders,
+                &mut self.impulse_joints,
+                &mut self.multibody_joints,
+                &mut self.ccd_solver,
+                &(),
+                &(),
+            );
+            pipeline += start.elapsed();
+            for pair in self.narrow_phase.contact_pairs() {
+                let impulse = pair.total_impulse_magnitude();
+                if pair.has_any_active_contact() && impulse.is_finite() && impulse > 0.0 {
+                    normal_impulse_n_s += impulse;
+                    impulse_pair_substeps += 1;
+                }
+            }
+        }
+        self.params.dt = outer_dt;
         // Rapier advances position-based kinematics after its broad-phase
         // update. Refresh articulated shape AABBs now so queries immediately
         // after this same published physics boundary see the committed pose,
@@ -2807,6 +2940,9 @@ impl PhysicsWorld {
         StepTiming {
             step_index: self.step_count,
             pipeline,
+            substeps,
+            normal_impulse_n_s,
+            impulse_pair_substeps,
         }
     }
 
@@ -4611,6 +4747,290 @@ mod tests {
             // Keep the original no-CCD result and measure the same exact
             // workload with candidate dynamic CCD enabled; neither is assumed
             // to provide a kinematic-part impact response.
+        }
+    }
+
+    #[test]
+    fn articulated_substeps_preserve_fast_target_time_and_produce_contact_response() {
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            for ccd in [false, true] {
+                let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+                let mut world = PhysicsWorld::new(PhysicsConfig {
+                    gravity_m_s2: [0.0; 3],
+                    solver_substeps: 20,
+                    ..Default::default()
+                });
+                let mut source = one_part(grid.clone(), 183, 1);
+                source.local_transform.translation_m[0] = -0.5;
+                let animal = world
+                    .add_articulated_kinematic_parts(
+                        [0.0; 3],
+                        [0.0, 0.0, 0.0, 1.0],
+                        1,
+                        vec![source],
+                        representation,
+                    )
+                    .unwrap();
+                let probe = world.add_body(BodySpec {
+                    kind: BodyKind::Dynamic { ccd },
+                    representation,
+                    grid,
+                    cell_m: 0.25,
+                    density_kg_m3: 1_000.0,
+                    mass_properties: None,
+                    translation_m: [0.0; 3],
+                    linvel_m_s: [0.0; 3],
+                });
+                world
+                    .update_articulated_pose(
+                        animal,
+                        ArticulatedPose {
+                            topology_token: 1,
+                            base_pose_token: 0,
+                            pose_token: 1,
+                            parts: vec![(7, PartTransform::IDENTITY)],
+                        },
+                    )
+                    .unwrap();
+                let start = Instant::now();
+                let timing = world.step();
+                let elapsed = start.elapsed();
+                let contacts = world
+                    .contact_impulses()
+                    .into_iter()
+                    .filter(|contact| contact.bodies.contains(&probe))
+                    .collect::<Vec<_>>();
+                let impulse_sum = contacts
+                    .iter()
+                    .map(|contact| contact.normal_impulse_n_s)
+                    .sum::<f32>();
+                let state = world.body_state(probe);
+                println!(
+                    "substep candidate {representation:?} dynamic_ccd={ccd} dt={} elapsed_us={} pipeline_us={} outer_steps={} substeps={} last_contacts={} last_impulse={} accumulated_impulse={} impulse_pair_substeps={} probe_x={} probe_vx={} mass_kg={} momentum_x={} kinetic_energy_j={}",
+                    1.0 / 60.0,
+                    elapsed.as_secs_f64() * 1.0e6,
+                    timing.pipeline.as_secs_f64() * 1.0e6,
+                    world.steps_run(),
+                    timing.substeps,
+                    contacts.len(),
+                    impulse_sum,
+                    timing.normal_impulse_n_s,
+                    timing.impulse_pair_substeps,
+                    state.translation_m[0],
+                    state.linvel_m_s[0],
+                    state.mass_kg,
+                    state.mass_kg * state.linvel_m_s[0],
+                    0.5 * state.mass_kg * state.linvel_m_s.iter().map(|v| v * v).sum::<f32>(),
+                );
+                assert_eq!(world.steps_run(), 1, "substeps publish one outer step");
+                assert!(state.is_finite());
+                assert!(timing.normal_impulse_n_s.is_finite() && timing.normal_impulse_n_s > 0.0);
+                assert!(timing.impulse_pair_substeps > 0);
+                assert!(state.linvel_m_s[0] > 0.0);
+                let animal_hit = world
+                    .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+                    .unwrap();
+                assert_eq!(animal_hit.pose_token, 1);
+                assert!(animal_hit.toi_m > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn articulated_substeps_admit_slow_motion_and_reject_over_budget_atomically() {
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                solver_substeps: 20,
+                ..Default::default()
+            });
+            let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+            let mut source = one_part(grid.clone(), 193, 1);
+            source.local_transform.translation_m[0] = -0.5;
+            let animal = world
+                .add_articulated_kinematic_parts(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![source],
+                    representation,
+                )
+                .unwrap();
+            let probe = world.add_body(BodySpec {
+                kind: BodyKind::Dynamic { ccd: false },
+                representation,
+                grid,
+                cell_m: 0.25,
+                density_kg_m3: 1_000.0,
+                mass_properties: None,
+                translation_m: [0.0; 3],
+                linvel_m_s: [0.0; 3],
+            });
+            let mut accumulated_impulse = 0.0_f32;
+            for pose_token in 1..=60 {
+                let target_x = -0.5 + pose_token as f32 * 0.01;
+                world
+                    .update_articulated_pose(
+                        animal,
+                        ArticulatedPose {
+                            topology_token: 1,
+                            base_pose_token: pose_token - 1,
+                            pose_token,
+                            parts: vec![(
+                                7,
+                                PartTransform {
+                                    translation_m: [target_x, 0.0, 0.0],
+                                    ..PartTransform::IDENTITY
+                                },
+                            )],
+                        },
+                    )
+                    .unwrap();
+                let timing = world.step();
+                assert_eq!(timing.substeps, 20);
+                accumulated_impulse += timing.normal_impulse_n_s;
+            }
+            let state = world.body_state(probe);
+            let hit = world
+                .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+                .unwrap();
+            println!(
+                "substep slow candidate {representation:?} displacement=0.6m outer_ticks=60 substeps=1200 elapsed_s={} impulse_n_s={} probe_x={} probe_vx={} probe_mass_kg={} dynamic_momentum_x={} kinetic_energy_j={} published_pose_token={}",
+                60.0 / 60.0,
+                accumulated_impulse,
+                state.translation_m[0],
+                state.linvel_m_s[0],
+                state.mass_kg,
+                state.mass_kg * state.linvel_m_s[0],
+                0.5 * state.mass_kg * state.speed_m_s().powi(2),
+                hit.pose_token,
+            );
+            assert!(accumulated_impulse.is_finite() && accumulated_impulse > 0.0);
+            assert!(state.is_finite());
+            assert_eq!(hit.pose_token, 60);
+            assert_eq!(world.steps_run(), 60);
+        }
+
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                solver_substeps: 20,
+                ..Default::default()
+            });
+            let animal = world
+                .add_articulated_kinematic_parts(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![one_part(grid, 194, 1)],
+                    representation,
+                )
+                .unwrap();
+            let before = world
+                .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+                .unwrap();
+            let rejected_translation = world.update_articulated_pose(
+                animal,
+                ArticulatedPose {
+                    topology_token: 1,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![(
+                        7,
+                        PartTransform {
+                            translation_m: [0.8, 0.0, 0.0],
+                            ..PartTransform::IDENTITY
+                        },
+                    )],
+                },
+            );
+            assert!(matches!(
+                rejected_translation,
+                Err(crate::articulated::ArticulatedError::WorkBudget)
+            ));
+            let after_translation = world
+                .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+                .unwrap();
+            assert_eq!(after_translation, before);
+
+            let rejected_rotation = world.update_articulated_pose(
+                animal,
+                ArticulatedPose {
+                    topology_token: 1,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![(
+                        7,
+                        PartTransform {
+                            rotation_xyzw: [0.0, 0.0, 1.0, 0.0],
+                            ..PartTransform::IDENTITY
+                        },
+                    )],
+                },
+            );
+            assert!(matches!(
+                rejected_rotation,
+                Err(crate::articulated::ArticulatedError::WorkBudget)
+            ));
+            let after_rotation = world
+                .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+                .unwrap();
+            assert_eq!(after_rotation, before);
+            let timing = world.step();
+            assert_eq!(timing.substeps, 20);
+            assert_eq!(world.steps_run(), 1);
+            assert_eq!(
+                world
+                    .raycast_articulated(animal, [-1.0, 0.125, 0.125], [1.0, 0.0, 0.0], 4.0)
+                    .unwrap(),
+                before
+            );
+        }
+
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let grid = one_cell_grid(GlobalCell::new(0, 0, 0));
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                solver_substeps: 20,
+                ..Default::default()
+            });
+            let animal = world
+                .add_articulated_kinematic_parts(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![one_part(grid.clone(), 195, 1)],
+                    representation,
+                )
+                .unwrap();
+            let probe = world.add_body(BodySpec {
+                kind: BodyKind::Dynamic { ccd: false },
+                representation,
+                grid,
+                cell_m: 0.25,
+                density_kg_m3: 1_000.0,
+                mass_properties: None,
+                translation_m: [10.0; 3],
+                linvel_m_s: [0.0; 3],
+            });
+            world
+                .update_articulated_pose(
+                    animal,
+                    ArticulatedPose {
+                        topology_token: 1,
+                        base_pose_token: 0,
+                        pose_token: 1,
+                        parts: vec![(7, PartTransform::IDENTITY)],
+                    },
+                )
+                .unwrap();
+            let timing = world.step();
+            let state = world.body_state(probe);
+            assert_eq!(timing.substeps, 20);
+            assert_eq!(timing.normal_impulse_n_s, 0.0);
+            assert_eq!(state.linvel_m_s, [0.0; 3]);
+            assert_eq!(world.steps_run(), 1);
         }
     }
 

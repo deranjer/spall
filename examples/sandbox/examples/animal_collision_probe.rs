@@ -76,6 +76,7 @@ struct Summary {
 struct CaseResult {
     animal: String,
     representation: &'static str,
+    solver_substeps: usize,
     clips: usize,
     sampled_phases: usize,
     source_cells: usize,
@@ -125,18 +126,37 @@ struct TerrainTransitionCase {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
     let kinematic_parts = args.iter().any(|arg| arg == "--kinematic-parts");
+    let solver_substeps = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--solver-substeps="))
+        .map(str::parse::<usize>)
+        .transpose()?
+        .unwrap_or(1);
     if args.iter().filter(|arg| *arg == "--bounded").count() != 1
-        || args
-            .iter()
-            .any(|arg| arg != "--bounded" && arg != "--kinematic-parts")
+        || args.iter().any(|arg| {
+            arg != "--bounded"
+                && arg != "--kinematic-parts"
+                && !arg.starts_with("--solver-substeps=")
+        })
+        || !(1..=64).contains(&solver_substeps)
+        || (solver_substeps > 1 && !kinematic_parts)
     {
-        return Err("usage: animal-collision-probe --bounded [--kinematic-parts]".into());
+        return Err(
+            "usage: animal-collision-probe --bounded [--kinematic-parts] [--solver-substeps=1..64]"
+                .into(),
+        );
     }
     let mut results = Vec::new();
     for (name, bytes) in ANIMALS {
         let animal = load_animal(decode(bytes)?)?;
         for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
-            results.push(run_case(name, &animal, representation, kinematic_parts)?);
+            results.push(run_case(
+                name,
+                &animal,
+                representation,
+                kinematic_parts,
+                solver_substeps,
+            )?);
         }
     }
     let transition_representation_disagreements =
@@ -156,6 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::Value::Null
         },
         "transition_representation_disagreements": transition_representation_disagreements,
+        "solver_substeps": solver_substeps,
         "hardware": hardware(),
         "results": results,
     });
@@ -344,6 +365,7 @@ fn run_case(
     animal: &Animal,
     representation: Representation,
     kinematic_parts: bool,
+    solver_substeps: usize,
 ) -> Result<CaseResult, Box<dyn std::error::Error>> {
     let mut samples = pose_samples(animal)?;
     let root_translation = -animal.pivot_m;
@@ -370,6 +392,7 @@ fn run_case(
     for iteration in 0..(WARMUP + REPEATS) {
         let mut rebuild_world = PhysicsWorld::new(PhysicsConfig {
             gravity_m_s2: [0.0; 3],
+            solver_substeps,
             ..Default::default()
         });
         let mut elapsed = Vec::new();
@@ -390,6 +413,7 @@ fn run_case(
     // every sampled animation phase. The cell-union oracle is outside timing.
     let mut validation_world = PhysicsWorld::new(PhysicsConfig {
         gravity_m_s2: [0.0; 3],
+        solver_substeps,
         ..Default::default()
     });
     let mut ignored = Vec::new();
@@ -418,7 +442,10 @@ fn run_case(
                     translation_m: root_translation.to_array(),
                     ..PartTransform::IDENTITY
                 },
-            )?;
+            ).map_err(|error| format!(
+                "substep admission rejected sampled pose animal={} clip={} tick={} substeps={}: {error:?}",
+                animal.asset.name, sample.clip, sample.tick, solver_substeps
+            ))?;
             if transition.blocked {
                 return Err(format!(
                     "terrain-free transition unexpectedly blocked animal={} clip={} tick={} part={:?} toi={:?}",
@@ -492,6 +519,7 @@ fn run_case(
     // fixed step; then time a real source-cell removal and restoration.
     let mut world = PhysicsWorld::new(PhysicsConfig {
         gravity_m_s2: [0.0; 3],
+        solver_substeps,
         ..Default::default()
     });
     let mut ignored = Vec::new();
@@ -613,6 +641,7 @@ fn run_case(
             &samples,
             representation,
             root_translation,
+            solver_substeps,
         )?)
     } else {
         None
@@ -620,6 +649,7 @@ fn run_case(
     Ok(CaseResult {
         animal: name.to_owned(),
         representation: representation.label(),
+        solver_substeps,
         clips: animal.clips.len(),
         sampled_phases: samples.len(),
         source_cells: animal.cell_count,
@@ -659,6 +689,7 @@ fn measure_terrain_transitions(
     samples: &[PoseSample],
     representation: Representation,
     root_translation: Vec3,
+    solver_substeps: usize,
 ) -> Result<TerrainTransitionSummary, Box<dyn std::error::Error>> {
     let mut cases = Vec::new();
     let mut elapsed = Vec::new();
@@ -727,6 +758,7 @@ fn measure_terrain_transitions(
         )?;
         let mut world = PhysicsWorld::new(PhysicsConfig {
             gravity_m_s2: [0.0; 3],
+            solver_substeps,
             ..Default::default()
         });
         let mut attachment = Vec::new();
@@ -781,7 +813,10 @@ fn measure_terrain_transitions(
                 translation_m: root_translation.to_array(),
                 rotation_xyzw: root_rotation.to_array(),
             },
-        )?;
+        ).map_err(|error| format!(
+            "substep admission rejected terrain transition animal={} clip={} from={} to={} substeps={}: {error:?}",
+            animal.asset.name, to.clip, from.tick, to.tick, solver_substeps
+        ))?;
         if !transition.blocked {
             world.step();
             for ray in representative_rays(&target_cells) {
