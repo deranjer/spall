@@ -12,8 +12,8 @@ use std::collections::HashSet;
 
 use glam::DVec3;
 use spall_core::{
-    BRUSH_UNIT, BrushPoint, EntityId, GlobalCell, IdError, MaterialId, PlayerInput, SphereBrush,
-    Tick,
+    BRUSH_UNIT, BrushPoint, CreatureAllocatorSnapshotV1, EntityId, GlobalCell, IdError, MaterialId,
+    PlayerInput, SphereBrush, Tick, WorldId,
 };
 use spall_physics::PhysicsOrigin;
 use spall_physics::{CharacterParams, CharacterState};
@@ -73,6 +73,82 @@ pub struct SimulationConfig {
     pub column_water_worker: bool,
     pub vegetation: Option<spall_ecology::living::LivingState>,
     pub weather_seed: u64,
+}
+
+#[cfg(test)]
+mod creature_host_tests {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+    use crate::creatures::{
+        CreatureIntentWriter, CreatureRuleError, CreatureScheduleContext, CreatureScheduleSnapshot,
+        CreatureSchedulingRules,
+    };
+
+    struct CountingRules {
+        calls: AtomicUsize,
+        contexts: Mutex<Vec<CreatureScheduleContext>>,
+    }
+
+    impl CreatureSchedulingRules for CountingRules {
+        fn propose(
+            &self,
+            context: CreatureScheduleContext,
+            _snapshots: &[CreatureScheduleSnapshot],
+            _output: &mut CreatureIntentWriter,
+        ) -> Result<(), CreatureRuleError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.contexts.lock().unwrap().push(context);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn simulation_host_starts_empty_and_world_replacement_advances_epoch_without_resetting_counter()
+    {
+        let mut simulation =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        simulation
+            .initialize_creature_host(WorldId::from_u128(10))
+            .unwrap();
+        let catalog = crate::creatures::tests::FixtureCatalog::new();
+        simulation
+            .creatures
+            .as_mut()
+            .unwrap()
+            .register_validated(catalog.state(1, 1001), &catalog.view())
+            .unwrap();
+        let before = simulation.creature_allocator_snapshot().unwrap();
+        assert_eq!(before.world_epoch, 1);
+        assert_eq!(before.next_creature_id, 1);
+
+        let rules = CountingRules {
+            calls: AtomicUsize::new(0),
+            contexts: Mutex::new(Vec::new()),
+        };
+        let report = simulation.tick_with_creature_rules(&rules).unwrap();
+        let schedule = report.creature_schedule.unwrap();
+        assert_eq!(schedule.snapshot_count, 1);
+        assert!(schedule.accepted_intents.is_empty());
+        assert_eq!(rules.calls.load(Ordering::SeqCst), 1);
+        let context = rules.contexts.lock().unwrap()[0];
+        assert_eq!(context.tick, 1);
+        assert!(context.terrain_revision > 0);
+        assert_eq!(context.water_frame_revision, None);
+
+        let fresh =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        simulation.replace_world(fresh).unwrap();
+        let after = simulation.creature_allocator_snapshot().unwrap();
+        assert_eq!(after.world_epoch, 2);
+        assert_eq!(after.next_creature_id, before.next_creature_id);
+        let report = simulation.tick_with_creature_rules(&rules).unwrap();
+        assert_eq!(report.creature_schedule.unwrap().snapshot_count, 0);
+        assert_eq!(rules.calls.load(Ordering::SeqCst), 1);
+    }
 }
 
 impl SimulationConfig {
@@ -147,6 +223,9 @@ pub struct Simulation {
     footfall_candidates: Vec<crate::footprints::FootfallCandidate>,
     /// The world a reset replaced, being freed on another thread (see [`Retiring`]).
     retiring: Retiring,
+    /// Empty unless the owning application explicitly installs an actor host.
+    /// No public actor-registration or startup-spawn path exists in this slice.
+    creatures: Option<crate::creatures::CreatureHost>,
 }
 
 /// Frees a large value on a background thread. Dropping a full-size world (hundreds of thousands
@@ -219,6 +298,7 @@ impl Simulation {
             pipeline: EditPipeline::new(config.max_pending_intents, config.serialize_threshold),
             journal: JournalSink::new(),
             retiring: Retiring::default(),
+            creatures: None,
             tick: Tick::ZERO,
             next_control_seq: 1,
             next_damage_seq: 0,
@@ -286,6 +366,7 @@ impl Simulation {
             ),
             journal: JournalSink::new(),
             retiring: Retiring::default(),
+            creatures: None,
             tick,
             next_control_seq: 1,
             next_damage_seq: 0,
@@ -329,6 +410,9 @@ impl Simulation {
     /// Players are not carried over; the caller re-adds them. Staged edits of
     /// the old world are dropped.
     pub fn replace_world(&mut self, fresh: Simulation) -> Result<(), crate::world::WorldError> {
+        if let Some(creatures) = &self.creatures {
+            creatures.preview_reset_epoch()?;
+        }
         let (entity, volume, transaction, journal_seq) = self.world.registry().counters();
         let Simulation {
             mut world,
@@ -347,6 +431,9 @@ impl Simulation {
             transaction.max(f_transaction),
             journal_seq.max(f_journal_seq),
         )?;
+        if let Some(creatures) = &mut self.creatures {
+            creatures.reset_epoch()?;
+        }
         let off_thread = self.pipeline.stages_off_thread();
         let old_world = std::mem::replace(&mut self.world, world);
         let old_pipeline = std::mem::replace(&mut self.pipeline, pipeline);
@@ -381,6 +468,42 @@ impl Simulation {
     /// Waits until the world a reset replaced has been freed, re-raising a panic from its drop.
     pub fn wait_for_retired(&mut self) {
         self.retiring.finish();
+    }
+
+    /// Installs an empty, owner-thread creature host. Registration remains
+    /// crate-private until the atomic lifecycle/source-ownership slice.
+    pub fn initialize_creature_host(
+        &mut self,
+        world_id: WorldId,
+    ) -> Result<(), crate::creatures::CreatureHostInitError> {
+        if self.creatures.is_some() {
+            return Err(crate::creatures::CreatureHostInitError::AlreadyInitialized);
+        }
+        self.creatures = Some(crate::creatures::CreatureHost::new(world_id)?);
+        Ok(())
+    }
+
+    /// Restores only the in-memory actor ID/epoch counters. Actor records remain
+    /// empty; this does not restore or publish creatures.
+    pub fn restore_creature_allocator_snapshot(
+        &mut self,
+        snapshot: CreatureAllocatorSnapshotV1,
+    ) -> Result<(), crate::creatures::CreatureHostInitError> {
+        if self.creatures.is_some() {
+            return Err(crate::creatures::CreatureHostInitError::AlreadyInitialized);
+        }
+        self.creatures = Some(crate::creatures::CreatureHost::from_allocator_snapshot(
+            snapshot,
+        )?);
+        Ok(())
+    }
+
+    /// Captures the in-memory creature allocator only. This is not wired into
+    /// any checkpoint or durable recovery schema.
+    pub fn creature_allocator_snapshot(&self) -> Option<CreatureAllocatorSnapshotV1> {
+        self.creatures
+            .as_ref()
+            .map(crate::creatures::CreatureHost::allocator_snapshot)
     }
 
     /// Stages edits on a worker thread instead of inline on the tick thread (see
@@ -850,6 +973,23 @@ impl Simulation {
     /// Advances one server tick: run the edit pipeline, then step physics and
     /// refresh extracted body state.
     pub fn tick(&mut self) -> Result<TickReport, TickError> {
+        self.tick_with_creature_rules_inner(None)
+    }
+
+    /// Runs the optional statically linked game scheduling policy against a
+    /// bounded immutable host snapshot. Returned intents are proposals only;
+    /// this slice does not apply actor movement or lifecycle changes.
+    pub fn tick_with_creature_rules(
+        &mut self,
+        rules: &dyn crate::creatures::CreatureSchedulingRules,
+    ) -> Result<TickReport, TickError> {
+        self.tick_with_creature_rules_inner(Some(rules))
+    }
+
+    fn tick_with_creature_rules_inner(
+        &mut self,
+        rules: Option<&dyn crate::creatures::CreatureSchedulingRules>,
+    ) -> Result<TickReport, TickError> {
         self.tick = self
             .tick
             .checked_next()
@@ -916,6 +1056,16 @@ impl Simulation {
             .map_err(TickError::Snow)?;
         self.refresh_snow_from_report(&report);
         drop(vegetation_span);
+        if let (Some(creatures), Some(rules)) = (&mut self.creatures, rules) {
+            let terrain_revision = self.world.terrain().volume.next_revision().get();
+            let water_frame_revision = self.column_water.as_ref().map(|water| water.frame().seq);
+            report.creature_schedule = Some(creatures.schedule(
+                self.tick.get(),
+                terrain_revision,
+                water_frame_revision,
+                rules,
+            ));
+        }
         // Bodies float: buoyancy and drag from the column water, before the
         // physics step that integrates them.
         if let Some(water) = &self.column_water {

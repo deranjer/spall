@@ -130,6 +130,9 @@ pub struct TickReport {
     /// updated body poses. This is populated by `Simulation::tick` so server
     /// telemetry can report the physics portion without timing a replica.
     pub physics_duration: std::time::Duration,
+    /// Bounded actor scheduling proposals produced after terrain/water state
+    /// publication and before physics. Proposals are not lifecycle mutations.
+    pub creature_schedule: Option<crate::creatures::CreatureScheduleReport>,
     /// Stacked-column water work (ENG-167), when installed.
     pub column_water: Option<crate::column_water::ColumnWaterTickMetrics>,
     /// Buoyancy applied to bodies in the column water this tick.

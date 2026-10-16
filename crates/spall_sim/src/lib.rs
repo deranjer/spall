@@ -41,6 +41,7 @@ pub mod collider;
 pub mod column_water;
 pub mod commit;
 pub mod contact_damage;
+pub mod creatures;
 pub mod dormancy;
 pub mod fixtures;
 pub mod footprints;
@@ -72,6 +73,13 @@ pub use commit::{CommitError, CommitOutcome, Committed};
 pub use contact_damage::{
     ContactDamageConfig, ContactDamageMaterialProfile, ContactDamagePlan, ContactDamagePolicy,
     ContactEvent, PlannedDamage,
+};
+pub use creatures::{
+    CreatureHostInitError, CreatureIntent, CreatureIntentKind, CreatureIntentWriter,
+    CreatureRuleError, CreatureScheduleContext, CreatureScheduleError, CreatureScheduleReport,
+    CreatureScheduleSnapshot, CreatureScheduleToken, CreatureSchedulingRules,
+    MAX_CREATURE_HOST_RECORDS, MAX_CREATURE_SCHEDULE_BINDINGS, MAX_CREATURE_SCHEDULE_INTENTS,
+    MAX_CREATURE_SCHEDULE_SNAPSHOTS,
 };
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
