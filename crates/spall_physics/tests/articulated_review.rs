@@ -522,7 +522,7 @@ fn empty_source_parts_retire_atomically_without_moving_survivors_then_last_part_
 }
 
 #[test]
-fn parent_part_retirement_with_surviving_child_is_rejected_before_ownership_or_queries_change() {
+fn parent_retirement_flattens_survivor_pose_and_preserves_query_identity_for_later_edits() {
     for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
         let mut world = world();
         let source = vec![
@@ -531,29 +531,102 @@ fn parent_part_retirement_with_surviving_child_is_rejected_before_ownership_or_q
                 2,
                 Some(1),
                 [0, 0, 0],
-                vec![true],
+                vec![true, true],
                 PartTransform {
                     translation_m: [4.0, 0.0, 0.0],
                     ..PartTransform::IDENTITY
                 },
             ),
         ];
+        let quarter_turn = [
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ];
         let id = world
-            .add_dynamic_corpse_aggregate(
-                [0.0, 0.0, 0.0],
+            .add_articulated_kinematic_parts(
+                [10.0, 3.0, 0.0],
                 PartTransform::IDENTITY.rotation_xyzw,
                 1,
-                source,
+                source.clone(),
                 representation,
-                |_| 1_000.0,
             )
             .unwrap();
+        world.step();
+        let death_child = PartTransform {
+            translation_m: [4.0, 1.0, 0.0],
+            ..source[1].local_transform
+        };
+        let death_root = PartTransform {
+            translation_m: [10.0, 3.0, 0.0],
+            rotation_xyzw: quarter_turn,
+        };
+        world
+            .update_articulated_pose_with_swept_root_pose(
+                id,
+                ArticulatedPose {
+                    topology_token: 1,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![(1, source[0].local_transform), (2, death_child)],
+                },
+                death_root,
+            )
+            .unwrap();
+        world.step();
+        world
+            .transfer_articulated_to_dynamic_corpse(id, 1, 1, |_| 1_000.0)
+            .unwrap();
         let root_before = world
-            .raycast_articulated(id, [0.5, 0.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .raycast_articulated(id, [9.5, 3.5, -2.0], [0.0, 0.0, 1.0], 4.0)
             .unwrap();
+        assert_eq!(root_before.part_id, 1);
         let child_before = world
-            .raycast_articulated(id, [4.5, 0.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .raycast_articulated(id, [8.5, 7.5, -2.0], [0.0, 0.0, 1.0], 4.0)
             .unwrap();
+        let child_second_before = world
+            .raycast_articulated(id, [8.5, 8.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        assert_eq!(
+            (child_before.cell, child_second_before.cell),
+            ([0, 0, 0], [1, 0, 0])
+        );
+        let old_state = world.articulated_body_state(id);
+        assert!(
+            old_state.angvel_rad_s[2].abs() > 1e-4,
+            "rotation required: {old_state:?}"
+        );
+        let old_sources = vec![
+            source[0].clone(),
+            SourcePart {
+                local_transform: death_child,
+                ..source[1].clone()
+            },
+        ];
+        let old_mass = articulated_mass_properties(
+            &old_sources,
+            &[source[0].local_transform, death_child],
+            |_| 1_000.0,
+        )
+        .unwrap();
+        let old_com_world = [
+            10.0 - old_mass.com_m[1],
+            3.0 + old_mass.com_m[0],
+            old_mass.com_m[2],
+        ];
+        let child_sources = [SourcePart {
+            parent_id: None,
+            local_transform: death_child,
+            ..source[1].clone()
+        }];
+        let child_mass =
+            articulated_mass_properties(&child_sources, &[death_child], |_| 1_000.0).unwrap();
+        let child_com_world = [
+            10.0 - child_mass.com_m[1],
+            3.0 + child_mass.com_m[0],
+            child_mass.com_m[2],
+        ];
         let empty = OccupancyGrid::from_solid_mask(
             GlobalCell::new(0, 0, 0),
             [1, 1, 1],
@@ -561,29 +634,112 @@ fn parent_part_retirement_with_surviving_child_is_rejected_before_ownership_or_q
             vec![MaterialId::AIR],
         )
         .unwrap();
-        assert_eq!(
-            world
-                .rebuild_dynamic_corpse_part_grid(id, 1, 2, 1, 7, 8, empty, |_| 1_000.0)
-                .unwrap_err(),
-            spall_physics::ArticulatedError::CannotRetireParentWithSurvivors
-        );
-        assert_eq!(world.articulated_collider_count(id), 2);
+        let retired = world
+            .rebuild_dynamic_corpse_part_grid(id, 1, 2, 1, 7, 8, empty, |_| 1_000.0)
+            .unwrap();
+        assert!(matches!(
+            retired,
+            spall_physics::CorpseEditOutcome::PartRetired { .. }
+        ));
+        assert_eq!(world.articulated_collider_count(id), 1);
         assert_eq!(world.articulated_rigid_body_count(id), 1);
-        assert_eq!(
+        assert!(
             world
-                .raycast_articulated(id, [0.5, 0.5, -2.0], [0.0, 0.0, 1.0], 4.0)
-                .unwrap(),
-            root_before
+                .raycast_articulated(id, [9.5, 3.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+                .is_err()
+        );
+        let child_after = world
+            .raycast_articulated(id, [8.5, 7.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        let child_second_after = world
+            .raycast_articulated(id, [8.5, 8.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        assert_eq!(
+            (
+                child_after.part_id,
+                child_after.volume_id,
+                child_after.source_revision,
+                child_after.cell,
+                child_after.pose_token
+            ),
+            (
+                child_before.part_id,
+                child_before.volume_id,
+                child_before.source_revision,
+                child_before.cell,
+                child_before.pose_token
+            )
         );
         assert_eq!(
-            world
-                .raycast_articulated(id, [4.5, 0.5, -2.0], [0.0, 0.0, 1.0], 4.0)
-                .unwrap(),
-            child_before
+            (
+                child_second_after.part_id,
+                child_second_after.volume_id,
+                child_second_after.source_revision,
+                child_second_after.cell,
+                child_second_after.pose_token
+            ),
+            (
+                child_second_before.part_id,
+                child_second_before.volume_id,
+                child_second_before.source_revision,
+                child_second_before.cell,
+                child_second_before.pose_token
+            )
+        );
+        assert_eq!(
+            (
+                child_after.topology_token,
+                child_second_after.topology_token
+            ),
+            (2, 2)
         );
         assert_eq!(
             (child_before.part_id, child_before.volume_id),
             (2, VolumeId::new(102).unwrap())
+        );
+        let after_retirement = world.articulated_body_state(id);
+        assert_eq!(after_retirement.angvel_rad_s, old_state.angvel_rad_s);
+        assert_vec_close(
+            point_velocity(after_retirement, child_com_world, [8.5, 8.5, 0.5]),
+            point_velocity(old_state, old_com_world, [8.5, 8.5, 0.5]),
+            1e-3,
+        );
+        let old_child_momentum = [
+            point_velocity(old_state, old_com_world, [8.5, 7.5, 0.5]),
+            point_velocity(old_state, old_com_world, [8.5, 8.5, 0.5]),
+        ]
+        .into_iter()
+        .fold([0.0; 3], |mut total, velocity| {
+            for axis in 0..3 {
+                total[axis] += 1_000.0 * velocity[axis];
+            }
+            total
+        });
+        let surviving_momentum = after_retirement
+            .linvel_m_s
+            .map(|v| f64::from(v) * child_mass.mass_kg);
+        assert_vec_close(surviving_momentum, old_child_momentum, 0.1);
+        let edited = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [2, 1, 1],
+            vec![false, true],
+            vec![MaterialId::AIR, MaterialId(1)],
+        )
+        .unwrap();
+        world
+            .rebuild_dynamic_corpse_part_grid(id, 2, 3, 2, 7, 8, edited, |_| 1_000.0)
+            .unwrap();
+        let surviving_child = world
+            .raycast_articulated(id, [8.5, 8.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        assert_eq!(
+            (
+                surviving_child.part_id,
+                surviving_child.volume_id,
+                surviving_child.cell,
+                surviving_child.source_revision
+            ),
+            (2, VolumeId::new(102).unwrap(), [1, 0, 0], 8)
         );
     }
 }

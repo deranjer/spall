@@ -44,13 +44,18 @@ angular velocity stay fixed, while COM linear velocity changes by
 The API returns the exact old-minus-new source-cell mass. Additions and material
 replacement are rejected until an incoming momentum policy exists; the adapter
 does not silently count them as removed material or manufacture their momentum.
-Mass and inertia are rebuilt before shape mutation. An empty leaf part retires
-only its collider and source ownership. A parent part with surviving descendants
-is rejected before mutation because reparenting/frozen-pose metadata has not
-been defined. Removing the final part retires the aggregate body. `PART`
-hierarchy is pose structure only: there are no inferred cross-part bonds or
-fracture connectivity. Selective fracture remains gated on an explicit
-connectivity/bond policy and source-volume ownership rule.
+Mass and inertia are rebuilt before shape mutation. An empty part retires only
+its collider and source ownership. Before committing that retirement, every
+surviving part is prepared with `parent_id=None` and its already-resolved
+assembly pose as its root-local pose. This flattens all frozen hierarchy
+metadata without moving collider geometry, world cells, source IDs, or query
+ownership. The edit preserves the surviving point-velocity field and its
+linear momentum; a regression retires a rotated parent, verifies the remaining
+child's exact query identity and world location, then successfully edits that
+child. Removing the final part retires the aggregate body. `PART` hierarchy is
+pose structure only: there are no inferred cross-part bonds or fracture
+connectivity. Selective fracture remains gated on an explicit connectivity/bond
+policy and source-volume ownership rule.
 
 ## Authored-animal measurements
 
@@ -90,8 +95,9 @@ sampled motion, post-transfer source queries, dynamic pose-update rejection,
 invalid-density edit rejection before mutation, additions/material changes
 rejected before mutation, both collider representations, exact mass deltas,
 asymmetric rotating-body point-velocity and remaining/removed momentum checks,
-empty leaf removal, final aggregate retirement, and rejected parent removal
-with child query identity intact. A coordinator-added independent closed-form
+empty leaf and parent removal, flattened survivor metadata, preserved child
+query identity and momentum, subsequent child edit, and final aggregate
+retirement. A coordinator-added independent closed-form
 oracle checks mass, COM, and every entry of the 3×3 inertia tensor for a rotated
 negative-origin box plus a nested mixed-density cube under reversed input
 order.
@@ -113,8 +119,8 @@ bounded physics candidate and must be gated separately.
 
 - `cargo check -p spall_physics` — passed.
 - `cargo test -p spall_physics --test articulated_review -- --nocapture` — 13 scenarios passed across both representations.
-- `cargo test -p spall_physics --all-targets` — 90 passed, 1 ignored; 13 articulated regressions and the independent tensor oracle also passed.
+- `cargo test -p spall_physics --all-targets` — 90 passed, 1 ignored; all 13 articulated regressions and the independent tensor oracle passed after the flattening change.
 - `cargo check -p sandbox --example animal-collision-probe` — passed.
 - `cargo run --quiet -p sandbox --release --example animal-collision-probe -- --corpse-bounded` — 18 live-rig transfer/edit cases completed and raw JSON saved.
 - `cargo fmt --package spall_physics --package sandbox -- --check` — passed.
-- `cargo clippy -p spall_physics --all-targets -- -D warnings` — currently blocked by `needless_range_loop` in the separately committed coordinator test `tests/corpse_mass_review.rs:17`. `--lib` and `--test articulated_review` strict clippy checks pass.
+- `cargo clippy -p spall_physics --all-targets -- -D warnings` — passed after coordinator commit `4f34e19` fixed the independent oracle lint.

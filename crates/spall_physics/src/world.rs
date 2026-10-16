@@ -2133,14 +2133,6 @@ impl PhysicsWorld {
         {
             return Err(ArticulatedError::StaleTopology);
         }
-        if new_grid.solid_count() == 0
-            && assembly
-                .parts
-                .iter()
-                .any(|part| part.parent_id == Some(part_id))
-        {
-            return Err(ArticulatedError::CannotRetireParentWithSurvivors);
-        }
         let original_parts = assembly.parts.clone();
         let mut removed_mass = 0.0;
         let mut invalid_density = false;
@@ -2201,12 +2193,15 @@ impl PhysicsWorld {
                 .filter(|(i, _)| *i != index_part)
                 .map(|(_, p)| SourcePart {
                     part_id: p.part_id,
-                    parent_id: p.parent_id,
+                    // Frozen corpse hierarchy is pose metadata only. Flatten
+                    // every surviving part to its already-resolved assembly
+                    // pose so removing a parent cannot orphan descendants.
+                    parent_id: None,
                     volume_id: p.volume_id,
                     source_revision: p.source_revision,
                     grid: p.grid.clone(),
                     cell_m: p.cell_m,
-                    local_transform: p.local_pose,
+                    local_transform: p.assembly_pose,
                 })
                 .collect::<Vec<_>>();
             let poses = remaining
@@ -2232,6 +2227,10 @@ impl PhysicsWorld {
             self.bodies[body].set_angvel(angular, true);
             let a = self.articulated.get_mut(&id.0).unwrap();
             a.parts.remove(index_part);
+            for part in &mut a.parts {
+                part.parent_id = None;
+                part.local_pose = part.assembly_pose;
+            }
             a.topology_token = new_topology_token;
             self.entries[entry_index(id.0, self.id_namespace)].collider = a.parts[0].collider;
             self.entries[entry_index(id.0, self.id_namespace)].mass_properties = Some(mass);
