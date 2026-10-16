@@ -98,6 +98,18 @@ blocking, source-cell damage resolution, and population costs remain separate
 gates. No runtime lifecycle, corpse aggregate, networking, storage or UI was
 implemented.
 
+A separate fast-angular impulse case remains unproven. The configured
+conservative bound rejects a 90-degree part-local turn for the one-cell probe
+fixture: its Rapier local AABB bound is 3.464 m, so `radius × angle` is 5.44 m,
+above the 1.60 m budget at 64 substeps. A 20-degree turn is admitted, but the
+attempted probe placement did not contact the moving collider and is not
+response evidence. The authored 10-degree root-yaw transition matrix is
+validated for sweep/query parity and admission, but it does not measure a
+dynamic impact. Thus the translation result does not close the angular-contact
+gate; the next experiment needs a contact fixture whose actual native and
+merged collision envelopes are independently verified before measuring solver
+response.
+
 Checks run:
 
 - `cargo test -p spall_physics --lib --test articulated_review` — 83 passed,
