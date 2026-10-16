@@ -1978,3 +1978,20 @@ Measure actual seed-1/4096-cell world, all clips and global solver-substep costs
 full fixed/dynamic/body/collider counts; no population target is accepted here.
 No runtime actor/network/storage/UI changes. Coordinator owns review/integration
 and tracking; Luna Medium worker uses its dedicated worktree.
+ENG-212/213 coordinator acceptance (2026-10-16): integrated through 30e859b for
+bounded CPU aggregate/locality feasibility. Checks pass 242 tests, 7 ignored,
+workspace all-target/all-feature compile, strict lint, format and diff checks.
+Eighteen corpse cases and candidate/default 38,520 rays + 66 misses pass.
+Actual 1024 m run retains 123892 fixed colliders and 60 accepted animal phases.
+No shipping fracture/runtime/network/recovery/weather population acceptance.
+Evidence: reports/ENG-212-213-integration.md. Next unblocked: ENG-214.
+
+## ENG-214: corpse connectivity, fracture and source split ownership
+
+After reviewed ENG-212, define exact material connectivity or authored source
+bonds without inferring anatomy from PART, approximate topology or anchors.
+Preserve source VolumeIds/cell coordinates/materials/revisions across atomic
+one-to-many component ownership; no revoxelization or per-part auto-explosion.
+Prove prepared/stale isolation, conservation, mass/motion/query identity and
+actual asset connectivity with independent CPU cases. Ambiguous geometry fails
+closed. Host/protocol/store/runtime interfaces depend on reviewed provenance.

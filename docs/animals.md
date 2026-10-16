@@ -189,7 +189,10 @@ limits are recorded in [ENG-210 integration](reports/ENG-210-integration.md).
 The original one-step counterexamples remain retained as diagnostic evidence;
 the new substep candidate does not make the default one-step solver continuous.
 
-Next prerequisite: ENG-212 editable multi-volume corpse aggregate feasibility.
+ENG-212's bounded editable dynamic aggregate and ENG-213's full-world locality
+are integrated; [combined evidence](reports/ENG-212-213-integration.md) records
+checks and actual 1024 m measurements. Next: ENG-214 explicit corpse connectivity
+and source-cell split ownership.
 Live spawning, navigation, multiplayer/recovery, far-origin precision and
 population capacity remain unproven. The requested 1 km weather/animal launch
 is held for fully simulated animals, rather than the visual zoo.
