@@ -116,6 +116,7 @@ struct TerrainTransitionCase {
     blocked: bool,
     hit_part_id: Option<u32>,
     hit_time_of_impact: Option<f32>,
+    independent_clearance_proven: bool,
     complete_update_query_step_us: f64,
     source_part_count: usize,
     terrain_collider_count: usize,
@@ -138,6 +139,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             results.push(run_case(name, &animal, representation, kinematic_parts)?);
         }
     }
+    let transition_representation_disagreements =
+        validate_transition_parity(&results, kinematic_parts)?;
     let mismatch_count = results
         .iter()
         .map(|result| result.ray_mismatches)
@@ -147,6 +150,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rig": if kinematic_parts { "one_position_kinematic_body_per_source_part" } else { "single_position_kinematic_root_with_part_colliders" },
         "physics": "same spall_physics PhysicsWorld Rapier adapter",
         "source": "authored SPVX trout/crow/deer, exact 6.25 cm cells, all clips/phases",
+        "terrain_transition_contract": if kinematic_parts {
+            serde_json::Value::String("continuous casts of every occupied source-cell Cuboid; linear part-body origin and shortest-arc rotation; 10 degree root yaw; bounded by one million cell-terrain casts".to_owned())
+        } else {
+            serde_json::Value::Null
+        },
+        "transition_representation_disagreements": transition_representation_disagreements,
         "hardware": hardware(),
         "results": results,
     });
@@ -158,6 +167,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     Ok(())
+}
+
+fn validate_transition_parity(
+    results: &[CaseResult],
+    kinematic_parts: bool,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    if !kinematic_parts {
+        return Ok(0);
+    }
+    let mut disagreement_count = 0;
+    for animal in ["trout", "crow", "deer"] {
+        let native = results
+            .iter()
+            .find(|result| result.animal == animal && result.representation == "native_voxels")
+            .and_then(|result| result.terrain_transition_sweeps.as_ref())
+            .ok_or_else(|| format!("missing NativeVoxels transition matrix for {animal}"))?;
+        let merged = results
+            .iter()
+            .find(|result| result.animal == animal && result.representation == "merged_cuboids")
+            .and_then(|result| result.terrain_transition_sweeps.as_ref())
+            .ok_or_else(|| format!("missing MergedCuboids transition matrix for {animal}"))?;
+        if native.cases.len() != merged.cases.len() {
+            return Err(format!("transition matrix length differs for {animal}").into());
+        }
+        for (native_case, merged_case) in native.cases.iter().zip(&merged.cases) {
+            if native_case.clip != merged_case.clip
+                || native_case.from_tick != merged_case.from_tick
+                || native_case.to_tick != merged_case.to_tick
+            {
+                return Err(format!("transition matrix ordering differs for {animal}").into());
+            }
+            if native_case.blocked != merged_case.blocked {
+                disagreement_count += 1;
+            }
+        }
+    }
+    if disagreement_count != 0 {
+        return Err(format!(
+            "continuous source-cell transition casts disagree between collider representations in {disagreement_count} cases"
+        )
+        .into());
+    }
+    for &(from_tick, to_tick) in &[(0.0, 12.0), (24.0, 36.0)] {
+        for representation in ["native_voxels", "merged_cuboids"] {
+            let accepted = results.iter().any(|result| {
+                result.animal == "deer"
+                    && result.representation == representation
+                    && result
+                        .terrain_transition_sweeps
+                        .as_ref()
+                        .is_some_and(|summary| {
+                            summary.cases.iter().any(|case| {
+                                case.clip == "walk"
+                                    && case.from_tick == from_tick
+                                    && case.to_tick == to_tick
+                                    && !case.blocked
+                            })
+                        })
+            });
+            if !accepted {
+                return Err(format!(
+                    "deer walk {from_tick}->{to_tick} must be accepted by cell-union sweep for {representation}"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(disagreement_count)
 }
 
 fn load_animal(asset: Asset) -> Result<Animal, Box<dyn std::error::Error>> {
@@ -626,6 +703,15 @@ fn measure_terrain_transitions(
         }
         let floor_top = min.y - 0.02;
         let wall_x = max.x + 0.02;
+        let independent_clearance_proven =
+            independent_cell_union_clearance(&from.ref_cells, &target_cells, floor_top, wall_x);
+        if !independent_clearance_proven {
+            return Err(format!(
+                "independent continuous source-cell clearance could not certify {} {} {}->{}",
+                animal.asset.name, to.clip, from.tick, to.tick
+            )
+            .into());
+        }
         let material = MaterialId(1);
         let floor_grid = OccupancyGrid::from_solid_mask(
             GlobalCell::new(0, 0, 0),
@@ -724,6 +810,7 @@ fn measure_terrain_transitions(
             blocked: transition.blocked,
             hit_part_id: transition.part_id,
             hit_time_of_impact: transition.time_of_impact,
+            independent_clearance_proven,
             complete_update_query_step_us: duration.as_secs_f64() * 1_000_000.0,
             source_part_count: animal.parts.len(),
             terrain_collider_count: 2,
@@ -738,6 +825,119 @@ fn measure_terrain_transitions(
         complete_transition_query_step: summarize(&elapsed),
         cases,
     })
+}
+
+/// Conservative continuous proof against the two infinite planes containing
+/// the finite floor and wall fixtures in this workload. For each occupied
+/// authored cell, the OBB's exact support extent is evaluated at the midpoint
+/// of an interval. Every point in that cell can move at most
+/// `(|linear origin delta| + angular delta * radius) * interval_half_width`
+/// from the midpoint. If both plane clearances exceed that bound, the complete
+/// interval is proven clear. Otherwise the interval is bisected to depth 24;
+/// failure to prove is conservatively reported as not clear. This independent
+/// oracle is not a finite-sample claim and can only overblock; it does not use
+/// Rapier's nonlinear cast implementation.
+fn independent_cell_union_clearance(
+    start_cells: &[RefCell],
+    end_cells: &[RefCell],
+    floor_top: f32,
+    wall_x: f32,
+) -> bool {
+    let end_by_cell: BTreeMap<_, _> = end_cells
+        .iter()
+        .map(|cell| ((cell.part_id, cell.cell), *cell))
+        .collect();
+    start_cells.iter().all(|start| {
+        let Some(end) = end_by_cell.get(&(start.part_id, start.cell)) else {
+            return false;
+        };
+        let local_center = (Vec3::new(
+            start.cell[0] as f32,
+            start.cell[1] as f32,
+            start.cell[2] as f32,
+        ) + Vec3::splat(0.5))
+            * CELL_M;
+        let pivot_start = start.center - start.rotation * local_center;
+        let pivot_end = end.center - end.rotation * local_center;
+        let angular_delta = (end.rotation * start.rotation.inverse()).to_scaled_axis();
+        let reach = local_center.length() + (3.0_f32).sqrt() * CELL_M * 0.5;
+        prove_cell_interval_clear(
+            pivot_start,
+            pivot_end,
+            start.rotation,
+            angular_delta,
+            local_center,
+            reach,
+            floor_top,
+            wall_x,
+            0.0,
+            1.0,
+            0,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_cell_interval_clear(
+    pivot_start: Vec3,
+    pivot_end: Vec3,
+    rotation_start: Quat,
+    angular_delta: Vec3,
+    local_center: Vec3,
+    reach: f32,
+    floor_top: f32,
+    wall_x: f32,
+    t0: f32,
+    t1: f32,
+    depth: u8,
+) -> bool {
+    let mid = (t0 + t1) * 0.5;
+    let pivot = pivot_start.lerp(pivot_end, mid);
+    let rotation = (Quat::from_scaled_axis(angular_delta * mid) * rotation_start).normalize();
+    let center = pivot + rotation * local_center;
+    let x_axis = rotation * Vec3::X;
+    let y_axis = rotation * Vec3::Y;
+    let z_axis = rotation * Vec3::Z;
+    let half = CELL_M * 0.5;
+    let radius_y = half * (x_axis.y.abs() + y_axis.y.abs() + z_axis.y.abs());
+    let radius_x = half * (x_axis.x.abs() + y_axis.x.abs() + z_axis.x.abs());
+    let floor_clearance = center.y - radius_y - floor_top;
+    let wall_clearance = wall_x - center.x - radius_x;
+    let half_interval = (t1 - t0) * 0.5;
+    let path_bound = (pivot_end - pivot_start).length() * half_interval
+        + angular_delta.length() * reach * half_interval;
+    const FLOAT_MARGIN_M: f32 = 2.0e-5;
+    if floor_clearance.min(wall_clearance) > path_bound + FLOAT_MARGIN_M {
+        return true;
+    }
+    if depth >= 24 {
+        return false;
+    }
+    prove_cell_interval_clear(
+        pivot_start,
+        pivot_end,
+        rotation_start,
+        angular_delta,
+        local_center,
+        reach,
+        floor_top,
+        wall_x,
+        t0,
+        mid,
+        depth + 1,
+    ) && prove_cell_interval_clear(
+        pivot_start,
+        pivot_end,
+        rotation_start,
+        angular_delta,
+        local_center,
+        reach,
+        floor_top,
+        wall_x,
+        mid,
+        t1,
+        depth + 1,
+    )
 }
 
 fn rebuild(

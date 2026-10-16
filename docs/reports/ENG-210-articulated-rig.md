@@ -294,3 +294,71 @@ also included
 and the unchanged
 `cargo test -p spall_physics articulated_part_body_fast_single_step_contact_is_measured_without_sweep
 -- --nocapture` (which prints CCD-off/on measurements for both shapes).
+
+### Representation mismatch resolution: continuous source-cell sweep
+
+The two NativeVoxels-only deer blocks above were caused by the pinned query
+implementation, not by a difference in occupied animal cells. Rapier 0.35.3
+re-exports Parry 0.30.2. Its `nonlinear_shape_cast_voxels_shape.rs` explicitly
+states that rotating moving Voxels are not supported: the code assumes the
+moving voxel shape is translational and approximates the other shape's AABB
+from endpoint orientations. The original aggregate-collider mismatch remains
+preserved, unchanged, in
+[pre-cell-oracle raw workload](ENG-210-animal-transition-workload-aggregate-cast-before-cell-oracle.json).
+
+The terrain transition implementation now casts every occupied source grid
+cell as a temporary Cuboid query shape. Each cell follows its owning source
+part body's linearly interpolated origin and the same shortest-arc angular
+delta used by Rapier's `RigidBodyPosition::pose_errors` when deriving a
+position-based kinematic target velocity. Its rotation center is the source
+part body origin, including negative grid origins. The live assembly is still
+one kinematic body and exact NativeVoxels/MergedCuboids collider per source
+part; query Cuboids do not become bodies, alter source IDs, or replace live
+colliders. The combined update remains all-or-nothing. Requests exceeding one
+million occupied-cell × fixed-terrain-collider casts reject with
+`WorkBudget` before any body/token is staged.
+
+The actual-asset probe independently validates the complete 48-case matrix
+against a continuous source-cell clearance oracle. It evaluates each cell's
+oriented-box support extent at each interval midpoint and subtracts a motion
+bound for every point in that cell:
+`(|part-origin delta| + angular delta × (cell-center radius + cell radius)) ×
+interval half-width`. A clear interval is certified only when both fixture
+plane gaps exceed that bound plus 20 µm; otherwise it bisects, to depth 24,
+and reports inconclusive as not clear. The oracle uses the authored start/end
+cell transforms and is separate from Rapier's nonlinear cast path. It treats
+the floor and wall planes as infinite, so the certificate is conservative for
+the finite fixtures and can overblock; it is not a discrete-time sample
+claim. Parry's cast remains an iterative numerical query (GJK distance
+tolerance and TOI bisection), so the independent plane certificate is the
+continuous no-contact check for these cases.
+
+All 48 authored same-clip transitions, with 10-degree root yaw, were certified
+clear by that oracle and accepted by the cell-union sweep. Both deer walk
+0→12 (part 8 in the former Native aggregate cast) and 24→36 (part 6) now agree
+as accepted in NativeVoxels and MergedCuboids. Cross-representation outcome
+disagreements: 0. The candidate retained all 38,520 independent source-cell
+ray checks and 66 miss checks, with zero mismatches and timed misses; the
+default-root run retained the same matrix. Current raw files are
+[cell-union candidate](ENG-210-animal-transition-workload-cell-union.json)
+and [default path](ENG-210-animal-transition-workload-cell-union-default.json).
+
+Single-animal full transition + source-ray + physics-step p50/p95 µs for the
+current run: trout Native 548.6/622.1 and Merged 1460.1/1543.0; crow Native
+1075.3/1111.4 and Merged 2611.1/2654.4; deer Native 2246.1/2421.1 and Merged
+4948.2/5072.9. This is much more expensive than the former aggregate cast;
+it is a bounded correctness candidate, not a population-scale performance
+acceptance, and no population target has been agreed. Counts remain 5/6/9
+source parts and colliders, 6/7/10 candidate bodies, and 136/217/285 occupied
+cells for trout/crow/deer; the queried terrain has two colliders in each case.
+
+The same-commit verification reran the full physics and articulated review
+suites (81 passed, 1 existing ignored, plus all 8 review cases), strict
+all-target physics Clippy, and strict probe Clippy. The release actual-asset
+candidate and default probes both completed, including the new representation
+parity and deer-pair assertions. Rapier's pose velocity source computes
+`(next.rotation * current.rotation.inverse()).to_scaled_axis()`, matching the
+implemented shortest-arc angular path, including its chosen axis at π. The
+original fast-impact and source-cell damage-attribution gates remain failed or
+unaccepted as described above; this sweep resolves only the representation
+mismatch.

@@ -1799,10 +1799,12 @@ impl PhysicsWorld {
     /// Sweeps every exact source-part collider through its declared one-tick
     /// world-space interpolation (linear translation and shortest-arc
     /// rotation), including an optional root translation/rotation, against
-    /// current fixed terrain. Rapier/Parry nonlinear casts cover rotation; a
-    /// terrain hit rejects the complete sample without staging any body or
-    /// token. This contract intentionally does not claim joint-constrained
-    /// intermediate poses or solver-driven terrain response.
+    /// current fixed terrain. Each occupied source cell is swept as a Cuboid
+    /// query shape so Parry's translating-only moving-Voxels nonlinear cast
+    /// path is not used for rotating NativeVoxels parts. A terrain hit rejects
+    /// the complete sample without staging any body or token. This contract
+    /// does not claim joint-constrained intermediate poses or solver-driven
+    /// terrain response.
     pub fn update_articulated_pose_with_swept_root_pose(
         &mut self,
         id: ArticulatedBodyId,
@@ -1908,6 +1910,11 @@ impl PhysicsWorld {
             .iter()
             .map(|part| part.part_id)
             .collect::<Vec<_>>();
+        let source_parts = assembly
+            .parts
+            .iter()
+            .map(|part| (part.body, part.grid.clone(), part.cell_m))
+            .collect::<Vec<_>>();
 
         // Query freshness is part of this gate: voxel edits/removals made since
         // the previous step must affect this same transition decision.
@@ -1924,31 +1931,69 @@ impl PhysicsWorld {
             })
             .collect();
         let mut earliest: Option<(u32, f32)> = None;
-        for (part_id, (_, collider_handle, start, end, _)) in part_ids.iter().zip(&targets) {
-            let delta = end.translation - start.translation;
-            let delta_rotation = end.rotation * start.rotation.inverse();
-            let motion = rapier3d::parry::query::NonlinearRigidMotion::new(
-                *start,
-                Vector::ZERO,
-                delta,
-                delta_rotation.to_scaled_axis(),
+        // Parry 0.30.2 explicitly treats a moving `Voxels` shape as translation
+        // only during nonlinear casts and builds an end AABB from endpoint
+        // orientations. A rotating off-center source grid therefore is not a
+        // sound broadphase/cast primitive for this operation. Cast each exact
+        // occupied source cell instead. This is still one source-part body and
+        // one live collider; cell cuboids exist only as bounded query shapes.
+        // Their center follows the same linear part-origin / shortest-arc
+        // rotation path as the kinematic body, so their union is the source
+        // grid at every time (up to Parry's documented iterative TOI tolerance).
+        const MAX_TRANSITION_CELL_CASTS: usize = 1_000_000;
+        let total_cells = source_parts
+            .iter()
+            .map(|(_, grid, _)| grid.solid_count() as usize)
+            .sum::<usize>();
+        if total_cells.saturating_mul(terrain_colliders.len()) > MAX_TRANSITION_CELL_CASTS {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        for ((part_id, (_, _, collider_start, _, body_target)), (body, grid, cell_m)) in
+            part_ids.iter().zip(&targets).zip(&source_parts)
+        {
+            let body_start = *self.bodies[*body].position();
+            let body_delta = body_target.translation - body_start.translation;
+            let delta_rotation = body_target.rotation * body_start.rotation.inverse();
+            let angular_delta = delta_rotation.to_scaled_axis();
+            let origin = grid.origin();
+            let grid_origin = Vector::new(
+                origin.x as f32 * *cell_m,
+                origin.y as f32 * *cell_m,
+                origin.z as f32 * *cell_m,
             );
-            let shape = self.colliders[*collider_handle].shape();
-            for &terrain_handle in &terrain_colliders {
-                let only_terrain = |handle: ColliderHandle, _: &Collider| handle == terrain_handle;
-                let filter = QueryFilter::default().predicate(&only_terrain);
-                let queries = self.broad_phase.as_query_pipeline(
-                    self.narrow_phase.query_dispatcher(),
-                    &self.bodies,
-                    &self.colliders,
-                    filter,
+            let half = Vector::splat(*cell_m * 0.5);
+            let cell_shape = rapier3d::prelude::Cuboid::new(half);
+            for [x, y, z] in grid.solid_indices() {
+                let cell_center = Vector::new(
+                    (x as f32 + 0.5) * *cell_m,
+                    (y as f32 + 0.5) * *cell_m,
+                    (z as f32 + 0.5) * *cell_m,
                 );
-                let Some((_, hit)) = queries.cast_shape_nonlinear(&motion, shape, 0.0, 1.0, true)
-                else {
-                    continue;
-                };
-                if earliest.is_none_or(|(_, toi)| hit.time_of_impact < toi) {
-                    earliest = Some((*part_id, hit.time_of_impact));
+                let cell_start = *collider_start * Pose::from_translation(cell_center);
+                let motion = rapier3d::parry::query::NonlinearRigidMotion::new(
+                    cell_start,
+                    -(grid_origin + cell_center),
+                    body_delta,
+                    angular_delta,
+                );
+                for &terrain_handle in &terrain_colliders {
+                    let only_terrain =
+                        |handle: ColliderHandle, _: &Collider| handle == terrain_handle;
+                    let filter = QueryFilter::default().predicate(&only_terrain);
+                    let queries = self.broad_phase.as_query_pipeline(
+                        self.narrow_phase.query_dispatcher(),
+                        &self.bodies,
+                        &self.colliders,
+                        filter,
+                    );
+                    let Some((_, hit)) =
+                        queries.cast_shape_nonlinear(&motion, &cell_shape, 0.0, 1.0, true)
+                    else {
+                        continue;
+                    };
+                    if earliest.is_none_or(|(_, toi)| hit.time_of_impact < toi) {
+                        earliest = Some((*part_id, hit.time_of_impact));
+                    }
                 }
             }
         }
