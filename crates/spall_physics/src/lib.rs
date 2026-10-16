@@ -46,7 +46,9 @@ pub use collider::{
     choose_representation,
 };
 pub use coordinates::PhysicsOrigin;
-pub use mass::{BodyMassProperties, MassProperties, analytic_mass_properties};
+pub use mass::{
+    BodyMassProperties, MassProperties, analytic_mass_properties, articulated_mass_properties,
+};
 pub use merge::{BoxSpan, greedy_boxes};
 pub use metrics::{DurationSamples, PercentileSummary};
 pub use occupancy::{ExtractError, OccupancyGrid};

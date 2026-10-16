@@ -1,7 +1,7 @@
 use spall_core::{GlobalCell, MaterialId, VolumeId};
 use spall_physics::{
     ArticulatedPose, OccupancyGrid, PartTransform, PhysicsConfig, PhysicsWorld, Representation,
-    SourcePart,
+    SourcePart, articulated_mass_properties,
 };
 
 fn part(
@@ -44,6 +44,156 @@ fn world() -> PhysicsWorld {
         disable_ccd: true,
         ..PhysicsConfig::default()
     })
+}
+
+#[test]
+fn frozen_pose_corpse_aggregate_is_one_editable_dynamic_owner_with_source_hits() {
+    for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+        let source = vec![
+            part(
+                1,
+                None,
+                [-2, 0, 0],
+                vec![true, true],
+                PartTransform::IDENTITY,
+            ),
+            part(
+                2,
+                Some(1),
+                [0, 0, 0],
+                vec![true, true],
+                PartTransform {
+                    translation_m: [3.0, 0.0, 0.0],
+                    rotation_xyzw: [
+                        0.0,
+                        0.0,
+                        std::f32::consts::FRAC_1_SQRT_2,
+                        std::f32::consts::FRAC_1_SQRT_2,
+                    ],
+                },
+            ),
+        ];
+        let poses = [PartTransform::IDENTITY, source[1].local_transform];
+        let mass = articulated_mass_properties(&source, &poses, |_| 1_000.0)
+            .unwrap()
+            .to_body_properties();
+        assert!((mass.mass_kg - 4_000.0).abs() < 0.1);
+        assert!(
+            mass.local_com_m[0] > 0.5 && mass.inertia_com_kg_m2[0][1].abs() > 1.0,
+            "off-center cells should shift COM: {mass:?}"
+        );
+
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            disable_ccd: true,
+            ..PhysicsConfig::default()
+        });
+        let corpse = world
+            .add_dynamic_corpse_aggregate(
+                [0.0, 3.0, 0.0],
+                PartTransform::IDENTITY.rotation_xyzw,
+                1,
+                source.clone(),
+                representation,
+                mass,
+            )
+            .unwrap();
+        assert_eq!(world.articulated_rigid_body_count(corpse), 1);
+        assert_eq!(world.articulated_collider_count(corpse), 2);
+        assert!(world.articulated_body_state(corpse).mass_kg > 0.0);
+        // Exact source queries report source IDs/cells before and after solver motion.
+        let hit = world
+            .raycast_articulated(corpse, [-1.5, 3.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        assert_eq!(
+            (hit.part_id, hit.volume_id, hit.cell),
+            (1, VolumeId::new(101).unwrap(), [-2, 0, 0])
+        );
+        for _ in 0..30 {
+            world.step();
+        }
+        assert!(world.articulated_body_state(corpse).translation_m[1] < 3.0);
+        let after = world
+            .raycast_articulated(corpse, [-1.5, 2.0, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        assert_eq!(
+            (after.part_id, after.volume_id, after.cell),
+            (1, VolumeId::new(101).unwrap(), [-2, 0, 0])
+        );
+        let edited_grid = part(
+            1,
+            None,
+            [-2, 0, 0],
+            vec![false, true],
+            PartTransform::IDENTITY,
+        )
+        .grid;
+        let mut edited_sources = source.clone();
+        edited_sources[0].grid = edited_grid.clone();
+        edited_sources[0].source_revision = 8;
+        let edited_mass = articulated_mass_properties(&edited_sources, &poses, |_| 1_000.0)
+            .unwrap()
+            .to_body_properties();
+        let body_origin_before_edit = world.articulated_body_state(corpse).translation_m;
+        world
+            .rebuild_dynamic_corpse_part_grid(
+                corpse,
+                1,
+                2,
+                1,
+                7,
+                8,
+                edited_grid.clone(),
+                edited_mass,
+            )
+            .unwrap();
+        assert_eq!(
+            world.articulated_body_state(corpse).translation_m,
+            body_origin_before_edit
+        );
+        assert!(
+            world
+                .raycast_articulated(
+                    corpse,
+                    [-1.5, body_origin_before_edit[1] + 0.5, -2.0],
+                    [0.0, 0.0, 1.0],
+                    4.0,
+                )
+                .is_err()
+        );
+        let survivor = world
+            .raycast_articulated(
+                corpse,
+                [-0.5, body_origin_before_edit[1] + 0.5, -2.0],
+                [0.0, 0.0, 1.0],
+                4.0,
+            )
+            .unwrap();
+        assert_eq!((survivor.cell, survivor.source_revision), ([-1, 0, 0], 8));
+        assert_eq!(
+            world
+                .rebuild_dynamic_corpse_part_grid(
+                    corpse,
+                    1,
+                    3,
+                    1,
+                    8,
+                    9,
+                    source[0].grid.clone(),
+                    mass,
+                )
+                .unwrap_err(),
+            spall_physics::ArticulatedError::StaleTopology,
+        );
+        let after_stale = world
+            .raycast_articulated(
+                corpse,
+                [-0.5, body_origin_before_edit[1] + 0.5, -2.0],
+                [0.0, 0.0, 1.0],
+                4.0,
+            )
+            .unwrap();
+        assert_eq!(after_stale, survivor);
+    }
 }
 
 #[test]

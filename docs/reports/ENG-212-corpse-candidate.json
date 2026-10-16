@@ -1,0 +1,888 @@
+{
+  "cases": [
+    {
+      "animal": "trout",
+      "attach_us": 71.60000000000001,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "idle",
+      "collider_count": 5,
+      "collider_primitives": 5,
+      "com_m": [
+        0.005514706019312143,
+        0.03446691110730171,
+        0.03125
+      ],
+      "contact_impulse_steps": 185,
+      "edit_and_mass_rebuild_us": 24.1,
+      "final_y_m": 0.1249661073088646,
+      "inertia_com_kg_m2": [
+        [
+          0.3464759588241577,
+          0.023000380024313927,
+          -3.903127820947816e-18
+        ],
+        [
+          0.023000380024313927,
+          1.3099745512008667,
+          4.336808689942018e-19
+        ],
+        [
+          -3.903127820947816e-18,
+          4.336808689942018e-19,
+          1.425025463104248
+        ]
+      ],
+      "mass_kg": 33.203125,
+      "mean_step_us": 4.447916666666667,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -1,
+        -2,
+        -1
+      ],
+      "source_cells": 136,
+      "source_cells_after_edit": 135,
+      "source_parts": 5,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "trout",
+      "attach_us": 20.2,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "idle",
+      "collider_count": 5,
+      "collider_primitives": 17,
+      "com_m": [
+        0.005514706019312143,
+        0.03446691110730171,
+        0.03125
+      ],
+      "contact_impulse_steps": 186,
+      "edit_and_mass_rebuild_us": 17.7,
+      "final_y_m": 0.12496864795684814,
+      "inertia_com_kg_m2": [
+        [
+          0.3464759588241577,
+          0.023000380024313927,
+          -3.903127820947816e-18
+        ],
+        [
+          0.023000380024313927,
+          1.3099745512008667,
+          4.336808689942018e-19
+        ],
+        [
+          -3.903127820947816e-18,
+          4.336808689942018e-19,
+          1.425025463104248
+        ]
+      ],
+      "mass_kg": 33.203125,
+      "mean_step_us": 2.086666666666667,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -1,
+        -2,
+        -1
+      ],
+      "source_cells": 136,
+      "source_cells_after_edit": 135,
+      "source_parts": 5,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "trout",
+      "attach_us": 28.7,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "swim",
+      "collider_count": 5,
+      "collider_primitives": 5,
+      "com_m": [
+        0.005514706019312143,
+        0.03446691110730171,
+        0.03125
+      ],
+      "contact_impulse_steps": 185,
+      "edit_and_mass_rebuild_us": 17.6,
+      "final_y_m": 0.1249661073088646,
+      "inertia_com_kg_m2": [
+        [
+          0.3464759588241577,
+          0.023000380024313927,
+          -3.903127820947816e-18
+        ],
+        [
+          0.023000380024313927,
+          1.3099745512008667,
+          4.336808689942018e-19
+        ],
+        [
+          -3.903127820947816e-18,
+          4.336808689942018e-19,
+          1.425025463104248
+        ]
+      ],
+      "mass_kg": 33.203125,
+      "mean_step_us": 3.5,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -1,
+        -2,
+        -1
+      ],
+      "source_cells": 136,
+      "source_cells_after_edit": 135,
+      "source_parts": 5,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "trout",
+      "attach_us": 13.8,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "swim",
+      "collider_count": 5,
+      "collider_primitives": 17,
+      "com_m": [
+        0.005514706019312143,
+        0.03446691110730171,
+        0.03125
+      ],
+      "contact_impulse_steps": 186,
+      "edit_and_mass_rebuild_us": 13.6,
+      "final_y_m": 0.12496864795684814,
+      "inertia_com_kg_m2": [
+        [
+          0.3464759588241577,
+          0.023000380024313927,
+          -3.903127820947816e-18
+        ],
+        [
+          0.023000380024313927,
+          1.3099745512008667,
+          4.336808689942018e-19
+        ],
+        [
+          -3.903127820947816e-18,
+          4.336808689942018e-19,
+          1.425025463104248
+        ]
+      ],
+      "mass_kg": 33.203125,
+      "mean_step_us": 1.8733333333333333,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -1,
+        -2,
+        -1
+      ],
+      "source_cells": 136,
+      "source_cells_after_edit": 135,
+      "source_parts": 5,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "trout",
+      "attach_us": 27.3,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "swim",
+      "collider_count": 5,
+      "collider_primitives": 5,
+      "com_m": [
+        0.005514706019312143,
+        0.03446691110730171,
+        0.03125
+      ],
+      "contact_impulse_steps": 185,
+      "edit_and_mass_rebuild_us": 18.099999999999998,
+      "final_y_m": 0.1249661073088646,
+      "inertia_com_kg_m2": [
+        [
+          0.3464759588241577,
+          0.023000380024313927,
+          -3.903127820947816e-18
+        ],
+        [
+          0.023000380024313927,
+          1.3099745512008667,
+          4.336808689942018e-19
+        ],
+        [
+          -3.903127820947816e-18,
+          4.336808689942018e-19,
+          1.425025463104248
+        ]
+      ],
+      "mass_kg": 33.203125,
+      "mean_step_us": 3.36625,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -1,
+        -2,
+        -1
+      ],
+      "source_cells": 136,
+      "source_cells_after_edit": 135,
+      "source_parts": 5,
+      "source_query_identity_before_step": true,
+      "tick": 60.0
+    },
+    {
+      "animal": "trout",
+      "attach_us": 12.5,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "swim",
+      "collider_count": 5,
+      "collider_primitives": 17,
+      "com_m": [
+        0.005514706019312143,
+        0.03446691110730171,
+        0.03125
+      ],
+      "contact_impulse_steps": 186,
+      "edit_and_mass_rebuild_us": 14.600000000000001,
+      "final_y_m": 0.12496864795684814,
+      "inertia_com_kg_m2": [
+        [
+          0.3464759588241577,
+          0.023000380024313927,
+          -3.903127820947816e-18
+        ],
+        [
+          0.023000380024313927,
+          1.3099745512008667,
+          4.336808689942018e-19
+        ],
+        [
+          -3.903127820947816e-18,
+          4.336808689942018e-19,
+          1.425025463104248
+        ]
+      ],
+      "mass_kg": 33.203125,
+      "mean_step_us": 1.82125,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -1,
+        -2,
+        -1
+      ],
+      "source_cells": 136,
+      "source_cells_after_edit": 135,
+      "source_parts": 5,
+      "source_query_identity_before_step": true,
+      "tick": 60.0
+    },
+    {
+      "animal": "crow",
+      "attach_us": 35.4,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "idle",
+      "collider_count": 6,
+      "collider_primitives": 6,
+      "com_m": [
+        -0.0015841013519093394,
+        0.039890553802251816,
+        0.03125
+      ],
+      "contact_impulse_steps": 186,
+      "edit_and_mass_rebuild_us": 12.700000000000001,
+      "final_y_m": 0.06248116120696068,
+      "inertia_com_kg_m2": [
+        [
+          1.8787567615509033,
+          -0.2791980504989624,
+          -1.3986208025063007e-17
+        ],
+        [
+          -0.2791980504989624,
+          2.9909870624542236,
+          0.0
+        ],
+        [
+          -1.3986208025063007e-17,
+          0.0,
+          2.775315999984741
+        ]
+      ],
+      "mass_kg": 52.978515625,
+      "mean_step_us": 4.4125,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -1,
+        -4,
+        -1
+      ],
+      "source_cells": 217,
+      "source_cells_after_edit": 216,
+      "source_parts": 6,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "crow",
+      "attach_us": 17.0,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "idle",
+      "collider_count": 6,
+      "collider_primitives": 14,
+      "com_m": [
+        -0.0015841013519093394,
+        0.039890553802251816,
+        0.03125
+      ],
+      "contact_impulse_steps": 188,
+      "edit_and_mass_rebuild_us": 15.1,
+      "final_y_m": 0.3749732971191406,
+      "inertia_com_kg_m2": [
+        [
+          1.8787567615509033,
+          -0.2791980504989624,
+          -1.3986208025063007e-17
+        ],
+        [
+          -0.2791980504989624,
+          2.9909870624542236,
+          0.0
+        ],
+        [
+          -1.3986208025063007e-17,
+          0.0,
+          2.775315999984741
+        ]
+      ],
+      "mass_kg": 52.978515625,
+      "mean_step_us": 2.1704166666666667,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -1,
+        -4,
+        -1
+      ],
+      "source_cells": 217,
+      "source_cells_after_edit": 216,
+      "source_parts": 6,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "crow",
+      "attach_us": 37.1,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "flap",
+      "collider_count": 6,
+      "collider_primitives": 6,
+      "com_m": [
+        -0.0015841013519093394,
+        0.06818520277738571,
+        0.0283909160643816
+      ],
+      "contact_impulse_steps": 186,
+      "edit_and_mass_rebuild_us": 13.4,
+      "final_y_m": 0.06247396022081375,
+      "inertia_com_kg_m2": [
+        [
+          1.761792540550232,
+          -0.328416645526886,
+          0.004973380360752344
+        ],
+        [
+          -0.328416645526886,
+          2.6163768768310547,
+          -0.025344206020236015
+        ],
+        [
+          0.004973380360752344,
+          -0.025344206020236015,
+          3.0329620838165283
+        ]
+      ],
+      "mass_kg": 52.978515625,
+      "mean_step_us": 4.4295833333333325,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -1,
+        -4,
+        -1
+      ],
+      "source_cells": 217,
+      "source_cells_after_edit": 216,
+      "source_parts": 6,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "crow",
+      "attach_us": 16.7,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "flap",
+      "collider_count": 6,
+      "collider_primitives": 14,
+      "com_m": [
+        -0.0015841013519093394,
+        0.06818520277738571,
+        0.0283909160643816
+      ],
+      "contact_impulse_steps": 188,
+      "edit_and_mass_rebuild_us": 10.7,
+      "final_y_m": 0.3749733865261078,
+      "inertia_com_kg_m2": [
+        [
+          1.761792540550232,
+          -0.328416645526886,
+          0.004973380360752344
+        ],
+        [
+          -0.328416645526886,
+          2.6163768768310547,
+          -0.025344206020236015
+        ],
+        [
+          0.004973380360752344,
+          -0.025344206020236015,
+          3.0329620838165283
+        ]
+      ],
+      "mass_kg": 52.978515625,
+      "mean_step_us": 2.2041666666666666,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -1,
+        -4,
+        -1
+      ],
+      "source_cells": 217,
+      "source_cells_after_edit": 216,
+      "source_parts": 6,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "crow",
+      "attach_us": 35.9,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "flap",
+      "collider_count": 6,
+      "collider_primitives": 6,
+      "com_m": [
+        -0.0015841013519093394,
+        0.06818520277738571,
+        0.0283909160643816
+      ],
+      "contact_impulse_steps": 186,
+      "edit_and_mass_rebuild_us": 10.5,
+      "final_y_m": 0.06247396022081375,
+      "inertia_com_kg_m2": [
+        [
+          1.761792540550232,
+          -0.328416645526886,
+          0.004973380360752344
+        ],
+        [
+          -0.328416645526886,
+          2.6163768768310547,
+          -0.025344206020236015
+        ],
+        [
+          0.004973380360752344,
+          -0.025344206020236015,
+          3.0329620838165283
+        ]
+      ],
+      "mass_kg": 52.978515625,
+      "mean_step_us": 4.390833333333333,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -1,
+        -4,
+        -1
+      ],
+      "source_cells": 217,
+      "source_cells_after_edit": 216,
+      "source_parts": 6,
+      "source_query_identity_before_step": true,
+      "tick": 48.0
+    },
+    {
+      "animal": "crow",
+      "attach_us": 14.5,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "flap",
+      "collider_count": 6,
+      "collider_primitives": 14,
+      "com_m": [
+        -0.0015841013519093394,
+        0.06818520277738571,
+        0.0283909160643816
+      ],
+      "contact_impulse_steps": 188,
+      "edit_and_mass_rebuild_us": 10.0,
+      "final_y_m": 0.3749733865261078,
+      "inertia_com_kg_m2": [
+        [
+          1.761792540550232,
+          -0.328416645526886,
+          0.004973380360752344
+        ],
+        [
+          -0.328416645526886,
+          2.6163768768310547,
+          -0.025344206020236015
+        ],
+        [
+          0.004973380360752344,
+          -0.025344206020236015,
+          3.0329620838165283
+        ]
+      ],
+      "mass_kg": 52.978515625,
+      "mean_step_us": 2.1758333333333337,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -1,
+        -4,
+        -1
+      ],
+      "source_cells": 217,
+      "source_cells_after_edit": 216,
+      "source_parts": 6,
+      "source_query_identity_before_step": true,
+      "tick": 48.0
+    },
+    {
+      "animal": "deer",
+      "attach_us": 51.199999999999996,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "idle",
+      "collider_count": 9,
+      "collider_primitives": 9,
+      "com_m": [
+        0.07587509602308273,
+        0.054495614022016525,
+        0.033111829310655594
+      ],
+      "contact_impulse_steps": 186,
+      "edit_and_mass_rebuild_us": 35.2,
+      "final_y_m": 0.005991071462631226,
+      "inertia_com_kg_m2": [
+        [
+          3.3144447803497314,
+          -1.4887138605117798,
+          -0.04009444639086723
+        ],
+        [
+          -1.4887138605117798,
+          3.5323121547698975,
+          -0.03652522712945938
+        ],
+        [
+          -0.04009444639086723,
+          -0.03652522712945938,
+          5.8413519859313965
+        ]
+      ],
+      "mass_kg": 69.580078125,
+      "mean_step_us": 25.927083333333332,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -2,
+        -1,
+        -2
+      ],
+      "source_cells": 285,
+      "source_cells_after_edit": 284,
+      "source_parts": 9,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "deer",
+      "attach_us": 32.4,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "idle",
+      "collider_count": 9,
+      "collider_primitives": 21,
+      "com_m": [
+        0.07587509602308273,
+        0.054495614022016525,
+        0.033111829310655594
+      ],
+      "contact_impulse_steps": 186,
+      "edit_and_mass_rebuild_us": 21.1,
+      "final_y_m": 0.18748392164707184,
+      "inertia_com_kg_m2": [
+        [
+          3.3144447803497314,
+          -1.4887138605117798,
+          -0.04009444639086723
+        ],
+        [
+          -1.4887138605117798,
+          3.5323121547698975,
+          -0.03652522712945938
+        ],
+        [
+          -0.04009444639086723,
+          -0.03652522712945938,
+          5.8413519859313965
+        ]
+      ],
+      "mass_kg": 69.580078125,
+      "mean_step_us": 4.82375,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -2,
+        -1,
+        -2
+      ],
+      "source_cells": 285,
+      "source_cells_after_edit": 284,
+      "source_parts": 9,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "deer",
+      "attach_us": 51.5,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "walk",
+      "collider_count": 9,
+      "collider_primitives": 9,
+      "com_m": [
+        0.07634608447551727,
+        0.056691091507673264,
+        0.03125
+      ],
+      "contact_impulse_steps": 172,
+      "edit_and_mass_rebuild_us": 26.0,
+      "final_y_m": 0.12498258054256439,
+      "inertia_com_kg_m2": [
+        [
+          3.2020862102508545,
+          -1.491113305091858,
+          -2.2737370319880768e-10
+        ],
+        [
+          -1.491113305091858,
+          3.6301231384277344,
+          -1.9081958235744878e-17
+        ],
+        [
+          -2.2737370319880768e-10,
+          -1.9081958235744878e-17,
+          5.829420566558838
+        ]
+      ],
+      "mass_kg": 69.580078125,
+      "mean_step_us": 13.54125,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -2,
+        -1,
+        -2
+      ],
+      "source_cells": 285,
+      "source_cells_after_edit": 284,
+      "source_parts": 9,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "deer",
+      "attach_us": 24.4,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "walk",
+      "collider_count": 9,
+      "collider_primitives": 21,
+      "com_m": [
+        0.07634608447551727,
+        0.056691091507673264,
+        0.03125
+      ],
+      "contact_impulse_steps": 185,
+      "edit_and_mass_rebuild_us": 19.599999999999998,
+      "final_y_m": 0.1874857097864151,
+      "inertia_com_kg_m2": [
+        [
+          3.2020862102508545,
+          -1.491113305091858,
+          -2.2737370319880768e-10
+        ],
+        [
+          -1.491113305091858,
+          3.6301231384277344,
+          -1.9081958235744878e-17
+        ],
+        [
+          -2.2737370319880768e-10,
+          -1.9081958235744878e-17,
+          5.829420566558838
+        ]
+      ],
+      "mass_kg": 69.580078125,
+      "mean_step_us": 4.811666666666667,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -2,
+        -1,
+        -2
+      ],
+      "source_cells": 285,
+      "source_cells_after_edit": 284,
+      "source_parts": 9,
+      "source_query_identity_before_step": true,
+      "tick": 0.0
+    },
+    {
+      "animal": "deer",
+      "attach_us": 50.2,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "walk",
+      "collider_count": 9,
+      "collider_primitives": 9,
+      "com_m": [
+        0.07634608447551727,
+        0.056691091507673264,
+        0.03125
+      ],
+      "contact_impulse_steps": 172,
+      "edit_and_mass_rebuild_us": 28.799999999999997,
+      "final_y_m": 0.12498258054256439,
+      "inertia_com_kg_m2": [
+        [
+          3.2020862102508545,
+          -1.491113305091858,
+          -2.2737370319880768e-10
+        ],
+        [
+          -1.491113305091858,
+          3.6301231384277344,
+          -1.9081958235744878e-17
+        ],
+        [
+          -2.2737370319880768e-10,
+          -1.9081958235744878e-17,
+          5.829420566558838
+        ]
+      ],
+      "mass_kg": 69.580078125,
+      "mean_step_us": 13.747916666666667,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "native_voxels",
+      "source_cell_removed": [
+        -2,
+        -1,
+        -2
+      ],
+      "source_cells": 285,
+      "source_cells_after_edit": 284,
+      "source_parts": 9,
+      "source_query_identity_before_step": true,
+      "tick": 48.0
+    },
+    {
+      "animal": "deer",
+      "attach_us": 28.099999999999998,
+      "body_count": 1,
+      "body_origin_shift_on_com_edit_m": 0.0,
+      "clip": "walk",
+      "collider_count": 9,
+      "collider_primitives": 21,
+      "com_m": [
+        0.07634608447551727,
+        0.056691091507673264,
+        0.03125
+      ],
+      "contact_impulse_steps": 185,
+      "edit_and_mass_rebuild_us": 20.7,
+      "final_y_m": 0.1874857097864151,
+      "inertia_com_kg_m2": [
+        [
+          3.2020862102508545,
+          -1.491113305091858,
+          -2.2737370319880768e-10
+        ],
+        [
+          -1.491113305091858,
+          3.6301231384277344,
+          -1.9081958235744878e-17
+        ],
+        [
+          -2.2737370319880768e-10,
+          -1.9081958235744878e-17,
+          5.829420566558838
+        ]
+      ],
+      "mass_kg": 69.580078125,
+      "mean_step_us": 4.909583333333333,
+      "notes": "mass sums source cells per source volume; coincident source cells count additively",
+      "removed_cell_still_hit": false,
+      "representation": "merged_cuboids",
+      "source_cell_removed": [
+        -2,
+        -1,
+        -2
+      ],
+      "source_cells": 285,
+      "source_cells_after_edit": 284,
+      "source_parts": 9,
+      "source_query_identity_before_step": true,
+      "tick": 48.0
+    }
+  ],
+  "scenario": "eng212_frozen_pose_editable_dynamic_corpse_candidate",
+  "scope": "CPU feasibility only; source-volume transfer/revision edits measured separately before any runtime interfaces"
+}

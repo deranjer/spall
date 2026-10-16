@@ -21,7 +21,7 @@ use spall_core::{GlobalCell, MaterialId, VolumeId};
 use spall_physics::{
     ArticulatedBodyId, ArticulatedPose, BodyKind, BodySpec, ContactCellAttribution,
     ContactWitnessUnattributed, OccupancyGrid, PartTransform, PhysicsConfig, PhysicsWorld,
-    Representation, SourcePart, build_collider,
+    Representation, SourcePart, articulated_mass_properties, build_collider,
 };
 use spall_sim::SimWorld;
 
@@ -153,6 +153,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
     if args.as_slice() == ["--generated-1km"] {
         return run_generated_1km();
+    }
+    if args.as_slice() == ["--corpse-bounded"] {
+        return run_corpse_bounded();
     }
     let kinematic_parts = args.iter().any(|arg| arg == "--kinematic-parts");
     let solver_substeps = args
@@ -616,6 +619,235 @@ fn generated_world_warm_steps(
         "pipeline_us": {"p50":percentile_us(&pipeline_us, 0.5), "p95":percentile_us(&pipeline_us, 0.95), "all":pipeline_us},
         "contact_witness_capture_us": {"p50":percentile_us(&witness_us, 0.5), "p95":percentile_us(&witness_us, 0.95), "all":witness_us},
     }))
+}
+
+fn run_corpse_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cases = Vec::new();
+    for (name, bytes) in ANIMALS {
+        let animal = load_animal(decode(bytes)?)?;
+        let samples = pose_samples(&animal)?;
+        let mut selected = vec![0, samples.len() / 2, samples.len() - 1];
+        selected.sort_unstable();
+        selected.dedup();
+        for index in selected {
+            let sample = &samples[index];
+            for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+                let mut sources = animal
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        let local = sample
+                            .locals
+                            .iter()
+                            .find(|(id, _)| *id == part.part.id)
+                            .map(|(_, pose)| *pose)
+                            .ok_or("death pose omitted source part")?;
+                        Ok(SourcePart {
+                            part_id: part.part.id,
+                            parent_id: (part.part.parent_id != 0).then_some(part.part.parent_id),
+                            volume_id: VolumeId::new(
+                                u64::from(part.part.id) + u64::from(name_salt(name)) * 1000,
+                            )?,
+                            source_revision: 1,
+                            grid: part.grid.clone(),
+                            cell_m: CELL_M,
+                            local_transform: local,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+                let local_poses = sources
+                    .iter()
+                    .map(|p| p.local_transform)
+                    .collect::<Vec<_>>();
+                let mass = articulated_mass_properties(&sources, &local_poses, |_| 1_000.0)
+                    .ok_or("invalid source hierarchy/mass input")?
+                    .to_body_properties();
+                let root = -animal.pivot_m + Vec3::new(0.0, 4.0, 0.0);
+                let mut world = PhysicsWorld::new(PhysicsConfig::default());
+                let floor_grid = OccupancyGrid::from_solid_mask(
+                    GlobalCell::new(-128, -1, -128),
+                    [256, 1, 256],
+                    vec![true; 256 * 256],
+                    vec![MaterialId(1); 256 * 256],
+                )?;
+                world.add_body(BodySpec {
+                    kind: BodyKind::Fixed,
+                    representation: Representation::MergedCuboids,
+                    grid: floor_grid,
+                    cell_m: CELL_M,
+                    density_kg_m3: 0.0,
+                    mass_properties: None,
+                    translation_m: [0.0; 3],
+                    linvel_m_s: [0.0; 3],
+                });
+                let attach_start = Instant::now();
+                let owner = world.add_dynamic_corpse_aggregate(
+                    root.to_array(),
+                    Quat::IDENTITY.to_array(),
+                    TOPOLOGY_TOKEN,
+                    std::mem::take(&mut sources),
+                    representation,
+                    mass,
+                )?;
+                let attach_us = attach_start.elapsed().as_secs_f64() * 1e6;
+                let refs = reference_cells(&animal, &sample.locals, root)?;
+                let target = refs
+                    .iter()
+                    .find(|cell| {
+                        let Some(part) = animal.parts.iter().find(|p| p.part.id == cell.part_id)
+                        else {
+                            return false;
+                        };
+                        let o = part.grid.origin();
+                        let x = i64::from(cell.cell[0]) - o.x;
+                        let y = i64::from(cell.cell[1]) - o.y;
+                        let z = i64::from(cell.cell[2]) - o.z;
+                        x > 0 && !part.grid.is_solid((x - 1) as u32, y as u32, z as u32)
+                    })
+                    .ok_or("asset had no negative-X exposed source cell")?;
+                let ray = target.center - Vec3::X * (CELL_M * 0.75);
+                let initial_hit = world.raycast_articulated(
+                    owner,
+                    ray.to_array(),
+                    Vec3::X.to_array(),
+                    CELL_M * 1.5,
+                )?;
+                let identity_ok =
+                    initial_hit.part_id == target.part_id && initial_hit.cell == target.cell;
+                let step_start = Instant::now();
+                let mut positive_contact_steps = 0;
+                for _ in 0..240 {
+                    world.step();
+                    positive_contact_steps += usize::from(!world.contact_impulses().is_empty());
+                }
+                let step_us = step_start.elapsed().as_secs_f64() * 1e6 / 240.0;
+                let state = world.articulated_body_state(owner);
+                let edit_start = Instant::now();
+                let (edited_part, removed_cell) = animal
+                    .parts
+                    .iter()
+                    .find_map(|part| {
+                        if part.grid.solid_count() <= 1 {
+                            return None;
+                        }
+                        let origin = part.grid.origin();
+                        part.cells
+                            .iter()
+                            .find(|cell| {
+                                let x = i64::from(cell[0]) - origin.x;
+                                let y = i64::from(cell[1]) - origin.y;
+                                let z = i64::from(cell[2]) - origin.z;
+                                x > 0 && !part.grid.is_solid((x - 1) as u32, y as u32, z as u32)
+                            })
+                            .map(|cell| (part, cell))
+                    })
+                    .ok_or("animal has no removable negative-X exposed source cell")?;
+                let source_index = animal
+                    .parts
+                    .iter()
+                    .position(|part| part.part.id == edited_part.part.id)
+                    .ok_or("source part lookup failed")?;
+                let edited_grid = grid_without_cell(&edited_part.grid, *removed_cell)?;
+                let edited_sources = animal
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        let local = sample
+                            .locals
+                            .iter()
+                            .find(|(id, _)| *id == part.part.id)
+                            .map(|(_, pose)| *pose)
+                            .ok_or("death pose omitted source part")?;
+                        Ok(SourcePart {
+                            part_id: part.part.id,
+                            parent_id: (part.part.parent_id != 0).then_some(part.part.parent_id),
+                            volume_id: VolumeId::new(
+                                u64::from(part.part.id) + u64::from(name_salt(name)) * 1000,
+                            )?,
+                            source_revision: if part.part.id == edited_part.part.id {
+                                2
+                            } else {
+                                1
+                            },
+                            grid: if part.part.id == edited_part.part.id {
+                                edited_grid.clone()
+                            } else {
+                                part.grid.clone()
+                            },
+                            cell_m: CELL_M,
+                            local_transform: local,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+                let edited_poses = edited_sources
+                    .iter()
+                    .map(|part| part.local_transform)
+                    .collect::<Vec<_>>();
+                let edited_mass =
+                    articulated_mass_properties(&edited_sources, &edited_poses, |_| 1_000.0)
+                        .ok_or("invalid edited source hierarchy/mass input")?
+                        .to_body_properties();
+                let before_edit_translation = world.articulated_body_state(owner).translation_m;
+                world.rebuild_dynamic_corpse_part_grid(
+                    owner,
+                    TOPOLOGY_TOKEN,
+                    TOPOLOGY_TOKEN + 1,
+                    edited_sources[source_index].part_id,
+                    1,
+                    2,
+                    edited_grid,
+                    edited_mass,
+                )?;
+                let edit_us = edit_start.elapsed().as_secs_f64() * 1e6;
+                let after_edit_state = world.articulated_body_state(owner);
+                let com_edit_shift_m = Vec3::from_array(after_edit_state.translation_m)
+                    .distance(Vec3::from_array(before_edit_translation));
+                let source_count_after_edit = edited_sources
+                    .iter()
+                    .map(|p| p.grid.solid_count() as usize)
+                    .sum::<usize>();
+                let ref_cell = refs
+                    .iter()
+                    .find(|cell| cell.part_id == edited_part.part.id && cell.cell == *removed_cell)
+                    .ok_or("removed cell was absent from independent geometry oracle")?;
+                let owner_rotation = Quat::from_array(after_edit_state.rotation).normalize();
+                let removed_center = Vec3::from_array(after_edit_state.translation_m)
+                    + owner_rotation * (ref_cell.center - root);
+                let ray_direction = owner_rotation * Vec3::X;
+                let removed_source_hit = world
+                    .raycast_articulated(
+                        owner,
+                        (removed_center - ray_direction * (CELL_M * 0.75)).to_array(),
+                        ray_direction.to_array(),
+                        0.9 * CELL_M,
+                    )
+                    .is_ok();
+                cases.push(serde_json::json!({
+                    "animal":name,"clip":sample.clip,"tick":sample.tick,
+                    "representation":representation.label(),"source_parts":animal.parts.len(),
+                    "source_cells":animal.cell_count,"body_count":world.articulated_rigid_body_count(owner),
+                    "collider_count":world.articulated_collider_count(owner),
+                    "collider_primitives":animal.parts.iter().map(|p| build_collider(&p.grid,CELL_M,representation).primitives).sum::<usize>(),
+                    "mass_kg":state.mass_kg,"com_m":mass.local_com_m,"inertia_com_kg_m2":mass.inertia_com_kg_m2,
+                    "attach_us":attach_us,"mean_step_us":step_us,"contact_impulse_steps":positive_contact_steps,
+                    "source_query_identity_before_step":identity_ok,"final_y_m":state.translation_m[1],
+                    "source_cell_removed":removed_cell,"source_cells_after_edit":source_count_after_edit,
+                    "edit_and_mass_rebuild_us":edit_us,"removed_cell_still_hit":removed_source_hit,
+                    "body_origin_shift_on_com_edit_m":com_edit_shift_m,
+                    "notes":"mass sums source cells per source volume; coincident source cells count additively"
+                }));
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "scenario":"eng212_frozen_pose_editable_dynamic_corpse_candidate",
+            "scope":"CPU feasibility only; source-volume transfer/revision edits measured separately before any runtime interfaces",
+            "cases":cases
+        }))?
+    );
+    Ok(())
 }
 
 fn validate_transition_parity(

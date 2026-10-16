@@ -89,6 +89,7 @@ impl PartTransform {
 }
 
 /// Immutable source geometry and hierarchy for one articulated part.
+#[derive(Clone)]
 pub struct SourcePart {
     pub part_id: u32,
     /// `None` only for the assembly root part.

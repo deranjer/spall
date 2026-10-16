@@ -870,6 +870,7 @@ impl PhysicsWorld {
             parts,
             representation,
             false,
+            None,
         )
     }
 
@@ -893,6 +894,29 @@ impl PhysicsWorld {
             parts,
             representation,
             true,
+            None,
+        )
+    }
+
+    /// Bounded corpse candidate: exact frozen per-source-part colliders under
+    /// one dynamic solver body. PART hierarchy defines pose only, never bonds.
+    pub fn add_dynamic_corpse_aggregate(
+        &mut self,
+        translation_m: [f32; 3],
+        rotation_xyzw: [f32; 4],
+        topology_token: u64,
+        parts: Vec<SourcePart>,
+        representation: Representation,
+        mass_properties: BodyMassProperties,
+    ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
+        self.add_articulated_body_mode(
+            translation_m,
+            rotation_xyzw,
+            topology_token,
+            parts,
+            representation,
+            false,
+            Some(mass_properties),
         )
     }
 
@@ -904,6 +928,7 @@ impl PhysicsWorld {
         parts: Vec<SourcePart>,
         representation: Representation,
         kinematic_part_bodies: bool,
+        dynamic_mass: Option<BodyMassProperties>,
     ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
         use crate::articulated::{
             ArticulatedError, MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_SOLID_CELLS,
@@ -1052,8 +1077,14 @@ impl PhysicsWorld {
             rotation_xyzw[2],
             rotation_xyzw[3],
         );
-        let root = self.bodies.insert(
+        let root_builder = if let Some(mass) = dynamic_mass {
+            RigidBodyBuilder::dynamic()
+                .additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]))
+        } else {
             RigidBodyBuilder::kinematic_position_based()
+        };
+        let root = self.bodies.insert(
+            root_builder
                 .translation(Vector::new(
                     translation_m[0],
                     translation_m[1],
@@ -1168,7 +1199,7 @@ impl PhysicsWorld {
                 first_origin.y as f32 * cell_m,
                 first_origin.z as f32 * cell_m,
             ],
-            mass_properties: None,
+            mass_properties: dynamic_mass,
             retired: false,
             dormant: false,
             query_only: false,
@@ -1558,6 +1589,41 @@ impl PhysicsWorld {
             self.entries[entry_index(id, self.id_namespace)].collider = new_handle;
         }
         Ok(start.elapsed())
+    }
+
+    /// Rebuilds a source grid on a dynamic corpse owner and installs the
+    /// caller's recomputed source-cell mass properties after revision checks.
+    /// The body origin and collider-local poses remain fixed as COM changes.
+    pub fn rebuild_dynamic_corpse_part_grid(
+        &mut self,
+        id: ArticulatedBodyId,
+        expected_topology_token: u64,
+        new_topology_token: u64,
+        part_id: u32,
+        expected_source_revision: u64,
+        new_source_revision: u64,
+        new_grid: OccupancyGrid,
+        mass_properties: BodyMassProperties,
+    ) -> Result<Duration, crate::articulated::ArticulatedError> {
+        let elapsed = self.rebuild_articulated_part_grid(
+            id,
+            expected_topology_token,
+            new_topology_token,
+            part_id,
+            expected_source_revision,
+            new_source_revision,
+            new_grid,
+        )?;
+        let index = entry_index(id.0, self.id_namespace);
+        let (body, offset) = {
+            let entry = &self.entries[index];
+            (entry.body, entry.collider_offset_m)
+        };
+        self.bodies[body]
+            .set_additional_mass_properties(rapier_mass_properties(mass_properties, offset), true);
+        self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
+        self.entries[index].mass_properties = Some(mass_properties);
+        Ok(elapsed)
     }
 
     /// Moves the single kinematic assembly root after validating every
@@ -2493,6 +2559,13 @@ impl PhysicsWorld {
                 1
             }
         })
+    }
+
+    /// Reads the assembly's primary rigid body state for bounded feasibility
+    /// diagnostics. Kinematic rigs expose their stationary root; a corpse
+    /// aggregate exposes its dynamic owner body.
+    pub fn articulated_body_state(&self, id: ArticulatedBodyId) -> BodyState {
+        self.body_state(id.0)
     }
 
     /// Casts against the live Rapier shape of every source part and maps the
