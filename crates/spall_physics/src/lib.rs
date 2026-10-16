@@ -24,6 +24,7 @@ pub mod character;
 pub mod collider;
 pub mod coordinates;
 pub mod fixtures;
+pub mod fracture;
 pub mod mass;
 pub mod merge;
 pub mod metrics;
@@ -46,6 +47,10 @@ pub use collider::{
     choose_representation,
 };
 pub use coordinates::PhysicsOrigin;
+pub use fracture::{
+    FRACTURE_PLAN_VERSION, FractureComponent, FractureError, FracturePartSnapshot,
+    FractureSnapshot, FractureSnapshotToken, PreparedFracturePlan, SourceCellRef, prepare_fracture,
+};
 pub use mass::{
     BodyMassProperties, MassProperties, analytic_mass_properties, articulated_mass_properties,
 };

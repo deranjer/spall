@@ -1,0 +1,801 @@
+//! Bounded exact source-cell connectivity planning for frozen corpse aggregates.
+//!
+//! The planner keeps authored source coordinates and identities. It creates no
+//! Rapier objects and mutates no owner; callers must revalidate the captured
+//! tokens before applying the immutable partition at a tick boundary.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use spall_core::{MaterialId, VolumeId};
+use thiserror::Error;
+
+use crate::articulated::{PartTransform, SourcePart};
+
+pub const FRACTURE_PLAN_VERSION: u16 = 1;
+pub const MAX_FRACTURE_SOURCE_CELLS: usize = 1_000_000;
+pub const MAX_FRACTURE_PARTS: usize = 256;
+pub const MAX_FRACTURE_DENSE_CELLS: usize = MAX_FRACTURE_SOURCE_CELLS;
+/// All cross-volume cell pairs examined, including broadphase rejects.
+pub const MAX_FRACTURE_CELL_PAIR_TESTS: usize = 1_000_000;
+
+/// Stable identity of one authoritatively owned source cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceCellRef {
+    pub volume_id: VolumeId,
+    pub part_id: u32,
+    pub cell: [i32; 3],
+    pub material: MaterialId,
+    pub source_revision: u64,
+}
+
+/// Immutable source geometry and its frozen pose in the corpse root frame.
+#[derive(Clone)]
+pub struct FracturePartSnapshot {
+    pub source: SourcePart,
+    pub root_local_pose: PartTransform,
+}
+
+/// Version tokens which must still match when a prepared plan is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FractureSnapshotToken {
+    pub corpse_key: u128,
+    pub topology_revision: u64,
+    pub pose_epoch: u64,
+    pub source_generation: u64,
+}
+
+/// Complete read-only snapshot consumed by [`prepare_fracture`].
+pub struct FractureSnapshot {
+    pub token: FractureSnapshotToken,
+    pub parts: Vec<FracturePartSnapshot>,
+}
+
+/// One physically connected set of source cells. Cells are canonical sorted
+/// provenance; source coordinates are never rebased or regenerated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FractureComponent {
+    pub cells: Vec<SourceCellRef>,
+}
+
+/// Versioned immutable one-to-many ownership proposal. Component keys are
+/// deliberately allocated by the owning simulation transaction at commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedFracturePlan {
+    pub version: u16,
+    pub token: FractureSnapshotToken,
+    pub source_cells: Vec<SourceCellRef>,
+    pub components: Vec<FractureComponent>,
+    pub candidate_pairs_tested: usize,
+    pub certified_cross_volume_edges: usize,
+    pub redundant_ambiguous_pairs_ignored: usize,
+    pub elapsed: std::time::Duration,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum FractureError {
+    #[error("fracture snapshot is empty, malformed, or has duplicate source identity")]
+    InvalidSnapshot,
+    #[error("fracture source cell or cross-volume pair budget exceeded")]
+    WorkBudget,
+    #[error(
+        "cross-volume source-cell geometry is too close to classify safely: {left:?} / {right:?}"
+    )]
+    AmbiguousContact {
+        left: SourceCellRef,
+        right: SourceCellRef,
+        /// Absolute pose-origin separation per axis as f64 bit patterns.
+        axis_gap_m_bits: [u64; 3],
+        /// Conservative sphere-radius sum as f64 bits.
+        required_gap_m_bits: u64,
+    },
+}
+
+#[derive(Clone)]
+struct CellGeometry {
+    source: SourceCellRef,
+    source_cell: [i32; 3],
+    pose_translation: [f32; 3],
+    rotation: [[i32; 3]; 3],
+    cell_m: f32,
+    bound_radius_m: f64,
+}
+
+/// Prepare deterministic connected components from an immutable corpse pose.
+/// Same-volume connectivity uses exact integer six-face adjacency. Cross-volume
+/// edges use exact shared-lattice positive-face proofs; arbitrary rotations are
+/// separated only by a conservative origin-sphere bound and otherwise fail
+/// closed.
+pub fn prepare_fracture(
+    snapshot: &FractureSnapshot,
+) -> Result<PreparedFracturePlan, FractureError> {
+    let start = std::time::Instant::now();
+    if snapshot.parts.is_empty()
+        || snapshot.parts.len() > MAX_FRACTURE_PARTS
+        || snapshot.token.corpse_key == 0
+    {
+        return Err(FractureError::InvalidSnapshot);
+    }
+
+    // Admit source and dense geometry budgets before allocating per-cell lists.
+    let mut solid_count = 0u64;
+    let mut dense_count = 0usize;
+    for part in &snapshot.parts {
+        let [x, y, z] = part.source.grid.dims();
+        let dense = usize::try_from(x)
+            .ok()
+            .and_then(|x| usize::try_from(y).ok().and_then(|y| x.checked_mul(y)))
+            .and_then(|xy| usize::try_from(z).ok().and_then(|z| xy.checked_mul(z)))
+            .ok_or(FractureError::WorkBudget)?;
+        if dense > MAX_FRACTURE_SOURCE_CELLS {
+            return Err(FractureError::WorkBudget);
+        }
+        dense_count = dense_count
+            .checked_add(dense)
+            .ok_or(FractureError::WorkBudget)?;
+        if dense_count > MAX_FRACTURE_DENSE_CELLS {
+            return Err(FractureError::WorkBudget);
+        }
+        solid_count = solid_count
+            .checked_add(part.source.grid.solid_count())
+            .ok_or(FractureError::WorkBudget)?;
+        if solid_count > MAX_FRACTURE_SOURCE_CELLS as u64 {
+            return Err(FractureError::WorkBudget);
+        }
+    }
+
+    let mut cells = Vec::new();
+    let mut geometry = Vec::new();
+    let mut part_ids = BTreeSet::new();
+    let mut volume_ids = BTreeSet::new();
+    for part in &snapshot.parts {
+        if part.source.part_id == 0
+            || !part_ids.insert(part.source.part_id)
+            || !volume_ids.insert(part.source.volume_id)
+            || part.source.source_revision == 0
+            || !part.source.cell_m.is_finite()
+            || part.source.cell_m <= 0.0
+            || !part.root_local_pose.is_valid()
+        {
+            return Err(FractureError::InvalidSnapshot);
+        }
+        let pose = part
+            .root_local_pose
+            .normalized()
+            .ok_or(FractureError::InvalidSnapshot)?;
+        let origin = part.source.grid.origin();
+        let axes = [
+            rotate64(pose.rotation_xyzw, [1.0, 0.0, 0.0]),
+            rotate64(pose.rotation_xyzw, [0.0, 1.0, 0.0]),
+            rotate64(pose.rotation_xyzw, [0.0, 0.0, 1.0]),
+        ];
+        for [x, y, z] in part.source.grid.solid_indices() {
+            let source_cell = [
+                i32::try_from(
+                    origin
+                        .x
+                        .checked_add(i64::from(x))
+                        .ok_or(FractureError::InvalidSnapshot)?,
+                )
+                .map_err(|_| FractureError::InvalidSnapshot)?,
+                i32::try_from(
+                    origin
+                        .y
+                        .checked_add(i64::from(y))
+                        .ok_or(FractureError::InvalidSnapshot)?,
+                )
+                .map_err(|_| FractureError::InvalidSnapshot)?,
+                i32::try_from(
+                    origin
+                        .z
+                        .checked_add(i64::from(z))
+                        .ok_or(FractureError::InvalidSnapshot)?,
+                )
+                .map_err(|_| FractureError::InvalidSnapshot)?,
+            ];
+            let material = part
+                .source
+                .grid
+                .material(x as u32, y as u32, z as u32)
+                .ok_or(FractureError::InvalidSnapshot)?;
+            let reference = SourceCellRef {
+                volume_id: part.source.volume_id,
+                part_id: part.source.part_id,
+                cell: source_cell,
+                material,
+                source_revision: part.source.source_revision,
+            };
+            cells.push(reference);
+            geometry.push(CellGeometry {
+                source: reference,
+                source_cell,
+                pose_translation: pose.translation_m,
+                rotation: signed_permutation(axes).unwrap_or([[0; 3]; 3]),
+                cell_m: part.source.cell_m,
+                // Loose sphere around the part origin enclosing every rotated
+                // cell. This does not use rounded quaternion axes.
+                bound_radius_m: (2.0
+                    * f64::from(part.source.cell_m)
+                    * (f64::from(source_cell[0]).abs()
+                        + f64::from(source_cell[1]).abs()
+                        + f64::from(source_cell[2]).abs()
+                        + 2.0))
+                    .next_up(),
+            });
+        }
+    }
+    if cells.is_empty() {
+        return Err(FractureError::InvalidSnapshot);
+    }
+    cells.sort_unstable();
+    if cells.windows(2).any(|pair| {
+        pair[0] == pair[1]
+            || (pair[0].volume_id, pair[0].part_id, pair[0].cell)
+                == (pair[1].volume_id, pair[1].part_id, pair[1].cell)
+    }) {
+        return Err(FractureError::InvalidSnapshot);
+    }
+    // The geometry array follows input part/cell order, while the union-find is
+    // indexed by canonical source identity.
+    geometry.sort_unstable_by_key(|cell| cell.source);
+    let indices = cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| (*cell, index))
+        .collect::<BTreeMap<_, _>>();
+    let geometric_indices = cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| ((cell.volume_id, cell.part_id, cell.cell), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut union = UnionFind::new(cells.len());
+
+    for (index, cell) in cells.iter().enumerate() {
+        for delta in [[1, 0, 0], [0, 1, 0], [0, 0, 1]] {
+            let Some(neighbor) = cell.cell[0]
+                .checked_add(delta[0])
+                .zip(cell.cell[1].checked_add(delta[1]))
+                .zip(cell.cell[2].checked_add(delta[2]))
+                .map(|((x, y), z)| [x, y, z])
+            else {
+                continue;
+            };
+            let key = (cell.volume_id, cell.part_id, neighbor);
+            if let Some(other) = geometric_indices.get(&key) {
+                union.join(index, *other);
+            }
+        }
+    }
+
+    let mut candidate_pairs_tested = 0usize;
+    let mut certified_cross_volume_edges = 0usize;
+    let mut ambiguous_pairs = Vec::new();
+    let mut by_volume = BTreeMap::<VolumeId, Vec<usize>>::new();
+    for (index, cell) in geometry.iter().enumerate() {
+        by_volume
+            .entry(cell.source.volume_id)
+            .or_default()
+            .push(index);
+    }
+    let volume_groups = by_volume.into_values().collect::<Vec<_>>();
+    // Bound all cross-volume work. Same-volume adjacency is handled above by
+    // one geometric lookup per cell and is not part of this pair budget.
+    for left_group in 0..volume_groups.len() {
+        for right_group in left_group + 1..volume_groups.len() {
+            for &left in &volume_groups[left_group] {
+                let a = &geometry[left];
+                for &right in &volume_groups[right_group] {
+                    let b = &geometry[right];
+                    candidate_pairs_tested = candidate_pairs_tested
+                        .checked_add(1)
+                        .ok_or(FractureError::WorkBudget)?;
+                    if candidate_pairs_tested > MAX_FRACTURE_CELL_PAIR_TESTS {
+                        return Err(FractureError::WorkBudget);
+                    }
+                    // Only exact lattice geometry can connect cells. Otherwise a
+                    // conservative origin-sphere gap may prove separation; overlap
+                    // never proves connectivity.
+                    let classification = classify_lattice_pair(a, b)
+                        .unwrap_or_else(|| classify_conservative_separation(a, b));
+                    match classification {
+                        ContactClass::Separated => {}
+                        ContactClass::PositiveVolume => {
+                            let left_index = indices[&a.source];
+                            let right_index = indices[&b.source];
+                            union.join(left_index, right_index);
+                            certified_cross_volume_edges += 1;
+                        }
+                        ContactClass::Ambiguous => ambiguous_pairs.push((
+                            indices[&a.source],
+                            indices[&b.source],
+                            a.source,
+                            b.source,
+                            std::array::from_fn(|axis| {
+                                (f64::from(a.pose_translation[axis])
+                                    - f64::from(b.pose_translation[axis]))
+                                .abs()
+                                .to_bits()
+                            }),
+                            (a.bound_radius_m + b.bound_radius_m).next_up().to_bits(),
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    // An uncertain edge cannot alter the partition if its endpoints already
+    // belong to one independently certified component. Defer ambiguity until
+    // the complete positive-proof graph exists so redundant joint surfaces do
+    // not reject a result unnecessarily.
+    let mut redundant_ambiguous_pairs_ignored = 0;
+    for (left, right, left_ref, right_ref, axis_gap_m_bits, required_gap_m_bits) in ambiguous_pairs
+    {
+        if union.root(left) != union.root(right) {
+            return Err(FractureError::AmbiguousContact {
+                left: left_ref,
+                right: right_ref,
+                axis_gap_m_bits,
+                required_gap_m_bits,
+            });
+        }
+        redundant_ambiguous_pairs_ignored += 1;
+    }
+
+    let mut groups = BTreeMap::<usize, Vec<SourceCellRef>>::new();
+    for (index, cell) in cells.iter().copied().enumerate() {
+        groups.entry(union.root(index)).or_default().push(cell);
+    }
+    let mut components = groups
+        .into_values()
+        .map(|mut cells| {
+            cells.sort_unstable();
+            FractureComponent { cells }
+        })
+        .collect::<Vec<_>>();
+    components.sort_by_key(|component| component.cells[0]);
+    Ok(PreparedFracturePlan {
+        version: FRACTURE_PLAN_VERSION,
+        token: snapshot.token,
+        source_cells: cells,
+        components,
+        candidate_pairs_tested,
+        certified_cross_volume_edges,
+        redundant_ambiguous_pairs_ignored,
+        elapsed: start.elapsed(),
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContactClass {
+    Separated,
+    PositiveVolume,
+    Ambiguous,
+}
+
+fn classify_conservative_separation(a: &CellGeometry, b: &CellGeometry) -> ContactClass {
+    let radius_sum = (a.bound_radius_m + b.bound_radius_m).next_up();
+    for axis in 0..3 {
+        let delta = f64::from(a.pose_translation[axis]) - f64::from(b.pose_translation[axis]);
+        let lower_gap = delta.abs().next_down();
+        if lower_gap > radius_sum {
+            return ContactClass::Separated;
+        }
+    }
+    ContactClass::Ambiguous
+}
+
+fn signed_permutation(axes: [[f64; 3]; 3]) -> Option<[[i32; 3]; 3]> {
+    let mut rotation = [[0; 3]; 3];
+    for column in 0..3 {
+        let mut found = None;
+        for (row, &value) in axes[column].iter().enumerate() {
+            match value {
+                -1.0 => {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some((row, -1));
+                }
+                0.0 => {}
+                1.0 => {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some((row, 1));
+                }
+                _ => return None,
+            }
+        }
+        let (row, sign) = found?;
+        if rotation[row].iter().any(|value| *value != 0) {
+            return None;
+        }
+        rotation[row][column] = sign;
+    }
+    Some(rotation)
+}
+
+/// Exact common-lattice predicate for signed-permutation part frames. The
+/// relative translation must be an exactly represented integer number of
+/// cells. Integer interval arithmetic proves positive-area face contact;
+/// edge/corner contacts are separated.
+fn classify_lattice_pair(a: &CellGeometry, b: &CellGeometry) -> Option<ContactClass> {
+    if a.rotation == [[0; 3]; 3]
+        || b.rotation == [[0; 3]; 3]
+        || a.cell_m.to_bits() != b.cell_m.to_bits()
+    {
+        return None;
+    }
+    let cell_m = a.cell_m;
+    // Promotion precedes subtraction: f64 represents each finite f32 exactly,
+    // but the subtraction itself is accepted only when TwoDiff proves no
+    // residual was lost.
+    let translation_delta = std::array::from_fn::<_, 3, _>(|axis| {
+        exact_difference(
+            f64::from(b.pose_translation[axis]),
+            f64::from(a.pose_translation[axis]),
+        )
+    });
+    let cell_m = f64::from(cell_m);
+    let mut delta = [0_i64; 3];
+    for axis in 0..3 {
+        let cells = translation_delta[axis]? / cell_m;
+        let rounded = cells.round();
+        if !rounded.is_finite()
+            || rounded < i64::MIN as f64
+            || rounded >= 9_007_199_254_740_992.0
+            || exact_product(rounded, cell_m)? != translation_delta[axis]?
+        {
+            return None;
+        }
+        delta[axis] = rounded as i64;
+    }
+    let world_cell =
+        |rotation: [[i32; 3]; 3], source: [i32; 3], offset: [i64; 3]| -> Option<[i64; 3]> {
+            let mut result = [0_i64; 3];
+            for axis in 0..3 {
+                let mut coordinate = offset[axis];
+                for input_axis in 0..3 {
+                    let sign = rotation[axis][input_axis];
+                    if sign == -1 {
+                        coordinate = coordinate.checked_sub(1)?;
+                    }
+                    coordinate =
+                        coordinate.checked_add(i64::from(sign) * i64::from(source[input_axis]))?;
+                }
+                result[axis] = coordinate;
+            }
+            Some(result)
+        };
+    let a_cell = world_cell(a.rotation, a.source_cell, [0; 3])?;
+    let b_cell = world_cell(b.rotation, b.source_cell, delta)?;
+    let diff = std::array::from_fn::<_, 3, _>(|axis| b_cell[axis].checked_sub(a_cell[axis]));
+    let diff = [diff[0]?, diff[1]?, diff[2]?];
+    let absolute = [
+        diff[0].checked_abs()?,
+        diff[1].checked_abs()?,
+        diff[2].checked_abs()?,
+    ];
+    if absolute.iter().any(|value| *value > 1) {
+        Some(ContactClass::Separated)
+    } else {
+        match absolute.iter().map(|value| *value as usize).sum::<usize>() {
+            0 => Some(ContactClass::PositiveVolume),
+            1 => Some(ContactClass::PositiveVolume),
+            _ => Some(ContactClass::Separated),
+        }
+    }
+}
+
+fn exact_difference(a: f64, b: f64) -> Option<f64> {
+    let difference = a - b;
+    let b_virtual = a - difference;
+    let a_virtual = difference + b_virtual;
+    let b_roundoff = b_virtual - b;
+    let a_roundoff = a - a_virtual;
+    let residual = a_roundoff + b_roundoff;
+    (residual == 0.0).then_some(difference)
+}
+
+fn exact_product(a: f64, b: f64) -> Option<f64> {
+    const SPLITTER: f64 = 134_217_729.0; // 2^27 + 1 for IEEE binary64.
+    let product = a * b;
+    if !product.is_finite() {
+        return None;
+    }
+    let a_split = SPLITTER * a;
+    let a_high = a_split - (a_split - a);
+    let a_low = a - a_high;
+    let b_split = SPLITTER * b;
+    let b_high = b_split - (b_split - b);
+    let b_low = b - b_high;
+    let residual = ((a_high * b_high - product) + a_high * b_low + a_low * b_high) + a_low * b_low;
+    (residual == 0.0).then_some(product)
+}
+
+fn rotate64(q: [f32; 4], v: [f64; 3]) -> [f64; 3] {
+    let q = q.map(f64::from);
+    let qv = [q[0], q[1], q[2]];
+    let t = scale(cross(qv, v), 2.0);
+    add(v, add(scale(t, q[3]), cross(qv, t)))
+}
+
+fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|axis| a[axis] + b[axis])
+}
+fn scale(a: [f64; 3], factor: f64) -> [f64; 3] {
+    a.map(|value| value * factor)
+}
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+impl UnionFind {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
+            rank: vec![0; len],
+        }
+    }
+    fn root(&mut self, index: usize) -> usize {
+        if self.parent[index] != index {
+            self.parent[index] = self.root(self.parent[index]);
+        }
+        self.parent[index]
+    }
+    fn join(&mut self, a: usize, b: usize) {
+        let mut a = self.root(a);
+        let mut b = self.root(b);
+        if a == b {
+            return;
+        }
+        if self.rank[a] < self.rank[b] {
+            std::mem::swap(&mut a, &mut b);
+        }
+        self.parent[b] = a;
+        if self.rank[a] == self.rank[b] {
+            self.rank[a] += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use spall_core::{GlobalCell, MaterialId, VolumeId};
+
+    use super::*;
+    use crate::occupancy::OccupancyGrid;
+
+    fn volume(id: u64) -> VolumeId {
+        VolumeId::new(id).unwrap()
+    }
+
+    fn part(
+        part_id: u32,
+        volume_id: u64,
+        origin: [i64; 3],
+        dims: [u32; 3],
+        solid: Vec<bool>,
+        pose: PartTransform,
+    ) -> FracturePartSnapshot {
+        let materials = vec![MaterialId(1); solid.len()];
+        FracturePartSnapshot {
+            source: SourcePart {
+                part_id,
+                parent_id: None,
+                volume_id: volume(volume_id),
+                source_revision: 7,
+                grid: OccupancyGrid::from_solid_mask(
+                    GlobalCell::new(origin[0], origin[1], origin[2]),
+                    dims,
+                    solid,
+                    materials,
+                )
+                .unwrap(),
+                cell_m: 1.0,
+                local_transform: PartTransform::IDENTITY,
+            },
+            root_local_pose: pose,
+        }
+    }
+
+    fn snapshot(parts: Vec<FracturePartSnapshot>) -> FractureSnapshot {
+        FractureSnapshot {
+            token: FractureSnapshotToken {
+                corpse_key: 9,
+                topology_revision: 11,
+                pose_epoch: 13,
+                source_generation: 17,
+            },
+            parts,
+        }
+    }
+
+    fn z_rotation_45(translation: [f32; 3]) -> PartTransform {
+        let half_angle = std::f32::consts::FRAC_PI_8;
+        PartTransform {
+            translation_m: translation,
+            rotation_xyzw: [0.0, 0.0, half_angle.sin(), half_angle.cos()],
+        }
+    }
+
+    #[test]
+    fn same_volume_uses_integer_face_adjacency_and_bridge_removal_partitions_exactly() {
+        let before = snapshot(vec![part(
+            1,
+            101,
+            [-3, -1, 2],
+            [3, 1, 1],
+            vec![true, true, true],
+            PartTransform::IDENTITY,
+        )]);
+        let plan = prepare_fracture(&before).unwrap();
+        assert_eq!(plan.components.len(), 1);
+        assert_eq!(plan.source_cells[0].cell, [-3, -1, 2]);
+        assert_eq!(plan.source_cells[2].cell, [-1, -1, 2]);
+
+        let after = snapshot(vec![part(
+            1,
+            101,
+            [-3, -1, 2],
+            [3, 1, 1],
+            vec![true, false, true],
+            PartTransform::IDENTITY,
+        )]);
+        let plan = prepare_fracture(&after).unwrap();
+        assert_eq!(plan.components.len(), 2);
+        assert_eq!(plan.components[0].cells[0].cell, [-3, -1, 2]);
+        assert_eq!(plan.components[1].cells[0].cell, [-1, -1, 2]);
+    }
+
+    #[test]
+    fn arbitrary_rotated_cross_volume_overlap_fails_closed() {
+        let result = prepare_fracture(&snapshot(vec![
+            part(
+                1,
+                101,
+                [0, 0, 0],
+                [1, 1, 1],
+                vec![true],
+                PartTransform::IDENTITY,
+            ),
+            part(
+                2,
+                102,
+                [0, 0, 0],
+                [1, 1, 1],
+                vec![true],
+                z_rotation_45([0.55, 0.0, 0.0]),
+            ),
+        ]));
+        assert!(matches!(
+            result,
+            Err(FractureError::AmbiguousContact { .. })
+        ));
+    }
+
+    #[test]
+    fn rotated_aabb_overlap_does_not_create_a_false_connection() {
+        let result = prepare_fracture(&snapshot(vec![
+            part(
+                1,
+                101,
+                [0, 0, 0],
+                [1, 1, 1],
+                vec![true],
+                PartTransform {
+                    translation_m: [-0.5, -0.5, -0.5],
+                    rotation_xyzw: PartTransform::IDENTITY.rotation_xyzw,
+                },
+            ),
+            part(
+                2,
+                102,
+                [0, 0, 0],
+                [1, 1, 1],
+                vec![true],
+                z_rotation_45([1.1, 0.393, -0.5]),
+            ),
+        ]));
+        // The loose conservative enclosure intentionally rejects this case;
+        // it never turns an AABB overlap into a weld.
+        assert!(matches!(
+            result,
+            Err(FractureError::AmbiguousContact { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_common_lattice_face_contact_is_connected() {
+        let result = prepare_fracture(&snapshot(vec![
+            part(
+                1,
+                101,
+                [0, 0, 0],
+                [1, 1, 1],
+                vec![true],
+                PartTransform::IDENTITY,
+            ),
+            part(
+                2,
+                102,
+                [0, 0, 0],
+                [1, 1, 1],
+                vec![true],
+                PartTransform {
+                    translation_m: [1.0, 0.0, 0.0],
+                    rotation_xyzw: PartTransform::IDENTITY.rotation_xyzw,
+                },
+            ),
+        ]));
+        let plan = result.unwrap();
+        assert_eq!(plan.certified_cross_volume_edges, 1);
+        assert_eq!(plan.components.len(), 1);
+    }
+
+    #[test]
+    fn plan_preserves_source_revision_material_and_full_identity() {
+        let plan = prepare_fracture(&snapshot(vec![part(
+            3,
+            503,
+            [-9, 2, -4],
+            [1, 1, 1],
+            vec![true],
+            PartTransform::IDENTITY,
+        )]))
+        .unwrap();
+        assert_eq!(plan.version, FRACTURE_PLAN_VERSION);
+        assert_eq!(plan.token.topology_revision, 11);
+        assert_eq!(plan.source_cells[0].volume_id, volume(503));
+        assert_eq!(plan.source_cells[0].part_id, 3);
+        assert_eq!(plan.source_cells[0].cell, [-9, 2, -4]);
+        assert_eq!(plan.source_cells[0].material, MaterialId(1));
+        assert_eq!(plan.source_cells[0].source_revision, 7);
+    }
+
+    #[test]
+    fn duplicate_or_empty_source_parts_reject() {
+        let duplicate = snapshot(vec![
+            part(
+                1,
+                101,
+                [0, 0, 0],
+                [1, 1, 1],
+                vec![true],
+                PartTransform::IDENTITY,
+            ),
+            part(
+                2,
+                101,
+                [2, 0, 0],
+                [1, 1, 1],
+                vec![true],
+                PartTransform::IDENTITY,
+            ),
+        ]);
+        assert_eq!(
+            prepare_fracture(&duplicate).unwrap_err(),
+            FractureError::InvalidSnapshot
+        );
+        let empty = snapshot(vec![part(
+            1,
+            101,
+            [0, 0, 0],
+            [1, 1, 1],
+            vec![false],
+            PartTransform::IDENTITY,
+        )]);
+        assert_eq!(
+            prepare_fracture(&empty).unwrap_err(),
+            FractureError::InvalidSnapshot
+        );
+    }
+}

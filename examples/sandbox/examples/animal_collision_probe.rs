@@ -20,8 +20,9 @@ use spall_asset::{Asset, Part, Transform, decode, sample_clip};
 use spall_core::{GlobalCell, MaterialId, VolumeId};
 use spall_physics::{
     ArticulatedBodyId, ArticulatedPose, BodyKind, BodySpec, ContactCellAttribution,
-    ContactWitnessUnattributed, OccupancyGrid, PartTransform, PhysicsConfig, PhysicsWorld,
-    Representation, SourcePart, articulated_mass_properties, build_collider,
+    ContactWitnessUnattributed, FracturePartSnapshot, FractureSnapshot, FractureSnapshotToken,
+    OccupancyGrid, PartTransform, PhysicsConfig, PhysicsWorld, Representation, SourcePart,
+    articulated_mass_properties, build_collider, prepare_fracture,
 };
 use spall_sim::SimWorld;
 
@@ -156,6 +157,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.as_slice() == ["--corpse-bounded"] {
         return run_corpse_bounded();
+    }
+    if args.as_slice() == ["--fracture-bounded"] {
+        return run_fracture_bounded();
     }
     let kinematic_parts = args.iter().any(|arg| arg == "--kinematic-parts");
     let solver_substeps = args
@@ -865,6 +869,174 @@ fn run_corpse_bounded() -> Result<(), Box<dyn std::error::Error>> {
         }))?
     );
     Ok(())
+}
+
+fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cases = Vec::new();
+    for (name, bytes) in ANIMALS {
+        let animal = load_animal(decode(bytes)?)?;
+        let samples = pose_samples(&animal)?;
+        let mut selected = vec![0, samples.len() / 2, samples.len() - 1];
+        selected.sort_unstable();
+        selected.dedup();
+        for index in selected {
+            let sample = &samples[index];
+            let local_by_id = sample.locals.iter().copied().collect::<BTreeMap<_, _>>();
+            let mut flattened = BTreeMap::<u32, PartTransform>::new();
+            for part in &animal.parts {
+                flatten_sampled_pose(part.part.id, &animal, &local_by_id, &mut flattened)?;
+            }
+            let sources = animal
+                .parts
+                .iter()
+                .map(|part| {
+                    let local = *local_by_id
+                        .get(&part.part.id)
+                        .ok_or("sample omitted source part")?;
+                    let root_local_pose = *flattened
+                        .get(&part.part.id)
+                        .ok_or("pose hierarchy did not resolve")?;
+                    Ok(FracturePartSnapshot {
+                        source: SourcePart {
+                            part_id: part.part.id,
+                            parent_id: (part.part.parent_id != 0).then_some(part.part.parent_id),
+                            volume_id: VolumeId::new(
+                                u64::from(part.part.id) + u64::from(name_salt(name)) * 1000,
+                            )?,
+                            source_revision: 1,
+                            grid: part.grid.clone(),
+                            cell_m: CELL_M,
+                            local_transform: local,
+                        },
+                        root_local_pose,
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            let expected = sources
+                .iter()
+                .flat_map(|part| {
+                    let origin = part.source.grid.origin();
+                    part.source
+                        .grid
+                        .solid_indices()
+                        .into_iter()
+                        .map(move |[x, y, z]| {
+                            (
+                                part.source.volume_id,
+                                part.source.part_id,
+                                [
+                                    (origin.x + i64::from(x)) as i32,
+                                    (origin.y + i64::from(y)) as i32,
+                                    (origin.z + i64::from(z)) as i32,
+                                ],
+                                part.source.source_revision,
+                            )
+                        })
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            let started = Instant::now();
+            let plan = prepare_fracture(&FractureSnapshot {
+                token: FractureSnapshotToken {
+                    corpse_key: 1,
+                    topology_revision: 1,
+                    pose_epoch: index as u64 + 1,
+                    source_generation: 1,
+                },
+                parts: sources.clone(),
+            });
+            let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+            match plan {
+                Ok(plan) => {
+                    let actual = plan
+                        .components
+                        .iter()
+                        .flat_map(|component| component.cells.iter())
+                        .map(|cell| {
+                            (
+                                cell.volume_id,
+                                cell.part_id,
+                                cell.cell,
+                                cell.source_revision,
+                            )
+                        })
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let partition_ok = actual == expected
+                        && actual.len() == plan.source_cells.len()
+                        && plan
+                            .components
+                            .iter()
+                            .map(|component| component.cells.len())
+                            .sum::<usize>()
+                            == animal.cell_count;
+                    if !partition_ok {
+                        return Err(format!(
+                            "fracture source conservation failed: {name} {}",
+                            sample.clip
+                        )
+                        .into());
+                    }
+                    cases.push(serde_json::json!({
+                        "animal":name,"clip":sample.clip,"tick":sample.tick,
+                        "source_parts":sources.len(),"source_cells":plan.source_cells.len(),
+                        "component_count":plan.components.len(),
+                        "component_cell_counts":plan.components.iter().map(|component| component.cells.len()).collect::<Vec<_>>(),
+                        "candidate_pairs_tested":plan.candidate_pairs_tested,
+                        "certified_cross_volume_edges":plan.certified_cross_volume_edges,
+                        "planner_elapsed_us":elapsed_us,
+                        "source_partition_conserved":partition_ok,
+                        "source_ids_and_integer_coordinates_preserved":true
+                    }));
+                }
+                Err(error) => cases.push(serde_json::json!({
+                    "animal":name,"clip":sample.clip,"tick":sample.tick,
+                    "source_parts":sources.len(),"source_cells":animal.cell_count,
+                    "planner_elapsed_us":elapsed_us,"rejected":format!("{error:?}"),
+                    "source_partition_conserved":false
+                })),
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "scenario":"eng214_actual_animal_fracture_connectivity",
+            "scope":"bounded immutable CPU topology planning only; no runtime owner split or actor population acceptance",
+            "cases":cases
+        }))?
+    );
+    Ok(())
+}
+
+fn flatten_sampled_pose(
+    part_id: u32,
+    animal: &Animal,
+    sampled: &BTreeMap<u32, PartTransform>,
+    output: &mut BTreeMap<u32, PartTransform>,
+) -> Result<PartTransform, Box<dyn std::error::Error>> {
+    if let Some(pose) = output.get(&part_id) {
+        return Ok(*pose);
+    }
+    let part = animal
+        .parts
+        .iter()
+        .find(|part| part.part.id == part_id)
+        .ok_or("pose references unknown part")?;
+    let local = *sampled.get(&part_id).ok_or("sample omitted part")?;
+    let resolved = if part.part.parent_id == 0 {
+        local
+    } else {
+        let parent = flatten_sampled_pose(part.part.parent_id, animal, sampled, output)?;
+        let parent_q = Quat::from_array(parent.rotation_xyzw).normalize();
+        let local_q = Quat::from_array(local.rotation_xyzw).normalize();
+        PartTransform {
+            translation_m: (Vec3::from_array(parent.translation_m)
+                + parent_q * Vec3::from_array(local.translation_m))
+            .to_array(),
+            rotation_xyzw: (parent_q * local_q).normalize().to_array(),
+        }
+    };
+    output.insert(part_id, resolved);
+    Ok(resolved)
 }
 
 fn validate_transition_parity(
