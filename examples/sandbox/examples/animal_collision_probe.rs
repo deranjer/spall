@@ -991,12 +991,19 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                             Representation::MergedCuboids,
                             |_| 1.0,
                         )?;
+                        physics.set_dynamic_corpse_component_velocity(
+                            owner,
+                            None,
+                            [0.2, 0.1, -0.15],
+                            [0.0, 0.3, 0.0],
+                        )?;
                         let live_snapshot = physics.capture_dynamic_corpse_fracture_snapshot(
                             owner,
                             0x454e_4732_3134,
                             None,
                         )?;
                         let live_plan = prepare_fracture(&live_snapshot)?;
+                        let before_queries = Instant::now();
                         let mut baseline_rays = Vec::with_capacity(plan.source_cells.len());
                         for cell in &plan.source_cells {
                             let pose = flattened[&cell.part_id];
@@ -1020,6 +1027,7 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                             )?;
                             baseline_rays.push((origin.to_array(), direction.to_array(), hit));
                         }
+                        let before_query_us = before_queries.elapsed().as_secs_f64() * 1e6;
                         let split = physics.commit_dynamic_corpse_fracture(
                             owner,
                             &live_snapshot,
@@ -1038,8 +1046,8 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                         // Confirm every live component still owns exactly its
                         // canonical source partition. A global nearest-hit ray
                         // cannot select buried cells or distinguish overlapping
-                        // independent components, so surface queries use the
-                        // dedicated synthetic source-query regression instead.
+                        // independent components. Compare nearest-hit baselines separately
+                        // from complete cell conservation.
                         let mut recaptured = Vec::new();
                         for (component_id, _) in &split.components {
                             let component_snapshot = physics
@@ -1060,6 +1068,7 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .into());
                         }
+                        let after_queries = Instant::now();
                         for (origin, direction, baseline) in &baseline_rays {
                             let after =
                                 physics.raycast_articulated(owner, *origin, *direction, 4.0)?;
@@ -1072,6 +1081,56 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                                 return Err(format!("post-split nearest-hit baseline changed: {name} {} {:?} -> {:?}", sample.clip, baseline, after).into());
                             }
                         }
+                        let after_query_us = after_queries.elapsed().as_secs_f64() * 1e6;
+                        let before_states = split
+                            .components
+                            .iter()
+                            .map(|(key, _)| physics.fracture_component_state(owner, *key))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let mut step_us = Vec::new();
+                        for _ in 0..30 {
+                            let started = Instant::now();
+                            physics.step();
+                            step_us.push(started.elapsed().as_secs_f64() * 1e6);
+                            for (key, _) in &split.components {
+                                if !physics.fracture_component_state(owner, *key)?.is_finite() {
+                                    return Err(format!(
+                                        "nonfinite moving fragment: {name} {}",
+                                        sample.clip
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
+                        let moved = split.components.iter().zip(&before_states).any(
+                            |((key, _), before)| {
+                                physics
+                                    .fracture_component_state(owner, *key)
+                                    .is_ok_and(|after| {
+                                        before
+                                            .translation_m
+                                            .iter()
+                                            .zip(after.translation_m)
+                                            .any(|(a, b)| (*a - b).abs() > 1e-6)
+                                    })
+                            },
+                        );
+                        if !moved {
+                            return Err("seeded physical fragments did not move".into());
+                        }
+                        let mut moved_cells = Vec::new();
+                        for (key, _) in &split.components {
+                            let captured = physics.capture_dynamic_corpse_fracture_snapshot(
+                                owner,
+                                0x454e_4732_3134,
+                                Some(*key),
+                            )?;
+                            moved_cells.extend(prepare_fracture(&captured)?.source_cells);
+                        }
+                        moved_cells.sort_unstable();
+                        if moved_cells != expected {
+                            return Err("moving fragments lost source identity".into());
+                        }
                         physical_split = Some(serde_json::json!({
                             "component_body_count":physics.articulated_rigid_body_count(owner),
                             "component_collider_count":physics.articulated_collider_count(owner),
@@ -1080,6 +1139,13 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                             "post_split_source_partition_exact":true,
                             "baseline_nearest_hit_rays_preserved":baseline_rays.len(),
                             "commit_elapsed_us":split.elapsed.as_secs_f64()*1e6,
+                            "baseline_query_batch_us":before_query_us,
+                            "post_split_query_batch_us":after_query_us,
+                            "seeded_motion_steps":30,
+                            "moving_fragment_states_finite":true,
+                            "moving_source_partition_exact":true,
+                            "step_p50_us":percentile_us(&step_us,0.5),
+                            "step_p95_us":percentile_us(&step_us,0.95),
                         }));
                     }
                     cases.push(serde_json::json!({

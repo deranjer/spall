@@ -134,9 +134,12 @@ fn large_translation_fractional_offsets_require_correct_geometric_classification
     assert_eq!(prepare_fracture(&input).unwrap().components.len(), 1);
     input.parts[1].root_local_pose.translation_m[0] = 1.5;
     assert_eq!(prepare_fracture(&input).unwrap().components.len(), 2);
-    // Partial-face tangency has no strict positive-volume certificate. The
-    // lattice path must not erase the fractional x offset and guess a weld.
+    // Exact coplanar faces may use the certified positive-area proof. The
+    // lattice path still must not erase a fractional offset and guess a weld.
     input.parts[1].root_local_pose.translation_m = [0.5, 1.0, 0.0];
+    assert_eq!(prepare_fracture(&input).unwrap().components.len(), 1);
+    // An edge-only contact has zero material face area and stays uncertain.
+    input.parts[1].root_local_pose.translation_m = [0.5, 1.0, 1.0];
     assert!(matches!(
         prepare_fracture(&input),
         Err(FractureError::AmbiguousContact { .. })

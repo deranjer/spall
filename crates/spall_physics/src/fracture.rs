@@ -122,11 +122,13 @@ struct CellGeometry {
     rotation_xyzw: [f32; 4],
     cell_m: f32,
     bound_radius_m: f64,
+    cached_box: Option<CachedBox>,
 }
 
 /// Prepare deterministic connected components from an immutable corpse pose.
 /// Same-volume connectivity uses exact integer six-face adjacency. Cross-volume
-/// edges use exact shared-lattice proofs or interval-certified positive-volume
+/// edges use exact shared-lattice proofs, exact coplanar positive-area contact,
+/// or interval-certified positive-volume
 /// overlap of the canonical affine cell boxes. The latter describes the stored
 /// normalized-f32 quaternion coefficients interpreted as exact affine inputs;
 /// it does not claim bit-for-bit equivalence with Rapier's contact arithmetic.
@@ -231,7 +233,7 @@ pub fn prepare_fracture(
                 source_revision: part.source.source_revision,
             };
             cells.push(reference);
-            geometry.push(CellGeometry {
+            let mut cell_geometry = CellGeometry {
                 source: reference,
                 source_cell,
                 pose_translation: pose.translation_m,
@@ -247,7 +249,10 @@ pub fn prepare_fracture(
                         + f64::from(source_cell[2]).abs()
                         + 2.0))
                     .next_up(),
-            });
+                cached_box: None,
+            };
+            cell_geometry.cached_box = cache_cell_box(&cell_geometry);
+            geometry.push(cell_geometry);
         }
     }
     if cells.is_empty() {
@@ -321,7 +326,7 @@ pub fn prepare_fracture(
                     }
                     // Prefer the exact lattice certificate. A loose origin sphere
                     // cheaply rejects distant pairs; unresolved pairs use bounded
-                    // interval SAT, which may connect only strict positive volume.
+                    // interval SAT and certified positive-area coplanar contacts.
                     let classification = if let Some(lattice) = classify_lattice_pair(a, b) {
                         lattice
                     } else {
@@ -339,7 +344,7 @@ pub fn prepare_fracture(
                     };
                     match classification {
                         ContactClass::Separated => {}
-                        ContactClass::PositiveVolume => {
+                        ContactClass::PositiveContact => {
                             let left_index = indices[&a.source];
                             let right_index = indices[&b.source];
                             union.join(left_index, right_index);
@@ -413,11 +418,18 @@ pub fn prepare_fracture(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContactClass {
     Separated,
-    PositiveVolume,
+    PositiveContact,
     Ambiguous,
 }
 
 fn classify_conservative_separation(a: &CellGeometry, b: &CellGeometry) -> ContactClass {
+    if let (Some(a_box), Some(b_box)) = (a.cached_box, b.cached_box)
+        && (0..3).any(|axis| {
+            a_box.aabb[axis].hi < b_box.aabb[axis].lo || b_box.aabb[axis].hi < a_box.aabb[axis].lo
+        })
+    {
+        return ContactClass::Separated;
+    }
     let radius_sum = (a.bound_radius_m + b.bound_radius_m).next_up();
     for axis in 0..3 {
         let delta = f64::from(a.pose_translation[axis]) - f64::from(b.pose_translation[axis]);
@@ -480,13 +492,36 @@ impl Interval {
         let mut upper = f64::NEG_INFINITY;
         for (a, b) in pairs {
             let product = a * b;
+            if !product.is_finite() {
+                return Self {
+                    lo: f64::NEG_INFINITY,
+                    hi: f64::INFINITY,
+                };
+            }
+            if a == 0.0 || b == 0.0 {
+                lower = lower.min(product);
+                upper = upper.max(product);
+                continue;
+            }
             let error = a.mul_add(b, -product);
-            let product_lo = if error < 0.0 {
+            if !error.is_finite() {
+                return Self {
+                    lo: f64::NEG_INFINITY,
+                    hi: f64::INFINITY,
+                };
+            }
+            // The exact FMA residual can round to zero when it is below the
+            // binary64 subnormal range, even for normal operands. Below 2^-969
+            // the residual's worst-case exponent may be unrepresentable; widen
+            // one full product ULP unconditionally instead of trusting zero.
+            let residual_safe_floor = f64::MIN_POSITIVE * (1_u64 << 53) as f64;
+            let underflow_guard = product.abs() < residual_safe_floor;
+            let product_lo = if error < 0.0 || underflow_guard {
                 product.next_down()
             } else {
                 product
             };
-            let product_hi = if error > 0.0 {
+            let product_hi = if error > 0.0 || underflow_guard {
                 product.next_up()
             } else {
                 product
@@ -607,11 +642,47 @@ fn cell_box(geometry: &CellGeometry) -> Option<(IVec3, [IVec3; 3])> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CachedBox {
+    center: IVec3,
+    edges: [IVec3; 3],
+    aabb: IVec3,
+}
+
+fn cache_cell_box(cell: &CellGeometry) -> Option<CachedBox> {
+    let (center, edges) = cell_box(cell)?;
+    let aabb = std::array::from_fn(|axis| {
+        let radius = edges
+            .iter()
+            .map(|edge| edge[axis].abs())
+            .fold(Interval::ZERO, Interval::add);
+        Interval {
+            lo: center[axis].sub(radius).lo,
+            hi: center[axis].add(radius).hi,
+        }
+    });
+    aabb.into_iter().all(Interval::finite).then_some(CachedBox {
+        center,
+        edges,
+        aabb,
+    })
+}
+
 fn classify_parallelepiped_pair(a: &CellGeometry, b: &CellGeometry) -> (ContactClass, usize) {
-    let Some((center_a, edges_a)) = cell_box(a) else {
+    let Some(CachedBox {
+        center: center_a,
+        edges: edges_a,
+        ..
+    }) = a.cached_box
+    else {
         return (ContactClass::Ambiguous, 0);
     };
-    let Some((center_b, edges_b)) = cell_box(b) else {
+    let Some(CachedBox {
+        center: center_b,
+        edges: edges_b,
+        ..
+    }) = b.cached_box
+    else {
         return (ContactClass::Ambiguous, 0);
     };
     let mut axes = [[Interval::ZERO; 3]; 15];
@@ -641,7 +712,8 @@ fn classify_parallelepiped_pair(a: &CellGeometry, b: &CellGeometry) -> (ContactC
     let delta = ivec_sub(center_b, center_a);
     let mut tested = 0;
     let mut strict_overlap = true;
-    for axis in axes {
+    let mut strict_axes = [false; 15];
+    for (axis_index, axis) in axes.into_iter().enumerate() {
         if axis.into_iter().all(Interval::exact_zero) {
             continue;
         }
@@ -665,15 +737,65 @@ fn classify_parallelepiped_pair(a: &CellGeometry, b: &CellGeometry) -> (ContactC
         if projection.lo > radius.hi {
             return (ContactClass::Separated, tested);
         }
-        if projection.hi >= radius.lo {
+        strict_axes[axis_index] = projection.hi < radius.lo;
+        if !strict_axes[axis_index] {
             strict_overlap = false;
         }
     }
-    if strict_overlap && tested > 0 {
-        (ContactClass::PositiveVolume, tested)
+    if (strict_overlap && tested > 0)
+        || certify_axis_aligned_face(center_a, edges_a, center_b, edges_b, axes, strict_axes)
+    {
+        (ContactClass::PositiveContact, tested)
     } else {
         (ContactClass::Ambiguous, tested)
     }
+}
+
+/// An exact shared supporting plane plus strict projected polygon overlap proves
+/// positive-area material contact. Only prisms with a certified pure world-axis
+/// edge and zero axial components on the other edges qualify. The four side-face
+/// normals are already present in the complete SAT set; no extra axis budget or
+/// tolerance is introduced. A nonzero axial face normal certifies rank two.
+fn certify_axis_aligned_face(
+    center_a: IVec3,
+    edges_a: [IVec3; 3],
+    center_b: IVec3,
+    edges_b: [IVec3; 3],
+    axes: [IVec3; 15],
+    strict_axes: [bool; 15],
+) -> bool {
+    let pure_edge = |edges: [IVec3; 3], axis: usize| {
+        (0..3).find(|&i| {
+            edges[i][axis].abs().lo > 0.0
+                && (0..3)
+                    .filter(|&j| j != axis)
+                    .all(|j| edges[i][j].exact_zero())
+                && (0..3)
+                    .filter(|&j| j != i)
+                    .all(|j| edges[j][axis].exact_zero())
+        })
+    };
+    let same_point = |a: Interval, b: Interval| {
+        a.finite() && b.finite() && a.lo == a.hi && b.lo == b.hi && a.lo == b.lo
+    };
+    for axis in 0..3 {
+        let (Some(i), Some(j)) = (pure_edge(edges_a, axis), pure_edge(edges_b, axis)) else {
+            continue;
+        };
+        let ra = edges_a[i][axis].abs();
+        let rb = edges_b[j][axis].abs();
+        let coincident = same_point(center_a[axis].add(ra), center_b[axis].sub(rb))
+            || same_point(center_b[axis].add(rb), center_a[axis].sub(ra));
+        if coincident
+            && axes[i][axis].abs().lo > 0.0
+            && axes[3 + j][axis].abs().lo > 0.0
+            && (0..3).filter(|&k| k != i).all(|k| strict_axes[k])
+            && (0..3).filter(|&k| k != j).all(|k| strict_axes[3 + k])
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn signed_permutation(axes: [[f64; 3]; 3]) -> Option<[[i32; 3]; 3]> {
@@ -772,8 +894,8 @@ fn classify_lattice_pair(a: &CellGeometry, b: &CellGeometry) -> Option<ContactCl
         Some(ContactClass::Separated)
     } else {
         match absolute.iter().map(|value| *value as usize).sum::<usize>() {
-            0 => Some(ContactClass::PositiveVolume),
-            1 => Some(ContactClass::PositiveVolume),
+            0 => Some(ContactClass::PositiveContact),
+            1 => Some(ContactClass::PositiveContact),
             _ => Some(ContactClass::Separated),
         }
     }
@@ -921,6 +1043,18 @@ mod tests {
     }
 
     #[test]
+    fn tiny_normal_product_with_underflowed_fma_residual_is_enclosed() {
+        let a = (1.0 + 2.0_f64.powi(-52)) * 2.0_f64.powi(-500);
+        let product = a * a;
+        // Exact expansion is 2^-1000 + 2^-1051 + 2^-1104. Binary64 rounds
+        // away the final term, and its FMA residual itself underflows to zero.
+        assert_eq!(a.mul_add(a, -product), 0.0);
+        let enclosed = Interval::point(a).mul(Interval::point(a));
+        assert_eq!(enclosed.lo, product.next_down());
+        assert_eq!(enclosed.hi, product.next_up());
+    }
+
+    #[test]
     fn same_volume_uses_integer_face_adjacency_and_bridge_removal_partitions_exactly() {
         let before = snapshot(vec![part(
             1,
@@ -950,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_rotated_cross_volume_overlap_fails_closed() {
+    fn arbitrary_rotated_cross_volume_overlap_requires_certified_material_intersection() {
         let result = prepare_fracture(&snapshot(vec![
             part(
                 1,
@@ -969,10 +1103,7 @@ mod tests {
                 z_rotation_45([0.55, 0.0, 0.0]),
             ),
         ]));
-        assert!(matches!(
-            result,
-            Err(FractureError::AmbiguousContact { .. })
-        ));
+        assert_eq!(result.unwrap().components.len(), 1);
     }
 
     #[test]
@@ -998,12 +1129,8 @@ mod tests {
                 z_rotation_45([1.1, 0.393, -0.5]),
             ),
         ]));
-        // The loose conservative enclosure intentionally rejects this case;
-        // it never turns an AABB overlap into a weld.
-        assert!(matches!(
-            result,
-            Err(FractureError::AmbiguousContact { .. })
-        ));
+        // SAT proves separation along a diagonal despite overlapping AABBs.
+        assert_eq!(result.unwrap().components.len(), 2);
     }
 
     #[test]
