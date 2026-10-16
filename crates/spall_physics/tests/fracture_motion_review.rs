@@ -274,6 +274,28 @@ fn owner_keys_cannot_alias_and_failed_mass_preparation_changes_no_owner() {
     let other_plan = prepare_fracture(&other).unwrap();
     assert!(
         world
+            .rebuild_dynamic_corpse_part_grid(
+                owners[0],
+                5,
+                6,
+                1,
+                1,
+                2,
+                first.parts[0].source.grid.clone(),
+                |_| 2.0
+            )
+            .is_err(),
+        "legacy corpse edit bypassed density manifest"
+    );
+    assert!(
+        world
+            .commit_dynamic_corpse_fracture(owners[0], &first, &first_plan, |_| 2.0)
+            .is_err(),
+        "density change silently changed surviving mass"
+    );
+    assert_eq!(world.articulated_rigid_body_count(owners[0]), 1);
+    assert!(
+        world
             .commit_dynamic_corpse_fracture(owners[0], &first, &first_plan, |_| f64::NAN)
             .is_err()
     );
@@ -304,4 +326,158 @@ fn owner_keys_cannot_alias_and_failed_mass_preparation_changes_no_owner() {
         "retired owner key was reused"
     );
     assert_eq!(world.articulated_rigid_body_count(owners[1]), 1);
+}
+
+#[test]
+fn moving_component_edit_and_resplit_leave_siblings_unchanged() {
+    for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            disable_ccd: true,
+            ..PhysicsConfig::default()
+        });
+        let volume = VolumeId::new(7201).unwrap();
+        let owner = world
+            .add_dynamic_corpse_aggregate(
+                [10.0, 2.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                5,
+                vec![SourcePart {
+                    part_id: 1,
+                    parent_id: None,
+                    volume_id: volume,
+                    source_revision: 1,
+                    grid: OccupancyGrid::from_solid_mask(
+                        GlobalCell::new(-3, 0, 0),
+                        [7, 1, 1],
+                        vec![true, true, true, false, false, false, true],
+                        vec![MaterialId(1); 7],
+                    )
+                    .unwrap(),
+                    cell_m: 1.0,
+                    local_transform: PartTransform::IDENTITY,
+                }],
+                representation,
+                |_| 1.0,
+            )
+            .unwrap();
+        let initial = world
+            .capture_dynamic_corpse_fracture_snapshot(owner, 7200, None)
+            .unwrap();
+        let initial_plan = prepare_fracture(&initial).unwrap();
+        let first = world
+            .commit_dynamic_corpse_fracture(owner, &initial, &initial_plan, |_| 1.0)
+            .unwrap();
+        let left = first.components[0].0;
+        let right = first.components[1].0;
+        world
+            .set_dynamic_corpse_component_velocity(
+                owner,
+                Some(left),
+                [0.0, 0.0, 1.0],
+                [0.0, 0.4, 0.0],
+            )
+            .unwrap();
+        world
+            .set_dynamic_corpse_component_velocity(owner, Some(right), [0.0, 0.0, -1.0], [0.0; 3])
+            .unwrap();
+        for _ in 0..12 {
+            world.step();
+        }
+        let before = world.fracture_component_state(owner, right).unwrap();
+        let stale = world
+            .capture_dynamic_corpse_fracture_snapshot(owner, 7200, Some(left))
+            .unwrap();
+        let edited = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(-3, 0, 0),
+            [3, 1, 1],
+            vec![true, false, true],
+            vec![MaterialId(1), MaterialId::AIR, MaterialId(1)],
+        )
+        .unwrap();
+        let outcome = world
+            .rebuild_dynamic_corpse_component_part_grid(
+                owner,
+                left,
+                stale.token.topology_revision,
+                stale.token.topology_revision + 1,
+                1,
+                1,
+                2,
+                edited,
+                |_| 1.0,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome,spall_physics::CorpseEditOutcome::Rebuilt { removed_mass_kg,.. } if (removed_mass_kg-1.0).abs() < 1e-6)
+        );
+        let stale_plan = prepare_fracture(&stale).unwrap();
+        assert!(
+            world
+                .commit_dynamic_corpse_fracture(owner, &stale, &stale_plan, |_| 1.0)
+                .is_err()
+        );
+        let current = world
+            .capture_dynamic_corpse_fracture_snapshot(owner, 7200, Some(left))
+            .unwrap();
+        let next_plan = prepare_fracture(&current).unwrap();
+        assert_eq!(next_plan.components.len(), 2);
+        let second = world
+            .commit_dynamic_corpse_fracture(owner, &current, &next_plan, |_| 1.0)
+            .unwrap();
+        assert_eq!(world.articulated_rigid_body_count(owner), 3);
+        assert!(world.fracture_component_state(owner, left).is_err());
+        let after = world.fracture_component_state(owner, right).unwrap();
+        assert_eq!(before.translation_m, after.translation_m);
+        assert_eq!(before.rotation, after.rotation);
+        assert_eq!(before.linvel_m_s, after.linvel_m_s);
+        assert_eq!(before.angvel_rad_s, after.angvel_rad_s);
+        let mut surviving = Vec::new();
+        for key in [right, second.components[0].0, second.components[1].0] {
+            let captured = world
+                .capture_dynamic_corpse_fracture_snapshot(owner, 7200, Some(key))
+                .unwrap();
+            for part in captured.parts {
+                assert_eq!(part.source.volume_id, volume);
+                assert_eq!(part.source.source_revision, 2);
+                let origin = part.source.grid.origin();
+                for cell in part.source.grid.solid_indices() {
+                    surviving.push(origin.x + i64::from(cell[0]));
+                }
+            }
+        }
+        surviving.sort_unstable();
+        assert_eq!(surviving, vec![-3, -1, 3]);
+        for key in [second.components[0].0, second.components[1].0, right] {
+            let captured = world
+                .capture_dynamic_corpse_fracture_snapshot(owner, 7200, Some(key))
+                .unwrap();
+            let source = &captured.parts[0].source;
+            let dims = source.grid.dims();
+            let dense = dims.into_iter().map(|v| v as usize).product();
+            let empty = OccupancyGrid::from_solid_mask(
+                source.grid.origin(),
+                dims,
+                vec![false; dense],
+                vec![MaterialId::AIR; dense],
+            )
+            .unwrap();
+            world
+                .rebuild_dynamic_corpse_component_part_grid(
+                    owner,
+                    key,
+                    captured.token.topology_revision,
+                    captured.token.topology_revision + 1,
+                    source.part_id,
+                    source.source_revision,
+                    source.source_revision + 1,
+                    empty,
+                    |_| 1.0,
+                )
+                .unwrap();
+            assert!(world.fracture_component_state(owner, key).is_err());
+        }
+        assert_eq!(world.articulated_rigid_body_count(owner), 0);
+        assert_eq!(world.articulated_collider_count(owner), 0);
+    }
 }
