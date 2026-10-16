@@ -47,6 +47,193 @@ fn world() -> PhysicsWorld {
 }
 
 #[test]
+fn living_rig_transfer_is_atomic_conserves_sampled_motion_and_dynamic_pose_apis_reject() {
+    for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+        let mut world = world();
+        let source = vec![
+            part(
+                1,
+                None,
+                [-1, 0, 0],
+                vec![true, true],
+                PartTransform::IDENTITY,
+            ),
+            part(
+                2,
+                Some(1),
+                [2, 0, 0],
+                vec![true],
+                PartTransform {
+                    translation_m: [3.0, 0.0, 0.0],
+                    rotation_xyzw: PartTransform::IDENTITY.rotation_xyzw,
+                },
+            ),
+        ];
+        let id = world
+            .add_articulated_kinematic_parts(
+                [0.0, 4.0, 0.0],
+                PartTransform::IDENTITY.rotation_xyzw,
+                9,
+                source.clone(),
+                representation,
+            )
+            .unwrap();
+        world.step();
+        let pose = PartTransform {
+            translation_m: [4.0, 0.0, 0.0],
+            ..source[1].local_transform
+        };
+        world
+            .update_articulated_pose_with_swept_root_pose(
+                id,
+                ArticulatedPose {
+                    topology_token: 9,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![(1, source[0].local_transform), (2, pose)],
+                },
+                PartTransform {
+                    translation_m: [0.0, 4.0, 0.0],
+                    ..PartTransform::IDENTITY
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            world
+                .transfer_articulated_to_dynamic_corpse(id, 9, 0, |_| 1_000.0)
+                .unwrap_err(),
+            spall_physics::ArticulatedError::PendingRootPose
+        );
+        assert_eq!(world.articulated_rigid_body_count(id), 3);
+        world.step();
+        let stale = world
+            .transfer_articulated_to_dynamic_corpse(id, 8, 1, |_| 1000.0)
+            .unwrap_err();
+        assert_eq!(stale, spall_physics::ArticulatedError::StaleTopology);
+        assert_eq!(
+            world.articulated_rigid_body_count(id),
+            3,
+            "failed transfer retains old rig"
+        );
+        assert_eq!(
+            world
+                .transfer_articulated_to_dynamic_corpse(id, 9, 1, |_| f64::NAN)
+                .unwrap_err(),
+            spall_physics::ArticulatedError::InvalidDensity
+        );
+        assert_eq!(world.articulated_rigid_body_count(id), 3);
+        let transfer = world
+            .transfer_articulated_to_dynamic_corpse(id, 9, 1, |_| 1000.0)
+            .unwrap();
+        assert!(
+            transfer
+                .linear_momentum_kg_m_s
+                .iter()
+                .any(|v| v.abs() > 1e-4)
+        );
+        assert_eq!(world.articulated_rigid_body_count(id), 1);
+        assert_eq!(world.articulated_collider_count(id), 2);
+        let hit = world
+            .raycast_articulated(id, [0.5, 4.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        assert_eq!(
+            (hit.part_id, hit.volume_id, hit.source_revision),
+            (1, VolumeId::new(101).unwrap(), 7)
+        );
+        assert_eq!(
+            world
+                .update_articulated_pose(
+                    id,
+                    ArticulatedPose {
+                        topology_token: 9,
+                        base_pose_token: 1,
+                        pose_token: 2,
+                        parts: vec![(1, PartTransform::IDENTITY), (2, pose)]
+                    }
+                )
+                .unwrap_err(),
+            spall_physics::ArticulatedError::DynamicCorpsePose
+        );
+    }
+}
+
+#[test]
+fn empty_source_parts_retire_atomically_without_moving_survivors_then_last_part_retires_body() {
+    for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+        let mut world = world();
+        let source = vec![
+            part(1, None, [0, 0, 0], vec![true], PartTransform::IDENTITY),
+            part(
+                2,
+                Some(1),
+                [4, 0, 0],
+                vec![true],
+                PartTransform {
+                    translation_m: [5.0, 0.0, 0.0],
+                    ..PartTransform::IDENTITY
+                },
+            ),
+        ];
+        let id = world
+            .add_dynamic_corpse_aggregate(
+                [0.0, 4.0, 0.0],
+                PartTransform::IDENTITY.rotation_xyzw,
+                1,
+                source.clone(),
+                representation,
+                |_| 1000.0,
+            )
+            .unwrap();
+        let before = world
+            .raycast_articulated(id, [0.5, 4.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+            .unwrap();
+        let empty = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(4, 0, 0),
+            [1, 1, 1],
+            vec![false],
+            vec![MaterialId::AIR],
+        )
+        .unwrap();
+        let retired = world
+            .rebuild_dynamic_corpse_part_grid(id, 1, 2, 2, 7, 8, empty, |_| 1000.0)
+            .unwrap();
+        assert!(matches!(
+            retired,
+            spall_physics::CorpseEditOutcome::PartRetired { .. }
+        ));
+        assert_eq!(world.articulated_rigid_body_count(id), 1);
+        assert_eq!(world.articulated_collider_count(id), 1);
+        assert_eq!(
+            world.articulated_body_state(id).translation_m,
+            [0.0, 4.0, 0.0]
+        );
+        assert_eq!(
+            world
+                .raycast_articulated(id, [0.5, 4.5, -2.0], [0.0, 0.0, 1.0], 4.0)
+                .unwrap()
+                .cell,
+            before.cell
+        );
+        let empty = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [1, 1, 1],
+            vec![false],
+            vec![MaterialId::AIR],
+        )
+        .unwrap();
+        let retired = world
+            .rebuild_dynamic_corpse_part_grid(id, 2, 3, 1, 7, 8, empty, |_| 1000.0)
+            .unwrap();
+        assert!(matches!(
+            retired,
+            spall_physics::CorpseEditOutcome::AggregateRetired { .. }
+        ));
+        assert_eq!(world.articulated_rigid_body_count(id), 0);
+        assert_eq!(world.articulated_collider_count(id), 0);
+    }
+}
+
+#[test]
 fn frozen_pose_corpse_aggregate_is_one_editable_dynamic_owner_with_source_hits() {
     for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
         let source = vec![
@@ -94,7 +281,7 @@ fn frozen_pose_corpse_aggregate_is_one_editable_dynamic_owner_with_source_hits()
                 1,
                 source.clone(),
                 representation,
-                mass,
+                |_| 1_000.0,
             )
             .unwrap();
         assert_eq!(world.articulated_rigid_body_count(corpse), 1);
@@ -130,21 +317,42 @@ fn frozen_pose_corpse_aggregate_is_one_editable_dynamic_owner_with_source_hits()
         let mut edited_sources = source.clone();
         edited_sources[0].grid = edited_grid.clone();
         edited_sources[0].source_revision = 8;
-        let edited_mass = articulated_mass_properties(&edited_sources, &poses, |_| 1_000.0)
-            .unwrap()
-            .to_body_properties();
         let body_origin_before_edit = world.articulated_body_state(corpse).translation_m;
+        assert_eq!(
+            world
+                .rebuild_dynamic_corpse_part_grid(
+                    corpse,
+                    1,
+                    2,
+                    1,
+                    7,
+                    8,
+                    edited_grid.clone(),
+                    |_| f64::NAN
+                )
+                .unwrap_err(),
+            spall_physics::ArticulatedError::InvalidDensity
+        );
+        assert_eq!(
+            world.articulated_body_state(corpse).translation_m,
+            body_origin_before_edit
+        );
+        assert_eq!(
+            world
+                .raycast_articulated(
+                    corpse,
+                    [-1.5, body_origin_before_edit[1] + 0.5, -2.0],
+                    [0.0, 0.0, 1.0],
+                    4.0
+                )
+                .unwrap()
+                .cell,
+            [-2, 0, 0]
+        );
         world
-            .rebuild_dynamic_corpse_part_grid(
-                corpse,
-                1,
-                2,
-                1,
-                7,
-                8,
-                edited_grid.clone(),
-                edited_mass,
-            )
+            .rebuild_dynamic_corpse_part_grid(corpse, 1, 2, 1, 7, 8, edited_grid.clone(), |_| {
+                1_000.0
+            })
             .unwrap();
         assert_eq!(
             world.articulated_body_state(corpse).translation_m,
@@ -179,7 +387,7 @@ fn frozen_pose_corpse_aggregate_is_one_editable_dynamic_owner_with_source_hits()
                     8,
                     9,
                     source[0].grid.clone(),
-                    mass,
+                    |_| 1_000.0,
                 )
                 .unwrap_err(),
             spall_physics::ArticulatedError::StaleTopology,

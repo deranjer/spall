@@ -351,6 +351,7 @@ struct Entry {
     restitution: f32,
 }
 
+#[derive(Clone)]
 struct ArticulatedPartEntry {
     part_id: u32,
     parent_id: Option<u32>,
@@ -426,7 +427,70 @@ struct ArticulatedEntry {
     pending_root_pose_token: Option<u64>,
     pending_pose: Option<PendingArticulatedPose>,
     kinematic_part_bodies: bool,
+    dynamic_corpse: bool,
     parts: Vec<ArticulatedPartEntry>,
+}
+
+/// Measurements from an atomic articulated-rig to corpse-owner transfer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CorpseTransferOutcome {
+    pub preparation_time: Duration,
+    pub mass_kg: f64,
+    pub com_world_m: [f64; 3],
+    pub linear_momentum_kg_m_s: [f64; 3],
+    pub angular_momentum_about_com_kg_m2_s: [f64; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CorpseEditOutcome {
+    Rebuilt {
+        elapsed: Duration,
+        removed_mass_kg: f64,
+    },
+    PartRetired {
+        elapsed: Duration,
+        removed_mass_kg: f64,
+    },
+    AggregateRetired {
+        elapsed: Duration,
+        removed_mass_kg: f64,
+    },
+}
+
+fn solve_symmetric3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
+    let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+        - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+        + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if !det.is_finite() || det <= 0.0 {
+        return None;
+    }
+    let inv = [
+        [
+            a[1][1] * a[2][2] - a[1][2] * a[2][1],
+            a[0][2] * a[2][1] - a[0][1] * a[2][2],
+            a[0][1] * a[1][2] - a[0][2] * a[1][1],
+        ],
+        [
+            a[1][2] * a[2][0] - a[1][0] * a[2][2],
+            a[0][0] * a[2][2] - a[0][2] * a[2][0],
+            a[0][2] * a[1][0] - a[0][0] * a[1][2],
+        ],
+        [
+            a[1][0] * a[2][1] - a[1][1] * a[2][0],
+            a[0][1] * a[2][0] - a[0][0] * a[2][1],
+            a[0][0] * a[1][1] - a[0][1] * a[1][0],
+        ],
+    ];
+    let x = inv.map(|row| (row[0] * b[0] + row[1] * b[1] + row[2] * b[2]) / det);
+    x.iter().all(|v| v.is_finite()).then_some(x)
+}
+
+fn cross64(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 
 struct PendingArticulatedPose {
@@ -713,6 +777,39 @@ fn rapier_mass_properties(
     )
 }
 
+fn validate_body_mass_properties(
+    props: BodyMassProperties,
+) -> Result<(), crate::articulated::ArticulatedError> {
+    use crate::articulated::ArticulatedError;
+    let finite = props.mass_kg.is_finite()
+        && props.local_com_m.iter().all(|value| value.is_finite())
+        && props
+            .inertia_com_kg_m2
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite());
+    if !finite || props.mass_kg <= 0.0 {
+        return Err(ArticulatedError::InvalidMassProperties);
+    }
+    let m = props.inertia_com_kg_m2;
+    let scale = m.iter().flatten().map(|v| v.abs()).fold(0.0_f32, f32::max);
+    let eps = (scale * 1.0e-6).max(f32::MIN_POSITIVE);
+    if (m[0][1] - m[1][0]).abs() > eps
+        || (m[0][2] - m[2][0]).abs() > eps
+        || (m[1][2] - m[2][1]).abs() > eps
+    {
+        return Err(ArticulatedError::InvalidMassProperties);
+    }
+    let minor2 = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if m[0][0] <= eps || minor2 <= eps * eps || det <= eps * eps * eps {
+        return Err(ArticulatedError::InvalidMassProperties);
+    }
+    Ok(())
+}
+
 /// The principal (eigenvalue) inertia triple of a symmetric tensor about the
 /// centre of mass — the diagonal in the frame where the tensor is diagonal.
 fn principal_inertia(inertia_com_kg_m2: [[f32; 3]; 3]) -> [f32; 3] {
@@ -907,8 +1004,26 @@ impl PhysicsWorld {
         topology_token: u64,
         parts: Vec<SourcePart>,
         representation: Representation,
-        mass_properties: BodyMassProperties,
+        density: impl Fn(spall_core::MaterialId) -> f64,
     ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
+        let mut invalid_density = false;
+        for part in &parts {
+            part.grid.for_each_solid(|_, _, _, material| {
+                let rho = density(material);
+                invalid_density |= !rho.is_finite() || rho <= 0.0;
+            });
+        }
+        if invalid_density {
+            return Err(crate::articulated::ArticulatedError::InvalidDensity);
+        }
+        let poses = parts
+            .iter()
+            .map(|part| part.local_transform)
+            .collect::<Vec<_>>();
+        let mass_properties = crate::mass::articulated_mass_properties(&parts, &poses, density)
+            .ok_or(crate::articulated::ArticulatedError::InvalidTransform)?
+            .to_body_properties();
+        validate_body_mass_properties(mass_properties)?;
         self.add_articulated_body_mode(
             translation_m,
             rotation_xyzw,
@@ -918,6 +1033,333 @@ impl PhysicsWorld {
             false,
             Some(mass_properties),
         )
+    }
+
+    /// Converts the existing ENG-210 multi-body kinematic owner in place. It
+    /// derives exact source-cell mass and momenta from each part body's current
+    /// pose and velocity; an invalid/stale/pending transfer mutates nothing.
+    pub fn transfer_articulated_to_dynamic_corpse(
+        &mut self,
+        id: ArticulatedBodyId,
+        expected_topology_token: u64,
+        expected_pose_token: u64,
+        density: impl Fn(spall_core::MaterialId) -> f64,
+    ) -> Result<CorpseTransferOutcome, crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        let started = Instant::now();
+        let body_id = id.0;
+        let assembly = self
+            .articulated
+            .get(&body_id)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        if !assembly.kinematic_part_bodies || assembly.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
+        if assembly.topology_token != expected_topology_token
+            || assembly.pose_token != expected_pose_token
+        {
+            return Err(ArticulatedError::StaleTopology);
+        }
+        if assembly.pending_root_pose_token.is_some() || assembly.pending_pose.is_some() {
+            return Err(ArticulatedError::PendingRootPose);
+        }
+        let other_volumes: std::collections::BTreeSet<_> = self
+            .articulated
+            .iter()
+            .filter(|(owner, _)| **owner != body_id)
+            .flat_map(|(_, a)| a.parts.iter().map(|p| p.volume_id))
+            .collect();
+        let mut source_volumes = std::collections::BTreeSet::new();
+        if assembly
+            .parts
+            .iter()
+            .any(|p| !source_volumes.insert(p.volume_id) || other_volumes.contains(&p.volume_id))
+        {
+            return Err(ArticulatedError::DuplicateVolume);
+        }
+        if assembly.parts.is_empty()
+            || assembly
+                .parts
+                .iter()
+                .map(|p| p.grid.solid_count())
+                .sum::<u64>()
+                > crate::articulated::MAX_ARTICULATED_SOLID_CELLS
+            || assembly.parts.iter().map(|p| p.primitives).sum::<usize>() > 65_536
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+
+        let source_parts = assembly
+            .parts
+            .iter()
+            .map(|p| SourcePart {
+                part_id: p.part_id,
+                parent_id: p.parent_id,
+                volume_id: p.volume_id,
+                source_revision: p.source_revision,
+                grid: p.grid.clone(),
+                cell_m: p.cell_m,
+                local_transform: p.local_pose,
+            })
+            .collect::<Vec<_>>();
+        let local_poses = source_parts
+            .iter()
+            .map(|p| p.local_transform)
+            .collect::<Vec<_>>();
+        let mass64 =
+            crate::mass::articulated_mass_properties(&source_parts, &local_poses, &density)
+                .ok_or(ArticulatedError::InvalidDensity)?;
+        let mass = mass64.to_body_properties();
+        validate_body_mass_properties(mass)?;
+
+        let entry_index = entry_index(body_id, self.id_namespace);
+        let root_body = self.entries[entry_index].body;
+        let root_pose = *self.bodies[root_body].position();
+        let mut cell_samples = Vec::with_capacity(
+            assembly
+                .parts
+                .iter()
+                .map(|p| p.grid.solid_count())
+                .sum::<u64>() as usize,
+        );
+        let mut total_mass = 0.0_f64;
+        let mut first_moment = [0.0_f64; 3];
+        let mut linear_momentum = [0.0_f64; 3];
+        for part in &assembly.parts {
+            let rb = &self.bodies[part.body];
+            let pose = *rb.position();
+            let linear = rb.linvel();
+            let angular = rb.angvel();
+            if ![
+                linear.x, linear.y, linear.z, angular.x, angular.y, angular.z,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            {
+                return Err(ArticulatedError::InvalidTransform);
+            }
+            let origin = part.grid.origin();
+            let s = part.cell_m;
+            let mut density_error = false;
+            part.grid.for_each_solid(|x, y, z, material| {
+                let rho = density(material);
+                if !rho.is_finite() || rho <= 0.0 {
+                    density_error = true;
+                    return;
+                }
+                let m = rho * f64::from(s).powi(3);
+                let local = Vector::new(
+                    (origin.x as f32 + x as f32 + 0.5) * s,
+                    (origin.y as f32 + y as f32 + 0.5) * s,
+                    (origin.z as f32 + z as f32 + 0.5) * s,
+                );
+                let point = pose.transform_point(local);
+                let r = point - pose.translation;
+                let velocity = linear + angular.cross(r);
+                let position = [point.x as f64, point.y as f64, point.z as f64];
+                let v = [velocity.x as f64, velocity.y as f64, velocity.z as f64];
+                total_mass += m;
+                for axis in 0..3 {
+                    first_moment[axis] += m * position[axis];
+                    linear_momentum[axis] += m * v[axis];
+                }
+                cell_samples.push((
+                    position,
+                    v,
+                    m,
+                    f64::from(s),
+                    [
+                        f64::from(angular.x),
+                        f64::from(angular.y),
+                        f64::from(angular.z),
+                    ],
+                ));
+            });
+            if density_error {
+                return Err(ArticulatedError::InvalidDensity);
+            }
+        }
+        if !total_mass.is_finite() || (total_mass - mass64.mass_kg).abs() > mass64.mass_kg * 1e-5 {
+            return Err(ArticulatedError::InvalidMassProperties);
+        }
+        let com_world = first_moment.map(|v| v / total_mass);
+        let mut inertia_world = [[0.0_f64; 3]; 3];
+        let mut angular_momentum = [0.0_f64; 3];
+        for (position, velocity, m, s, omega) in cell_samples {
+            let r = [
+                position[0] - com_world[0],
+                position[1] - com_world[1],
+                position[2] - com_world[2],
+            ];
+            let p = velocity.map(|v| v * m);
+            let spin = cross64(r, p);
+            for axis in 0..3 {
+                angular_momentum[axis] += spin[axis];
+            }
+            let r2 = r.iter().map(|v| v * v).sum::<f64>();
+            for a in 0..3 {
+                for b in 0..3 {
+                    let diagonal = if a == b { 1.0 } else { 0.0 };
+                    inertia_world[a][b] +=
+                        m * s * s / 6.0 * diagonal + m * (diagonal * r2 - r[a] * r[b]);
+                }
+            }
+            // The body's point velocity contains only orbital motion; a cube's
+            // spin contribution is its isotropic self-inertia times omega.
+            let self_i = m * s * s / 6.0;
+            for axis in 0..3 {
+                angular_momentum[axis] += self_i * omega[axis];
+            }
+        }
+        let omega_world = solve_symmetric3(inertia_world, angular_momentum)
+            .ok_or(ArticulatedError::InvalidMassProperties)?;
+        let linear_velocity = linear_momentum.map(|v| v / total_mass);
+        let com_local = root_pose.inverse_transform_point(Vector::new(
+            com_world[0] as f32,
+            com_world[1] as f32,
+            com_world[2] as f32,
+        ));
+        let props = BodyMassProperties {
+            mass_kg: mass.mass_kg,
+            local_com_m: [com_local.x, com_local.y, com_local.z],
+            inertia_com_kg_m2: mass.inertia_com_kg_m2,
+        };
+        validate_body_mass_properties(props)?;
+
+        // Prepare every replacement collider and its root-local pose before
+        // changing ownership. Insertion is infallible; no fallible check below
+        // this point can leave a partially transferred rig.
+        let prepared = assembly
+            .parts
+            .iter()
+            .map(|part| {
+                let origin = part.grid.origin();
+                let origin_m = [
+                    origin.x as f32 * part.cell_m,
+                    origin.y as f32 * part.cell_m,
+                    origin.z as f32 * part.cell_m,
+                ];
+                let offset = rotate(part.assembly_pose.rotation_xyzw, origin_m);
+                let translation = [
+                    part.assembly_pose.translation_m[0] + offset[0],
+                    part.assembly_pose.translation_m[1] + offset[1],
+                    part.assembly_pose.translation_m[2] + offset[2],
+                ];
+                let pose = Pose::new(
+                    Vector::new(translation[0], translation[1], translation[2]),
+                    Rotation::from_xyzw(
+                        part.assembly_pose.rotation_xyzw[0],
+                        part.assembly_pose.rotation_xyzw[1],
+                        part.assembly_pose.rotation_xyzw[2],
+                        part.assembly_pose.rotation_xyzw[3],
+                    )
+                    .to_scaled_axis(),
+                );
+                (part.collider, part.body, pose)
+            })
+            .collect::<Vec<_>>();
+        let mut replacement_handles = Vec::with_capacity(prepared.len());
+        for (old, _, pose) in &prepared {
+            let old_collider = &self.colliders[*old];
+            let restitution = old_collider.restitution();
+            let restitution_rule = old_collider.restitution_combine_rule();
+            let friction = old_collider.friction();
+            let friction_rule = old_collider.friction_combine_rule();
+            let collision_groups = old_collider.collision_groups();
+            let solver_groups = old_collider.solver_groups();
+            let active_collision_types = old_collider.active_collision_types();
+            let sensor = old_collider.is_sensor();
+            let mut collider = ColliderBuilder::new(old_collider.shared_shape().clone())
+                .density(0.0)
+                .position(*pose)
+                .friction(friction)
+                .active_collision_types(active_collision_types)
+                .sensor(sensor)
+                .build();
+            collider.set_restitution(restitution);
+            collider.set_restitution_combine_rule(restitution_rule);
+            collider.set_friction_combine_rule(friction_rule);
+            collider.set_collision_groups(collision_groups);
+            collider.set_solver_groups(solver_groups);
+            let handle = self
+                .colliders
+                .insert_with_parent(collider, root_body, &mut self.bodies);
+            self.tag_collider(handle, body_id);
+            replacement_handles.push(handle);
+        }
+        let old_root_pose = *self.bodies[root_body].position();
+        self.bodies[root_body].set_body_type(RigidBodyType::Dynamic, true);
+        self.bodies[root_body]
+            .set_additional_mass_properties(rapier_mass_properties(props, [0.0; 3]), true);
+        self.bodies[root_body].recompute_mass_properties_from_colliders(&self.colliders);
+        self.bodies[root_body].set_position(old_root_pose, true);
+        self.bodies[root_body].set_linvel(
+            Vector::new(
+                linear_velocity[0] as f32,
+                linear_velocity[1] as f32,
+                linear_velocity[2] as f32,
+            ),
+            true,
+        );
+        self.bodies[root_body].set_angvel(
+            Vector::new(
+                omega_world[0] as f32,
+                omega_world[1] as f32,
+                omega_world[2] as f32,
+            ),
+            true,
+        );
+        let mut old_bodies = prepared
+            .iter()
+            .map(|(_, body, _)| *body)
+            .collect::<Vec<_>>();
+        old_bodies.sort_by_key(|body| body.into_raw_parts());
+        old_bodies.dedup();
+        for (old, _, _) in &prepared {
+            self.colliders
+                .remove(*old, &mut self.islands, &mut self.bodies, true);
+            self.pending_removed.push(*old);
+        }
+        for old in old_bodies {
+            self.bodies.remove(
+                old,
+                &mut self.islands,
+                &mut self.colliders,
+                &mut self.impulse_joints,
+                &mut self.multibody_joints,
+                true,
+            );
+        }
+        self.ccd_solver = CCDSolver::new();
+        self.pending_modified
+            .extend(replacement_handles.iter().copied());
+        let assembly = self
+            .articulated
+            .get_mut(&body_id)
+            .expect("prevalidated assembly");
+        for (part, handle) in assembly
+            .parts
+            .iter_mut()
+            .zip(replacement_handles.iter().copied())
+        {
+            part.body = root_body;
+            part.collider = handle;
+        }
+        assembly.kinematic_part_bodies = false;
+        assembly.dynamic_corpse = true;
+        let entry = &mut self.entries[entry_index];
+        entry.body = root_body;
+        entry.collider = replacement_handles[0];
+        entry.collider_offset_m = [0.0; 3];
+        entry.density = 0.0;
+        entry.mass_properties = Some(props);
+        Ok(CorpseTransferOutcome {
+            preparation_time: started.elapsed(),
+            mass_kg: total_mass,
+            com_world_m: com_world,
+            linear_momentum_kg_m_s: linear_momentum,
+            angular_momentum_about_com_kg_m2_s: angular_momentum,
+        })
     }
 
     fn add_articulated_body_mode(
@@ -1220,6 +1662,7 @@ impl PhysicsWorld {
                 pending_root_pose_token: None,
                 pending_pose: None,
                 kinematic_part_bodies,
+                dynamic_corpse: dynamic_mass.is_some(),
                 parts: built_parts,
             },
         );
@@ -1240,6 +1683,9 @@ impl PhysicsWorld {
             .articulated
             .get(&id)
             .ok_or(ArticulatedError::Hierarchy)?;
+        if current.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
         if update.topology_token != current.topology_token
             || current.pending_root_pose_token.is_some()
             || current.pending_pose.is_some()
@@ -1418,6 +1864,29 @@ impl PhysicsWorld {
         new_source_revision: u64,
         new_grid: OccupancyGrid,
     ) -> Result<Duration, crate::articulated::ArticulatedError> {
+        self.rebuild_articulated_part_grid_impl(
+            id,
+            expected_topology_token,
+            new_topology_token,
+            part_id,
+            expected_source_revision,
+            new_source_revision,
+            new_grid,
+            false,
+        )
+    }
+
+    fn rebuild_articulated_part_grid_impl(
+        &mut self,
+        id: ArticulatedBodyId,
+        expected_topology_token: u64,
+        new_topology_token: u64,
+        part_id: u32,
+        expected_source_revision: u64,
+        new_source_revision: u64,
+        new_grid: OccupancyGrid,
+        dynamic_allowed: bool,
+    ) -> Result<Duration, crate::articulated::ArticulatedError> {
         use crate::articulated::{
             ArticulatedError, MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_SOLID_CELLS,
         };
@@ -1426,6 +1895,9 @@ impl PhysicsWorld {
             .articulated
             .get(&id)
             .ok_or(ArticulatedError::Hierarchy)?;
+        if assembly.dynamic_corpse != dynamic_allowed {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
         let part_index = assembly
             .parts
             .iter()
@@ -1591,9 +2063,10 @@ impl PhysicsWorld {
         Ok(start.elapsed())
     }
 
-    /// Rebuilds a source grid on a dynamic corpse owner and installs the
-    /// caller's recomputed source-cell mass properties after revision checks.
-    /// The body origin and collider-local poses remain fixed as COM changes.
+    /// Edits dynamic-corpse source geometry with an open-system rule: removed
+    /// cells leave carrying their instantaneous rigid-body velocity field;
+    /// the surviving body's pose and twist are preserved. This does not claim
+    /// closed-system momentum conservation across a destructive edit.
     pub fn rebuild_dynamic_corpse_part_grid(
         &mut self,
         id: ArticulatedBodyId,
@@ -1603,9 +2076,133 @@ impl PhysicsWorld {
         expected_source_revision: u64,
         new_source_revision: u64,
         new_grid: OccupancyGrid,
-        mass_properties: BodyMassProperties,
-    ) -> Result<Duration, crate::articulated::ArticulatedError> {
-        let elapsed = self.rebuild_articulated_part_grid(
+        density: impl Fn(spall_core::MaterialId) -> f64,
+    ) -> Result<CorpseEditOutcome, crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        let assembly = self
+            .articulated
+            .get(&id.0)
+            .ok_or(ArticulatedError::Hierarchy)?;
+        if !assembly.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
+        if assembly.topology_token != expected_topology_token
+            || assembly.pending_pose.is_some()
+            || assembly.pending_root_pose_token.is_some()
+            || new_topology_token <= expected_topology_token
+        {
+            return Err(ArticulatedError::StaleTopology);
+        }
+        let index_part = assembly
+            .parts
+            .iter()
+            .position(|p| p.part_id == part_id)
+            .ok_or(ArticulatedError::StaleTopology)?;
+        let old = &assembly.parts[index_part];
+        if old.source_revision != expected_source_revision
+            || new_source_revision <= expected_source_revision
+        {
+            return Err(ArticulatedError::StaleTopology);
+        }
+        let original_parts = assembly.parts.clone();
+        let mut removed_mass = 0.0;
+        let mut bad_density = false;
+        old.grid.for_each_solid(|_, _, _, material| {
+            let rho = density(material);
+            if !rho.is_finite() || rho <= 0.0 {
+                bad_density = true;
+            } else {
+                removed_mass += rho * f64::from(old.cell_m).powi(3);
+            }
+        });
+        if bad_density {
+            return Err(ArticulatedError::InvalidDensity);
+        }
+        let pose = *self.bodies[self.entries[entry_index(id.0, self.id_namespace)].body].position();
+        let linear = self.bodies[self.entries[entry_index(id.0, self.id_namespace)].body].linvel();
+        let angular = self.bodies[self.entries[entry_index(id.0, self.id_namespace)].body].angvel();
+        if new_grid.solid_count() == 0 {
+            if original_parts.len() == 1 {
+                self.retire_articulated_body(id);
+                return Ok(CorpseEditOutcome::AggregateRetired {
+                    elapsed: Duration::ZERO,
+                    removed_mass_kg: removed_mass,
+                });
+            }
+            let remaining = original_parts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index_part)
+                .map(|(_, p)| SourcePart {
+                    part_id: p.part_id,
+                    parent_id: p.parent_id,
+                    volume_id: p.volume_id,
+                    source_revision: p.source_revision,
+                    grid: p.grid.clone(),
+                    cell_m: p.cell_m,
+                    local_transform: p.local_pose,
+                })
+                .collect::<Vec<_>>();
+            let poses = remaining
+                .iter()
+                .map(|p| p.local_transform)
+                .collect::<Vec<_>>();
+            let mass = crate::mass::articulated_mass_properties(&remaining, &poses, &density)
+                .ok_or(ArticulatedError::InvalidDensity)?
+                .to_body_properties();
+            validate_body_mass_properties(mass)?;
+            let started = Instant::now();
+            let old_handle = original_parts[index_part].collider;
+            self.colliders
+                .remove(old_handle, &mut self.islands, &mut self.bodies, true);
+            self.pending_removed.push(old_handle);
+            let body = self.entries[entry_index(id.0, self.id_namespace)].body;
+            self.bodies[body]
+                .set_additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]), true);
+            self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
+            self.bodies[body].set_position(pose, true);
+            self.bodies[body].set_linvel(linear, true);
+            self.bodies[body].set_angvel(angular, true);
+            let a = self.articulated.get_mut(&id.0).unwrap();
+            a.parts.remove(index_part);
+            a.topology_token = new_topology_token;
+            self.entries[entry_index(id.0, self.id_namespace)].collider = a.parts[0].collider;
+            self.entries[entry_index(id.0, self.id_namespace)].mass_properties = Some(mass);
+            return Ok(CorpseEditOutcome::PartRetired {
+                elapsed: started.elapsed(),
+                removed_mass_kg: removed_mass,
+            });
+        }
+        let sources = original_parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| SourcePart {
+                part_id: p.part_id,
+                parent_id: p.parent_id,
+                volume_id: p.volume_id,
+                source_revision: if i == index_part {
+                    new_source_revision
+                } else {
+                    p.source_revision
+                },
+                grid: if i == index_part {
+                    new_grid.clone()
+                } else {
+                    p.grid.clone()
+                },
+                cell_m: p.cell_m,
+                local_transform: p.local_pose,
+            })
+            .collect::<Vec<_>>();
+        let poses = sources
+            .iter()
+            .map(|p| p.local_transform)
+            .collect::<Vec<_>>();
+        let mass = crate::mass::articulated_mass_properties(&sources, &poses, &density)
+            .ok_or(ArticulatedError::InvalidDensity)?
+            .to_body_properties();
+        validate_body_mass_properties(mass)?;
+        let elapsed = self.rebuild_articulated_part_grid_impl(
             id,
             expected_topology_token,
             new_topology_token,
@@ -1613,17 +2210,21 @@ impl PhysicsWorld {
             expected_source_revision,
             new_source_revision,
             new_grid,
+            true,
         )?;
         let index = entry_index(id.0, self.id_namespace);
-        let (body, offset) = {
-            let entry = &self.entries[index];
-            (entry.body, entry.collider_offset_m)
-        };
+        let body = self.entries[index].body;
         self.bodies[body]
-            .set_additional_mass_properties(rapier_mass_properties(mass_properties, offset), true);
+            .set_additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]), true);
         self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
-        self.entries[index].mass_properties = Some(mass_properties);
-        Ok(elapsed)
+        self.bodies[body].set_position(pose, true);
+        self.bodies[body].set_linvel(linear, true);
+        self.bodies[body].set_angvel(angular, true);
+        self.entries[index].mass_properties = Some(mass);
+        Ok(CorpseEditOutcome::Rebuilt {
+            elapsed,
+            removed_mass_kg: removed_mass,
+        })
     }
 
     /// Moves the single kinematic assembly root after validating every
@@ -1653,6 +2254,9 @@ impl PhysicsWorld {
             .articulated
             .get(&body_id)
             .ok_or(ArticulatedError::Hierarchy)?;
+        if assembly.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
         if assembly.kinematic_part_bodies {
             return Err(ArticulatedError::InvalidRootPose);
         }
@@ -1756,6 +2360,9 @@ impl PhysicsWorld {
             .articulated
             .get(&body_id)
             .ok_or(ArticulatedError::Hierarchy)?;
+        if assembly.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
         if assembly.kinematic_part_bodies && !allow_kinematic_part_rig {
             return Err(ArticulatedError::InvalidRootPose);
         }
@@ -1871,6 +2478,9 @@ impl PhysicsWorld {
             .articulated
             .get(&body_id)
             .ok_or(ArticulatedError::Hierarchy)?;
+        if assembly.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
         if !assembly.kinematic_part_bodies {
             return Err(ArticulatedError::Hierarchy);
         }
@@ -2082,6 +2692,9 @@ impl PhysicsWorld {
             .articulated
             .get(&id.0)
             .ok_or(ArticulatedError::Hierarchy)?;
+        if assembly.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
         if !assembly.kinematic_part_bodies
             || assembly.topology_token != update.topology_token
             || assembly.pose_token != update.base_pose_token
@@ -2203,6 +2816,9 @@ impl PhysicsWorld {
             .articulated
             .get(&body_id)
             .ok_or(ArticulatedError::Hierarchy)?;
+        if assembly.dynamic_corpse {
+            return Err(ArticulatedError::DynamicCorpsePose);
+        }
         if !assembly.kinematic_part_bodies
             || assembly.topology_token != update.topology_token
             || assembly.pose_token != update.base_pose_token

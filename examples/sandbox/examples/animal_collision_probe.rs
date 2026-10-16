@@ -631,12 +631,17 @@ fn run_corpse_bounded() -> Result<(), Box<dyn std::error::Error>> {
         selected.dedup();
         for index in selected {
             let sample = &samples[index];
+            let prior_sample = if index > 0 {
+                &samples[index - 1]
+            } else {
+                sample
+            };
             for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
                 let mut sources = animal
                     .parts
                     .iter()
                     .map(|part| {
-                        let local = sample
+                        let local = prior_sample
                             .locals
                             .iter()
                             .find(|(id, _)| *id == part.part.id)
@@ -681,15 +686,32 @@ fn run_corpse_bounded() -> Result<(), Box<dyn std::error::Error>> {
                     linvel_m_s: [0.0; 3],
                 });
                 let attach_start = Instant::now();
-                let owner = world.add_dynamic_corpse_aggregate(
+                let owner = world.add_articulated_kinematic_parts(
                     root.to_array(),
                     Quat::IDENTITY.to_array(),
                     TOPOLOGY_TOKEN,
                     std::mem::take(&mut sources),
                     representation,
-                    mass,
                 )?;
-                let attach_us = attach_start.elapsed().as_secs_f64() * 1e6;
+                let living_attach_us = attach_start.elapsed().as_secs_f64() * 1e6;
+                world.update_articulated_pose(
+                    owner,
+                    spall_physics::ArticulatedPose {
+                        topology_token: TOPOLOGY_TOKEN,
+                        base_pose_token: 0,
+                        pose_token: 1,
+                        parts: sample.locals.clone(),
+                    },
+                )?;
+                world.step();
+                let transfer_start = Instant::now();
+                let transfer = world.transfer_articulated_to_dynamic_corpse(
+                    owner,
+                    TOPOLOGY_TOKEN,
+                    1,
+                    |_| 1_000.0,
+                )?;
+                let transfer_us = transfer_start.elapsed().as_secs_f64() * 1e6;
                 let refs = reference_cells(&animal, &sample.locals, root)?;
                 let target = refs
                     .iter()
@@ -779,14 +801,6 @@ fn run_corpse_bounded() -> Result<(), Box<dyn std::error::Error>> {
                         })
                     })
                     .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-                let edited_poses = edited_sources
-                    .iter()
-                    .map(|part| part.local_transform)
-                    .collect::<Vec<_>>();
-                let edited_mass =
-                    articulated_mass_properties(&edited_sources, &edited_poses, |_| 1_000.0)
-                        .ok_or("invalid edited source hierarchy/mass input")?
-                        .to_body_properties();
                 let before_edit_translation = world.articulated_body_state(owner).translation_m;
                 world.rebuild_dynamic_corpse_part_grid(
                     owner,
@@ -796,7 +810,7 @@ fn run_corpse_bounded() -> Result<(), Box<dyn std::error::Error>> {
                     1,
                     2,
                     edited_grid,
-                    edited_mass,
+                    |_| 1_000.0,
                 )?;
                 let edit_us = edit_start.elapsed().as_secs_f64() * 1e6;
                 let after_edit_state = world.articulated_body_state(owner);
@@ -829,7 +843,10 @@ fn run_corpse_bounded() -> Result<(), Box<dyn std::error::Error>> {
                     "collider_count":world.articulated_collider_count(owner),
                     "collider_primitives":animal.parts.iter().map(|p| build_collider(&p.grid,CELL_M,representation).primitives).sum::<usize>(),
                     "mass_kg":state.mass_kg,"com_m":mass.local_com_m,"inertia_com_kg_m2":mass.inertia_com_kg_m2,
-                    "attach_us":attach_us,"mean_step_us":step_us,"contact_impulse_steps":positive_contact_steps,
+                    "living_attach_us":living_attach_us,"transfer_us":transfer_us,
+                    "death_linear_momentum_kg_m_s":transfer.linear_momentum_kg_m_s,
+                    "death_angular_momentum_kg_m2_s":transfer.angular_momentum_about_com_kg_m2_s,
+                    "mean_step_us":step_us,"contact_impulse_steps":positive_contact_steps,
                     "source_query_identity_before_step":identity_ok,"final_y_m":state.translation_m[1],
                     "source_cell_removed":removed_cell,"source_cells_after_edit":source_count_after_edit,
                     "edit_and_mass_rebuild_us":edit_us,"removed_cell_still_hit":removed_source_hit,

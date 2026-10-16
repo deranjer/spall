@@ -88,6 +88,7 @@ pub fn articulated_mass_properties(
     let mut cells = Vec::new();
     let mut mass = 0.0;
     let mut moment = [0.0; 3];
+    let mut valid_density = true;
     for part in parts {
         let pose = &flattened[&part.part_id];
         let origin = part.grid.origin();
@@ -104,13 +105,21 @@ pub fn articulated_mass_properties(
                 f64::from(pose.translation_m[1] + rotated[1]),
                 f64::from(pose.translation_m[2] + rotated[2]),
             ];
-            let m = density(mat) * s * s * s;
+            let rho = density(mat);
+            if !rho.is_finite() || rho <= 0.0 {
+                valid_density = false;
+                return;
+            }
+            let m = rho * s * s * s;
             mass += m;
             for a in 0..3 {
                 moment[a] += m * c[a];
             }
             cells.push((c, m, s));
         });
+    }
+    if !valid_density || mass <= 0.0 || !mass.is_finite() {
+        return None;
     }
     let com = if mass > 0.0 {
         moment.map(|v| v / mass)

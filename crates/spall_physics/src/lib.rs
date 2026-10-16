@@ -58,6 +58,6 @@ pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_f
 pub use world::{
     ArticulatedContactWitness, BodyId, BodyKind, BodySpec, BodyState, CONTACT_WITNESS_VERSION,
     ColliderExclusion, ContactCellAttribution, ContactImpulse, ContactWitnessUnattributed,
-    MAX_CONTACT_WITNESSES_PER_STEP, PhysicsConfig, PhysicsWorld, PreparedBodySpec,
-    PreparedCollider, SourceContactWitness, StepTiming,
+    CorpseEditOutcome, CorpseTransferOutcome, MAX_CONTACT_WITNESSES_PER_STEP, PhysicsConfig,
+    PhysicsWorld, PreparedBodySpec, PreparedCollider, SourceContactWitness, StepTiming,
 };

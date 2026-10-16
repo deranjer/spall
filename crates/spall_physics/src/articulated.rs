@@ -57,6 +57,14 @@ pub enum ArticulatedError {
     InvalidRootPose,
     #[error("another articulated root pose is awaiting the next physics step")]
     PendingRootPose,
+    #[error("dynamic corpse aggregates do not accept authored pose or sweep updates")]
+    DynamicCorpsePose,
+    #[error("aggregate source-cell mass properties are invalid or singular")]
+    InvalidMassProperties,
+    #[error("solid source material has an invalid or non-positive density")]
+    InvalidDensity,
+    #[error("a dynamic corpse aggregate must retain at least one occupied source part")]
+    EmptyAggregate,
 }
 
 /// A unit-scale part-local transform in metres and `(x, y, z, w)` form.
