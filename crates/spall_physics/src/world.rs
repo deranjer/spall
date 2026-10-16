@@ -3711,6 +3711,43 @@ mod tests {
     }
 
     #[test]
+    fn articulated_sweep_encloses_rotated_off_center_source_volume() {
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: one_cell_grid(GlobalCell::new(0, 0, -12)),
+            cell_m: 0.25,
+            density_kg_m3: 0.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        let animal = world
+            .add_articulated_kinematic_parts(
+                [0.0; 3],
+                [
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ],
+                1,
+                vec![one_part(one_cell_grid(GlobalCell::new(8, 0, 0)), 195, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let movement = world
+            .sweep_articulated_root_translation(animal, 1, 0, 1, [0.0, 0.0, -1.0])
+            .unwrap();
+        assert!(movement.blocked, "rotated off-center sweep={movement:?}");
+        assert!(movement.fraction < 0.8, "sweep={movement:?}");
+    }
+
+    #[test]
     fn articulated_conservative_sweep_blocks_wall_and_rejects_stale_updates() {
         let mut world = PhysicsWorld::new(PhysicsConfig {
             gravity_m_s2: [0.0; 3],
