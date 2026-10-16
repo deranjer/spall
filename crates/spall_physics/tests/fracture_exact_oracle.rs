@@ -1665,3 +1665,71 @@ const CASES:&[([u32;6],u8)]=&[
     ([0,1065353216,0,1065353216,1073741824,1067450368],2),
     ([0,1065353216,0,1065353216,1073741824,1073741824],2),
 ];
+
+#[test]
+fn rational_polygon_oracle_covers_exact_shared_faces_on_all_world_axes() {
+    let mut classified = 0;
+    let mut ambiguous = 0;
+    for axis in 0..3 {
+        for &(bits, expected) in CASES {
+            let v = bits.map(f32::from_bits);
+            let parts = (0..2)
+                .map(|i| {
+                    let (rotation_xyzw, translation_m) = match axis {
+                        0 => ([v[i * 2], 0.0, 0.0, v[i * 2 + 1]], [1.0, v[4], v[5]]),
+                        1 => ([0.0, v[i * 2], 0.0, v[i * 2 + 1]], [v[5], 1.0, v[4]]),
+                        _ => ([0.0, 0.0, v[i * 2], v[i * 2 + 1]], [v[4], v[5], 1.0]),
+                    };
+                    FracturePartSnapshot {
+                        source: SourcePart {
+                            part_id: i as u32 + 1,
+                            parent_id: None,
+                            volume_id: VolumeId::new(i as u64 + 8100).unwrap(),
+                            source_revision: 1,
+                            grid: OccupancyGrid::from_solid_mask(
+                                GlobalCell::new(0, 0, 0),
+                                [1, 1, 1],
+                                vec![true],
+                                vec![MaterialId(1)],
+                            )
+                            .unwrap(),
+                            cell_m: 1.0,
+                            local_transform: PartTransform::IDENTITY,
+                        },
+                        root_local_pose: PartTransform {
+                            rotation_xyzw,
+                            translation_m: if i == 0 { [0.0; 3] } else { translation_m },
+                        },
+                    }
+                })
+                .collect();
+            let snapshot = FractureSnapshot {
+                token: FractureSnapshotToken {
+                    corpse_key: 8100,
+                    component_key: None,
+                    topology_revision: 1,
+                    pose_epoch: 1,
+                    source_generation: 1,
+                },
+                parts,
+            };
+            match prepare_fracture(&snapshot) {
+                Ok(plan) => {
+                    assert_eq!(
+                        plan.components.len(),
+                        usize::from(expected),
+                        "shared axis{axis} input{bits:?}"
+                    );
+                    classified += 1;
+                }
+                Err(FractureError::AmbiguousContact { .. }) => ambiguous += 1,
+                Err(other) => panic!("unexpected shared-face error{other:?}"),
+            }
+        }
+    }
+    assert!(classified > CASES.len() * 3 / 2);
+    eprintln!(
+        "exact-rational shared-face oracle: {classified} classified, {ambiguous} conservative ambiguities, {} total",
+        CASES.len() * 3
+    );
+}
