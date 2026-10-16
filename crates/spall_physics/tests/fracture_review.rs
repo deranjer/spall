@@ -117,7 +117,7 @@ fn half_turns_preserve_exact_overlap_face_edge_and_corner_connectivity() {
 }
 
 #[test]
-fn large_translation_cannot_round_a_fractional_offset_onto_the_lattice() {
+fn large_translation_fractional_offsets_require_correct_geometric_classification() {
     let mut input = snapshot(GlobalCell::new(-16_777_216, 0, 0), vec![true], 1);
     input.parts[0].source.cell_m = 1.0;
     input.parts[0].root_local_pose.translation_m = [16_777_216.0, 0.0, 0.0];
@@ -129,8 +129,14 @@ fn large_translation_cannot_round_a_fractional_offset_onto_the_lattice() {
     other.source.cell_m = 1.0;
     other.root_local_pose.translation_m = [0.5, 0.0, 0.0];
     input.parts.push(other);
-    // Canonical f32 inputs promoted exactly give boxes [0,1] and [.5,1.5].
-    // They are not on a common unit lattice. f32 subtraction loses the .5.
+    // Exact affine boxes [0,1] and [.5,1.5] overlap, despite not sharing a
+    // unit lattice. The separate interval certificate may now prove this.
+    assert_eq!(prepare_fracture(&input).unwrap().components.len(), 1);
+    input.parts[1].root_local_pose.translation_m[0] = 1.5;
+    assert_eq!(prepare_fracture(&input).unwrap().components.len(), 2);
+    // Partial-face tangency has no strict positive-volume certificate. The
+    // lattice path must not erase the fractional x offset and guess a weld.
+    input.parts[1].root_local_pose.translation_m = [0.5, 1.0, 0.0];
     assert!(matches!(
         prepare_fracture(&input),
         Err(FractureError::AmbiguousContact { .. })

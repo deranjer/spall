@@ -1,4 +1,4 @@
-//! Bounded exact source-cell connectivity planning for frozen corpse aggregates.
+//! Bounded source-cell connectivity planning for frozen corpse aggregates.
 //!
 //! The planner keeps authored source coordinates and identities. It creates no
 //! Rapier objects and mutates no owner; callers must revalidate the captured
@@ -18,6 +18,7 @@ pub const MAX_FRACTURE_DENSE_CELLS: usize = MAX_FRACTURE_SOURCE_CELLS;
 pub const MAX_FRACTURE_COMPONENTS: usize = 256;
 /// All cross-volume cell pairs examined, including broadphase rejects.
 pub const MAX_FRACTURE_CELL_PAIR_TESTS: usize = 1_000_000;
+pub const MAX_FRACTURE_SAT_AXIS_TESTS: usize = MAX_FRACTURE_CELL_PAIR_TESTS * 15;
 
 /// Stable identity of one authoritatively owned source cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -79,6 +80,9 @@ pub struct PreparedFracturePlan {
     pub source_cells: Vec<SourceCellRef>,
     pub components: Vec<FractureComponent>,
     pub candidate_pairs_tested: usize,
+    /// Number of certified interval SAT axes evaluated, bounded by 15 per
+    /// non-lattice candidate pair.
+    pub sat_axes_tested: usize,
     pub certified_cross_volume_edges: usize,
     pub redundant_ambiguous_pairs_ignored: usize,
     pub elapsed: std::time::Duration,
@@ -115,15 +119,18 @@ struct CellGeometry {
     source_cell: [i32; 3],
     pose_translation: [f32; 3],
     rotation: [[i32; 3]; 3],
+    rotation_xyzw: [f32; 4],
     cell_m: f32,
     bound_radius_m: f64,
 }
 
 /// Prepare deterministic connected components from an immutable corpse pose.
 /// Same-volume connectivity uses exact integer six-face adjacency. Cross-volume
-/// edges use exact shared-lattice positive-face proofs; arbitrary rotations are
-/// separated only by a conservative origin-sphere bound and otherwise fail
-/// closed.
+/// edges use exact shared-lattice proofs or interval-certified positive-volume
+/// overlap of the canonical affine cell boxes. The latter describes the stored
+/// normalized-f32 quaternion coefficients interpreted as exact affine inputs;
+/// it does not claim bit-for-bit equivalence with Rapier's contact arithmetic.
+/// Uncertain cases fail closed.
 pub fn prepare_fracture(
     snapshot: &FractureSnapshot,
 ) -> Result<PreparedFracturePlan, FractureError> {
@@ -229,6 +236,7 @@ pub fn prepare_fracture(
                 source_cell,
                 pose_translation: pose.translation_m,
                 rotation: signed_permutation(axes).unwrap_or([[0; 3]; 3]),
+                rotation_xyzw: pose.rotation_xyzw,
                 cell_m: part.source.cell_m,
                 // Loose sphere around the part origin enclosing every rotated
                 // cell. This does not use rounded quaternion axes.
@@ -286,6 +294,7 @@ pub fn prepare_fracture(
     }
 
     let mut candidate_pairs_tested = 0usize;
+    let mut sat_axes_tested = 0usize;
     let mut certified_cross_volume_edges = 0usize;
     let mut ambiguous_pairs = Vec::new();
     let mut by_volume = BTreeMap::<VolumeId, Vec<usize>>::new();
@@ -310,11 +319,24 @@ pub fn prepare_fracture(
                     if candidate_pairs_tested > MAX_FRACTURE_CELL_PAIR_TESTS {
                         return Err(FractureError::WorkBudget);
                     }
-                    // Only exact lattice geometry can connect cells. Otherwise a
-                    // conservative origin-sphere gap may prove separation; overlap
-                    // never proves connectivity.
-                    let classification = classify_lattice_pair(a, b)
-                        .unwrap_or_else(|| classify_conservative_separation(a, b));
+                    // Prefer the exact lattice certificate. A loose origin sphere
+                    // cheaply rejects distant pairs; unresolved pairs use bounded
+                    // interval SAT, which may connect only strict positive volume.
+                    let classification = if let Some(lattice) = classify_lattice_pair(a, b) {
+                        lattice
+                    } else {
+                        let coarse = classify_conservative_separation(a, b);
+                        if coarse != ContactClass::Ambiguous {
+                            coarse
+                        } else {
+                            let (sat, axes_tested) = classify_parallelepiped_pair(a, b);
+                            sat_axes_tested = sat_axes_tested
+                                .checked_add(axes_tested)
+                                .filter(|count| *count <= MAX_FRACTURE_SAT_AXIS_TESTS)
+                                .ok_or(FractureError::WorkBudget)?;
+                            sat
+                        }
+                    };
                     match classification {
                         ContactClass::Separated => {}
                         ContactClass::PositiveVolume => {
@@ -381,6 +403,7 @@ pub fn prepare_fracture(
         source_cells: cells,
         components,
         candidate_pairs_tested,
+        sat_axes_tested,
         certified_cross_volume_edges,
         redundant_ambiguous_pairs_ignored,
         elapsed: start.elapsed(),
@@ -404,6 +427,253 @@ fn classify_conservative_separation(a: &CellGeometry, b: &CellGeometry) -> Conta
         }
     }
     ContactClass::Ambiguous
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Interval {
+    lo: f64,
+    hi: f64,
+}
+
+impl Interval {
+    const ZERO: Self = Self { lo: 0.0, hi: 0.0 };
+
+    fn point(value: f64) -> Self {
+        Self {
+            lo: value,
+            hi: value,
+        }
+    }
+
+    fn finite(self) -> bool {
+        self.lo.is_finite() && self.hi.is_finite() && self.lo <= self.hi
+    }
+
+    fn add(self, rhs: Self) -> Self {
+        let (lo, lo_err) = two_sum(self.lo, rhs.lo);
+        let (hi, hi_err) = two_sum(self.hi, rhs.hi);
+        Self {
+            lo: if lo_err < 0.0 { lo.next_down() } else { lo },
+            hi: if hi_err > 0.0 { hi.next_up() } else { hi },
+        }
+    }
+
+    fn neg(self) -> Self {
+        Self {
+            lo: -self.hi,
+            hi: -self.lo,
+        }
+    }
+
+    fn sub(self, rhs: Self) -> Self {
+        self.add(rhs.neg())
+    }
+
+    fn mul(self, rhs: Self) -> Self {
+        let pairs = [
+            (self.lo, rhs.lo),
+            (self.lo, rhs.hi),
+            (self.hi, rhs.lo),
+            (self.hi, rhs.hi),
+        ];
+        let mut lower = f64::INFINITY;
+        let mut upper = f64::NEG_INFINITY;
+        for (a, b) in pairs {
+            let product = a * b;
+            let error = a.mul_add(b, -product);
+            let product_lo = if error < 0.0 {
+                product.next_down()
+            } else {
+                product
+            };
+            let product_hi = if error > 0.0 {
+                product.next_up()
+            } else {
+                product
+            };
+            lower = lower.min(product_lo);
+            upper = upper.max(product_hi);
+        }
+        Self {
+            lo: lower,
+            hi: upper,
+        }
+    }
+
+    fn abs(self) -> Self {
+        if self.lo >= 0.0 {
+            self
+        } else if self.hi <= 0.0 {
+            self.neg()
+        } else {
+            Self {
+                lo: 0.0,
+                hi: (-self.lo).max(self.hi),
+            }
+        }
+    }
+
+    fn exact_zero(self) -> bool {
+        self.lo == 0.0 && self.hi == 0.0
+    }
+}
+
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let sum = a + b;
+    let b_virtual = sum - a;
+    let error = (a - (sum - b_virtual)) + (b - b_virtual);
+    (sum, error)
+}
+
+type IVec3 = [Interval; 3];
+
+fn ivec_add(a: IVec3, b: IVec3) -> IVec3 {
+    std::array::from_fn(|i| a[i].add(b[i]))
+}
+
+fn ivec_sub(a: IVec3, b: IVec3) -> IVec3 {
+    std::array::from_fn(|i| a[i].sub(b[i]))
+}
+
+fn ivec_scale(a: IVec3, scale: Interval) -> IVec3 {
+    std::array::from_fn(|i| a[i].mul(scale))
+}
+
+fn ivec_dot(a: IVec3, b: IVec3) -> Interval {
+    a[0].mul(b[0]).add(a[1].mul(b[1])).add(a[2].mul(b[2]))
+}
+
+fn ivec_cross(a: IVec3, b: IVec3) -> IVec3 {
+    [
+        a[1].mul(b[2]).sub(a[2].mul(b[1])),
+        a[2].mul(b[0]).sub(a[0].mul(b[2])),
+        a[0].mul(b[1]).sub(a[1].mul(b[0])),
+    ]
+}
+
+fn rotate_interval(q: [f32; 4], value: IVec3) -> IVec3 {
+    let qv = [
+        Interval::point(f64::from(q[0])),
+        Interval::point(f64::from(q[1])),
+        Interval::point(f64::from(q[2])),
+    ];
+    let twice_cross = ivec_scale(ivec_cross(qv, value), Interval::point(2.0));
+    ivec_add(
+        value,
+        ivec_add(
+            ivec_scale(twice_cross, Interval::point(f64::from(q[3]))),
+            ivec_cross(qv, twice_cross),
+        ),
+    )
+}
+
+fn cell_box(geometry: &CellGeometry) -> Option<(IVec3, [IVec3; 3])> {
+    let cell_m = Interval::point(f64::from(geometry.cell_m));
+    let source_center: IVec3 = std::array::from_fn(|axis| {
+        Interval::point(f64::from(geometry.source_cell[axis]))
+            .add(Interval::point(0.5))
+            .mul(cell_m)
+    });
+    let translation = geometry
+        .pose_translation
+        .map(|v| Interval::point(f64::from(v)));
+    let center = ivec_add(
+        translation,
+        rotate_interval(geometry.rotation_xyzw, source_center),
+    );
+    let half = cell_m.mul(Interval::point(0.5));
+    let edges = [
+        rotate_interval(
+            geometry.rotation_xyzw,
+            [half, Interval::ZERO, Interval::ZERO],
+        ),
+        rotate_interval(
+            geometry.rotation_xyzw,
+            [Interval::ZERO, half, Interval::ZERO],
+        ),
+        rotate_interval(
+            geometry.rotation_xyzw,
+            [Interval::ZERO, Interval::ZERO, half],
+        ),
+    ];
+    if center
+        .into_iter()
+        .chain(edges.into_iter().flatten())
+        .all(Interval::finite)
+    {
+        Some((center, edges))
+    } else {
+        None
+    }
+}
+
+fn classify_parallelepiped_pair(a: &CellGeometry, b: &CellGeometry) -> (ContactClass, usize) {
+    let Some((center_a, edges_a)) = cell_box(a) else {
+        return (ContactClass::Ambiguous, 0);
+    };
+    let Some((center_b, edges_b)) = cell_box(b) else {
+        return (ContactClass::Ambiguous, 0);
+    };
+    let mut axes = [[Interval::ZERO; 3]; 15];
+    axes[0] = ivec_cross(edges_a[1], edges_a[2]);
+    axes[1] = ivec_cross(edges_a[2], edges_a[0]);
+    axes[2] = ivec_cross(edges_a[0], edges_a[1]);
+    axes[3] = ivec_cross(edges_b[1], edges_b[2]);
+    axes[4] = ivec_cross(edges_b[2], edges_b[0]);
+    axes[5] = ivec_cross(edges_b[0], edges_b[1]);
+    let mut axis_index = 6;
+    for (index_a, edge_a) in edges_a.into_iter().enumerate() {
+        for (index_b, edge_b) in edges_b.into_iter().enumerate() {
+            // Identical canonical affine directions have an exactly zero
+            // cross-axis. Interval dependency alone cannot recover that
+            // algebraic identity from two independently enclosed products.
+            let same_direction = index_a == index_b
+                && a.rotation_xyzw.map(f32::to_bits) == b.rotation_xyzw.map(f32::to_bits)
+                && a.cell_m.to_bits() == b.cell_m.to_bits();
+            axes[axis_index] = if same_direction {
+                [Interval::ZERO; 3]
+            } else {
+                ivec_cross(edge_a, edge_b)
+            };
+            axis_index += 1;
+        }
+    }
+    let delta = ivec_sub(center_b, center_a);
+    let mut tested = 0;
+    let mut strict_overlap = true;
+    for axis in axes {
+        if axis.into_iter().all(Interval::exact_zero) {
+            continue;
+        }
+        tested += 1;
+        if !axis.into_iter().all(Interval::finite) {
+            return (ContactClass::Ambiguous, tested);
+        }
+        let projection = ivec_dot(delta, axis).abs();
+        let radius_a = edges_a
+            .iter()
+            .map(|edge| ivec_dot(axis, *edge).abs())
+            .fold(Interval::ZERO, Interval::add);
+        let radius_b = edges_b
+            .iter()
+            .map(|edge| ivec_dot(axis, *edge).abs())
+            .fold(Interval::ZERO, Interval::add);
+        let radius = radius_a.add(radius_b);
+        if !projection.finite() || !radius.finite() {
+            return (ContactClass::Ambiguous, tested);
+        }
+        if projection.lo > radius.hi {
+            return (ContactClass::Separated, tested);
+        }
+        if projection.hi >= radius.lo {
+            strict_overlap = false;
+        }
+    }
+    if strict_overlap && tested > 0 {
+        (ContactClass::PositiveVolume, tested)
+    } else {
+        (ContactClass::Ambiguous, tested)
+    }
 }
 
 fn signed_permutation(axes: [[f64; 3]; 3]) -> Option<[[i32; 3]; 3]> {

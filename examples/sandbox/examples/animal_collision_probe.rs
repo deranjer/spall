@@ -1088,6 +1088,7 @@ fn run_fracture_bounded() -> Result<(), Box<dyn std::error::Error>> {
                         "component_count":plan.components.len(),
                         "component_cell_counts":plan.components.iter().map(|component| component.cells.len()).collect::<Vec<_>>(),
                         "candidate_pairs_tested":plan.candidate_pairs_tested,
+                        "sat_axes_tested":plan.sat_axes_tested,
                         "certified_cross_volume_edges":plan.certified_cross_volume_edges,
                         "planner_elapsed_us":elapsed_us,
                         "source_partition_conserved":partition_ok,
