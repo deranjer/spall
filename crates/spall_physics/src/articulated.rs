@@ -144,6 +144,12 @@ pub struct ArticulatedTransition {
     pub terrain_candidates: usize,
     /// Exact source-cell nonlinear casts actually issued for this transition.
     pub cell_casts: usize,
+    /// Time spent refreshing live query structures before broadphase lookup.
+    pub query_sync_time: std::time::Duration,
+    /// Time spent collecting candidates from the refreshed broadphase.
+    pub candidate_query_time: std::time::Duration,
+    /// Time spent in exact source-cell nonlinear casts.
+    pub exact_cast_time: std::time::Duration,
 }
 
 /// Compose a child-local transform with its parent's assembly-local transform.

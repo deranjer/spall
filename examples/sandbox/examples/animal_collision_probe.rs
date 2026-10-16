@@ -278,6 +278,9 @@ fn run_generated_1km() -> Result<(), Box<dyn std::error::Error>> {
             let mut step_us = Vec::new();
             let mut candidate_counts = Vec::new();
             let mut cast_counts = Vec::new();
+            let mut query_sync_us = Vec::new();
+            let mut candidate_query_us = Vec::new();
+            let mut exact_cast_us = Vec::new();
             let mut blocked = Vec::new();
             let mut sample_pairs = Vec::new();
             for sample in &samples {
@@ -300,6 +303,9 @@ fn run_generated_1km() -> Result<(), Box<dyn std::error::Error>> {
                 query_us.push(started.elapsed().as_secs_f64() * 1.0e6);
                 candidate_counts.push(transition.terrain_candidates);
                 cast_counts.push(transition.cell_casts);
+                query_sync_us.push(transition.query_sync_time.as_secs_f64() * 1.0e6);
+                candidate_query_us.push(transition.candidate_query_time.as_secs_f64() * 1.0e6);
+                exact_cast_us.push(transition.exact_cast_time.as_secs_f64() * 1.0e6);
                 blocked.push(transition.blocked);
                 sample_pairs.push(format!("{}@{}", sample.clip, sample.tick));
                 if !transition.blocked {
@@ -330,6 +336,9 @@ fn run_generated_1km() -> Result<(), Box<dyn std::error::Error>> {
                 "exact_cell_casts_max": cast_counts.iter().copied().max().unwrap_or(0),
                 "transition_query_us_p50": percentile_us(&query_us, 0.5),
                 "transition_query_us_p95": percentile_us(&query_us, 0.95),
+                "query_sync_us_p50": percentile_us(&query_sync_us, 0.5),
+                "candidate_query_us_p50": percentile_us(&candidate_query_us, 0.5),
+                "exact_cast_us_p50": percentile_us(&exact_cast_us, 0.5),
                 "accepted_step_us_p50": percentile_us(&step_us, 0.5),
                 "accepted_step_us_p95": percentile_us(&step_us, 0.95),
             }));
@@ -338,6 +347,9 @@ fn run_generated_1km() -> Result<(), Box<dyn std::error::Error>> {
     drop(sim);
     let one_substep = generated_trio_step(&scene, &animals, &habitat_centers, 1)?;
     let thirty_two_substeps = generated_trio_step(&scene, &animals, &habitat_centers, 32)?;
+    let no_animal_warm_steps =
+        generated_world_warm_steps(&scene, &animals, &habitat_centers, false)?;
+    let trio_warm_steps = generated_world_warm_steps(&scene, &animals, &habitat_centers, true)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -348,6 +360,7 @@ fn run_generated_1km() -> Result<(), Box<dyn std::error::Error>> {
             "animals": cases,
             "hardware": hardware(),
             "global_step": {"one_substep":one_substep, "thirty_two_substeps":thirty_two_substeps},
+            "warmed_32_substep_steps": {"no_animals_dynamic_probe":no_animal_warm_steps, "trio_plus_dynamic_probe":trio_warm_steps},
             "measurement_note":"Trout habitat uses the exact generated initial water plan at tick zero; no fluid solver or weather step is included. Each transition uses the actual generated authoritative per-brick terrain colliders and exact source-cell continuous casts."
         }))?
     );
@@ -535,6 +548,73 @@ fn generated_trio_step(
         "step_wall_us":wall_us,
         "pipeline_us":timing.pipeline.as_secs_f64()*1.0e6,
         "substeps_reported":timing.substeps
+    }))
+}
+
+fn generated_world_warm_steps(
+    scene: &worldgen_scene::GeneratedScene,
+    animals: &[(&str, Animal)],
+    centers: &[Vec3],
+    include_animals: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    const SAMPLES: usize = 30;
+    let mut setup = scene.world_setup();
+    setup.physics.solver_substeps = 32;
+    let mut sim = SimWorld::new(setup)?;
+    let fixed_colliders = sim.terrain_brick_collider_count();
+    let mut rig_bodies = 0;
+    let mut rig_colliders = 0;
+    if include_animals {
+        for ((_, animal), center) in animals.iter().zip(centers) {
+            let mut ignored = Vec::new();
+            let id = rebuild(
+                sim.physics_mut(),
+                animal,
+                Representation::MergedCuboids,
+                *center - animal.pivot_m,
+                &mut ignored,
+                true,
+            )?;
+            rig_bodies += sim.physics().articulated_rigid_body_count(id);
+            rig_colliders += sim.physics().articulated_collider_count(id);
+        }
+    }
+    let probe_grid = OccupancyGrid::from_solid_mask(
+        GlobalCell::new(0, 0, 0),
+        [1, 1, 1],
+        vec![true],
+        vec![MaterialId(1)],
+    )?;
+    sim.physics_mut().add_body(BodySpec {
+        kind: BodyKind::Dynamic { ccd: false },
+        representation: Representation::MergedCuboids,
+        grid: probe_grid,
+        cell_m: CELL_M,
+        density_kg_m3: 1_000.0,
+        mass_properties: None,
+        translation_m: [500.0, 100.0, 500.0],
+        linvel_m_s: [0.0; 3],
+    });
+    let mut wall_us = Vec::with_capacity(SAMPLES);
+    let mut pipeline_us = Vec::with_capacity(SAMPLES);
+    let mut witness_us = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let timing = sim.physics_mut().step();
+        wall_us.push(started.elapsed().as_secs_f64() * 1.0e6);
+        pipeline_us.push(timing.pipeline.as_secs_f64() * 1.0e6);
+        witness_us.push(timing.contact_witness_capture.as_secs_f64() * 1.0e6);
+    }
+    Ok(serde_json::json!({
+        "solver_substeps":32, "outer_dt_s":PhysicsConfig::default().dt_s,
+        "samples":SAMPLES, "warmup_samples_included":10,
+        "fixed_terrain_colliders":fixed_colliders,
+        "articulated_part_body_count":rig_bodies,
+        "articulated_part_collider_count":rig_colliders,
+        "dynamic_body_count":1,
+        "step_wall_us": {"p50":percentile_us(&wall_us, 0.5), "p95":percentile_us(&wall_us, 0.95), "all":wall_us},
+        "pipeline_us": {"p50":percentile_us(&pipeline_us, 0.5), "p95":percentile_us(&pipeline_us, 0.95), "all":pipeline_us},
+        "contact_witness_capture_us": {"p50":percentile_us(&witness_us, 0.5), "p95":percentile_us(&witness_us, 0.95), "all":witness_us},
     }))
 }
 

@@ -2221,7 +2221,9 @@ impl PhysicsWorld {
 
         // Query freshness is part of this gate: voxel edits/removals made since
         // the previous step must affect this same transition decision.
+        let sync_started = Instant::now();
         self.sync_queries();
+        let query_sync_time = sync_started.elapsed();
         let mut earliest: Option<(u32, f32)> = None;
         // Cull fixed terrain using a conservative bound for the complete
         // declared part-origin path. Every cell corner stays within `radius`
@@ -2279,6 +2281,7 @@ impl PhysicsWorld {
                     .and_then(|parent| self.bodies.get(parent))
                     .is_some_and(|body| body.is_fixed())
         };
+        let candidate_started = Instant::now();
         let query = self.broad_phase.as_query_pipeline(
             self.narrow_phase.query_dispatcher(),
             &self.bodies,
@@ -2294,6 +2297,7 @@ impl PhysicsWorld {
                 }
             }
         }
+        let candidate_query_time = candidate_started.elapsed();
         let terrain_candidate_count = terrain_colliders.len();
         // Parry 0.30.2 explicitly treats a moving `Voxels` shape as translation
         // only during nonlinear casts and builds an end AABB from endpoint
@@ -2316,6 +2320,7 @@ impl PhysicsWorld {
             });
         }
         let mut cell_casts = 0usize;
+        let casts_started = Instant::now();
         for ((part_id, (_, _, collider_start, _, body_target)), (body, grid, cell_m)) in
             part_ids.iter().zip(&targets).zip(&source_parts)
         {
@@ -2346,18 +2351,27 @@ impl PhysicsWorld {
                 );
                 for &terrain_handle in &terrain_colliders {
                     cell_casts += 1;
-                    let only_terrain =
-                        |handle: ColliderHandle, _: &Collider| handle == terrain_handle;
-                    let filter = QueryFilter::default().predicate(&only_terrain);
-                    let queries = self.broad_phase.as_query_pipeline(
-                        self.narrow_phase.query_dispatcher(),
-                        &self.bodies,
-                        &self.colliders,
-                        filter,
+                    // The terrain candidate list came from the synchronized live
+                    // broad phase above. Querying one candidate by constructing a
+                    // filtered QueryPipeline here would rebuild a view of every
+                    // collider for every source cell. Cast directly against that
+                    // candidate's exact live shape and world pose instead.
+                    let terrain = &self.colliders[terrain_handle];
+                    let stationary = rapier3d::parry::query::NonlinearRigidMotion::new(
+                        *terrain.position(),
+                        Vector::ZERO,
+                        Vector::ZERO,
+                        Vector::ZERO,
                     );
-                    let Some((_, hit)) =
-                        queries.cast_shape_nonlinear(&motion, &cell_shape, 0.0, 1.0, true)
-                    else {
+                    let Ok(Some(hit)) = rapier3d::parry::query::cast_shapes_nonlinear(
+                        &motion,
+                        &cell_shape,
+                        &stationary,
+                        terrain.shape(),
+                        0.0,
+                        1.0,
+                        true,
+                    ) else {
                         continue;
                     };
                     if earliest.is_none_or(|(_, toi)| hit.time_of_impact < toi) {
@@ -2373,6 +2387,9 @@ impl PhysicsWorld {
                 time_of_impact: Some(time_of_impact),
                 terrain_candidates: terrain_candidate_count,
                 cell_casts,
+                query_sync_time,
+                candidate_query_time,
+                exact_cast_time: casts_started.elapsed(),
             });
         }
 
@@ -2403,6 +2420,9 @@ impl PhysicsWorld {
             time_of_impact: None,
             terrain_candidates: terrain_candidate_count,
             cell_casts,
+            query_sync_time,
+            candidate_query_time,
+            exact_cast_time: casts_started.elapsed(),
         })
     }
 
