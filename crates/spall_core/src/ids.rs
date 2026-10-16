@@ -181,6 +181,15 @@ impl CreatureKey {
             generation,
         })
     }
+
+    /// Revalidates keys obtained through deserialization or external DTOs.
+    pub const fn validate(self) -> Result<(), IdError> {
+        if self.world_id.is_nil() || self.world_epoch.get() == 0 {
+            Err(IdError::Reserved)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub const CREATURE_ALLOCATOR_SCHEMA: u16 = 1;
