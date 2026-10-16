@@ -1964,3 +1964,17 @@ Default solver remains one step. No production damage, population, corpse or
 live-world/network/recovery acceptance is implied. Evidence and exact commands:
 docs/reports/ENG-210-integration.md. Next unblocked: ENG-212; the user-requested
 1 km weather/fully simulated animal instance remains held for dependent gates.
+## ENG-213: full-world animal transition locality and 1 km physics feasibility
+
+Independent of ENG-212 corpse implementation; requires accepted ENG-210.
+The full authoritative 1024 m terrain has per-brick fixed colliders. Current
+source-cell transition work counts all fixed colliders before the one-million
+cast budget; deer exceeds it above 3508 colliders. Measure the actual count.
+Implement conservative current-world broadphase filtering over the full
+linear-origin/shortest-arc rotation path, with exhaustive small-world oracle,
+mid-arc thin obstacles, edits/removal, negative/off-center geometry and budgets.
+Do not increase the cap, shrink the world or use endpoint-only clearance.
+Measure actual seed-1/4096-cell world, all clips and global solver-substep costs,
+full fixed/dynamic/body/collider counts; no population target is accepted here.
+No runtime actor/network/storage/UI changes. Coordinator owns review/integration
+and tracking; Luna Medium worker uses its dedicated worktree.
