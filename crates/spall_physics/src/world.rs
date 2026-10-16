@@ -1595,6 +1595,18 @@ impl PhysicsWorld {
             root.translation_m[2] + rotated_center[2],
         ]));
         let displacement = Vector::from(requested_translation_m);
+        let displacement_length = displacement.length();
+        let displacement_direction = if displacement_length > 0.0 {
+            displacement / displacement_length
+        } else {
+            Vector::ZERO
+        };
+        // Parry's conservative advancement loses sub-10µm displacement at
+        // world-coordinate float precision. Cast at a fixed minimum distance,
+        // discard contacts beyond the actual request, and convert TOI back to
+        // a fraction of that request.
+        let query_distance = displacement_length.max(1.0e-5);
+        let query_displacement = displacement_direction * query_distance;
         let excluded: Vec<_> = assembly.parts.iter().map(|part| part.collider).collect();
         // Root translation is explicitly a terrain sweep. Dynamic/kinematic
         // bodies are handled by the shared Rapier solver after scheduling;
@@ -1610,7 +1622,7 @@ impl PhysicsWorld {
                 (fixed && !collider.is_sensor()).then_some(handle)
             })
             .collect();
-        let hit = if displacement.length_squared() <= 1.0e-12 {
+        let hit = if displacement.length_squared() == 0.0 {
             None
         } else {
             let shape = Ball::new(radius);
@@ -1628,7 +1640,7 @@ impl PhysicsWorld {
                 );
                 let Some(candidate) = queries.cast_shape(
                     &start,
-                    displacement,
+                    query_displacement,
                     &shape,
                     rapier3d::parry::query::ShapeCastOptions {
                         max_time_of_impact: 1.0,
@@ -1639,11 +1651,16 @@ impl PhysicsWorld {
                 ) else {
                     continue;
                 };
+                if candidate.1.time_of_impact * query_distance > displacement_length {
+                    continue;
+                }
                 // At exact support tangency Rapier may report TOI=0 for a
                 // tangent or separating request. Ignore only that contact;
-                // retain zero-time hits whose normal shows motion into terrain.
+                // retain zero-time hits whose normalized motion direction
+                // points into terrain. The angular tolerance is independent of
+                // request distance, so tiny inward moves are still blocked.
                 if candidate.1.time_of_impact <= 1.0e-6
-                    && candidate.1.normal1.dot(displacement) >= -1.0e-6
+                    && candidate.1.normal1.dot(displacement_direction) >= -1.0e-6
                 {
                     continue;
                 }
@@ -1656,7 +1673,9 @@ impl PhysicsWorld {
             nearest
         };
         let blocked = hit.is_some();
-        let fraction = hit.map_or(1.0, |(_, hit)| hit.time_of_impact.clamp(0.0, 1.0));
+        let fraction = hit.map_or(1.0, |(_, hit)| {
+            (hit.time_of_impact * query_distance / displacement_length).clamp(0.0, 1.0)
+        });
         let applied_translation_m = requested_translation_m.map(|value| value * fraction);
         let target = [
             root.translation_m[0] + applied_translation_m[0],
@@ -3895,6 +3914,63 @@ mod tests {
     }
 
     #[test]
+    fn articulated_sweep_does_not_skip_later_wall_in_shared_l_terrain_collider() {
+        for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let mut solid = vec![false; 4 * 4 * 4];
+            for z in 0..4 {
+                for x in 0..4 {
+                    solid[(z * 4) + x] = true;
+                }
+            }
+            for y in 1..4 {
+                for z in 0..4 {
+                    solid[(y * 4 * 4) + (z * 4) + 2] = true;
+                }
+            }
+            let terrain = OccupancyGrid::from_solid_mask(
+                GlobalCell::new(0, 0, 0),
+                [4, 4, 4],
+                solid,
+                vec![fixtures::STONE; 4 * 4 * 4],
+            )
+            .unwrap();
+            let mut world = PhysicsWorld::new(PhysicsConfig {
+                gravity_m_s2: [0.0; 3],
+                ..PhysicsConfig::default()
+            });
+            world.add_body(BodySpec {
+                kind: BodyKind::Fixed,
+                representation,
+                grid: terrain,
+                cell_m: 0.25,
+                density_kg_m3: 0.0,
+                mass_properties: None,
+                translation_m: [0.0; 3],
+                linvel_m_s: [0.0; 3],
+            });
+            assert_eq!(
+                world.colliders.len(),
+                1,
+                "expected one shared terrain collider"
+            );
+            let animal = world
+                .add_articulated_kinematic_parts(
+                    [0.0, 0.34150636, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 197, 1)],
+                    Representation::MergedCuboids,
+                )
+                .unwrap();
+            let movement = world
+                .sweep_articulated_root_translation(animal, 1, 0, 1, [1.0, 0.0, 0.0])
+                .unwrap();
+            assert!(movement.blocked, "{representation:?}: {movement:?}");
+            assert!(movement.fraction < 0.5, "{representation:?}: {movement:?}");
+        }
+    }
+
+    #[test]
     fn articulated_sweep_encloses_rotated_off_center_source_volume() {
         let mut world = PhysicsWorld::new(PhysicsConfig {
             gravity_m_s2: [0.0; 3],
@@ -3962,14 +4038,77 @@ mod tests {
         assert!(into_overlap.blocked, "initial overlap={into_overlap:?}");
         assert_eq!(into_overlap.fraction, 0.0);
         world.step();
+        let tiny_into_surface = world
+            .sweep_articulated_root_translation(animal, 1, 1, 2, [0.0, -1.0e-7, 0.0])
+            .unwrap();
+        assert!(
+            tiny_into_surface.blocked,
+            "tiny inward move={tiny_into_surface:?}"
+        );
+        assert_eq!(tiny_into_surface.fraction, 0.0);
+        world.step();
         let ledge_departure = world
-            .sweep_articulated_root_translation(animal, 1, 1, 2, [0.5, 0.0, 0.0])
+            .sweep_articulated_root_translation(animal, 1, 2, 3, [0.5, 0.0, 0.0])
             .unwrap();
         assert!(
             !ledge_departure.blocked,
             "ledge departure={ledge_departure:?}"
         );
         assert_eq!(ledge_departure.fraction, 1.0);
+    }
+
+    #[test]
+    fn articulated_combined_range_rejection_does_not_leave_part_targets_pending() {
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        let mut source = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 198, 1);
+        source.local_transform.translation_m[0] = 9.6;
+        let animal = world
+            .add_articulated_kinematic_parts(
+                [990.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![source],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let before = world.body_state(animal.0);
+        let hit_before = world
+            .raycast_articulated(animal, [990.0, 0.125, 0.125], [1.0, 0.0, 0.0], 20.0)
+            .unwrap();
+        assert!(
+            world
+                .update_articulated_pose_with_swept_root_translation(
+                    animal,
+                    ArticulatedPose {
+                        topology_token: 1,
+                        base_pose_token: 0,
+                        pose_token: 1,
+                        parts: vec![(
+                            7,
+                            PartTransform {
+                                translation_m: [9.6, 0.0, 0.0],
+                                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                            },
+                        )],
+                    },
+                    [0.5, 0.0, 0.0],
+                )
+                .is_err()
+        );
+        let after = world.body_state(animal.0);
+        assert_eq!(after.translation_m, before.translation_m);
+        let hit_after = world
+            .raycast_articulated(animal, [990.0, 0.125, 0.125], [1.0, 0.0, 0.0], 20.0)
+            .unwrap();
+        assert_eq!(hit_after, hit_before);
+        world.step();
+        assert_eq!(
+            world.body_state(animal.0).translation_m,
+            before.translation_m
+        );
     }
 
     #[test]

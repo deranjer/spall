@@ -150,17 +150,24 @@ against fixed terrain colliders individually so exact zero-time support hits
 can be classified by normal: tangent or separating motion is ignored, while
 motion into the surface remains blocked. There is no query-space offset. New
 cases cover grounded 0.25m lateral and 0.2m upward movement, downward motion
-into the floor, a wall adjacent to the floor, initial-overlap rejection, and
-departure from a one-cell ledge. The wall-removal case casts again immediately
-after collider removal without manual query synchronization.
+into the floor, a wall adjacent to the floor inside a single NativeVoxels
+collider and a single MergedCuboids compound, initial-overlap rejection, a
+0.1µm inward request, and departure from a one-cell ledge. For very short
+requests, the cast extends along the same normalized direction to 10µm to avoid
+Parry float-precision loss, discards any hit farther than the requested
+distance, and converts the accepted TOI back to the request fraction. The
+support-direction threshold is angular (`1e-6`) rather than proportional to
+movement distance. The wall-removal case casts again immediately after
+collider removal without manual query synchronization.
 
 `update_articulated_pose_with_swept_root_translation` validates the complete
 sample and requested root target before staging either side, then commits the
 part poses and clipped root at the same physics boundary. Its combined sweep
 uses a root-centered sphere enclosing old and proposed source corners through
 interpolated part rotations/translations. This can overblock and is not exact
-clearance for discontinuous authored motion. A rejected malformed pose leaves
-the root transform, query hit, and pose token unchanged in the scenario test.
+clearance for discontinuous authored motion. Rejected malformed and
+near-world-extent combined updates leave root pose, source-cell query result,
+and pose token unchanged through a following physics step.
 
 ## Checks
 
@@ -171,6 +178,8 @@ cargo test -p spall_physics --lib --test articulated_review
 cargo test -p spall_physics articulated_ -- --nocapture
 cargo test -p spall_physics articulated_sweep_allows_grounded_horizontal_and_upward_recovery -- --nocapture
 cargo test -p spall_physics articulated_sweep_rejects_initial_penetration_and_allows_small_ledge_departure -- --nocapture
+cargo test -p spall_physics articulated_sweep_does_not_skip_later_wall_in_shared_l_terrain_collider -- --nocapture
+cargo test -p spall_physics articulated_combined_range_rejection_does_not_leave_part_targets_pending -- --nocapture
 cargo test -p spall_physics diagnostic_kinematic_root_crosses_fixed_terrain_but_character_sweep_blocks -- --nocapture
 cargo clippy -p spall_physics --all-targets -- -D warnings
 cargo clippy -p sandbox --example animal-collision-probe -- -D warnings
@@ -182,12 +191,14 @@ cargo build -p sandbox --release --example animal-collision-probe
 .\target\release\examples\animal-collision-probe.exe --bounded
 ```
 
-The physics suite passed 78 tests with 1 existing ignored diagnostic, plus all
+The physics suite passed 80 tests with 1 existing ignored diagnostic, plus all
 8 independent `articulated_review` scenarios. The focused ENG-210 scenario run
 passed all selected cases, including unbiased support tangency, terrain removal
 freshness, and combined pose/root staging. Strict Clippy, formatting,
-whitespace, and the bounded release asset probe passed. GPU, network, storage,
-live actor, corpse transfer, and population target gates did not run.
+whitespace, and the bounded release asset probe passed. A near-extent combined
+update was rejected before staging and preserved root pose and hit provenance
+through a following step. GPU, network, storage, live actor, corpse transfer,
+and population target gates did not run.
 
 The final line reran the unchanged ENG-209 single-root mode against the new
 shared code and passed the same 38,520 ray / 66 miss matrix with zero
