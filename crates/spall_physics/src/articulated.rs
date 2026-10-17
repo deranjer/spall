@@ -73,11 +73,13 @@ pub enum ArticulatedError {
     UnsupportedCorpseEdit,
     #[error("portable corpse restore state is invalid or incomplete")]
     InvalidRestore,
+    #[error("prepared physics batch is stale or belongs to another world")]
+    StalePreparedBatch,
 }
 
 /// One independent dynamic component in a portable corpse restore bundle.
-/// `part_poses` are frozen source-part transforms in this component's own
-/// root frame; they are distinct from the original authored hierarchy.
+/// Its frame moves independently; source-to-component poses are derived
+/// from the supplied frozen source hierarchy, never inferred from new bonds.
 #[derive(Clone)]
 pub struct DynamicCorpseComponentRestore {
     pub component_id: Option<crate::fracture::DerivedFractureComponentId>,

@@ -99,3 +99,213 @@ fn public_restore_preserves_negative_source_coordinates_and_live_world_on_failur
             .is_ok()
     );
 }
+
+#[test]
+fn a_late_invalid_restore_or_cross_member_collision_publishes_no_owner() {
+    for case in 0..4 {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let first = bundle(77, 101);
+        let mut second = bundle(78, 102);
+        match case {
+            0 => second.components[0].linear_velocity_m_s[0] = f32::NAN,
+            1 => {
+                second.owner_key = 77;
+                second.components[0]
+                    .component_id
+                    .as_mut()
+                    .unwrap()
+                    .owner_key = 77;
+            }
+            2 => {
+                second.source_parts[0].volume_id = VolumeId::new(101).unwrap();
+                second.components[0].cells[0].volume_id = VolumeId::new(101).unwrap();
+            }
+            3 => second.source_parts.push(SourcePart {
+                part_id: 2,
+                parent_id: Some(1),
+                volume_id: VolumeId::new(101).unwrap(),
+                source_revision: 7,
+                cell_m: 0.5,
+                local_transform: PartTransform::IDENTITY,
+                grid: OccupancyGrid::from_solid_mask(
+                    GlobalCell::new(0, 0, 0),
+                    [1, 1, 1],
+                    vec![false],
+                    vec![MaterialId::AIR],
+                )
+                .unwrap(),
+            }),
+            _ => unreachable!(),
+        }
+        assert!(
+            world
+                .prepare_dynamic_corpse_restore_batch(
+                    vec![first, second],
+                    Representation::MergedCuboids,
+                    |_| 900.0,
+                )
+                .is_err(),
+            "batch case {case}"
+        );
+        assert_eq!(world.body_count(), 0);
+        // Even a failure after preparing the first owner's shapes consumes no identity.
+        assert!(
+            world
+                .restore_dynamic_corpse(bundle(77, 101), Representation::MergedCuboids, |_| 900.0)
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn prepared_restores_are_world_bound_and_reject_stale_batches_before_insertion() {
+    let mut source = PhysicsWorld::new(PhysicsConfig::default());
+    let mut another = PhysicsWorld::new(PhysicsConfig::default());
+    let prepared = source
+        .prepare_dynamic_corpse_restore_batch(
+            vec![bundle(77, 101), bundle(78, 102)],
+            Representation::MergedCuboids,
+            |_| 900.0,
+        )
+        .unwrap();
+    assert_eq!(source.body_count(), 0, "preparation is pure");
+    assert!(matches!(
+        another.commit_dynamic_corpse_restore_batch(prepared),
+        Err(spall_physics::ArticulatedError::StalePreparedBatch)
+    ));
+    assert_eq!(another.body_count(), 0);
+    let prepared = source
+        .prepare_dynamic_corpse_restore_batch(
+            vec![bundle(77, 101), bundle(78, 102)],
+            Representation::MergedCuboids,
+            |_| 900.0,
+        )
+        .unwrap();
+    source.step();
+    assert!(matches!(
+        source.commit_dynamic_corpse_restore_batch(prepared),
+        Err(spall_physics::ArticulatedError::StalePreparedBatch)
+    ));
+    assert_eq!(source.body_count(), 0);
+
+    let prepared = source
+        .prepare_dynamic_corpse_restore_batch(
+            vec![bundle(77, 101), bundle(78, 102)],
+            Representation::MergedCuboids,
+            |_| 900.0,
+        )
+        .unwrap();
+    source
+        .restore_dynamic_corpse(bundle(79, 103), Representation::MergedCuboids, |_| 900.0)
+        .unwrap();
+    assert!(matches!(
+        source.commit_dynamic_corpse_restore_batch(prepared),
+        Err(spall_physics::ArticulatedError::StalePreparedBatch)
+    ));
+    assert_eq!(
+        source.body_count(),
+        1,
+        "no first-member insertion before detecting staleness"
+    );
+    let prepared = source
+        .prepare_dynamic_corpse_restore_batch(
+            vec![bundle(77, 101), bundle(78, 102)],
+            Representation::MergedCuboids,
+            |_| 900.0,
+        )
+        .unwrap();
+    assert_eq!(
+        source
+            .commit_dynamic_corpse_restore_batch(prepared)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(source.body_count(), 3);
+}
+
+#[test]
+fn one_prepared_commit_installs_all_exact_owners_and_preserves_their_identity() {
+    let mut world = PhysicsWorld::new(PhysicsConfig::default());
+    let first = bundle(77, 101);
+    let mut second = bundle(78, 102);
+    second.components[0].translation_m[0] = 20.0;
+    let prepared = world
+        .prepare_dynamic_corpse_restore_batch(
+            vec![first, second],
+            Representation::MergedCuboids,
+            |_| 900.0,
+        )
+        .unwrap();
+    assert_eq!(world.body_count(), 0);
+    let owners = world.commit_dynamic_corpse_restore_batch(prepared).unwrap();
+    assert_eq!(owners.len(), 2);
+    for (index, id) in owners.into_iter().enumerate() {
+        let key = DerivedFractureComponentId {
+            owner_key: 77 + index as u128,
+            serial: 41,
+        };
+        let state = world.fracture_component_state(id, key).unwrap();
+        assert_eq!(state.translation_m, [10.0 + 10.0 * index as f32, 0.0, 0.0]);
+        assert!((state.mass_kg - 112.5).abs() < 1.0e-4);
+        assert_eq!(state.linvel_m_s, [1.0, 2.0, 3.0]);
+        let hit = world
+            .raycast_articulated(
+                id,
+                [8.75 + 10.0 * index as f32, 0.25, -1.0],
+                [0.0, 0.0, 1.0],
+                3.0,
+            )
+            .unwrap();
+        assert_eq!(hit.volume_id, VolumeId::new(101 + index as u64).unwrap());
+        assert_eq!(hit.cell, [-3, 0, 0]);
+        assert_eq!(hit.pose_token, 29);
+    }
+}
+
+#[test]
+fn reconstruction_owner_count_is_bounded_before_preparing_shapes() {
+    let world = PhysicsWorld::new(PhysicsConfig::default());
+    let inputs = vec![bundle(77, 101); spall_physics::MAX_CORPSE_RESTORE_BATCH_OWNERS + 1];
+    assert!(matches!(
+        world
+            .prepare_dynamic_corpse_restore_batch(inputs, Representation::MergedCuboids, |_| 900.0),
+        Err(spall_physics::ArticulatedError::WorkBudget)
+    ));
+    assert_eq!(world.body_count(), 0);
+}
+
+#[test]
+fn a_batch_freezes_each_material_density_once_for_all_owners() {
+    let world = PhysicsWorld::new(PhysicsConfig::default());
+    let calls = std::cell::Cell::new(0_u32);
+    let prepared = world
+        .prepare_dynamic_corpse_restore_batch(
+            vec![bundle(77, 101), bundle(78, 102)],
+            Representation::MergedCuboids,
+            |_| {
+                calls.set(calls.get() + 1);
+                900.0 * f64::from(calls.get())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        calls.get(),
+        1,
+        "one immutable catalog snapshot across the batch"
+    );
+    let mut world = world;
+    let owners = world.commit_dynamic_corpse_restore_batch(prepared).unwrap();
+    for (index, owner) in owners.into_iter().enumerate() {
+        let state = world
+            .fracture_component_state(
+                owner,
+                DerivedFractureComponentId {
+                    owner_key: 77 + index as u128,
+                    serial: 41,
+                },
+            )
+            .unwrap();
+        assert!((state.mass_kg - 112.5).abs() < 1.0e-4);
+    }
+}

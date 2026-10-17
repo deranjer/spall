@@ -437,6 +437,64 @@ fn source_surface_radius_m(
     radius_sq.sqrt() as f32
 }
 
+/// Maximum logical owners in one cold reconstruction batch. Dense/source
+/// cell and primitive limits apply cumulatively across the entire batch.
+pub const MAX_CORPSE_RESTORE_BATCH_OWNERS: usize = 1024;
+pub const MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS: u64 = 16 * 1024 * 1024;
+pub const MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS: u64 = 4_000_000;
+pub const MAX_CORPSE_RESTORE_BATCH_PRIMITIVES: usize = 4_000_000;
+
+/// Owned immutable solver preparation. It is not serializable and cannot be
+/// committed to another world, reused after a step, or published twice.
+pub struct PreparedDynamicCorpseBatch {
+    world_identity: std::sync::Arc<()>,
+    expected_step: u64,
+    expected_entries: usize,
+    owners: Vec<PreparedCorpseRestoreOwner>,
+}
+
+struct PreparedCorpsePartIdentity {
+    part_id: u32,
+    volume_id: spall_core::VolumeId,
+    source_revision: u64,
+    cell_m: f32,
+}
+
+struct PreparedCorpseComponentState {
+    component_id: Option<DerivedFractureComponentId>,
+    linear_velocity_m_s: [f32; 3],
+    angular_velocity_rad_s: [f32; 3],
+}
+
+type PreparedCorpsePart = (
+    PreparedCorpsePartIdentity,
+    OccupancyGrid,
+    PartTransform,
+    usize,
+    Collider,
+);
+type PreparedCorpseComponent = (
+    PreparedCorpseComponentState,
+    BodyMassProperties,
+    [f32; 4],
+    [f32; 3],
+    Vec<PreparedCorpsePart>,
+);
+
+struct PreparedCorpseRestoreOwner {
+    owner_key: u128,
+    source_generation: u64,
+    topology_revision: u64,
+    pose_epoch: u64,
+    next_component_serial: u64,
+    source_volumes: std::collections::BTreeSet<spall_core::VolumeId>,
+    manifest: HashMap<MaterialId, u64>,
+    representation: Representation,
+    prepared: Vec<PreparedCorpseComponent>,
+    primitive_count: usize,
+    derived_dense: u64,
+}
+
 struct ArticulatedEntry {
     topology_token: u64,
     pose_token: u64,
@@ -956,6 +1014,7 @@ fn principal_inertia(inertia_com_kg_m2: [[f32; 3]; 3]) -> [f32; 3] {
 
 /// A fixed-step rigid-body world over voxel colliders.
 pub struct PhysicsWorld {
+    preparation_identity: std::sync::Arc<()>,
     id_namespace: u32,
     gravity: Vector,
     params: IntegrationParameters,
@@ -1058,6 +1117,7 @@ impl PhysicsWorld {
             params.max_ccd_substeps = 0;
         }
         Self {
+            preparation_identity: std::sync::Arc::new(()),
             id_namespace,
             gravity: Vector::new(
                 cfg.gravity_m_s2[0],
@@ -1204,15 +1264,178 @@ impl PhysicsWorld {
         Ok(owner)
     }
 
-    /// Reconstructs a complete portable dynamic-corpse owner without replaying
-    /// transfer or fracture. All source partitions, shapes, masses, transforms,
-    /// and stable component identities are validated before any Rapier insert.
+    /// Reconstructs one exact owner using the same preparation/publication
+    /// boundary as a multi-owner cold restore.
     pub fn restore_dynamic_corpse(
         &mut self,
         restore: crate::articulated::DynamicCorpseRestore,
         representation: Representation,
-        density: impl Fn(spall_core::MaterialId) -> f64,
+        density: impl Fn(MaterialId) -> f64,
     ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
+        let prepared =
+            self.prepare_dynamic_corpse_restore_batch(vec![restore], representation, density)?;
+        let mut owners = self.commit_dynamic_corpse_restore_batch(prepared)?;
+        Ok(owners
+            .pop()
+            .expect("singleton restore prepares exactly one owner"))
+    }
+
+    /// Prepares all sources, masks, shapes, masses and identities without
+    /// inserting any solver object. The returned value is bound to this world.
+    /// Input order is the order of the returned owner handles at commit.
+    pub fn prepare_dynamic_corpse_restore_batch(
+        &self,
+        restores: Vec<crate::articulated::DynamicCorpseRestore>,
+        representation: Representation,
+        density: impl Fn(MaterialId) -> f64,
+    ) -> Result<PreparedDynamicCorpseBatch, crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        if restores.is_empty() || restores.len() > MAX_CORPSE_RESTORE_BATCH_OWNERS {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        let mut dense = 0_u64;
+        let mut solids = 0_u64;
+        let mut mask_cells = 0_usize;
+        let mut materials = std::collections::BTreeSet::new();
+        for restore in &restores {
+            if restore.source_parts.len() > MAX_ARTICULATED_PARTS
+                || restore.components.len() > crate::fracture::MAX_FRACTURE_COMPONENTS
+            {
+                return Err(ArticulatedError::WorkBudget);
+            }
+            for part in &restore.source_parts {
+                let dims = part.grid.dims();
+                let cells = u64::from(dims[0])
+                    .checked_mul(u64::from(dims[1]))
+                    .and_then(|n| n.checked_mul(u64::from(dims[2])))
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                dense = dense
+                    .checked_add(cells)
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                solids = solids
+                    .checked_add(part.grid.solid_count())
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                if dense > MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS
+                    || solids > MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS
+                {
+                    return Err(ArticulatedError::WorkBudget);
+                }
+                part.grid.for_each_solid(|_, _, _, material| {
+                    materials.insert(material);
+                });
+            }
+            for component in &restore.components {
+                mask_cells = mask_cells
+                    .checked_add(component.cells.len())
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                if mask_cells as u64 > MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS {
+                    return Err(ArticulatedError::WorkBudget);
+                }
+            }
+        }
+        // Snapshot each material density once for the complete batch. Shapes
+        // and mass preparation cannot observe different catalog values per owner.
+        let mut material_densities = HashMap::new();
+        for material in materials {
+            let rho = density(material);
+            if !rho.is_finite() || rho <= 0.0 {
+                return Err(ArticulatedError::InvalidDensity);
+            }
+            material_densities.insert(material, rho.to_bits());
+        }
+        let stable_density = |material| manifest_density(&material_densities, material);
+        let mut owners = Vec::with_capacity(restores.len());
+        let mut owner_keys = std::collections::BTreeSet::new();
+        let mut volume_ids = std::collections::BTreeSet::new();
+        let mut primitives = 0_usize;
+        let mut derived_dense = 0_u64;
+        for restore in restores {
+            let owner =
+                self.prepare_corpse_restore_owner(restore, representation, &stable_density)?;
+            if !owner_keys.insert(owner.owner_key)
+                || owner
+                    .source_volumes
+                    .iter()
+                    .any(|id| !volume_ids.insert(*id))
+            {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            primitives = primitives
+                .checked_add(owner.primitive_count)
+                .ok_or(ArticulatedError::WorkBudget)?;
+            derived_dense = derived_dense
+                .checked_add(owner.derived_dense)
+                .ok_or(ArticulatedError::WorkBudget)?;
+            if primitives > MAX_CORPSE_RESTORE_BATCH_PRIMITIVES
+                || derived_dense > MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS
+            {
+                return Err(ArticulatedError::WorkBudget);
+            }
+            owners.push(owner);
+        }
+        Ok(PreparedDynamicCorpseBatch {
+            world_identity: self.preparation_identity.clone(),
+            expected_step: self.step_count,
+            expected_entries: self.entries.len(),
+            owners,
+        })
+    }
+
+    /// Revalidates the entire prepared batch before the first insertion.
+    /// Stale or conflicting batches publish no owners and consume no handles.
+    pub fn commit_dynamic_corpse_restore_batch(
+        &mut self,
+        prepared: PreparedDynamicCorpseBatch,
+    ) -> Result<Vec<ArticulatedBodyId>, crate::articulated::ArticulatedError> {
+        use crate::articulated::ArticulatedError;
+        if !std::sync::Arc::ptr_eq(&prepared.world_identity, &self.preparation_identity)
+            || prepared.expected_step != self.step_count
+            || prepared.expected_entries != self.entries.len()
+        {
+            return Err(ArticulatedError::StalePreparedBatch);
+        }
+        let final_entries = self
+            .entries
+            .len()
+            .checked_add(prepared.owners.len())
+            .ok_or(ArticulatedError::WorkBudget)?;
+        if final_entries > u32::MAX as usize {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        let live_volumes: std::collections::BTreeSet<_> = self
+            .articulated
+            .values()
+            .flat_map(|owner| owner.source_volume_ids.iter().copied())
+            .collect();
+        for owner in &prepared.owners {
+            if self.fracture_owner_keys.contains_key(&owner.owner_key)
+                || self
+                    .articulated
+                    .values()
+                    .any(|live| live.fracture_owner_key == Some(owner.owner_key))
+                || owner
+                    .source_volumes
+                    .iter()
+                    .any(|id| live_volumes.contains(id))
+            {
+                return Err(ArticulatedError::StalePreparedBatch);
+            }
+        }
+        let mut owners = Vec::with_capacity(prepared.owners.len());
+        // All bounds, reservations and freshness checks have completed.
+        // Publication below contains no fallible preparation or validation.
+        for owner in prepared.owners {
+            owners.push(self.publish_corpse_restore_owner(owner));
+        }
+        Ok(owners)
+    }
+
+    fn prepare_corpse_restore_owner(
+        &self,
+        restore: crate::articulated::DynamicCorpseRestore,
+        representation: Representation,
+        density: &impl Fn(spall_core::MaterialId) -> f64,
+    ) -> Result<PreparedCorpseRestoreOwner, crate::articulated::ArticulatedError> {
         use crate::articulated::{
             ArticulatedError, MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_PARTS,
             MAX_ARTICULATED_SOLID_CELLS,
@@ -1535,7 +1758,18 @@ impl PhysicsWorld {
                 if total_shards > MAX_ARTICULATED_PARTS {
                     return Err(ArticulatedError::WorkBudget);
                 }
-                parts.push((part, grid, *frozen_pose, built.primitives, collider));
+                parts.push((
+                    PreparedCorpsePartIdentity {
+                        part_id: part.part_id,
+                        volume_id: part.volume_id,
+                        source_revision: part.source_revision,
+                        cell_m: part.cell_m,
+                    },
+                    grid,
+                    *frozen_pose,
+                    built.primitives,
+                    collider,
+                ));
             }
             if parts.is_empty() {
                 return Err(ArticulatedError::EmptyAggregate);
@@ -1552,9 +1786,50 @@ impl PhysicsWorld {
             if !articulated_translation_in_range(translation) {
                 return Err(ArticulatedError::GeometryRange);
             }
-            prepared.push((component, mass, rotation, translation, parts));
+            prepared.push((
+                PreparedCorpseComponentState {
+                    component_id: component.component_id,
+                    linear_velocity_m_s: component.linear_velocity_m_s,
+                    angular_velocity_rad_s: component.angular_velocity_rad_s,
+                },
+                mass,
+                rotation,
+                translation,
+                parts,
+            ));
         }
 
+        Ok(PreparedCorpseRestoreOwner {
+            owner_key: restore.owner_key,
+            source_generation: restore.source_generation,
+            topology_revision: restore.topology_revision,
+            pose_epoch: restore.pose_epoch,
+            next_component_serial: restore.next_component_serial,
+            source_volumes,
+            manifest,
+            prepared,
+            representation,
+            primitive_count,
+            derived_dense,
+        })
+    }
+
+    fn publish_corpse_restore_owner(
+        &mut self,
+        restore: PreparedCorpseRestoreOwner,
+    ) -> ArticulatedBodyId {
+        let PreparedCorpseRestoreOwner {
+            owner_key,
+            source_generation,
+            topology_revision,
+            pose_epoch,
+            next_component_serial,
+            source_volumes,
+            manifest,
+            prepared,
+            representation,
+            ..
+        } = restore;
         let first_translation = prepared[0].3;
         let first_rotation = prepared[0].2;
         let first_mass = prepared[0].1;
@@ -1675,8 +1950,8 @@ impl PhysicsWorld {
         self.articulated.insert(
             id,
             ArticulatedEntry {
-                topology_token: restore.topology_revision,
-                pose_token: restore.pose_epoch,
+                topology_token: topology_revision,
+                pose_token: pose_epoch,
                 root_pose: PartTransform {
                     translation_m: first_translation,
                     rotation_xyzw: first_rotation,
@@ -1685,17 +1960,17 @@ impl PhysicsWorld {
                 pending_pose: None,
                 kinematic_part_bodies: false,
                 dynamic_corpse: true,
-                source_generation: restore.source_generation,
-                fracture_owner_key: Some(restore.owner_key),
-                next_component_serial: restore.next_component_serial,
+                source_generation,
+                fracture_owner_key: Some(owner_key),
+                next_component_serial,
                 density_manifest: Some(manifest),
                 source_volume_ids: source_volumes,
                 parts: built_parts,
             },
         );
-        self.fracture_owner_keys.insert(restore.owner_key, id);
+        self.fracture_owner_keys.insert(owner_key, id);
         self.ccd_solver = CCDSolver::new();
-        Ok(ArticulatedBodyId(id))
+        ArticulatedBodyId(id)
     }
 
     /// Converts the existing ENG-210 multi-body kinematic owner in place. It

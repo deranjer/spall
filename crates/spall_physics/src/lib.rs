@@ -66,6 +66,8 @@ pub use world::{
     ArticulatedContactWitness, ArticulatedOwnerSnapshot, BodyId, BodyKind, BodySpec, BodyState,
     CONTACT_WITNESS_VERSION, ColliderExclusion, ContactCellAttribution, ContactImpulse,
     ContactWitnessUnattributed, CorpseEditOutcome, CorpseTransferOutcome, FractureCommitOutcome,
-    MAX_CONTACT_WITNESSES_PER_STEP, PhysicsConfig, PhysicsWorld, PreparedBodySpec,
-    PreparedCollider, SourceContactWitness, StepTiming,
+    MAX_CONTACT_WITNESSES_PER_STEP, MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS,
+    MAX_CORPSE_RESTORE_BATCH_OWNERS, MAX_CORPSE_RESTORE_BATCH_PRIMITIVES,
+    MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS, PhysicsConfig, PhysicsWorld, PreparedBodySpec,
+    PreparedCollider, PreparedDynamicCorpseBatch, SourceContactWitness, StepTiming,
 };
