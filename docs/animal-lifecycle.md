@@ -439,3 +439,14 @@ their own creature identity state reject before mutation. Combined checks pass
 334 tests with 9 existing manual/large-scale tests ignored. See
 `reports/ENG-215-integration.md`. The next slice is atomic actor lifecycle/source
 ownership; this acceptance does not establish live actors, networking or persistence.
+
+ENG-216 coordinator acceptance (2026-10-16 local date): the bounded in-memory
+source ownership and birth/death seam is integrated through `cd0b6e3`. Original
+source Volumes stay separate from ordinary Bodies. Full source freshness and
+retained hierarchy protect death; a checked prepublication transfer validates
+the exact resultant corpse motion. Combined checks pass 364 tests with 10
+existing manual/large-scale tests ignored, and all 18 release animal corpse
+cases pass. Mutation and source storage remain unit-test-only. No journal,
+baseline or saved schema was changed. Evidence: `reports/ENG-216-integration.md`.
+Next: ENG-217 versioned actor/source ownership and ordered lifecycle replay,
+followed by replica/baseline and durable recovery consumers before live spawning.

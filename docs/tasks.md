@@ -2075,3 +2075,30 @@ Birth reserves original VolumeIds and CreatureKey from cloned authoritative
 allocators; physics preparation must fail atomically before ownership publication.
 Lifetime part bindings remain even for empty sources; partial edits/removal follow.
 Luna worker received reviewed boundary and is proceeding in animal-ownership.
+ENG-216 coordinator acceptance (2026-10-16 local): integrated through cd0b6e3.
+Bounded unit-test-only source ownership and atomic birth/death pass 364 tests,
+10 existing ignored, workspace compile/scoped strict lint/format/diff checks.
+All18 release trout/crow/deer corpse cases pass. Nine independent review cases
+cover lifecycle/material/motion rejection, both allocators, reset and refusal
+before transfer. Nested3part mixed-material rotated-root queries/mass pass.
+Same-max canonical source replacement rejects; ordinary apply_edit already
+advances the volume-wide revision high-water mark. Full source freshness and
+retained hierarchy protect transfer; exact resultant motion validates before
+physics mutation. Source-only hash excludes actor/pose state. No production
+registration, transaction/wire/checkpoint schema or journal changed.
+Evidence: reports/ENG-216-integration.md. Next unblocked: ENG-217 versioned
+actor/source records and ordered lifecycle replay, design review before edits.
+Replica/baseline and durable recovery must support actors before live spawning.
+
+## ENG-217: versioned animal source ownership and ordered lifecycle replay
+
+Depends on accepted ENG-216. Review portable actor/source/hierarchy/component
+DTOs, canonical hash domain/version and existing ordered transaction/replay
+extension before shared edits. Runtime stamps/handles never serialize. Preserve
+legacy ordinary bytes and no-actor hashes. Candidate-first all-or-nothing
+application and idempotent/divergent replay tests must prove exact source
+identity, revision/material checks and allocator safety. Agree fragment masks
+and source-edit synchronization boundaries explicitly; unsupported paths remain
+closed. No separate journal or unjournaled sequence consumption. Production
+registration stays disabled until baseline/replica and checkpoint/recovery
+consumers are implemented. Exact scoped acceptance is on Loopira ENG-217.
