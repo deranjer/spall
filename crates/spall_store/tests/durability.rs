@@ -74,77 +74,50 @@ fn snow_checkpoint_round_trips_and_republication_clears_the_previous_blob() {
 }
 
 #[test]
-fn legacy_snow_table_backfill_is_atomic_and_missing_existing_rows_are_corruption() {
-    let scratch = Scratch::new("snow-upgrade");
-    let cp = checkpoint(0, 0);
-    let mut writer = Writer::open(scratch.db()).unwrap();
-    writer.publish_checkpoint(&cp).unwrap();
-    drop(writer);
-    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
-    conn.execute_batch("DROP TABLE checkpoint_snow").unwrap();
-    drop(conn);
-    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
-    drop(Writer::open(scratch.db()).unwrap());
-    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
-    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
-    conn.execute("DELETE FROM checkpoint_snow", []).unwrap();
-    drop(conn);
-    drop(Writer::open(scratch.db()).unwrap());
-    assert!(
-        recover(scratch.db()).is_err(),
-        "opening must not erase missing-row evidence"
-    );
+fn current_schema_missing_auxiliary_tables_reject_without_mutation() {
+    for missing in [
+        "checkpoint_snow",
+        "checkpoint_vegetation",
+        "checkpoint_weather",
+        "game_outbox",
+    ] {
+        let scratch = Scratch::new(&format!("missing-{missing}"));
+        let mut writer = Writer::open(scratch.db()).unwrap();
+        writer.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+        drop(writer);
+        let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+        conn.execute(&format!("DROP TABLE {missing}"), []).unwrap();
+        drop(conn);
+        let before = std::fs::read(scratch.db()).unwrap();
+        assert!(matches!(
+            Writer::open(scratch.db()),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(recover(scratch.db()), Err(StoreError::Corrupt(_))));
+        assert_eq!(
+            std::fs::read(scratch.db()).unwrap(),
+            before,
+            "rejecting absent {missing} must not mutate the file"
+        );
+    }
 }
 
 #[test]
-fn corrupt_snow_payload_uses_the_prior_complete_world_checkpoint() {
-    let scratch = Scratch::new("snow-corruption");
-    let mut old = checkpoint(10, 0);
-    old.snow = Some(vec![1, 0, 8]);
-    let mut new = checkpoint(20, 0);
-    new.snow = Some(vec![1, 0, 16]);
-    let mut writer = Writer::open(scratch.db()).unwrap();
-    writer.publish_checkpoint(&old).unwrap();
-    writer.publish_checkpoint(&new).unwrap();
-    drop(writer);
+fn an_unversioned_nonempty_database_is_rejected_without_mutation() {
+    let scratch = Scratch::new("unversioned-nonempty");
     let conn = rusqlite::Connection::open(scratch.db()).unwrap();
-    conn.execute("UPDATE checkpoint_snow SET state=x'0000' WHERE tick=20", [])
-        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE old_world(value BLOB); INSERT INTO old_world VALUES(x'0102');",
+    )
+    .unwrap();
     drop(conn);
-    let recovered = recover(scratch.db()).unwrap();
-    assert_eq!(recovered.checkpoint, old);
-    assert!(
-        recovered
-            .corruption
-            .iter()
-            .any(|report| report.detail.contains("snow checkpoint checksum"))
-    );
+    let before = std::fs::read(scratch.db()).unwrap();
+    assert!(matches!(
+        Writer::open(scratch.db()),
+        Err(StoreError::SchemaTooOld { found: 0, .. })
+    ));
+    assert_eq!(std::fs::read(scratch.db()).unwrap(), before);
 }
-
-#[test]
-fn legacy_schema_two_vegetation_backfill_preserves_world_and_detects_missing_rows() {
-    let scratch = Scratch::new("vegetation-upgrade");
-    let cp = checkpoint(0, 0);
-    let mut writer = Writer::open(scratch.db()).unwrap();
-    writer.publish_checkpoint(&cp).unwrap();
-    drop(writer);
-    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
-    conn.execute_batch("DROP TABLE checkpoint_vegetation;")
-        .unwrap();
-    drop(conn);
-    // Read-only recovery of an old save does not rewrite the world.
-    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
-    // Opening the writer atomically installs empty rows for old checkpoints.
-    drop(Writer::open(scratch.db()).unwrap());
-    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
-    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
-    conn.execute("DELETE FROM checkpoint_vegetation", [])
-        .unwrap();
-    drop(conn);
-    drop(Writer::open(scratch.db()).unwrap());
-    assert!(recover(scratch.db()).is_err());
-}
-
 impl Scratch {
     fn new(tag: &str) -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -913,10 +886,14 @@ fn missing_or_corrupt_column_water_checkpoint_never_restores_a_silent_dry_world(
         let conn = rusqlite::Connection::open(scratch.db()).unwrap();
         conn.execute_batch(sql).unwrap();
         drop(conn);
-        assert!(matches!(
-            recover(scratch.db()),
-            Err(StoreError::CheckpointsUnrecoverable(_))
-        ));
+        if tag == "missing_water_table" {
+            assert!(matches!(recover(scratch.db()), Err(StoreError::Corrupt(_))));
+        } else {
+            assert!(matches!(
+                recover(scratch.db()),
+                Err(StoreError::CheckpointsUnrecoverable(_))
+            ));
+        }
     }
 }
 
@@ -945,34 +922,39 @@ fn unsupported_save_versions_are_rejected_before_changing_rollback_journal_mode(
 }
 
 #[test]
-fn schema_one_weather_checkpoint_and_journal_migrate_to_automatic_state() {
+fn old_weather_checkpoint_and_journal_layouts_are_not_migrated() {
     use serde::Serialize;
-    use spall_protocol::{WeatherClock, WeatherClockSource, WeatherState, WeatherStateV1};
-    #[allow(dead_code)]
-    #[derive(Serialize)]
-    enum LegacyJournal {
-        Topology {
-            transaction: Vec<u8>,
-            participants: Vec<Vec<u8>>,
-        },
-        PoseBatch {
-            snapshots: Vec<Vec<u8>>,
-        },
-        TopologyBulkSplit {
-            transaction: Vec<u8>,
-            participants: Vec<Vec<u8>>,
-            baseline: Vec<u8>,
-        },
-        VegetationState(Vec<u8>),
-        VegetationClock {
-            time_ms: u64,
-            credit_ms: u64,
-        },
-        ColumnWaterDelta(spall_protocol::ColumnWaterDelta),
-        WeatherState(WeatherStateV1),
+    use spall_protocol::{WeatherClock, WeatherClockSource, WeatherKind, WeatherState};
+    #[derive(Clone, Serialize)]
+    struct HistoricalWeatherState {
+        schema: u16,
+        world_epoch: u64,
+        world_revision: u64,
+        effective_tick: u64,
+        clock_ms: u64,
+        clock_source: WeatherClockSource,
+        start_season: u8,
+        season_ms: u64,
+        weather_seed: u64,
+        transition_id: u64,
+        transition_start_ms: u64,
+        transition_duration_ms: u32,
+        kind: WeatherKind,
+        precipitation_q16: u16,
+        wind_x_q15: i16,
+        wind_z_q15: i16,
+        gust_q16: u16,
+        temperature_centi_c: i16,
+        lightning_id: u64,
+        lightning_tick: u64,
     }
-    let scratch = Scratch::new("weather-v1-upgrade");
-    let mut cp = checkpoint(120, 0);
+    #[derive(Serialize)]
+    enum OldJournal {
+        WeatherState(HistoricalWeatherState),
+    }
+    let scratch = Scratch::new("weather-v1-rejected");
+    let mut prior = checkpoint(100, 0);
+    let mut current_cp = checkpoint(120, 0);
     let current = WeatherState::for_clock(
         42,
         3,
@@ -985,11 +967,13 @@ fn schema_one_weather_checkpoint_and_journal_migrate_to_automatic_state() {
         },
         9,
     );
-    cp.weather = Some(current.clone());
+    prior.weather = Some(current.clone());
+    current_cp.weather = Some(current.clone());
     let mut writer = Writer::open(scratch.db()).unwrap();
-    writer.publish_checkpoint(&cp).unwrap();
+    writer.publish_checkpoint(&prior).unwrap();
+    writer.publish_checkpoint(&current_cp).unwrap();
     drop(writer);
-    let old = WeatherStateV1 {
+    let old = HistoricalWeatherState {
         schema: 1,
         world_epoch: current.world_epoch,
         world_revision: current.world_revision,
@@ -1012,7 +996,7 @@ fn schema_one_weather_checkpoint_and_journal_migrate_to_automatic_state() {
         lightning_tick: current.lightning_tick,
     };
     let checkpoint_blob = postcard::to_stdvec(&Some(old.clone())).unwrap();
-    let legacy_payload = postcard::to_stdvec(&LegacyJournal::WeatherState(old)).unwrap();
+    let journal_blob = postcard::to_stdvec(&OldJournal::WeatherState(old)).unwrap();
     let crc = |b: &[u8]| blake3::hash(b).as_bytes()[..16].to_vec();
     let conn = rusqlite::Connection::open(scratch.db()).unwrap();
     conn.execute(
@@ -1022,17 +1006,32 @@ fn schema_one_weather_checkpoint_and_journal_migrate_to_automatic_state() {
     .unwrap();
     conn.execute(
         "INSERT INTO journal(seq,tick,payload,crc) VALUES(1,121,?1,?2)",
-        rusqlite::params![legacy_payload, crc(&legacy_payload)],
+        rusqlite::params![journal_blob, crc(&journal_blob)],
     )
     .unwrap();
     drop(conn);
     let recovered = recover(scratch.db()).unwrap();
-    assert_eq!(recovered.checkpoint.weather.unwrap().override_kind, None);
+    assert_eq!(
+        recovered.checkpoint, prior,
+        "invalid legacy checkpoint must fall back to the prior complete checkpoint"
+    );
     assert!(
-        matches!(recovered.journal[0].payload,JournalPayload::WeatherState(ref state) if state.schema==spall_protocol::WEATHER_SCHEMA && state.override_kind.is_none())
+        recovered.journal.is_empty(),
+        "legacy journal payload must not be converted"
+    );
+    assert!(
+        recovered
+            .corruption
+            .iter()
+            .any(|c| c.detail.contains("checkpoint tick 120"))
+    );
+    assert!(
+        recovered
+            .corruption
+            .iter()
+            .any(|c| c.detail.contains("journal seq 1 did not decode"))
     );
 }
-
 #[test]
 fn weather_clock_checkpoint_and_journal_survive_restart_exactly() {
     use spall_protocol::{WeatherClock, WeatherClockSource, WeatherState};
