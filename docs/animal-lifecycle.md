@@ -429,3 +429,13 @@ reports/ENG-214-integration.md. The next implementation task is ENG-215
 (host identities, bounded DTOs, registry and scheduling seam). Atomic actor
 lifecycle transactions, species movement/habitat, actor replication/recovery
 and the combined fully simulated 1024m launch are still pending.
+
+ENG-215 coordinator acceptance (2026-10-16): stable identities, checked allocator
+snapshots, bounded standalone state validation and immutable scheduling proposals
+are integrated through `32cf744`. Production registration remains unavailable
+until atomic source ownership is implemented. Species/version binds exactly one
+asset, V1 generation is 1, corpse clips are frozen, and replacement worlds carrying
+their own creature identity state reject before mutation. Combined checks pass
+334 tests with 9 existing manual/large-scale tests ignored. See
+`reports/ENG-215-integration.md`. The next slice is atomic actor lifecycle/source
+ownership; this acceptance does not establish live actors, networking or persistence.

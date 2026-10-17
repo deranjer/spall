@@ -2042,3 +2042,14 @@ channel or durable schema changes until following slices; DTO roundtrip and
 counter snapshots alone are not launch acceptance. Required rejection,
 allocator/restore/reset, bounded scheduling and stale-intent invariant tests
 are recorded on ENG-215. Dedicated worktree; coordinator owns integration/log.
+
+ENG-215 coordinator acceptance (2026-10-16): integrated through32cf744.
+Stable checked creature identities/counters, bounded standalone state DTOs and
+owner-thread immutable scheduling proposals pass334 tests,9existing ignored.
+Workspace all-target/all-feature compile, scoped strict lint,format/diff pass.
+Independent review fixed species/asset binding, pre-allocation source limits,
+invalid epochs, frozen corpse scheduling, reset identity loss and ID reuse.
+Production registration is unavailable pending atomic source ownership.
+Evidence: reports/ENG-215-integration.md. Next dependency-ready work: atomic
+actor lifecycle/source ownership. Network/durable/species integration and the
+fully simulated1024m weather launch remain pending.
