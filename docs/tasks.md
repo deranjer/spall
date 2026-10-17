@@ -2150,3 +2150,14 @@ corpse cases passed. See docs/reports/ENG-218-progress.md for commands and limit
 Next unblocked task remains ENG-218: common prepared birth/death/restore batch,
 then real ordered operations, complete baseline and durable recovery consumers.
 No production population or combined weather/1024m acceptance is claimed.
+
+ENG-218 checkpoint (2026-10-17, main96ba47d): common articulated birth/death/
+restore preparation, selected-body freshness fence, owned geometry preparation
+and no-journal publication seam integrated. Actual joint geometry-first/animal
+publish fixture passes; it is not a serialized lifecycle transaction. Measured:
+667 tests passed, 12 existing ignored across68suites; workspace all-target/
+feature check, scoped strict all-target lint, fmt/diff and18releasecorpsecases
+passed. See reports/ENG-218-progress.md. Next remainsENG-218 actual ordered
+lifecycle transaction/client consumers, typedbulk, completebaseline and durable
+checkpoint/replay. Combinedcapacity/registry/journal admission must precede any
+mixedpublish. No productionanimals or combinedweather/1024m acceptance claimed.

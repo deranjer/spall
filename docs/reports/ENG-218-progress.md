@@ -65,8 +65,7 @@ Density is captured once per material across the batch.
 Reconstruction retains original source coordinates and VolumeIds, independent
 component poses/twists, a single surviving derived component, retired serial
 high-water and empty lifetime source bindings. It does not rerun death or
-fracture. The batch is currently limited to cold corpse restore; mixed alive
-birth, checked death transfer and restore preparation is the next prerequisite.
+fracture. This cold-restore milestone preceded the common mixed batch below.
 Its safety caps (1024 owners, 16 Mi dense cells, 4 million solid cells and
 4 million primitives across a batch) bound work; they are not measured
 population or 1 km performance targets.
@@ -102,6 +101,69 @@ production registration, real lifecycle TopologyOp, actor checkpoint or complete
 baseline consumer is claimed by these prerequisite checks. GPU, two-client
 animal recovery/crash, population performance and combined weather/1024 m gates
 remain unrun.
+
+## Common physics and geometry preparation
+
+Main commits `8cb4f09` and `bcbaaaa` integrate the common articulated batch and
+independent public-API checks. The batch prepares living kinematic births,
+checked alive-to-corpse transfers and exact cold restoration together. Density
+is sampled once per material; birth-bound density changes reject at death,
+while legacy unbound kinematic creation retains its existing density semantics.
+Death retains all lifetime source IDs. Cumulative primitive accounting includes
+the actual collider primitives in transfers, not merely their collider count.
+
+The opaque selected-body fence covers world identity, physics step/slots and
+affected body pose/twist/mass and collider shape/configuration. It explicitly
+tracks absent colliders. Batch validation and infallible publication are split
+so unrelated prevalidated geometry can publish between them. Using a validated
+token on another world or tick is a programmer error caught before mutation;
+the owning simulation thread must validate all participants before any publish.
+
+Main `3e3eed5` adds owned geometry preparation and final freshness validation
+while keeping the public `commit` wrapper. It captures target geometry, registry,
+world/physics identity, origin/epoch, affected terrain colliders and journal
+cursor without cloning the whole physics world. Main `96ba47d` separates geometry
+publication from journal append: the normal wrapper appends exactly once, and a
+future combined transaction can apply both prepared participants before appending
+the returned entry. Commit timing still covers prepare through journal append.
+These are prerequisites, not yet
+an actual ordered lifecycle transaction, client consumer or durable actor store.
+
+New evidence covers the permitted interleave: prepare and validate geometry and
+a two-part living birth, publish geometry first (adding a child body), publish
+the validated articulated batch, verify exact source ray attribution and geometry
+hashes, then append one journal entry. This fixture does not serialize the animal
+into that geometry transaction and does not establish lifecycle durability.
+The future combined candidate must reserve total geometry plus articulated body
+capacity and shared allocator/journal/attachment bounds before either publishes.
+
+Additional changed files: `spall_sim/src/{commit,world,commit_review}.rs` and
+`spall_physics/tests/articulated_batch_review.rs`. The physics selected-body fence
+also verifies absent collider state followed by collider reappearance; an empty
+affected terrain-brick edit was not naturally present in the simulation fixture.
+
+## Integrated checks after common preparation
+
+Measured on main `96ba47d`:
+
+- `cargo test -p spall_protocol -p spall_physics -p spall_sim -p spall_client`:
+  **667 passed, 0 failed, 12 existing ignored**, across 68 test/doc-test suites
+  with local loopback access. Log: `.local/eng218-composed-tests.log`.
+- `cargo check --workspace --all-targets --all-features`: passed.
+  Log: `.local/eng218-composed-workspace-check.log`.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_client --all-targets -- -D warnings`:
+  passed. Log: `.local/eng218-composed-clippy.log`.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `cargo build --release -p sandbox --example animal-collision-probe` and
+  `target/release/examples/animal-collision-probe.exe --corpse-bounded`: passed,
+  all 18 original trout/crow/deer cases. Logs:
+  `.local/eng218-composed-release-build.log`, `.local/eng218-composed-corpse.json`.
+
+The independent public tests initially exposed a missing bound-density check in
+death preparation; it was fixed before this integrated run. The test expectation
+was also corrected to count the living aggregate root plus two part bodies.
+No failed check was treated as a pass. Filesystem hard-link cache fallback
+warnings remain. Versions and the unrun launch gates listed above are unchanged.
 
 Next unblocked task: continue ENG-218 through the real typed ordered operation,
 bounded correlated bulk transport, complete baseline/segmented staging, and
