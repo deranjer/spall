@@ -415,3 +415,19 @@ fn owner_rejection_of_resultant_motion_preserves_living_rig() {
         )
         .unwrap();
 }
+
+#[test]
+fn exhausted_creature_allocator_cannot_consume_source_ids_or_publish_physics() {
+    let mut f = Fixture::new();
+    let mut snapshot = f.sim.creature_allocator_snapshot().unwrap();
+    snapshot.next_creature_id = u64::MAX;
+    f.sim.creatures =
+        Some(crate::creatures::CreatureHost::from_allocator_snapshot(snapshot).unwrap());
+    let mut state = f.state();
+    state.key.creature_id = spall_core::CreatureId::new(u64::MAX).unwrap();
+    let registry = f.sim.world.registry().counters();
+    let bodies = f.sim.world.physics().body_count();
+    let hash = f.sim.world.creature_source_hash_for_test();
+    assert!(f.birth(state, MaterialId(1)).is_err());
+    f.assert_empty_unchanged(registry, snapshot, bodies, hash);
+}
