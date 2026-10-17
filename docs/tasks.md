@@ -2142,3 +2142,11 @@ specified; no ghost actors or fake Body ownership. Production species spawning
 stays closed; sourceedit/fracture sync and integrated1024m proof still follow.
 Exact contract: Loopira ENG-218. Coordinator reviews design before shared edits;
 Luna6Medium worker uses dedicated animal-consumers checkout from84880c2.
+ENG-218 checkpoint (2026-10-17): integrated replay guard, source-fenced lifecycle
+commit evidence, exact corpse reconstruction and owned atomic cold-restore batch.
+Main 963d1b7: 646 tests passed, 12 existing ignored; workspace all-target/features
+check, four-package strict all-targets Clippy, fmt/diff and 18 release animal
+corpse cases passed. See docs/reports/ENG-218-progress.md for commands and limits.
+Next unblocked task remains ENG-218: common prepared birth/death/restore batch,
+then real ordered operations, complete baseline and durable recovery consumers.
+No production population or combined weather/1024m acceptance is claimed.

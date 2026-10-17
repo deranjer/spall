@@ -44,21 +44,64 @@ Checks on the main checkout:
 Only filesystem incremental-cache hard-link warnings remained. These CPU and
 loopback tests are not the combined 1024 m, GPU or population performance gate.
 
-## Work under review
+## Integrated lifecycle evidence and exact restore
 
-The dedicated animal-consumers checkout contains the protocol commit wrapper
-and exact physics reconstruction work. Neither is accepted as a completed
-consumer slice. Review requires an outer receipt binding the unchanged ENG-217
-change, authoritative death evidence and source-fenced pre-motion snapshot.
-Missed motion datagrams must not prevent death; stale source topology must still
-reject. Separate topology and motion hashes must explicitly bind lifecycle and
-preserve actor-free legacy hashes.
+Commits `a00102d`, `360cdd9` and `41112ff` add and independently verify the
+lifecycle commit envelope. Its outer receipt binds the unchanged ENG-217 change,
+authoritative death witness and source-fenced pre-motion overlay. Valid death
+can catch up after missed motion datagrams, including a clip restart under a
+newer epoch; stale source generations, static poses and forged evidence reject.
+Topology and motion hashes are separate. This is still a portable reducer,
+not an installed wire operation or a completed consumer slice.
 
-Cold physics restoration must preserve exact original source identities and
-independently moving corpse components, including a single surviving derived
-component and retired serial high-water. Empty lifetime source bindings must
-remain reserved; all shapes and mass properties must prepare before publication.
-Restoration must not rerun death/fracture or manufacture a one-volume body.
+Commits `88c1e41`, `1a83051` and `df9a74f` add exact corpse reconstruction and
+an owned prepare/commit batch. All component shapes, source shards and mass
+properties prepare before any solver insertion. Commit checks the creating
+world identity, physics step, body-slot count and every source/owner reservation
+before publishing the batch. Invalid later members, cross-member collisions,
+stale preparations and preparations from a different world reject atomically.
+Density is captured once per material across the batch.
+
+Reconstruction retains original source coordinates and VolumeIds, independent
+component poses/twists, a single surviving derived component, retired serial
+high-water and empty lifetime source bindings. It does not rerun death or
+fracture. The batch is currently limited to cold corpse restore; mixed alive
+birth, checked death transfer and restore preparation is the next prerequisite.
+Its safety caps (1024 owners, 16 Mi dense cells, 4 million solid cells and
+4 million primitives across a batch) bound work; they are not measured
+population or 1 km performance targets.
+
+Additional changed files: `spall_protocol/src/creature_owner.rs`, protocol
+`creature_commit_review.rs` and `creature_owner_review.rs`; physics
+`src/articulated.rs`, `src/world.rs`, `src/lib.rs` and
+`tests/corpse_restore_review.rs`; `docs/reports/ENG-218-design.md`.
+
+## Integrated checks after cold-restore batching
+
+Measured on main `963d1b7`:
+
+- `cargo test -p spall_protocol -p spall_physics -p spall_sim -p spall_client`:
+  **646 passed, 0 failed, 12 existing ignored**, across 67 test/doc-test suites,
+  with local loopback access. Log: `.local/eng218-final-tests.log`.
+- `cargo check --workspace --all-targets --all-features`: passed.
+  Log: `.local/eng218-final-workspace-check.log`.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_client --all-targets -- -D warnings`:
+  passed. Log: `.local/eng218-final-clippy.log`.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+Release regression checks:
+
+- `cargo build --release -p sandbox --example animal-collision-probe`: passed.
+- `target/release/examples/animal-collision-probe.exe --corpse-bounded`:
+  passed all 18 existing trout/crow/deer cases. This retains the original
+  bounded corpse workload; it does not exercise a populated 1 km world.
+  Logs: `.local/eng218-release-build.log` and `.local/eng218-corpse.json`.
+
+Protocol/wire 7, baseline schema 1 and store schema 3 remain unchanged. No
+production registration, real lifecycle TopologyOp, actor checkpoint or complete
+baseline consumer is claimed by these prerequisite checks. GPU, two-client
+animal recovery/crash, population performance and combined weather/1024 m gates
+remain unrun.
 
 Next unblocked task: continue ENG-218 through the real typed ordered operation,
 bounded correlated bulk transport, complete baseline/segmented staging, and
