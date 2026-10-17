@@ -327,9 +327,8 @@ macro_rules! seeded_struct {
         #[serde(field_identifier)]
         enum $field_enum { $(#[serde(rename = $wire)] $variant),+, #[serde(other)] Ignored }
 
-        struct $seed<'a> { budget: &'a mut DecodeBudget }
 
-        impl<'de, 'a> BudgetDecode<'de> for $output {
+        impl<'de> BudgetDecode<'de> for $output {
             fn decode<D: Deserializer<'de>>(
                 deserializer: D,
                 budget: &mut DecodeBudget,
@@ -339,13 +338,6 @@ macro_rules! seeded_struct {
                     &[$($wire),+],
                     $visitor { budget },
                 )
-            }
-        }
-
-        impl<'de, 'a> DeserializeSeed<'de> for $seed<'a> {
-            type Value = $output;
-            fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-                <$output as BudgetDecode<'de>>::decode(deserializer, self.budget)
             }
         }
 
@@ -710,10 +702,7 @@ where
     D: Deserializer<'de>,
 {
     let mut budget = DecodeBudget::new::<D::Error>()?;
-    RecordSeed {
-        budget: &mut budget,
-    }
-    .deserialize(deserializer)
+    <CreatureOwnershipRecordV1 as BudgetDecode>::decode(deserializer, &mut budget)
 }
 
 #[cfg(test)]
@@ -796,8 +785,10 @@ mod tests {
     #[test]
     fn declared_cumulative_nested_count_rejects_before_reading_elements() {
         let accesses = Rc::new(Cell::new(0));
-        let mut budget = DecodeBudget::default();
-        budget.parts = MAX_CREATURE_OWNER_PARTS;
+        let mut budget = DecodeBudget {
+            parts: MAX_CREATURE_OWNER_PARTS,
+            ..DecodeBudget::default()
+        };
         let result = CountedVecSeed::<CreatureSourcePartV1> {
             budget: &mut budget,
             counter: Counter::Parts,
@@ -820,8 +811,10 @@ mod tests {
 
     #[test]
     fn unknown_size_exact_cap_eof_succeeds_and_excess_payload_is_not_decoded() {
-        let mut budget = DecodeBudget::default();
-        budget.parts = MAX_CREATURE_OWNER_PARTS;
+        let mut budget = DecodeBudget {
+            parts: MAX_CREATURE_OWNER_PARTS,
+            ..DecodeBudget::default()
+        };
         let accesses = Rc::new(Cell::new(0));
         let payload_reads = Rc::new(Cell::new(0));
         let exact = CountedVecSeed::<CreatureSourcePartV1> {

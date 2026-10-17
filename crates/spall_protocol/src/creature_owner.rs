@@ -222,34 +222,17 @@ pub enum CreatureOwnershipError {
     Encoding(String),
 }
 
+#[path = "creature_owner_decode.rs"]
+mod decode;
+
 impl<'de> Deserialize<'de> for CreatureOwnershipRecordV1 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        struct Wire {
-            schema: u16,
-            state: CreatureStateV1,
-            owner_key: u128,
-            source_generation: u64,
-            next_component_serial: u64,
-            parts: BoundedParts,
-            components: BoundedComponents,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            schema: wire.schema,
-            state: wire.state,
-            owner_key: wire.owner_key,
-            source_generation: wire.source_generation,
-            next_component_serial: wire.next_component_serial,
-            parts: wire.parts.0,
-            components: wire.components.0,
-        })
+        decode::deserialize_record(deserializer)
     }
 }
-
 impl<'de> Deserialize<'de> for CreatureSourcePartV1 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -358,22 +341,10 @@ macro_rules! bounded_vec {
 }
 
 bounded_vec!(
-    BoundedParts,
-    CreatureSourcePartV1,
-    MAX_CREATURE_OWNER_PARTS,
-    "source parts"
-);
-bounded_vec!(
     BoundedBricks,
     BaselineBrickBounded,
     MAX_CREATURE_OWNER_BRICKS,
     "source bricks"
-);
-bounded_vec!(
-    BoundedComponents,
-    CreatureOwnedComponentV1,
-    MAX_CREATURE_OWNER_COMPONENTS,
-    "components"
 );
 bounded_vec!(
     BoundedMasks,
@@ -600,9 +571,12 @@ impl CreatureSourcePartV1 {
                     w.u8(0).u16(*id);
                 }
                 BaselineCells::Dense(ids) => {
-                    let first = ids.first().copied();
-                    if first.is_some() && ids.iter().all(|id| Some(*id) == first) {
-                        w.u8(0).u16(first.expect("dense brick is non-empty"));
+                    let first = ids
+                        .first()
+                        .copied()
+                        .filter(|first| ids.iter().all(|id| id == first));
+                    if let Some(first) = first {
+                        w.u8(0).u16(first);
                     } else {
                         w.u8(1).u32(ids.len() as u32);
                         for id in ids {
@@ -807,9 +781,7 @@ impl CreatureOwnershipRecordV1 {
                 .serial
                 .is_some_and(|serial| serial != 0 && serial < self.next_component_serial)
         });
-        if (!intact && !derived)
-            || (self.state.lifecycle == crate::CreatureLifecycleState::Alive && !intact)
-        {
+        if !intact && (self.state.lifecycle == crate::CreatureLifecycleState::Alive || !derived) {
             return Err(CreatureOwnershipError::Mask);
         }
         if intact && self.next_component_serial != 1 {
