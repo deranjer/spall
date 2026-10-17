@@ -438,7 +438,7 @@ fn source_material_must_belong_to_selected_asset_keys() {
         .unwrap();
     sim.commit_creature_birth_for_test(
         state.clone(),
-        &base.view(),
+        &catalog,
         vec![CreatureBirthPartInput {
             part_id: 1,
             parent_id: None,
