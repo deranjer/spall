@@ -64,6 +64,10 @@ fn creature_source_freshness(
 #[path = "creature_lifecycle_review.rs"]
 mod creature_lifecycle_review;
 
+#[cfg(test)]
+#[path = "creature_owner_bridge.rs"]
+mod creature_owner_bridge;
+
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a
 /// band a wire `RequestId` never reaches — a client action claiming a value at

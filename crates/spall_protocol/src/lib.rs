@@ -25,6 +25,7 @@ pub mod codec;
 pub mod column_water;
 pub mod column_water_wire;
 pub mod creature;
+pub mod creature_owner;
 pub mod handshake;
 pub mod input;
 pub mod limits;
@@ -66,6 +67,18 @@ pub use creature::{
     MAX_CREATURE_CATALOG_SPECIES, MAX_CREATURE_CLIP_NAME_BYTES, MAX_CREATURE_LINEAR_VELOCITY_M_S,
     MAX_CREATURE_POSITION_M, MAX_CREATURE_SOURCE_PARTS, MAX_CREATURE_SPECIES_KEY_BYTES,
     MAX_CREATURE_STATE_BYTES, creature_material_mapping_hash,
+};
+pub use creature_owner::{
+    CREATURE_CHANGE_DOMAIN, CREATURE_CHANGE_SCHEMA,
+    CREATURE_OWNER_DOMAIN, CREATURE_OWNER_SCHEMA, CREATURE_OWNER_SET_DOMAIN,
+    CreatureLifecycleCandidateV1, CreatureLifecycleChangeV1, CreatureLifecycleContextV1,
+    CreatureLifecycleOperationV1, CreatureLocalPoseV1, CreatureMaskCellV1,
+    CreatureOwnedComponentV1, CreatureOwnershipError, CreatureOwnershipRecordV1,
+    CreatureOwnershipSetV1, CreatureReductionOutcome, CreatureSourceMaskBrickV1,
+    CreatureSourcePartV1, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
+    MAX_CREATURE_OWNER_DENSE_CELLS, MAX_CREATURE_OWNER_MASK_BRICKS,
+    MAX_CREATURE_OWNER_MASK_CELLS, MAX_CREATURE_OWNER_PARTS, MAX_CREATURE_OWNER_RECORD_BYTES,
+    MAX_CREATURE_OWNER_SOLID_CELLS, reduce_creature_lifecycle_candidate,
 };
 pub use handshake::{
     AlgorithmVersions, Handshake, Incompatibility, NegotiatedLimits, PROTOCOL_VERSION,
