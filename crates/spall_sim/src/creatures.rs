@@ -197,6 +197,7 @@ impl CreatureHost {
             .map_err(|_| CreatureScheduleError::InvalidBatch)?;
         if state.key.world_id != self.allocator.world_id()
             || state.key.world_epoch != self.allocator.world_epoch()
+            || state.key.creature_id.get() != self.allocator.next_creature_id()
             || self.records.len() >= MAX_CREATURE_HOST_RECORDS
             || self.records.contains_key(&state.key.creature_id)
         {
@@ -225,6 +226,13 @@ impl CreatureHost {
             .iter()
             .any(|binding| !volumes.insert(binding.source_volume_id))
         {
+            return Err(CreatureScheduleError::InvalidBatch);
+        }
+        let allocated = self
+            .allocator
+            .allocate()
+            .map_err(|_| CreatureScheduleError::CounterExhausted)?;
+        if allocated != state.key {
             return Err(CreatureScheduleError::InvalidBatch);
         }
         self.records.insert(state.key.creature_id, state);
@@ -355,7 +363,8 @@ fn validate_intent_batch(
         }
         match intent.kind {
             CreatureIntentKind::AdvanceClipPhase { phase_tick }
-                if current.clip_mode == spall_protocol::CreatureClipMode::Playing
+                if current.lifecycle == spall_protocol::CreatureLifecycleState::Alive
+                    && current.clip_mode == spall_protocol::CreatureClipMode::Playing
                     && current.clip_phase_tick.checked_add(1) == Some(phase_tick) => {}
             _ => return Err(CreatureScheduleError::InvalidBatch),
         }
@@ -554,6 +563,63 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum Tamper {
+        Generation,
+        StateRevision,
+        TopologyRevision,
+        PoseEpoch,
+        ClipEpoch,
+        ForeignKey,
+        Context,
+        Duplicate,
+    }
+
+    struct TamperedBatch(Tamper);
+
+    impl CreatureSchedulingRules for TamperedBatch {
+        fn propose(
+            &self,
+            context: CreatureScheduleContext,
+            snapshots: &[CreatureScheduleSnapshot],
+            output: &mut CreatureIntentWriter,
+        ) -> Result<(), CreatureRuleError> {
+            for (index, snapshot) in snapshots.iter().enumerate() {
+                if matches!(self.0, Tamper::Duplicate) && index > 0 {
+                    continue;
+                }
+                let mut context = context;
+                let mut token = snapshot.token;
+                match self.0 {
+                    Tamper::Generation => {
+                        token.key.generation = spall_core::CreatureGeneration::new(2).unwrap();
+                    }
+                    Tamper::StateRevision => token.state_revision += 1,
+                    Tamper::TopologyRevision => token.topology_revision += 1,
+                    Tamper::PoseEpoch => token.pose_epoch += 1,
+                    Tamper::ClipEpoch => token.clip_epoch += 1,
+                    Tamper::ForeignKey => {
+                        token.key.creature_id = CreatureId::new(999).unwrap();
+                    }
+                    Tamper::Context => context.tick += 1,
+                    Tamper::Duplicate => {}
+                }
+                let intent = CreatureIntent {
+                    context,
+                    token,
+                    kind: CreatureIntentKind::AdvanceClipPhase {
+                        phase_tick: snapshot.state.clip_phase_tick + 1,
+                    },
+                };
+                output.push(intent.clone())?;
+                if matches!(self.0, Tamper::Duplicate) {
+                    output.push(intent)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn scheduler_is_deterministic_bounded_and_round_robin() {
         let catalog = FixtureCatalog::new();
@@ -585,6 +651,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frozen_corpses_do_not_accept_clip_phase_intents() {
+        let catalog = FixtureCatalog::new();
+        let mut host = CreatureHost::new(WorldId::from_u128(10)).unwrap();
+        let mut corpse = catalog.state(1, 1001);
+        corpse.lifecycle = spall_protocol::CreatureLifecycleState::Corpse;
+        corpse.clip_mode = spall_protocol::CreatureClipMode::Frozen;
+        host.register_validated(corpse, &catalog.view()).unwrap();
+
+        let report = host.schedule(1, 9, Some(3), &AdvanceAll);
+        assert_eq!(report.rejected, Some(CreatureScheduleError::InvalidBatch));
+        assert!(report.accepted_intents.is_empty());
+    }
+
+    #[test]
     fn stale_or_oversized_intent_batches_reject_all_without_actor_mutation() {
         let catalog = FixtureCatalog::new();
         let mut host = CreatureHost::new(WorldId::from_u128(10)).unwrap();
@@ -610,6 +690,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_token_context_and_duplicate_intent_error_rejects_the_whole_batch() {
+        let catalog = FixtureCatalog::new();
+        let mutations = [
+            Tamper::Generation,
+            Tamper::StateRevision,
+            Tamper::TopologyRevision,
+            Tamper::PoseEpoch,
+            Tamper::ClipEpoch,
+            Tamper::ForeignKey,
+            Tamper::Context,
+            Tamper::Duplicate,
+        ];
+        for mutation in mutations {
+            let mut host = CreatureHost::new(WorldId::from_u128(10)).unwrap();
+            for id in 1..=2 {
+                host.register_validated(catalog.state(id, 1000 + id), &catalog.view())
+                    .unwrap();
+            }
+            let before_snapshot = host.allocator_snapshot();
+            let before_records = host.records.clone();
+            let before_cursor = host.schedule_cursor;
+            let before_schedule_epoch = host.schedule_epoch;
+            let report = host.schedule(1, 9, None, &TamperedBatch(mutation));
+            assert_eq!(report.rejected, Some(CreatureScheduleError::Stale));
+            assert!(report.accepted_intents.is_empty());
+            assert_eq!(host.allocator_snapshot(), before_snapshot);
+            assert_eq!(host.records, before_records);
+            assert_eq!(host.schedule_cursor, before_cursor);
+            assert_eq!(host.schedule_epoch, before_schedule_epoch);
+        }
+    }
+
+    #[test]
     fn source_ownership_is_unique_and_reset_drops_records_without_reusing_ids() {
         let catalog = FixtureCatalog::new();
         let mut host = CreatureHost::new(WorldId::from_u128(10)).unwrap();
@@ -628,5 +741,20 @@ pub(crate) mod tests {
         let restored = CreatureHost::from_allocator_snapshot(after).unwrap();
         assert_eq!(restored.world_epoch().get(), after.world_epoch);
         assert_eq!(restored.world_id(), WorldId::from_u128(10));
+    }
+
+    #[test]
+    fn registration_requires_the_next_unallocated_identity() {
+        let catalog = FixtureCatalog::new();
+        let mut host = CreatureHost::new(WorldId::from_u128(10)).unwrap();
+        let before = host.allocator_snapshot();
+        assert_eq!(
+            host.register_validated(catalog.state(2, 1002), &catalog.view()),
+            Err(CreatureScheduleError::InvalidBatch)
+        );
+        assert_eq!(host.allocator_snapshot(), before);
+        host.register_validated(catalog.state(1, 1001), &catalog.view())
+            .unwrap();
+        assert_eq!(host.allocator_snapshot().next_creature_id, 2);
     }
 }

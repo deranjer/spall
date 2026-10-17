@@ -295,6 +295,11 @@ impl CreatureStateV1 {
         if self.key.generation.get() != 1 {
             return Err(CreatureStateError::Identity);
         }
+        if self.lifecycle == CreatureLifecycleState::Corpse
+            && self.clip_mode != CreatureClipMode::Frozen
+        {
+            return Err(CreatureStateError::Identity);
+        }
         if self.state_revision == 0
             || self.species_version == 0
             || self.material_mapping_version == 0
@@ -374,17 +379,14 @@ impl CreatureStateV1 {
         {
             return Err(CreatureStateError::Reference);
         }
-        let species_matches = catalog
+        let mut species_matches = catalog
             .species
             .iter()
-            .filter(|entry| {
-                entry.key == self.species_key
-                    && entry.version == self.species_version
-                    && entry.enabled
-                    && entry.asset == self.asset
-            })
-            .count();
-        if species_matches != 1 {
+            .filter(|entry| entry.key == self.species_key && entry.version == self.species_version);
+        let Some(species) = species_matches.next() else {
+            return Err(CreatureStateError::Reference);
+        };
+        if species_matches.next().is_some() || !species.enabled || species.asset != self.asset {
             return Err(CreatureStateError::Reference);
         }
         let mut asset_matches = catalog.assets.iter().filter(|entry| {
@@ -738,12 +740,40 @@ mod tests {
             bad.validate(&other_catalog),
             Err(CreatureStateError::Reference)
         );
+        let conflicting_species = [
+            other_species[0],
+            CreatureSpeciesCatalogEntry {
+                key: "deer",
+                version: 1,
+                enabled: true,
+                asset: CreatureAssetIdentity {
+                    uuid: [5; 16],
+                    logical_hash: Hash32([6; 32]),
+                },
+            },
+        ];
+        let conflicting_catalog = make_catalog(
+            &materials,
+            &other_assets,
+            &conflicting_species,
+            &mapping,
+            mapping_hash,
+        );
+        assert_eq!(
+            state.validate(&conflicting_catalog),
+            Err(CreatureStateError::Reference)
+        );
         bad = state.clone();
         bad.key.generation = spall_core::CreatureGeneration::new(2).unwrap();
         assert_eq!(bad.validate(&catalog), Err(CreatureStateError::Identity));
         bad = state.clone();
         bad.root_translation_m[0] = f64::INFINITY;
         assert_eq!(bad.validate(&catalog), Err(CreatureStateError::Limit));
+        bad = state.clone();
+        bad.lifecycle = CreatureLifecycleState::Corpse;
+        assert_eq!(bad.validate(&catalog), Err(CreatureStateError::Identity));
+        bad.clip_mode = CreatureClipMode::Frozen;
+        assert_eq!(bad.validate(&catalog), Ok(()));
         assert_eq!(
             CreatureStateV1::decode(&vec![0; MAX_CREATURE_STATE_BYTES + 1], &catalog),
             Err(CreatureStateError::Limit)

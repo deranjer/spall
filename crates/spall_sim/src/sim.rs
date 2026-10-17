@@ -123,7 +123,7 @@ mod creature_host_tests {
             .unwrap();
         let before = simulation.creature_allocator_snapshot().unwrap();
         assert_eq!(before.world_epoch, 1);
-        assert_eq!(before.next_creature_id, 1);
+        assert_eq!(before.next_creature_id, 2);
 
         let rules = CountingRules {
             calls: AtomicUsize::new(0),
