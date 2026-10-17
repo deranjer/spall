@@ -528,3 +528,67 @@ fn validated_nonempty_birth_round_trips_as_an_ordered_operation() {
     );
     assert_eq!(reduced.record.components[0].source_masks[0].cells.len(), 1);
 }
+
+#[test]
+fn validated_three_part_sources_require_bulk_instead_of_a_control_frame() {
+    let mut f = Fixture::new();
+    f.assets[0].part_ids = &[1, 2, 3];
+    let mut after = owner(&f);
+    let source = after.parts[0].clone();
+    let mask = after.components[0].source_masks[0].clone();
+    after.parts.clear();
+    after.state.source_bindings.clear();
+    after.components[0].source_masks.clear();
+    for index in 0..3_u32 {
+        let part_id = index + 1;
+        let volume = VolumeId::new(100 + u64::from(index)).unwrap();
+        let mut part = source.clone();
+        part.part_id = part_id;
+        part.source_volume_id = volume;
+        part.parent_id = (index > 0).then_some(index);
+        part.source_content_hash = part.canonical_source_content_hash();
+        after.parts.push(part);
+        after.state.source_bindings.push(CreaturePartBinding {
+            part_id,
+            source_volume_id: volume,
+            source_revision: 1,
+        });
+        let mut part_mask = mask.clone();
+        part_mask.part_id = part_id;
+        part_mask.volume_id = volume;
+        after.components[0].source_masks.push(part_mask);
+    }
+    after.validate(&f.catalog()).unwrap();
+    let commit = CreatureLifecycleCommitV1 {
+        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        change: birth(after.clone()),
+        expected_before_topology_hash: Hash32::ZERO,
+        pre_motion: None,
+        death_witness: None,
+    };
+    let reduced = commit
+        .validate_and_reduce(None, context(7, 1, 100), &f.catalog())
+        .unwrap();
+    assert_eq!(reduced.record, after);
+    let tx = TopologyTransaction {
+        transaction_id: commit.change.transaction_id,
+        server_tick: spall_core::Tick(9),
+        control_seq: ControlSeq(10),
+        algorithm_version: 1,
+        dependencies: vec![],
+        before: vec![],
+        after: vec![],
+        ops: vec![TopologyOp::CreatureLifecycle {
+            commit: Box::new(commit),
+        }],
+        result_hashes: vec![],
+    };
+    tx.validate().unwrap();
+    let body_bytes = postcard::experimental::serialized_size(&tx).unwrap();
+    println!(
+        "three-part ownership fixture control body: {body_bytes} bytes; cap: {}",
+        limits::MAX_CONTROL_RECORD
+    );
+    assert!(body_bytes > limits::MAX_CONTROL_RECORD);
+    assert!(matches!(encode_control(&tx), Err(CodecError::Size(_))));
+}
