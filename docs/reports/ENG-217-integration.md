@@ -85,7 +85,7 @@ it is not yet called by real network or durable recovery consumers. Simulation
 source storage and lifecycle mutation remain unit-test-only. Source edits,
 fracture and terminal removal reduction remain unsupported.
 
-The next unblocked work is coordinated ordered transaction, baseline/replica
+The next unblocked task is ENG-218: coordinated ordered transaction, baseline/replica
 and checkpoint/recovery integration using these same records and reducer.
 It needs explicit version handling and a topology hash that excludes motion;
 the complete ownership hash here includes motion and cannot replace the legacy
