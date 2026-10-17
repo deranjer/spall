@@ -75,6 +75,16 @@ fn encode<R: Record>(
     channel: &'static str,
 ) -> Result<Vec<u8>, CodecError> {
     record.validate()?;
+    let body_size = postcard::experimental::serialized_size(record)
+        .map_err(|e| CodecError::Body(e.to_string()))?;
+    let total_size = HEADER_LEN
+        .checked_add(body_size)
+        .ok_or_else(|| CodecError::Size(SizeLimitError::bytes(channel, usize::MAX, limit)))?;
+    if total_size > limit {
+        return Err(CodecError::Size(SizeLimitError::bytes(
+            channel, total_size, limit,
+        )));
+    }
     let body = postcard::to_stdvec(record).map_err(|e| CodecError::Body(e.to_string()))?;
     let total = HEADER_LEN + body.len();
     if total > limit {
@@ -206,9 +216,9 @@ mod tests {
             journal_seq: JournalSeq(300),
         };
         let bytes = encode_control(&record).unwrap();
-        // header: schema=7 (authoritative snow surface family added),
+        // header: schema=8 (ordered creature lifecycle op added),
         // tag=11 (DurableThrough); body: postcard varint of 300 = 0xAC 0x02
-        assert_eq!(bytes, [0x07, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
+        assert_eq!(bytes, [0x08, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
         let back: DurableThrough = decode_control(&bytes).unwrap();
         assert_eq!(back, record);
     }

@@ -2434,6 +2434,19 @@ impl SimWorld {
     ) -> Result<(), WorldError> {
         use spall_protocol::TopologyOp;
 
+        // This entry point owns geometry only. Refuse actor-bearing records
+        // before checking or mutating any geometry so mixed transactions stay
+        // fail-closed until Simulation has the complete candidate path.
+        if tx
+            .ops
+            .iter()
+            .any(|op| matches!(op, TopologyOp::CreatureLifecycle { .. }))
+        {
+            return Err(WorldError::ReplayResultHash(
+                "creature lifecycle replay requires Simulation ownership".into(),
+            ));
+        }
+
         // T17 increment 2: a giant split's `SplitOffBulkBaseline` /
         // `SourcePatchBulkBaseline` markers get their geometry from this
         // out-of-band world, delivered as a `spall_store` `TopologyBulkSplit`
@@ -2647,6 +2660,9 @@ impl SimWorld {
                     flush(self, group.take(), &mut touched, &mut new_children)?;
                     let bv = bulk_volume(*source)?;
                     self.patch_source_from_baseline(*source, bv, &mut touched)?;
+                }
+                TopologyOp::CreatureLifecycle { .. } => {
+                    unreachable!("preflight rejects creature lifecycle operations")
                 }
             }
         }

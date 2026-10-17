@@ -333,6 +333,7 @@ fn giant_collapse_attempt() {
             spall_protocol::TopologyOp::SplitOff { .. } => "SplitOff",
             spall_protocol::TopologyOp::CellRun { .. } => "CellRun",
             spall_protocol::TopologyOp::IntegerBrush { .. } => "IntegerBrush",
+            spall_protocol::TopologyOp::CreatureLifecycle { .. } => "CreatureLifecycle",
         })
         .collect();
     println!(

@@ -21,10 +21,10 @@ use crate::limits::{
 };
 
 /// Schema version stamped into every encoded record header. A peer on another version cannot
-/// decode a single record, so mismatched builds refuse each other at the first message. Bumped to
-/// 4 with the chunked topology hash (`spall.topology.v2`): every `result_hashes` and world hash
-/// value changed, so a mixed pair could otherwise connect and then reject every transaction.
-pub const WIRE_SCHEMA_VERSION: u16 = 7;
+/// decode a single record, so mismatched builds refuse each other at the first message. Version 8
+/// appends the typed creature lifecycle operation to `TopologyOp`; live v7 frames remain rejected.
+/// The saved-journal decoder retains only its explicit, known-layout v5/v6 handling.
+pub const WIRE_SCHEMA_VERSION: u16 = 8;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -501,6 +501,12 @@ pub enum TopologyOp {
     /// [`TopologyOp::SplitOffBulkBaseline`] children, under the same
     /// `transfer_id`.
     SourcePatchBulkBaseline { source: VolumeId, transfer_id: u64 },
+    /// Versioned actor lifecycle payload in the same ordered transaction.
+    /// This op is structurally validated here; world/catalog validation and
+    /// candidate application belong to the owning simulation or replica.
+    CreatureLifecycle {
+        commit: Box<crate::CreatureLifecycleCommitV1>,
+    },
 }
 
 impl TopologyOp {
@@ -595,6 +601,24 @@ impl Record for TopologyTransaction {
                 });
             }
         }
+        let txid = self.transaction_id;
+        for (ordinal, op) in self.ops.iter().enumerate() {
+            if let TopologyOp::CreatureLifecycle { commit } = op {
+                let ordinal = u32::try_from(ordinal).map_err(|_| RecordError::OutOfRange {
+                    field: "TopologyOp.CreatureLifecycle.operation_ordinal",
+                    detail: "operation ordinal does not fit u32",
+                })?;
+                if commit.schema != crate::CREATURE_LIFECYCLE_COMMIT_SCHEMA
+                    || commit.change.schema != crate::CREATURE_CHANGE_SCHEMA
+                    || commit.change.transaction_id != txid
+                    || commit.change.operation_ordinal != ordinal
+                {
+                    return Err(RecordError::Inconsistent(
+                        "creature lifecycle envelope schema, transaction id, or ordinal mismatch",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -644,7 +668,8 @@ impl TopologyTransaction {
                 // material-checked where it decodes.
                 TopologyOp::SplitOff { .. }
                 | TopologyOp::SplitOffBulkBaseline { .. }
-                | TopologyOp::SourcePatchBulkBaseline { .. } => continue,
+                | TopologyOp::SourcePatchBulkBaseline { .. }
+                | TopologyOp::CreatureLifecycle { .. } => continue,
                 // A split baseline blob carries whole bricks: decode it and
                 // check every material it names against the manifest.
                 TopologyOp::SplitOffBaseline { blob, .. }
@@ -988,6 +1013,160 @@ mod tests {
             material: MaterialId(1),
         };
         assert!(tx.validate().is_ok());
+    }
+
+    #[test]
+    fn lifecycle_op_round_trips_and_binds_enclosing_identity() {
+        use crate::{
+            CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA, CreatureAssetIdentity,
+            CreatureLifecycleCommitV1, CreatureLifecycleOperationV1, CreatureLifecycleState,
+            CreatureOwnershipRecordV1, CreatureStateV1,
+        };
+        use spall_core::{CreatureGeneration, CreatureId, CreatureKey, WorldEpoch, WorldId};
+
+        let key = CreatureKey::new(
+            WorldId::from_u128(11),
+            WorldEpoch::INITIAL,
+            CreatureId::new(3).unwrap(),
+            CreatureGeneration::INITIAL,
+        )
+        .unwrap();
+        let after = CreatureOwnershipRecordV1 {
+            schema: CREATURE_OWNER_SCHEMA,
+            state: CreatureStateV1 {
+                schema: 1,
+                key,
+                state_revision: 1,
+                lifecycle: CreatureLifecycleState::Alive,
+                species_key: "deer".into(),
+                species_version: 1,
+                asset: CreatureAssetIdentity {
+                    uuid: [7; 16],
+                    logical_hash: crate::Hash32([8; 32]),
+                },
+                material_manifest_hash: crate::Hash32([9; 32]),
+                material_mapping_version: 1,
+                material_mapping_hash: crate::Hash32([10; 32]),
+                clip_name: "idle".into(),
+                clip_mode: crate::CreatureClipMode::Playing,
+                clip_phase_tick: 0,
+                clip_subtick_remainder: 0,
+                clip_epoch: 1,
+                source_bindings: vec![],
+                aggregate_topology_revision: 1,
+                pose_epoch: 1,
+                root_translation_m: [0.0; 3],
+                root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                linear_velocity_m_s: [0.0; 3],
+                angular_velocity_rad_s: [0.0; 3],
+                locomotion_tag: 0,
+            },
+            owner_key: 17,
+            source_generation: 1,
+            next_component_serial: 1,
+            parts: vec![],
+            components: vec![],
+        };
+        let transaction_id = TransactionId::new(42).unwrap();
+        let commit = CreatureLifecycleCommitV1 {
+            schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+            change: crate::CreatureLifecycleChangeV1 {
+                schema: crate::CREATURE_CHANGE_SCHEMA,
+                transaction_id,
+                operation_ordinal: 0,
+                expected_before_hash: crate::Hash32::ZERO,
+                expected_after_hash: after.canonical_hash(),
+                operation: CreatureLifecycleOperationV1::Birth { after },
+            },
+            expected_before_topology_hash: crate::Hash32::ZERO,
+            pre_motion: None,
+            death_witness: None,
+        };
+        let mut tx = TopologyTransaction {
+            transaction_id,
+            server_tick: Tick(5),
+            control_seq: ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![TopologyOp::CreatureLifecycle {
+                commit: Box::new(commit.clone()),
+            }],
+            result_hashes: vec![],
+        };
+
+        assert!(tx.validate().is_ok());
+        let encoded = crate::encode_control(&tx).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([encoded[0], encoded[1]]),
+            WIRE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            crate::decode_control::<TopologyTransaction>(&encoded).unwrap(),
+            tx
+        );
+        let mut old_wire = encoded.clone();
+        old_wire[..2].copy_from_slice(&7u16.to_le_bytes());
+        assert!(matches!(
+            crate::decode_control::<TopologyTransaction>(&old_wire),
+            Err(crate::CodecError::SchemaVersion {
+                expected: 8,
+                found: 7
+            })
+        ));
+        let mut multiple = tx.clone();
+        let mut second = commit.clone();
+        second.change.operation_ordinal = 1;
+        multiple.ops.push(TopologyOp::CreatureLifecycle {
+            commit: Box::new(second),
+        });
+        assert!(
+            multiple.validate().is_ok(),
+            "bounded multiple lifecycle ops are valid structurally"
+        );
+        let initial_hash = commit.canonical_hash();
+        let mut altered = commit.clone();
+        altered.expected_before_topology_hash = crate::Hash32([1; 32]);
+        assert_ne!(altered.canonical_hash(), initial_hash);
+
+        if let TopologyOp::CreatureLifecycle { commit } = &mut tx.ops[0] {
+            commit.change.operation_ordinal = 1;
+        }
+        assert!(matches!(tx.validate(), Err(RecordError::Inconsistent(_))));
+        if let TopologyOp::CreatureLifecycle { commit } = &mut tx.ops[0] {
+            commit.change.operation_ordinal = 0;
+            commit.change.transaction_id = TransactionId::new(43).unwrap();
+        }
+        assert!(matches!(tx.validate(), Err(RecordError::Inconsistent(_))));
+
+        let mut wrong_schema = tx.clone();
+        if let TopologyOp::CreatureLifecycle { commit } = &mut wrong_schema.ops[0] {
+            commit.change.transaction_id = transaction_id;
+            commit.schema += 1;
+        }
+        assert!(matches!(
+            wrong_schema.validate(),
+            Err(RecordError::Inconsistent(_))
+        ));
+
+        let mut oversized = tx.clone();
+        if let TopologyOp::CreatureLifecycle { commit } = &mut oversized.ops[0] {
+            commit.change.transaction_id = transaction_id;
+            commit.change.operation_ordinal = 0;
+            if let CreatureLifecycleOperationV1::Birth { after } = &mut commit.change.operation {
+                after.state.species_key = "x".repeat(70 * 1024);
+            }
+        }
+        assert!(oversized.validate().is_ok());
+        assert!(matches!(
+            oversized.replay_identity_hash(),
+            Err(crate::CodecError::FrameTooLarge { .. })
+        ));
+        assert!(matches!(
+            crate::encode_control(&oversized),
+            Err(crate::CodecError::Size(_))
+        ));
     }
 
     #[test]
