@@ -693,17 +693,27 @@ submit imprint positions. See weather.md for rates, caps and exposure rules.
 
 Canonical checkpoints retain exact fractional snow depth and climate cursors;
 geometry journal entries preserve exact cohort changes. Footprints clear on
-restart. Live and saved topology/motion records now require protocol/wire 8. Saved
-wire headers 5, 6 and 7 are rejected without migration or header rewriting.
+restart. Live and saved topology/motion records now require protocol/wire 9. Saved
+wire headers 5, 6, 7 and 8 are rejected without migration or header rewriting.
 
 ### ENG-218 - Ordered creature lifecycle boundary
 
-Protocol and wire schema 8 append a typed inline `TopologyOp::CreatureLifecycle`
+Protocol/wire 8 introduced a typed inline `TopologyOp::CreatureLifecycle`
 carrying the unchanged inner change inside `CreatureLifecycleCommitV1`. The
 operation must use its enclosing transaction ID and exact operation ordinal.
 Multiple operations use the existing transaction count limit. The codec checks
 the 64 KiB control limit before allocating an encoded frame. Catalog, source and
 transition validation still belong to the owning candidate consumer.
+
+Current protocol/wire 9 adds `TopologyOp::CreatureLifecycleBulk`, binding its
+exact operation ordinal, payload schema, outer commit hash and shared transfer ID.
+`CreatureLifecycleBulkPayloadV1` uses world-version tag 6 and bounded postcard/zstd
+framing. The decoder checks the marker correlation prefix before nested owner
+decoding and hashing. Raw commit, cumulative source/ownership work and compressed
+assembly limits are enforced. Geometry split children and their source patch may
+share a geometry transfer ID; lifecycle IDs may not reuse each other or geometry
+IDs. The codec and marker are implemented; network dispatch for tag 6 remains
+closed until atomic typed attachment consumers and the common allocator are ready.
 
 The current geometry-only replica and SimWorld replay paths reject actor-bearing
 transactions before geometry, clocks, sequence gates or replay receipts change.

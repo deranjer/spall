@@ -3,6 +3,11 @@
 Date: 2026-10-17. ENG-218 remains in progress. This is measured partial
 implementation evidence, not acceptance of animal replication or recovery.
 
+Current accepted main protocol/wire is 9: inline lifecycle framing plus a
+bounded typed bulk marker/codec. Dispatch and production spawning remain closed;
+the authoritative producer draft is isolated pending validation. Earlier sections
+below record the versions and test counts at their specific integration points.
+
 ## Integrated replay guard
 
 Main commit `81b89f4` adds a bounded transaction payload fingerprint and
@@ -230,3 +235,54 @@ lifecycle consumers, bounded correlated bulk transport, complete baseline/segmen
 checkpoint/journal recovery consumers. Production animal spawning remains
 disabled. Source edit/fracture synchronization, species/current habitat and
 integrated two-client restart/destruction/performance proof still follow.
+
+## Typed bulk framing accepted after current-only cleanup
+
+Worker `0d643bd` is integrated as main `bf6ba9a`, with the geometry-only replay
+guard extended to refuse both actor forms. Protocol and handshake are now 9;
+previous versions, including 8, reject without migration. The new marker carries
+the operation ordinal, payload schema, outer hash and transfer ID. Its bounded
+postcard/zstd payload checks correlation before nested decoding and enforces
+raw, compressed and cumulative source/ownership work limits before hashing.
+Geometry split groups retain a shared transfer ID across multiple children and
+their source patch; lifecycle IDs cannot reuse geometry or other lifecycle IDs.
+World-version tag 6 is defined for the payload but is not enabled in network
+dispatch. This is transport framing, not a completed attachment consumer.
+
+The unchanged validated three-part fixture measures **99,093 raw bulk-envelope
+bytes, 397 compressed bytes**. The earlier **99,068-byte** measurement is its
+inline topology body. Neither is a measurement of the shipped animal assets.
+
+Worker checks passed: protocol unit tests 81; focused bulk tests 5; server unit
+tests 88 with 1 ignored plus all server integrations; store unit tests 15 plus
+persistence integrations 29; strict protocol library/test Clippy. The earlier
+client run passed 129 tests with 2 ignored. Initial old expected-version
+assertions were corrected. A compact Uniform overflow test also originally
+expected the later bulk work check, while the existing bounded owner decoder
+correctly rejected earlier; the test now preserves that earlier refusal.
+
+Coordinator checks on integrated main passed:
+
+- `cargo test -p spall_protocol --test creature_commit_review`: 11 passed.
+- `cargo test -p spall_client lifecycle_rejection_review`: 2 passed, now covering
+  inline and bulk forms, both catalogue states and repeat delivery. Both client
+  and geometry-only recovery retain geometry, clocks, receipts and queues.
+- `cargo check --workspace --all-targets --all-features`: passed after adding
+  missing bulk labels to the existing G4 diagnostic and miniature test applier.
+  The initial attempts failed those exhaustive matches; neither was hidden.
+- Seven-package all-target Clippy with warnings denied passed; formatting and
+  diff checks passed after formatting the new geometry-only guard.
+
+Logs: `.local/eng218-bulk-integrated-protocol.log`,
+`.local/eng218-bulk-integrated-rejection.log`,
+`.local/eng218-bulk-integrated-workspace-retry2.log`,
+`.local/eng218-bulk-integrated-clippy.log`, and
+`.local/eng218-bulk-format-retry.log`. Cache hard-link fallback warnings remain.
+
+The isolated producer's first ordered Birth/inline-overflow test passed. Review
+then required final death-source freshness, installed birth-twist consistency,
+incremental work bounds and real mixed/death scenarios. Those additions remain
+unaccepted until their focused/full checks pass. Next unblocked work is still
+ENG-218: finish that producer, shared transfer reservations and typed journal
+attachments, then replica/baseline and durable recovery consumers. No launch,
+GPU or population acceptance is claimed.

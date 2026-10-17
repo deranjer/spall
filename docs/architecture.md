@@ -877,7 +877,7 @@ interest-filtered transactions, or distant visual LOD. Those require separate me
 Animal source volumes have separate ownership from terrain and ordinary bodies.
 Lifecycle changes belong in the existing ordered topology transaction and journal,
 sharing the world ID allocators and transaction replay receipt. The accepted
-protocol/wire-8 inline operation is a framing boundary: current client and
+protocol/wire-9 inline operation and typed bulk marker are framing boundaries: current client and
 geometry-only replay consumers reject actor-bearing transactions before mutation.
 The full authoritative/replica/baseline/store consumer remains under implementation;
 production animal spawning is disabled. See

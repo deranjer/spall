@@ -2437,16 +2437,12 @@ impl SimWorld {
         // This entry point owns geometry only. Refuse actor-bearing records
         // before checking or mutating any geometry so mixed transactions stay
         // fail-closed until Simulation has the complete candidate path.
-        if tx
-            .ops
-            .iter()
-            .any(|op| {
-                matches!(
-                    op,
-                    TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
-                )
-            })
-        {
+        if tx.ops.iter().any(|op| {
+            matches!(
+                op,
+                TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
+            )
+        }) {
             return Err(WorldError::ReplayResultHash(
                 "creature lifecycle replay requires Simulation ownership".into(),
             ));

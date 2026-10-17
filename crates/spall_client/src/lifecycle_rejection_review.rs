@@ -3,7 +3,7 @@ use super::*;
 use spall_core::{CreatureGeneration, CreatureId, CreatureKey, WorldEpoch, WorldId};
 use spall_protocol::*;
 
-fn mixed_transaction() -> TopologyTransaction {
+fn mixed_transaction(bulk: bool) -> TopologyTransaction {
     let materials = spall_sim::fixtures::flat_terrain_setup().materials;
     let asset = CreatureAssetIdentity {
         uuid: [3; 16],
@@ -133,7 +133,7 @@ fn mixed_transaction() -> TopologyTransaction {
         expected_after_hash: after.canonical_hash(),
         operation: CreatureLifecycleOperationV1::Birth { after },
     };
-    TopologyTransaction {
+    let mut transaction = TopologyTransaction {
         transaction_id,
         server_tick: spall_core::Tick(999),
         control_seq: ControlSeq(100),
@@ -159,12 +159,24 @@ fn mixed_transaction() -> TopologyTransaction {
                 }),
             },
         ],
+    };
+    if bulk {
+        let TopologyOp::CreatureLifecycle { commit } = &transaction.ops[1] else {
+            unreachable!("fixture contains an inline lifecycle operation")
+        };
+        transaction.ops[1] = TopologyOp::CreatureLifecycleBulk {
+            operation_ordinal: 1,
+            payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+            commit_hash: commit.canonical_hash(),
+            transfer_id: 77,
+        };
     }
+    transaction
 }
 
 #[test]
 fn unsupported_lifecycle_does_not_mutate_replica_geometry_clocks_or_queues() {
-    for pending_catalogue in [false, true] {
+    for (pending_catalogue, bulk) in [(false, false), (true, false), (false, true), (true, true)] {
         let setup = spall_sim::fixtures::flat_terrain_setup();
         let mut replica = ReplicaWorld::from_baseline(setup.terrain, ReplicaConfig::default());
         if pending_catalogue {
@@ -178,7 +190,7 @@ fn unsupported_lifecycle_does_not_mutate_replica_geometry_clocks_or_queues() {
             replica.applied_tx.clone(),
             replica.catalogue_pending,
         );
-        let mut tx = mixed_transaction();
+        let mut tx = mixed_transaction(bulk);
         tx.validate().unwrap();
         assert_eq!(
             decode_control::<TopologyTransaction>(&encode_control(&tx).unwrap()).unwrap(),
@@ -216,15 +228,17 @@ fn geometry_only_recovery_rejects_later_lifecycle_op_before_first_cell_run() {
         world.registry().counters(),
         world.physics().body_count(),
     );
-    let tx = mixed_transaction();
-    tx.validate().unwrap();
-    assert!(world.replay_transaction(&tx, &[], None).is_err());
-    assert_eq!(
-        (
-            world.world_hash(),
-            world.registry().counters(),
-            world.physics().body_count()
-        ),
-        before
-    );
+    for bulk in [false, true] {
+        let tx = mixed_transaction(bulk);
+        tx.validate().unwrap();
+        assert!(world.replay_transaction(&tx, &[], None).is_err());
+        assert_eq!(
+            (
+                world.world_hash(),
+                world.registry().counters(),
+                world.physics().body_count()
+            ),
+            before
+        );
+    }
 }
