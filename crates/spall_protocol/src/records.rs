@@ -600,6 +600,38 @@ impl Record for TopologyTransaction {
 }
 
 impl TopologyTransaction {
+    /// Identity of the ordered transaction payload, independent of the
+    /// recipient's control-stream sequence. Repairs may resend the same
+    /// transaction on a new sequence; changing any logical field is divergent.
+    /// Bound serialized work before allocating or cloning payload bytes.
+    pub fn replay_identity_hash(&self) -> Result<Hash32, crate::CodecError> {
+        self.validate()?;
+        let size = postcard::experimental::serialized_size(self)
+            .map_err(|e| crate::CodecError::Body(e.to_string()))?;
+        let limit = crate::limits::MAX_CONTROL_RECORD;
+        if size > limit - crate::codec::HEADER_LEN {
+            return Err(crate::CodecError::FrameTooLarge {
+                actual: size.saturating_add(crate::codec::HEADER_LEN),
+                limit,
+            });
+        }
+        let identity = (
+            &self.transaction_id,
+            &self.server_tick,
+            &self.algorithm_version,
+            &self.dependencies,
+            &self.before,
+            &self.after,
+            &self.ops,
+            &self.result_hashes,
+        );
+        let bytes =
+            postcard::to_stdvec(&identity).map_err(|e| crate::CodecError::Body(e.to_string()))?;
+        let mut writer = crate::CanonicalWriter::with_domain(b"spall.transaction-replay.v1");
+        writer.blob(&bytes);
+        Ok(writer.hash())
+    }
+
     /// Extra validation that needs the world manifest: every material id
     /// referenced by an op must be defined (or be air).
     pub fn validate_against(&self, manifest: &MaterialManifest) -> Result<(), RecordError> {

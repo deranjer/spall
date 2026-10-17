@@ -14,8 +14,8 @@
 //! > data are pending. [...] A failed candidate cannot partly replace live
 //! > state.
 //!
-//! A transaction whose `TransactionId` has already been committed is always a
-//! no-op; the control-stream [`SequenceGate`] additionally tracks the high-water
+//! An exact repeat of a committed transaction is a no-op; conflicting reuse of
+//! its ID is rejected. The control-stream [`SequenceGate`] tracks the high-water
 //! mark for gap reporting but never drops an unseen id, so a catch-up / repair
 //! delivery of an earlier transaction is still evaluated. An unexpected source
 //! revision produces a [`spall_protocol::RepairRequest`], never a guessed
@@ -377,7 +377,9 @@ pub struct ReplicaWorld {
     volume_of_entity: BTreeMap<u64, u64>,
     /// Retired body ids; a late packet can never resurrect one.
     tombstoned: BTreeSet<u64>,
-    applied_tx: BTreeSet<u64>,
+    /// The existing replay guard binds each ID to its logical payload, excluding
+    /// the recipient-specific control-stream sequence used by repair resends.
+    applied_tx: BTreeMap<u64, Hash32>,
     control_gate: SequenceGate,
     /// Newest held snapshot for a body that does not exist yet: entity → (snap,
     /// server tick it was received at).
@@ -682,7 +684,7 @@ impl ReplicaWorld {
             bodies: BTreeMap::new(),
             volume_of_entity: BTreeMap::new(),
             tombstoned: BTreeSet::new(),
-            applied_tx: BTreeSet::new(),
+            applied_tx: BTreeMap::new(),
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
             pending_repair_txns: BTreeMap::new(),
@@ -721,7 +723,7 @@ impl ReplicaWorld {
             bodies: BTreeMap::new(),
             volume_of_entity: BTreeMap::new(),
             tombstoned: BTreeSet::new(),
-            applied_tx: BTreeSet::new(),
+            applied_tx: BTreeMap::new(),
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
             pending_repair_txns: BTreeMap::new(),
@@ -818,7 +820,7 @@ impl ReplicaWorld {
         self.bodies = staged.bodies;
         self.volume_of_entity = staged.volume_of_entity;
         self.tombstoned = BTreeSet::new();
-        self.applied_tx = BTreeSet::new();
+        self.applied_tx = BTreeMap::new();
         self.control_gate = SequenceGate::new();
         self.pending_snapshots = BTreeMap::new();
         // A fresh baseline supersedes any transaction that was held pending a
@@ -1497,7 +1499,7 @@ impl ReplicaWorld {
 
     /// Whether a transaction id has already been applied.
     pub fn has_applied(&self, transaction: TransactionId) -> bool {
-        self.applied_tx.contains(&transaction.get())
+        self.applied_tx.contains_key(&transaction.get())
     }
 
     /// Entity ids of every live replicated body.
@@ -1538,22 +1540,53 @@ impl ReplicaWorld {
 
     /// Applies one committed transaction. See [`ApplyOutcome`].
     pub fn apply_transaction(&mut self, tx: &TopologyTransaction) -> ApplyOutcome {
-        self.now_tick = self.now_tick.max(tx.server_tick.get());
-
-        // `applied_tx` is the authoritative replay guard: a transaction id we
-        // have already committed is always a no-op. The control-stream gate only
-        // tracks the high-water mark for gap reporting; a low sequence with an
-        // id we have *not* applied is an out-of-order / repair delivery and must
-        // still be evaluated, not dropped.
-        if self.applied_tx.contains(&tx.transaction_id.get()) {
-            return ApplyOutcome::Duplicate;
-        }
-        let _ = self.control_gate.observe(tx.control_seq.0);
-        if let Err(e) = tx.validate() {
-            return ApplyOutcome::Rejected {
-                reason: format!("invalid transaction: {e}"),
+        // Validate even a duplicate before consulting the existing replay guard.
+        // No clock, sequence or held payload changes on conflicting ID reuse.
+        let identity = match tx.replay_identity_hash() {
+            Ok(identity) => identity,
+            Err(e) => {
+                return ApplyOutcome::Rejected {
+                    reason: format!("invalid transaction: {e}"),
+                };
+            }
+        };
+        if let Some(applied) = self.applied_tx.get(&tx.transaction_id.get()) {
+            return if *applied == identity {
+                ApplyOutcome::Duplicate
+            } else {
+                ApplyOutcome::Rejected {
+                    reason: "transaction ID reused with different payload".into(),
+                }
             };
         }
+        let conflicting_hold = self
+            .catalogue_deferred
+            .iter()
+            .chain(self.pending_repair_txns.values())
+            .chain(self.pending_bulk_split_txns.values())
+            .filter(|held| held.transaction_id == tx.transaction_id)
+            .any(|held| held.replay_identity_hash().ok() != Some(identity));
+        if conflicting_hold {
+            return ApplyOutcome::Rejected {
+                reason: "held transaction ID reused with different payload".into(),
+            };
+        }
+        if tx
+            .ops
+            .iter()
+            .filter_map(TopologyOp::bulk_transfer_id)
+            .any(|id| {
+                self.pending_bulk_split_txns
+                    .get(&id)
+                    .is_some_and(|held| held.transaction_id != tx.transaction_id)
+            })
+        {
+            return ApplyOutcome::Rejected {
+                reason: "bulk transfer is already bound to another transaction".into(),
+            };
+        }
+        self.now_tick = self.now_tick.max(tx.server_tick.get());
+        let _ = self.control_gate.observe(tx.control_seq.0);
 
         // The distant terrain catalogue is still arriving: a transaction may
         // touch a brick whose digest is not known yet, and its result hash covers
@@ -1767,7 +1800,7 @@ impl ReplicaWorld {
             } else {
                 // Record it applied and drop any pending hold so the replica
                 // does not loop re-requesting a repair it cannot use.
-                self.applied_tx.insert(tx.transaction_id.get());
+                self.applied_tx.insert(tx.transaction_id.get(), identity);
                 self.pending_repair_txns.remove(&tx.transaction_id.get());
                 return ApplyOutcome::Duplicate;
             }
@@ -1957,7 +1990,7 @@ impl ReplicaWorld {
                 },
             );
         }
-        self.applied_tx.insert(tx.transaction_id.get());
+        self.applied_tx.insert(tx.transaction_id.get(), identity);
         if terrain_touched {
             self.bump_terrain_generation();
         }
@@ -3104,6 +3137,113 @@ mod tests {
         again.control_seq = spall_protocol::ControlSeq(2);
         assert_eq!(replica.apply_transaction(&again), ApplyOutcome::Duplicate);
         assert_eq!(replica.world_hash(), after_first);
+    }
+
+    fn replay_test_transaction() -> TopologyTransaction {
+        TopologyTransaction {
+            transaction_id: TransactionId::new(7).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: VolumeId::new(1).unwrap(),
+                start: GlobalCell::new(0, 0, 0),
+                len: 2,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        }
+    }
+
+    #[test]
+    fn conflicting_or_malformed_committed_replays_do_not_mutate_replica() {
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let tx = replay_test_transaction();
+        assert!(matches!(
+            replica.apply_transaction(&tx),
+            ApplyOutcome::Published { .. }
+        ));
+        let hash = replica.world_hash();
+        let applied = replica.applied_tx.clone();
+        let tick = replica.now_tick;
+        for case in 0..5 {
+            let mut changed = tx.clone();
+            match case {
+                0 => changed.server_tick = spall_core::Tick(9999),
+                1 => changed.algorithm_version += 1,
+                2 => changed.dependencies.push(TransactionId::new(1).unwrap()),
+                3 => changed.ops.clear(), // Must validate before duplicate handling.
+                4 => changed.result_hashes.push(spall_protocol::VolumeHash {
+                    volume: VolumeId::new(1).unwrap(),
+                    hash: Hash32([7; 32]),
+                }),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    replica.apply_transaction(&changed),
+                    ApplyOutcome::Rejected { .. }
+                ),
+                "case {case}"
+            );
+            assert_eq!(replica.world_hash(), hash);
+            assert_eq!(replica.applied_tx, applied);
+            assert_eq!(replica.now_tick, tick);
+        }
+    }
+
+    #[test]
+    fn conflicting_replays_cannot_replace_catalogue_repair_or_bulk_holds() {
+        for queue in 0..3 {
+            let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+            let mut tx = replay_test_transaction();
+            match queue {
+                0 => replica.catalogue_pending = Some(spall_protocol::TransferId(5)),
+                1 => tx.before.push(spall_protocol::BrickRevision {
+                    volume: VolumeId::new(1).unwrap(),
+                    coord: BrickCoord::new(0, 0, 0),
+                    revision: Revision(999),
+                }),
+                2 => {
+                    tx.ops = vec![TopologyOp::SourcePatchBulkBaseline {
+                        source: VolumeId::new(1).unwrap(),
+                        transfer_id: 77,
+                    }]
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                replica.apply_transaction(&tx),
+                ApplyOutcome::NeedsRepair(_) | ApplyOutcome::AwaitingBulkSplit { .. }
+            ));
+            let hash = replica.world_hash();
+            let tick = replica.now_tick;
+            let catalogue = replica.catalogue_deferred.clone();
+            let repair = replica.pending_repair_txns.clone();
+            let bulk = replica.pending_bulk_split_txns.clone();
+            let mut changed = tx.clone();
+            changed.server_tick = spall_core::Tick(9999);
+            assert!(matches!(
+                replica.apply_transaction(&changed),
+                ApplyOutcome::Rejected { .. }
+            ));
+            if queue == 2 {
+                changed = tx.clone();
+                changed.transaction_id = TransactionId::new(8).unwrap();
+                assert!(matches!(
+                    replica.apply_transaction(&changed),
+                    ApplyOutcome::Rejected { .. }
+                ));
+            }
+            assert_eq!(replica.world_hash(), hash);
+            assert_eq!(replica.now_tick, tick);
+            assert_eq!(replica.catalogue_deferred, catalogue);
+            assert_eq!(replica.pending_repair_txns, repair);
+            assert_eq!(replica.pending_bulk_split_txns, bulk);
+        }
     }
 
     #[test]
