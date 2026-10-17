@@ -204,6 +204,17 @@ impl BodyState {
     }
 }
 
+/// Value-only live snapshot for an articulated owner. It contains no physics
+/// handles and lets an owner validate a prepared lifecycle transition against
+/// the current topology and sampled pose.
+#[derive(Debug, Clone, Copy)]
+pub struct ArticulatedOwnerSnapshot {
+    pub topology_token: u64,
+    pub pose_token: u64,
+    pub pending_pose: bool,
+    pub root: BodyState,
+}
+
 /// Per-step timing.
 #[derive(Debug, Clone, Copy)]
 pub struct StepTiming {
@@ -4420,6 +4431,42 @@ impl PhysicsWorld {
     /// aggregate exposes its dynamic owner body.
     pub fn articulated_body_state(&self, id: ArticulatedBodyId) -> BodyState {
         self.body_state(id.0)
+    }
+
+    /// Returns current owner tokens and root motion without exposing handles.
+    pub fn articulated_owner_snapshot(
+        &self,
+        id: ArticulatedBodyId,
+    ) -> Option<ArticulatedOwnerSnapshot> {
+        let assembly = self.articulated.get(&id.0)?;
+        Some(ArticulatedOwnerSnapshot {
+            topology_token: assembly.topology_token,
+            pose_token: assembly.pose_token,
+            pending_pose: assembly.pending_root_pose_token.is_some()
+                || assembly.pending_pose.is_some(),
+            root: self.body_state(id.0),
+        })
+    }
+
+    /// Returns the applied authored local pose for each source part in stable
+    /// part-ID order. Pending samples are not reported as applied state.
+    pub fn articulated_pose_snapshot(
+        &self,
+        id: ArticulatedBodyId,
+    ) -> Option<crate::articulated::ArticulatedPose> {
+        let assembly = self.articulated.get(&id.0)?;
+        let mut parts = assembly
+            .parts
+            .iter()
+            .map(|part| (part.part_id, part.local_pose))
+            .collect::<Vec<_>>();
+        parts.sort_by_key(|(part_id, _)| *part_id);
+        Some(crate::articulated::ArticulatedPose {
+            topology_token: assembly.topology_token,
+            base_pose_token: assembly.pose_token,
+            pose_token: assembly.pose_token,
+            parts,
+        })
     }
 
     /// Returns live state for a currently owned stable fracture component.

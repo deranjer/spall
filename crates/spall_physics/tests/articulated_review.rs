@@ -71,6 +71,36 @@ fn assert_vec_close(actual: [f64; 3], expected: [f64; 3], tolerance: f64) {
 }
 
 #[test]
+fn articulated_owner_snapshot_reports_live_tokens_without_handles() {
+    let mut world = world();
+    let id = world
+        .add_articulated_kinematic_parts(
+            [1.0, 2.0, 3.0],
+            PartTransform::IDENTITY.rotation_xyzw,
+            17,
+            vec![part(
+                1,
+                None,
+                [0, 0, 0],
+                vec![true],
+                PartTransform::IDENTITY,
+            )],
+            Representation::MergedCuboids,
+        )
+        .unwrap();
+
+    let snapshot = world.articulated_owner_snapshot(id).unwrap();
+    assert_eq!((snapshot.topology_token, snapshot.pose_token), (17, 0));
+    assert!(!snapshot.pending_pose);
+    assert_eq!(snapshot.root.translation_m, [1.0, 2.0, 3.0]);
+    let pose = world.articulated_pose_snapshot(id).unwrap();
+    assert_eq!((pose.topology_token, pose.pose_token), (17, 0));
+    assert_eq!(pose.parts, vec![(1, PartTransform::IDENTITY)]);
+    world.retire_articulated_body(id);
+    assert!(world.articulated_owner_snapshot(id).is_none());
+}
+
+#[test]
 fn living_rig_transfer_is_atomic_conserves_sampled_motion_and_dynamic_pose_apis_reject() {
     for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
         let mut world = world();
