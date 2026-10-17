@@ -47,6 +47,37 @@ fn staged_bridged_cut() -> (SimWorld, StagedEdit) {
     (world, staged)
 }
 
+fn source_part(
+    part_id: u32,
+    parent_id: Option<u32>,
+    volume_id: VolumeId,
+    translation_m: [f32; 3],
+) -> spall_physics::SourcePart {
+    let mut volume = Volume::new(volume_id, CellSizeCode::Quarter);
+    volume
+        .apply_edit(&EditPlan::filled_box(
+            volume_id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(0, 0, 0),
+            MaterialId(1),
+        ))
+        .unwrap();
+    spall_physics::SourcePart {
+        part_id,
+        parent_id,
+        volume_id,
+        source_revision: 1,
+        grid: spall_physics::occupancy::OccupancyGrid::from_volume(&volume)
+            .unwrap()
+            .unwrap(),
+        cell_m: 0.25,
+        local_transform: spall_physics::PartTransform {
+            translation_m,
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        },
+    }
+}
+
 fn world_snapshot(world: &SimWorld, journal: &JournalSink) -> (Hash32, u64, (u64, u64, u64, u64)) {
     (
         world.world_hash(),
@@ -158,6 +189,31 @@ fn prepared_fence_rejects_solver_step_drift() {
 }
 
 #[test]
+fn prepared_fence_rejects_another_identical_world_instance() {
+    let (world, journal, prepared) = prepared_candidate();
+    let other = SimWorld::new(crate::fixtures::bridged_terrain_setup()).unwrap();
+    assert_eq!(world.world_hash(), other.world_hash());
+    assert_eq!(world.registry().counters(), other.registry().counters());
+    assert_eq!(world.topology_epoch(), other.topology_epoch());
+    assert!(matches!(
+        validate_prepared_geometry(&other, &journal, prepared),
+        Err(CommitError::PreparedStateChanged)
+    ));
+}
+
+#[test]
+fn prepared_fence_rejects_physics_origin_drift() {
+    let (mut world, journal, prepared) = prepared_candidate();
+    world.set_physics_origin_for_test(spall_physics::PhysicsOrigin::new([1.0, 0.0, 0.0]).unwrap());
+    let before = world_snapshot(&world, &journal);
+    assert!(matches!(
+        validate_prepared_geometry(&world, &journal, prepared),
+        Err(CommitError::PreparedStateChanged)
+    ));
+    assert_eq!(world_snapshot(&world, &journal), before);
+}
+
+#[test]
 fn prepared_fence_rejects_journal_cursor_drift_before_publication() {
     let (world, mut journal, prepared) = prepared_candidate();
     journal.append(JournalEntry {
@@ -252,6 +308,32 @@ fn prepared_fence_rejects_registry_and_geometry_drift() {
 }
 
 #[test]
+fn prepared_fence_tracks_affected_per_brick_terrain_colliders() {
+    let (mut world, journal, prepared) = prepared_candidate();
+    assert!(world.terrain_brick_colliders_enabled());
+    let entries = prepared.fence.terrain_bricks_for_test();
+    assert!(
+        !entries.is_empty(),
+        "terrain cut must fence affected bricks"
+    );
+    let Some((_, Some((body, _, true)))) = entries
+        .iter()
+        .find(|(_, entry)| entry.is_some_and(|(_, _, has_collider)| has_collider))
+    else {
+        panic!("fixture must include an affected terrain brick collider");
+    };
+    world
+        .physics_mut()
+        .set_body_pose(*body, [0.5, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]);
+    let before = world_snapshot(&world, &journal);
+    assert!(matches!(
+        validate_prepared_geometry(&world, &journal, prepared),
+        Err(CommitError::PreparedStateChanged)
+    ));
+    assert_eq!(world_snapshot(&world, &journal), before);
+}
+
+#[test]
 fn singleton_commit_keeps_existing_transaction_journal_hash_and_split_ids() {
     let (mut world, staged) = staged_bridged_cut();
     let before_solid = world.total_solid_cells();
@@ -266,6 +348,7 @@ fn singleton_commit_keeps_existing_transaction_journal_hash_and_split_ids() {
     assert!(committed.children.len() == 1);
     assert_eq!(journal.cursor(), 1);
     assert_eq!(journal.entries()[0].transaction, committed.topology);
+    assert!(world.validate_terrain_brick_colliders().is_ok());
     assert_eq!(
         world.total_solid_cells(),
         before_solid - staged.ledger.destroyed
@@ -278,4 +361,147 @@ fn singleton_commit_keeps_existing_transaction_journal_hash_and_split_ids() {
         (2, 3, 2, 2),
         "entity/volume and transaction/journal sequences retain their legacy allocation order"
     );
+}
+
+#[test]
+fn validated_geometry_can_publish_before_the_shared_journal_append() {
+    let (mut world, staged) = staged_bridged_cut();
+    let mut journal = JournalSink::new();
+    let before = world.world_hash();
+    let PrepareGeometryOutcome::Ready(prepared) =
+        prepare_geometry(&world, &journal, &staged, Tick(1), ControlSeq(1)).unwrap()
+    else {
+        panic!("fixture token unexpectedly stale");
+    };
+    let validated = validate_prepared_geometry(&world, &journal, *prepared).unwrap();
+    let (committed, entry) = publish_validated_geometry_without_journal(&mut world, validated);
+
+    assert_ne!(world.world_hash(), before);
+    assert_eq!(committed.topology, entry.transaction);
+    assert_eq!(committed.journal_seq, entry.seq);
+    assert!(journal.is_empty());
+
+    journal.append(entry);
+    assert_eq!(journal.cursor(), committed.journal_seq.0);
+    assert_eq!(journal.entries()[0].transaction, committed.topology);
+}
+
+#[test]
+fn geometry_and_articulated_birth_can_validate_then_publish_before_one_journal_append() {
+    let (mut world, staged) = staged_bridged_cut();
+    let mut journal = JournalSink::new();
+    let PrepareGeometryOutcome::Ready(prepared_geometry) =
+        prepare_geometry(&world, &journal, &staged, Tick(1), ControlSeq(1)).unwrap()
+    else {
+        panic!("fixture token unexpectedly stale");
+    };
+    let prepared_articulated = world
+        .physics()
+        .prepare_articulated_batch(
+            vec![spall_physics::ArticulatedBatchOperation::AliveBirth {
+                operation_tag: 77,
+                translation_m: [20.0, 10.0, 20.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                topology_token: 1,
+                parts: vec![
+                    source_part(1, None, VolumeId::new(100).unwrap(), [0.0; 3]),
+                    source_part(2, Some(1), VolumeId::new(101).unwrap(), [1.0, 0.0, 0.0]),
+                ],
+                representation: spall_physics::Representation::MergedCuboids,
+            }],
+            |_| 1.0,
+        )
+        .unwrap();
+
+    // Both capabilities are checked while their shared PhysicsWorld is still
+    // at its captured state. Geometry publication adds a child body, so the
+    // articulated publisher must accept that explicitly permitted interleave.
+    let validated_geometry =
+        validate_prepared_geometry(&world, &journal, *prepared_geometry).unwrap();
+    let validated_articulated = world
+        .physics()
+        .validate_articulated_batch(prepared_articulated)
+        .unwrap();
+    let (committed, entry) =
+        publish_validated_geometry_without_journal(&mut world, validated_geometry);
+    let outcomes = world
+        .physics_mut()
+        .publish_validated_articulated_batch(validated_articulated);
+
+    let outcome = outcomes
+        .iter()
+        .find(|outcome| outcome.operation_tag == 77)
+        .unwrap();
+    assert_eq!(
+        world.physics().articulated_collider_count(outcome.owner_id),
+        2
+    );
+    assert_eq!(
+        world
+            .physics()
+            .articulated_rigid_body_count(outcome.owner_id),
+        3
+    );
+    let hit = world
+        .physics_mut()
+        .raycast_articulated(outcome.owner_id, [21.1, 10.1, 19.0], [0.0, 0.0, 1.0], 3.0)
+        .unwrap();
+    assert_eq!(hit.part_id, 2);
+    assert_eq!(hit.volume_id, VolumeId::new(101).unwrap());
+    for result in &committed.topology.result_hashes {
+        assert_eq!(world.volume_hash(result.volume), Some(result.hash));
+    }
+    assert_eq!(journal.cursor(), 0);
+    assert_eq!(committed.journal_seq.0, 1);
+    assert_eq!(entry.seq, committed.journal_seq);
+    journal.append(entry);
+    assert_eq!(journal.cursor(), 1);
+    assert_eq!(journal.entries()[0].transaction, committed.topology);
+}
+
+#[test]
+fn failed_joint_validation_publishes_neither_prepared_participant() {
+    let (mut world, staged) = staged_bridged_cut();
+    let journal = JournalSink::new();
+    let PrepareGeometryOutcome::Ready(prepared_geometry) =
+        prepare_geometry(&world, &journal, &staged, Tick(1), ControlSeq(1)).unwrap()
+    else {
+        panic!("fixture token unexpectedly stale");
+    };
+    let prepared_articulated = world
+        .physics()
+        .prepare_articulated_batch(
+            vec![spall_physics::ArticulatedBatchOperation::AliveBirth {
+                operation_tag: 78,
+                translation_m: [20.0, 10.0, 20.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                topology_token: 1,
+                parts: vec![
+                    source_part(1, None, VolumeId::new(100).unwrap(), [0.0; 3]),
+                    source_part(2, Some(1), VolumeId::new(101).unwrap(), [1.0, 0.0, 0.0]),
+                ],
+                representation: spall_physics::Representation::MergedCuboids,
+            }],
+            |_| 1.0,
+        )
+        .unwrap();
+
+    // Force only the geometry capability stale. The articulated token is
+    // still valid, but the joint caller must publish neither side.
+    world.registry_mut().allocate_entity().unwrap();
+    let before = world_snapshot(&world, &journal);
+    let body_count = world.physics().body_count();
+    assert!(matches!(
+        validate_prepared_geometry(&world, &journal, *prepared_geometry),
+        Err(CommitError::PreparedStateChanged)
+    ));
+    assert!(
+        world
+            .physics()
+            .validate_articulated_batch(prepared_articulated)
+            .is_ok()
+    );
+    assert_eq!(world_snapshot(&world, &journal), before);
+    assert_eq!(world.physics().body_count(), body_count);
+    assert!(journal.is_empty());
 }

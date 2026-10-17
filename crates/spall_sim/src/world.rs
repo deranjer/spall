@@ -215,6 +215,16 @@ pub(crate) struct GeometryCommitFence {
     terrain_bricks: Vec<TerrainBrickFenceEntry>,
 }
 
+#[cfg(test)]
+pub(crate) type TerrainBrickFenceTestEntry = (BrickCoord, Option<(PhysBodyId, Revision, bool)>);
+
+#[cfg(test)]
+impl GeometryCommitFence {
+    pub(crate) fn terrain_bricks_for_test(&self) -> &[TerrainBrickFenceTestEntry] {
+        &self.terrain_bricks
+    }
+}
+
 type TerrainBrickFenceEntry = (BrickCoord, Option<(PhysBodyId, Revision, bool)>);
 
 /// The authoritative simulation world.
@@ -470,6 +480,11 @@ impl SimWorld {
 
     pub fn physics_origin(&self) -> PhysicsOrigin {
         self.physics_origin
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_physics_origin_for_test(&mut self, origin: PhysicsOrigin) {
+        self.physics_origin = origin;
     }
 
     /// Converts an authoritative world-space pose to this region's solver

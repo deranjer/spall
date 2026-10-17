@@ -186,13 +186,14 @@ pub fn commit(
     server_tick: Tick,
     control_seq: ControlSeq,
 ) -> Result<CommitOutcome, CommitError> {
+    let _total = crate::prof::Span::start("commit.total");
     match prepare_geometry(world, journal, staged, server_tick, control_seq)? {
         PrepareGeometryOutcome::Stale(reason) => Ok(CommitOutcome::Stale(reason)),
         PrepareGeometryOutcome::Ready(prepared) => {
             let validated = validate_prepared_geometry(world, journal, *prepared)?;
-            Ok(CommitOutcome::Committed(publish_validated_geometry(
-                world, journal, validated,
-            )))
+            let (committed, entry) = publish_validated_geometry_without_journal(world, validated);
+            journal.append(entry);
+            Ok(CommitOutcome::Committed(committed))
         }
     }
 }
@@ -207,7 +208,7 @@ pub(crate) fn prepare_geometry(
     server_tick: Tick,
     control_seq: ControlSeq,
 ) -> Result<PrepareGeometryOutcome, CommitError> {
-    let _total = crate::prof::Span::start("commit.total");
+    let _prepare = crate::prof::Span::start("commit.prepare");
     let validate = crate::prof::Span::start("commit.validate");
     // 1. Re-validate against the live world.
     match staged.token.check(world) {
@@ -718,11 +719,15 @@ pub(crate) struct ValidatedGeometryCommit {
     prepared: PreparedGeometryCommit,
 }
 
-pub(crate) fn publish_validated_geometry(
+/// Publishes prepared geometry and returns the entry for the caller to append.
+/// The caller must have validated every participant before calling this
+/// infallible publication function. Keeping journal append separate lets a
+/// future mixed transaction publish all prepared participants before adding
+/// its single combined journal entry.
+pub(crate) fn publish_validated_geometry_without_journal(
     world: &mut SimWorld,
-    journal: &mut JournalSink,
     validated: ValidatedGeometryCommit,
-) -> Committed {
+) -> (Committed, JournalEntry) {
     let _publish = crate::prof::Span::start("commit.publish");
     let PreparedGeometryCommit {
         registry,
@@ -825,12 +830,12 @@ pub(crate) fn publish_validated_geometry(
     if bumped_epoch {
         world.bump_topology_epoch();
     }
-    journal.append(JournalEntry {
+    let entry = JournalEntry {
         seq: journal_seq,
         transaction: topology.clone(),
         participants,
         bulk_baseline: bulk_baseline.clone(),
-    });
+    };
 
     if let Some(index) = post_index
         && stamp_before_commit == input_stamp
@@ -839,15 +844,18 @@ pub(crate) fn publish_validated_geometry(
         world.set_warm_structure(volume, live.state_stamp(), index, remove_outcome.clone());
     }
 
-    Committed {
-        transaction: transaction_id,
-        journal_seq,
-        topology,
-        children: child_entities,
-        bumped_epoch,
-        bulk_baseline,
-        removed_materials,
-    }
+    (
+        Committed {
+            transaction: transaction_id,
+            journal_seq,
+            topology,
+            children: child_entities,
+            bumped_epoch,
+            bulk_baseline,
+            removed_materials,
+        },
+        entry,
+    )
 }
 
 /// How an oversized split's geometry is carried once the inline `CellRun` list
