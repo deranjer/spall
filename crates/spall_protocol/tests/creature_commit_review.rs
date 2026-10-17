@@ -484,3 +484,47 @@ fn outer_decode_bounds_overlay_and_witness_lists_before_accepting_items() {
     });
     assert!(serde_json::from_value::<CreatureLifecycleCommitV1>(raw).is_err());
 }
+
+#[test]
+fn validated_nonempty_birth_round_trips_as_an_ordered_operation() {
+    let f = Fixture::new();
+    let after = owner(&f);
+    after.validate(&f.catalog()).unwrap();
+    let commit = CreatureLifecycleCommitV1 {
+        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        change: birth(after.clone()),
+        expected_before_topology_hash: Hash32::ZERO,
+        pre_motion: None,
+        death_witness: None,
+    };
+    let tx = TopologyTransaction {
+        transaction_id: commit.change.transaction_id,
+        server_tick: spall_core::Tick(9),
+        control_seq: ControlSeq(10),
+        algorithm_version: 1,
+        dependencies: vec![],
+        before: vec![],
+        after: vec![],
+        ops: vec![TopologyOp::CreatureLifecycle {
+            commit: Box::new(commit),
+        }],
+        result_hashes: vec![],
+    };
+    let bytes = encode_control(&tx).unwrap();
+    assert!(bytes.len() < limits::MAX_CONTROL_RECORD);
+    let decoded: TopologyTransaction = decode_control(&bytes).unwrap();
+    assert_eq!(decoded, tx);
+    let TopologyOp::CreatureLifecycle { commit } = &decoded.ops[0] else {
+        panic!("typed lifecycle op lost");
+    };
+    let reduced = commit
+        .validate_and_reduce(None, context(7, 1, 100), &f.catalog())
+        .unwrap();
+    assert_eq!(reduced.record, after);
+    assert_eq!(reduced.record.parts.len(), 1);
+    assert_eq!(
+        reduced.record.parts[0].source_volume_id,
+        VolumeId::new(100).unwrap()
+    );
+    assert_eq!(reduced.record.components[0].source_masks[0].cells.len(), 1);
+}

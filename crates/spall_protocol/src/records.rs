@@ -23,7 +23,7 @@ use crate::limits::{
 /// Schema version stamped into every encoded record header. A peer on another version cannot
 /// decode a single record, so mismatched builds refuse each other at the first message. Version 8
 /// appends the typed creature lifecycle operation to `TopologyOp`; live v7 frames remain rejected.
-/// The saved-journal decoder retains only its explicit, known-layout v5/v6 handling.
+/// Saved journals and live peers both reject older versions without migration.
 pub const WIRE_SCHEMA_VERSION: u16 = 8;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
