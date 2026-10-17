@@ -1746,6 +1746,7 @@ impl CreatureOwnershipRecordV1 {
             .u64(self.state.key.world_epoch.get())
             .u64(self.state.key.creature_id.get())
             .u32(self.state.key.generation.get())
+            .u8(self.state.lifecycle as u8)
             .blob(self.state.species_key.as_bytes())
             .u32(self.state.species_version)
             .blob(&self.state.asset.uuid)
@@ -1802,7 +1803,12 @@ impl CreatureOwnershipRecordV1 {
     /// Hashes state and component motion fields omitted from topology_hash.
     pub fn motion_hash(&self) -> Hash32 {
         let mut w = CanonicalWriter::with_domain(CREATURE_MOTION_DOMAIN);
-        w.u64(self.state.state_revision)
+        w.u128(self.state.key.world_id.to_u128())
+            .u64(self.state.key.world_epoch.get())
+            .u64(self.state.key.creature_id.get())
+            .u32(self.state.key.generation.get())
+            .u128(self.owner_key)
+            .u64(self.state.state_revision)
             .u8(self.state.clip_mode as u8)
             .u64(self.state.clip_phase_tick)
             .u32(self.state.clip_subtick_remainder)
@@ -1815,12 +1821,14 @@ impl CreatureOwnershipRecordV1 {
         w.u8(self.state.locomotion_tag);
         let mut parts: Vec<_> = self.parts.iter().collect();
         parts.sort_by_key(|part| part.part_id);
+        w.u32(parts.len() as u32);
         for part in parts {
             w.u32(part.part_id);
             write_local_pose(part.frozen_local_pose, &mut w);
         }
         let mut components: Vec<_> = self.components.iter().collect();
         components.sort_by_key(|component| component_order(component));
+        w.u32(components.len() as u32);
         for component in components {
             w.u128(component.owner_key);
             write_option_u64(component.serial, &mut w);
@@ -1896,6 +1904,10 @@ mod topology_motion_hash_tests {
         assert_eq!(before.topology_hash(), after.topology_hash());
         assert_ne!(before.motion_hash(), after.motion_hash());
         assert_ne!(before.canonical_hash(), after.canonical_hash());
+        let mut corpse = before.clone();
+        corpse.state.lifecycle = crate::CreatureLifecycleState::Corpse;
+        assert_ne!(before.topology_hash(), corpse.topology_hash());
+        assert_ne!(before.canonical_hash(), corpse.canonical_hash());
     }
 }
 
@@ -2116,7 +2128,10 @@ impl CreatureMotionOverlayV1 {
         if self.state_revision < record.state.state_revision
             || self.pose_epoch < record.state.pose_epoch
             || self.clip_epoch < record.state.clip_epoch
-            || self.clip_phase_tick < record.state.clip_phase_tick
+            || (self.clip_epoch == record.state.clip_epoch
+                && (self.clip_phase_tick < record.state.clip_phase_tick
+                    || (self.clip_phase_tick == record.state.clip_phase_tick
+                        && self.clip_subtick_remainder < record.state.clip_subtick_remainder)))
             || self.parts.len() != record.parts.len()
             || self.components.len() != record.components.len()
             || self.parts.windows(2).any(|p| p[0].part_id >= p[1].part_id)
@@ -2168,6 +2183,9 @@ impl CreatureLifecycleCommitV1 {
         context: CreatureLifecycleContextV1<'_>,
         catalog: &CreatureValidationCatalog<'_>,
     ) -> Result<CreatureLifecycleCandidateV1, CreatureOwnershipError> {
+        if context.replay_receipt.is_some() {
+            return Err(CreatureOwnershipError::DivergentReplay);
+        }
         if self.schema != CREATURE_LIFECYCLE_COMMIT_SCHEMA {
             return Err(CreatureOwnershipError::Schema);
         }
@@ -2182,12 +2200,12 @@ impl CreatureLifecycleCommitV1 {
         {
             return Err(CreatureOwnershipError::Limit);
         }
+        self.change.validate(catalog)?;
         let size = postcard::experimental::serialized_size(self)
             .map_err(|e| CreatureOwnershipError::Encoding(e.to_string()))?;
         if size > MAX_CREATURE_OWNER_RECORD_BYTES {
             return Err(CreatureOwnershipError::Limit);
         }
-        self.change.validate(catalog)?;
         if let Some(record) = current {
             record.validate(catalog)?;
             if postcard::experimental::serialized_size(record)
@@ -2221,7 +2239,9 @@ impl CreatureLifecycleCommitV1 {
                     .ok_or(CreatureOwnershipError::Stale)?;
                 overlay.apply_to(before)?;
                 before.validate(catalog)?;
-                if before.canonical_hash() != self.change.expected_before_hash {
+                if before.topology_hash() != self.expected_before_topology_hash
+                    || before.canonical_hash() != self.change.expected_before_hash
+                {
                     return Err(CreatureOwnershipError::Stale);
                 }
                 let witness = self
@@ -2360,5 +2380,120 @@ mod lifecycle_commit_hash_tests {
             .unwrap()
             .installed_linear_velocity_m_s[0] = 3.0;
         assert_ne!(witness_hash, witness.canonical_hash());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreatureLifecycleCommitReplayReceiptV1 {
+    pub transaction_id: TransactionId,
+    pub operation_ordinal: u32,
+    pub commit_hash: Hash32,
+}
+
+impl CreatureLifecycleCommitV1 {
+    /// Reduces with a receipt verified by the enclosing existing transaction ledger.
+    /// The receipt binds the complete outer commit, including witness and overlay.
+    pub fn validate_and_reduce_with_receipt(
+        &self,
+        current: Option<&CreatureOwnershipRecordV1>,
+        context: CreatureLifecycleContextV1<'_>,
+        catalog: &CreatureValidationCatalog<'_>,
+        receipt: Option<CreatureLifecycleCommitReplayReceiptV1>,
+    ) -> Result<CreatureLifecycleCandidateV1, CreatureOwnershipError> {
+        if context.replay_receipt.is_some() {
+            return Err(CreatureOwnershipError::DivergentReplay);
+        }
+        if self.schema != CREATURE_LIFECYCLE_COMMIT_SCHEMA {
+            return Err(CreatureOwnershipError::Schema);
+        }
+        if self.pre_motion.as_ref().is_some_and(|o| {
+            o.parts.len() > MAX_COMMIT_PART_POSES
+                || o.components.len() > MAX_COMMIT_COMPONENT_MOTIONS
+                || o.parts.windows(2).any(|p| p[0].part_id >= p[1].part_id)
+                || o.components
+                    .windows(2)
+                    .any(|p| component_order_values(&p[0]) >= component_order_values(&p[1]))
+        }) || self.death_witness.as_ref().is_some_and(|w| {
+            w.frozen_local_poses.len() > MAX_CREATURE_OWNER_PARTS
+                || w.frozen_local_poses.windows(2).any(|p| p[0].0 >= p[1].0)
+        }) {
+            return Err(CreatureOwnershipError::Limit);
+        }
+        self.change.validate(catalog)?;
+        let size = postcard::experimental::serialized_size(self)
+            .map_err(|e| CreatureOwnershipError::Encoding(e.to_string()))?;
+        if size > MAX_CREATURE_OWNER_RECORD_BYTES {
+            return Err(CreatureOwnershipError::Limit);
+        }
+        if let Some(receipt) = receipt {
+            if receipt.transaction_id != self.change.transaction_id
+                || receipt.operation_ordinal != self.change.operation_ordinal
+                || receipt.commit_hash != self.canonical_hash()
+            {
+                return Err(CreatureOwnershipError::DivergentReplay);
+            }
+            let after = match &self.change.operation {
+                CreatureLifecycleOperationV1::Birth { after }
+                | CreatureLifecycleOperationV1::Death { after } => after,
+            };
+            after.validate(catalog)?;
+            let current_record = current.ok_or(CreatureOwnershipError::DivergentReplay)?;
+            current_record.validate(catalog)?;
+            if postcard::experimental::serialized_size(current_record)
+                .map_err(|e| CreatureOwnershipError::Encoding(e.to_string()))?
+                > MAX_CREATURE_OWNER_RECORD_BYTES
+            {
+                return Err(CreatureOwnershipError::Limit);
+            }
+            if current_record.canonical_hash() != self.change.expected_after_hash {
+                return Err(CreatureOwnershipError::DivergentReplay);
+            }
+            if let CreatureLifecycleOperationV1::Death { .. } = &self.change.operation {
+                let overlay = self
+                    .pre_motion
+                    .as_ref()
+                    .ok_or(CreatureOwnershipError::Stale)?;
+                let witness = self
+                    .death_witness
+                    .as_ref()
+                    .ok_or(CreatureOwnershipError::Stale)?;
+                let mut before = current_record.clone();
+                before.state.lifecycle = crate::CreatureLifecycleState::Alive;
+                before.state.state_revision = overlay.state_revision;
+                before.state.pose_epoch = overlay.pose_epoch;
+                before.state.clip_epoch = overlay.clip_epoch;
+                before.state.clip_phase_tick = overlay.clip_phase_tick;
+                before.state.clip_subtick_remainder = overlay.clip_subtick_remainder;
+                overlay.apply_to(&mut before)?;
+                before.validate(catalog)?;
+                if before.topology_hash() != self.expected_before_topology_hash
+                    || before.canonical_hash() != self.change.expected_before_hash
+                    || !valid_death_transition(&before, after, witness)
+                {
+                    return Err(CreatureOwnershipError::Stale);
+                }
+            } else if self.pre_motion.is_some()
+                || self.death_witness.is_some()
+                || self.expected_before_topology_hash != Hash32::ZERO
+            {
+                return Err(CreatureOwnershipError::Stale);
+            }
+            let verified_context = CreatureLifecycleContextV1 {
+                replay_receipt: Some(CreatureLifecycleReplayReceiptV1 {
+                    transaction_id: receipt.transaction_id,
+                    operation_ordinal: receipt.operation_ordinal,
+                    change_hash: self.change.canonical_hash(),
+                }),
+                death_witness: self.death_witness.as_ref(),
+                ..context
+            };
+            return reduce_creature_lifecycle_candidate(
+                Some(current_record),
+                &self.change,
+                verified_context,
+                catalog,
+            );
+        }
+        self.validate_and_reduce(current, context, catalog)
     }
 }
