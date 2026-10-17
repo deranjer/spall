@@ -5,11 +5,11 @@ use spall_core::{CellSizeCode, GlobalCell, TransactionId, VolumeId};
 use spall_physics::{PartTransform, Representation};
 use spall_protocol::creature_owner::CreatureDeathWitnessV1;
 use spall_protocol::{
-    baseline::BaselineBrick, reduce_creature_lifecycle_candidate, BaselineCells, BaselineOwner,
+    BaselineCells, BaselineOwner, CREATURE_CHANGE_SCHEMA, CREATURE_OWNER_SCHEMA,
     CreatureLifecycleChangeV1, CreatureLifecycleContextV1, CreatureLifecycleOperationV1,
     CreatureLocalPoseV1, CreatureMaskCellV1, CreatureOwnedComponentV1, CreatureOwnershipRecordV1,
     CreaturePartBinding, CreatureReductionOutcome, CreatureSourceMaskBrickV1, CreatureSourcePartV1,
-    Hash32, CREATURE_CHANGE_SCHEMA, CREATURE_OWNER_SCHEMA,
+    Hash32, baseline::BaselineBrick, reduce_creature_lifecycle_candidate,
 };
 use spall_voxel::{EditPlan, Volume};
 
@@ -479,8 +479,8 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
 #[test]
 fn source_material_must_belong_to_selected_asset_keys() {
     use spall_protocol::{
-        creature_material_mapping_hash, CreatureAssetCatalogEntry, CreatureAssetIdentity,
-        CreatureMaterialMappingEntry, CreatureSpeciesCatalogEntry, CreatureValidationCatalog,
+        CreatureAssetCatalogEntry, CreatureAssetIdentity, CreatureMaterialMappingEntry,
+        CreatureSpeciesCatalogEntry, CreatureValidationCatalog, creature_material_mapping_hash,
     };
 
     let mut sim =
@@ -568,8 +568,8 @@ fn source_material_must_belong_to_selected_asset_keys() {
 
 #[test]
 fn record_work_preflight_rejects_duplicate_masks_and_large_owned_sets() {
-    use spall_protocol::creature_owner::MAX_CREATURE_OWNER_SET_SOLID_CELLS;
     use spall_protocol::CreatureOwnershipSetV1;
+    use spall_protocol::creature_owner::MAX_CREATURE_OWNER_SET_SOLID_CELLS;
     let mut sim =
         Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
     sim.initialize_creature_host(WorldId::from_u128(10))

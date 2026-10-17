@@ -83,7 +83,8 @@ pub struct CreatureSourcePartV1 {
 
 /// Stable physical component identity and motion, with exact original-cell
 /// ownership. `serial=None` is the one intact logical component; fractured
-/// records use at least two nonzero, monotonically allocated serials.
+/// records use nonzero, monotonically allocated serials, including a single
+/// surviving derived component after other components have retired.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CreatureOwnedComponentV1 {
     pub owner_key: u128,
@@ -134,7 +135,7 @@ pub struct CreatureLifecycleChangeV1 {
     pub operation: CreatureLifecycleOperationV1,
 }
 
-/// Existing caller-owned replay and identity context. `already_committed`
+/// Existing caller-owned replay and identity context. The replay receipt
 /// comes from the transaction/journal consumer's replay guard.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CreatureLifecycleContextV1<'a> {

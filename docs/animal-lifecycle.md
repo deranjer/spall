@@ -450,3 +450,17 @@ cases pass. Mutation and source storage remain unit-test-only. No journal,
 baseline or saved schema was changed. Evidence: `reports/ENG-216-integration.md`.
 Next: ENG-217 versioned actor/source ownership and ordered lifecycle replay,
 followed by replica/baseline and durable recovery consumers before live spawning.
+
+ENG-217 coordinator acceptance (2026-10-17): canonical portable ownership,
+bounded cumulative decoding and candidate-first birth/death reduction are
+integrated. The actual three-part ENG-216 bridge preserves source identity,
+nested hierarchy, frozen poses and transferred motion. Protocol/simulation
+checks pass 331 tests, with 9 existing ignored; workspace compilation, scoped
+strict lint and formatting checks pass. These totals cover the named packages,
+not a full-workspace test. Legacy terrain/body hashes remain unchanged.
+See `reports/ENG-217-integration.md`. Production mutation stays unavailable:
+wire 7, baseline 1 and store 3 are unchanged. The next unblocked integration
+must carry the same records/reducer through ordered world transactions,
+baseline/replica and checkpoint/journal recovery, with explicit compatibility.
+Source editing/fracture, species/current habitat and integrated launch proof
+still follow; this acceptance does not establish live replicated animals.

@@ -6,6 +6,107 @@ use spall_core::{
 use spall_protocol::creature_owner::{CreatureDeathWitnessV1, CreatureLifecycleReplayReceiptV1};
 use spall_protocol::*;
 
+#[test]
+fn exact_partition_rejects_missing_foreign_air_stale_and_overlapping_cells() {
+    let f = Fixture::new();
+    let original = owner(&f);
+    original.validate(&f.catalog()).unwrap();
+    for case in 0..8 {
+        let mut record = original.clone();
+        let mask = &mut record.components[0].source_masks[0];
+        match case {
+            0 => mask.cells.clear(),
+            1 => mask.volume_id = VolumeId::new(999).unwrap(),
+            2 => mask.cells[0].index = 1, // Known air in the source.
+            3 => mask.source_revision += 1,
+            4 => mask.brick_revision += 1,
+            5 => mask.cells.push(mask.cells[0]),
+            6 => mask.cells[0].material_id = 2,
+            7 => {
+                record.state.lifecycle = CreatureLifecycleState::Corpse;
+                record.state.clip_mode = CreatureClipMode::Frozen;
+                record.next_component_serial = 3;
+                record.components[0].serial = Some(1);
+                let mut overlapping = record.components[0].clone();
+                overlapping.serial = Some(2);
+                record.components.push(overlapping);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            record.validate(&f.catalog()),
+            Err(CreatureOwnershipError::Mask),
+            "partition case {case}"
+        );
+    }
+}
+
+#[test]
+fn failed_birth_preserves_inputs_and_rejects_collisions_stale_hash_and_exhaustion() {
+    let f = Fixture::new();
+    let record = owner(&f);
+    let change = birth(record.clone());
+    let before = change.clone();
+    let keys = [record.state.key];
+    let owners = [record.owner_key];
+    let volumes = [record.parts[0].source_volume_id];
+    for case in 0..4 {
+        let mut ctx = context(7, 1, 100);
+        let mut attempted = change.clone();
+        match case {
+            0 => ctx.existing_keys = &keys,
+            1 => ctx.existing_owner_keys = &owners,
+            2 => ctx.existing_source_volumes = &volumes,
+            3 => attempted.expected_before_hash = Hash32([7; 32]),
+            _ => unreachable!(),
+        }
+        let saved_context = ctx;
+        assert!(reduce_creature_lifecycle_candidate(None, &attempted, ctx, &f.catalog()).is_err());
+        assert_eq!(ctx, saved_context);
+        assert_eq!(change, before);
+    }
+    let mut exhausted = record;
+    exhausted.state.key.creature_id = CreatureId::new(u64::MAX).unwrap();
+    let attempted = birth(exhausted);
+    assert_eq!(
+        reduce_creature_lifecycle_candidate(
+            None,
+            &attempted,
+            context(7, u64::MAX, 100),
+            &f.catalog()
+        ),
+        Err(CreatureOwnershipError::CounterExhausted)
+    );
+}
+
+#[test]
+fn source_hash_binds_air_resident_revision_edited_bounds_and_cell_size() {
+    let f = Fixture::new();
+    let original = owner(&f);
+    let original_hash = original.parts[0].canonical_source_content_hash();
+    for case in 0..5 {
+        let mut part = original.parts[0].clone();
+        match case {
+            0 => part.bricks[0].revision += 1,
+            1 => part.bricks[0].edited = false,
+            2 => part.bounds = None,
+            3 => part.cell_size_code += 1,
+            4 => part.bricks.push(BaselineBrick {
+                coord: [1, 0, 0],
+                revision: 2,
+                edited: true,
+                cells: BaselineCells::Uniform(0),
+            }),
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            part.canonical_source_content_hash(),
+            original_hash,
+            "source metadata case {case}"
+        );
+    }
+}
+
 struct Fixture {
     materials: MaterialManifest,
     assets: [CreatureAssetCatalogEntry<'static>; 2],

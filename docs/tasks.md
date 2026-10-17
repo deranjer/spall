@@ -2114,3 +2114,14 @@ rejects explicitly. Death preserves all source bytes and freezes exact hierarchy
 and resultant motion. Bridge ENG-216 fixtures into records; bound nested decode,
 mask/dense/occupied work and checked arithmetic. Production registration stays
 closed. Luna worker proceeds in dedicated animal-replay checkout at a313196.
+ENG-217 coordinator acceptance (2026-10-17): portable source ownership,
+canonical separate hash domains, cumulative bounded decode and one affected
+record lifecycle reducer are integrated. Actual nested3part simulation bridge
+preserves sources/hierarchy/frozenposes/resultant motion. Protocol+sim tests:
+331passed0failed9existingignored; workspace all-target/all-feature compile,
+scoped strict lint and format/diff pass. No production registration, wire7,
+baseline1, store3 or journal changes. Evidence: reports/ENG-217-integration.md.
+Next unblocked work: coordinated ordered transaction, replica/baseline and
+durable checkpoint/replay consumers using these same records/reducer, with
+explicit compatibility and topology-versus-motion hash separation. Source
+edit/fracture synchronization, species/habitat and combined1024m proof follow.
