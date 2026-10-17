@@ -55,59 +55,7 @@ pub struct WeatherState {
     pub temperature_centi_c: i16,
     pub lightning_id: u64,
     pub lightning_tick: u64,
-    #[serde(default)]
     pub override_kind: Option<WeatherKind>,
-}
-/// Explicit schema-1 layout used only when reading pre-override save and journal bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WeatherStateV1 {
-    pub schema: u16,
-    pub world_epoch: u64,
-    pub world_revision: u64,
-    pub effective_tick: u64,
-    pub clock_ms: u64,
-    pub clock_source: WeatherClockSource,
-    pub start_season: u8,
-    pub season_ms: u64,
-    pub weather_seed: u64,
-    pub transition_id: u64,
-    pub transition_start_ms: u64,
-    pub transition_duration_ms: u32,
-    pub kind: WeatherKind,
-    pub precipitation_q16: u16,
-    pub wind_x_q15: i16,
-    pub wind_z_q15: i16,
-    pub gust_q16: u16,
-    pub temperature_centi_c: i16,
-    pub lightning_id: u64,
-    pub lightning_tick: u64,
-}
-impl From<WeatherStateV1> for WeatherState {
-    fn from(v: WeatherStateV1) -> Self {
-        Self {
-            schema: WEATHER_SCHEMA,
-            world_epoch: v.world_epoch,
-            world_revision: v.world_revision,
-            effective_tick: v.effective_tick,
-            clock_ms: v.clock_ms,
-            clock_source: v.clock_source,
-            start_season: v.start_season,
-            season_ms: v.season_ms,
-            weather_seed: v.weather_seed,
-            transition_id: v.transition_id,
-            transition_start_ms: v.transition_start_ms,
-            transition_duration_ms: v.transition_duration_ms,
-            kind: v.kind,
-            precipitation_q16: v.precipitation_q16,
-            wind_x_q15: v.wind_x_q15,
-            wind_z_q15: v.wind_z_q15,
-            gust_q16: v.gust_q16,
-            temperature_centi_c: v.temperature_centi_c,
-            lightning_id: v.lightning_id,
-            lightning_tick: v.lightning_tick,
-            override_kind: None,
-        }
-    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WeatherError {
@@ -350,30 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_weather_presets_are_normalized_and_legacy_states_decode() {
-        #[derive(serde::Serialize)]
-        struct LegacyWeatherState {
-            schema: u16,
-            world_epoch: u64,
-            world_revision: u64,
-            effective_tick: u64,
-            clock_ms: u64,
-            clock_source: WeatherClockSource,
-            start_season: u8,
-            season_ms: u64,
-            weather_seed: u64,
-            transition_id: u64,
-            transition_start_ms: u64,
-            transition_duration_ms: u32,
-            kind: WeatherKind,
-            precipitation_q16: u16,
-            wind_x_q15: i16,
-            wind_z_q15: i16,
-            gust_q16: u16,
-            temperature_centi_c: i16,
-            lightning_id: u64,
-            lightning_tick: u64,
-        }
+    fn forced_weather_presets_are_normalized() {
         let clock = WeatherClock {
             time_ms: 0,
             source: WeatherClockSource::ServerFallback,
@@ -401,34 +326,6 @@ mod tests {
         storm.effective_tick = 8;
         storm.force_kind(Some(WeatherKind::Storm));
         assert_eq!((storm.lightning_id, storm.lightning_tick), (id, event_tick));
-        let old = LegacyWeatherState {
-            schema: 1,
-            world_epoch: 1,
-            world_revision: 0,
-            effective_tick: 5,
-            clock_ms: 0,
-            clock_source: clock.source,
-            start_season: 1,
-            season_ms: 900_000,
-            weather_seed: 2,
-            transition_id: 0,
-            transition_start_ms: 0,
-            transition_duration_ms: 0,
-            kind: WeatherKind::Clear,
-            precipitation_q16: 0,
-            wind_x_q15: 0,
-            wind_z_q15: 0,
-            gust_q16: 0,
-            temperature_centi_c: 2200,
-            lightning_id: 0,
-            lightning_tick: 0,
-        };
-        let bytes = postcard::to_stdvec(&old).unwrap();
-        let decoded: WeatherStateV1 = postcard::from_bytes(&bytes).unwrap();
-        let decoded: WeatherState = decoded.into();
-        assert_eq!(decoded.schema, WEATHER_SCHEMA);
-        assert_eq!(decoded.override_kind, None);
-        decoded.validate().unwrap();
     }
 
     #[test]
