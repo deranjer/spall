@@ -161,7 +161,7 @@ pub struct CreatureLifecycleReplayReceiptV1 {
     pub change_hash: Hash32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CreatureDeathWitnessV1 {
     pub key: CreatureKey,
     pub source_generation: u64,
@@ -1729,4 +1729,636 @@ fn write_creature_state(state: &CreatureStateV1, w: &mut CanonicalWriter) {
     write_vec3_f32(state.linear_velocity_m_s, w);
     write_vec3_f32(state.angular_velocity_rad_s, w);
     w.u8(state.locomotion_tag);
+}
+
+/// Domain for lifecycle topology fences; intentionally excludes all motion-only fields.
+pub const CREATURE_TOPOLOGY_DOMAIN: &[u8] = b"spall.creature-topology.v1";
+/// Domain for the mutable state excluded from the topology fence.
+pub const CREATURE_MOTION_DOMAIN: &[u8] = b"spall.creature-motion.v1";
+
+impl CreatureOwnershipRecordV1 {
+    /// Hashes source identity, exact source content, hierarchy and component
+    /// ownership while excluding root/local poses, velocity and clip progress.
+    pub fn topology_hash(&self) -> Hash32 {
+        let mut w = CanonicalWriter::with_domain(CREATURE_TOPOLOGY_DOMAIN);
+        w.u16(self.schema)
+            .u128(self.state.key.world_id.to_u128())
+            .u64(self.state.key.world_epoch.get())
+            .u64(self.state.key.creature_id.get())
+            .u32(self.state.key.generation.get())
+            .blob(self.state.species_key.as_bytes())
+            .u32(self.state.species_version)
+            .blob(&self.state.asset.uuid)
+            .blob(&self.state.asset.logical_hash.0)
+            .blob(&self.state.material_manifest_hash.0)
+            .u32(self.state.material_mapping_version)
+            .blob(&self.state.material_mapping_hash.0)
+            .blob(self.state.clip_name.as_bytes())
+            .u64(self.state.aggregate_topology_revision)
+            .u128(self.owner_key)
+            .u64(self.source_generation)
+            .u64(self.next_component_serial);
+        let mut parts: Vec<_> = self.parts.iter().collect();
+        parts.sort_by_key(|part| part.part_id);
+        w.u32(parts.len() as u32);
+        for part in parts {
+            w.u32(part.part_id)
+                .u64(part.source_volume_id.get())
+                .u64(part.source_generation)
+                .u64(part.source_revision)
+                .u8(part.cell_size_code);
+            write_bounds(part.bounds, &mut w);
+            w.blob(&part.source_content_hash.0);
+            write_option_u32(part.parent_id, &mut w);
+            write_local_pose(part.initial_local_pose, &mut w);
+        }
+        let mut components: Vec<_> = self.components.iter().collect();
+        components.sort_by_key(|component| component_order(component));
+        w.u32(components.len() as u32);
+        for component in components {
+            w.u128(component.owner_key);
+            write_option_u64(component.serial, &mut w);
+            let mut masks: Vec<_> = component.source_masks.iter().collect();
+            masks.sort_by_key(|mask| (mask.volume_id, mask.coord[2], mask.coord[1], mask.coord[0]));
+            w.u32(masks.len() as u32);
+            for mask in masks {
+                w.u64(mask.volume_id.get()).u32(mask.part_id);
+                for coordinate in mask.coord {
+                    w.i64(coordinate);
+                }
+                w.u64(mask.source_revision)
+                    .u64(mask.brick_revision)
+                    .u32(mask.cells.len() as u32);
+                let mut cells: Vec<_> = mask.cells.iter().collect();
+                cells.sort_by_key(|cell| cell.index);
+                for cell in cells {
+                    w.u16(cell.index).u16(cell.material_id);
+                }
+            }
+        }
+        w.hash()
+    }
+
+    /// Hashes state and component motion fields omitted from topology_hash.
+    pub fn motion_hash(&self) -> Hash32 {
+        let mut w = CanonicalWriter::with_domain(CREATURE_MOTION_DOMAIN);
+        w.u64(self.state.state_revision)
+            .u8(self.state.clip_mode as u8)
+            .u64(self.state.clip_phase_tick)
+            .u32(self.state.clip_subtick_remainder)
+            .u64(self.state.clip_epoch)
+            .u64(self.state.pose_epoch);
+        write_vec3_f64(self.state.root_translation_m, &mut w);
+        write_quat(self.state.root_rotation_xyzw, &mut w);
+        write_vec3_f32(self.state.linear_velocity_m_s, &mut w);
+        write_vec3_f32(self.state.angular_velocity_rad_s, &mut w);
+        w.u8(self.state.locomotion_tag);
+        let mut parts: Vec<_> = self.parts.iter().collect();
+        parts.sort_by_key(|part| part.part_id);
+        for part in parts {
+            w.u32(part.part_id);
+            write_local_pose(part.frozen_local_pose, &mut w);
+        }
+        let mut components: Vec<_> = self.components.iter().collect();
+        components.sort_by_key(|component| component_order(component));
+        for component in components {
+            w.u128(component.owner_key);
+            write_option_u64(component.serial, &mut w);
+            write_vec3_f64(component.translation_m, &mut w);
+            write_quat(component.rotation_xyzw, &mut w);
+            write_vec3_f32(component.linear_velocity_m_s, &mut w);
+            write_vec3_f32(component.angular_velocity_rad_s, &mut w);
+        }
+        w.hash()
+    }
+}
+
+#[cfg(test)]
+mod topology_motion_hash_tests {
+    use super::*;
+    use spall_core::{CreatureGeneration, CreatureId, WorldEpoch, WorldId};
+
+    fn empty_record() -> CreatureOwnershipRecordV1 {
+        let key = CreatureKey::new(
+            WorldId::from_u128(1),
+            WorldEpoch::INITIAL,
+            CreatureId::new(1).unwrap(),
+            CreatureGeneration::INITIAL,
+        )
+        .unwrap();
+        let state = CreatureStateV1 {
+            schema: 1,
+            key,
+            state_revision: 1,
+            lifecycle: crate::CreatureLifecycleState::Alive,
+            species_key: "deer".into(),
+            species_version: 1,
+            asset: crate::CreatureAssetIdentity {
+                uuid: [1; 16],
+                logical_hash: Hash32([2; 32]),
+            },
+            material_manifest_hash: Hash32([3; 32]),
+            material_mapping_version: 1,
+            material_mapping_hash: Hash32([4; 32]),
+            clip_name: "idle".into(),
+            clip_mode: crate::CreatureClipMode::Playing,
+            clip_phase_tick: 0,
+            clip_subtick_remainder: 0,
+            clip_epoch: 1,
+            source_bindings: vec![],
+            aggregate_topology_revision: 1,
+            pose_epoch: 1,
+            root_translation_m: [0.0; 3],
+            root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            linear_velocity_m_s: [0.0; 3],
+            angular_velocity_rad_s: [0.0; 3],
+            locomotion_tag: 0,
+        };
+        CreatureOwnershipRecordV1 {
+            schema: CREATURE_OWNER_SCHEMA,
+            state,
+            owner_key: 1,
+            source_generation: 1,
+            next_component_serial: 1,
+            parts: vec![],
+            components: vec![],
+        }
+    }
+
+    #[test]
+    fn motion_changes_do_not_change_topology_hash() {
+        let before = empty_record();
+        let mut after = before.clone();
+        after.state.root_translation_m = [10.0, 0.0, 0.0];
+        after.state.linear_velocity_m_s = [3.0, 0.0, 0.0];
+        after.state.pose_epoch = 2;
+        after.state.clip_phase_tick = 9;
+        assert_eq!(before.topology_hash(), after.topology_hash());
+        assert_ne!(before.motion_hash(), after.motion_hash());
+        assert_ne!(before.canonical_hash(), after.canonical_hash());
+    }
+}
+
+pub const CREATURE_LIFECYCLE_COMMIT_SCHEMA: u16 = 1;
+pub const CREATURE_LIFECYCLE_COMMIT_DOMAIN: &[u8] = b"spall.creature-lifecycle-commit.v1";
+const MAX_COMMIT_PART_POSES: usize = MAX_CREATURE_OWNER_PARTS;
+const MAX_COMMIT_COMPONENT_MOTIONS: usize = MAX_CREATURE_OWNER_COMPONENTS;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CreaturePartMotionV1 {
+    pub part_id: u32,
+    pub frozen_local_pose: CreatureLocalPoseV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreatureComponentMotionV1 {
+    pub owner_key: u128,
+    pub serial: Option<u64>,
+    pub translation_m: [f64; 3],
+    pub rotation_xyzw: [f32; 4],
+    pub linear_velocity_m_s: [f32; 3],
+    pub angular_velocity_rad_s: [f32; 3],
+}
+
+/// Explicit mutable pre-motion values only. Identity, lifecycle, source,
+/// clip definition, topology revision, component identity and masks are fenced.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CreatureMotionOverlayV1 {
+    pub state_revision: u64,
+    pub clip_mode: crate::CreatureClipMode,
+    pub clip_phase_tick: u64,
+    pub clip_subtick_remainder: u32,
+    pub clip_epoch: u64,
+    pub pose_epoch: u64,
+    pub root_translation_m: [f64; 3],
+    pub root_rotation_xyzw: [f32; 4],
+    pub linear_velocity_m_s: [f32; 3],
+    pub angular_velocity_rad_s: [f32; 3],
+    pub locomotion_tag: u8,
+    pub parts: Vec<CreaturePartMotionV1>,
+    pub components: Vec<CreatureComponentMotionV1>,
+}
+
+bounded_vec!(
+    BoundedOverlayParts,
+    CreaturePartMotionV1,
+    MAX_COMMIT_PART_POSES,
+    "overlay part poses"
+);
+bounded_vec!(
+    BoundedOverlayComponents,
+    CreatureComponentMotionV1,
+    MAX_COMMIT_COMPONENT_MOTIONS,
+    "overlay component motions"
+);
+bounded_vec!(
+    BoundedDeathWitnessPoses,
+    (u32, CreatureLocalPoseV1),
+    MAX_CREATURE_OWNER_PARTS,
+    "death witness poses"
+);
+
+impl<'de> Deserialize<'de> for CreatureMotionOverlayV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            state_revision: u64,
+            clip_mode: crate::CreatureClipMode,
+            clip_phase_tick: u64,
+            clip_subtick_remainder: u32,
+            clip_epoch: u64,
+            pose_epoch: u64,
+            root_translation_m: [f64; 3],
+            root_rotation_xyzw: [f32; 4],
+            linear_velocity_m_s: [f32; 3],
+            angular_velocity_rad_s: [f32; 3],
+            locomotion_tag: u8,
+            parts: BoundedOverlayParts,
+            components: BoundedOverlayComponents,
+        }
+        let value = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            state_revision: value.state_revision,
+            clip_mode: value.clip_mode,
+            clip_phase_tick: value.clip_phase_tick,
+            clip_subtick_remainder: value.clip_subtick_remainder,
+            clip_epoch: value.clip_epoch,
+            pose_epoch: value.pose_epoch,
+            root_translation_m: value.root_translation_m,
+            root_rotation_xyzw: value.root_rotation_xyzw,
+            linear_velocity_m_s: value.linear_velocity_m_s,
+            angular_velocity_rad_s: value.angular_velocity_rad_s,
+            locomotion_tag: value.locomotion_tag,
+            parts: value.parts.0,
+            components: value.components.0,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CreatureDeathWitnessV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            key: CreatureKey,
+            source_generation: u64,
+            before_state_revision: u64,
+            before_topology_revision: u64,
+            before_pose_epoch: u64,
+            root_translation_m: [f64; 3],
+            root_rotation_xyzw: [f32; 4],
+            installed_linear_velocity_m_s: [f32; 3],
+            installed_angular_velocity_rad_s: [f32; 3],
+            frozen_local_poses: BoundedDeathWitnessPoses,
+        }
+        let value = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            key: value.key,
+            source_generation: value.source_generation,
+            before_state_revision: value.before_state_revision,
+            before_topology_revision: value.before_topology_revision,
+            before_pose_epoch: value.before_pose_epoch,
+            root_translation_m: value.root_translation_m,
+            root_rotation_xyzw: value.root_rotation_xyzw,
+            installed_linear_velocity_m_s: value.installed_linear_velocity_m_s,
+            installed_angular_velocity_rad_s: value.installed_angular_velocity_rad_s,
+            frozen_local_poses: value.frozen_local_poses.0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreatureLifecycleCommitV1 {
+    pub schema: u16,
+    pub change: CreatureLifecycleChangeV1,
+    pub expected_before_topology_hash: Hash32,
+    pub pre_motion: Option<CreatureMotionOverlayV1>,
+    pub death_witness: Option<CreatureDeathWitnessV1>,
+}
+
+impl CreatureLifecycleCommitV1 {
+    pub fn canonical_hash(&self) -> Hash32 {
+        let mut w = CanonicalWriter::with_domain(CREATURE_LIFECYCLE_COMMIT_DOMAIN);
+        w.u16(self.schema)
+            .blob(&self.change.canonical_hash().0)
+            .blob(&self.expected_before_topology_hash.0);
+        match &self.pre_motion {
+            None => {
+                w.u8(0);
+            }
+            Some(o) => {
+                w.u8(1)
+                    .u64(o.state_revision)
+                    .u8(o.clip_mode as u8)
+                    .u64(o.clip_phase_tick)
+                    .u32(o.clip_subtick_remainder)
+                    .u64(o.clip_epoch)
+                    .u64(o.pose_epoch);
+                write_vec3_f64(o.root_translation_m, &mut w);
+                write_quat(o.root_rotation_xyzw, &mut w);
+                write_vec3_f32(o.linear_velocity_m_s, &mut w);
+                write_vec3_f32(o.angular_velocity_rad_s, &mut w);
+                w.u8(o.locomotion_tag).u32(o.parts.len() as u32);
+                for p in &o.parts {
+                    w.u32(p.part_id);
+                    write_local_pose(p.frozen_local_pose, &mut w);
+                }
+                w.u32(o.components.len() as u32);
+                for c in &o.components {
+                    w.u128(c.owner_key);
+                    write_option_u64(c.serial, &mut w);
+                    write_vec3_f64(c.translation_m, &mut w);
+                    write_quat(c.rotation_xyzw, &mut w);
+                    write_vec3_f32(c.linear_velocity_m_s, &mut w);
+                    write_vec3_f32(c.angular_velocity_rad_s, &mut w);
+                }
+            }
+        }
+        match &self.death_witness {
+            None => {
+                w.u8(0);
+            }
+            Some(d) => {
+                w.u8(1)
+                    .u128(d.key.world_id.to_u128())
+                    .u64(d.key.world_epoch.get())
+                    .u64(d.key.creature_id.get())
+                    .u32(d.key.generation.get())
+                    .u64(d.source_generation)
+                    .u64(d.before_state_revision)
+                    .u64(d.before_topology_revision)
+                    .u64(d.before_pose_epoch);
+                write_vec3_f64(d.root_translation_m, &mut w);
+                write_quat(d.root_rotation_xyzw, &mut w);
+                write_vec3_f32(d.installed_linear_velocity_m_s, &mut w);
+                write_vec3_f32(d.installed_angular_velocity_rad_s, &mut w);
+                w.u32(d.frozen_local_poses.len() as u32);
+                for (id, pose) in &d.frozen_local_poses {
+                    w.u32(*id);
+                    write_local_pose(*pose, &mut w);
+                }
+            }
+        }
+        w.hash()
+    }
+}
+
+impl CreatureMotionOverlayV1 {
+    fn apply_to(
+        &self,
+        record: &mut CreatureOwnershipRecordV1,
+    ) -> Result<(), CreatureOwnershipError> {
+        if self.state_revision < record.state.state_revision
+            || self.pose_epoch < record.state.pose_epoch
+            || self.clip_epoch < record.state.clip_epoch
+            || self.clip_phase_tick < record.state.clip_phase_tick
+            || self.parts.len() != record.parts.len()
+            || self.components.len() != record.components.len()
+            || self.parts.windows(2).any(|p| p[0].part_id >= p[1].part_id)
+            || self
+                .components
+                .windows(2)
+                .any(|p| component_order_values(&p[0]) >= component_order_values(&p[1]))
+        {
+            return Err(CreatureOwnershipError::Stale);
+        }
+        for (part, motion) in record.parts.iter_mut().zip(&self.parts) {
+            if part.part_id != motion.part_id {
+                return Err(CreatureOwnershipError::Stale);
+            }
+            part.frozen_local_pose = motion.frozen_local_pose;
+        }
+        for (component, motion) in record.components.iter_mut().zip(&self.components) {
+            if component.owner_key != motion.owner_key || component.serial != motion.serial {
+                return Err(CreatureOwnershipError::Stale);
+            }
+            component.translation_m = motion.translation_m;
+            component.rotation_xyzw = motion.rotation_xyzw;
+            component.linear_velocity_m_s = motion.linear_velocity_m_s;
+            component.angular_velocity_rad_s = motion.angular_velocity_rad_s;
+        }
+        record.state.state_revision = self.state_revision;
+        record.state.clip_mode = self.clip_mode;
+        record.state.clip_phase_tick = self.clip_phase_tick;
+        record.state.clip_subtick_remainder = self.clip_subtick_remainder;
+        record.state.clip_epoch = self.clip_epoch;
+        record.state.pose_epoch = self.pose_epoch;
+        record.state.root_translation_m = self.root_translation_m;
+        record.state.root_rotation_xyzw = self.root_rotation_xyzw;
+        record.state.linear_velocity_m_s = self.linear_velocity_m_s;
+        record.state.angular_velocity_rad_s = self.angular_velocity_rad_s;
+        record.state.locomotion_tag = self.locomotion_tag;
+        Ok(())
+    }
+}
+
+fn component_order_values(component: &CreatureComponentMotionV1) -> (u128, Option<u64>) {
+    (component.owner_key, component.serial)
+}
+
+impl CreatureLifecycleCommitV1 {
+    pub fn validate_and_reduce(
+        &self,
+        current: Option<&CreatureOwnershipRecordV1>,
+        context: CreatureLifecycleContextV1<'_>,
+        catalog: &CreatureValidationCatalog<'_>,
+    ) -> Result<CreatureLifecycleCandidateV1, CreatureOwnershipError> {
+        if self.schema != CREATURE_LIFECYCLE_COMMIT_SCHEMA {
+            return Err(CreatureOwnershipError::Schema);
+        }
+        // Check all declared work before sizing or cloning potentially large values.
+        if self.pre_motion.as_ref().is_some_and(|o| {
+            o.parts.len() > MAX_COMMIT_PART_POSES
+                || o.components.len() > MAX_COMMIT_COMPONENT_MOTIONS
+        }) || self
+            .death_witness
+            .as_ref()
+            .is_some_and(|w| w.frozen_local_poses.len() > MAX_CREATURE_OWNER_PARTS)
+        {
+            return Err(CreatureOwnershipError::Limit);
+        }
+        let size = postcard::experimental::serialized_size(self)
+            .map_err(|e| CreatureOwnershipError::Encoding(e.to_string()))?;
+        if size > MAX_CREATURE_OWNER_RECORD_BYTES {
+            return Err(CreatureOwnershipError::Limit);
+        }
+        self.change.validate(catalog)?;
+        if let Some(record) = current {
+            record.validate(catalog)?;
+            if postcard::experimental::serialized_size(record)
+                .map_err(|e| CreatureOwnershipError::Encoding(e.to_string()))?
+                > MAX_CREATURE_OWNER_RECORD_BYTES
+            {
+                return Err(CreatureOwnershipError::Limit);
+            }
+        }
+        let mut candidate_before = current.cloned();
+        match &self.change.operation {
+            CreatureLifecycleOperationV1::Birth { .. } => {
+                if current.is_some()
+                    || self.pre_motion.is_some()
+                    || self.death_witness.is_some()
+                    || self.expected_before_topology_hash != Hash32::ZERO
+                {
+                    return Err(CreatureOwnershipError::Stale);
+                }
+            }
+            CreatureLifecycleOperationV1::Death { .. } => {
+                let before = candidate_before
+                    .as_mut()
+                    .ok_or(CreatureOwnershipError::Stale)?;
+                if before.topology_hash() != self.expected_before_topology_hash {
+                    return Err(CreatureOwnershipError::Stale);
+                }
+                let overlay = self
+                    .pre_motion
+                    .as_ref()
+                    .ok_or(CreatureOwnershipError::Stale)?;
+                overlay.apply_to(before)?;
+                before.validate(catalog)?;
+                if before.canonical_hash() != self.change.expected_before_hash {
+                    return Err(CreatureOwnershipError::Stale);
+                }
+                let witness = self
+                    .death_witness
+                    .as_ref()
+                    .ok_or(CreatureOwnershipError::Stale)?;
+                if witness.key != before.state.key
+                    || witness.source_generation != before.source_generation
+                    || witness.before_state_revision != before.state.state_revision
+                    || witness.before_topology_revision != before.state.aggregate_topology_revision
+                    || witness.before_pose_epoch != before.state.pose_epoch
+                {
+                    return Err(CreatureOwnershipError::Stale);
+                }
+            }
+        }
+        let ctx = CreatureLifecycleContextV1 {
+            death_witness: self.death_witness.as_ref(),
+            ..context
+        };
+        reduce_creature_lifecycle_candidate(candidate_before.as_ref(), &self.change, ctx, catalog)
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_commit_hash_tests {
+    use super::*;
+    use spall_core::{CreatureGeneration, CreatureId, TransactionId, WorldEpoch, WorldId};
+
+    fn key() -> CreatureKey {
+        CreatureKey::new(
+            WorldId::from_u128(9),
+            WorldEpoch::INITIAL,
+            CreatureId::new(1).unwrap(),
+            CreatureGeneration::INITIAL,
+        )
+        .unwrap()
+    }
+
+    fn commit() -> CreatureLifecycleCommitV1 {
+        let key = key();
+        let after = CreatureOwnershipRecordV1 {
+            schema: CREATURE_OWNER_SCHEMA,
+            state: CreatureStateV1 {
+                schema: 1,
+                key,
+                state_revision: 1,
+                lifecycle: crate::CreatureLifecycleState::Alive,
+                species_key: "deer".into(),
+                species_version: 1,
+                asset: crate::CreatureAssetIdentity {
+                    uuid: [1; 16],
+                    logical_hash: Hash32([2; 32]),
+                },
+                material_manifest_hash: Hash32([3; 32]),
+                material_mapping_version: 1,
+                material_mapping_hash: Hash32([4; 32]),
+                clip_name: "idle".into(),
+                clip_mode: crate::CreatureClipMode::Playing,
+                clip_phase_tick: 0,
+                clip_subtick_remainder: 0,
+                clip_epoch: 1,
+                source_bindings: vec![],
+                aggregate_topology_revision: 1,
+                pose_epoch: 1,
+                root_translation_m: [0.0; 3],
+                root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                linear_velocity_m_s: [0.0; 3],
+                angular_velocity_rad_s: [0.0; 3],
+                locomotion_tag: 0,
+            },
+            owner_key: 1,
+            source_generation: 1,
+            next_component_serial: 1,
+            parts: vec![],
+            components: vec![],
+        };
+        let change = CreatureLifecycleChangeV1 {
+            schema: CREATURE_CHANGE_SCHEMA,
+            transaction_id: TransactionId::new(1).unwrap(),
+            operation_ordinal: 0,
+            expected_before_hash: Hash32::ZERO,
+            expected_after_hash: after.canonical_hash(),
+            operation: CreatureLifecycleOperationV1::Birth { after },
+        };
+        CreatureLifecycleCommitV1 {
+            schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+            change,
+            expected_before_topology_hash: Hash32::ZERO,
+            pre_motion: None,
+            death_witness: None,
+        }
+    }
+
+    #[test]
+    fn outer_hash_binds_pre_motion_and_witness_without_changing_inner_hash() {
+        let baseline = commit();
+        let inner = baseline.change.canonical_hash();
+        let base_hash = baseline.canonical_hash();
+        let mut overlay = baseline.clone();
+        overlay.pre_motion = Some(CreatureMotionOverlayV1 {
+            state_revision: 2,
+            clip_mode: crate::CreatureClipMode::Playing,
+            clip_phase_tick: 1,
+            clip_subtick_remainder: 0,
+            clip_epoch: 2,
+            pose_epoch: 2,
+            root_translation_m: [1.0, 0.0, 0.0],
+            root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            linear_velocity_m_s: [1.0, 0.0, 0.0],
+            angular_velocity_rad_s: [0.0; 3],
+            locomotion_tag: 1,
+            parts: vec![],
+            components: vec![],
+        });
+        assert_ne!(base_hash, overlay.canonical_hash());
+        assert_eq!(inner, overlay.change.canonical_hash());
+        let mut witness = baseline;
+        witness.death_witness = Some(CreatureDeathWitnessV1 {
+            key: key(),
+            source_generation: 1,
+            before_state_revision: 2,
+            before_topology_revision: 1,
+            before_pose_epoch: 2,
+            root_translation_m: [1.0, 0.0, 0.0],
+            root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            installed_linear_velocity_m_s: [2.0, 0.0, 0.0],
+            installed_angular_velocity_rad_s: [0.0; 3],
+            frozen_local_poses: vec![],
+        });
+        assert_ne!(base_hash, witness.canonical_hash());
+        let witness_hash = witness.canonical_hash();
+        witness
+            .death_witness
+            .as_mut()
+            .unwrap()
+            .installed_linear_velocity_m_s[0] = 3.0;
+        assert_ne!(witness_hash, witness.canonical_hash());
+    }
 }
