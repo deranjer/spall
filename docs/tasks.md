@@ -2064,3 +2064,14 @@ duplicate/foreign and failed preparations atomically. Production registration
 stays gated if actor wire/store support is absent. Exact scope and required
 invariants are in Loopira ENG-216; coordinator review precedes shared edits.
 Next launch requirements remain species/habitat, replication and durable recovery.
+ENG-216 design review (2026-10-16): scope narrowed explicitly to typed SimWorld
+source ownership plus atomic in-memory birth/death test seam. Mutation remains
+unreachable from shipped production paths. No journal/control sequence consumed,
+no TopologyTransaction/checkpoint extension or competing journal in this slice.
+Existing ordered transaction, replica and recovery integration is a following
+prerequisite. Separate versioned actor hash domain preserves legacy owner bytes;
+actor state must never be published as a complete legacy checkpoint/world hash.
+Birth reserves original VolumeIds and CreatureKey from cloned authoritative
+allocators; physics preparation must fail atomically before ownership publication.
+Lifetime part bindings remain even for empty sources; partial edits/removal follow.
+Luna worker received reviewed boundary and is proceeding in animal-ownership.
