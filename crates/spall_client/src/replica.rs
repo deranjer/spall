@@ -43,6 +43,10 @@ use spall_protocol::{
 };
 use spall_voxel::{Brick, BrickHash, EditPlan, Volume};
 
+#[cfg(test)]
+#[path = "lifecycle_rejection_review.rs"]
+mod lifecycle_rejection_review;
+
 /// Tunables for a [`ReplicaWorld`].
 #[derive(Debug, Clone, Copy)]
 pub struct ReplicaConfig {
