@@ -121,6 +121,7 @@ pub struct CreatureScheduleReport {
     pub rejected: Option<CreatureScheduleError>,
 }
 
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct CreatureHost {
     allocator: CreatureAllocator,
     records: BTreeMap<CreatureId, CreatureStateV1>,
@@ -234,6 +235,31 @@ impl CreatureHost {
             .map_err(|_| CreatureScheduleError::CounterExhausted)?;
         if allocated != state.key {
             return Err(CreatureScheduleError::InvalidBatch);
+        }
+        self.records.insert(state.key.creature_id, state);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_record_for_lifecycle_test(
+        &mut self,
+        state: CreatureStateV1,
+        catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+    ) -> Result<(), CreatureScheduleError> {
+        state
+            .validate(catalog)
+            .map_err(|_| CreatureScheduleError::InvalidBatch)?;
+        let Some(current) = self.records.get(&state.key.creature_id) else {
+            return Err(CreatureScheduleError::InvalidBatch);
+        };
+        if current.key != state.key
+            || current.lifecycle != spall_protocol::CreatureLifecycleState::Alive
+            || state.lifecycle != spall_protocol::CreatureLifecycleState::Corpse
+            || state.state_revision <= current.state_revision
+            || state.source_bindings != current.source_bindings
+            || state.aggregate_topology_revision != current.aggregate_topology_revision
+        {
+            return Err(CreatureScheduleError::Stale);
         }
         self.records.insert(state.key.creature_id, state);
         Ok(())

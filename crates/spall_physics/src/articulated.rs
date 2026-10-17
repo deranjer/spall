@@ -123,6 +123,15 @@ pub struct ArticulatedPose {
     pub parts: Vec<(u32, PartTransform)>,
 }
 
+/// Value-only snapshot of the currently applied per-part pose. Unlike an
+/// [`ArticulatedPose`] update, this has no base token to misinterpret.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArticulatedPoseSnapshot {
+    pub topology_token: u64,
+    pub pose_token: u64,
+    pub parts: Vec<(u32, PartTransform)>,
+}
+
 /// Authoritative result of a Rapier ray hit on an articulated source collider.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceCellHit {

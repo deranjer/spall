@@ -1,9 +1,10 @@
 # ENG-216 design: in-memory creature source ownership
 
-Status: coordinator-approved design; implementation remains gated by the
-checks listed below. This slice owns an in-memory atomic model and tests only.
-It does not publish live actors from a server, add a wire operation, or claim
-durable recovery.
+Status: coordinator-approved design; the bounded in-memory lifecycle seam is
+implemented under `cfg(test)`. Production actor registration remains gated by
+ordered transaction replay and checkpoint/baseline support. This slice does not
+publish live actors from a server, add a wire operation, or claim durable
+recovery.
 
 ## Ownership model
 
@@ -64,10 +65,11 @@ the existing transaction/journal order rather than introduce another journal.
 
 `CanonicalOwner` currently encodes only Terrain and Body. Keep their canonical
 byte streams and all existing world hashes byte-identical for worlds without
-creatures. Define an explicitly versioned, domain-separated source/lifecycle
-hash over sorted CreatureKey, part ID, source VolumeId, source revision and
-canonical source-volume contents for in-memory fixture checks. Lifecycle
-state is a separate hash input from topology. Do not return the old complete
+creatures. Use an explicitly versioned, domain-separated source-ownership hash
+over sorted CreatureKey, part ID, source VolumeId, source revision and canonical
+source-volume contents for in-memory fixture checks. The creature state DTO is
+retained separately; a future combined actor-state hash must include its
+canonical lifecycle bytes. Do not return the old complete
 `world_hash` for a populated actor world. A later wire/checkpoint slice must
 review the versioned combined hash and update every replay/baseline consumer
 before exposing a populated world.
@@ -116,3 +118,36 @@ schema, or the legacy canonical hash.
   after all source parts are empty.
 - Existing ordinary world hashes and transaction replay results remain
   byte-identical.
+
+## Implemented checkpoint
+
+The test-only birth seam in `Simulation` validates the V1 state against its
+catalog, allocates the next creature key and source volume IDs on cloned
+counters, derives occupancy from the exact source `Volume`s, validates exclusive
+source ownership, and prebuilds articulated physics before publishing the host,
+source owner maps, and ID registry. The test-only death seam revalidates the
+state revision, source bindings/revisions, and current physics topology/pose
+tokens; it rejects pending poses, freezes the clip, captures current root
+motion and per-part local poses, binds density to materials present in source
+cells, then performs the prepared ENG-214 transfer before replacing the host
+record. Failure tests cover invalid geometry, a caller-selected foreign
+VolumeId, stale and pending death tokens, and unchanged counters/host/physics.
+
+`SimWorld` stores actor source volumes in a test-only owner map and reverse
+index. They do not enter ordinary `Body`, `volume_owner`, `volume_ref`, or
+`body_by_volume` paths. A distinct source ownership hash has its own v1 domain;
+the legacy `world_hash` fails closed in test builds when source owners exist.
+The physics crate exposes read-only value snapshots of live articulated owner
+tokens/root motion and sorted applied part poses; no runtime handle escapes.
+
+The fixtures prove a one-part birth and alive-to-corpse transfer. They do not
+provide production species construction, an actor wire/journal operation,
+checkpoint or baseline coverage, replica application, partial source edits, or
+split-component ownership integration. The only supported lifecycle entry
+points remain compiled out of production builds until the ordered replay and
+durability slice lands.
+
+Validation in the dedicated worktree passed `cargo test -p spall_sim -p
+spall_physics`, `cargo clippy -p spall_sim -p spall_physics --all-targets --
+-D warnings`, `cargo fmt --check`, and `git diff --check`. Existing ignored manual
+and measurement tests were not run.

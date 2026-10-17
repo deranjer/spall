@@ -9,6 +9,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use glam::DQuat;
+#[cfg(test)]
+use spall_core::CreatureKey;
 use spall_core::{
     BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, MaterialId, PlayerInput, Revision,
     VolumeId,
@@ -267,6 +269,19 @@ pub struct SimWorld {
     /// one; with `None`, an edit that needs evicted geometry is rejected rather
     /// than reloaded.
     backing: Option<std::sync::Arc<dyn crate::backing::BrickBacking>>,
+    /// In-memory ownership fixture only. Actor sources deliberately remain
+    /// outside Body/volume_owner until ordered lifecycle replay exists.
+    #[cfg(test)]
+    creature_sources: CreatureSourceStore,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CreatureSourceStore {
+    owners: BTreeMap<CreatureKey, BTreeMap<u32, Volume>>,
+    volume_owner: BTreeMap<VolumeId, (CreatureKey, u32)>,
+    physics_owner: BTreeMap<CreatureKey, spall_physics::ArticulatedBodyId>,
+    frozen_poses: BTreeMap<CreatureKey, Vec<(u32, spall_physics::PartTransform)>>,
 }
 
 /// A shared empty digest set, so [`SimWorld::evicted`] can return a reference
@@ -392,6 +407,8 @@ impl SimWorld {
             window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
             backing: None,
+            #[cfg(test)]
+            creature_sources: CreatureSourceStore::default(),
         };
         if mode == TerrainColliderMode::PerBrick {
             world.ensure_terrain_brick_colliders()?;
@@ -1069,6 +1086,164 @@ impl SimWorld {
 
     pub fn physics(&self) -> &PhysicsWorld {
         &self.physics
+    }
+
+    /// Validates a private in-memory source ownership candidate. This does not
+    /// publish actor volumes into ordinary Body lookup or transaction state.
+    #[cfg(test)]
+    pub(crate) fn validate_creature_sources_for_test(
+        &self,
+        key: CreatureKey,
+        parts: &[(u32, Volume)],
+    ) -> Result<(), &'static str> {
+        key.validate().map_err(|_| "invalid creature key")?;
+        if parts.is_empty() || parts.len() > spall_protocol::MAX_CREATURE_SOURCE_PARTS {
+            return Err("source part count outside bound");
+        }
+        if self.creature_sources.owners.contains_key(&key) {
+            return Err("creature source owner already exists");
+        }
+        let mut part_ids = std::collections::BTreeSet::new();
+        let mut volume_ids = std::collections::BTreeSet::new();
+        for (part_id, volume) in parts {
+            if *part_id == 0 || !part_ids.insert(*part_id) {
+                return Err("source part IDs must be unique and nonzero");
+            }
+            let id = volume.id();
+            if !volume_ids.insert(id)
+                || self.volume_ref(id).is_some()
+                || self.creature_sources.volume_owner.contains_key(&id)
+            {
+                return Err("source volume is already owned");
+            }
+            if solid_cells(volume) == 0 {
+                return Err("new source part must contain solid cells");
+            }
+        }
+        let total_parts = self
+            .creature_sources
+            .owners
+            .values()
+            .try_fold(parts.len(), |count, existing| {
+                count.checked_add(existing.len())
+            })
+            .ok_or("source part count overflow")?;
+        if total_parts
+            > crate::creatures::MAX_CREATURE_HOST_RECORDS
+                * spall_protocol::MAX_CREATURE_SOURCE_PARTS
+        {
+            return Err("total source part count exceeds bound");
+        }
+        Ok(())
+    }
+
+    /// Publishes a prevalidated source candidate without a fallible step.
+    #[cfg(test)]
+    pub(crate) fn publish_creature_sources_for_test(
+        &mut self,
+        key: CreatureKey,
+        parts: Vec<(u32, Volume)>,
+    ) {
+        debug_assert!(self.validate_creature_sources_for_test(key, &parts).is_ok());
+        let mut owner_parts = BTreeMap::new();
+        for (part_id, volume) in parts {
+            let id = volume.id();
+            self.creature_sources
+                .volume_owner
+                .insert(id, (key, part_id));
+            owner_parts.insert(part_id, volume);
+        }
+        self.creature_sources.owners.insert(key, owner_parts);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn creature_source_owner_for_test(
+        &self,
+        volume: VolumeId,
+    ) -> Option<(CreatureKey, u32)> {
+        self.creature_sources.volume_owner.get(&volume).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn creature_source_part_for_test(
+        &self,
+        key: CreatureKey,
+        part_id: u32,
+    ) -> Option<&Volume> {
+        self.creature_sources.owners.get(&key)?.get(&part_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_creature_physics_owner_for_test(
+        &mut self,
+        key: CreatureKey,
+        owner: spall_physics::ArticulatedBodyId,
+    ) {
+        debug_assert!(self.creature_sources.owners.contains_key(&key));
+        self.creature_sources.physics_owner.insert(key, owner);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn creature_physics_owner_for_test(
+        &self,
+        key: CreatureKey,
+    ) -> Option<spall_physics::ArticulatedBodyId> {
+        self.creature_sources.physics_owner.get(&key).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_creature_frozen_poses_for_test(
+        &mut self,
+        key: CreatureKey,
+        mut poses: Vec<(u32, spall_physics::PartTransform)>,
+    ) {
+        debug_assert!(self.creature_sources.owners.contains_key(&key));
+        poses.sort_by_key(|(part_id, _)| *part_id);
+        self.creature_sources.frozen_poses.insert(key, poses);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn creature_frozen_poses_for_test(
+        &self,
+        key: CreatureKey,
+    ) -> Option<&[(u32, spall_physics::PartTransform)]> {
+        self.creature_sources
+            .frozen_poses
+            .get(&key)
+            .map(Vec::as_slice)
+    }
+
+    /// Separate, versioned source digest for fixture checks. This is not a
+    /// complete world hash and is never included in legacy world_hash bytes.
+    #[cfg(test)]
+    pub(crate) fn creature_source_hash_for_test(&self) -> Hash32 {
+        let mut writer =
+            spall_protocol::CanonicalWriter::with_domain(b"spall.creature-source-ownership.v1");
+        writer.seq(self.creature_sources.owners.len());
+        for (key, parts) in &self.creature_sources.owners {
+            writer
+                .blob(&key.world_id.to_le_bytes())
+                .u64(key.world_epoch.get())
+                .u64(key.creature_id.get())
+                .u32(key.generation.get())
+                .seq(parts.len());
+            for (part_id, volume) in parts {
+                writer
+                    .u32(*part_id)
+                    .u64(volume.id().get())
+                    .u64(
+                        volume
+                            .resident_brick_coords()
+                            .iter()
+                            .filter_map(|coord| volume.brick_revision(*coord).ok().flatten())
+                            .map(|revision| revision.0)
+                            .max()
+                            .unwrap_or(0),
+                    )
+                    .blob(&volume_topology_hash_for(volume, CanonicalOwner::Terrain).0);
+            }
+        }
+        writer.hash()
     }
 
     /// Advances physics one fixed step and refreshes every dynamic body's
@@ -2472,6 +2647,11 @@ impl SimWorld {
 
     /// Canonical topology hash of the whole world (terrain + every body).
     pub fn world_hash(&self) -> Hash32 {
+        #[cfg(test)]
+        assert!(
+            self.creature_sources.owners.is_empty(),
+            "legacy world_hash is unavailable when creature source owners exist"
+        );
         let mut volumes: Vec<(&Volume, CanonicalOwner)> =
             vec![(&self.terrain.volume, CanonicalOwner::Terrain)];
         for body in self.bodies.values() {
@@ -3023,5 +3203,84 @@ mod window_change_tests {
             9,
             centre
         ));
+    }
+}
+
+#[cfg(test)]
+mod creature_source_owner_tests {
+    use super::*;
+    use spall_core::{CreatureGeneration, CreatureId, WorldEpoch, WorldId};
+
+    fn key(id: u64) -> CreatureKey {
+        CreatureKey::new(
+            WorldId::from_u128(0x216),
+            WorldEpoch::INITIAL,
+            CreatureId::new(id).unwrap(),
+            CreatureGeneration::INITIAL,
+        )
+        .unwrap()
+    }
+
+    fn source(world: &mut SimWorld) -> Volume {
+        let id = world.registry_mut().allocate_volume().unwrap();
+        let mut volume = Volume::new(id, CellSizeCode::Quarter);
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(1, 0, 0),
+                crate::fixtures::STONE,
+            ))
+            .unwrap();
+        volume
+    }
+
+    #[test]
+    fn source_owner_is_disjoint_from_body_lookup_and_legacy_hash_is_gated() {
+        let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
+        let source = source(&mut world);
+        let id = source.id();
+        let candidate = vec![(7, source.clone())];
+        assert!(
+            world
+                .validate_creature_sources_for_test(key(1), &candidate)
+                .is_ok()
+        );
+        let before = world.creature_source_hash_for_test();
+        world.publish_creature_sources_for_test(key(1), candidate);
+
+        assert_eq!(world.creature_source_owner_for_test(id), Some((key(1), 7)));
+        assert!(world.volume_ref(id).is_none());
+        assert!(world.body_by_volume(id).is_none());
+        assert_ne!(world.creature_source_hash_for_test(), before);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.world_hash())).is_err()
+        );
+
+        // A second logical actor cannot claim the same original source volume.
+        assert!(
+            world
+                .validate_creature_sources_for_test(key(2), &[(8, source)])
+                .is_err()
+        );
+        assert_eq!(world.creature_source_owner_for_test(id), Some((key(1), 7)));
+    }
+
+    #[test]
+    fn failed_source_preflight_leaves_owner_hash_and_reverse_index_unchanged() {
+        let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
+        let source = source(&mut world);
+        let candidate = vec![(3, source.clone()), (3, source)];
+        let hash_before = world.creature_source_hash_for_test();
+        assert!(
+            world
+                .validate_creature_sources_for_test(key(1), &candidate)
+                .is_err()
+        );
+        assert_eq!(world.creature_source_hash_for_test(), hash_before);
+        assert_eq!(
+            world.creature_source_owner_for_test(candidate[0].1.id()),
+            None
+        );
     }
 }

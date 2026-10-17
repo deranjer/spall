@@ -29,6 +29,24 @@ use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, TerrainColliderMode, WorldSetup};
 use spall_voxel::Sample;
 
+#[cfg(test)]
+struct CreatureBirthPartInput {
+    part_id: u32,
+    parent_id: Option<u32>,
+    local_transform: spall_physics::PartTransform,
+    volume: spall_voxel::Volume,
+}
+
+#[cfg(test)]
+fn creature_source_revision(volume: &spall_voxel::Volume) -> Option<u64> {
+    volume
+        .resident_brick_coords()
+        .iter()
+        .filter_map(|coord| volume.brick_revision(*coord).ok().flatten())
+        .map(|revision| revision.0)
+        .max()
+}
+
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a
 /// band a wire `RequestId` never reaches — a client action claiming a value at
@@ -87,10 +105,237 @@ mod creature_host_tests {
         CreatureIntentWriter, CreatureRuleError, CreatureScheduleContext, CreatureScheduleSnapshot,
         CreatureSchedulingRules,
     };
+    use spall_core::{CellSizeCode, GlobalCell, MaterialId};
+    use spall_physics::{ArticulatedPose, PartTransform, Representation};
+    use spall_voxel::{EditPlan, Volume};
 
     struct CountingRules {
         calls: AtomicUsize,
         contexts: Mutex<Vec<CreatureScheduleContext>>,
+    }
+
+    fn source_volume(id: spall_core::VolumeId) -> Volume {
+        let mut volume = Volume::new(id, CellSizeCode::Quarter);
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(0, 0, 0),
+                MaterialId(1),
+            ))
+            .unwrap();
+        volume
+    }
+
+    #[test]
+    fn test_only_creature_birth_publishes_source_physics_and_ids_atomically() {
+        let mut simulation =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        simulation
+            .initialize_creature_host(WorldId::from_u128(10))
+            .unwrap();
+        let catalog = crate::creatures::tests::FixtureCatalog::new();
+        let allocated_volume = simulation
+            .world
+            .registry()
+            .clone()
+            .allocate_volume()
+            .unwrap();
+        let source = source_volume(allocated_volume);
+        let state = catalog.state(1, allocated_volume.get());
+
+        let counters_before = simulation.world.registry().counters();
+        let host_before = simulation.creature_allocator_snapshot().unwrap();
+        let physics_before = simulation.world.physics().body_count();
+        let foreign_volume = spall_core::VolumeId::new(999).unwrap();
+        assert!(
+            simulation
+                .commit_creature_birth_for_test(
+                    catalog.state(1, foreign_volume.get()),
+                    &catalog.view(),
+                    vec![CreatureBirthPartInput {
+                        part_id: 1,
+                        parent_id: None,
+                        local_transform: PartTransform::IDENTITY,
+                        volume: source_volume(foreign_volume),
+                    }],
+                    Representation::MergedCuboids,
+                )
+                .is_err()
+        );
+        let invalid = simulation.commit_creature_birth_for_test(
+            state.clone(),
+            &catalog.view(),
+            vec![CreatureBirthPartInput {
+                part_id: 1,
+                parent_id: None,
+                local_transform: PartTransform {
+                    rotation_xyzw: [0.0; 4],
+                    ..PartTransform::IDENTITY
+                },
+                volume: source.clone(),
+            }],
+            Representation::MergedCuboids,
+        );
+        assert!(invalid.is_err());
+        assert_eq!(simulation.world.registry().counters(), counters_before);
+        assert_eq!(
+            simulation.creature_allocator_snapshot().unwrap(),
+            host_before
+        );
+        assert_eq!(simulation.world.physics().body_count(), physics_before);
+        assert!(
+            simulation
+                .creatures
+                .as_ref()
+                .unwrap()
+                .record(state.key.creature_id)
+                .is_none()
+        );
+
+        let owner = simulation
+            .commit_creature_birth_for_test(
+                state.clone(),
+                &catalog.view(),
+                vec![CreatureBirthPartInput {
+                    part_id: 1,
+                    parent_id: None,
+                    local_transform: PartTransform::IDENTITY,
+                    volume: source,
+                }],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        assert_eq!(
+            simulation.world.registry().counters().1,
+            counters_before.1 + 1
+        );
+        assert_eq!(
+            simulation
+                .creature_allocator_snapshot()
+                .unwrap()
+                .next_creature_id,
+            2
+        );
+        assert_eq!(
+            simulation.world.creature_physics_owner_for_test(state.key),
+            Some(owner)
+        );
+        assert_eq!(
+            simulation
+                .world
+                .creature_source_owner_for_test(allocated_volume),
+            Some((state.key, 1))
+        );
+        assert_eq!(
+            simulation.world.physics().articulated_collider_count(owner),
+            1
+        );
+        assert!(simulation.world.volume_ref(allocated_volume).is_none());
+        assert!(simulation.world.body_by_volume(allocated_volume).is_none());
+
+        let moved_part_pose = PartTransform {
+            translation_m: [0.75, 0.0, 0.0],
+            ..PartTransform::IDENTITY
+        };
+        simulation
+            .world
+            .physics_mut()
+            .update_articulated_pose(
+                owner,
+                ArticulatedPose {
+                    topology_token: state.aggregate_topology_revision,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![(1, moved_part_pose)],
+                },
+            )
+            .unwrap();
+
+        let source_hash = simulation.world.creature_source_hash_for_test();
+        let body_count = simulation.world.physics().body_count();
+        assert!(
+            simulation
+                .commit_creature_death_for_test(
+                    state.key,
+                    state.state_revision,
+                    state.aggregate_topology_revision,
+                    99,
+                    &catalog.view(),
+                )
+                .is_err()
+        );
+        assert_eq!(simulation.world.physics().body_count(), body_count);
+        assert_eq!(
+            simulation.world.creature_source_hash_for_test(),
+            source_hash
+        );
+        assert_eq!(
+            simulation
+                .creatures
+                .as_ref()
+                .unwrap()
+                .record(state.key.creature_id)
+                .unwrap()
+                .lifecycle,
+            spall_protocol::CreatureLifecycleState::Alive
+        );
+        assert!(
+            simulation
+                .commit_creature_death_for_test(
+                    state.key,
+                    state.state_revision,
+                    state.aggregate_topology_revision,
+                    1,
+                    &catalog.view(),
+                )
+                .is_err()
+        );
+        simulation.world.step_physics();
+
+        let transfer = simulation
+            .commit_creature_death_for_test(
+                state.key,
+                state.state_revision,
+                state.aggregate_topology_revision,
+                1,
+                &catalog.view(),
+            )
+            .unwrap();
+        assert!(transfer.mass_kg > 0.0);
+        assert_eq!(
+            simulation.world.creature_source_hash_for_test(),
+            source_hash
+        );
+        let corpse = simulation
+            .creatures
+            .as_ref()
+            .unwrap()
+            .record(state.key.creature_id)
+            .unwrap();
+        assert_eq!(
+            corpse.lifecycle,
+            spall_protocol::CreatureLifecycleState::Corpse
+        );
+        assert_eq!(corpse.clip_mode, spall_protocol::CreatureClipMode::Frozen);
+        assert_eq!(corpse.state_revision, state.state_revision + 1);
+        assert_eq!(
+            simulation
+                .world
+                .creature_frozen_poses_for_test(state.key)
+                .unwrap(),
+            &[(1, moved_part_pose)]
+        );
+        assert!(
+            simulation
+                .world
+                .physics()
+                .articulated_owner_snapshot(owner)
+                .unwrap()
+                .root
+                .mass_kg
+                > 0.0
+        );
     }
 
     impl CreatureSchedulingRules for CountingRules {
@@ -507,6 +752,239 @@ impl Simulation {
         self.creatures
             .as_ref()
             .map(crate::creatures::CreatureHost::allocator_snapshot)
+    }
+
+    /// Test-only transaction seam for source ownership. It is intentionally
+    /// absent from production builds until lifecycle replay and checkpoint
+    /// publication can carry actor state.
+    #[cfg(test)]
+    fn commit_creature_birth_for_test(
+        &mut self,
+        state: spall_protocol::CreatureStateV1,
+        catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+        parts: Vec<CreatureBirthPartInput>,
+        representation: spall_physics::Representation,
+    ) -> Result<spall_physics::ArticulatedBodyId, crate::creatures::CreatureScheduleError> {
+        use crate::creatures::CreatureScheduleError;
+        use spall_physics::{OccupancyGrid, SourcePart};
+
+        let mut candidate_host = self
+            .creatures
+            .as_ref()
+            .ok_or(CreatureScheduleError::InvalidBatch)?
+            .clone();
+        // Validate the immutable DTO and consume only a cloned creature counter.
+        candidate_host.register_validated(state.clone(), catalog)?;
+
+        if parts.len() != state.source_bindings.len()
+            || parts
+                .windows(2)
+                .any(|pair| pair[0].part_id >= pair[1].part_id)
+        {
+            return Err(CreatureScheduleError::InvalidBatch);
+        }
+        let mut candidate_registry = self.world.registry().clone();
+        let mut source_volumes = Vec::with_capacity(parts.len());
+        let mut physics_parts = Vec::with_capacity(parts.len());
+        for (input, binding) in parts.into_iter().zip(&state.source_bindings) {
+            let allocated = candidate_registry
+                .allocate_volume()
+                .map_err(|_| CreatureScheduleError::CounterExhausted)?;
+            if input.part_id != binding.part_id
+                || input.volume.id() != binding.source_volume_id
+                || allocated != binding.source_volume_id
+                || creature_source_revision(&input.volume) != Some(binding.source_revision)
+            {
+                return Err(CreatureScheduleError::InvalidBatch);
+            }
+            let grid = OccupancyGrid::from_volume(&input.volume)
+                .map_err(|_| CreatureScheduleError::InvalidBatch)?
+                .ok_or(CreatureScheduleError::InvalidBatch)?;
+            let cell_m = input.volume.cell_size().metres() as f32;
+            physics_parts.push(SourcePart {
+                part_id: input.part_id,
+                parent_id: input.parent_id,
+                volume_id: binding.source_volume_id,
+                source_revision: binding.source_revision,
+                grid,
+                cell_m,
+                local_transform: input.local_transform,
+            });
+            source_volumes.push((input.part_id, input.volume));
+        }
+        self.world
+            .validate_creature_sources_for_test(state.key, &source_volumes)
+            .map_err(|_| CreatureScheduleError::InvalidBatch)?;
+
+        let translation = self
+            .world
+            .physics_translation(state.root_translation_m)
+            .map_err(|_| CreatureScheduleError::InvalidBatch)?;
+        // The physics adapter preflights every part, collider and transform
+        // before inserting any owner state. No fallible step follows success.
+        let physics_owner = self
+            .world
+            .physics_mut()
+            .add_articulated_kinematic_parts(
+                translation,
+                state.root_rotation_xyzw,
+                state.aggregate_topology_revision,
+                physics_parts,
+                representation,
+            )
+            .map_err(|_| CreatureScheduleError::InvalidBatch)?;
+
+        self.world
+            .publish_creature_sources_for_test(state.key, source_volumes);
+        self.world
+            .set_creature_physics_owner_for_test(state.key, physics_owner);
+        self.world.registry_mut().clone_from(&candidate_registry);
+        self.creatures = Some(candidate_host);
+        Ok(physics_owner)
+    }
+
+    #[cfg(test)]
+    fn commit_creature_death_for_test(
+        &mut self,
+        key: spall_core::CreatureKey,
+        expected_state_revision: u64,
+        expected_topology_token: u64,
+        expected_pose_token: u64,
+        catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+    ) -> Result<spall_physics::CorpseTransferOutcome, crate::creatures::CreatureScheduleError> {
+        use crate::creatures::CreatureScheduleError;
+        use spall_protocol::{CreatureClipMode, CreatureLifecycleState};
+
+        let current = self
+            .creatures
+            .as_ref()
+            .and_then(|host| host.record(key.creature_id))
+            .filter(|state| state.key == key)
+            .ok_or(CreatureScheduleError::Stale)?;
+        if current.lifecycle != CreatureLifecycleState::Alive
+            || current.state_revision != expected_state_revision
+            || current.aggregate_topology_revision != expected_topology_token
+        {
+            return Err(CreatureScheduleError::Stale);
+        }
+        for binding in &current.source_bindings {
+            let source = self
+                .world
+                .creature_source_part_for_test(key, binding.part_id)
+                .ok_or(CreatureScheduleError::Stale)?;
+            if self
+                .world
+                .creature_source_owner_for_test(binding.source_volume_id)
+                != Some((key, binding.part_id))
+                || source.id() != binding.source_volume_id
+                || creature_source_revision(source) != Some(binding.source_revision)
+            {
+                return Err(CreatureScheduleError::Stale);
+            }
+        }
+        let physics_owner = self
+            .world
+            .creature_physics_owner_for_test(key)
+            .ok_or(CreatureScheduleError::Stale)?;
+        let live = self
+            .world
+            .physics()
+            .articulated_owner_snapshot(physics_owner)
+            .ok_or(CreatureScheduleError::Stale)?;
+        if live.pending_pose
+            || live.topology_token != expected_topology_token
+            || live.pose_token != expected_pose_token
+        {
+            return Err(CreatureScheduleError::Stale);
+        }
+        let live_parts = self
+            .world
+            .physics()
+            .articulated_pose_snapshot(physics_owner)
+            .ok_or(CreatureScheduleError::Stale)?;
+        if live_parts.topology_token != expected_topology_token
+            || live_parts.pose_token != expected_pose_token
+            || live_parts
+                .parts
+                .iter()
+                .map(|(part_id, _)| *part_id)
+                .ne(current
+                    .source_bindings
+                    .iter()
+                    .map(|binding| binding.part_id))
+        {
+            return Err(CreatureScheduleError::Stale);
+        }
+
+        let mut corpse = current.clone();
+        corpse.state_revision = corpse
+            .state_revision
+            .checked_add(1)
+            .ok_or(CreatureScheduleError::CounterExhausted)?;
+        corpse.lifecycle = CreatureLifecycleState::Corpse;
+        corpse.clip_mode = CreatureClipMode::Frozen;
+        corpse.clip_epoch = corpse
+            .clip_epoch
+            .checked_add(1)
+            .ok_or(CreatureScheduleError::CounterExhausted)?;
+        corpse.pose_epoch = corpse
+            .pose_epoch
+            .checked_add(1)
+            .ok_or(CreatureScheduleError::CounterExhausted)?;
+        corpse.root_translation_m = self
+            .world
+            .physics_origin()
+            .to_world_f64(live.root.translation_m);
+        corpse.root_rotation_xyzw = live.root.rotation;
+        corpse.linear_velocity_m_s = live.root.linvel_m_s;
+        corpse.angular_velocity_rad_s = live.root.angvel_rad_s;
+
+        let mut candidate_host = self.creatures.as_ref().unwrap().clone();
+        candidate_host.replace_record_for_lifecycle_test(corpse, catalog)?;
+
+        // Density is read from the Simulation's immutable material manifest,
+        // and the exact materials present in source cells are preflighted
+        // before the physics owner changes.
+        let mut densities = std::collections::BTreeMap::new();
+        for binding in &current.source_bindings {
+            let volume = self
+                .world
+                .creature_source_part_for_test(key, binding.part_id)
+                .ok_or(CreatureScheduleError::Stale)?;
+            let grid = spall_physics::OccupancyGrid::from_volume(volume)
+                .map_err(|_| CreatureScheduleError::InvalidBatch)?
+                .ok_or(CreatureScheduleError::InvalidBatch)?;
+            grid.for_each_solid(|_, _, _, material| {
+                densities
+                    .entry(material)
+                    .or_insert_with(|| self.world.density(material));
+            });
+        }
+        if densities
+            .values()
+            .any(|density| !density.is_finite() || *density <= 0.0)
+        {
+            return Err(CreatureScheduleError::InvalidBatch);
+        }
+        let density = |material| densities.get(&material).copied().unwrap_or(0.0);
+
+        // The transfer API validates and prepares all source mass/colliders
+        // before replacing its live kinematic owner. It is the final fallible
+        // operation; the host candidate swap after success cannot fail.
+        let outcome = self
+            .world
+            .physics_mut()
+            .transfer_articulated_to_dynamic_corpse(
+                physics_owner,
+                expected_topology_token,
+                expected_pose_token,
+                density,
+            )
+            .map_err(|_| CreatureScheduleError::InvalidBatch)?;
+        self.world
+            .set_creature_frozen_poses_for_test(key, live_parts.parts);
+        self.creatures = Some(candidate_host);
+        Ok(outcome)
     }
 
     /// Stages edits on a worker thread instead of inline on the tick thread (see

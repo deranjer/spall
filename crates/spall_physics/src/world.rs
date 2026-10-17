@@ -4453,7 +4453,7 @@ impl PhysicsWorld {
     pub fn articulated_pose_snapshot(
         &self,
         id: ArticulatedBodyId,
-    ) -> Option<crate::articulated::ArticulatedPose> {
+    ) -> Option<crate::articulated::ArticulatedPoseSnapshot> {
         let assembly = self.articulated.get(&id.0)?;
         let mut parts = assembly
             .parts
@@ -4461,9 +4461,8 @@ impl PhysicsWorld {
             .map(|part| (part.part_id, part.local_pose))
             .collect::<Vec<_>>();
         parts.sort_by_key(|(part_id, _)| *part_id);
-        Some(crate::articulated::ArticulatedPose {
+        Some(crate::articulated::ArticulatedPoseSnapshot {
             topology_token: assembly.topology_token,
-            base_pose_token: assembly.pose_token,
             pose_token: assembly.pose_token,
             parts,
         })
