@@ -487,6 +487,9 @@ pub struct CorpseTransferOutcome {
     pub com_world_m: [f64; 3],
     pub linear_momentum_kg_m_s: [f64; 3],
     pub angular_momentum_about_com_kg_m2_s: [f64; 3],
+    /// Resultant rigid-body twist installed on the corpse owner.
+    pub linear_velocity_m_s: [f64; 3],
+    pub angular_velocity_rad_s: [f64; 3],
 }
 
 /// Measurements from one all-or-nothing physical corpse component split.
@@ -1210,6 +1213,27 @@ impl PhysicsWorld {
         expected_pose_token: u64,
         density: impl Fn(spall_core::MaterialId) -> f64,
     ) -> Result<CorpseTransferOutcome, crate::articulated::ArticulatedError> {
+        self.transfer_articulated_to_dynamic_corpse_checked(
+            id,
+            expected_topology_token,
+            expected_pose_token,
+            density,
+            |_| true,
+        )
+    }
+
+    /// As [`Self::transfer_articulated_to_dynamic_corpse`], with a final
+    /// value-only owner validation hook. The hook runs after exact mass,
+    /// resultant motion, and every replacement shape are prepared, but before
+    /// any collider/body ownership mutation. Returning false rejects atomically.
+    pub fn transfer_articulated_to_dynamic_corpse_checked(
+        &mut self,
+        id: ArticulatedBodyId,
+        expected_topology_token: u64,
+        expected_pose_token: u64,
+        density: impl Fn(spall_core::MaterialId) -> f64,
+        validate_final: impl FnOnce(&CorpseTransferOutcome) -> bool,
+    ) -> Result<CorpseTransferOutcome, crate::articulated::ArticulatedError> {
         use crate::articulated::ArticulatedError;
         let started = Instant::now();
         let body_id = id.0;
@@ -1425,29 +1449,48 @@ impl PhysicsWorld {
                 (part.collider, part.body, pose)
             })
             .collect::<Vec<_>>();
+        let prepared_colliders = prepared
+            .iter()
+            .map(|(old, _, pose)| {
+                let old_collider = &self.colliders[*old];
+                let restitution = old_collider.restitution();
+                let restitution_rule = old_collider.restitution_combine_rule();
+                let friction = old_collider.friction();
+                let friction_rule = old_collider.friction_combine_rule();
+                let collision_groups = old_collider.collision_groups();
+                let solver_groups = old_collider.solver_groups();
+                let active_collision_types = old_collider.active_collision_types();
+                let sensor = old_collider.is_sensor();
+                let mut collider = ColliderBuilder::new(old_collider.shared_shape().clone())
+                    .density(0.0)
+                    .position(*pose)
+                    .friction(friction)
+                    .active_collision_types(active_collision_types)
+                    .sensor(sensor)
+                    .build();
+                collider.set_restitution(restitution);
+                collider.set_restitution_combine_rule(restitution_rule);
+                collider.set_friction_combine_rule(friction_rule);
+                collider.set_collision_groups(collision_groups);
+                collider.set_solver_groups(solver_groups);
+                collider
+            })
+            .collect::<Vec<_>>();
+        let mut outcome = CorpseTransferOutcome {
+            preparation_time: started.elapsed(),
+            mass_kg: total_mass,
+            com_world_m: com_world,
+            linear_momentum_kg_m_s: linear_momentum,
+            angular_momentum_about_com_kg_m2_s: angular_momentum,
+            linear_velocity_m_s: linear_velocity,
+            angular_velocity_rad_s: omega_world,
+        };
+        if !validate_final(&outcome) {
+            return Err(ArticulatedError::TransferRejected);
+        }
+
         let mut replacement_handles = Vec::with_capacity(prepared.len());
-        for (old, _, pose) in &prepared {
-            let old_collider = &self.colliders[*old];
-            let restitution = old_collider.restitution();
-            let restitution_rule = old_collider.restitution_combine_rule();
-            let friction = old_collider.friction();
-            let friction_rule = old_collider.friction_combine_rule();
-            let collision_groups = old_collider.collision_groups();
-            let solver_groups = old_collider.solver_groups();
-            let active_collision_types = old_collider.active_collision_types();
-            let sensor = old_collider.is_sensor();
-            let mut collider = ColliderBuilder::new(old_collider.shared_shape().clone())
-                .density(0.0)
-                .position(*pose)
-                .friction(friction)
-                .active_collision_types(active_collision_types)
-                .sensor(sensor)
-                .build();
-            collider.set_restitution(restitution);
-            collider.set_restitution_combine_rule(restitution_rule);
-            collider.set_friction_combine_rule(friction_rule);
-            collider.set_collision_groups(collision_groups);
-            collider.set_solver_groups(solver_groups);
+        for ((_, _, _), collider) in prepared.iter().zip(prepared_colliders) {
             let handle = self
                 .colliders
                 .insert_with_parent(collider, root_body, &mut self.bodies);
@@ -1521,13 +1564,8 @@ impl PhysicsWorld {
         entry.collider_offset_m = [0.0; 3];
         entry.density = 0.0;
         entry.mass_properties = Some(props);
-        Ok(CorpseTransferOutcome {
-            preparation_time: started.elapsed(),
-            mass_kg: total_mass,
-            com_world_m: com_world,
-            linear_momentum_kg_m_s: linear_momentum,
-            angular_momentum_about_com_kg_m2_s: angular_momentum,
-        })
+        outcome.preparation_time = started.elapsed();
+        Ok(outcome)
     }
 
     /// Captures one live physical component for bounded immutable fracture

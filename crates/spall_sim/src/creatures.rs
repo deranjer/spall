@@ -443,8 +443,12 @@ pub(crate) mod tests {
 
     impl FixtureCatalog {
         pub(crate) fn new() -> Self {
+            Self::with_materials(manifest())
+        }
+
+        pub(crate) fn with_materials(materials: MaterialManifest) -> Self {
             Self {
-                materials: manifest(),
+                materials,
                 assets: [CreatureAssetCatalogEntry {
                     uuid: [8; 16],
                     logical_hash: spall_protocol::Hash32([9; 32]),

@@ -279,9 +279,31 @@ pub struct SimWorld {
 #[derive(Default)]
 struct CreatureSourceStore {
     owners: BTreeMap<CreatureKey, BTreeMap<u32, Volume>>,
+    metadata: BTreeMap<CreatureKey, BTreeMap<u32, CreatureSourceMetadata>>,
     volume_owner: BTreeMap<VolumeId, (CreatureKey, u32)>,
     physics_owner: BTreeMap<CreatureKey, spall_physics::ArticulatedBodyId>,
     frozen_poses: BTreeMap<CreatureKey, Vec<(u32, spall_physics::PartTransform)>>,
+}
+
+/// Immutable source provenance and authored hierarchy needed to reconstruct a
+/// part without retaining any physics-library handles.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreatureSourceMetadata {
+    pub parent_id: Option<u32>,
+    pub initial_local_transform: spall_physics::PartTransform,
+    pub state_stamp: u64,
+    pub content_hash: Hash32,
+    pub brick_revisions: Vec<(BrickCoord, u64)>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CreatureHierarchyPartSnapshot {
+    pub part_id: u32,
+    pub parent_id: Option<u32>,
+    pub initial_local_transform: spall_physics::PartTransform,
+    pub frozen_local_transform: spall_physics::PartTransform,
 }
 
 /// A shared empty digest set, so [`SimWorld::evicted`] can return a reference
@@ -1144,16 +1166,68 @@ impl SimWorld {
         key: CreatureKey,
         parts: Vec<(u32, Volume)>,
     ) {
-        debug_assert!(self.validate_creature_sources_for_test(key, &parts).is_ok());
+        let parts = parts
+            .into_iter()
+            .map(|(part_id, volume)| {
+                let brick_revisions = volume
+                    .resident_brick_coords()
+                    .into_iter()
+                    .filter_map(|coord| {
+                        volume
+                            .brick_revision(coord)
+                            .ok()
+                            .flatten()
+                            .map(|revision| (coord, revision.0))
+                    })
+                    .collect();
+                let metadata = CreatureSourceMetadata {
+                    parent_id: None,
+                    initial_local_transform: spall_physics::PartTransform::IDENTITY,
+                    state_stamp: volume.state_stamp(),
+                    content_hash: volume_topology_hash_for(&volume, CanonicalOwner::Terrain),
+                    brick_revisions,
+                };
+                (part_id, volume, metadata)
+            })
+            .collect();
+        self.publish_creature_sources_with_metadata_for_test(key, parts);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_creature_sources_with_metadata_for_test(
+        &mut self,
+        key: CreatureKey,
+        parts: Vec<(u32, Volume, CreatureSourceMetadata)>,
+    ) {
+        let validation_parts: Vec<_> = parts
+            .iter()
+            .map(|(part_id, volume, _)| (*part_id, volume.clone()))
+            .collect();
+        debug_assert!(
+            self.validate_creature_sources_for_test(key, &validation_parts)
+                .is_ok()
+        );
         let mut owner_parts = BTreeMap::new();
-        for (part_id, volume) in parts {
+        let mut metadata = BTreeMap::new();
+        for (part_id, volume, source_metadata) in parts {
             let id = volume.id();
             self.creature_sources
                 .volume_owner
                 .insert(id, (key, part_id));
             owner_parts.insert(part_id, volume);
+            metadata.insert(part_id, source_metadata);
         }
         self.creature_sources.owners.insert(key, owner_parts);
+        self.creature_sources.metadata.insert(key, metadata);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn creature_source_metadata_for_test(
+        &self,
+        key: CreatureKey,
+        part_id: u32,
+    ) -> Option<&CreatureSourceMetadata> {
+        self.creature_sources.metadata.get(&key)?.get(&part_id)
     }
 
     #[cfg(test)]
@@ -1171,6 +1245,26 @@ impl SimWorld {
         part_id: u32,
     ) -> Option<&Volume> {
         self.creature_sources.owners.get(&key)?.get(&part_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_creature_source_for_test(
+        &mut self,
+        key: CreatureKey,
+        part_id: u32,
+        replacement: Volume,
+    ) -> Result<(), &'static str> {
+        let current = self
+            .creature_sources
+            .owners
+            .get_mut(&key)
+            .and_then(|parts| parts.get_mut(&part_id))
+            .ok_or("source part is not owned")?;
+        if current.id() != replacement.id() {
+            return Err("replacement changed source volume identity");
+        }
+        *current = replacement;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1200,6 +1294,31 @@ impl SimWorld {
         debug_assert!(self.creature_sources.owners.contains_key(&key));
         poses.sort_by_key(|(part_id, _)| *part_id);
         self.creature_sources.frozen_poses.insert(key, poses);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn creature_hierarchy_for_test(
+        &self,
+        key: CreatureKey,
+    ) -> Option<Vec<CreatureHierarchyPartSnapshot>> {
+        let sources = self.creature_sources.owners.get(&key)?;
+        let metadata = self.creature_sources.metadata.get(&key)?;
+        let frozen = self.creature_sources.frozen_poses.get(&key)?;
+        if sources.len() != metadata.len() || sources.len() != frozen.len() {
+            return None;
+        }
+        frozen
+            .iter()
+            .map(|(part_id, current_local)| {
+                let source = metadata.get(part_id)?;
+                Some(CreatureHierarchyPartSnapshot {
+                    part_id: *part_id,
+                    parent_id: source.parent_id,
+                    initial_local_transform: source.initial_local_transform,
+                    frozen_local_transform: *current_local,
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]

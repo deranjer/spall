@@ -65,6 +65,8 @@ pub enum ArticulatedError {
     InvalidDensity,
     #[error("a dynamic corpse aggregate must retain at least one occupied source part")]
     EmptyAggregate,
+    #[error("the owning simulation rejected the prepared corpse state")]
+    TransferRejected,
     #[error(
         "corpse edits currently support removals only; additions/material changes need a momentum policy"
     )]

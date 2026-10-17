@@ -9,10 +9,16 @@ recovery.
 ## Ownership model
 
 `SimWorld` remains the owner of authoritative voxel `Volume`s. Creature part
-volumes live in a separate `CreatureSourceAssembly` collection keyed by the
-stable `CreatureKey`; each part maps `(part_id, original VolumeId)` to the exact
-`Volume`, source revision/generation, and authored/runtime source pose. A
-separate reverse index maps every actor `VolumeId` to exactly one key and part.
+volumes live in a separate test-only source assembly keyed by the stable
+`CreatureKey`; each part maps `(part_id, original VolumeId)` to the exact
+`Volume`, its full birth freshness token, and its authored hierarchy metadata.
+A separate reverse index maps every actor `VolumeId` to exactly one key and
+part. The freshness token contains the volume state stamp, canonical
+source-volume content/revision hash, and every resident brick coordinate and
+revision. The state stamp is a runtime stale guard, not part of the deterministic
+source hash. At death, the store also retains each authored parent ID and
+initial parent-local transform beside the current frozen parent-local pose;
+these reconstruct the hierarchy without physics handles.
 These source volumes never enter ordinary `Body`, `bodies`, or
 `volume_owner`; no actor part is disguised as a one-volume body. Ordinary
 terrain/body lookup and edit semantics remain unchanged in this slice.
@@ -29,27 +35,33 @@ death.
 
 ## Candidate transactions
 
-Birth preparation accepts validated immutable creature state plus bounded part
-geometry/pose inputs, not caller-selected identity or source `VolumeId`s. It
-clones the `IdRegistry` and `CreatureAllocator`, allocates the `CreatureKey`
-and each source `VolumeId` from those clones, constructs the exact
-`spall_voxel::Volume`s, and rewrites bindings to those allocated IDs at their
-initial revisions. It checks identity/catalog limits, duplicate ownership
-against terrain, ordinary bodies, and existing creature parts, source-cell and
-dense-work caps, geometry/query validity, and complete articulated collider
-and mass preparation before publishing either clone or any owner map.
+The current direct test-only birth call accepts an already-created DTO and
+bounded candidate part volumes. It clones the `IdRegistry` and `CreatureHost`,
+then requires the DTO key and each candidate source `VolumeId` to be exactly
+the next checked allocations from those clones; it does not construct source
+volumes or rewrite caller state. It rejects anything except Alive/Playing,
+requires the DTO and supplied catalog material manifest hashes to match the
+authoritative `SimWorld` manifest, and checks every occupied source material
+against that manifest and the asset's mapped portable keys. It then validates
+complete part/binding coverage, exclusive ownership against terrain, ordinary
+bodies, and existing creature parts, source-cell and dense-work caps,
+geometry/query validity, and complete articulated collider/mass preparation
+before publishing cloned counters, host record, and owner maps. The entrypoint
+is synchronous; there is no externally retained prepared-plan DTO or later
+stale-plan commit boundary in this slice.
 
 Death preparation takes the current live actor key and expected topology, pose,
-clip, per-part source revision, and source-generation tokens. Commit recaptures
-and compares those tokens. It freezes the accepted clip, retains every source
-VolumeId/cell/material/revision, derives source grids from the exact volumes,
-and prepares the ENG-212/214 dynamic aggregate from the current root pose and
-twist. Actor state, source owner index, source assemblies, physics aggregate,
-and checked counters publish together only after all recoverable fallible
-validation and physics preparation succeeds. Stale or failed work changes
-none of them. Prepared structs are untrusted inputs: commit revalidates their
-version, complete part/binding coverage, allocator snapshots, exact source
-content/revisions, tokens, and geometry before mutation.
+state, and per-source freshness tokens. It rechecks each source stamp, hash, and
+sorted brick revision, not merely the maximum brick revision, and freezes the
+current local hierarchy poses while preserving parent/initial-transform
+metadata. It derives source grids from those same volumes. The physics adapter
+computes the corpse's resultant rigid-body twist from all part momenta and
+prebuilds all replacement colliders, then invokes a value-only owner validation
+closure before its first mutation. That closure stores the exact resultant
+twist in the corpse DTO and validates the replacement host candidate;
+rejection leaves physics unchanged. After acceptance, physics publication and
+the prevalidated source/host swaps have no recoverable failure path. This is a
+direct synchronous test seam, not a general prepared transaction API.
 
 Production entrypoints remain crate-private/test-only. Existing checkpoint and
 baseline capture does not include creature actors, and the current ordered
@@ -65,11 +77,13 @@ the existing transaction/journal order rather than introduce another journal.
 
 `CanonicalOwner` currently encodes only Terrain and Body. Keep their canonical
 byte streams and all existing world hashes byte-identical for worlds without
-creatures. Use an explicitly versioned, domain-separated source-ownership hash
-over sorted CreatureKey, part ID, source VolumeId, source revision and canonical
-source-volume contents for in-memory fixture checks. The creature state DTO is
-retained separately; a future combined actor-state hash must include its
-canonical lifecycle bytes. Do not return the old complete
+creatures. The fixture-only, explicitly versioned source hash covers sorted
+CreatureKeys, part IDs, source VolumeIds, and canonical source-volume contents.
+It is deliberately source-only: it does not cover the runtime freshness stamp,
+authored parent/local transforms, current frozen poses, or lifecycle DTO. Those
+are retained in separate records and checked by targeted assertions; a future
+combined actor-state hash must include their canonical versioned
+representations. Do not return the old complete
 `world_hash` for a populated actor world. A later wire/checkpoint slice must
 review the versioned combined hash and update every replay/baseline consumer
 before exposing a populated world.
@@ -140,7 +154,15 @@ the legacy `world_hash` fails closed in test builds when source owners exist.
 The physics crate exposes read-only value snapshots of live articulated owner
 tokens/root motion and sorted applied part poses; no runtime handle escapes.
 
-The fixtures prove a one-part birth and alive-to-corpse transfer. They do not
+The fixtures prove a one-part lifecycle transfer plus a three-part nested,
+rotated-root transfer with mixed mapped materials, per-part query-identity
+checks, source-hash preservation, hierarchy reconstruction metadata, and
+independent density-derived mass conservation. A stale-source regression
+reconstructs candidate source data with changed content in a low-revision brick
+while preserving a separate high-revision brick at revision 5; the maximum
+remains 5 but the volume stamp and canonical hash change, so death is rejected.
+This covers same-maximum replacement/reload drift; normal `apply_edit` advances
+the volume-wide revision high-water mark. They do not
 provide production species construction, an actor wire/journal operation,
 checkpoint or baseline coverage, replica application, partial source edits, or
 split-component ownership integration. The only supported lifecycle entry

@@ -38,14 +38,31 @@ struct CreatureBirthPartInput {
 }
 
 #[cfg(test)]
-fn creature_source_revision(volume: &spall_voxel::Volume) -> Option<u64> {
-    volume
-        .resident_brick_coords()
-        .iter()
-        .filter_map(|coord| volume.brick_revision(*coord).ok().flatten())
-        .map(|revision| revision.0)
-        .max()
+fn creature_source_freshness(
+    volume: &spall_voxel::Volume,
+    parent_id: Option<u32>,
+    local_transform: spall_physics::PartTransform,
+) -> Option<crate::world::CreatureSourceMetadata> {
+    let mut brick_revisions = Vec::new();
+    for coord in volume.resident_brick_coords() {
+        let revision = volume.brick_revision(coord).ok().flatten()?;
+        brick_revisions.push((coord, revision.0));
+    }
+    Some(crate::world::CreatureSourceMetadata {
+        parent_id,
+        initial_local_transform: local_transform,
+        state_stamp: volume.state_stamp(),
+        content_hash: crate::world::volume_topology_hash_for(
+            volume,
+            spall_protocol::CanonicalOwner::Terrain,
+        ),
+        brick_revisions,
+    })
 }
+
+#[cfg(test)]
+#[path = "creature_lifecycle_review.rs"]
+mod creature_lifecycle_review;
 
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a
@@ -127,6 +144,96 @@ mod creature_host_tests {
         volume
     }
 
+    fn source_volume_material(id: spall_core::VolumeId, material: MaterialId) -> Volume {
+        let mut volume = Volume::new(id, CellSizeCode::Quarter);
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(0, 0, 0),
+                material,
+            ))
+            .unwrap();
+        volume
+    }
+
+    struct HierarchyCatalog {
+        materials: spall_core::MaterialManifest,
+        asset: [spall_protocol::CreatureAssetCatalogEntry<'static>; 1],
+        species: [spall_protocol::CreatureSpeciesCatalogEntry<'static>; 1],
+        mapping: [spall_protocol::CreatureMaterialMappingEntry<'static>; 2],
+    }
+
+    impl HierarchyCatalog {
+        fn view(&self) -> spall_protocol::CreatureValidationCatalog<'_> {
+            spall_protocol::CreatureValidationCatalog {
+                assets: &self.asset,
+                species: &self.species,
+                materials: &self.materials,
+                material_mapping_version: 1,
+                material_mapping_hash: spall_protocol::creature_material_mapping_hash(
+                    &self.mapping,
+                )
+                .unwrap(),
+                material_mapping: &self.mapping,
+            }
+        }
+
+        fn state(&self, volumes: [spall_core::VolumeId; 3]) -> spall_protocol::CreatureStateV1 {
+            let mapping_hash =
+                spall_protocol::creature_material_mapping_hash(&self.mapping).unwrap();
+            spall_protocol::CreatureStateV1 {
+                schema: spall_protocol::CREATURE_STATE_SCHEMA,
+                key: spall_core::CreatureKey::new(
+                    WorldId::from_u128(10),
+                    spall_core::WorldEpoch::INITIAL,
+                    spall_core::CreatureId::new(1).unwrap(),
+                    spall_core::CreatureGeneration::INITIAL,
+                )
+                .unwrap(),
+                state_revision: 1,
+                lifecycle: spall_protocol::CreatureLifecycleState::Alive,
+                species_key: "deer".into(),
+                species_version: 1,
+                asset: spall_protocol::CreatureAssetIdentity {
+                    uuid: [8; 16],
+                    logical_hash: spall_protocol::Hash32([9; 32]),
+                },
+                material_manifest_hash: spall_protocol::content_manifest_hash(&self.materials),
+                material_mapping_version: 1,
+                material_mapping_hash: mapping_hash,
+                clip_name: "idle".into(),
+                clip_mode: spall_protocol::CreatureClipMode::Playing,
+                clip_phase_tick: 0,
+                clip_subtick_remainder: 0,
+                clip_epoch: 1,
+                source_bindings: volumes
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(index, source_volume_id)| spall_protocol::CreaturePartBinding {
+                            part_id: index as u32 + 1,
+                            source_volume_id,
+                            source_revision: 1,
+                        },
+                    )
+                    .collect(),
+                aggregate_topology_revision: 2,
+                pose_epoch: 1,
+                root_translation_m: [10.0, 5.0, 10.0],
+                root_rotation_xyzw: [
+                    0.0,
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ],
+                linear_velocity_m_s: [0.0; 3],
+                angular_velocity_rad_s: [0.0; 3],
+                locomotion_tag: 0,
+            }
+        }
+    }
+
     #[test]
     fn test_only_creature_birth_publishes_source_physics_and_ids_atomically() {
         let mut simulation =
@@ -134,7 +241,9 @@ mod creature_host_tests {
         simulation
             .initialize_creature_host(WorldId::from_u128(10))
             .unwrap();
-        let catalog = crate::creatures::tests::FixtureCatalog::new();
+        let catalog = crate::creatures::tests::FixtureCatalog::with_materials(
+            simulation.world.materials().clone(),
+        );
         let allocated_volume = simulation
             .world
             .registry()
@@ -335,6 +444,406 @@ mod creature_host_tests {
                 .root
                 .mass_kg
                 > 0.0
+        );
+    }
+
+    #[test]
+    fn death_rejects_replaced_source_content_with_same_max_revision() {
+        let mut simulation =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        simulation
+            .initialize_creature_host(WorldId::from_u128(10))
+            .unwrap();
+        let catalog = crate::creatures::tests::FixtureCatalog::with_materials(
+            simulation.world.materials().clone(),
+        );
+        let volume_id = simulation
+            .world
+            .registry()
+            .clone()
+            .allocate_volume()
+            .unwrap();
+        let sparse_brick = |solid_local_cell: usize, revision: u64| {
+            let mut cells = vec![MaterialId::AIR; 32 * 32 * 32];
+            cells[solid_local_cell] = crate::fixtures::STONE;
+            spall_voxel::Brick::restored(&cells, spall_core::Revision(revision), true)
+        };
+        let mut source = Volume::new(volume_id, CellSizeCode::Quarter);
+        source
+            .insert_brick(spall_core::BrickCoord::new(0, 0, 0), sparse_brick(0, 1))
+            .unwrap();
+        source
+            .insert_brick(spall_core::BrickCoord::new(1, 0, 0), sparse_brick(0, 5))
+            .unwrap();
+        let mut state = catalog.state(1, volume_id.get());
+        state.source_bindings[0].source_revision = 5;
+        let owner = simulation
+            .commit_creature_birth_for_test(
+                state.clone(),
+                &catalog.view(),
+                vec![CreatureBirthPartInput {
+                    part_id: 1,
+                    parent_id: None,
+                    local_transform: PartTransform::IDENTITY,
+                    volume: source,
+                }],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let captured_stamp = simulation
+            .world
+            .creature_source_metadata_for_test(state.key, 1)
+            .unwrap()
+            .state_stamp;
+        let max_revision = |volume: &Volume| {
+            volume
+                .resident_brick_coords()
+                .into_iter()
+                .filter_map(|coord| volume.brick_revision(coord).ok().flatten())
+                .map(|revision| revision.0)
+                .max()
+                .unwrap()
+        };
+        let before_max_revision = max_revision(
+            simulation
+                .world
+                .creature_source_part_for_test(state.key, 1)
+                .unwrap(),
+        );
+        assert_eq!(before_max_revision, 5);
+        let mut changed_source = Volume::new(volume_id, CellSizeCode::Quarter);
+        changed_source
+            .insert_brick(spall_core::BrickCoord::new(0, 0, 0), sparse_brick(1, 1))
+            .unwrap();
+        changed_source
+            .insert_brick(spall_core::BrickCoord::new(1, 0, 0), sparse_brick(0, 5))
+            .unwrap();
+        simulation
+            .world
+            .replace_creature_source_for_test(state.key, 1, changed_source)
+            .unwrap();
+        assert_ne!(
+            simulation
+                .world
+                .creature_source_part_for_test(state.key, 1)
+                .unwrap()
+                .state_stamp(),
+            captured_stamp
+        );
+        assert_eq!(
+            max_revision(
+                simulation
+                    .world
+                    .creature_source_part_for_test(state.key, 1)
+                    .unwrap()
+            ),
+            before_max_revision,
+            "replacement changes low-revision content while the maximum stays 5"
+        );
+        let before_hash = simulation.world.creature_source_hash_for_test();
+        let before_counters = simulation.world.registry().counters();
+        let before_allocator = simulation.creature_allocator_snapshot().unwrap();
+        let before_body_count = simulation.world.physics().body_count();
+        assert!(
+            simulation
+                .commit_creature_death_for_test(
+                    state.key,
+                    state.state_revision,
+                    state.aggregate_topology_revision,
+                    0,
+                    &catalog.view(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            simulation.world.creature_source_hash_for_test(),
+            before_hash
+        );
+        assert_eq!(simulation.world.registry().counters(), before_counters);
+        assert_eq!(
+            simulation.creature_allocator_snapshot().unwrap(),
+            before_allocator
+        );
+        assert_eq!(simulation.world.physics().body_count(), before_body_count);
+        assert_eq!(
+            simulation.world.creature_physics_owner_for_test(state.key),
+            Some(owner)
+        );
+        assert_eq!(
+            simulation
+                .creatures
+                .as_ref()
+                .unwrap()
+                .record(state.key.creature_id),
+            Some(&state)
+        );
+    }
+
+    #[test]
+    fn nested_mixed_material_sources_keep_hierarchy_queries_and_mass_on_transfer() {
+        use spall_physics::{ArticulatedPose, PartTransform, Representation};
+        use spall_protocol::{
+            CreatureAssetCatalogEntry, CreatureAssetIdentity, CreatureMaterialMappingEntry,
+            CreatureSpeciesCatalogEntry, content_manifest_hash,
+        };
+
+        let mut simulation =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        simulation
+            .initialize_creature_host(WorldId::from_u128(10))
+            .unwrap();
+        let materials = simulation.world.materials().clone();
+        let catalog = HierarchyCatalog {
+            materials: materials.clone(),
+            asset: [CreatureAssetCatalogEntry {
+                uuid: [8; 16],
+                logical_hash: spall_protocol::Hash32([9; 32]),
+                part_ids: &[1, 2, 3],
+                clip_names: &["idle"],
+                portable_material_keys: &["fur", "hide"],
+            }],
+            species: [CreatureSpeciesCatalogEntry {
+                key: "deer",
+                version: 1,
+                enabled: true,
+                asset: CreatureAssetIdentity {
+                    uuid: [8; 16],
+                    logical_hash: spall_protocol::Hash32([9; 32]),
+                },
+            }],
+            mapping: [
+                CreatureMaterialMappingEntry {
+                    portable_key: "fur",
+                    material_id: MaterialId(1),
+                },
+                CreatureMaterialMappingEntry {
+                    portable_key: "hide",
+                    material_id: MaterialId(2),
+                },
+            ],
+        };
+        assert_eq!(
+            content_manifest_hash(&materials),
+            content_manifest_hash(simulation.world.materials())
+        );
+        let mut candidate_registry = simulation.world.registry().clone();
+        let volumes = [
+            candidate_registry.allocate_volume().unwrap(),
+            candidate_registry.allocate_volume().unwrap(),
+            candidate_registry.allocate_volume().unwrap(),
+        ];
+        let state = catalog.state(volumes);
+        let q90 = [
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ];
+        let authored = [
+            (None, PartTransform::IDENTITY),
+            (
+                Some(1),
+                PartTransform {
+                    translation_m: [1.0, 0.0, 0.0],
+                    rotation_xyzw: q90,
+                },
+            ),
+            (
+                Some(2),
+                PartTransform {
+                    translation_m: [1.0, 0.0, 0.0],
+                    rotation_xyzw: q90,
+                },
+            ),
+        ];
+        let sources = [
+            source_volume_material(volumes[0], MaterialId(1)),
+            source_volume_material(volumes[1], MaterialId(2)),
+            source_volume_material(volumes[2], MaterialId(1)),
+        ];
+        let owner = simulation
+            .commit_creature_birth_for_test(
+                state.clone(),
+                &catalog.view(),
+                (0..3)
+                    .map(|index| CreatureBirthPartInput {
+                        part_id: index as u32 + 1,
+                        parent_id: authored[index].0,
+                        local_transform: authored[index].1,
+                        volume: sources[index].clone(),
+                    })
+                    .collect(),
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        assert_eq!(
+            simulation.world.registry().counters().1,
+            candidate_registry.counters().1
+        );
+
+        let moving = [
+            (1, PartTransform::IDENTITY),
+            (
+                2,
+                PartTransform {
+                    translation_m: [1.25, 0.0, 0.0],
+                    rotation_xyzw: q90,
+                },
+            ),
+            (
+                3,
+                PartTransform {
+                    translation_m: [0.75, 0.5, 0.0],
+                    rotation_xyzw: q90,
+                },
+            ),
+        ];
+        simulation
+            .world
+            .physics_mut()
+            .update_articulated_pose(
+                owner,
+                ArticulatedPose {
+                    topology_token: state.aggregate_topology_revision,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: moving.to_vec(),
+                },
+            )
+            .unwrap();
+        simulation.world.step_physics();
+
+        let root_q = glam::Quat::from_xyzw(q90[0], q90[1], q90[2], q90[3]);
+        let root_t = glam::Vec3::new(10.0, 5.0, 10.0);
+        let compose = |parent: (glam::Vec3, glam::Quat), local: PartTransform| {
+            let q = glam::Quat::from_xyzw(
+                local.rotation_xyzw[0],
+                local.rotation_xyzw[1],
+                local.rotation_xyzw[2],
+                local.rotation_xyzw[3],
+            );
+            (
+                parent.0 + parent.1 * glam::Vec3::from_array(local.translation_m),
+                parent.1 * q,
+            )
+        };
+        let part1 = (root_t, root_q);
+        let part2 = compose(part1, moving[1].1);
+        let part3 = compose(part2, moving[2].1);
+        let rays: Vec<_> = [part1, part2, part3]
+            .into_iter()
+            .map(|(translation, rotation)| {
+                let center = translation + rotation * glam::Vec3::splat(0.125);
+                let origin = center - glam::Vec3::Z;
+                (
+                    [origin.x, origin.y, origin.z],
+                    [center.x, center.y, center.z],
+                )
+            })
+            .collect();
+        let mut baseline = Vec::new();
+        for (origin, _) in &rays {
+            let hit = simulation
+                .world
+                .physics_mut()
+                .raycast_articulated(owner, *origin, [0.0, 0.0, 1.0], 2.0)
+                .unwrap();
+            baseline.push((hit.part_id, hit.volume_id, hit.cell));
+        }
+        assert_eq!(
+            baseline.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+
+        let source_hash = simulation.world.creature_source_hash_for_test();
+        let transfer = simulation
+            .commit_creature_death_for_test(
+                state.key,
+                state.state_revision,
+                state.aggregate_topology_revision,
+                1,
+                &catalog.view(),
+            )
+            .unwrap();
+        let cell_volume = 0.25_f64.powi(3);
+        let expected_mass = cell_volume
+            * (simulation.world.density(MaterialId(1)) * 2.0
+                + simulation.world.density(MaterialId(2)));
+        assert!((transfer.mass_kg - expected_mass).abs() < 1.0e-5);
+        assert_eq!(
+            simulation.world.creature_source_hash_for_test(),
+            source_hash
+        );
+        let hierarchy = simulation
+            .world
+            .creature_hierarchy_for_test(state.key)
+            .unwrap();
+        assert_eq!(hierarchy.len(), 3);
+        for (index, part) in hierarchy.iter().enumerate() {
+            assert_eq!(part.part_id, index as u32 + 1);
+            assert_eq!(part.parent_id, authored[index].0);
+            assert_eq!(
+                part.initial_local_transform.translation_m,
+                authored[index].1.translation_m
+            );
+            assert_eq!(
+                part.frozen_local_transform.translation_m,
+                moving[index].1.translation_m
+            );
+            for (actual, expected) in part
+                .initial_local_transform
+                .rotation_xyzw
+                .iter()
+                .zip(authored[index].1.rotation_xyzw)
+                .chain(
+                    part.frozen_local_transform
+                        .rotation_xyzw
+                        .iter()
+                        .zip(moving[index].1.rotation_xyzw),
+                )
+            {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+            assert_eq!(
+                simulation
+                    .world
+                    .creature_source_owner_for_test(volumes[index]),
+                Some((state.key, index as u32 + 1))
+            );
+            assert_eq!(
+                simulation
+                    .world
+                    .creature_source_part_for_test(state.key, index as u32 + 1)
+                    .unwrap()
+                    .id(),
+                volumes[index]
+            );
+        }
+        for ((origin, _), expected) in rays.iter().zip(baseline) {
+            let hit = simulation
+                .world
+                .physics_mut()
+                .raycast_articulated(owner, *origin, [0.0, 0.0, 1.0], 2.0)
+                .unwrap();
+            assert_eq!((hit.part_id, hit.volume_id, hit.cell), expected);
+        }
+        let corpse = simulation
+            .creatures
+            .as_ref()
+            .unwrap()
+            .record(state.key.creature_id)
+            .unwrap();
+        assert_eq!(
+            corpse.material_manifest_hash,
+            content_manifest_hash(simulation.world.materials())
+        );
+        assert_eq!(
+            spall_protocol::creature_material_mapping_hash(&catalog.mapping).unwrap(),
+            corpse.material_mapping_hash
+        );
+        assert_eq!(
+            simulation.world.physics().articulated_collider_count(owner),
+            3
         );
     }
 
@@ -767,6 +1276,17 @@ impl Simulation {
     ) -> Result<spall_physics::ArticulatedBodyId, crate::creatures::CreatureScheduleError> {
         use crate::creatures::CreatureScheduleError;
         use spall_physics::{OccupancyGrid, SourcePart};
+        use spall_protocol::{CreatureClipMode, CreatureLifecycleState, content_manifest_hash};
+
+        if state.lifecycle != CreatureLifecycleState::Alive
+            || state.clip_mode != CreatureClipMode::Playing
+            || state.linear_velocity_m_s != [0.0; 3]
+            || state.angular_velocity_rad_s != [0.0; 3]
+            || content_manifest_hash(catalog.materials)
+                != content_manifest_hash(self.world.materials())
+        {
+            return Err(CreatureScheduleError::InvalidBatch);
+        }
 
         let mut candidate_host = self
             .creatures
@@ -784,6 +1304,21 @@ impl Simulation {
             return Err(CreatureScheduleError::InvalidBatch);
         }
         let mut candidate_registry = self.world.registry().clone();
+        let asset = catalog
+            .assets
+            .iter()
+            .find(|asset| {
+                asset.uuid == state.asset.uuid && asset.logical_hash == state.asset.logical_hash
+            })
+            .ok_or(CreatureScheduleError::InvalidBatch)?;
+        let portable_keys: std::collections::BTreeSet<_> =
+            asset.portable_material_keys.iter().copied().collect();
+        let mapped_materials: std::collections::BTreeSet<_> = catalog
+            .material_mapping
+            .iter()
+            .filter(|entry| portable_keys.contains(entry.portable_key))
+            .map(|entry| entry.material_id)
+            .collect();
         let mut source_volumes = Vec::with_capacity(parts.len());
         let mut physics_parts = Vec::with_capacity(parts.len());
         for (input, binding) in parts.into_iter().zip(&state.source_bindings) {
@@ -793,13 +1328,23 @@ impl Simulation {
             if input.part_id != binding.part_id
                 || input.volume.id() != binding.source_volume_id
                 || allocated != binding.source_volume_id
-                || creature_source_revision(&input.volume) != Some(binding.source_revision)
             {
                 return Err(CreatureScheduleError::InvalidBatch);
             }
             let grid = OccupancyGrid::from_volume(&input.volume)
                 .map_err(|_| CreatureScheduleError::InvalidBatch)?
                 .ok_or(CreatureScheduleError::InvalidBatch)?;
+            let mut materials_valid = true;
+            grid.for_each_solid(|_, _, _, material| {
+                materials_valid &= self.world.materials().contains(material)
+                    && mapped_materials.contains(&material);
+            });
+            if !materials_valid {
+                return Err(CreatureScheduleError::InvalidBatch);
+            }
+            let freshness =
+                creature_source_freshness(&input.volume, input.parent_id, input.local_transform)
+                    .ok_or(CreatureScheduleError::InvalidBatch)?;
             let cell_m = input.volume.cell_size().metres() as f32;
             physics_parts.push(SourcePart {
                 part_id: input.part_id,
@@ -810,10 +1355,14 @@ impl Simulation {
                 cell_m,
                 local_transform: input.local_transform,
             });
-            source_volumes.push((input.part_id, input.volume));
+            source_volumes.push((input.part_id, input.volume, freshness));
         }
+        let source_volumes_for_validation: Vec<_> = source_volumes
+            .iter()
+            .map(|(part_id, volume, _)| (*part_id, volume.clone()))
+            .collect();
         self.world
-            .validate_creature_sources_for_test(state.key, &source_volumes)
+            .validate_creature_sources_for_test(state.key, &source_volumes_for_validation)
             .map_err(|_| CreatureScheduleError::InvalidBatch)?;
 
         let translation = self
@@ -835,7 +1384,7 @@ impl Simulation {
             .map_err(|_| CreatureScheduleError::InvalidBatch)?;
 
         self.world
-            .publish_creature_sources_for_test(state.key, source_volumes);
+            .publish_creature_sources_with_metadata_for_test(state.key, source_volumes);
         self.world
             .set_creature_physics_owner_for_test(state.key, physics_owner);
         self.world.registry_mut().clone_from(&candidate_registry);
@@ -864,9 +1413,29 @@ impl Simulation {
         if current.lifecycle != CreatureLifecycleState::Alive
             || current.state_revision != expected_state_revision
             || current.aggregate_topology_revision != expected_topology_token
+            || spall_protocol::content_manifest_hash(catalog.materials)
+                != spall_protocol::content_manifest_hash(self.world.materials())
         {
             return Err(CreatureScheduleError::Stale);
         }
+        current
+            .validate(catalog)
+            .map_err(|_| CreatureScheduleError::Stale)?;
+        let asset = catalog
+            .assets
+            .iter()
+            .find(|asset| {
+                asset.uuid == current.asset.uuid && asset.logical_hash == current.asset.logical_hash
+            })
+            .ok_or(CreatureScheduleError::Stale)?;
+        let portable_keys: std::collections::BTreeSet<_> =
+            asset.portable_material_keys.iter().copied().collect();
+        let mapped_materials: std::collections::BTreeSet<_> = catalog
+            .material_mapping
+            .iter()
+            .filter(|entry| portable_keys.contains(entry.portable_key))
+            .map(|entry| entry.material_id)
+            .collect();
         for binding in &current.source_bindings {
             let source = self
                 .world
@@ -877,8 +1446,46 @@ impl Simulation {
                 .creature_source_owner_for_test(binding.source_volume_id)
                 != Some((key, binding.part_id))
                 || source.id() != binding.source_volume_id
-                || creature_source_revision(source) != Some(binding.source_revision)
             {
+                return Err(CreatureScheduleError::Stale);
+            }
+            let Some(metadata) = self
+                .world
+                .creature_source_metadata_for_test(key, binding.part_id)
+            else {
+                return Err(CreatureScheduleError::Stale);
+            };
+            let current_revisions: Vec<_> = source
+                .resident_brick_coords()
+                .into_iter()
+                .map(|coord| {
+                    source
+                        .brick_revision(coord)
+                        .ok()
+                        .flatten()
+                        .map(|revision| (coord, revision.0))
+                })
+                .collect::<Option<_>>()
+                .ok_or(CreatureScheduleError::Stale)?;
+            if metadata.state_stamp != source.state_stamp()
+                || metadata.content_hash
+                    != crate::world::volume_topology_hash_for(
+                        source,
+                        spall_protocol::CanonicalOwner::Terrain,
+                    )
+                || metadata.brick_revisions != current_revisions
+            {
+                return Err(CreatureScheduleError::Stale);
+            }
+            let grid = spall_physics::OccupancyGrid::from_volume(source)
+                .map_err(|_| CreatureScheduleError::Stale)?
+                .ok_or(CreatureScheduleError::Stale)?;
+            let mut materials_valid = true;
+            grid.for_each_solid(|_, _, _, material| {
+                materials_valid &= self.world.materials().contains(material)
+                    && mapped_materials.contains(&material);
+            });
+            if !materials_valid {
                 return Err(CreatureScheduleError::Stale);
             }
         }
@@ -940,7 +1547,6 @@ impl Simulation {
         corpse.angular_velocity_rad_s = live.root.angvel_rad_s;
 
         let mut candidate_host = self.creatures.as_ref().unwrap().clone();
-        candidate_host.replace_record_for_lifecycle_test(corpse, catalog)?;
 
         // Density is read from the Simulation's immutable material manifest,
         // and the exact materials present in source cells are preflighted
@@ -968,17 +1574,27 @@ impl Simulation {
         }
         let density = |material| densities.get(&material).copied().unwrap_or(0.0);
 
-        // The transfer API validates and prepares all source mass/colliders
-        // before replacing its live kinematic owner. It is the final fallible
-        // operation; the host candidate swap after success cannot fail.
+        // The adapter invokes this closure after exact mass/resultant motion
+        // and collider preparation, before changing physics ownership. It
+        // validates the final DTO/host candidate so no fallible step follows
+        // the physical transfer.
         let outcome = self
             .world
             .physics_mut()
-            .transfer_articulated_to_dynamic_corpse(
+            .transfer_articulated_to_dynamic_corpse_checked(
                 physics_owner,
                 expected_topology_token,
                 expected_pose_token,
                 density,
+                |outcome| {
+                    corpse.linear_velocity_m_s =
+                        outcome.linear_velocity_m_s.map(|value| value as f32);
+                    corpse.angular_velocity_rad_s =
+                        outcome.angular_velocity_rad_s.map(|value| value as f32);
+                    candidate_host
+                        .replace_record_for_lifecycle_test(corpse, catalog)
+                        .is_ok()
+                },
             )
             .map_err(|_| CreatureScheduleError::InvalidBatch)?;
         self.world
