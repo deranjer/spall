@@ -529,11 +529,9 @@ fn validated_nonempty_birth_round_trips_as_an_ordered_operation() {
     assert_eq!(reduced.record.components[0].source_masks[0].cells.len(), 1);
 }
 
-#[test]
-fn validated_three_part_sources_require_bulk_instead_of_a_control_frame() {
-    let mut f = Fixture::new();
+fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV1 {
     f.assets[0].part_ids = &[1, 2, 3];
-    let mut after = owner(&f);
+    let mut after = owner(f);
     let source = after.parts[0].clone();
     let mask = after.components[0].source_masks[0].clone();
     after.parts.clear();
@@ -559,17 +557,23 @@ fn validated_three_part_sources_require_bulk_instead_of_a_control_frame() {
         after.components[0].source_masks.push(part_mask);
     }
     after.validate(&f.catalog()).unwrap();
-    let commit = CreatureLifecycleCommitV1 {
+    CreatureLifecycleCommitV1 {
         schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
-        change: birth(after.clone()),
+        change: birth(after),
         expected_before_topology_hash: Hash32::ZERO,
         pre_motion: None,
         death_witness: None,
-    };
+    }
+}
+
+#[test]
+fn validated_three_part_sources_require_bulk_instead_of_a_control_frame() {
+    let mut f = Fixture::new();
+    let commit = validated_three_part_commit(&mut f);
     let reduced = commit
         .validate_and_reduce(None, context(7, 1, 100), &f.catalog())
         .unwrap();
-    assert_eq!(reduced.record, after);
+    assert_eq!(reduced.record.parts.len(), 3);
     let tx = TopologyTransaction {
         transaction_id: commit.change.transaction_id,
         server_tick: spall_core::Tick(9),
@@ -586,9 +590,269 @@ fn validated_three_part_sources_require_bulk_instead_of_a_control_frame() {
     tx.validate().unwrap();
     let body_bytes = postcard::experimental::serialized_size(&tx).unwrap();
     println!(
-        "three-part ownership fixture control body: {body_bytes} bytes; cap: {}",
+        "validated three-part control body: {body_bytes} bytes; cap: {}",
         limits::MAX_CONTROL_RECORD
     );
     assert!(body_bytes > limits::MAX_CONTROL_RECORD);
     assert!(matches!(encode_control(&tx), Err(CodecError::Size(_))));
+}
+
+#[test]
+fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_semantics() {
+    use std::io::Read;
+
+    let mut f = Fixture::new();
+    let commit = validated_three_part_commit(&mut f);
+    let transaction_id = commit.change.transaction_id;
+    let payload = CreatureLifecycleBulkPayloadV1::new(transaction_id, 0, commit.clone()).unwrap();
+    let compressed = payload.encode_compressed().unwrap();
+    let mut decoder = zstd::stream::Decoder::new(compressed.as_slice()).unwrap();
+    let mut raw = Vec::new();
+    decoder.read_to_end(&mut raw).unwrap();
+    println!(
+        "validated three-part lifecycle bulk payload: {} raw bytes, {} compressed bytes",
+        raw.len(),
+        compressed.len()
+    );
+    assert!(raw.len() > limits::MAX_CONTROL_RECORD);
+    let decoded = CreatureLifecycleBulkPayloadV1::decode_compressed(
+        &compressed,
+        transaction_id,
+        0,
+        payload.commit_hash,
+    )
+    .unwrap();
+    assert_eq!(decoded, payload);
+    assert_eq!(postcard::to_stdvec(&payload).unwrap(), raw);
+
+    let marker = TopologyOp::CreatureLifecycleBulk {
+        operation_ordinal: 0,
+        payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        commit_hash: payload.commit_hash,
+        transfer_id: 77,
+    };
+    let tx = TopologyTransaction {
+        transaction_id,
+        server_tick: spall_core::Tick(9),
+        control_seq: ControlSeq(10),
+        algorithm_version: 1,
+        dependencies: vec![],
+        before: vec![],
+        after: vec![],
+        ops: vec![marker],
+        result_hashes: vec![],
+    };
+    tx.validate().unwrap();
+    let marker_bytes = encode_control(&tx).unwrap();
+    assert_eq!(
+        decode_control::<TopologyTransaction>(&marker_bytes).unwrap(),
+        tx
+    );
+    assert_eq!(tx.bulk_transfer_ids(), [77]);
+
+    let wrong_correlation = CreatureLifecycleBulkPayloadV1::decode_compressed(
+        &compressed,
+        spall_core::TransactionId::new(8).unwrap(),
+        0,
+        payload.commit_hash,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        wrong_correlation,
+        CreatureLifecycleBulkError::Correlation
+    ));
+
+    // Deliberately invalid nested bytes prove correlation is checked before
+    // the nested commit decoder is entered.
+    let mut hostile_outer = postcard::to_stdvec(&(
+        CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        transaction_id,
+        0_u32,
+        payload.commit_hash,
+    ))
+    .unwrap();
+    hostile_outer.push(0xff);
+    let hostile_compressed = zstd::stream::encode_all(hostile_outer.as_slice(), 0).unwrap();
+    assert!(matches!(
+        CreatureLifecycleBulkPayloadV1::decode_compressed(
+            &hostile_compressed,
+            spall_core::TransactionId::new(8).unwrap(),
+            0,
+            payload.commit_hash,
+        ),
+        Err(CreatureLifecycleBulkError::Correlation)
+    ));
+
+    let split_pair = TopologyTransaction {
+        ops: vec![
+            TopologyOp::SplitOffBulkBaseline {
+                source: VolumeId::new(100).unwrap(),
+                child: VolumeId::new(200).unwrap(),
+                child_entity: spall_core::EntityId::new(200).unwrap(),
+                transfer_id: 88,
+            },
+            TopologyOp::SplitOffBulkBaseline {
+                source: VolumeId::new(100).unwrap(),
+                child: VolumeId::new(201).unwrap(),
+                child_entity: spall_core::EntityId::new(201).unwrap(),
+                transfer_id: 88,
+            },
+            TopologyOp::SourcePatchBulkBaseline {
+                source: VolumeId::new(100).unwrap(),
+                transfer_id: 88,
+            },
+        ],
+        ..tx.clone()
+    };
+    assert!(split_pair.validate().is_ok());
+    assert_eq!(split_pair.bulk_transfer_ids(), [88]);
+
+    let reused_across_kinds = TopologyTransaction {
+        ops: vec![
+            TopologyOp::SplitOffBulkBaseline {
+                source: VolumeId::new(100).unwrap(),
+                child: VolumeId::new(200).unwrap(),
+                child_entity: spall_core::EntityId::new(200).unwrap(),
+                transfer_id: 77,
+            },
+            TopologyOp::CreatureLifecycleBulk {
+                operation_ordinal: 1,
+                payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+                commit_hash: payload.commit_hash,
+                transfer_id: 77,
+            },
+        ],
+        ..tx
+    };
+    assert!(reused_across_kinds.validate().is_err());
+}
+
+#[test]
+fn lifecycle_bulk_rejects_nested_hash_mismatch_trailing_bytes_and_bad_zstd() {
+    let mut f = Fixture::new();
+    let commit = validated_three_part_commit(&mut f);
+    let transaction_id = commit.change.transaction_id;
+    let payload = CreatureLifecycleBulkPayloadV1::new(transaction_id, 0, commit.clone()).unwrap();
+
+    let mut changed = commit.clone();
+    changed.expected_before_topology_hash = Hash32([0x5a; 32]);
+    let mut altered_raw = postcard::to_stdvec(&(
+        CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        transaction_id,
+        0_u32,
+        payload.commit_hash,
+    ))
+    .unwrap();
+    altered_raw.extend(postcard::to_stdvec(&changed).unwrap());
+    let altered = zstd::stream::encode_all(altered_raw.as_slice(), 0).unwrap();
+    assert!(matches!(
+        CreatureLifecycleBulkPayloadV1::decode_compressed(
+            &altered,
+            transaction_id,
+            0,
+            payload.commit_hash,
+        ),
+        Err(CreatureLifecycleBulkError::CommitHash)
+    ));
+
+    let mut trailing_raw = postcard::to_stdvec(&payload).unwrap();
+    trailing_raw.push(0xaa);
+    let trailing = zstd::stream::encode_all(trailing_raw.as_slice(), 0).unwrap();
+    assert!(matches!(
+        CreatureLifecycleBulkPayloadV1::decode_compressed(
+            &trailing,
+            transaction_id,
+            0,
+            payload.commit_hash,
+        ),
+        Err(CreatureLifecycleBulkError::Postcard(_))
+    ));
+
+    assert!(matches!(
+        CreatureLifecycleBulkPayloadV1::decode_compressed(
+            &[0],
+            transaction_id,
+            0,
+            payload.commit_hash,
+        ),
+        Err(CreatureLifecycleBulkError::Zstd(_))
+    ));
+    let compressed = payload.encode_compressed().unwrap();
+    let truncated = &compressed[..compressed.len() / 2];
+    assert!(
+        CreatureLifecycleBulkPayloadV1::decode_compressed(
+            truncated,
+            transaction_id,
+            0,
+            payload.commit_hash,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn lifecycle_bulk_decode_caps_decompressed_payload_before_nested_decode() {
+    let raw = vec![0_u8; MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED + 1];
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 0).unwrap();
+    assert!(matches!(
+        CreatureLifecycleBulkPayloadV1::decode_compressed(
+            &compressed,
+            spall_core::TransactionId::new(7).unwrap(),
+            0,
+            Hash32::ZERO,
+        ),
+        Err(CreatureLifecycleBulkError::DecompressedLimit(_))
+    ));
+}
+
+#[test]
+fn lifecycle_bulk_decode_rejects_compact_uniform_solid_work() {
+    let mut f = Fixture::new();
+    let mut commit = validated_three_part_commit(&mut f);
+    let record = match &mut commit.change.operation {
+        CreatureLifecycleOperationV1::Birth { after }
+        | CreatureLifecycleOperationV1::Death { after } => after,
+    };
+    let mut brick = record.parts[0].bricks[0].clone();
+    brick.cells = BaselineCells::Uniform(1);
+    record.parts[0].bricks = vec![brick; 32];
+    let transaction_id = commit.change.transaction_id;
+    let commit_hash = commit.canonical_hash();
+    let mut raw = postcard::to_stdvec(&(
+        CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        transaction_id,
+        0_u32,
+        commit_hash,
+    ))
+    .unwrap();
+    raw.extend(postcard::to_stdvec(&commit).unwrap());
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 0).unwrap();
+    assert!(matches!(
+        CreatureLifecycleBulkPayloadV1::decode_compressed(
+            &compressed,
+            transaction_id,
+            0,
+            commit_hash,
+        ),
+        Err(CreatureLifecycleBulkError::WorkLimit) | Err(CreatureLifecycleBulkError::Postcard(_))
+    ));
+}
+
+#[test]
+fn lifecycle_bulk_rejects_uniform_brick_hash_work_before_hashing() {
+    let mut f = Fixture::new();
+    let mut commit = validated_three_part_commit(&mut f);
+    let record = match &mut commit.change.operation {
+        CreatureLifecycleOperationV1::Birth { after }
+        | CreatureLifecycleOperationV1::Death { after } => after,
+    };
+    let mut dense_brick = record.parts[0].bricks[0].clone();
+    dense_brick.cells = BaselineCells::Uniform(1);
+    for _ in 0..32 {
+        record.parts[0].bricks.push(dense_brick.clone());
+    }
+    assert!(matches!(
+        CreatureLifecycleBulkPayloadV1::new(commit.change.transaction_id, 0, commit,),
+        Err(CreatureLifecycleBulkError::WorkLimit)
+    ));
 }

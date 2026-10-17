@@ -16,7 +16,7 @@ use crate::records::{Record, RecordError, WireTag};
 use crate::session::SessionId;
 
 /// Current wire protocol version. Bumped on any breaking record-layout change.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Fixed simulation and snapshot rates (Hz).
 pub const SERVER_TICK_HZ: u16 = 60;
@@ -212,15 +212,17 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_handshake_matches_wire_and_explicitly_refuses_v7() {
+    fn lifecycle_handshake_matches_wire_and_refuses_previous_wire_versions() {
         assert_eq!(PROTOCOL_VERSION, crate::WIRE_SCHEMA_VERSION);
         let server = server_handshake();
-        let mut old = server.clone();
-        old.protocol_version = 7;
-        assert!(matches!(
-            check_compatible(&old, &server),
-            Err(Incompatibility::ProtocolVersion { .. })
-        ));
+        for old_version in [7, 8] {
+            let mut old = server.clone();
+            old.protocol_version = old_version;
+            assert!(matches!(
+                check_compatible(&old, &server),
+                Err(Incompatibility::ProtocolVersion { .. })
+            ));
+        }
     }
 
     #[test]

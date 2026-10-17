@@ -1554,11 +1554,12 @@ impl ReplicaWorld {
                 };
             }
         };
-        if tx
-            .ops
-            .iter()
-            .any(|op| matches!(op, TopologyOp::CreatureLifecycle { .. }))
-        {
+        if tx.ops.iter().any(|op| {
+            matches!(
+                op,
+                TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
+            )
+        }) {
             return ApplyOutcome::Rejected {
                 reason: "creature lifecycle replay requires an installed actor candidate path"
                     .into(),
@@ -1671,6 +1672,7 @@ impl ReplicaWorld {
                     TopologyOp::SplitOffBulkBaseline { .. } => "split-bulk",
                     TopologyOp::SourcePatchBulkBaseline { .. } => "patch-bulk",
                     TopologyOp::CreatureLifecycle { .. } => "creature-lifecycle",
+                    TopologyOp::CreatureLifecycleBulk { .. } => "creature-lifecycle-bulk",
                 })
                 .collect();
             let before: Vec<String> = tx
@@ -2300,7 +2302,7 @@ fn topology_op_touches_volume(op: &TopologyOp, volume: VolumeId) -> bool {
         }
         TopologyOp::SourcePatchBaseline { source, .. }
         | TopologyOp::SourcePatchBulkBaseline { source, .. } => *source == volume,
-        TopologyOp::CreatureLifecycle { .. } => false,
+        TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. } => false,
     }
 }
 
@@ -2423,7 +2425,7 @@ fn replay_ops(
                 let bv = bulk_volume(*source)?;
                 patch_split_source(candidate, *source, bv, newer_only)?;
             }
-            TopologyOp::CreatureLifecycle { .. } => {
+            TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. } => {
                 return Err("creature lifecycle replay requires actor candidate path".into());
             }
         }

@@ -2440,7 +2440,12 @@ impl SimWorld {
         if tx
             .ops
             .iter()
-            .any(|op| matches!(op, TopologyOp::CreatureLifecycle { .. }))
+            .any(|op| {
+                matches!(
+                    op,
+                    TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
+                )
+            })
         {
             return Err(WorldError::ReplayResultHash(
                 "creature lifecycle replay requires Simulation ownership".into(),
@@ -2661,7 +2666,7 @@ impl SimWorld {
                     let bv = bulk_volume(*source)?;
                     self.patch_source_from_baseline(*source, bv, &mut touched)?;
                 }
-                TopologyOp::CreatureLifecycle { .. } => {
+                TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. } => {
                     unreachable!("preflight rejects creature lifecycle operations")
                 }
             }

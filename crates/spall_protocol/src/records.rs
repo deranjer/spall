@@ -21,10 +21,10 @@ use crate::limits::{
 };
 
 /// Schema version stamped into every encoded record header. A peer on another version cannot
-/// decode a single record, so mismatched builds refuse each other at the first message. Version 8
-/// appends the typed creature lifecycle operation to `TopologyOp`; live v7 frames remain rejected.
+/// decode a single record, so mismatched builds refuse each other at the first message. Version 9
+/// appends the typed creature lifecycle bulk marker to `TopologyOp`; live v8 frames remain rejected.
 /// Saved journals and live peers both reject older versions without migration.
-pub const WIRE_SCHEMA_VERSION: u16 = 8;
+pub const WIRE_SCHEMA_VERSION: u16 = 9;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -507,6 +507,14 @@ pub enum TopologyOp {
     CreatureLifecycle {
         commit: Box<crate::CreatureLifecycleCommitV1>,
     },
+    /// Marker for a lifecycle commit delivered through the ordered bulk stream.
+    /// World version 6 carries its bounded payload; this marker alone never applies an actor.
+    CreatureLifecycleBulk {
+        operation_ordinal: u32,
+        payload_schema: u16,
+        commit_hash: Hash32,
+        transfer_id: u64,
+    },
 }
 
 impl TopologyOp {
@@ -515,7 +523,8 @@ impl TopologyOp {
     pub fn bulk_transfer_id(&self) -> Option<u64> {
         match self {
             TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
-            | TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => Some(*transfer_id),
+            | TopologyOp::SourcePatchBulkBaseline { transfer_id, .. }
+            | TopologyOp::CreatureLifecycleBulk { transfer_id, .. } => Some(*transfer_id),
             _ => None,
         }
     }
@@ -602,7 +611,41 @@ impl Record for TopologyTransaction {
             }
         }
         let txid = self.transaction_id;
+        let mut lifecycle_transfer_ids = std::collections::BTreeSet::new();
+        let mut transfer_uses = std::collections::BTreeMap::<u64, [u8; 3]>::new();
         for (ordinal, op) in self.ops.iter().enumerate() {
+            let transfer_use = match op {
+                TopologyOp::SplitOffBulkBaseline { transfer_id, .. } => Some((*transfer_id, 0)),
+                TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => Some((*transfer_id, 1)),
+                TopologyOp::CreatureLifecycleBulk { transfer_id, .. } => Some((*transfer_id, 2)),
+                _ => None,
+            };
+            if let Some((id, kind)) = transfer_use {
+                let counts = transfer_uses.entry(id).or_default();
+                counts[kind] = counts[kind].saturating_add(1);
+            }
+            if let TopologyOp::CreatureLifecycleBulk {
+                operation_ordinal,
+                payload_schema,
+                transfer_id,
+                ..
+            } = op
+            {
+                let expected_ordinal =
+                    u32::try_from(ordinal).map_err(|_| RecordError::OutOfRange {
+                        field: "TopologyOp.CreatureLifecycleBulk.operation_ordinal",
+                        detail: "operation ordinal does not fit u32",
+                    })?;
+                if *operation_ordinal != expected_ordinal
+                    || *payload_schema != crate::CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA
+                    || *transfer_id == 0
+                    || !lifecycle_transfer_ids.insert(*transfer_id)
+                {
+                    return Err(RecordError::Inconsistent(
+                        "creature lifecycle bulk schema, ordinal, or transfer id is invalid",
+                    ));
+                }
+            }
             if let TopologyOp::CreatureLifecycle { commit } = op {
                 let ordinal = u32::try_from(ordinal).map_err(|_| RecordError::OutOfRange {
                     field: "TopologyOp.CreatureLifecycle.operation_ordinal",
@@ -619,11 +662,33 @@ impl Record for TopologyTransaction {
                 }
             }
         }
+        if transfer_uses.values().any(|counts| {
+            let total = counts
+                .iter()
+                .map(|count| usize::from(*count))
+                .sum::<usize>();
+            total > 1 && !(counts[0] > 0 && counts[1] <= 1 && counts[2] == 0)
+        }) {
+            return Err(RecordError::Inconsistent(
+                "bulk transfer id is reused outside one geometry split group",
+            ));
+        }
         Ok(())
     }
 }
 
 impl TopologyTransaction {
+    /// Sorted distinct transfer ids referenced by this transaction. Geometry split
+    /// source/child markers intentionally collapse to one attachment id.
+    pub fn bulk_transfer_ids(&self) -> Vec<u64> {
+        self.ops
+            .iter()
+            .filter_map(TopologyOp::bulk_transfer_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Identity of the ordered transaction payload, independent of the
     /// recipient's control-stream sequence. Repairs may resend the same
     /// transaction on a new sequence; changing any logical field is divergent.
@@ -669,7 +734,8 @@ impl TopologyTransaction {
                 TopologyOp::SplitOff { .. }
                 | TopologyOp::SplitOffBulkBaseline { .. }
                 | TopologyOp::SourcePatchBulkBaseline { .. }
-                | TopologyOp::CreatureLifecycle { .. } => continue,
+                | TopologyOp::CreatureLifecycle { .. }
+                | TopologyOp::CreatureLifecycleBulk { .. } => continue,
                 // A split baseline blob carries whole bricks: decode it and
                 // check every material it names against the manifest.
                 TopologyOp::SplitOffBaseline { blob, .. }
@@ -1107,12 +1173,12 @@ mod tests {
             tx
         );
         let mut old_wire = encoded.clone();
-        old_wire[..2].copy_from_slice(&7u16.to_le_bytes());
+        old_wire[..2].copy_from_slice(&8u16.to_le_bytes());
         assert!(matches!(
             crate::decode_control::<TopologyTransaction>(&old_wire),
             Err(crate::CodecError::SchemaVersion {
-                expected: 8,
-                found: 7
+                expected: 9,
+                found: 8
             })
         ));
         let mut multiple = tx.clone();

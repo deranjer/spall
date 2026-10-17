@@ -28,6 +28,7 @@ pub mod creature;
 pub mod creature_owner;
 pub mod handshake;
 pub mod input;
+pub mod lifecycle_bulk;
 pub mod limits;
 pub mod records;
 pub mod segment;
@@ -87,6 +88,10 @@ pub use handshake::{
     AlgorithmVersions, Handshake, Incompatibility, NegotiatedLimits, PROTOCOL_VERSION,
     check_compatible,
 };
+pub use lifecycle_bulk::{
+    CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA, CreatureLifecycleBulkError,
+    CreatureLifecycleBulkPayloadV1, MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
+};
 pub use limits::SizeLimitError;
 pub use records::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, BaselineAck, BaselineBegin,
@@ -97,6 +102,7 @@ pub use records::{
     SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq, TopologyOp, TopologyTransaction, TransferId,
     VolumeHash, WIRE_SCHEMA_VERSION, WORLD_RESET_TRANSFER_ID_BIT, WireTag,
 };
+pub use segment::BASELINE_CREATURE_LIFECYCLE_WORLD_VERSION;
 pub use session::{
     GenerationExhausted, PlayerId, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,
     StaleSession, StreamKind, StreamSeq,
