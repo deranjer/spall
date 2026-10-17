@@ -2053,3 +2053,14 @@ Production registration is unavailable pending atomic source ownership.
 Evidence: reports/ENG-215-integration.md. Next dependency-ready work: atomic
 actor lifecycle/source ownership. Network/durable/species integration and the
 fully simulated1024m weather launch remain pending.
+## ENG-216: atomic animal lifecycle and source-volume ownership
+
+Depends on accepted ENG-215. Dedicated animal-ownership worktree starts9733695.
+Design-first review covers separate creature source ownership, canonical hashes,
+existing transaction/journal ordering, physics prepare/commit and retirement.
+Preserve original VolumeIds/cell/material/revisions and checked stable counters;
+no ordinary one-volume BodyRecord workaround or alternate journal. Reject stale,
+duplicate/foreign and failed preparations atomically. Production registration
+stays gated if actor wire/store support is absent. Exact scope and required
+invariants are in Loopira ENG-216; coordinator review precedes shared edits.
+Next launch requirements remain species/habitat, replication and durable recovery.
