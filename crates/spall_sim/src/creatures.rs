@@ -9,14 +9,12 @@ use spall_core::{
     WorldId,
 };
 use spall_protocol::CreatureStateV1;
-#[cfg(test)]
 use spall_protocol::MAX_CREATURE_SOURCE_PARTS;
 
 pub const MAX_CREATURE_HOST_RECORDS: usize = 1_024;
 pub const MAX_CREATURE_SCHEDULE_SNAPSHOTS: usize = 64;
 pub const MAX_CREATURE_SCHEDULE_BINDINGS: usize = 1_024;
 pub const MAX_CREATURE_SCHEDULE_INTENTS: usize = 64;
-#[cfg(test)]
 const MAX_CREATURE_HOST_BINDINGS: usize = MAX_CREATURE_HOST_RECORDS * MAX_CREATURE_SOURCE_PARTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -121,12 +119,13 @@ pub struct CreatureScheduleReport {
     pub rejected: Option<CreatureScheduleError>,
 }
 
-#[cfg_attr(test, derive(Clone))]
+#[derive(Clone)]
 pub(crate) struct CreatureHost {
     allocator: CreatureAllocator,
     records: BTreeMap<CreatureId, CreatureStateV1>,
     schedule_cursor: Option<CreatureId>,
     schedule_epoch: u64,
+    revision: u64,
 }
 
 impl CreatureHost {
@@ -136,6 +135,7 @@ impl CreatureHost {
             records: BTreeMap::new(),
             schedule_cursor: None,
             schedule_epoch: 1,
+            revision: 1,
         })
     }
 
@@ -147,11 +147,16 @@ impl CreatureHost {
             records: BTreeMap::new(),
             schedule_cursor: None,
             schedule_epoch: 1,
+            revision: 1,
         })
     }
 
     pub(crate) fn allocator_snapshot(&self) -> CreatureAllocatorSnapshotV1 {
         self.allocator.snapshot()
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub(crate) fn preview_reset_epoch(&self) -> Result<WorldEpoch, IdError> {
@@ -167,11 +172,13 @@ impl CreatureHost {
             .schedule_epoch
             .checked_add(1)
             .ok_or(IdError::Exhausted)?;
+        let next_revision = self.revision.checked_add(1).ok_or(IdError::Exhausted)?;
         self.allocator.advance_world_epoch()?;
         debug_assert_eq!(self.allocator.world_epoch(), next_world_epoch);
         self.records.clear();
         self.schedule_cursor = None;
         self.schedule_epoch = next_schedule_epoch;
+        self.revision = next_revision;
         Ok(())
     }
 
@@ -187,7 +194,6 @@ impl CreatureHost {
 
     /// Crate-private until the atomic source ownership slice introduces the
     /// production registration transaction.
-    #[cfg(test)]
     pub(crate) fn register_validated(
         &mut self,
         state: CreatureStateV1,
@@ -213,6 +219,10 @@ impl CreatureHost {
         if binding_count.is_none_or(|count| count > MAX_CREATURE_HOST_BINDINGS) {
             return Err(CreatureScheduleError::Capacity);
         }
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(CreatureScheduleError::CounterExhausted)?;
         let mut volumes = BTreeSet::new();
         for existing in self.records.values() {
             volumes.extend(
@@ -237,11 +247,11 @@ impl CreatureHost {
             return Err(CreatureScheduleError::InvalidBatch);
         }
         self.records.insert(state.key.creature_id, state);
+        self.revision = next_revision;
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn replace_record_for_lifecycle_test(
+    pub(crate) fn replace_record_for_lifecycle(
         &mut self,
         state: CreatureStateV1,
         catalog: &spall_protocol::CreatureValidationCatalog<'_>,
@@ -261,13 +271,30 @@ impl CreatureHost {
         {
             return Err(CreatureScheduleError::Stale);
         }
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(CreatureScheduleError::CounterExhausted)?;
         self.records.insert(state.key.creature_id, state);
+        self.revision = next_revision;
         Ok(())
     }
 
     #[cfg(test)]
+    pub(crate) fn replace_record_for_lifecycle_test(
+        &mut self,
+        state: CreatureStateV1,
+        catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+    ) -> Result<(), CreatureScheduleError> {
+        self.replace_record_for_lifecycle(state, catalog)
+    }
+
     pub(crate) fn record(&self, id: CreatureId) -> Option<&CreatureStateV1> {
         self.records.get(&id)
+    }
+
+    pub(crate) fn records(&self) -> impl Iterator<Item = &CreatureStateV1> {
+        self.records.values()
     }
 
     pub(crate) fn schedule(
@@ -340,8 +367,13 @@ impl CreatureHost {
             report.rejected = Some(CreatureScheduleError::CounterExhausted);
             return report;
         };
+        let Some(next_revision) = self.revision.checked_add(1) else {
+            report.rejected = Some(CreatureScheduleError::CounterExhausted);
+            return report;
+        };
         self.schedule_cursor = keys.get(snapshots.len().saturating_sub(1)).copied();
         self.schedule_epoch = next_epoch;
+        self.revision = next_revision;
         report.accepted_intents = writer.intents;
         report
     }

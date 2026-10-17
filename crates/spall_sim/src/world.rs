@@ -9,11 +9,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use glam::DQuat;
-#[cfg(test)]
-use spall_core::CreatureKey;
 use spall_core::{
-    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, MaterialId, PlayerInput, Revision,
-    VolumeId,
+    BrickCoord, CellSizeCode, CreatureKey, EntityId, GlobalCell, IdError, MaterialId, PlayerInput,
+    Revision, VolumeId,
 };
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
@@ -201,6 +199,12 @@ pub(crate) struct PreparedTerrainBrickPublication {
     localized_grid: Option<(OccupancyGrid, [f32; 3])>,
 }
 
+impl PreparedTerrainBrickPublication {
+    pub(crate) fn adds_body_slot(&self) -> bool {
+        self.existing.is_none() && self.localized_grid.is_some()
+    }
+}
+
 /// Exact world/target/collider read set captured by a prepared geometry commit.
 /// Kept private to simulation so it cannot become a second public transaction API.
 pub(crate) struct GeometryCommitFence {
@@ -308,13 +312,11 @@ pub struct SimWorld {
     /// one; with `None`, an edit that needs evicted geometry is rejected rather
     /// than reloaded.
     backing: Option<std::sync::Arc<dyn crate::backing::BrickBacking>>,
-    /// In-memory ownership fixture only. Actor sources deliberately remain
-    /// outside Body/volume_owner until ordered lifecycle replay exists.
-    #[cfg(test)]
+    /// Actor source volumes remain separate from ordinary Body lookup. Ordered
+    /// lifecycle commits are the only production mutation path.
     creature_sources: CreatureSourceStore,
 }
 
-#[cfg(test)]
 #[derive(Default)]
 struct CreatureSourceStore {
     owners: BTreeMap<CreatureKey, BTreeMap<u32, Volume>>,
@@ -326,7 +328,6 @@ struct CreatureSourceStore {
 
 /// Immutable source provenance and authored hierarchy needed to reconstruct a
 /// part without retaining any physics-library handles.
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreatureSourceMetadata {
     pub parent_id: Option<u32>,
@@ -336,8 +337,8 @@ pub(crate) struct CreatureSourceMetadata {
     pub brick_revisions: Vec<(BrickCoord, u64)>,
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(test)]
 pub(crate) struct CreatureHierarchyPartSnapshot {
     pub part_id: u32,
     pub parent_id: Option<u32>,
@@ -469,7 +470,6 @@ impl SimWorld {
             window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
             backing: None,
-            #[cfg(test)]
             creature_sources: CreatureSourceStore::default(),
         };
         if mode == TerrainColliderMode::PerBrick {
@@ -1286,12 +1286,11 @@ impl SimWorld {
     }
 
     /// Validates a private in-memory source ownership candidate. This does not
-    /// publish actor volumes into ordinary Body lookup or transaction state.
-    #[cfg(test)]
-    pub(crate) fn validate_creature_sources_for_test(
+    /// publish actor volumes into ordinary Body lookup or volume hashes.
+    pub(crate) fn validate_creature_sources<T: std::borrow::Borrow<Volume>>(
         &self,
         key: CreatureKey,
-        parts: &[(u32, Volume)],
+        parts: &[(u32, T)],
     ) -> Result<(), &'static str> {
         key.validate().map_err(|_| "invalid creature key")?;
         if parts.is_empty() || parts.len() > spall_protocol::MAX_CREATURE_SOURCE_PARTS {
@@ -1303,6 +1302,7 @@ impl SimWorld {
         let mut part_ids = std::collections::BTreeSet::new();
         let mut volume_ids = std::collections::BTreeSet::new();
         for (part_id, volume) in parts {
+            let volume = volume.borrow();
             if *part_id == 0 || !part_ids.insert(*part_id) {
                 return Err("source part IDs must be unique and nonzero");
             }
@@ -1336,11 +1336,7 @@ impl SimWorld {
 
     /// Publishes a prevalidated source candidate without a fallible step.
     #[cfg(test)]
-    pub(crate) fn publish_creature_sources_for_test(
-        &mut self,
-        key: CreatureKey,
-        parts: Vec<(u32, Volume)>,
-    ) {
+    pub(crate) fn publish_creature_sources(&mut self, key: CreatureKey, parts: Vec<(u32, Volume)>) {
         let parts = parts
             .into_iter()
             .map(|(part_id, volume)| {
@@ -1365,23 +1361,18 @@ impl SimWorld {
                 (part_id, volume, metadata)
             })
             .collect();
-        self.publish_creature_sources_with_metadata_for_test(key, parts);
+        self.publish_creature_sources_with_metadata(key, parts);
     }
 
-    #[cfg(test)]
-    pub(crate) fn publish_creature_sources_with_metadata_for_test(
+    pub(crate) fn publish_creature_sources_with_metadata(
         &mut self,
         key: CreatureKey,
         parts: Vec<(u32, Volume, CreatureSourceMetadata)>,
     ) {
-        let validation_parts: Vec<_> = parts
-            .iter()
-            .map(|(part_id, volume, _)| (*part_id, volume.clone()))
-            .collect();
-        debug_assert!(
-            self.validate_creature_sources_for_test(key, &validation_parts)
-                .is_ok()
-        );
+        // The caller validated this complete source set while it was still a
+        // candidate. Publication intentionally does not re-run fallible or
+        // potentially large source validation after another transaction
+        // participant has published.
         let mut owner_parts = BTreeMap::new();
         let mut metadata = BTreeMap::new();
         for (part_id, volume, source_metadata) in parts {
@@ -1396,8 +1387,7 @@ impl SimWorld {
         self.creature_sources.metadata.insert(key, metadata);
     }
 
-    #[cfg(test)]
-    pub(crate) fn creature_source_metadata_for_test(
+    pub(crate) fn creature_source_metadata(
         &self,
         key: CreatureKey,
         part_id: u32,
@@ -1405,25 +1395,16 @@ impl SimWorld {
         self.creature_sources.metadata.get(&key)?.get(&part_id)
     }
 
-    #[cfg(test)]
-    pub(crate) fn creature_source_owner_for_test(
-        &self,
-        volume: VolumeId,
-    ) -> Option<(CreatureKey, u32)> {
+    pub(crate) fn creature_source_owner(&self, volume: VolumeId) -> Option<(CreatureKey, u32)> {
         self.creature_sources.volume_owner.get(&volume).copied()
     }
 
-    #[cfg(test)]
-    pub(crate) fn creature_source_part_for_test(
-        &self,
-        key: CreatureKey,
-        part_id: u32,
-    ) -> Option<&Volume> {
+    pub(crate) fn creature_source_part(&self, key: CreatureKey, part_id: u32) -> Option<&Volume> {
         self.creature_sources.owners.get(&key)?.get(&part_id)
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_creature_source_for_test(
+    pub(crate) fn replace_creature_source(
         &mut self,
         key: CreatureKey,
         part_id: u32,
@@ -1442,8 +1423,7 @@ impl SimWorld {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_creature_physics_owner_for_test(
+    pub(crate) fn set_creature_physics_owner(
         &mut self,
         key: CreatureKey,
         owner: spall_physics::ArticulatedBodyId,
@@ -1452,16 +1432,14 @@ impl SimWorld {
         self.creature_sources.physics_owner.insert(key, owner);
     }
 
-    #[cfg(test)]
-    pub(crate) fn creature_physics_owner_for_test(
+    pub(crate) fn creature_physics_owner(
         &self,
         key: CreatureKey,
     ) -> Option<spall_physics::ArticulatedBodyId> {
         self.creature_sources.physics_owner.get(&key).copied()
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_creature_frozen_poses_for_test(
+    pub(crate) fn set_creature_frozen_poses(
         &mut self,
         key: CreatureKey,
         mut poses: Vec<(u32, spall_physics::PartTransform)>,
@@ -1472,7 +1450,7 @@ impl SimWorld {
     }
 
     #[cfg(test)]
-    pub(crate) fn creature_hierarchy_for_test(
+    pub(crate) fn creature_hierarchy(
         &self,
         key: CreatureKey,
     ) -> Option<Vec<CreatureHierarchyPartSnapshot>> {
@@ -1497,7 +1475,7 @@ impl SimWorld {
     }
 
     #[cfg(test)]
-    pub(crate) fn creature_frozen_poses_for_test(
+    pub(crate) fn creature_frozen_poses(
         &self,
         key: CreatureKey,
     ) -> Option<&[(u32, spall_physics::PartTransform)]> {
@@ -3552,15 +3530,11 @@ mod creature_source_owner_tests {
         let source = source(&mut world);
         let id = source.id();
         let candidate = vec![(7, source.clone())];
-        assert!(
-            world
-                .validate_creature_sources_for_test(key(1), &candidate)
-                .is_ok()
-        );
+        assert!(world.validate_creature_sources(key(1), &candidate).is_ok());
         let before = world.creature_source_hash_for_test();
-        world.publish_creature_sources_for_test(key(1), candidate);
+        world.publish_creature_sources(key(1), candidate);
 
-        assert_eq!(world.creature_source_owner_for_test(id), Some((key(1), 7)));
+        assert_eq!(world.creature_source_owner(id), Some((key(1), 7)));
         assert!(world.volume_ref(id).is_none());
         assert!(world.body_by_volume(id).is_none());
         assert_ne!(world.creature_source_hash_for_test(), before);
@@ -3571,10 +3545,10 @@ mod creature_source_owner_tests {
         // A second logical actor cannot claim the same original source volume.
         assert!(
             world
-                .validate_creature_sources_for_test(key(2), &[(8, source)])
+                .validate_creature_sources(key(2), &[(8, source)])
                 .is_err()
         );
-        assert_eq!(world.creature_source_owner_for_test(id), Some((key(1), 7)));
+        assert_eq!(world.creature_source_owner(id), Some((key(1), 7)));
     }
 
     #[test]
@@ -3583,15 +3557,85 @@ mod creature_source_owner_tests {
         let source = source(&mut world);
         let candidate = vec![(3, source.clone()), (3, source)];
         let hash_before = world.creature_source_hash_for_test();
-        assert!(
-            world
-                .validate_creature_sources_for_test(key(1), &candidate)
-                .is_err()
-        );
+        assert!(world.validate_creature_sources(key(1), &candidate).is_err());
         assert_eq!(world.creature_source_hash_for_test(), hash_before);
-        assert_eq!(
-            world.creature_source_owner_for_test(candidate[0].1.id()),
-            None
-        );
+        assert_eq!(world.creature_source_owner(candidate[0].1.id()), None);
+    }
+
+    #[test]
+    fn geometry_replay_rejects_inline_and_bulk_lifecycle_before_mutation() {
+        use spall_core::{Tick, TransactionId};
+        use spall_protocol::{
+            CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA,
+            CreatureLifecycleChangeV1, CreatureLifecycleCommitV1, CreatureLifecycleOperationV1,
+            CreatureOwnershipRecordV1, Hash32, TopologyOp, TopologyTransaction,
+        };
+
+        let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
+        let catalog = crate::creatures::tests::FixtureCatalog::new();
+        let state = catalog.state(1, 1001);
+        let empty_record = CreatureOwnershipRecordV1 {
+            schema: CREATURE_OWNER_SCHEMA,
+            state,
+            owner_key: 1,
+            source_generation: 1,
+            next_component_serial: 1,
+            parts: Vec::new(),
+            components: Vec::new(),
+        };
+        let txid = TransactionId::new(1).unwrap();
+        let inline = TopologyOp::CreatureLifecycle {
+            commit: Box::new(CreatureLifecycleCommitV1 {
+                schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+                change: CreatureLifecycleChangeV1 {
+                    schema: CREATURE_CHANGE_SCHEMA,
+                    transaction_id: txid,
+                    operation_ordinal: 0,
+                    expected_before_hash: Hash32::ZERO,
+                    expected_after_hash: Hash32::ZERO,
+                    operation: CreatureLifecycleOperationV1::Birth {
+                        after: empty_record,
+                    },
+                },
+                expected_before_topology_hash: Hash32::ZERO,
+                pre_motion: None,
+                death_witness: None,
+            }),
+        };
+        let bulk = TopologyOp::CreatureLifecycleBulk {
+            operation_ordinal: 0,
+            payload_schema: spall_protocol::CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+            commit_hash: Hash32::ZERO,
+            transfer_id: 1,
+        };
+
+        for op in [inline, bulk] {
+            let transaction = TopologyTransaction {
+                transaction_id: txid,
+                server_tick: Tick(1),
+                control_seq: spall_protocol::ControlSeq(1),
+                algorithm_version: 1,
+                dependencies: Vec::new(),
+                before: Vec::new(),
+                after: Vec::new(),
+                ops: vec![op],
+                result_hashes: Vec::new(),
+            };
+            let before = (
+                world.world_hash(),
+                world.registry().counters(),
+                world.physics().body_count(),
+            );
+            assert!(world.replay_transaction(&transaction, &[], None).is_err());
+            assert_eq!(
+                (
+                    world.world_hash(),
+                    world.registry().counters(),
+                    world.physics().body_count()
+                ),
+                before,
+                "geometry-only replay must reject actor payloads without partial mutation"
+            );
+        }
     }
 }

@@ -192,15 +192,10 @@ fn world_reset_retires_source_and_physics_without_reusing_identity() {
     assert!(
         f.sim
             .world
-            .creature_source_owner_for_test(state.source_bindings[0].source_volume_id)
+            .creature_source_owner(state.source_bindings[0].source_volume_id)
             .is_none()
     );
-    assert!(
-        f.sim
-            .world
-            .creature_physics_owner_for_test(state.key)
-            .is_none()
-    );
+    assert!(f.sim.world.creature_physics_owner(state.key).is_none());
     assert!(
         f.sim
             .world

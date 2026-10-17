@@ -27,15 +27,9 @@ fn record_from_sim(
     state: spall_protocol::CreatureStateV1,
 ) -> CreatureOwnershipRecordV1 {
     let local_poses = if state.lifecycle == spall_protocol::CreatureLifecycleState::Corpse {
-        sim.world
-            .creature_frozen_poses_for_test(state.key)
-            .unwrap()
-            .to_vec()
+        sim.world.creature_frozen_poses(state.key).unwrap().to_vec()
     } else {
-        let owner = sim
-            .world
-            .creature_physics_owner_for_test(state.key)
-            .unwrap();
+        let owner = sim.world.creature_physics_owner(state.key).unwrap();
         sim.world
             .physics()
             .articulated_pose_snapshot(owner)
@@ -47,7 +41,7 @@ fn record_from_sim(
     for entry in &state.source_bindings {
         let volume = sim
             .world
-            .creature_source_part_for_test(state.key, entry.part_id)
+            .creature_source_part(state.key, entry.part_id)
             .unwrap();
         let baseline = crate::replication::baseline_volume_of(volume, BaselineOwner::Terrain, None);
         let mut source_masks = Vec::new();
@@ -106,7 +100,7 @@ fn record_from_sim(
             .collect::<Vec<_>>();
         let metadata = sim
             .world
-            .creature_source_metadata_for_test(state.key, entry.part_id)
+            .creature_source_metadata(state.key, entry.part_id)
             .unwrap();
         let local_pose = local_poses
             .iter()
@@ -313,10 +307,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     );
     assert_eq!(birth_candidate.next_volume_id, next_volume_id + 3);
 
-    let owner = sim
-        .world
-        .creature_physics_owner_for_test(state.key)
-        .unwrap();
+    let owner = sim.world.creature_physics_owner(state.key).unwrap();
     sim.world
         .physics_mut()
         .update_articulated_pose(
@@ -367,7 +358,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     after.validate(&catalog).unwrap();
     let frozen_local_poses = sim
         .world
-        .creature_frozen_poses_for_test(state.key)
+        .creature_frozen_poses(state.key)
         .unwrap()
         .iter()
         .map(|(id, transform)| (*id, pose(*transform)))
