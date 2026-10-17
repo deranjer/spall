@@ -2102,3 +2102,15 @@ and source-edit synchronization boundaries explicitly; unsupported paths remain
 closed. No separate journal or unjournaled sequence consumption. Production
 registration stays disabled until baseline/replica and checkpoint/recovery
 consumers are implemented. Exact scoped acceptance is on Loopira ENG-217.
+ENG-217 design review: exact wire schema7 and store schema3 embed framed topology
+bytes, so adding lifecycle operations safely requires coordinated consumers.
+Approved current slice: canonical portable actor/source records plus one reusable
+pure candidate reducer. No independent actor sequence/ledger/journal, no current
+TopologyTransaction/wire/baseline/store version mutation. Later consumers wrap
+these same records/reducer in existing order with explicit compatibility gates.
+Runtime source stamps never serialize; portable generation/content/revisions do.
+Exact component masks may encode, but unsupported split/edit/removal reduction
+rejects explicitly. Death preserves all source bytes and freezes exact hierarchy
+and resultant motion. Bridge ENG-216 fixtures into records; bound nested decode,
+mask/dense/occupied work and checked arithmetic. Production registration stays
+closed. Luna worker proceeds in dedicated animal-replay checkout at a313196.
