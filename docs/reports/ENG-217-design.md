@@ -31,7 +31,10 @@ by portable source generation, per-brick revisions, and a canonical content
 hash over the exact source bytes and metadata.
 
 The record also carries sorted stable physical component serials and exact
-source-cell masks. A mask entry identifies the original source volume, part,
+source-cell masks. Assigned serials are nonzero and below
+`next_component_serial`, which is a monotonic high-water mark; it remains
+advanced when only one formerly fractured component survives. A mask entry
+identifies the original source volume, part,
 integer cell coordinate, material and source revision, matching ENG-214's
 `SourceCellRef` semantics. Validation proves that every occupied source cell
 appears in exactly one component, no mask references air or a foreign/stale
@@ -41,10 +44,14 @@ Sources retain their complete authoritative brick data; component masks do not
 revoxelize, duplicate, or replace it.
 
 The decoder checks the outer byte limit and bounded declared sequence lengths
-before allocating nested vectors. It enforces canonical order for owned
-records and checked coordinate/range arithmetic. Empty resident bricks remain
-in the source record with their exact revision and edited flag; air cells are
-not expanded into per-cell entity records or emitted as separate mask entries.
+before allocating nested vectors. Its 16 MiB decode budget is a conservative
+estimate of decoded memory, including fixed record overhead and nested vector
+capacities, rather than only the serialized byte length; a record below the
+serialized ceiling can therefore still exceed the memory estimate. It enforces
+canonical order for owned records and checked coordinate/range arithmetic.
+Empty resident bricks remain in the source record with their exact revision
+and edited flag; air cells are not expanded into per-cell entity records or
+emitted as separate mask entries.
 
 The format can validate multi-component frozen corpses, but this reducer does
 not create fractured records. Lifecycle death must preserve identical source
@@ -57,8 +64,8 @@ component coalescing is allowed.
 ## Candidate-first reducer
 
 Protocol code owns portable DTO validation and canonical source/owner hashing.
-The reducer operates on an owned candidate state containing the creature
-records and their source-owner mapping; it has no physics or game dependency.
+The reducer operates on the affected creature record and supplied allocator,
+receipt, witness and collision metadata; it has no physics or game dependency.
 An input change is explicitly versioned and names the caller's existing
 transaction context, creature key, operation, expected before record hash and
 complete after record where applicable.

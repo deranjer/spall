@@ -318,10 +318,19 @@ impl<'de, T: Deserialize<'de>> DeserializeSeed<'de> for PlainSeed<T> {
     }
 }
 
+macro_rules! map_field_value {
+    ($field:ident, $wire:literal, $access:ident) => {
+        $field.ok_or_else(|| $access::Error::missing_field($wire))?
+    };
+    ($field:ident, $wire:literal, $access:ident, default $default:expr) => {
+        $field.unwrap_or($default)
+    };
+}
+
 macro_rules! seeded_struct {
     (
         $seed:ident, $visitor:ident, $field_enum:ident, $output:ident, $type_name:literal, $budget:ident,
-        { $($field:ident => $variant:ident ($wire:literal): $field_ty:ty = $field_seed:expr),+ $(,)? }
+        { $($field:ident => $variant:ident ($wire:literal): $field_ty:ty = $field_seed:expr $(; default $field_default:expr)?),+ $(,)? }
     ) => {
         #[derive(Deserialize)]
         #[serde(field_identifier)]
@@ -371,7 +380,7 @@ macro_rules! seeded_struct {
                         $field_enum::Ignored => { let _: de::IgnoredAny = map.next_value()?; }
                     }
                 }
-                Ok($output { $($field: $field.ok_or_else(|| A::Error::missing_field($wire))?),+ })
+                Ok($output { $($field: map_field_value!($field, $wire, A $(, default $field_default)?)),+ })
             }
         }
     };
@@ -480,9 +489,9 @@ seeded_struct!(
         source_generation => SourceGeneration ("source_generation"): u64 = PlainSeed::<u64>::new(),
         source_revision => SourceRevision ("source_revision"): u64 = PlainSeed::<u64>::new(),
         cell_size_code => CellSizeCode ("cell_size_code"): u8 = PlainSeed::<u8>::new(),
-        bounds => Bounds ("bounds"): Option<[[i64; 3]; 2]> = PlainSeed::<Option<[[i64; 3]; 2]>>::new(),
+        bounds => Bounds ("bounds"): Option<[[i64; 3]; 2]> = PlainSeed::<Option<[[i64; 3]; 2]>>::new(); default None,
         source_content_hash => SourceContentHash ("source_content_hash"): Hash32 = PlainSeed::<Hash32>::new(),
-        parent_id => ParentId ("parent_id"): Option<u32> = PlainSeed::<Option<u32>>::new(),
+        parent_id => ParentId ("parent_id"): Option<u32> = PlainSeed::<Option<u32>>::new(); default None,
         initial_local_pose => InitialLocalPose ("initial_local_pose"): CreatureLocalPoseV1 = PlainSeed::<CreatureLocalPoseV1>::new(),
         frozen_local_pose => FrozenLocalPose ("frozen_local_pose"): CreatureLocalPoseV1 = PlainSeed::<CreatureLocalPoseV1>::new(),
         bricks => Bricks ("bricks"): Vec<BaselineBrick> = BricksSeed { budget: &mut *budget },
@@ -493,7 +502,7 @@ seeded_struct!(
     ComponentSeed, ComponentVisitor, ComponentField, CreatureOwnedComponentV1, "CreatureOwnedComponentV1", budget,
     {
         owner_key => OwnerKey ("owner_key"): u128 = PlainSeed::<u128>::new(),
-        serial => Serial ("serial"): Option<u64> = PlainSeed::<Option<u64>>::new(),
+        serial => Serial ("serial"): Option<u64> = PlainSeed::<Option<u64>>::new(); default None,
         translation_m => TranslationM ("translation_m"): [f64; 3] = PlainSeed::<[f64; 3]>::new(),
         rotation_xyzw => RotationXyzw ("rotation_xyzw"): [f32; 4] = PlainSeed::<[f32; 4]>::new(),
         linear_velocity_m_s => LinearVelocityMS ("linear_velocity_m_s"): [f32; 3] = PlainSeed::<[f32; 3]>::new(),
@@ -950,6 +959,80 @@ mod tests {
         let error = deserialize_record(&mut serde_json::Deserializer::from_str(&text)).unwrap_err();
         assert!(
             error.to_string().contains("cumulative count limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn optional_field_record_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema": 1,
+            "state": {
+                "schema": 1,
+                "key": {"world_id": 9, "world_epoch": 1, "creature_id": 1, "generation": 1},
+                "state_revision": 1,
+                "lifecycle": "Alive",
+                "species_key": "test",
+                "species_version": 1,
+                "asset": {"uuid": vec![1_u8; 16], "logical_hash": vec![0_u8; 32]},
+                "material_manifest_hash": vec![0_u8; 32],
+                "material_mapping_version": 1,
+                "material_mapping_hash": vec![0_u8; 32],
+                "clip_name": "idle",
+                "clip_mode": "Playing",
+                "clip_phase_tick": 1,
+                "clip_subtick_remainder": 0,
+                "clip_epoch": 1,
+                "source_bindings": [],
+                "aggregate_topology_revision": 1,
+                "pose_epoch": 1,
+                "root_translation_m": [0.0, 0.0, 0.0],
+                "root_rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                "linear_velocity_m_s": [0.0, 0.0, 0.0],
+                "angular_velocity_rad_s": [0.0, 0.0, 0.0],
+                "locomotion_tag": 0
+            },
+            "owner_key": 7,
+            "source_generation": 1,
+            "next_component_serial": 1,
+            "parts": [{
+                "part_id": 1,
+                "source_volume_id": 100,
+                "source_generation": 1,
+                "source_revision": 1,
+                "cell_size_code": 1,
+                "source_content_hash": vec![0_u8; 32],
+                "initial_local_pose": {"translation_m": [0.0,0.0,0.0], "rotation_xyzw": [0.0,0.0,0.0,1.0]},
+                "frozen_local_pose": {"translation_m": [0.0,0.0,0.0], "rotation_xyzw": [0.0,0.0,0.0,1.0]},
+                "bricks": []
+            }],
+            "components": [{
+                "owner_key": 7,
+                "translation_m": [0.0, 0.0, 0.0],
+                "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                "linear_velocity_m_s": [0.0, 0.0, 0.0],
+                "angular_velocity_rad_s": [0.0, 0.0, 0.0],
+                "source_masks": []
+            }]
+        })
+    }
+
+    #[test]
+    fn optional_map_fields_default_to_none_but_required_fields_still_fail() {
+        let decoded: CreatureOwnershipRecordV1 =
+            serde_json::from_value(optional_field_record_json()).unwrap();
+        assert_eq!(decoded.parts[0].bounds, None);
+        assert_eq!(decoded.parts[0].parent_id, None);
+        assert_eq!(decoded.components[0].serial, None);
+
+        let mut missing_required = optional_field_record_json();
+        missing_required["parts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("part_id");
+        let error =
+            serde_json::from_value::<CreatureOwnershipRecordV1>(missing_required).unwrap_err();
+        assert!(
+            error.to_string().contains("part_id"),
             "unexpected error: {error}"
         );
     }
