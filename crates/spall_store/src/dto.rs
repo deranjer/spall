@@ -159,14 +159,14 @@ pub struct StoredBrick {
 /// DB transaction is the checkpoint-publication contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Checkpoint {
-    /// Versioned ecology bytes; absent in older schema-2 checkpoints.
+    /// Current versioned ecology bytes; empty when ecology is not configured.
     pub vegetation: Vec<u8>,
     /// Stacked-column water (schema 3 DTO) in its own additive checkpoint row.
     pub column_water: Option<spall_protocol::ColumnWaterState>,
-    /// Authoritative weather/fallback clock checkpoint; absent means deterministic legacy initialization.
+    /// Authoritative weather clock; None when weather is not configured.
     pub weather: Option<spall_protocol::WeatherState>,
     /// Versioned canonical thin snow; transient footprints are excluded by the owner.
-    /// None is the deterministic default for checkpoints predating snow support.
+    /// None when the caller has no snow state.
     pub snow: Option<Vec<u8>>,
     pub tick: u64,
     /// Highest journal sequence this checkpoint already includes. Recovery

@@ -67,7 +67,7 @@ pub enum StoreError {
     )]
     SchemaTooNew { found: u32, supported: u32 },
     #[error(
-        "database schema version {found} predates supported {supported}; a migration is required"
+        "database schema version {found} predates supported {supported}; refusing unsupported format"
     )]
     SchemaTooOld { found: u32, supported: u32 },
     #[error("database did not enter WAL mode (got {0:?})")]
