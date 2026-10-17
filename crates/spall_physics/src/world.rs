@@ -449,6 +449,7 @@ struct ArticulatedEntry {
     fracture_owner_key: Option<u128>,
     next_component_serial: u64,
     density_manifest: Option<HashMap<MaterialId, u64>>,
+    source_volume_ids: std::collections::BTreeSet<spall_core::VolumeId>,
     parts: Vec<ArticulatedPartEntry>,
 }
 
@@ -1203,6 +1204,500 @@ impl PhysicsWorld {
         Ok(owner)
     }
 
+    /// Reconstructs a complete portable dynamic-corpse owner without replaying
+    /// transfer or fracture. All source partitions, shapes, masses, transforms,
+    /// and stable component identities are validated before any Rapier insert.
+    pub fn restore_dynamic_corpse(
+        &mut self,
+        restore: crate::articulated::DynamicCorpseRestore,
+        representation: Representation,
+        density: impl Fn(spall_core::MaterialId) -> f64,
+    ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
+        use crate::articulated::{
+            ArticulatedError, MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_PARTS,
+            MAX_ARTICULATED_SOLID_CELLS,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+
+        if restore.owner_key == 0
+            || restore.source_generation == 0
+            || restore.topology_revision == 0
+            || restore.pose_epoch == 0
+            || restore.next_component_serial == 0
+            || restore.source_parts.is_empty()
+            || restore.source_parts.len() > MAX_ARTICULATED_PARTS
+            || restore.components.is_empty()
+            || restore.components.len() > crate::fracture::MAX_FRACTURE_COMPONENTS
+            || self.fracture_owner_keys.contains_key(&restore.owner_key)
+            || self
+                .articulated
+                .values()
+                .any(|assembly| assembly.fracture_owner_key == Some(restore.owner_key))
+            || representation == Representation::SmoothConvex
+        {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+
+        let mut sources = restore.source_parts;
+        sources.sort_by_key(|part| part.part_id);
+        let mut source_part_ids = BTreeSet::new();
+        let mut source_volumes = BTreeSet::new();
+        let mut roots = 0;
+        let mut source_dense = 0_u64;
+        let mut source_solid = 0_u64;
+        for part in &mut sources {
+            if part.part_id == 0
+                || !source_part_ids.insert(part.part_id)
+                || !source_volumes.insert(part.volume_id)
+                || !part.local_transform.is_valid()
+                || part.source_revision == 0
+                || !part.cell_m.is_finite()
+                || part.cell_m <= 0.0
+                || !articulated_grid_range_valid(&part.grid, part.cell_m)
+            {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            roots += usize::from(part.parent_id.is_none());
+            part.local_transform = part
+                .local_transform
+                .normalized()
+                .ok_or(ArticulatedError::InvalidRestore)?;
+            let dims = part.grid.dims();
+            let dense = u64::from(dims[0])
+                .checked_mul(u64::from(dims[1]))
+                .and_then(|value| value.checked_mul(u64::from(dims[2])))
+                .ok_or(ArticulatedError::WorkBudget)?;
+            source_dense = source_dense
+                .checked_add(dense)
+                .ok_or(ArticulatedError::WorkBudget)?;
+            source_solid = source_solid
+                .checked_add(part.grid.solid_count())
+                .ok_or(ArticulatedError::WorkBudget)?;
+        }
+        if roots != 1
+            || sources.iter().any(|part| {
+                part.parent_id
+                    .is_some_and(|parent| !source_part_ids.contains(&parent))
+            })
+            || source_dense > MAX_ARTICULATED_DENSE_CELLS
+            || source_solid == 0
+            || source_solid > MAX_ARTICULATED_SOLID_CELLS
+        {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+        let frozen_poses = flatten_source_parts(&sources)?;
+        if frozen_poses
+            .iter()
+            .any(|pose| !articulated_translation_in_range(pose.translation_m))
+        {
+            return Err(ArticulatedError::GeometryRange);
+        }
+
+        // A source VolumeId can be repeated by different derived components,
+        // but never by two original source parts or another live owner.
+        let live_volumes: BTreeSet<_> = self
+            .articulated
+            .values()
+            .flat_map(|assembly| assembly.source_volume_ids.iter().copied())
+            .collect();
+        if source_volumes
+            .iter()
+            .any(|volume| live_volumes.contains(volume))
+        {
+            return Err(ArticulatedError::DuplicateVolume);
+        }
+
+        if restore.components.iter().any(|component| {
+            component
+                .component_id
+                .is_some_and(|id| id.owner_key != restore.owner_key)
+                || !component.translation_m.iter().all(|v| v.is_finite())
+                || !component.rotation_xyzw.iter().all(|v| v.is_finite())
+                || !component.linear_velocity_m_s.iter().all(|v| v.is_finite())
+                || !component
+                    .angular_velocity_rad_s
+                    .iter()
+                    .all(|v| v.is_finite())
+                || !articulated_translation_in_range(component.translation_m)
+                || !(PartTransform {
+                    translation_m: [0.0; 3],
+                    rotation_xyzw: component.rotation_xyzw,
+                })
+                .is_valid()
+                || component.cells.is_empty()
+        }) {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+        let intact = restore.components.len() == 1 && restore.components[0].component_id.is_none();
+        if (intact && restore.next_component_serial != 1)
+            || restore.components.iter().any(|component| {
+                component.component_id.is_none() != intact
+                    || component.component_id.is_some_and(|id| {
+                        id.owner_key != restore.owner_key
+                            || id.serial == 0
+                            || id.serial >= restore.next_component_serial
+                    })
+            })
+        {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+        let mut component_ids = BTreeSet::new();
+        if restore
+            .components
+            .iter()
+            .filter_map(|c| c.component_id)
+            .any(|id| !component_ids.insert(id))
+        {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+
+        // Read the canonical source occupancy once. Component masks are routed
+        // through this index, so work scales with source cells plus mask cells,
+        // not source cells multiplied by the number of components.
+        let mut expected = BTreeMap::new();
+        for (part_index, part) in sources.iter().enumerate() {
+            let origin = part.grid.origin();
+            let mut range_error = false;
+            part.grid.for_each_solid(|x, y, z, material| {
+                let xyz = [
+                    origin.x.checked_add(i64::from(x)),
+                    origin.y.checked_add(i64::from(y)),
+                    origin.z.checked_add(i64::from(z)),
+                ];
+                let [Some(cx), Some(cy), Some(cz)] =
+                    xyz.map(|coord| coord.and_then(|value| i32::try_from(value).ok()))
+                else {
+                    range_error = true;
+                    return;
+                };
+                let key = SourceCellRef {
+                    volume_id: part.volume_id,
+                    part_id: part.part_id,
+                    cell: [cx, cy, cz],
+                    material,
+                    source_revision: part.source_revision,
+                };
+                if expected.insert(key, (part_index, [x, y, z])).is_some() {
+                    range_error = true;
+                }
+            });
+            if range_error {
+                return Err(ArticulatedError::GeometryRange);
+            }
+        }
+        let mut assigned = BTreeSet::new();
+        let mut component_owned = Vec::with_capacity(restore.components.len());
+        for component in &restore.components {
+            let mut local = BTreeSet::new();
+            let mut by_part = vec![Vec::new(); sources.len()];
+            for cell in &component.cells {
+                let Some((part_index, local_coord)) = expected.get(cell).copied() else {
+                    return Err(ArticulatedError::InvalidRestore);
+                };
+                if !local.insert(*cell) || !assigned.insert(*cell) {
+                    return Err(ArticulatedError::InvalidRestore);
+                }
+                by_part[part_index].push((
+                    local_coord[0],
+                    local_coord[1],
+                    local_coord[2],
+                    cell.material,
+                ));
+            }
+            component_owned.push(by_part);
+        }
+        if assigned.len() != expected.len() {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+
+        let manifest = density_manifest(&sources, &density)?;
+        let stable_density = |material| manifest_density(&manifest, material);
+        let mut prepared = Vec::with_capacity(restore.components.len());
+        let mut primitive_count = 0_usize;
+        let mut derived_dense = 0_u64;
+        let mut total_shards = 0_usize;
+        for (component_index, component) in restore.components.iter().enumerate() {
+            let rotation = normalize(component.rotation_xyzw);
+            let mut source_shards = Vec::new();
+            let mut flat_poses = Vec::new();
+            let mut parts = Vec::new();
+            for (part_index, (part, frozen_pose)) in sources.iter().zip(&frozen_poses).enumerate() {
+                let origin = part.grid.origin();
+                let owned = &component_owned[component_index][part_index];
+                if owned.is_empty() {
+                    continue;
+                }
+                let min = std::array::from_fn::<_, 3, _>(|axis| {
+                    owned.iter().map(|c| [c.0, c.1, c.2][axis]).min().unwrap()
+                });
+                let max = std::array::from_fn::<_, 3, _>(|axis| {
+                    owned.iter().map(|c| [c.0, c.1, c.2][axis]).max().unwrap()
+                });
+                let dims = [
+                    max[0] - min[0] + 1,
+                    max[1] - min[1] + 1,
+                    max[2] - min[2] + 1,
+                ];
+                let dense = u64::from(dims[0])
+                    .checked_mul(u64::from(dims[1]))
+                    .and_then(|v| v.checked_mul(u64::from(dims[2])))
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                derived_dense = derived_dense
+                    .checked_add(dense)
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                if derived_dense > crate::fracture::MAX_FRACTURE_DENSE_CELLS as u64 {
+                    return Err(ArticulatedError::WorkBudget);
+                }
+                let volume = usize::try_from(dense).map_err(|_| ArticulatedError::WorkBudget)?;
+                let mut mask = vec![false; volume];
+                let mut materials = vec![MaterialId::AIR; volume];
+                for &(x, y, z, material) in owned {
+                    let local = [x - min[0], y - min[1], z - min[2]];
+                    let index = local[0] as usize
+                        + dims[0] as usize
+                            * (local[1] as usize + dims[1] as usize * local[2] as usize);
+                    mask[index] = true;
+                    materials[index] = material;
+                }
+                let grid = OccupancyGrid::from_solid_mask(
+                    GlobalCell::new(
+                        origin.x + i64::from(min[0]),
+                        origin.y + i64::from(min[1]),
+                        origin.z + i64::from(min[2]),
+                    ),
+                    dims,
+                    mask,
+                    materials,
+                )
+                .map_err(|_| ArticulatedError::InvalidRestore)?;
+                source_shards.push(SourcePart {
+                    part_id: part.part_id,
+                    parent_id: None,
+                    volume_id: part.volume_id,
+                    source_revision: part.source_revision,
+                    grid: grid.clone(),
+                    cell_m: part.cell_m,
+                    local_transform: *frozen_pose,
+                });
+                flat_poses.push(*frozen_pose);
+                let built = build_collider(&grid, part.cell_m, representation);
+                primitive_count = primitive_count
+                    .checked_add(built.primitives)
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                if built.primitives > crate::collider::MERGED_CUBOID_PRIMITIVE_BUDGET
+                    || primitive_count > 65_536
+                {
+                    return Err(ArticulatedError::WorkBudget);
+                }
+                let origin = grid.origin();
+                let origin_m = [
+                    origin.x as f32 * part.cell_m,
+                    origin.y as f32 * part.cell_m,
+                    origin.z as f32 * part.cell_m,
+                ];
+                let offset = rotate(frozen_pose.rotation_xyzw, origin_m);
+                let local_translation = [
+                    frozen_pose.translation_m[0] + offset[0],
+                    frozen_pose.translation_m[1] + offset[1],
+                    frozen_pose.translation_m[2] + offset[2],
+                ];
+                let world_offset = rotate(rotation, local_translation);
+                if !articulated_translation_in_range(local_translation)
+                    || !articulated_translation_in_range([
+                        component.translation_m[0] + world_offset[0],
+                        component.translation_m[1] + world_offset[1],
+                        component.translation_m[2] + world_offset[2],
+                    ])
+                {
+                    return Err(ArticulatedError::GeometryRange);
+                }
+                let local_pose = Pose::new(
+                    Vector::new(
+                        local_translation[0],
+                        local_translation[1],
+                        local_translation[2],
+                    ),
+                    Rotation::from_xyzw(
+                        frozen_pose.rotation_xyzw[0],
+                        frozen_pose.rotation_xyzw[1],
+                        frozen_pose.rotation_xyzw[2],
+                        frozen_pose.rotation_xyzw[3],
+                    )
+                    .to_scaled_axis(),
+                );
+                let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
+                    .density(0.0)
+                    .position(local_pose)
+                    .build();
+                total_shards = total_shards
+                    .checked_add(1)
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                if total_shards > MAX_ARTICULATED_PARTS {
+                    return Err(ArticulatedError::WorkBudget);
+                }
+                parts.push((part, grid, *frozen_pose, built.primitives, collider));
+            }
+            if parts.is_empty() {
+                return Err(ArticulatedError::EmptyAggregate);
+            }
+            let mass = crate::mass::articulated_mass_properties(
+                &source_shards,
+                &flat_poses,
+                stable_density,
+            )
+            .ok_or(ArticulatedError::InvalidMassProperties)?
+            .to_body_properties();
+            validate_body_mass_properties(mass)?;
+            let translation = component.translation_m;
+            if !articulated_translation_in_range(translation) {
+                return Err(ArticulatedError::GeometryRange);
+            }
+            prepared.push((component, mass, rotation, translation, parts));
+        }
+
+        let first_translation = prepared[0].3;
+        let first_rotation = prepared[0].2;
+        let first_mass = prepared[0].1;
+        let first_linear = prepared[0].0.linear_velocity_m_s;
+        let first_angular = prepared[0].0.angular_velocity_rad_s;
+        let first_body = self.bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(Vector::new(
+                    first_translation[0],
+                    first_translation[1],
+                    first_translation[2],
+                ))
+                .rotation(
+                    Rotation::from_xyzw(
+                        first_rotation[0],
+                        first_rotation[1],
+                        first_rotation[2],
+                        first_rotation[3],
+                    )
+                    .to_scaled_axis(),
+                )
+                .additional_mass_properties(rapier_mass_properties(first_mass, [0.0; 3]))
+                .linvel(Vector::from(first_linear))
+                .angvel(Vector::from(first_angular))
+                .build(),
+        );
+        let id = BodyId((u64::from(self.id_namespace) << 32) | self.entries.len() as u64);
+        let mut built_parts = Vec::new();
+        let mut primary_collider = None;
+        let mut primary_cell_m = 1.0;
+        let mut primary_origin = [0.0; 3];
+        let mut first_body_handle = first_body;
+        for (component_index, (component, mass, rotation, translation, parts)) in
+            prepared.into_iter().enumerate()
+        {
+            let body = if component_index == 0 {
+                first_body_handle
+            } else {
+                self.bodies.insert(
+                    RigidBodyBuilder::dynamic()
+                        .translation(Vector::new(translation[0], translation[1], translation[2]))
+                        .rotation(
+                            Rotation::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3])
+                                .to_scaled_axis(),
+                        )
+                        .additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]))
+                        .linvel(Vector::from(component.linear_velocity_m_s))
+                        .angvel(Vector::from(component.angular_velocity_rad_s))
+                        .build(),
+                )
+            };
+            if component_index == 0 {
+                first_body_handle = body;
+            }
+            let component_id = component.component_id;
+            for (part, grid, frozen_pose, primitives, collider) in parts {
+                let collider = self
+                    .colliders
+                    .insert_with_parent(collider, body, &mut self.bodies);
+                self.tag_collider(collider, id);
+                self.pending_modified.push(collider);
+                if primary_collider.is_none() {
+                    primary_collider = Some(collider);
+                    primary_cell_m = part.cell_m;
+                    let origin = grid.origin();
+                    primary_origin = [
+                        origin.x as f32 * part.cell_m,
+                        origin.y as f32 * part.cell_m,
+                        origin.z as f32 * part.cell_m,
+                    ];
+                }
+                built_parts.push(ArticulatedPartEntry {
+                    part_id: part.part_id,
+                    parent_id: None,
+                    volume_id: part.volume_id,
+                    source_revision: part.source_revision,
+                    grid: grid.clone(),
+                    cell_m: part.cell_m,
+                    local_pose: frozen_pose,
+                    assembly_pose: frozen_pose,
+                    part_surface_radius_m: source_surface_radius_m(
+                        &grid,
+                        part.cell_m,
+                        [0.0; 3],
+                        None,
+                    ),
+                    root_surface_radius_m: source_surface_radius_m(
+                        &grid,
+                        part.cell_m,
+                        [0.0; 3],
+                        Some(frozen_pose),
+                    ),
+                    body,
+                    collider,
+                    primitives,
+                    component_id,
+                });
+            }
+            self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
+            self.bodies[body]
+                .set_additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]), true);
+            self.bodies[body].set_linvel(Vector::from(component.linear_velocity_m_s), true);
+            self.bodies[body].set_angvel(Vector::from(component.angular_velocity_rad_s), true);
+        }
+        self.entries.push(Entry {
+            body: first_body_handle,
+            collider: primary_collider.expect("nonempty prepared restore has a primary collider"),
+            cell_m: primary_cell_m,
+            representation,
+            density: 0.0,
+            collider_offset_m: primary_origin,
+            mass_properties: Some(first_mass),
+            retired: false,
+            dormant: false,
+            query_only: false,
+            restitution: 0.0,
+        });
+        self.articulated.insert(
+            id,
+            ArticulatedEntry {
+                topology_token: restore.topology_revision,
+                pose_token: restore.pose_epoch,
+                root_pose: PartTransform {
+                    translation_m: first_translation,
+                    rotation_xyzw: first_rotation,
+                },
+                pending_root_pose_token: None,
+                pending_pose: None,
+                kinematic_part_bodies: false,
+                dynamic_corpse: true,
+                source_generation: restore.source_generation,
+                fracture_owner_key: Some(restore.owner_key),
+                next_component_serial: restore.next_component_serial,
+                density_manifest: Some(manifest),
+                source_volume_ids: source_volumes,
+                parts: built_parts,
+            },
+        );
+        self.fracture_owner_keys.insert(restore.owner_key, id);
+        self.ccd_solver = CCDSolver::new();
+        Ok(ArticulatedBodyId(id))
+    }
+
     /// Converts the existing ENG-210 multi-body kinematic owner in place. It
     /// derives exact source-cell mass and momenta from each part body's current
     /// pose and velocity; an invalid/stale/pending transfer mutates nothing.
@@ -1256,13 +1751,13 @@ impl PhysicsWorld {
             .articulated
             .iter()
             .filter(|(owner, _)| **owner != body_id)
-            .flat_map(|(_, a)| a.parts.iter().map(|p| p.volume_id))
+            .flat_map(|(_, a)| a.source_volume_ids.iter().copied())
             .collect();
-        let mut source_volumes = std::collections::BTreeSet::new();
-        if assembly
-            .parts
-            .iter()
-            .any(|p| !source_volumes.insert(p.volume_id) || other_volumes.contains(&p.volume_id))
+        if assembly.source_volume_ids.is_empty()
+            || assembly
+                .source_volume_ids
+                .iter()
+                .any(|volume| other_volumes.contains(volume))
         {
             return Err(ArticulatedError::DuplicateVolume);
         }
@@ -2153,7 +2648,7 @@ impl PhysicsWorld {
         let already_owned_volumes: std::collections::BTreeSet<_> = self
             .articulated
             .values()
-            .flat_map(|assembly| assembly.parts.iter().map(|part| part.volume_id))
+            .flat_map(|assembly| assembly.source_volume_ids.iter().copied())
             .collect();
         let mut sorted = parts;
         sorted.sort_by_key(|part| part.part_id);
@@ -2224,6 +2719,7 @@ impl PhysicsWorld {
         {
             return Err(ArticulatedError::GeometryRange);
         }
+        let source_volume_ids = sorted.iter().map(|part| part.volume_id).collect();
         let builds: Vec<_> = sorted
             .iter()
             .map(|part| build_collider(&part.grid, cell_m, representation))
@@ -2429,6 +2925,7 @@ impl PhysicsWorld {
                 fracture_owner_key: None,
                 next_component_serial: 1,
                 density_manifest: None,
+                source_volume_ids,
                 parts: built_parts,
             },
         );
@@ -6446,6 +6943,510 @@ mod tests {
             cell_m: 0.25,
             local_transform: crate::articulated::PartTransform::IDENTITY,
         }
+    }
+
+    fn source_cell_refs(part: &crate::articulated::SourcePart) -> Vec<SourceCellRef> {
+        let origin = part.grid.origin();
+        let mut cells = Vec::new();
+        part.grid.for_each_solid(|x, y, z, material| {
+            cells.push(SourceCellRef {
+                volume_id: part.volume_id,
+                part_id: part.part_id,
+                cell: [
+                    (origin.x + i64::from(x)) as i32,
+                    (origin.y + i64::from(y)) as i32,
+                    (origin.z + i64::from(z)) as i32,
+                ],
+                material,
+                source_revision: part.source_revision,
+            });
+        });
+        cells.sort();
+        cells
+    }
+
+    fn grid_from_x_cells(xs: &[usize], width: usize) -> OccupancyGrid {
+        let mut mask = vec![false; width];
+        for &x in xs {
+            mask[x] = true;
+        }
+        OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [width as u32, 1, 1],
+            mask,
+            vec![fixtures::STONE; width],
+        )
+        .unwrap()
+    }
+
+    fn restore_component(
+        id: Option<DerivedFractureComponentId>,
+        state: BodyState,
+        cells: Vec<SourceCellRef>,
+    ) -> crate::articulated::DynamicCorpseComponentRestore {
+        crate::articulated::DynamicCorpseComponentRestore {
+            component_id: id,
+            translation_m: state.translation_m,
+            rotation_xyzw: state.rotation,
+            linear_velocity_m_s: state.linvel_m_s,
+            angular_velocity_rad_s: state.angvel_rad_s,
+            cells,
+        }
+    }
+
+    #[test]
+    fn cold_restore_preserves_split_motion_mass_query_and_serial_highwater() {
+        let cfg = PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            solver_substeps: 4,
+            ..Default::default()
+        };
+        let mut live = PhysicsWorld::new(cfg);
+        let part = one_part(grid_from_x_cells(&[0, 1, 2, 4], 5), 90, 7);
+        let owner = live
+            .add_dynamic_corpse_aggregate(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![part.clone()],
+                Representation::MergedCuboids,
+                mix_density,
+            )
+            .unwrap();
+        let snapshot = live
+            .capture_dynamic_corpse_fracture_snapshot(owner, 0xabc, None)
+            .unwrap();
+        let plan = prepare_fracture(&snapshot).unwrap();
+        assert_eq!(plan.components.len(), 2);
+        let committed = live
+            .commit_dynamic_corpse_fracture(owner, &snapshot, &plan, mix_density)
+            .unwrap();
+        let ids: Vec<_> = committed.components.iter().map(|entry| entry.0).collect();
+        assert_eq!(
+            ids,
+            vec![
+                DerivedFractureComponentId {
+                    owner_key: 0xabc,
+                    serial: 1
+                },
+                DerivedFractureComponentId {
+                    owner_key: 0xabc,
+                    serial: 2
+                },
+            ]
+        );
+        live.set_dynamic_corpse_component_velocity(owner, Some(ids[0]), [1.0, 0.0, 0.0], [0.0; 3])
+            .unwrap();
+        live.set_dynamic_corpse_component_velocity(owner, Some(ids[1]), [-1.0, 0.0, 0.0], [0.0; 3])
+            .unwrap();
+        live.step();
+
+        let components = ids
+            .iter()
+            .zip(&plan.components)
+            .map(|(component_id, planned)| {
+                restore_component(
+                    Some(*component_id),
+                    live.fracture_component_state(owner, *component_id).unwrap(),
+                    planned.cells.clone(),
+                )
+            })
+            .collect();
+        let mut cold = PhysicsWorld::new(cfg);
+        let restored = cold
+            .restore_dynamic_corpse(
+                crate::articulated::DynamicCorpseRestore {
+                    owner_key: 0xabc,
+                    source_generation: 2,
+                    topology_revision: 2,
+                    pose_epoch: 77,
+                    next_component_serial: 3,
+                    source_parts: vec![part],
+                    components,
+                },
+                Representation::MergedCuboids,
+                mix_density,
+            )
+            .unwrap();
+        assert_eq!(cold.articulated_collider_count(restored), 2);
+        assert_eq!(cold.articulated_rigid_body_count(restored), 2);
+        assert_eq!(
+            cold.articulated_owner_snapshot(restored)
+                .unwrap()
+                .pose_token,
+            77
+        );
+        for &id in &ids {
+            let expected = live.fracture_component_state(owner, id).unwrap();
+            let actual = cold.fracture_component_state(restored, id).unwrap();
+            assert!((expected.translation_m[0] - actual.translation_m[0]).abs() < 1.0e-5);
+            assert!((expected.linvel_m_s[0] - actual.linvel_m_s[0]).abs() < 1.0e-5);
+            assert!((expected.mass_kg - actual.mass_kg).abs() < 1.0e-3);
+        }
+        // The adapter restored the portable pose epoch without modifying the
+        // world-global freshness counter used by fracture snapshots.
+        assert_eq!(
+            cold.capture_dynamic_corpse_fracture_snapshot(restored, 0xabc, Some(ids[0]))
+                .unwrap()
+                .token
+                .pose_epoch,
+            0
+        );
+        for x in [0.14_f32, 1.11_f32] {
+            let hit = cold
+                .raycast_articulated(restored, [x, 1.0, 0.125], [0.0, -1.0, 0.0], 2.0)
+                .unwrap();
+            assert_eq!(hit.volume_id, VolumeId::new(90).unwrap());
+        }
+        let fixed = cold.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: one_cell_grid(GlobalCell::new(0, 0, 0)),
+            cell_m: 0.25,
+            density_kg_m3: 1_000.0,
+            mass_properties: None,
+            translation_m: [0.75, 0.0, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+        cold.step();
+        assert!(cold.articulated_contact_witnesses().iter().any(|witness| {
+            witness.bodies.contains(&restored.0)
+                && witness.bodies.contains(&fixed)
+                && witness.source_sides.iter().flatten().any(|side| {
+                    side.volume_id == VolumeId::new(90).unwrap()
+                        && side.normal_impulse_n_s.is_some()
+                })
+        }));
+
+        // Removing the bridge from the restored first component creates two
+        // new components; serials continue above the persisted high-water.
+        let edited = grid_from_x_cells(&[0, 2], 3);
+        cold.rebuild_dynamic_corpse_component_part_grid(
+            restored,
+            ids[0],
+            2,
+            3,
+            7,
+            7,
+            8,
+            edited,
+            mix_density,
+        )
+        .unwrap();
+        let edited_snapshot = cold
+            .capture_dynamic_corpse_fracture_snapshot(restored, 0xabc, Some(ids[0]))
+            .unwrap();
+        let edited_plan = prepare_fracture(&edited_snapshot).unwrap();
+        assert_eq!(edited_plan.components.len(), 2);
+        let resplit = cold
+            .commit_dynamic_corpse_fracture(restored, &edited_snapshot, &edited_plan, mix_density)
+            .unwrap();
+        assert_eq!(
+            resplit
+                .components
+                .iter()
+                .map(|entry| entry.0.serial)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(cold.fracture_component_state(restored, ids[0]).is_err());
+    }
+
+    #[test]
+    fn cold_restore_accepts_mixed_source_cell_sizes_and_empty_bindings() {
+        let mut root = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 101, 1);
+        let mut child = crate::articulated::SourcePart {
+            part_id: 8,
+            parent_id: Some(root.part_id),
+            volume_id: VolumeId::new(102).unwrap(),
+            source_revision: 3,
+            grid: one_cell_grid(GlobalCell::new(4, 0, 0)),
+            cell_m: 0.5,
+            local_transform: crate::articulated::PartTransform {
+                translation_m: [1.0, 0.0, 0.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+        let mut empty = one_part(
+            OccupancyGrid::from_solid_mask(
+                GlobalCell::new(10, 0, 0),
+                [1, 1, 1],
+                vec![false],
+                vec![MaterialId::AIR],
+            )
+            .unwrap(),
+            103,
+            1,
+        );
+        empty.part_id = 9;
+        empty.parent_id = Some(root.part_id);
+        root.local_transform.translation_m = [0.0, 0.0, 0.0];
+        child.local_transform.translation_m = [1.0, 0.0, 0.0];
+        let mut cells = source_cell_refs(&root);
+        cells.extend(source_cell_refs(&child));
+        cells.sort();
+        let component = crate::articulated::DynamicCorpseComponentRestore {
+            component_id: None,
+            translation_m: [2.0, 3.0, 4.0],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            linear_velocity_m_s: [0.5, 0.0, 0.0],
+            angular_velocity_rad_s: [0.0; 3],
+            cells,
+        };
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let mut incomplete = component.clone();
+        incomplete.cells.pop();
+        assert_eq!(
+            world.restore_dynamic_corpse(
+                crate::articulated::DynamicCorpseRestore {
+                    owner_key: 0xdef,
+                    source_generation: 5,
+                    topology_revision: 4,
+                    pose_epoch: 8,
+                    next_component_serial: 1,
+                    source_parts: vec![root.clone(), child.clone(), empty.clone()],
+                    components: vec![incomplete],
+                },
+                Representation::MergedCuboids,
+                mix_density,
+            ),
+            Err(crate::articulated::ArticulatedError::InvalidRestore)
+        );
+        assert!(world.entries.is_empty());
+        let id = world
+            .restore_dynamic_corpse(
+                crate::articulated::DynamicCorpseRestore {
+                    owner_key: 0xdef,
+                    source_generation: 5,
+                    topology_revision: 4,
+                    pose_epoch: 8,
+                    next_component_serial: 1,
+                    source_parts: vec![root, child, empty],
+                    components: vec![component],
+                },
+                Representation::MergedCuboids,
+                mix_density,
+            )
+            .unwrap();
+        assert_eq!(world.articulated_collider_count(id), 2);
+        assert_eq!(world.articulated_rigid_body_count(id), 1);
+        assert_eq!(world.articulated_owner_snapshot(id).unwrap().pose_token, 8);
+        assert!((world.articulated_body_state(id).mass_kg - 15.625 - 125.0).abs() < 1.0e-2);
+        let reused_empty_binding = one_part(one_cell_grid(GlobalCell::new(20, 0, 0)), 103, 2);
+        assert_eq!(
+            world.restore_dynamic_corpse(
+                crate::articulated::DynamicCorpseRestore {
+                    owner_key: 0x123,
+                    source_generation: 1,
+                    topology_revision: 1,
+                    pose_epoch: 1,
+                    next_component_serial: 1,
+                    components: vec![crate::articulated::DynamicCorpseComponentRestore {
+                        component_id: None,
+                        translation_m: [0.0; 3],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        linear_velocity_m_s: [0.0; 3],
+                        angular_velocity_rad_s: [0.0; 3],
+                        cells: source_cell_refs(&reused_empty_binding),
+                    }],
+                    source_parts: vec![reused_empty_binding.clone()],
+                },
+                Representation::MergedCuboids,
+                mix_density,
+            ),
+            Err(crate::articulated::ArticulatedError::DuplicateVolume)
+        );
+        assert_eq!(
+            world.add_articulated_body(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                1,
+                vec![reused_empty_binding.clone()],
+                Representation::MergedCuboids,
+            ),
+            Err(crate::articulated::ArticulatedError::DuplicateVolume)
+        );
+        world.retire_articulated_body(id);
+        assert_eq!(world.fracture_owner_keys.get(&0xdef), Some(&id.0));
+        assert!(
+            world
+                .add_articulated_body(
+                    [0.0; 3],
+                    [0.0, 0.0, 0.0, 1.0],
+                    1,
+                    vec![reused_empty_binding],
+                    Representation::MergedCuboids,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn restore_rejects_bad_identity_partition_and_density_before_publication() {
+        let part = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 111, 4);
+        let cells = source_cell_refs(&part);
+        let make_intact = || crate::articulated::DynamicCorpseRestore {
+            owner_key: 0x456,
+            source_generation: 3,
+            topology_revision: 2,
+            pose_epoch: 1,
+            next_component_serial: 1,
+            source_parts: vec![part.clone()],
+            components: vec![crate::articulated::DynamicCorpseComponentRestore {
+                component_id: None,
+                translation_m: [0.0; 3],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                linear_velocity_m_s: [0.0; 3],
+                angular_velocity_rad_s: [0.0; 3],
+                cells: cells.clone(),
+            }],
+        };
+        let mut invalid = Vec::new();
+        let mut bad = make_intact();
+        bad.owner_key = 0;
+        invalid.push(bad);
+        let mut bad = make_intact();
+        bad.source_generation = 0;
+        invalid.push(bad);
+        let mut bad = make_intact();
+        bad.topology_revision = 0;
+        invalid.push(bad);
+        let mut bad = make_intact();
+        bad.pose_epoch = 0;
+        invalid.push(bad);
+        let mut bad = make_intact();
+        bad.next_component_serial = 2;
+        invalid.push(bad);
+        let mut bad = make_intact();
+        bad.source_parts[0].source_revision = 0;
+        invalid.push(bad);
+        let mut bad = make_intact();
+        bad.components[0].component_id = Some(DerivedFractureComponentId {
+            owner_key: 0x999,
+            serial: 1,
+        });
+        bad.next_component_serial = 2;
+        invalid.push(bad);
+        let mut bad = make_intact();
+        bad.components[0].component_id = Some(DerivedFractureComponentId {
+            owner_key: 0x456,
+            serial: 1,
+        });
+        bad.next_component_serial = 1;
+        invalid.push(bad);
+
+        let derived_component = |serial| crate::articulated::DynamicCorpseComponentRestore {
+            component_id: Some(DerivedFractureComponentId {
+                owner_key: 0x456,
+                serial,
+            }),
+            translation_m: [0.0; 3],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            linear_velocity_m_s: [0.0; 3],
+            angular_velocity_rad_s: [0.0; 3],
+            cells: cells.clone(),
+        };
+        let mut overlapping = make_intact();
+        overlapping.next_component_serial = 3;
+        overlapping.components = vec![derived_component(1), derived_component(2)];
+        invalid.push(overlapping);
+
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let live_owner = world
+            .add_articulated_body(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                19,
+                vec![one_part(one_cell_grid(GlobalCell::new(30, 0, 0)), 110, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        for bundle in invalid {
+            assert!(
+                world
+                    .restore_dynamic_corpse(bundle, Representation::MergedCuboids, mix_density)
+                    .is_err()
+            );
+            assert_eq!(world.entries.len(), 1);
+            assert!(world.articulated_owner_snapshot(live_owner).is_some());
+            assert!(world.fracture_owner_keys.is_empty());
+        }
+
+        assert_eq!(
+            world.restore_dynamic_corpse(make_intact(), Representation::MergedCuboids, |_| 0.0,),
+            Err(crate::articulated::ArticulatedError::InvalidDensity)
+        );
+        assert_eq!(world.entries.len(), 1);
+        assert!(world.articulated_owner_snapshot(live_owner).is_some());
+        assert!(world.fracture_owner_keys.is_empty());
+    }
+
+    #[test]
+    fn restore_keeps_single_derived_component_highwater_for_next_split() {
+        let part = one_part(grid_from_x_cells(&[0, 1, 2], 3), 112, 7);
+        let component_id = DerivedFractureComponentId {
+            owner_key: 0x789,
+            serial: 4,
+        };
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let owner = world
+            .restore_dynamic_corpse(
+                crate::articulated::DynamicCorpseRestore {
+                    owner_key: component_id.owner_key,
+                    source_generation: 9,
+                    topology_revision: 8,
+                    pose_epoch: 5,
+                    next_component_serial: 9,
+                    source_parts: vec![part.clone()],
+                    components: vec![crate::articulated::DynamicCorpseComponentRestore {
+                        component_id: Some(component_id),
+                        translation_m: [1.0, 2.0, 3.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        linear_velocity_m_s: [0.5, 0.0, 0.0],
+                        angular_velocity_rad_s: [0.0; 3],
+                        cells: source_cell_refs(&part),
+                    }],
+                },
+                Representation::MergedCuboids,
+                mix_density,
+            )
+            .unwrap();
+        assert_eq!(world.articulated_rigid_body_count(owner), 1);
+        assert_eq!(
+            world
+                .fracture_component_state(owner, component_id)
+                .unwrap()
+                .translation_m,
+            [1.0, 2.0, 3.0]
+        );
+        world
+            .rebuild_dynamic_corpse_component_part_grid(
+                owner,
+                component_id,
+                8,
+                9,
+                7,
+                7,
+                8,
+                grid_from_x_cells(&[0, 2], 3),
+                mix_density,
+            )
+            .unwrap();
+        let snapshot = world
+            .capture_dynamic_corpse_fracture_snapshot(owner, 0x789, Some(component_id))
+            .unwrap();
+        let plan = prepare_fracture(&snapshot).unwrap();
+        let split = world
+            .commit_dynamic_corpse_fracture(owner, &snapshot, &plan, mix_density)
+            .unwrap();
+        assert_eq!(
+            split
+                .components
+                .iter()
+                .map(|entry| entry.0.serial)
+                .collect::<Vec<_>>(),
+            vec![9, 10]
+        );
     }
 
     #[test]

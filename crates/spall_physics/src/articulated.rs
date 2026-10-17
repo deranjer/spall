@@ -71,6 +71,34 @@ pub enum ArticulatedError {
         "corpse edits currently support removals only; additions/material changes need a momentum policy"
     )]
     UnsupportedCorpseEdit,
+    #[error("portable corpse restore state is invalid or incomplete")]
+    InvalidRestore,
+}
+
+/// One independent dynamic component in a portable corpse restore bundle.
+/// `part_poses` are frozen source-part transforms in this component's own
+/// root frame; they are distinct from the original authored hierarchy.
+#[derive(Clone)]
+pub struct DynamicCorpseComponentRestore {
+    pub component_id: Option<crate::fracture::DerivedFractureComponentId>,
+    pub translation_m: [f32; 3],
+    pub rotation_xyzw: [f32; 4],
+    pub linear_velocity_m_s: [f32; 3],
+    pub angular_velocity_rad_s: [f32; 3],
+    pub cells: Vec<crate::fracture::SourceCellRef>,
+}
+
+/// Value-only reconstruction input for one dynamic corpse owner. The source
+/// parts remain complete originals; components partition their occupied cells.
+#[derive(Clone)]
+pub struct DynamicCorpseRestore {
+    pub owner_key: u128,
+    pub source_generation: u64,
+    pub topology_revision: u64,
+    pub pose_epoch: u64,
+    pub next_component_serial: u64,
+    pub source_parts: Vec<SourcePart>,
+    pub components: Vec<DynamicCorpseComponentRestore>,
 }
 
 /// A unit-scale part-local transform in metres and `(x, y, z, w)` form.
