@@ -529,6 +529,36 @@ pub struct PreparedArticulatedBatch {
     changes: Vec<PreparedArticulatedChange>,
 }
 
+impl PreparedArticulatedBatch {
+    /// Returns the exact prepared motion and mass-conservation witness for a
+    /// checked death transfer, before publication. Tags are unique within the
+    /// batch; absent or non-transfer tags return `None`.
+    pub fn transfer_outcome(&self, operation_tag: u64) -> Option<&CorpseTransferOutcome> {
+        self.changes.iter().find_map(|change| match change {
+            PreparedArticulatedChange::CheckedDeathTransfer {
+                operation_tag: tag,
+                transfer,
+            } if *tag == operation_tag => Some(&transfer.outcome),
+            _ => None,
+        })
+    }
+
+    /// Number of new logical `BodyId` slots the batch will append. Each birth
+    /// or cold restore creates one owner entry; checked death transfers reuse
+    /// their existing owner slot.
+    pub fn additional_body_slots(&self) -> usize {
+        self.changes
+            .iter()
+            .filter(|change| {
+                !matches!(
+                    change,
+                    PreparedArticulatedChange::CheckedDeathTransfer { .. }
+                )
+            })
+            .count()
+    }
+}
+
 /// One-shot publication capability produced only after every batch member
 /// and cross-owner reservation passed validation.
 pub struct ValidatedArticulatedBatch {
@@ -1721,6 +1751,21 @@ impl PhysicsWorld {
         &self,
         prepared: PreparedArticulatedBatch,
     ) -> Result<ValidatedArticulatedBatch, crate::articulated::ArticulatedError> {
+        self.validate_articulated_batch_with_reserved_body_slots(prepared, 0)
+    }
+
+    /// Jointly checks this batch and an external reservation against the
+    /// remaining logical `BodyId` space. `external_additions` is a bounded
+    /// upper allowance for unrelated, already-prepared geometry entries that
+    /// the caller will publish after all participants validate and before this
+    /// articulated batch. It does not allocate or reserve IDs itself; the
+    /// caller owns the other participants' registry, source and journal checks
+    /// and must not publish more entries than the stated allowance.
+    pub fn validate_articulated_batch_with_reserved_body_slots(
+        &self,
+        prepared: PreparedArticulatedBatch,
+        external_additions: usize,
+    ) -> Result<ValidatedArticulatedBatch, crate::articulated::ArticulatedError> {
         use crate::articulated::ArticulatedError;
         if !std::sync::Arc::ptr_eq(&prepared.world_identity, &self.preparation_identity)
             || prepared.expected_step != self.step_count
@@ -1728,20 +1773,11 @@ impl PhysicsWorld {
         {
             return Err(ArticulatedError::StalePreparedBatch);
         }
-        let additions = prepared
-            .changes
-            .iter()
-            .filter(|change| {
-                !matches!(
-                    change,
-                    PreparedArticulatedChange::CheckedDeathTransfer { .. }
-                )
-            })
-            .count();
         let final_entries = self
             .entries
             .len()
-            .checked_add(additions)
+            .checked_add(prepared.additional_body_slots())
+            .and_then(|entries| entries.checked_add(external_additions))
             .ok_or(ArticulatedError::WorkBudget)?;
         if final_entries > u32::MAX as usize {
             return Err(ArticulatedError::WorkBudget);
@@ -8409,6 +8445,10 @@ mod tests {
                 mix_density,
             )
             .unwrap();
+        assert_eq!(prepared.additional_body_slots(), 1);
+        let transfer_witness = *prepared.transfer_outcome(12).unwrap();
+        assert!(prepared.transfer_outcome(11).is_none());
+        assert!(prepared.transfer_outcome(999).is_none());
         assert_eq!(
             world.body_count(),
             before,
@@ -8426,6 +8466,7 @@ mod tests {
             vec![11, 12]
         );
         assert!(outcomes[1].transfer.is_some());
+        assert_eq!(outcomes[1].transfer, Some(transfer_witness));
         let born = world.articulated.get(&outcomes[0].owner_id.0).unwrap();
         assert!(born.kinematic_part_bodies && !born.dynamic_corpse);
         let converted = world.articulated.get(&alive.0).unwrap();
@@ -8512,6 +8553,7 @@ mod tests {
                 mix_density,
             )
             .unwrap();
+        assert_eq!(prepared.additional_body_slots(), 2);
         assert_eq!(
             world.body_count(),
             before,
@@ -8544,6 +8586,46 @@ mod tests {
             8
         );
         assert_eq!(world.body_count(), before + 2);
+    }
+
+    #[test]
+    fn articulated_batch_capacity_reservation_is_joint_and_overflow_is_atomic() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let make_birth = |tag, volume| ArticulatedBatchOperation::AliveBirth {
+            operation_tag: tag,
+            translation_m: [0.0; 3],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            topology_token: tag,
+            parts: vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), volume, 1)],
+            representation: Representation::MergedCuboids,
+        };
+        let before = world.body_count();
+        let prepared = world
+            .prepare_articulated_batch(vec![make_birth(61, 561)], mix_density)
+            .unwrap();
+        assert_eq!(prepared.additional_body_slots(), 1);
+        let validated = world
+            .validate_articulated_batch_with_reserved_body_slots(prepared, 2)
+            .unwrap();
+        assert_eq!(world.body_count(), before);
+        let outcomes = world.publish_validated_articulated_batch(validated);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(world.body_count(), before + 1);
+
+        let prepared = world
+            .prepare_articulated_batch(vec![make_birth(62, 562)], mix_density)
+            .unwrap();
+        let before_overflow = world.body_count();
+        assert!(matches!(
+            world.validate_articulated_batch_with_reserved_body_slots(prepared, usize::MAX),
+            Err(crate::articulated::ArticulatedError::WorkBudget)
+        ));
+        assert_eq!(world.body_count(), before_overflow);
+        assert!(!world.articulated.values().any(|owner| {
+            owner
+                .source_volume_ids
+                .contains(&VolumeId::new(562).unwrap())
+        }));
     }
 
     #[test]
