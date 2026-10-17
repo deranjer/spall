@@ -5,11 +5,11 @@ use spall_core::{CellSizeCode, GlobalCell, TransactionId, VolumeId};
 use spall_physics::{PartTransform, Representation};
 use spall_protocol::creature_owner::CreatureDeathWitnessV1;
 use spall_protocol::{
-    BaselineCells, BaselineOwner, CREATURE_CHANGE_SCHEMA, CREATURE_OWNER_SCHEMA,
+    baseline::BaselineBrick, reduce_creature_lifecycle_candidate, BaselineCells, BaselineOwner,
     CreatureLifecycleChangeV1, CreatureLifecycleContextV1, CreatureLifecycleOperationV1,
     CreatureLocalPoseV1, CreatureMaskCellV1, CreatureOwnedComponentV1, CreatureOwnershipRecordV1,
-    CreatureReductionOutcome, CreatureSourceMaskBrickV1, CreatureSourcePartV1, Hash32,
-    baseline::BaselineBrick, reduce_creature_lifecycle_candidate,
+    CreaturePartBinding, CreatureReductionOutcome, CreatureSourceMaskBrickV1, CreatureSourcePartV1,
+    Hash32, CREATURE_CHANGE_SCHEMA, CREATURE_OWNER_SCHEMA,
 };
 use spall_voxel::{EditPlan, Volume};
 
@@ -168,31 +168,100 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
         Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
     sim.initialize_creature_host(WorldId::from_u128(10))
         .unwrap();
-    let catalog = FixtureCatalog::with_materials(sim.world.materials().clone());
+    use spall_protocol::{
+        CreatureAssetCatalogEntry, CreatureSpeciesCatalogEntry, CreatureValidationCatalog,
+    };
+    let base_catalog = FixtureCatalog::with_materials(sim.world.materials().clone());
+    let base_view = base_catalog.view();
     let next_volume_id = sim.world.registry().counters().1;
-    let volume_id = VolumeId::new(next_volume_id).unwrap();
+    let volume_ids = [
+        VolumeId::new(next_volume_id).unwrap(),
+        VolumeId::new(next_volume_id + 1).unwrap(),
+        VolumeId::new(next_volume_id + 2).unwrap(),
+    ];
+    let assets = [CreatureAssetCatalogEntry {
+        uuid: base_view.assets[0].uuid,
+        logical_hash: base_view.assets[0].logical_hash,
+        part_ids: &[1, 2, 3],
+        clip_names: base_view.assets[0].clip_names,
+        portable_material_keys: base_view.assets[0].portable_material_keys,
+    }];
+    let species = [CreatureSpeciesCatalogEntry {
+        key: base_view.species[0].key,
+        version: base_view.species[0].version,
+        enabled: base_view.species[0].enabled,
+        asset: base_view.species[0].asset,
+    }];
+    let catalog = CreatureValidationCatalog {
+        assets: &assets,
+        species: &species,
+        materials: base_view.materials,
+        material_mapping_version: base_view.material_mapping_version,
+        material_mapping_hash: base_view.material_mapping_hash,
+        material_mapping: base_view.material_mapping,
+    };
     let before_allocator = sim.creature_allocator_snapshot().unwrap();
-    let state = catalog.state(1, volume_id.get());
-    let mut state = state;
+    let mut state = base_catalog.state(1, volume_ids[0].get());
+    state.source_bindings = volume_ids
+        .iter()
+        .enumerate()
+        .map(|(index, volume_id)| CreaturePartBinding {
+            part_id: index as u32 + 1,
+            source_volume_id: *volume_id,
+            source_revision: 1,
+        })
+        .collect();
     state.root_translation_m = [10.0, 5.0, 10.0];
-    let mut source = Volume::new(volume_id, CellSizeCode::Quarter);
-    source
-        .apply_edit(&EditPlan::filled_box(
-            volume_id,
-            GlobalCell::new(0, 0, 0),
-            GlobalCell::new(0, 0, 0),
-            MaterialId(1),
-        ))
-        .unwrap();
+    state.root_rotation_xyzw = [
+        0.0,
+        0.0,
+        std::f32::consts::FRAC_1_SQRT_2,
+        std::f32::consts::FRAC_1_SQRT_2,
+    ];
+    let q90 = state.root_rotation_xyzw;
+    let authored = [
+        (None, PartTransform::IDENTITY),
+        (
+            Some(1),
+            PartTransform {
+                translation_m: [1.0, 0.0, 0.0],
+                rotation_xyzw: q90,
+            },
+        ),
+        (
+            Some(2),
+            PartTransform {
+                translation_m: [1.0, 0.0, 0.0],
+                rotation_xyzw: q90,
+            },
+        ),
+    ];
+    let source_parts = volume_ids
+        .iter()
+        .map(|volume_id| {
+            let mut source = Volume::new(*volume_id, CellSizeCode::Quarter);
+            source
+                .apply_edit(&EditPlan::filled_box(
+                    *volume_id,
+                    GlobalCell::new(0, 0, 0),
+                    GlobalCell::new(0, 0, 0),
+                    MaterialId(1),
+                ))
+                .unwrap();
+            source
+        })
+        .collect::<Vec<_>>();
     sim.commit_creature_birth_for_test(
         state.clone(),
-        &catalog.view(),
-        vec![CreatureBirthPartInput {
-            part_id: 1,
-            parent_id: None,
-            local_transform: PartTransform::IDENTITY,
-            volume: source,
-        }],
+        &catalog,
+        (0..3)
+            .map(|index| CreatureBirthPartInput {
+                part_id: index as u32 + 1,
+                parent_id: authored[index].0,
+                local_transform: authored[index].1,
+                volume: source_parts[index].clone(),
+            })
+            .collect(),
         Representation::MergedCuboids,
     )
     .unwrap();
@@ -204,7 +273,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
         .unwrap()
         .clone();
     let before = record_from_sim(&sim, alive);
-    before.validate(&catalog.view()).unwrap();
+    before.validate(&catalog).unwrap();
     let transaction_id = TransactionId::new(1).unwrap();
     let birth = CreatureLifecycleChangeV1 {
         schema: CREATURE_CHANGE_SCHEMA,
@@ -230,7 +299,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
             existing_owner_keys: &[],
             existing_source_volumes: &[],
         },
-        &catalog.view(),
+        &catalog,
     )
     .unwrap();
     assert_eq!(birth_candidate.outcome, CreatureReductionOutcome::Applied);
@@ -242,7 +311,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
         birth_candidate.next_creature_id,
         before_allocator.next_creature_id + 1
     );
-    assert_eq!(birth_candidate.next_volume_id, next_volume_id + 1);
+    assert_eq!(birth_candidate.next_volume_id, next_volume_id + 3);
 
     let owner = sim
         .world
@@ -256,13 +325,23 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
                 topology_token: state.aggregate_topology_revision,
                 base_pose_token: 0,
                 pose_token: 1,
-                parts: vec![(
-                    1,
-                    PartTransform {
-                        translation_m: [0.5, 0.25, 0.0],
-                        ..PartTransform::IDENTITY
-                    },
-                )],
+                parts: vec![
+                    (1, PartTransform::IDENTITY),
+                    (
+                        2,
+                        PartTransform {
+                            translation_m: [1.25, 0.0, 0.0],
+                            rotation_xyzw: q90,
+                        },
+                    ),
+                    (
+                        3,
+                        PartTransform {
+                            translation_m: [0.75, 0.5, 0.0],
+                            rotation_xyzw: q90,
+                        },
+                    ),
+                ],
             },
         )
         .unwrap();
@@ -273,7 +352,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
             state.state_revision,
             state.aggregate_topology_revision,
             1,
-            &catalog.view(),
+            &catalog,
         )
         .unwrap();
     assert!(transfer.mass_kg > 0.0);
@@ -285,7 +364,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
         .unwrap()
         .clone();
     let after = record_from_sim(&sim, corpse);
-    after.validate(&catalog.view()).unwrap();
+    after.validate(&catalog).unwrap();
     let frozen_local_poses = sim
         .world
         .creature_frozen_poses_for_test(state.key)
@@ -340,7 +419,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     );
     let existing_keys = [state.key];
     let existing_owner_keys = [OWNER_KEY];
-    let existing_source_volumes = [volume_id];
+    let existing_source_volumes = volume_ids;
     let reduced = reduce_creature_lifecycle_candidate(
         Some(&before),
         &death,
@@ -355,32 +434,53 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
             existing_owner_keys: &existing_owner_keys,
             existing_source_volumes: &existing_source_volumes,
         },
-        &catalog.view(),
+        &catalog,
     )
     .unwrap();
     assert_eq!(reduced.outcome, CreatureReductionOutcome::Applied);
     assert_eq!(reduced.record.canonical_hash(), after.canonical_hash());
-    assert_eq!(reduced.record.parts[0].bricks, before.parts[0].bricks);
+    for ((before_part, after_part), reduced_part) in before
+        .parts
+        .iter()
+        .zip(&after.parts)
+        .zip(&reduced.record.parts)
+    {
+        assert_eq!(reduced_part.source_volume_id, before_part.source_volume_id);
+        assert_eq!(reduced_part.bricks, before_part.bricks);
+        assert_eq!(
+            reduced_part.source_content_hash,
+            before_part.source_content_hash
+        );
+        assert_eq!(reduced_part.parent_id, before_part.parent_id);
+        assert_eq!(
+            reduced_part.initial_local_pose,
+            before_part.initial_local_pose
+        );
+        assert_eq!(reduced_part.frozen_local_pose, after_part.frozen_local_pose);
+    }
     assert_eq!(
-        reduced.record.parts[0].source_content_hash,
-        before.parts[0].source_content_hash
+        before
+            .parts
+            .iter()
+            .map(|part| part.parent_id)
+            .collect::<Vec<_>>(),
+        [None, Some(1), Some(2)]
     );
-    assert_eq!(reduced.record.parts[0].parent_id, before.parts[0].parent_id);
     assert_eq!(
-        reduced.record.parts[0].initial_local_pose,
-        before.parts[0].initial_local_pose
-    );
-    assert_eq!(
-        reduced.record.parts[0].frozen_local_pose,
-        after.parts[0].frozen_local_pose
+        after
+            .parts
+            .iter()
+            .map(|part| part.parent_id)
+            .collect::<Vec<_>>(),
+        [None, Some(1), Some(2)]
     );
 }
 
 #[test]
 fn source_material_must_belong_to_selected_asset_keys() {
     use spall_protocol::{
-        CreatureAssetCatalogEntry, CreatureAssetIdentity, CreatureMaterialMappingEntry,
-        CreatureSpeciesCatalogEntry, CreatureValidationCatalog, creature_material_mapping_hash,
+        creature_material_mapping_hash, CreatureAssetCatalogEntry, CreatureAssetIdentity,
+        CreatureMaterialMappingEntry, CreatureSpeciesCatalogEntry, CreatureValidationCatalog,
     };
 
     let mut sim =
@@ -468,8 +568,8 @@ fn source_material_must_belong_to_selected_asset_keys() {
 
 #[test]
 fn record_work_preflight_rejects_duplicate_masks_and_large_owned_sets() {
-    use spall_protocol::CreatureOwnershipSetV1;
     use spall_protocol::creature_owner::MAX_CREATURE_OWNER_SET_SOLID_CELLS;
+    use spall_protocol::CreatureOwnershipSetV1;
     let mut sim =
         Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
     sim.initialize_creature_host(WorldId::from_u128(10))
