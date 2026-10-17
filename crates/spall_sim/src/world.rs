@@ -17,8 +17,8 @@ use spall_core::{
 };
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
-    BodyId as PhysBodyId, BodyKind as PhysBodyKind, BodySpec, CharacterParams, CharacterQueryCache,
-    OccupancyGrid, PhysicsConfig, PhysicsOrigin, PhysicsWorld, Representation,
+    BodyCommitFence, BodyId as PhysBodyId, BodyKind as PhysBodyKind, BodySpec, CharacterParams,
+    CharacterQueryCache, OccupancyGrid, PhysicsConfig, PhysicsOrigin, PhysicsWorld, Representation,
     analytic_mass_properties, step_character_in_water,
 };
 use spall_protocol::{
@@ -191,6 +191,32 @@ struct TerrainBrickCollider {
     has_collider: bool,
 }
 
+/// All fallible terrain-brick localization is completed before transaction
+/// publication. The payload is private and tied to the captured world fence.
+pub(crate) struct PreparedTerrainBrickPublication {
+    coord: BrickCoord,
+    revision: Revision,
+    existing: Option<TerrainBrickCollider>,
+    representation: Option<Representation>,
+    localized_grid: Option<(OccupancyGrid, [f32; 3])>,
+}
+
+/// Exact world/target/collider read set captured by a prepared geometry commit.
+/// Kept private to simulation so it cannot become a second public transaction API.
+pub(crate) struct GeometryCommitFence {
+    world_identity: std::sync::Arc<()>,
+    physics: BodyCommitFence,
+    registry_counters: (u64, u64, u64, u64),
+    topology_epoch: TopologyEpoch,
+    physics_origin: PhysicsOrigin,
+    journal_cursor: u64,
+    target: (VolumeId, Option<EntityId>, PhysBodyId, BodyKind, u64, u64),
+    terrain_brick_mode: bool,
+    terrain_bricks: Vec<TerrainBrickFenceEntry>,
+}
+
+type TerrainBrickFenceEntry = (BrickCoord, Option<(PhysBodyId, Revision, bool)>);
+
 /// The authoritative simulation world.
 /// A structure index remembered across commits; see [`SimWorld::warm_structure_index`].
 struct WarmStructure {
@@ -206,6 +232,9 @@ struct WarmStructure {
 }
 
 pub struct SimWorld {
+    /// Distinguishes this authoritative world instance from another world
+    /// with identical contents when a prepared commit is published later.
+    pub(crate) commit_identity: std::sync::Arc<()>,
     /// The terrain's structure index as the last non-splitting commit left it, valid only while
     /// the terrain volume still carries the stamp it was recorded under (see
     /// [`spall_voxel::Volume::state_stamp`]). Staging clones it instead of rebuilding the
@@ -408,6 +437,7 @@ impl SimWorld {
         };
 
         let mut world = Self {
+            commit_identity: std::sync::Arc::new(()),
             registry,
             materials: setup.materials,
             anchor: setup.anchor,
@@ -673,12 +703,6 @@ impl SimWorld {
         coord: BrickCoord,
         plan: Option<&ColliderPlan>,
     ) -> Result<(), WorldError> {
-        let existing = self
-            .terrain_brick_colliders
-            .as_ref()
-            .and_then(|m| m.get(&coord))
-            .copied();
-        let cell_m = self.terrain.volume.cell_size().metres() as f32;
         let revision = self
             .terrain
             .volume
@@ -686,6 +710,23 @@ impl SimWorld {
             .ok()
             .flatten()
             .unwrap_or(Revision::ZERO);
+        let prepared = self.prepare_terrain_brick_publication(coord, revision, plan)?;
+        self.publish_prepared_terrain_brick(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_terrain_brick_publication(
+        &self,
+        coord: BrickCoord,
+        revision: Revision,
+        plan: Option<&ColliderPlan>,
+    ) -> Result<PreparedTerrainBrickPublication, WorldError> {
+        let existing = self
+            .terrain_brick_colliders
+            .as_ref()
+            .and_then(|m| m.get(&coord))
+            .copied();
+        let cell_m = self.terrain.volume.cell_size().metres() as f32;
         let local_plan = if let Some(plan) = plan {
             let (grid, translation_m) = self
                 .physics_origin
@@ -695,10 +736,34 @@ impl SimWorld {
         } else {
             None
         };
-        let next = match (existing, plan, local_plan) {
-            (Some(entry), Some(plan), Some((grid, _))) => {
+        Ok(PreparedTerrainBrickPublication {
+            coord,
+            revision,
+            existing,
+            representation: plan.map(|plan| plan.representation),
+            localized_grid: local_plan,
+        })
+    }
+
+    /// Publishes a terrain plan whose coordinate conversion and required map
+    /// initialization were validated during preparation. This path cannot
+    /// return an error after another transaction participant has published.
+    pub(crate) fn publish_prepared_terrain_brick(
+        &mut self,
+        prepared: PreparedTerrainBrickPublication,
+    ) {
+        let PreparedTerrainBrickPublication {
+            coord,
+            revision,
+            existing,
+            representation,
+            localized_grid,
+        } = prepared;
+        let cell_m = self.terrain.volume.cell_size().metres() as f32;
+        let next = match (existing, representation, localized_grid) {
+            (Some(entry), Some(representation), Some((grid, _))) => {
                 self.physics
-                    .rebuild_collider(entry.phys, &grid, plan.representation);
+                    .rebuild_collider(entry.phys, &grid, representation);
                 TerrainBrickCollider {
                     phys: entry.phys,
                     built_revision: revision,
@@ -715,10 +780,10 @@ impl SimWorld {
                     has_collider: false,
                 }
             }
-            (None, Some(plan), Some((grid, translation_m))) => {
+            (None, Some(representation), Some((grid, translation_m))) => {
                 let phys = self.physics.add_body(BodySpec {
                     kind: PhysBodyKind::Fixed,
-                    representation: plan.representation,
+                    representation,
                     grid,
                     cell_m,
                     density_kg_m3: 1.0,
@@ -732,12 +797,12 @@ impl SimWorld {
                     has_collider: true,
                 }
             }
-            (None, None, None) => return Ok(()),
+            (None, None, None) => return,
             _ => unreachable!("terrain plan localization is paired with plan presence"),
         };
         self.terrain_brick_colliders
             .as_mut()
-            .expect("terrain brick state initialized")
+            .expect("terrain brick state was initialized during preparation")
             .insert(coord, next);
         if existing.is_none() {
             self.terrain_exclusion = None;
@@ -745,7 +810,6 @@ impl SimWorld {
         let edge = f64::from(spall_core::BRICK_EDGE) * f64::from(cell_m);
         let lo = [coord.x, coord.y, coord.z].map(|c| c as f64 * edge);
         self.note_terrain_collider_change(Some((lo, lo.map(|v| v + edge))));
-        Ok(())
     }
 
     fn rebuild_terrain_brick_colliders(&mut self) -> Result<(), WorldError> {
@@ -1108,6 +1172,102 @@ impl SimWorld {
 
     pub fn physics(&self) -> &PhysicsWorld {
         &self.physics
+    }
+
+    /// Captures the bounded read set that an edit commit's candidate depends on.
+    pub(crate) fn capture_geometry_commit_fence(
+        &self,
+        volume: VolumeId,
+        terrain_bricks: &[BrickCoord],
+        journal_cursor: u64,
+    ) -> Result<GeometryCommitFence, String> {
+        let body = self
+            .volume_body(volume)
+            .ok_or_else(|| format!("missing target volume {volume}"))?;
+        let terrain_brick_mode = self.terrain_brick_colliders.is_some();
+        let mut physics_bodies = Vec::new();
+        if body.kind != BodyKind::Terrain || !terrain_brick_mode {
+            physics_bodies.push(body.phys);
+        }
+        let terrain_bricks = terrain_bricks
+            .iter()
+            .copied()
+            .map(|coord| {
+                let entry = self
+                    .terrain_brick_colliders
+                    .as_ref()
+                    .and_then(|entries| entries.get(&coord))
+                    .copied();
+                if let Some(entry) = entry {
+                    physics_bodies.push(entry.phys);
+                }
+                (
+                    coord,
+                    entry.map(|entry| (entry.phys, entry.built_revision, entry.has_collider)),
+                )
+            })
+            .collect();
+        let physics = self
+            .physics
+            .snapshot_body_commit_fence(&physics_bodies)
+            .map_err(|error| error.to_string())?;
+        Ok(GeometryCommitFence {
+            world_identity: self.commit_identity.clone(),
+            physics,
+            registry_counters: self.registry.counters(),
+            topology_epoch: self.topology_epoch,
+            physics_origin: self.physics_origin,
+            journal_cursor,
+            target: (
+                volume,
+                body.entity,
+                body.phys,
+                body.kind,
+                body.volume.state_stamp(),
+                body.collider_revision,
+            ),
+            terrain_brick_mode,
+            terrain_bricks,
+        })
+    }
+
+    /// Revalidates all state read by geometry preparation without scanning or
+    /// cloning the world. Call immediately before any authoritative publish.
+    pub(crate) fn validates_geometry_commit_fence(
+        &self,
+        fence: &GeometryCommitFence,
+        journal_cursor: u64,
+    ) -> bool {
+        if !std::sync::Arc::ptr_eq(&fence.world_identity, &self.commit_identity)
+            || !self.physics.validate_body_commit_fence(&fence.physics)
+            || self.registry.counters() != fence.registry_counters
+            || self.topology_epoch != fence.topology_epoch
+            || self.physics_origin != fence.physics_origin
+            || journal_cursor != fence.journal_cursor
+            || self.terrain_brick_colliders.is_some() != fence.terrain_brick_mode
+        {
+            return false;
+        }
+        let (volume, entity, phys, kind, stamp, collider_revision) = fence.target;
+        let Some(body) = self.volume_body(volume) else {
+            return false;
+        };
+        if body.entity != entity
+            || body.phys != phys
+            || body.kind != kind
+            || body.volume.state_stamp() != stamp
+            || body.collider_revision != collider_revision
+        {
+            return false;
+        }
+        fence.terrain_bricks.iter().all(|(coord, expected)| {
+            let current = self
+                .terrain_brick_colliders
+                .as_ref()
+                .and_then(|entries| entries.get(coord))
+                .map(|entry| (entry.phys, entry.built_revision, entry.has_collider));
+            current == *expected
+        })
     }
 
     /// Validates a private in-memory source ownership candidate. This does not
