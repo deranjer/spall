@@ -59,25 +59,12 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, DtoError>
     Ok(postcard::from_bytes(bytes)?)
 }
 
-/// Saved topology/motion layouts did not change when weather controls (6) and
-/// snow frames (7) were added. Migrate only those known journal families;
-/// live transport negotiation and all other record layouts remain strict.
+/// Journal records use the current protocol schema exactly. Historical headers
+/// are rejected by the shared codec; saved rows are never reinterpreted under a
+/// newer enum layout.
 fn decode_saved_record<R: spall_protocol::Record>(bytes: &[u8]) -> Result<R, CodecError> {
-    if bytes.len() >= spall_protocol::codec::HEADER_LEN
-        && bytes.len() <= spall_protocol::limits::MAX_CONTROL_RECORD
-        && matches!(
-            R::TAG,
-            spall_protocol::WireTag::TopologyTransaction | spall_protocol::WireTag::MotionSnapshot
-        )
-        && matches!(u16::from_le_bytes([bytes[0], bytes[1]]), 5 | 6)
-    {
-        let mut migrated = bytes.to_vec();
-        migrated[..2].copy_from_slice(&R::SCHEMA_VERSION.to_le_bytes());
-        return decode_control(&migrated);
-    }
     decode_control(bytes)
 }
-
 /// Required world metadata (`docs/protocol.md` "Persistence"): schema version,
 /// world identity, seed, generator version, material manifest hash, cell-size
 /// codes, next-ID counters, and structural algorithm versions. The
@@ -416,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_snow_saved_topology_and_poses_migrate_without_relaxing_live_wire_versions() {
+    fn saved_topology_motion_and_bulk_rows_reject_noncurrent_protocol_versions() {
         let motion = MotionSnapshot {
             server_tick: Tick(9),
             snapshot_seq: spall_protocol::SnapshotSeq(1),
@@ -436,50 +423,62 @@ mod tests {
             angular_velocity: [0.0; 3],
             sleeping: true,
         };
-        for version in [5u16, 6] {
-            let mut tx = encode_control(&a_tx()).unwrap();
-            let mut pose = encode_control(&motion).unwrap();
+        let current_tx = encode_control(&a_tx()).unwrap();
+        let current_motion = encode_control(&motion).unwrap();
+        for version in [2u16, 5, 6, 7, 9] {
+            let mut tx = current_tx.clone();
+            let mut pose = current_motion.clone();
             tx[..2].copy_from_slice(&version.to_le_bytes());
             pose[..2].copy_from_slice(&version.to_le_bytes());
-            assert!(decode_control::<TopologyTransaction>(&tx).is_err());
-            assert!(decode_control::<MotionSnapshot>(&pose).is_err());
-            let journal = JournalPayload::Topology {
+            let topology = JournalPayload::Topology {
                 transaction: tx.clone(),
                 participants: vec![pose.clone()],
             };
-            assert_eq!(
-                journal.as_topology().unwrap().unwrap(),
-                (a_tx(), vec![motion])
+            assert!(
+                topology.as_topology().unwrap().is_err(),
+                "topology schema {version}"
             );
             let batch = JournalPayload::PoseBatch {
                 snapshots: vec![pose.clone()],
             };
-            assert_eq!(batch.as_pose_batch().unwrap().unwrap(), vec![motion]);
-            let world = a_baseline_world();
+            assert!(
+                batch.as_pose_batch().unwrap().is_err(),
+                "motion schema {version}"
+            );
             let bulk = JournalPayload::TopologyBulkSplit {
                 transaction: tx,
                 participants: vec![pose],
-                baseline: world.encode_compressed(),
-            };
-            assert_eq!(
-                bulk.as_topology_bulk_split().unwrap().unwrap(),
-                (a_tx(), vec![motion], world)
-            );
-        }
-        for version in [2u16, 8] {
-            let mut tx = encode_control(&a_tx()).unwrap();
-            tx[..2].copy_from_slice(&version.to_le_bytes());
-            let journal = JournalPayload::Topology {
-                transaction: tx,
-                participants: vec![],
+                baseline: a_baseline_world().encode_compressed(),
             };
             assert!(
-                journal.as_topology().unwrap().is_err(),
-                "unsupported saved schema {version}"
+                bulk.as_topology_bulk_split().unwrap().is_err(),
+                "bulk topology schema {version}"
             );
         }
+        // Current records remain usable through every journal accessor.
+        let topology = JournalPayload::Topology {
+            transaction: current_tx.clone(),
+            participants: vec![current_motion.clone()],
+        };
+        assert_eq!(
+            topology.as_topology().unwrap().unwrap(),
+            (a_tx(), vec![motion])
+        );
+        let poses = JournalPayload::PoseBatch {
+            snapshots: vec![current_motion.clone()],
+        };
+        assert_eq!(poses.as_pose_batch().unwrap().unwrap(), vec![motion]);
+        let world = a_baseline_world();
+        let bulk = JournalPayload::TopologyBulkSplit {
+            transaction: current_tx,
+            participants: vec![current_motion],
+            baseline: world.encode_compressed(),
+        };
+        assert_eq!(
+            bulk.as_topology_bulk_split().unwrap().unwrap(),
+            (a_tx(), vec![motion], world)
+        );
     }
-
     fn a_baseline_world() -> BaselineWorld {
         use spall_protocol::baseline::{
             BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume,
