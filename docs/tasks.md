@@ -2125,3 +2125,20 @@ Next unblocked work: coordinated ordered transaction, replica/baseline and
 durable checkpoint/replay consumers using these same records/reducer, with
 explicit compatibility and topology-versus-motion hash separation. Source
 edit/fracture synchronization, species/habitat and combined1024m proof follow.
+## ENG-218: ordered animal lifecycle consumers and durable recovery
+
+Depends on accepted ENG-217(main84880c2). Design-first coordinated integration
+of the SAME portable ownership records/reducer with actual ordered world
+transactions, client baseline/replica and checkpoint/journal recovery. Evaluate
+one legitimate typed lifecycle TopologyOp within existing transaction order;
+never fake geometry or a separate actor stream/ledger/journal. Explicit wire,
+baseline and store version handling, allocator highwater even for empty sets,
+portable checked death evidence and source owner uniqueness are required.
+Define actor topology hashing separately from motion-bearing fullowner hashing.
+Mixedop atomicity, duplicate/divergent replay, baseline/restart/suffix recovery,
+oldformat rejection without mutation, checkpoint crash cuts and exact source/
+hierarchy/motion/counter checks precede acceptance. Physical restore must be
+specified; no ghost actors or fake Body ownership. Production species spawning
+stays closed; sourceedit/fracture sync and integrated1024m proof still follow.
+Exact contract: Loopira ENG-218. Coordinator reviews design before shared edits;
+Luna6Medium worker uses dedicated animal-consumers checkout from84880c2.
