@@ -653,3 +653,199 @@ fn aggregate_brick_limit_rejects_nested_payload_before_record_validation() {
         "per-part bounds must not defer cumulative rejection until after nested allocations"
     );
 }
+
+fn motion_overlay_for_review(record: &CreatureOwnershipRecordV1) -> CreatureMotionOverlayV1 {
+    CreatureMotionOverlayV1 {
+        state_revision: record.state.state_revision,
+        clip_mode: record.state.clip_mode,
+        clip_phase_tick: record.state.clip_phase_tick,
+        clip_subtick_remainder: record.state.clip_subtick_remainder,
+        clip_epoch: record.state.clip_epoch,
+        pose_epoch: record.state.pose_epoch,
+        root_translation_m: record.state.root_translation_m,
+        root_rotation_xyzw: record.state.root_rotation_xyzw,
+        linear_velocity_m_s: record.state.linear_velocity_m_s,
+        angular_velocity_rad_s: record.state.angular_velocity_rad_s,
+        locomotion_tag: record.state.locomotion_tag,
+        parts: record
+            .parts
+            .iter()
+            .map(|p| CreaturePartMotionV1 {
+                part_id: p.part_id,
+                frozen_local_pose: p.frozen_local_pose,
+            })
+            .collect(),
+        components: record
+            .components
+            .iter()
+            .map(|c| CreatureComponentMotionV1 {
+                owner_key: c.owner_key,
+                serial: c.serial,
+                translation_m: c.translation_m,
+                rotation_xyzw: c.rotation_xyzw,
+                linear_velocity_m_s: c.linear_velocity_m_s,
+                angular_velocity_rad_s: c.angular_velocity_rad_s,
+            })
+            .collect(),
+    }
+}
+
+fn moved_death_for_review(f: &Fixture) -> (CreatureOwnershipRecordV1, CreatureLifecycleCommitV1) {
+    let mut before = owner(f);
+    // A client may have a large phase in an old playback epoch.
+    before.state.clip_phase_tick = 100;
+    let mut moved = before.clone();
+    moved.state.state_revision = 4;
+    moved.state.pose_epoch = 7;
+    moved.state.clip_epoch = 2;
+    moved.state.clip_phase_tick = 3;
+    moved.state.root_translation_m = [3.0, 4.0, 5.0];
+    moved.state.linear_velocity_m_s = [1.0, 0.0, 0.0];
+    moved.parts[0].frozen_local_pose.translation_m[0] = 0.125;
+    moved.components[0].translation_m = moved.state.root_translation_m;
+    moved.components[0].linear_velocity_m_s = moved.state.linear_velocity_m_s;
+    moved.validate(&f.catalog()).unwrap();
+    let mut after = moved.clone();
+    after.state.lifecycle = CreatureLifecycleState::Corpse;
+    after.state.clip_mode = CreatureClipMode::Frozen;
+    after.state.state_revision += 1;
+    after.state.pose_epoch += 1;
+    after.state.clip_epoch += 1;
+    after.state.root_translation_m[0] += 1.0;
+    after.state.linear_velocity_m_s[0] = 2.0;
+    after.components[0].translation_m = after.state.root_translation_m;
+    after.components[0].linear_velocity_m_s = after.state.linear_velocity_m_s;
+    after.validate(&f.catalog()).unwrap();
+    let witness = CreatureDeathWitnessV1 {
+        key: moved.state.key,
+        source_generation: moved.source_generation,
+        before_state_revision: moved.state.state_revision,
+        before_topology_revision: moved.state.aggregate_topology_revision,
+        before_pose_epoch: moved.state.pose_epoch,
+        root_translation_m: after.state.root_translation_m,
+        root_rotation_xyzw: after.state.root_rotation_xyzw,
+        installed_linear_velocity_m_s: after.state.linear_velocity_m_s,
+        installed_angular_velocity_rad_s: after.state.angular_velocity_rad_s,
+        frozen_local_poses: after
+            .parts
+            .iter()
+            .map(|p| (p.part_id, p.frozen_local_pose))
+            .collect(),
+    };
+    let commit = CreatureLifecycleCommitV1 {
+        schema: 1,
+        change: CreatureLifecycleChangeV1 {
+            schema: 1,
+            transaction_id: spall_core::TransactionId::new(8).unwrap(),
+            operation_ordinal: 0,
+            expected_before_hash: moved.canonical_hash(),
+            expected_after_hash: after.canonical_hash(),
+            operation: CreatureLifecycleOperationV1::Death { after },
+        },
+        expected_before_topology_hash: before.topology_hash(),
+        pre_motion: Some(motion_overlay_for_review(&moved)),
+        death_witness: Some(witness),
+    };
+    (before, commit)
+}
+
+#[test]
+fn coordinator_motion_refresh_accepts_epoch_reset_but_preserves_source_fence() {
+    let f = Fixture::new();
+    let (before, commit) = moved_death_for_review(&f);
+    let result = commit
+        .validate_and_reduce(Some(&before), context(8, 2, 101), &f.catalog())
+        .unwrap();
+    assert_eq!(
+        result.record.canonical_hash(),
+        commit.change.expected_after_hash
+    );
+    assert_eq!(result.record.parts[0].bricks, before.parts[0].bricks);
+    assert_eq!(
+        result.record.parts[0].source_volume_id,
+        before.parts[0].source_volume_id
+    );
+    assert_ne!(
+        result.record.topology_hash(),
+        before.topology_hash(),
+        "lifecycle is topology"
+    );
+    for case in 0..4 {
+        let mut stale = before.clone();
+        match case {
+            0 => stale.parts[0].initial_local_pose.translation_m[0] = 0.25,
+            1 => {
+                stale.source_generation += 1;
+                stale.parts[0].source_generation += 1;
+                stale.parts[0].source_content_hash = stale.parts[0].canonical_source_content_hash();
+            }
+            2 => stale.state.pose_epoch = 8, // Snapshot is already newer than pre-death motion.
+            3 => stale.state.clip_epoch = 3,
+            _ => unreachable!(),
+        }
+        stale.validate(&f.catalog()).unwrap();
+        let saved = stale.clone();
+        assert!(
+            commit
+                .validate_and_reduce(Some(&stale), context(8, 2, 101), &f.catalog())
+                .is_err(),
+            "stale case {case}"
+        );
+        assert_eq!(stale, saved);
+    }
+}
+
+#[test]
+fn coordinator_outer_receipt_cannot_authorize_changed_death_evidence() {
+    use spall_protocol::creature_owner::CreatureLifecycleCommitReplayReceiptV1;
+    let f = Fixture::new();
+    let (before, commit) = moved_death_for_review(&f);
+    let applied = commit
+        .validate_and_reduce(Some(&before), context(8, 2, 101), &f.catalog())
+        .unwrap();
+    let receipt = CreatureLifecycleCommitReplayReceiptV1 {
+        transaction_id: commit.change.transaction_id,
+        operation_ordinal: 0,
+        commit_hash: commit.canonical_hash(),
+    };
+    let duplicate = commit
+        .validate_and_reduce_with_receipt(
+            Some(&applied.record),
+            context(8, 2, 101),
+            &f.catalog(),
+            Some(receipt),
+        )
+        .unwrap();
+    assert_eq!(duplicate.outcome, CreatureReductionOutcome::Duplicate);
+    for case in 0..3 {
+        let mut changed = commit.clone();
+        match case {
+            0 => {
+                changed
+                    .death_witness
+                    .as_mut()
+                    .unwrap()
+                    .installed_linear_velocity_m_s[0] += 1.0
+            }
+            1 => {
+                changed.pre_motion.as_mut().unwrap().parts[0]
+                    .frozen_local_pose
+                    .translation_m[0] += 0.25
+            }
+            2 => changed.change.operation_ordinal = 1,
+            _ => unreachable!(),
+        }
+        assert_ne!(changed.canonical_hash(), receipt.commit_hash);
+        assert!(
+            changed
+                .validate_and_reduce_with_receipt(
+                    Some(&applied.record),
+                    context(8, 2, 101),
+                    &f.catalog(),
+                    Some(receipt)
+                )
+                .is_err(),
+            "receipt case {case}"
+        );
+    }
+}
