@@ -20,7 +20,7 @@ fn mixed_transaction() -> TopologyTransaction {
         key: "deer",
         version: 1,
         enabled: true,
-        asset: asset.clone(),
+        asset,
     }];
     let mapping = [CreatureMaterialMappingEntry {
         portable_key: "stone",

@@ -165,8 +165,68 @@ was also corrected to count the living aggregate root plus two part bodies.
 No failed check was treated as a pass. Filesystem hard-link cache fallback
 warnings remain. Versions and the unrun launch gates listed above are unchanged.
 
-Next unblocked task: continue ENG-218 through the real typed ordered operation,
-bounded correlated bulk transport, complete baseline/segmented staging, and
+## Current-only protocol and save boundary
+
+The user's 2026-10-17 instruction removes legacy compatibility from this work.
+Main now uses protocol/wire 8. `TopologyOp::CreatureLifecycle` carries the outer
+commit inside the existing ordered transaction; enclosing transaction ID,
+operation ordinal and schema are structurally checked. The codec checks size
+before allocating the encoded frame. Catalog/transition validation remains the
+candidate consumer's responsibility. Clients and geometry-only recovery refuse
+actor-bearing transactions before geometry, clocks, sequence gates or queues
+change. Production spawning remains closed.
+
+Main `4b8e090` exposes immutable prepared transfer evidence and logical body-slot
+demand, plus a joint external geometry capacity check. Main `1e22e53` adds the
+inline wire boundary; `7e6dc65` fixes the handshake version and verifies a valid
+nonempty source-bearing Birth through codec and reducer. Main `6446151` adds
+independent rejection tests with a validated actor payload after an ordinary
+cell edit. Both replica and geometry-only recovery leave their state unchanged.
+
+Main `fcf24fe`, `20c355d` and `25a818e` remove journal header rewriting, old
+weather checkpoint/journal DTO fallbacks and conversions, missing-table
+creation/backfills, vegetation v1-v3 DTO upgrades and old organism decoding.
+Current store schema 3 requires its complete table/column layout. A nonempty
+unversioned database is rejected; only a pristine database initializes. Current
+weather/snow behavior and fallback to a prior complete valid checkpoint after
+actual corruption remain. Baseline schema 1 is unchanged; actor-aware durable
+recovery still requires the planned new schema.
+
+Validation evidence for this boundary:
+
+- Worker `cargo test -p spall_store`: 45 passed, 1 ignored after removal;
+  protocol suite: 111 passed; ecology suite: 32 passed. Strict combined
+  store/protocol/ecology all-target Clippy and diff checks passed.
+- Coordinator focused nonempty Birth codec/reducer and handshake-v7 refusal:
+  each passed. Client/recovery atomic rejection tests: 2 passed;
+  `.local/eng218-lifecycle-rejection-review.log`.
+- The coordinator seven-package integrated run stopped at the server snow test's
+  obsolete expectation that wire-6 journals migrate. Earlier suites passed; this
+  run is not recorded as a complete pass. Main `ca33d8f` replaces that expectation
+  with old-version rejection while retaining the current snow restart/Q32 checks.
+  `cargo test -p spall_server --test snow_persistence` then passed (1 test).
+  Logs: `.local/eng218-current-only-tests.log` and
+  `.local/eng218-snow-current-only-retry.log`.
+- The complete coordinator retry, `cargo test -p spall_server -p spall_sim
+  -p spall_store`, passed: 479 tests, 12 ignored. Workspace all-target/all-feature
+  checking passed. Seven-package all-target Clippy with warnings denied first
+  caught a redundant clone in the new client review fixture; removing it made
+  the retry pass. Formatting and diff checks passed. Logs:
+  `.local/eng218-current-only-remaining-tests.log`,
+  `.local/eng218-current-only-workspace-check.log` and
+  `.local/eng218-current-only-clippy-retry.log`. The build emitted a filesystem
+  hard-link cache fallback warning; no GPU or launch performance result is implied.
+
+Main `5c289eb` measures the full validated three-part sparse-source fixture:
+**99,068 postcard body bytes**, above the **65,536-byte** control cap. Codec
+rejection is expected and atomic; the fixture was not reduced or revoxelized.
+Typed bulk transport is therefore a concrete prerequisite for this multi-part
+representation. The later bulk marker/codec and server candidate changes remain
+in the isolated worktree under implementation, not accepted in this report.
+Log: `.local/eng218-three-part-wire-size.log`.
+
+Next unblocked task: continue ENG-218 through real authoritative and replica
+lifecycle consumers, bounded correlated bulk transport, complete baseline/segmented staging, and
 checkpoint/journal recovery consumers. Production animal spawning remains
 disabled. Source edit/fracture synchronization, species/current habitat and
 integrated two-client restart/destruction/performance proof still follow.

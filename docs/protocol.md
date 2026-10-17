@@ -115,17 +115,7 @@ geometry, conserving displaced mass. Velocity, pressure, solver cache and sleep
 reset to rest/awake; restarting is not a continuation of the pre-crash flow
 trajectory. Presentation bytes never serve as canonical saves.
 
-Older saves require an explicit copy migration:
-
-```powershell
-cargo xtask migrate-water-save --source old/world.db --output migrated/world.db
-```
-
-The source stays intact. The destination must be absent; migration copies
-schema-1 geometry/history, inserts empty water groups, rewrites metadata to
-schema 2 and verifies recovery. Schema-1 saves did not persist water, so water
-cannot be reconstructed from their historical presentation. Older binaries
-reject the schema-2 version instead of silently dropping water.
+Old save formats are rejected. No save-copy migration command or compatibility decoder is retained.
 
 ## Column water presentation and recovery (ENG-167)
 
@@ -260,7 +250,7 @@ no crash-recovery promise.
 
 Retire journal records only after a newer durable checkpoint covers them and no snapshot transfer needs them. Cap retention; lagging joins get a fresh baseline. Persist modified-air bricks explicitly so procedural regeneration cannot restore mined blocks. Initial baselines transfer authoritative terrain rather than trusting client-side generation to be bit-identical.
 
-Use versioned DTO migrations with fixture worlds before changing save formats. Unknown newer schemas are rejected without modifying the database. Back up/migrate into a separate database and validate before replacement.
+Use explicit versioned DTOs and fixture worlds when changing save formats. Unsupported schemas are rejected without modifying the database; no save-format migration paths are retained.
 
 ## Network budget and overload behavior
 
@@ -682,8 +672,8 @@ Wire schema/protocol 6 adds WeatherSnapshot tag 24 and appended
 AdminCommand::SetWeather { kind: Option<WeatherKind> }; None restores automatic.
 WeatherState schema 2 carries the canonical override along with explicit clock,
 epoch/revision, quantized precipitation/wind and stable lightning event fields.
-Matching client/server versions are required. Explicit schema-1 checkpoint and
-journal migration produces automatic mode; no runtime enum bytes are persisted.
+Matching client/server versions are required. Old weather checkpoint/journal
+layouts are rejected; no runtime enum bytes are persisted.
 Existing ecology chronological clock and VegetationClock journal semantics stay
 unchanged. A persisted fallback tick clock serves worlds without vegetation.
 Weather overrides require the existing admin authorization and persist through
@@ -693,7 +683,7 @@ reports/ENG-196-weather-foundation.md and reports/ENG-199-weather-controls.md.
 
 ### ENG-206/208 - Ground snow and footprints
 
-Current wire schema/protocol 7 adds `SnowSurfaceFrame` (tag 25), versioned
+Wire schema/protocol 7 originally added `SnowSurfaceFrame` (tag 25), versioned
 separately as snow schema 1. Frames replace one 4 m tile/Y layer, carrying
 disjoint exposed-face cohorts, terrain revisions, quantized depth and bounded
 transient footprints. Empty frames remove old layers. Epoch, sequence and
@@ -703,6 +693,23 @@ submit imprint positions. See weather.md for rates, caps and exposure rules.
 
 Canonical checkpoints retain exact fractional snow depth and climate cursors;
 geometry journal entries preserve exact cohort changes. Footprints clear on
-restart. Storage recovery accepts the unchanged topology/motion layouts from
-saved wire headers 5 and 6 through an explicit storage-only migration. Live
-traffic still requires protocol 7; unknown saved schemas remain rejected.
+restart. Live and saved topology/motion records now require protocol/wire 8. Saved
+wire headers 5, 6 and 7 are rejected without migration or header rewriting.
+
+### ENG-218 - Ordered creature lifecycle boundary
+
+Protocol and wire schema 8 append a typed inline `TopologyOp::CreatureLifecycle`
+carrying the unchanged inner change inside `CreatureLifecycleCommitV1`. The
+operation must use its enclosing transaction ID and exact operation ordinal.
+Multiple operations use the existing transaction count limit. The codec checks
+the 64 KiB control limit before allocating an encoded frame. Catalog, source and
+transition validation still belong to the owning candidate consumer.
+
+The current geometry-only replica and SimWorld replay paths reject actor-bearing
+transactions before geometry, clocks, sequence gates or replay receipts change.
+This boundary does not enable spawning or claim complete baseline or durable
+animal recovery. Baseline schema 1 and store schema 3 remain current until their
+actor-aware replacements are implemented and validated. Unsupported old formats
+are rejected; legacy save upgrades and missing-table backfills have been removed
+under the user's explicit compatibility decision. Crash recovery from a valid
+complete checkpoint remains a separate requirement.
