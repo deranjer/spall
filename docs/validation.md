@@ -1658,3 +1658,26 @@ The release 1024 m winter world is `cargo xtask play --release --worldgen natura
 walk, then choose Clear to retain cold snow while inspecting tracks. Ground snow
 is a non-colliding coating; tracks clear on restart. Exact evidence, capture
 locations and unmeasured performance gates: reports/ENG-207-snow-playtest.md.
+
+## ENG-218 - Current-only lifecycle boundary
+
+The accepted boundary and exact evidence are in
+[ENG-218 progress](reports/ENG-218-progress.md). Run
+`cargo test -p spall_protocol --test creature_commit_review` for valid source-bearing
+codec/reducer fixtures and the measured three-part inline overflow;
+`cargo test -p spall_client lifecycle_rejection_review` for atomic client and
+geometry-only recovery refusal of a mixed actor transaction. These refusal tests
+do not prove an actor consumer has been implemented.
+
+Current-only storage checks are `cargo test -p spall_store` and
+`cargo test -p spall_ecology`; retained current snow recovery is
+`cargo test -p spall_server --test snow_persistence`. Unsupported versions,
+nonempty unversioned stores and incomplete current schemas reject without
+upgrades or backfills. A prior complete valid checkpoint may still recover from
+corruption under the existing crash-recovery contract.
+
+Production animal spawning stays closed until authoritative, replica, baseline,
+bulk and durable-recovery consumers pass the acceptance scenarios in
+[ENG-218 design](reports/ENG-218-design.md). No combined animal/weather 1024 m,
+population, GPU or multiplayer restart/destruction result is implied by the
+current CPU checks.

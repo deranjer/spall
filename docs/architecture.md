@@ -871,3 +871,20 @@ canonical hash/catalogue construction still visit all logical bricks, and distan
 geometry even outside current interest. Global water/ecology replication is unchanged. This change
 reduces initial terrain geometry transfer/client residency; it is not server region generation,
 interest-filtered transactions, or distant visual LOD. Those require separate measured work.
+
+## ENG-218 animal ownership integration boundary
+
+Animal source volumes have separate ownership from terrain and ordinary bodies.
+Lifecycle changes belong in the existing ordered topology transaction and journal,
+sharing the world ID allocators and transaction replay receipt. The accepted
+protocol/wire-8 inline operation is a framing boundary: current client and
+geometry-only replay consumers reject actor-bearing transactions before mutation.
+The full authoritative/replica/baseline/store consumer remains under implementation;
+production animal spawning is disabled. See
+[ENG-218 design](reports/ENG-218-design.md) and
+[measured progress](reports/ENG-218-progress.md).
+
+Only current protocol and save layouts are supported. Old journal headers are
+never rewritten; older DTO layouts and incomplete current store schemas are
+rejected without migration or backfill. Recovery from a complete valid checkpoint
+after corruption remains part of the durability contract.
