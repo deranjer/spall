@@ -188,6 +188,47 @@ pub struct BodyState {
     pub mass_kg: f32,
 }
 
+/// Opaque read fence for selected ordinary physics bodies. Runtime handles
+/// and shared-shape identity stay inside this module and are never encoded.
+pub struct BodyCommitFence {
+    world_identity: std::sync::Arc<()>,
+    step_count: u64,
+    entry_count: usize,
+    body_count: usize,
+    bodies: Vec<BodyCommitFenceEntry>,
+}
+
+struct BodyCommitFenceEntry {
+    id: BodyId,
+    body: RigidBodyHandle,
+    body_type: RigidBodyType,
+    position: Pose,
+    linvel: Vector,
+    angvel: Vector,
+    mass: f32,
+    center_of_mass: Vector,
+    retired: bool,
+    dormant: bool,
+    collider: Option<ColliderCommitFenceState>,
+    representation: Representation,
+    query_only: bool,
+    density: f32,
+    mass_properties: Option<BodyMassProperties>,
+}
+
+struct ColliderCommitFenceState {
+    handle: ColliderHandle,
+    shape: SharedShape,
+    position: Pose,
+    enabled: bool,
+    sensor: bool,
+    active_collision_types: ActiveCollisionTypes,
+    collision_groups: InteractionGroups,
+    solver_groups: InteractionGroups,
+    friction: f32,
+    restitution: f32,
+}
+
 impl BodyState {
     /// True if every kinematic field is finite (no NaN / infinity blow-up).
     pub fn is_finite(&self) -> bool {
@@ -444,13 +485,158 @@ pub const MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS: u64 = 16 * 1024 * 1024;
 pub const MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS: u64 = 4_000_000;
 pub const MAX_CORPSE_RESTORE_BATCH_PRIMITIVES: usize = 4_000_000;
 
+/// One lifecycle operation prepared and published atomically with its batch.
+/// Tags are caller-owned correlation IDs and must be unique within a batch.
+pub enum ArticulatedBatchOperation {
+    /// Create a live kinematic articulated owner from a complete source snapshot.
+    AliveBirth {
+        operation_tag: u64,
+        translation_m: [f32; 3],
+        rotation_xyzw: [f32; 4],
+        topology_token: u64,
+        parts: Vec<SourcePart>,
+        representation: Representation,
+    },
+    /// Convert one live kinematic articulated owner into its dynamic corpse.
+    CheckedDeathTransfer {
+        operation_tag: u64,
+        id: ArticulatedBodyId,
+        expected_topology_token: u64,
+        expected_pose_token: u64,
+    },
+    /// Reconstruct one exact portable owner from canonical source and masks.
+    ColdRestore {
+        operation_tag: u64,
+        restore: crate::articulated::DynamicCorpseRestore,
+        representation: Representation,
+    },
+}
+
+/// Result for one operation in a committed articulated batch.
+#[derive(Debug)]
+pub struct ArticulatedBatchOutcome {
+    pub operation_tag: u64,
+    pub owner_id: ArticulatedBodyId,
+    pub transfer: Option<CorpseTransferOutcome>,
+}
+
 /// Owned immutable solver preparation. It is not serializable and cannot be
 /// committed to another world, reused after a step, or published twice.
-pub struct PreparedDynamicCorpseBatch {
+pub struct PreparedArticulatedBatch {
     world_identity: std::sync::Arc<()>,
     expected_step: u64,
     expected_entries: usize,
-    owners: Vec<PreparedCorpseRestoreOwner>,
+    changes: Vec<PreparedArticulatedChange>,
+}
+
+/// One-shot publication capability produced only after every batch member
+/// and cross-owner reservation passed validation.
+pub struct ValidatedArticulatedBatch {
+    prepared: PreparedArticulatedBatch,
+}
+
+/// Compatibility name for callers using the original restore-only batch.
+pub type PreparedDynamicCorpseBatch = PreparedArticulatedBatch;
+
+enum PreparedArticulatedChange {
+    AliveBirth {
+        operation_tag: u64,
+        birth: PreparedArticulatedBirth,
+    },
+    DynamicCorpseBirth {
+        operation_tag: u64,
+        birth: PreparedArticulatedBirth,
+    },
+    ColdRestore {
+        operation_tag: u64,
+        owner: PreparedCorpseRestoreOwner,
+    },
+    CheckedDeathTransfer {
+        operation_tag: u64,
+        transfer: PreparedCorpseTransfer,
+    },
+}
+
+struct PreparedArticulatedBirth {
+    translation_m: [f32; 3],
+    rotation_xyzw: [f32; 4],
+    topology_token: u64,
+    parts: Vec<SourcePart>,
+    flattened: Vec<PartTransform>,
+    collider_poses: Vec<([f32; 3], [f32; 4])>,
+    builds: Vec<crate::collider::ColliderBuild>,
+    source_volume_ids: std::collections::BTreeSet<spall_core::VolumeId>,
+    mass: Option<BodyMassProperties>,
+    manifest: Option<HashMap<MaterialId, u64>>,
+    kinematic_part_bodies: bool,
+    representation: Representation,
+    primitive_count: usize,
+}
+
+struct PreparedCorpseTransferPartSnapshot {
+    body: RigidBodyHandle,
+    collider: ColliderHandle,
+    position: Pose,
+    linvel: Vector,
+    angvel: Vector,
+    part_id: u32,
+    volume_id: spall_core::VolumeId,
+    source_revision: u64,
+    cell_m: f32,
+    grid_origin: GlobalCell,
+    grid_dims: [u32; 3],
+    source_solid_count: u64,
+    source_cells: Vec<(u32, u32, u32, MaterialId)>,
+    local_pose: PartTransform,
+    assembly_pose: PartTransform,
+}
+
+struct PreparedCorpseTransfer {
+    id: ArticulatedBodyId,
+    expected_topology_token: u64,
+    expected_pose_token: u64,
+    source_generation: u64,
+    source_volume_ids: std::collections::BTreeSet<spall_core::VolumeId>,
+    parts: Vec<PreparedCorpseTransferPartSnapshot>,
+    entry_body: RigidBodyHandle,
+    entry_position: Pose,
+    entry_linvel: Vector,
+    entry_angvel: Vector,
+    entry_collider: ColliderHandle,
+    props: BodyMassProperties,
+    manifest: HashMap<MaterialId, u64>,
+    prepared: Vec<(ColliderHandle, RigidBodyHandle, Pose)>,
+    replacement_colliders: Vec<Collider>,
+    primitive_count: usize,
+    outcome: CorpseTransferOutcome,
+}
+
+fn add_batch_grid_budget(
+    grid: &OccupancyGrid,
+    dense: &mut u64,
+    solids: &mut u64,
+    materials: &mut std::collections::BTreeSet<MaterialId>,
+) -> Result<(), crate::articulated::ArticulatedError> {
+    let dims = grid.dims();
+    let cells = u64::from(dims[0])
+        .checked_mul(u64::from(dims[1]))
+        .and_then(|value| value.checked_mul(u64::from(dims[2])))
+        .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
+    *dense = dense
+        .checked_add(cells)
+        .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
+    *solids = solids
+        .checked_add(grid.solid_count())
+        .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
+    if *dense > MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS
+        || *solids > MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS
+    {
+        return Err(crate::articulated::ArticulatedError::WorkBudget);
+    }
+    grid.for_each_solid(|_, _, _, material| {
+        materials.insert(material);
+    });
+    Ok(())
 }
 
 struct PreparedCorpsePartIdentity {
@@ -513,7 +699,7 @@ struct ArticulatedEntry {
 
 fn density_manifest(
     parts: &[SourcePart],
-    density: &impl Fn(MaterialId) -> f64,
+    density: &(impl Fn(MaterialId) -> f64 + ?Sized),
 ) -> Result<HashMap<MaterialId, u64>, crate::articulated::ArticulatedError> {
     let mut manifest = HashMap::new();
     for part in parts {
@@ -1181,7 +1367,7 @@ impl PhysicsWorld {
         parts: Vec<SourcePart>,
         representation: Representation,
     ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
-        self.add_articulated_body_mode(
+        let birth = self.prepare_articulated_birth(
             translation_m,
             rotation_xyzw,
             topology_token,
@@ -1189,7 +1375,21 @@ impl PhysicsWorld {
             representation,
             true,
             None,
-        )
+        )?;
+        let prepared = PreparedArticulatedBatch {
+            world_identity: self.preparation_identity.clone(),
+            expected_step: self.step_count,
+            expected_entries: self.entries.len(),
+            changes: vec![PreparedArticulatedChange::AliveBirth {
+                operation_tag: 0,
+                birth,
+            }],
+        };
+        let mut outcomes = self.commit_articulated_batch(prepared)?;
+        Ok(outcomes
+            .pop()
+            .expect("singleton kinematic birth yields one result")
+            .owner_id)
     }
 
     /// Bounded corpse candidate: exact frozen per-source-part colliders under
@@ -1203,65 +1403,44 @@ impl PhysicsWorld {
         representation: Representation,
         density: impl Fn(spall_core::MaterialId) -> f64,
     ) -> Result<ArticulatedBodyId, crate::articulated::ArticulatedError> {
-        use crate::articulated::{MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_SOLID_CELLS};
-        if parts.is_empty() || parts.len() > MAX_ARTICULATED_PARTS {
-            return Err(crate::articulated::ArticulatedError::PartCount);
-        }
-        let mut dense_preflight = 0_u64;
-        let mut solid_preflight = 0_u64;
-        for part in &parts {
-            let dims = part.grid.dims();
-            let dense = u64::from(dims[0])
-                .checked_mul(u64::from(dims[1]))
-                .and_then(|v| v.checked_mul(u64::from(dims[2])))
-                .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
-            dense_preflight = dense_preflight
-                .checked_add(dense)
-                .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
-            solid_preflight = solid_preflight
-                .checked_add(part.grid.solid_count())
-                .ok_or(crate::articulated::ArticulatedError::WorkBudget)?;
-        }
-        if dense_preflight > MAX_ARTICULATED_DENSE_CELLS
-            || solid_preflight > MAX_ARTICULATED_SOLID_CELLS
-        {
-            return Err(crate::articulated::ArticulatedError::WorkBudget);
-        }
-        let manifest = density_manifest(&parts, &density)?;
-        let stable_density = |material| manifest_density(&manifest, material);
-        let mut invalid_density = false;
+        let mut materials = std::collections::BTreeSet::new();
         for part in &parts {
             part.grid.for_each_solid(|_, _, _, material| {
-                let rho = stable_density(material);
-                invalid_density |= !rho.is_finite() || rho <= 0.0;
+                materials.insert(material);
             });
         }
-        if invalid_density {
-            return Err(crate::articulated::ArticulatedError::InvalidDensity);
+        let mut manifest = HashMap::new();
+        for material in materials {
+            let rho = density(material);
+            if !rho.is_finite() || rho <= 0.0 {
+                return Err(crate::articulated::ArticulatedError::InvalidDensity);
+            }
+            manifest.insert(material, rho.to_bits());
         }
-        let poses = parts
-            .iter()
-            .map(|part| part.local_transform)
-            .collect::<Vec<_>>();
-        let mass_properties =
-            crate::mass::articulated_mass_properties(&parts, &poses, stable_density)
-                .ok_or(crate::articulated::ArticulatedError::InvalidTransform)?
-                .to_body_properties();
-        validate_body_mass_properties(mass_properties)?;
-        let owner = self.add_articulated_body_mode(
+        let stable_density = |material| manifest_density(&manifest, material);
+        let birth = self.prepare_articulated_birth(
             translation_m,
             rotation_xyzw,
             topology_token,
             parts,
             representation,
             false,
-            Some(mass_properties),
+            Some(&stable_density),
         )?;
-        self.articulated
-            .get_mut(&owner.0)
-            .expect("created owner")
-            .density_manifest = Some(manifest);
-        Ok(owner)
+        let prepared = PreparedArticulatedBatch {
+            world_identity: self.preparation_identity.clone(),
+            expected_step: self.step_count,
+            expected_entries: self.entries.len(),
+            changes: vec![PreparedArticulatedChange::DynamicCorpseBirth {
+                operation_tag: 0,
+                birth,
+            }],
+        };
+        let mut outcomes = self.commit_articulated_batch(prepared)?;
+        Ok(outcomes
+            .pop()
+            .expect("singleton birth yields one result")
+            .owner_id)
     }
 
     /// Reconstructs one exact owner using the same preparation/publication
@@ -1289,48 +1468,94 @@ impl PhysicsWorld {
         representation: Representation,
         density: impl Fn(MaterialId) -> f64,
     ) -> Result<PreparedDynamicCorpseBatch, crate::articulated::ArticulatedError> {
+        self.prepare_articulated_batch(
+            restores
+                .into_iter()
+                .enumerate()
+                .map(|(index, restore)| ArticulatedBatchOperation::ColdRestore {
+                    operation_tag: index as u64,
+                    restore,
+                    representation,
+                })
+                .collect(),
+            density,
+        )
+    }
+
+    /// Prepares all supported articulated lifecycle operations without
+    /// inserting solver objects. Density values are sampled once per material
+    /// for the complete batch. Operation tags must be unique.
+    pub fn prepare_articulated_batch(
+        &self,
+        operations: Vec<ArticulatedBatchOperation>,
+        density: impl Fn(MaterialId) -> f64,
+    ) -> Result<PreparedArticulatedBatch, crate::articulated::ArticulatedError> {
         use crate::articulated::ArticulatedError;
-        if restores.is_empty() || restores.len() > MAX_CORPSE_RESTORE_BATCH_OWNERS {
+        if operations.is_empty() || operations.len() > MAX_CORPSE_RESTORE_BATCH_OWNERS {
             return Err(ArticulatedError::WorkBudget);
         }
         let mut dense = 0_u64;
         let mut solids = 0_u64;
         let mut mask_cells = 0_usize;
         let mut materials = std::collections::BTreeSet::new();
-        for restore in &restores {
-            if restore.source_parts.len() > MAX_ARTICULATED_PARTS
-                || restore.components.len() > crate::fracture::MAX_FRACTURE_COMPONENTS
-            {
+        let mut tags = std::collections::BTreeSet::new();
+        for operation in &operations {
+            let tag = match operation {
+                ArticulatedBatchOperation::AliveBirth { operation_tag, .. }
+                | ArticulatedBatchOperation::CheckedDeathTransfer { operation_tag, .. }
+                | ArticulatedBatchOperation::ColdRestore { operation_tag, .. } => *operation_tag,
+            };
+            if !tags.insert(tag) {
+                return Err(ArticulatedError::StalePreparedBatch);
+            }
+            let parts = match operation {
+                ArticulatedBatchOperation::AliveBirth { parts, .. } => parts.as_slice(),
+                ArticulatedBatchOperation::ColdRestore { restore, .. } => {
+                    if restore.components.len() > crate::fracture::MAX_FRACTURE_COMPONENTS {
+                        return Err(ArticulatedError::WorkBudget);
+                    }
+                    for component in &restore.components {
+                        mask_cells = mask_cells
+                            .checked_add(component.cells.len())
+                            .ok_or(ArticulatedError::WorkBudget)?;
+                    }
+                    if mask_cells as u64 > MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS {
+                        return Err(ArticulatedError::WorkBudget);
+                    }
+                    restore.source_parts.as_slice()
+                }
+                ArticulatedBatchOperation::CheckedDeathTransfer { id, .. } => {
+                    let assembly = self
+                        .articulated
+                        .get(&id.0)
+                        .ok_or(ArticulatedError::Hierarchy)?;
+                    let source = assembly
+                        .parts
+                        .iter()
+                        .map(|part| SourcePart {
+                            part_id: part.part_id,
+                            parent_id: part.parent_id,
+                            volume_id: part.volume_id,
+                            source_revision: part.source_revision,
+                            grid: part.grid.clone(),
+                            cell_m: part.cell_m,
+                            local_transform: part.local_pose,
+                        })
+                        .collect::<Vec<_>>();
+                    if source.len() > MAX_ARTICULATED_PARTS {
+                        return Err(ArticulatedError::WorkBudget);
+                    }
+                    for part in &source {
+                        add_batch_grid_budget(&part.grid, &mut dense, &mut solids, &mut materials)?;
+                    }
+                    continue;
+                }
+            };
+            if parts.len() > MAX_ARTICULATED_PARTS {
                 return Err(ArticulatedError::WorkBudget);
             }
-            for part in &restore.source_parts {
-                let dims = part.grid.dims();
-                let cells = u64::from(dims[0])
-                    .checked_mul(u64::from(dims[1]))
-                    .and_then(|n| n.checked_mul(u64::from(dims[2])))
-                    .ok_or(ArticulatedError::WorkBudget)?;
-                dense = dense
-                    .checked_add(cells)
-                    .ok_or(ArticulatedError::WorkBudget)?;
-                solids = solids
-                    .checked_add(part.grid.solid_count())
-                    .ok_or(ArticulatedError::WorkBudget)?;
-                if dense > MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS
-                    || solids > MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS
-                {
-                    return Err(ArticulatedError::WorkBudget);
-                }
-                part.grid.for_each_solid(|_, _, _, material| {
-                    materials.insert(material);
-                });
-            }
-            for component in &restore.components {
-                mask_cells = mask_cells
-                    .checked_add(component.cells.len())
-                    .ok_or(ArticulatedError::WorkBudget)?;
-                if mask_cells as u64 > MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS {
-                    return Err(ArticulatedError::WorkBudget);
-                }
+            for part in parts {
+                add_batch_grid_budget(&part.grid, &mut dense, &mut solids, &mut materials)?;
             }
         }
         // Snapshot each material density once for the complete batch. Shapes
@@ -1344,40 +1569,123 @@ impl PhysicsWorld {
             material_densities.insert(material, rho.to_bits());
         }
         let stable_density = |material| manifest_density(&material_densities, material);
-        let mut owners = Vec::with_capacity(restores.len());
+        let mut changes = Vec::with_capacity(operations.len());
         let mut owner_keys = std::collections::BTreeSet::new();
         let mut volume_ids = std::collections::BTreeSet::new();
         let mut primitives = 0_usize;
         let mut derived_dense = 0_u64;
-        for restore in restores {
-            let owner =
-                self.prepare_corpse_restore_owner(restore, representation, &stable_density)?;
-            if !owner_keys.insert(owner.owner_key)
-                || owner
-                    .source_volumes
-                    .iter()
-                    .any(|id| !volume_ids.insert(*id))
-            {
-                return Err(ArticulatedError::InvalidRestore);
+        let mut transfer_ids = HashSet::new();
+        for operation in operations {
+            match operation {
+                ArticulatedBatchOperation::AliveBirth {
+                    operation_tag,
+                    translation_m,
+                    rotation_xyzw,
+                    topology_token,
+                    parts,
+                    representation,
+                } => {
+                    let birth = self.prepare_articulated_birth(
+                        translation_m,
+                        rotation_xyzw,
+                        topology_token,
+                        parts,
+                        representation,
+                        true,
+                        Some(&stable_density),
+                    )?;
+                    if birth
+                        .source_volume_ids
+                        .iter()
+                        .any(|id| !volume_ids.insert(*id))
+                    {
+                        return Err(ArticulatedError::DuplicateVolume);
+                    }
+                    primitives = primitives
+                        .checked_add(birth.primitive_count)
+                        .ok_or(ArticulatedError::WorkBudget)?;
+                    if primitives > MAX_CORPSE_RESTORE_BATCH_PRIMITIVES {
+                        return Err(ArticulatedError::WorkBudget);
+                    }
+                    changes.push(PreparedArticulatedChange::AliveBirth {
+                        operation_tag,
+                        birth,
+                    });
+                }
+                ArticulatedBatchOperation::ColdRestore {
+                    operation_tag,
+                    restore,
+                    representation,
+                } => {
+                    let owner = self.prepare_corpse_restore_owner(
+                        restore,
+                        representation,
+                        &stable_density,
+                    )?;
+                    if !owner_keys.insert(owner.owner_key)
+                        || owner
+                            .source_volumes
+                            .iter()
+                            .any(|id| !volume_ids.insert(*id))
+                    {
+                        return Err(ArticulatedError::InvalidRestore);
+                    }
+                    primitives = primitives
+                        .checked_add(owner.primitive_count)
+                        .ok_or(ArticulatedError::WorkBudget)?;
+                    derived_dense = derived_dense
+                        .checked_add(owner.derived_dense)
+                        .ok_or(ArticulatedError::WorkBudget)?;
+                    if primitives > MAX_CORPSE_RESTORE_BATCH_PRIMITIVES
+                        || derived_dense > MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS
+                    {
+                        return Err(ArticulatedError::WorkBudget);
+                    }
+                    changes.push(PreparedArticulatedChange::ColdRestore {
+                        operation_tag,
+                        owner,
+                    });
+                }
+                ArticulatedBatchOperation::CheckedDeathTransfer {
+                    operation_tag,
+                    id,
+                    expected_topology_token,
+                    expected_pose_token,
+                } => {
+                    if !transfer_ids.insert(id.0) {
+                        return Err(ArticulatedError::StalePreparedBatch);
+                    }
+                    let transfer = self.prepare_dynamic_corpse_transfer(
+                        id,
+                        expected_topology_token,
+                        expected_pose_token,
+                        stable_density,
+                    )?;
+                    if transfer
+                        .source_volume_ids
+                        .iter()
+                        .any(|source| !volume_ids.insert(*source))
+                    {
+                        return Err(ArticulatedError::DuplicateVolume);
+                    }
+                    primitives = primitives
+                        .checked_add(transfer.primitive_count)
+                        .ok_or(ArticulatedError::WorkBudget)?;
+                    if primitives > MAX_CORPSE_RESTORE_BATCH_PRIMITIVES {
+                        return Err(ArticulatedError::WorkBudget);
+                    }
+                    changes.push(PreparedArticulatedChange::CheckedDeathTransfer {
+                        operation_tag,
+                        transfer,
+                    });
+                }
             }
-            primitives = primitives
-                .checked_add(owner.primitive_count)
-                .ok_or(ArticulatedError::WorkBudget)?;
-            derived_dense = derived_dense
-                .checked_add(owner.derived_dense)
-                .ok_or(ArticulatedError::WorkBudget)?;
-            if primitives > MAX_CORPSE_RESTORE_BATCH_PRIMITIVES
-                || derived_dense > MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS
-            {
-                return Err(ArticulatedError::WorkBudget);
-            }
-            owners.push(owner);
         }
-        Ok(PreparedDynamicCorpseBatch {
+        Ok(PreparedArticulatedBatch {
             world_identity: self.preparation_identity.clone(),
             expected_step: self.step_count,
             expected_entries: self.entries.len(),
-            owners,
+            changes,
         })
     }
 
@@ -1387,6 +1695,32 @@ impl PhysicsWorld {
         &mut self,
         prepared: PreparedDynamicCorpseBatch,
     ) -> Result<Vec<ArticulatedBodyId>, crate::articulated::ArticulatedError> {
+        self.commit_articulated_batch(prepared).map(|outcomes| {
+            outcomes
+                .into_iter()
+                .map(|outcome| outcome.owner_id)
+                .collect()
+        })
+    }
+
+    /// Revalidates every operation and cross-operation reservation before
+    /// publishing any member. Publication has no fallible checks or Result
+    /// paths after the first Rapier mutation.
+    pub fn commit_articulated_batch(
+        &mut self,
+        prepared: PreparedArticulatedBatch,
+    ) -> Result<Vec<ArticulatedBatchOutcome>, crate::articulated::ArticulatedError> {
+        let validated = self.validate_articulated_batch(prepared)?;
+        Ok(self.publish_validated_articulated_batch(validated))
+    }
+
+    /// Performs every fallible freshness, identity, source and cross-member
+    /// check. The returned private token may be published after a separately
+    /// prepared geometry batch mutates unrelated physics entries.
+    pub fn validate_articulated_batch(
+        &self,
+        prepared: PreparedArticulatedBatch,
+    ) -> Result<ValidatedArticulatedBatch, crate::articulated::ArticulatedError> {
         use crate::articulated::ArticulatedError;
         if !std::sync::Arc::ptr_eq(&prepared.world_identity, &self.preparation_identity)
             || prepared.expected_step != self.step_count
@@ -1394,10 +1728,20 @@ impl PhysicsWorld {
         {
             return Err(ArticulatedError::StalePreparedBatch);
         }
+        let additions = prepared
+            .changes
+            .iter()
+            .filter(|change| {
+                !matches!(
+                    change,
+                    PreparedArticulatedChange::CheckedDeathTransfer { .. }
+                )
+            })
+            .count();
         let final_entries = self
             .entries
             .len()
-            .checked_add(prepared.owners.len())
+            .checked_add(additions)
             .ok_or(ArticulatedError::WorkBudget)?;
         if final_entries > u32::MAX as usize {
             return Err(ArticulatedError::WorkBudget);
@@ -1407,27 +1751,478 @@ impl PhysicsWorld {
             .values()
             .flat_map(|owner| owner.source_volume_ids.iter().copied())
             .collect();
-        for owner in &prepared.owners {
-            if self.fracture_owner_keys.contains_key(&owner.owner_key)
-                || self
-                    .articulated
-                    .values()
-                    .any(|live| live.fracture_owner_key == Some(owner.owner_key))
-                || owner
-                    .source_volumes
-                    .iter()
-                    .any(|id| live_volumes.contains(id))
-            {
-                return Err(ArticulatedError::StalePreparedBatch);
+        let mut batch_owner_keys = std::collections::BTreeSet::new();
+        let mut batch_volumes = std::collections::BTreeSet::new();
+        for change in &prepared.changes {
+            match change {
+                PreparedArticulatedChange::ColdRestore { owner, .. } => {
+                    if self.fracture_owner_keys.contains_key(&owner.owner_key)
+                        || self
+                            .articulated
+                            .values()
+                            .any(|live| live.fracture_owner_key == Some(owner.owner_key))
+                        || owner
+                            .source_volumes
+                            .iter()
+                            .any(|id| live_volumes.contains(id) || !batch_volumes.insert(*id))
+                        || !batch_owner_keys.insert(owner.owner_key)
+                    {
+                        return Err(ArticulatedError::StalePreparedBatch);
+                    }
+                }
+                PreparedArticulatedChange::AliveBirth { birth, .. } => {
+                    if birth
+                        .source_volume_ids
+                        .iter()
+                        .any(|id| live_volumes.contains(id) || !batch_volumes.insert(*id))
+                    {
+                        return Err(ArticulatedError::StalePreparedBatch);
+                    }
+                }
+                PreparedArticulatedChange::DynamicCorpseBirth { birth, .. } => {
+                    if birth
+                        .source_volume_ids
+                        .iter()
+                        .any(|id| live_volumes.contains(id) || !batch_volumes.insert(*id))
+                    {
+                        return Err(ArticulatedError::StalePreparedBatch);
+                    }
+                }
+                PreparedArticulatedChange::CheckedDeathTransfer { transfer, .. } => {
+                    if !self.validate_prepared_corpse_transfer(transfer) {
+                        return Err(ArticulatedError::StalePreparedBatch);
+                    }
+                    if transfer
+                        .source_volume_ids
+                        .iter()
+                        .any(|id| !batch_volumes.insert(*id))
+                    {
+                        return Err(ArticulatedError::StalePreparedBatch);
+                    }
+                }
             }
         }
-        let mut owners = Vec::with_capacity(prepared.owners.len());
+        Ok(ValidatedArticulatedBatch { prepared })
+    }
+
+    /// Publishes a previously validated batch without another fallible path.
+    /// The token must be published on its creating world at the same tick,
+    /// after joint validation and before unrelated mutation. When composing
+    /// with geometry, only the already-validated geometry publication may
+    /// intervene. Publishing on another world is programmer error and panics
+    /// before this batch mutates either solver structures or owner indexes.
+    pub fn publish_validated_articulated_batch(
+        &mut self,
+        validated: ValidatedArticulatedBatch,
+    ) -> Vec<ArticulatedBatchOutcome> {
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &validated.prepared.world_identity,
+                &self.preparation_identity
+            ) && validated.prepared.expected_step == self.step_count,
+            "validated articulated batch belongs to another PhysicsWorld or tick"
+        );
+        let prepared = validated.prepared;
+        let mut outcomes = Vec::with_capacity(prepared.changes.len());
         // All bounds, reservations and freshness checks have completed.
         // Publication below contains no fallible preparation or validation.
-        for owner in prepared.owners {
-            owners.push(self.publish_corpse_restore_owner(owner));
+        for change in prepared.changes {
+            match change {
+                PreparedArticulatedChange::AliveBirth {
+                    operation_tag,
+                    birth,
+                } => {
+                    let owner_id = self.publish_articulated_birth(birth);
+                    outcomes.push(ArticulatedBatchOutcome {
+                        operation_tag,
+                        owner_id,
+                        transfer: None,
+                    });
+                }
+                PreparedArticulatedChange::DynamicCorpseBirth {
+                    operation_tag,
+                    birth,
+                } => {
+                    let owner_id = self.publish_articulated_birth(birth);
+                    outcomes.push(ArticulatedBatchOutcome {
+                        operation_tag,
+                        owner_id,
+                        transfer: None,
+                    });
+                }
+                PreparedArticulatedChange::ColdRestore {
+                    operation_tag,
+                    owner,
+                } => {
+                    let owner_id = self.publish_corpse_restore_owner(owner);
+                    outcomes.push(ArticulatedBatchOutcome {
+                        operation_tag,
+                        owner_id,
+                        transfer: None,
+                    });
+                }
+                PreparedArticulatedChange::CheckedDeathTransfer {
+                    operation_tag,
+                    transfer,
+                } => {
+                    let outcome = self.publish_prepared_corpse_transfer(transfer);
+                    outcomes.push(ArticulatedBatchOutcome {
+                        operation_tag,
+                        owner_id: outcome.0,
+                        transfer: Some(outcome.1),
+                    });
+                }
+            }
         }
-        Ok(owners)
+        outcomes
+    }
+
+    fn prepare_articulated_birth(
+        &self,
+        translation_m: [f32; 3],
+        rotation_xyzw: [f32; 4],
+        topology_token: u64,
+        parts: Vec<SourcePart>,
+        representation: Representation,
+        kinematic_part_bodies: bool,
+        density: Option<&dyn Fn(MaterialId) -> f64>,
+    ) -> Result<PreparedArticulatedBirth, crate::articulated::ArticulatedError> {
+        use crate::articulated::{
+            ArticulatedError, MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_SOLID_CELLS,
+        };
+        if parts.is_empty()
+            || parts.len() > MAX_ARTICULATED_PARTS
+            || !articulated_translation_in_range(translation_m)
+            || !(PartTransform {
+                translation_m: [0.0; 3],
+                rotation_xyzw,
+            })
+            .is_valid()
+            || representation == Representation::SmoothConvex
+        {
+            return Err(ArticulatedError::InvalidTransform);
+        }
+        let root_rotation = normalize(rotation_xyzw);
+        let live_volumes: std::collections::BTreeSet<_> = self
+            .articulated
+            .values()
+            .flat_map(|owner| owner.source_volume_ids.iter().copied())
+            .collect();
+        let mut sorted = parts;
+        sorted.sort_by_key(|part| part.part_id);
+        let mut ids = std::collections::BTreeSet::new();
+        let mut source_volume_ids = std::collections::BTreeSet::new();
+        let mut roots = 0usize;
+        let mut dense = 0u64;
+        let mut solids = 0u64;
+        let cell_m = sorted[0].cell_m;
+        for part in &mut sorted {
+            if part.part_id == 0 || !ids.insert(part.part_id) {
+                return Err(ArticulatedError::DuplicatePart);
+            }
+            if !source_volume_ids.insert(part.volume_id) || live_volumes.contains(&part.volume_id) {
+                return Err(ArticulatedError::DuplicateVolume);
+            }
+            roots += usize::from(part.parent_id.is_none());
+            if !part.cell_m.is_finite()
+                || part.cell_m <= 0.0
+                || (part.cell_m - cell_m).abs() > 1e-7
+                || !part.local_transform.is_valid()
+            {
+                return Err(ArticulatedError::InvalidTransform);
+            }
+            if !articulated_translation_in_range(part.local_transform.translation_m)
+                || !articulated_grid_range_valid(&part.grid, part.cell_m)
+            {
+                return Err(ArticulatedError::GeometryRange);
+            }
+            part.local_transform = part
+                .local_transform
+                .normalized()
+                .ok_or(ArticulatedError::InvalidTransform)?;
+            let dims = part.grid.dims();
+            let part_dense = u64::from(dims[0])
+                .checked_mul(u64::from(dims[1]))
+                .and_then(|n| n.checked_mul(u64::from(dims[2])))
+                .ok_or(ArticulatedError::WorkBudget)?;
+            dense = dense
+                .checked_add(part_dense)
+                .ok_or(ArticulatedError::WorkBudget)?;
+            solids = solids
+                .checked_add(part.grid.solid_count())
+                .ok_or(ArticulatedError::WorkBudget)?;
+            if part.grid.solid_count() == 0 {
+                return Err(ArticulatedError::EmptyPart(part.part_id));
+            }
+            if dense > MAX_ARTICULATED_DENSE_CELLS || solids > MAX_ARTICULATED_SOLID_CELLS {
+                return Err(ArticulatedError::WorkBudget);
+            }
+        }
+        if roots != 1
+            || sorted
+                .iter()
+                .any(|part| part.parent_id.is_some_and(|parent| !ids.contains(&parent)))
+        {
+            return Err(ArticulatedError::Hierarchy);
+        }
+        let flattened = flatten_source_parts(&sorted)?;
+        if flattened
+            .iter()
+            .any(|pose| !articulated_translation_in_range(pose.translation_m))
+        {
+            return Err(ArticulatedError::GeometryRange);
+        }
+        let manifest = density
+            .map(|density| density_manifest(&sorted, density))
+            .transpose()?;
+        let mass = if kinematic_part_bodies {
+            None
+        } else {
+            let manifest_ref = manifest.as_ref().ok_or(ArticulatedError::InvalidDensity)?;
+            let stable_density = |material| manifest_density(manifest_ref, material);
+            let mass =
+                crate::mass::articulated_mass_properties(&sorted, &flattened, stable_density)
+                    .ok_or(ArticulatedError::InvalidTransform)?
+                    .to_body_properties();
+            validate_body_mass_properties(mass)?;
+            Some(mass)
+        };
+        let builds = sorted
+            .iter()
+            .map(|part| build_collider(&part.grid, cell_m, representation))
+            .collect::<Vec<_>>();
+        let primitive_count = builds.iter().map(|build| build.primitives).sum::<usize>();
+        if builds
+            .iter()
+            .any(|build| build.primitives > crate::collider::MERGED_CUBOID_PRIMITIVE_BUDGET)
+            || primitive_count > 65_536
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        let collider_poses = sorted
+            .iter()
+            .zip(&flattened)
+            .map(|(part, pose)| {
+                let origin = part.grid.origin();
+                let origin_m = [
+                    origin.x as f32 * cell_m,
+                    origin.y as f32 * cell_m,
+                    origin.z as f32 * cell_m,
+                ];
+                let offset = rotate(pose.rotation_xyzw, origin_m);
+                (
+                    [
+                        pose.translation_m[0] + offset[0],
+                        pose.translation_m[1] + offset[1],
+                        pose.translation_m[2] + offset[2],
+                    ],
+                    pose.rotation_xyzw,
+                )
+            })
+            .collect::<Vec<_>>();
+        if collider_poses.iter().any(|(local, rotation)| {
+            !articulated_translation_in_range(*local)
+                || !rotation.iter().all(|v| v.is_finite())
+                || {
+                    let world = rotate(root_rotation, *local);
+                    !articulated_translation_in_range([
+                        translation_m[0] + world[0],
+                        translation_m[1] + world[1],
+                        translation_m[2] + world[2],
+                    ])
+                }
+        }) {
+            return Err(ArticulatedError::GeometryRange);
+        }
+        Ok(PreparedArticulatedBirth {
+            translation_m,
+            rotation_xyzw: root_rotation,
+            topology_token,
+            parts: sorted,
+            flattened,
+            collider_poses,
+            builds,
+            source_volume_ids,
+            mass,
+            manifest,
+            kinematic_part_bodies,
+            representation,
+            primitive_count,
+        })
+    }
+
+    fn publish_articulated_birth(&mut self, birth: PreparedArticulatedBirth) -> ArticulatedBodyId {
+        let PreparedArticulatedBirth {
+            translation_m,
+            rotation_xyzw,
+            topology_token,
+            parts,
+            flattened,
+            collider_poses,
+            builds,
+            source_volume_ids,
+            mass,
+            manifest,
+            kinematic_part_bodies,
+            representation,
+            ..
+        } = birth;
+        let pose = Pose::new(
+            Vector::from(translation_m),
+            Rotation::from_xyzw(
+                rotation_xyzw[0],
+                rotation_xyzw[1],
+                rotation_xyzw[2],
+                rotation_xyzw[3],
+            )
+            .to_scaled_axis(),
+        );
+        let root_builder = if let Some(mass) = mass {
+            RigidBodyBuilder::dynamic()
+                .additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]))
+        } else {
+            RigidBodyBuilder::kinematic_position_based()
+        };
+        let root = self.bodies.insert(root_builder.pose(pose).build());
+        let id = BodyId((u64::from(self.id_namespace) << 32) | self.entries.len() as u64);
+        let cell_m = parts[0].cell_m;
+        let mut built_parts = Vec::with_capacity(parts.len());
+        for (((part, assembly_pose), (local_translation, local_rotation)), build) in parts
+            .into_iter()
+            .zip(flattened)
+            .zip(collider_poses)
+            .zip(builds)
+        {
+            let local_rotation = Rotation::from_xyzw(
+                local_rotation[0],
+                local_rotation[1],
+                local_rotation[2],
+                local_rotation[3],
+            );
+            let (part_body, collider_pose) = if kinematic_part_bodies {
+                let world_pose = compose(
+                    PartTransform {
+                        translation_m,
+                        rotation_xyzw,
+                    },
+                    assembly_pose,
+                );
+                let part_body = self.bodies.insert(
+                    RigidBodyBuilder::kinematic_position_based()
+                        .pose(Pose::new(
+                            Vector::from(world_pose.translation_m),
+                            Rotation::from_xyzw(
+                                world_pose.rotation_xyzw[0],
+                                world_pose.rotation_xyzw[1],
+                                world_pose.rotation_xyzw[2],
+                                world_pose.rotation_xyzw[3],
+                            )
+                            .to_scaled_axis(),
+                        ))
+                        .build(),
+                );
+                let origin = part.grid.origin();
+                (
+                    part_body,
+                    Pose::from_translation(Vector::new(
+                        origin.x as f32 * cell_m,
+                        origin.y as f32 * cell_m,
+                        origin.z as f32 * cell_m,
+                    )),
+                )
+            } else {
+                (
+                    root,
+                    Pose::new(
+                        Vector::from(local_translation),
+                        local_rotation.to_scaled_axis(),
+                    ),
+                )
+            };
+            let mut collider_builder = ColliderBuilder::new(build.collider.shared_shape().clone())
+                .density(0.0)
+                .position(collider_pose);
+            if kinematic_part_bodies {
+                collider_builder = collider_builder.active_collision_types(
+                    ActiveCollisionTypes::default() | ActiveCollisionTypes::KINEMATIC_FIXED,
+                );
+            }
+            let collider = collider_builder.build();
+            let handle = self
+                .colliders
+                .insert_with_parent(collider, part_body, &mut self.bodies);
+            self.pending_modified.push(handle);
+            let part_surface_radius_m = source_surface_radius_m(&part.grid, cell_m, [0.0; 3], None);
+            let root_surface_radius_m =
+                source_surface_radius_m(&part.grid, cell_m, [0.0; 3], Some(assembly_pose));
+            built_parts.push(ArticulatedPartEntry {
+                part_id: part.part_id,
+                parent_id: part.parent_id,
+                volume_id: part.volume_id,
+                source_revision: part.source_revision,
+                grid: part.grid,
+                cell_m,
+                local_pose: part.local_transform,
+                assembly_pose,
+                part_surface_radius_m,
+                root_surface_radius_m,
+                body: part_body,
+                collider: handle,
+                primitives: build.primitives,
+                component_id: None,
+            });
+        }
+        let first_origin = built_parts[0].grid.origin();
+        let primary = built_parts[0].collider;
+        self.entries.push(Entry {
+            body: root,
+            collider: primary,
+            cell_m,
+            representation,
+            density: 0.0,
+            collider_offset_m: [
+                first_origin.x as f32 * cell_m,
+                first_origin.y as f32 * cell_m,
+                first_origin.z as f32 * cell_m,
+            ],
+            mass_properties: mass,
+            retired: false,
+            dormant: false,
+            query_only: false,
+            restitution: 0.0,
+        });
+        for part in &built_parts {
+            self.tag_collider(part.collider, id);
+        }
+        self.articulated.insert(
+            id,
+            ArticulatedEntry {
+                topology_token,
+                pose_token: 0,
+                root_pose: PartTransform {
+                    translation_m,
+                    rotation_xyzw,
+                },
+                pending_root_pose_token: None,
+                pending_pose: None,
+                kinematic_part_bodies,
+                dynamic_corpse: mass.is_some(),
+                source_generation: 1,
+                fracture_owner_key: None,
+                next_component_serial: 1,
+                density_manifest: manifest,
+                source_volume_ids,
+                parts: built_parts,
+            },
+        );
+        if let Some(mass) = mass {
+            let pose = *self.bodies[root].position();
+            self.bodies[root]
+                .set_additional_mass_properties(rapier_mass_properties(mass, [0.0; 3]), true);
+            self.bodies[root].recompute_mass_properties_from_colliders(&self.colliders);
+            self.bodies[root].set_position(pose, true);
+        }
+        ArticulatedBodyId(id)
     }
 
     fn prepare_corpse_restore_owner(
@@ -2004,6 +2799,44 @@ impl PhysicsWorld {
         density: impl Fn(spall_core::MaterialId) -> f64,
         validate_final: impl FnOnce(&CorpseTransferOutcome) -> bool,
     ) -> Result<CorpseTransferOutcome, crate::articulated::ArticulatedError> {
+        let prepared = self.prepare_articulated_batch(
+            vec![ArticulatedBatchOperation::CheckedDeathTransfer {
+                operation_tag: 0,
+                id,
+                expected_topology_token,
+                expected_pose_token,
+            }],
+            density,
+        )?;
+        let transfer_outcome = prepared
+            .changes
+            .iter()
+            .find_map(|change| {
+                if let PreparedArticulatedChange::CheckedDeathTransfer { transfer, .. } = change {
+                    Some(&transfer.outcome)
+                } else {
+                    None
+                }
+            })
+            .expect("singleton transfer prepares one transfer");
+        let accepted = validate_final(transfer_outcome);
+        if !accepted {
+            return Err(crate::articulated::ArticulatedError::TransferRejected);
+        }
+        let mut outcomes = self.commit_articulated_batch(prepared)?;
+        Ok(outcomes
+            .pop()
+            .and_then(|outcome| outcome.transfer)
+            .expect("singleton transfer includes its witness"))
+    }
+
+    fn prepare_dynamic_corpse_transfer(
+        &self,
+        id: ArticulatedBodyId,
+        expected_topology_token: u64,
+        expected_pose_token: u64,
+        density: impl Fn(spall_core::MaterialId) -> f64,
+    ) -> Result<PreparedCorpseTransfer, crate::articulated::ArticulatedError> {
         use crate::articulated::ArticulatedError;
         let started = Instant::now();
         let body_id = id.0;
@@ -2061,11 +2894,18 @@ impl PhysicsWorld {
                 local_transform: p.local_pose,
             })
             .collect::<Vec<_>>();
+        let manifest = density_manifest(&source_parts, &density)?;
+        if assembly.density_manifest.as_ref().is_some_and(|bound| {
+            manifest
+                .iter()
+                .any(|(material, bits)| bound.get(material) != Some(bits))
+        }) {
+            return Err(ArticulatedError::InvalidDensity);
+        }
         let local_poses = source_parts
             .iter()
             .map(|p| p.local_transform)
             .collect::<Vec<_>>();
-        let manifest = density_manifest(&source_parts, &density)?;
         let stable_density = |material| manifest_density(&manifest, material);
         let mass64 =
             crate::mass::articulated_mass_properties(&source_parts, &local_poses, stable_density)
@@ -2255,12 +3095,156 @@ impl PhysicsWorld {
             linear_velocity_m_s: linear_velocity,
             angular_velocity_rad_s: omega_world,
         };
-        if !validate_final(&outcome) {
-            return Err(ArticulatedError::TransferRejected);
-        }
+        let source_volume_ids = assembly.source_volume_ids.clone();
+        let primitive_count = assembly.parts.iter().try_fold(0_usize, |total, part| {
+            total
+                .checked_add(part.primitives)
+                .ok_or(ArticulatedError::WorkBudget)
+        })?;
+        let snapshots = assembly
+            .parts
+            .iter()
+            .map(|part| {
+                let body = &self.bodies[part.body];
+                let mut source_cells = Vec::with_capacity(part.grid.solid_count() as usize);
+                part.grid
+                    .for_each_solid(|x, y, z, material| source_cells.push((x, y, z, material)));
+                PreparedCorpseTransferPartSnapshot {
+                    body: part.body,
+                    collider: part.collider,
+                    position: *body.position(),
+                    linvel: body.linvel(),
+                    angvel: body.angvel(),
+                    part_id: part.part_id,
+                    volume_id: part.volume_id,
+                    source_revision: part.source_revision,
+                    cell_m: part.cell_m,
+                    grid_origin: part.grid.origin(),
+                    grid_dims: part.grid.dims(),
+                    source_solid_count: part.grid.solid_count(),
+                    source_cells,
+                    local_pose: part.local_pose,
+                    assembly_pose: part.assembly_pose,
+                }
+            })
+            .collect();
+        let mut old_bodies = prepared
+            .iter()
+            .map(|(_, body, _)| *body)
+            .collect::<Vec<_>>();
+        old_bodies.sort_by_key(|body| body.into_raw_parts());
+        old_bodies.dedup();
+        outcome.preparation_time = started.elapsed();
+        Ok(PreparedCorpseTransfer {
+            id,
+            expected_topology_token,
+            expected_pose_token,
+            source_generation: assembly.source_generation,
+            source_volume_ids,
+            parts: snapshots,
+            entry_body: root_body,
+            entry_position: *self.bodies[root_body].position(),
+            entry_linvel: self.bodies[root_body].linvel(),
+            entry_angvel: self.bodies[root_body].angvel(),
+            entry_collider: self.entries[entry_index].collider,
+            props,
+            manifest,
+            prepared,
+            replacement_colliders: prepared_colliders,
+            primitive_count,
+            outcome,
+        })
+    }
 
+    fn validate_prepared_corpse_transfer(&self, transfer: &PreparedCorpseTransfer) -> bool {
+        let body_id = transfer.id.0;
+        let Some(assembly) = self.articulated.get(&body_id) else {
+            return false;
+        };
+        if !assembly.kinematic_part_bodies
+            || assembly.dynamic_corpse
+            || assembly.topology_token != transfer.expected_topology_token
+            || assembly.pose_token != transfer.expected_pose_token
+            || assembly.source_generation != transfer.source_generation
+            || assembly.pending_root_pose_token.is_some()
+            || assembly.pending_pose.is_some()
+            || assembly.source_volume_ids != transfer.source_volume_ids
+            || assembly.parts.len() != transfer.parts.len()
+        {
+            return false;
+        }
+        let index = entry_index(body_id, self.id_namespace);
+        let Some(entry) = self.entries.get(index) else {
+            return false;
+        };
+        if entry.body != transfer.entry_body || entry.collider != transfer.entry_collider {
+            return false;
+        }
+        let Some(entry_body) = self.bodies.get(transfer.entry_body) else {
+            return false;
+        };
+        if *entry_body.position() != transfer.entry_position
+            || entry_body.linvel() != transfer.entry_linvel
+            || entry_body.angvel() != transfer.entry_angvel
+        {
+            return false;
+        }
+        for (part, snapshot) in assembly.parts.iter().zip(&transfer.parts) {
+            let Some(body) = self.bodies.get(part.body) else {
+                return false;
+            };
+            if part.body != snapshot.body
+                || part.collider != snapshot.collider
+                || part.part_id != snapshot.part_id
+                || part.volume_id != snapshot.volume_id
+                || part.source_revision != snapshot.source_revision
+                || part.cell_m.to_bits() != snapshot.cell_m.to_bits()
+                || part.grid.origin() != snapshot.grid_origin
+                || part.grid.dims() != snapshot.grid_dims
+                || part.grid.solid_count() != snapshot.source_solid_count
+                || part.local_pose.translation_m != snapshot.local_pose.translation_m
+                || part.local_pose.rotation_xyzw != snapshot.local_pose.rotation_xyzw
+                || part.assembly_pose.translation_m != snapshot.assembly_pose.translation_m
+                || part.assembly_pose.rotation_xyzw != snapshot.assembly_pose.rotation_xyzw
+                || *body.position() != snapshot.position
+                || body.linvel() != snapshot.linvel
+                || body.angvel() != snapshot.angvel
+            {
+                return false;
+            }
+            let mut idx = 0usize;
+            let mut same = true;
+            part.grid.for_each_solid(|x, y, z, material| {
+                if snapshot.source_cells.get(idx).copied() != Some((x, y, z, material)) {
+                    same = false;
+                }
+                idx += 1;
+            });
+            if !same || idx != snapshot.source_cells.len() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn publish_prepared_corpse_transfer(
+        &mut self,
+        transfer: PreparedCorpseTransfer,
+    ) -> (ArticulatedBodyId, CorpseTransferOutcome) {
+        let PreparedCorpseTransfer {
+            id,
+            props,
+            manifest,
+            prepared,
+            replacement_colliders,
+            outcome,
+            ..
+        } = transfer;
+        let body_id = id.0;
+        let index = entry_index(body_id, self.id_namespace);
+        let root_body = self.entries[index].body;
         let mut replacement_handles = Vec::with_capacity(prepared.len());
-        for ((_, _, _), collider) in prepared.iter().zip(prepared_colliders) {
+        for collider in replacement_colliders {
             let handle = self
                 .colliders
                 .insert_with_parent(collider, root_body, &mut self.bodies);
@@ -2275,17 +3259,17 @@ impl PhysicsWorld {
         self.bodies[root_body].set_position(old_root_pose, true);
         self.bodies[root_body].set_linvel(
             Vector::new(
-                linear_velocity[0] as f32,
-                linear_velocity[1] as f32,
-                linear_velocity[2] as f32,
+                outcome.linear_velocity_m_s[0] as f32,
+                outcome.linear_velocity_m_s[1] as f32,
+                outcome.linear_velocity_m_s[2] as f32,
             ),
             true,
         );
         self.bodies[root_body].set_angvel(
             Vector::new(
-                omega_world[0] as f32,
-                omega_world[1] as f32,
-                omega_world[2] as f32,
+                outcome.angular_velocity_rad_s[0] as f32,
+                outcome.angular_velocity_rad_s[1] as f32,
+                outcome.angular_velocity_rad_s[2] as f32,
             ),
             true,
         );
@@ -2316,7 +3300,7 @@ impl PhysicsWorld {
         let assembly = self
             .articulated
             .get_mut(&body_id)
-            .expect("prevalidated assembly");
+            .expect("batch transfer was prevalidated");
         for (part, handle) in assembly
             .parts
             .iter_mut()
@@ -2328,14 +3312,13 @@ impl PhysicsWorld {
         assembly.kinematic_part_bodies = false;
         assembly.dynamic_corpse = true;
         assembly.density_manifest = Some(manifest);
-        let entry = &mut self.entries[entry_index];
+        let entry = &mut self.entries[index];
         entry.body = root_body;
         entry.collider = replacement_handles[0];
         entry.collider_offset_m = [0.0; 3];
         entry.density = 0.0;
         entry.mass_properties = Some(props);
-        outcome.preparation_time = started.elapsed();
-        Ok(outcome)
+        (id, outcome)
     }
 
     /// Captures one live physical component for bounded immutable fracture
@@ -6568,9 +7551,132 @@ impl PhysicsWorld {
         self.entries[entry_index(id, self.id_namespace)].representation
     }
 
-    /// Kinematic snapshot of a body. A retired body (its volume became empty) or
-    /// a dormant one (T21, deactivated pending reactivation) has no Rapier body
-    /// left; it reports an all-zero, non-sleeping state and the caller is
+    /// Captures the creating world's identity, step/slot counts and selected
+    /// body/collider state for a same-step commit fence. A fixed body slot may
+    /// have no collider after an empty terrain-brick publication; that absence
+    /// is captured and a collider appearing or disappearing makes the fence
+    /// stale.
+    pub fn snapshot_body_commit_fence(
+        &self,
+        ids: &[BodyId],
+    ) -> Result<BodyCommitFence, crate::articulated::ArticulatedError> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut bodies = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(id.0) || (id.0 >> 32) as u32 != self.id_namespace {
+                return Err(crate::articulated::ArticulatedError::Hierarchy);
+            }
+            let index = (id.0 as u32) as usize;
+            let entry = self
+                .entries
+                .get(index)
+                .ok_or(crate::articulated::ArticulatedError::Hierarchy)?;
+            let body = self
+                .bodies
+                .get(entry.body)
+                .ok_or(crate::articulated::ArticulatedError::Hierarchy)?;
+            let collider =
+                self.colliders
+                    .get(entry.collider)
+                    .map(|collider| ColliderCommitFenceState {
+                        handle: entry.collider,
+                        shape: collider.shared_shape().clone(),
+                        position: *collider.position(),
+                        enabled: collider.is_enabled(),
+                        sensor: collider.is_sensor(),
+                        active_collision_types: collider.active_collision_types(),
+                        collision_groups: collider.collision_groups(),
+                        solver_groups: collider.solver_groups(),
+                        friction: collider.friction(),
+                        restitution: collider.restitution(),
+                    });
+            bodies.push(BodyCommitFenceEntry {
+                id: *id,
+                body: entry.body,
+                body_type: body.body_type(),
+                position: *body.position(),
+                linvel: body.linvel(),
+                angvel: body.angvel(),
+                mass: body.mass(),
+                center_of_mass: body.center_of_mass(),
+                retired: entry.retired,
+                dormant: entry.dormant,
+                collider,
+                representation: entry.representation,
+                query_only: entry.query_only,
+                density: entry.density,
+                mass_properties: entry.mass_properties,
+            });
+        }
+        Ok(BodyCommitFence {
+            world_identity: self.preparation_identity.clone(),
+            step_count: self.step_count,
+            entry_count: self.entries.len(),
+            body_count: self.bodies.len(),
+            bodies,
+        })
+    }
+
+    /// Revalidates a selected-body fence. Same-step pose/twist, collider
+    /// rebuild/shape/config, or entry changes invalidate it.
+    pub fn validate_body_commit_fence(&self, fence: &BodyCommitFence) -> bool {
+        if !std::sync::Arc::ptr_eq(&fence.world_identity, &self.preparation_identity)
+            || fence.step_count != self.step_count
+            || fence.entry_count != self.entries.len()
+            || fence.body_count != self.bodies.len()
+        {
+            return false;
+        }
+        fence.bodies.iter().all(|saved| {
+            if (saved.id.0 >> 32) as u32 != self.id_namespace {
+                return false;
+            }
+            let index = (saved.id.0 as u32) as usize;
+            let Some(entry) = self.entries.get(index) else {
+                return false;
+            };
+            if entry.body != saved.body
+                || entry.retired != saved.retired
+                || entry.dormant != saved.dormant
+                || entry.representation != saved.representation
+                || entry.query_only != saved.query_only
+                || entry.density.to_bits() != saved.density.to_bits()
+                || entry.mass_properties != saved.mass_properties
+            {
+                return false;
+            }
+            let Some(body) = self.bodies.get(saved.body) else {
+                return false;
+            };
+            let collider_matches = match (&saved.collider, self.colliders.get(entry.collider)) {
+                (None, None) => true,
+                (Some(saved), Some(collider)) => {
+                    saved.handle == entry.collider
+                        && std::sync::Arc::ptr_eq(&saved.shape.0, &collider.shared_shape().0)
+                        && *collider.position() == saved.position
+                        && collider.is_enabled() == saved.enabled
+                        && collider.is_sensor() == saved.sensor
+                        && collider.active_collision_types() == saved.active_collision_types
+                        && collider.collision_groups() == saved.collision_groups
+                        && collider.solver_groups() == saved.solver_groups
+                        && collider.friction().to_bits() == saved.friction.to_bits()
+                        && collider.restitution().to_bits() == saved.restitution.to_bits()
+                }
+                _ => false,
+            };
+            collider_matches
+                && body.body_type() == saved.body_type
+                && *body.position() == saved.position
+                && body.linvel() == saved.linvel
+                && body.angvel() == saved.angvel
+                && body.mass().to_bits() == saved.mass.to_bits()
+                && body.center_of_mass() == saved.center_of_mass
+        })
+    }
+
+    /// Kinematic snapshot of a body. A retired body (its volume became empty)
+    /// or a dormant one (T21, deactivated pending reactivation) has no Rapier
+    /// body left; it reports an all-zero, non-sleeping state and the caller is
     /// expected to hold the authoritative pose itself.
     pub fn body_state(&self, id: BodyId) -> BodyState {
         let entry = &self.entries[entry_index(id, self.id_namespace)];
@@ -7270,6 +8376,281 @@ mod tests {
     }
 
     #[test]
+    fn articulated_batch_publishes_alive_birth_and_checked_transfer_together() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let alive = world
+            .add_articulated_kinematic_parts(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                7,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 501, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let before = world.body_count();
+        let prepared = world
+            .prepare_articulated_batch(
+                vec![
+                    ArticulatedBatchOperation::AliveBirth {
+                        operation_tag: 11,
+                        translation_m: [2.0, 0.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        topology_token: 9,
+                        parts: vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 502, 1)],
+                        representation: Representation::MergedCuboids,
+                    },
+                    ArticulatedBatchOperation::CheckedDeathTransfer {
+                        operation_tag: 12,
+                        id: alive,
+                        expected_topology_token: 7,
+                        expected_pose_token: 0,
+                    },
+                ],
+                mix_density,
+            )
+            .unwrap();
+        assert_eq!(
+            world.body_count(),
+            before,
+            "prepare must not publish bodies"
+        );
+        let validated = world.validate_articulated_batch(prepared).unwrap();
+        assert_eq!(
+            world.body_count(),
+            before,
+            "validation must not publish bodies"
+        );
+        let outcomes = world.publish_validated_articulated_batch(validated);
+        assert_eq!(
+            outcomes.iter().map(|o| o.operation_tag).collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+        assert!(outcomes[1].transfer.is_some());
+        let born = world.articulated.get(&outcomes[0].owner_id.0).unwrap();
+        assert!(born.kinematic_part_bodies && !born.dynamic_corpse);
+        let converted = world.articulated.get(&alive.0).unwrap();
+        assert!(!converted.kinematic_part_bodies && converted.dynamic_corpse);
+        assert!(
+            converted
+                .source_volume_ids
+                .contains(&VolumeId::new(501).unwrap())
+        );
+    }
+
+    #[test]
+    fn articulated_batch_prepares_two_deaths_birth_and_cold_restore_atomically() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let death_a = world
+            .add_articulated_kinematic_parts(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                31,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 531, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let death_b = world
+            .add_articulated_kinematic_parts(
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                32,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 532, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let restored_part = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 533, 4);
+        let restored = crate::articulated::DynamicCorpseRestore {
+            owner_key: 0x5eed,
+            source_generation: 4,
+            topology_revision: 3,
+            pose_epoch: 8,
+            next_component_serial: 1,
+            source_parts: vec![restored_part.clone()],
+            components: vec![restore_component(
+                None,
+                BodyState {
+                    translation_m: [4.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    linvel_m_s: [0.0; 3],
+                    angvel_rad_s: [0.0; 3],
+                    mass_kg: 0.0,
+                    sleeping: false,
+                },
+                source_cell_refs(&restored_part),
+            )],
+        };
+        let before = world.body_count();
+        let prepared = world
+            .prepare_articulated_batch(
+                vec![
+                    ArticulatedBatchOperation::AliveBirth {
+                        operation_tag: 41,
+                        translation_m: [2.0, 0.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        topology_token: 40,
+                        parts: vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 534, 1)],
+                        representation: Representation::MergedCuboids,
+                    },
+                    ArticulatedBatchOperation::CheckedDeathTransfer {
+                        operation_tag: 42,
+                        id: death_a,
+                        expected_topology_token: 31,
+                        expected_pose_token: 0,
+                    },
+                    ArticulatedBatchOperation::ColdRestore {
+                        operation_tag: 43,
+                        restore: restored,
+                        representation: Representation::MergedCuboids,
+                    },
+                    ArticulatedBatchOperation::CheckedDeathTransfer {
+                        operation_tag: 44,
+                        id: death_b,
+                        expected_topology_token: 32,
+                        expected_pose_token: 0,
+                    },
+                ],
+                mix_density,
+            )
+            .unwrap();
+        assert_eq!(
+            world.body_count(),
+            before,
+            "prepare must not publish members"
+        );
+        let outcomes = world.commit_articulated_batch(prepared).unwrap();
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.operation_tag)
+                .collect::<Vec<_>>(),
+            vec![41, 42, 43, 44]
+        );
+        assert!(outcomes[1].transfer.is_some());
+        assert!(outcomes[3].transfer.is_some());
+        assert!(world.articulated.get(&death_a.0).unwrap().dynamic_corpse);
+        assert!(world.articulated.get(&death_b.0).unwrap().dynamic_corpse);
+        assert!(
+            world
+                .articulated
+                .get(&outcomes[0].owner_id.0)
+                .unwrap()
+                .kinematic_part_bodies
+        );
+        assert_eq!(
+            world
+                .articulated_owner_snapshot(outcomes[2].owner_id)
+                .unwrap()
+                .pose_token,
+            8
+        );
+        assert_eq!(world.body_count(), before + 2);
+    }
+
+    #[test]
+    fn articulated_batch_rejects_same_step_transfer_drift_before_birth_publication() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let alive = world
+            .add_articulated_kinematic_parts(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                17,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 511, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let before = world.body_count();
+        let prepared = world
+            .prepare_articulated_batch(
+                vec![
+                    ArticulatedBatchOperation::AliveBirth {
+                        operation_tag: 21,
+                        translation_m: [2.0, 0.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        topology_token: 19,
+                        parts: vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 512, 1)],
+                        representation: Representation::MergedCuboids,
+                    },
+                    ArticulatedBatchOperation::CheckedDeathTransfer {
+                        operation_tag: 22,
+                        id: alive,
+                        expected_topology_token: 17,
+                        expected_pose_token: 0,
+                    },
+                ],
+                mix_density,
+            )
+            .unwrap();
+        let live_body = world.entries[entry_index(alive.0, world.id_namespace)].body;
+        world.bodies[live_body]
+            .set_position(Pose::from_translation(Vector::new(0.001, 0.0, 0.0)), true);
+        assert!(matches!(
+            world.commit_articulated_batch(prepared),
+            Err(crate::articulated::ArticulatedError::StalePreparedBatch)
+        ));
+        assert_eq!(
+            world.body_count(),
+            before,
+            "stale last member must leave the first birth unpublished"
+        );
+        assert!(
+            world
+                .articulated
+                .get(&alive.0)
+                .unwrap()
+                .kinematic_part_bodies
+        );
+        assert!(!world.articulated.values().any(|owner| {
+            owner
+                .source_volume_ids
+                .contains(&VolumeId::new(512).unwrap())
+        }));
+    }
+
+    #[test]
+    fn body_commit_fence_rejects_same_step_twist_changes() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let id = world
+            .add_articulated_kinematic_parts(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                27,
+                vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 521, 1)],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let fence = world.snapshot_body_commit_fence(&[id.0]).unwrap();
+        assert!(world.validate_body_commit_fence(&fence));
+        let live_body = world.entries[entry_index(id.0, world.id_namespace)].body;
+        world.bodies[live_body]
+            .set_position(Pose::from_translation(Vector::new(0.001, 0.0, 0.0)), true);
+        assert!(!world.validate_body_commit_fence(&fence));
+    }
+
+    #[test]
+    fn body_commit_fence_accepts_and_tracks_absent_terrain_collider() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let id = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: one_cell_grid(GlobalCell::new(0, 0, 0)),
+            cell_m: 0.25,
+            density_kg_m3: 1.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        world.remove_collider(id);
+        let fence = world.snapshot_body_commit_fence(&[id]).unwrap();
+        assert!(world.validate_body_commit_fence(&fence));
+        world.rebuild_collider(
+            id,
+            &one_cell_grid(GlobalCell::new(1, 0, 0)),
+            Representation::MergedCuboids,
+        );
+        assert!(!world.validate_body_commit_fence(&fence));
+    }
+
+    #[test]
     fn cold_restore_preserves_split_motion_mass_query_and_serial_highwater() {
         let cfg = PhysicsConfig {
             gravity_m_s2: [0.0; 3],
@@ -7554,6 +8935,34 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn validated_articulated_batch_rejects_foreign_world_before_mutation() {
+        let source = PhysicsWorld::new(PhysicsConfig::default());
+        let prepared = source
+            .prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::AliveBirth {
+                    operation_tag: 25,
+                    translation_m: [0.0; 3],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    topology_token: 25,
+                    parts: vec![one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 515, 1)],
+                    representation: Representation::MergedCuboids,
+                }],
+                mix_density,
+            )
+            .unwrap();
+        let validated = source.validate_articulated_batch(prepared).unwrap();
+        let mut other = PhysicsWorld::new(PhysicsConfig::default());
+        let before_source = source.body_count();
+        let before_other = other.body_count();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            other.publish_validated_articulated_batch(validated)
+        }));
+        assert!(result.is_err());
+        assert_eq!(source.body_count(), before_source);
+        assert_eq!(other.body_count(), before_other);
     }
 
     #[test]

@@ -63,11 +63,13 @@ pub use query_cache::{CharacterQueryCache, REBUILD_MARGIN_M, WINDOW_RADIUS_M, Wi
 pub use region_set::{PhysicsRegionSet, PhysicsRegionSetError, RegionalBodyState};
 pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
 pub use world::{
-    ArticulatedContactWitness, ArticulatedOwnerSnapshot, BodyId, BodyKind, BodySpec, BodyState,
+    ArticulatedBatchOperation, ArticulatedBatchOutcome, ArticulatedContactWitness,
+    ArticulatedOwnerSnapshot, BodyCommitFence, BodyId, BodyKind, BodySpec, BodyState,
     CONTACT_WITNESS_VERSION, ColliderExclusion, ContactCellAttribution, ContactImpulse,
     ContactWitnessUnattributed, CorpseEditOutcome, CorpseTransferOutcome, FractureCommitOutcome,
     MAX_CONTACT_WITNESSES_PER_STEP, MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS,
     MAX_CORPSE_RESTORE_BATCH_OWNERS, MAX_CORPSE_RESTORE_BATCH_PRIMITIVES,
-    MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS, PhysicsConfig, PhysicsWorld, PreparedBodySpec,
-    PreparedCollider, PreparedDynamicCorpseBatch, SourceContactWitness, StepTiming,
+    MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS, PhysicsConfig, PhysicsWorld, PreparedArticulatedBatch,
+    PreparedBodySpec, PreparedCollider, PreparedDynamicCorpseBatch, SourceContactWitness,
+    StepTiming, ValidatedArticulatedBatch,
 };
