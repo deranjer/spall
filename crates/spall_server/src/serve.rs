@@ -26,7 +26,9 @@ use std::time::Duration;
 
 use crate::action_catalog::ToolCatalog;
 use crate::replication::{BodyDigest, ClientReplication, InterestSet, MotionBudget};
-use crate::transfer_ids::{TransferIdAllocator, TransferIdError, TransferNamespace};
+use crate::transfer_ids::{
+    TransferIdAllocator, TransferIdError, TransferIdReservation, TransferNamespace,
+};
 use glam::DVec3;
 use serde::Serialize;
 use spall_core::{
@@ -3184,122 +3186,130 @@ async fn serve_async(
                                 accepted: false,
                                 message: reason.into(),
                             },
-                            None => {
-                                let started = std::time::Instant::now();
-                                // What deferred clients already hold of the world about to be
-                                // replaced, so their catalogue can be a delta.
-                                let catalogue_basis =
-                                    lj.capture_catalogue_basis(&sim, &clients_for_sim);
-                                let basis_ms = started.elapsed().as_millis() as u64;
-                                // The old world is not needed from here (the tick thread is busy
-                                // for the whole reset): start freeing it on a background thread
-                                // before the new one is built, so the two are not both resident
-                                // at full size. A one-brick placeholder stands in meanwhile.
-                                match Simulation::new(spall_sim::SimulationConfig::new(
-                                    spall_sim::fixtures::flat_terrain_setup(),
-                                )) {
-                                    Ok(placeholder) => {
-                                        if let Err(e) = sim.replace_world(placeholder) {
+                            None => match lj.reserve_reset_group() {
+                                Err(error) => spall_protocol::AdminStatus {
+                                    request_id: req.request_id,
+                                    accepted: false,
+                                    message: format!("world reset refused: {error}"),
+                                },
+                                Ok(reset_group) => {
+                                    let started = std::time::Instant::now();
+                                    // What deferred clients already hold of the world about to be
+                                    // replaced, so their catalogue can be a delta.
+                                    let catalogue_basis =
+                                        lj.capture_catalogue_basis(&sim, &clients_for_sim);
+                                    let basis_ms = started.elapsed().as_millis() as u64;
+                                    // The old world is not needed from here (the tick thread is busy
+                                    // for the whole reset): start freeing it on a background thread
+                                    // before the new one is built, so the two are not both resident
+                                    // at full size. A one-brick placeholder stands in meanwhile.
+                                    match Simulation::new(spall_sim::SimulationConfig::new(
+                                        spall_sim::fixtures::flat_terrain_setup(),
+                                    )) {
+                                        Ok(placeholder) => {
+                                            if let Err(e) = sim.replace_world(placeholder) {
+                                                return SimResult::error(
+                                                    format!("world reset failed: {e}"),
+                                                    ticks_run,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
                                             return SimResult::error(
                                                 format!("world reset failed: {e}"),
                                                 ticks_run,
                                             );
                                         }
                                     }
-                                    Err(e) => {
+                                    sim.wait_for_retired();
+                                    let freed_ms = started.elapsed().as_millis() as u64;
+                                    let mut fresh = scene.simulation_with_materials(
+                                        terrain_collider_mode,
+                                        reset_materials.clone(),
+                                        custom_world.as_ref(),
+                                    );
+                                    fresh.set_weather_seed(config.seed);
+                                    let built_ms = started.elapsed().as_millis() as u64;
+                                    if let Err(e) = sim.replace_world(fresh) {
                                         return SimResult::error(
                                             format!("world reset failed: {e}"),
                                             ticks_run,
                                         );
                                     }
-                                }
-                                sim.wait_for_retired();
-                                let freed_ms = started.elapsed().as_millis() as u64;
-                                let mut fresh = scene.simulation_with_materials(
-                                    terrain_collider_mode,
-                                    reset_materials.clone(),
-                                    custom_world.as_ref(),
-                                );
-                                fresh.set_weather_seed(config.seed);
-                                let built_ms = started.elapsed().as_millis() as u64;
-                                if let Err(e) = sim.replace_world(fresh) {
-                                    return SimResult::error(
-                                        format!("world reset failed: {e}"),
-                                        ticks_run,
+                                    let replaced_ms = started.elapsed().as_millis() as u64;
+                                    let spawns = custom_world.as_ref().map_or_else(
+                                        || scene.player_spawns(),
+                                        CustomWorld::player_spawns,
                                     );
-                                }
-                                let replaced_ms = started.elapsed().as_millis() as u64;
-                                let spawns = custom_world.as_ref().map_or_else(
-                                    || scene.player_spawns(),
-                                    CustomWorld::player_spawns,
-                                );
-                                if !spawns.is_empty() {
-                                    for session in lj.sessions().collect::<Vec<_>>() {
-                                        let slot = session.slot().0 as usize;
-                                        let spawn = spawns[slot.min(spawns.len() - 1)];
-                                        sim.add_player(session_player_entity(session), spawn);
-                                    }
-                                }
-                                // Everything below described bodies or edits of the
-                                // replaced world.
-                                // An edit staged against the replaced world will never
-                                // commit (the new world has a new pipeline). Say so, so the
-                                // client retries it instead of waiting for a receipt that
-                                // cannot come.
-                                for (request, (session, _)) in submitted_by.drain() {
-                                    reject(
-                                        &clients_for_sim,
-                                        session,
-                                        request,
-                                        "overloaded: world reset, retry",
-                                    );
-                                    actions_discarded_by_reset += 1;
-                                    rejected_total += 1;
-                                }
-                                submitted_at.clear();
-                                client_repl.clear();
-                                prev_body_y.clear();
-                                body_stable_ticks = 0;
-                                column_water_sent.clear();
-                                snow_page_cursor.clear();
-                                snow_center_page_cursor.clear();
-                                if let Some(drops) = playground_drops.as_mut() {
-                                    *drops = playground_drop_schedules(&sim);
-                                }
-                                match lj.reset_world(
-                                    &sim,
-                                    &clients_for_sim,
-                                    &mut motion,
-                                    catalogue_basis.as_ref(),
-                                ) {
-                                    Ok(clients) => {
-                                        world_resets += 1;
-                                        tracing::info!(
-                                            clients,
-                                            freed_ms,
-                                            built_ms,
-                                            basis_ms,
-                                            replaced_ms,
-                                            elapsed_ms = started.elapsed().as_millis() as u64,
-                                            "admin world reset"
-                                        );
-                                        spall_protocol::AdminStatus {
-                                            request_id: req.request_id,
-                                            accepted: true,
-                                            message: format!(
-                                                "world reset in {} ms",
-                                                started.elapsed().as_millis()
-                                            ),
+                                    if !spawns.is_empty() {
+                                        for session in lj.sessions().collect::<Vec<_>>() {
+                                            let slot = session.slot().0 as usize;
+                                            let spawn = spawns[slot.min(spawns.len() - 1)];
+                                            sim.add_player(session_player_entity(session), spawn);
                                         }
                                     }
-                                    Err(e) => {
-                                        return SimResult::error(
-                                            format!("world reset baseline capture failed: {e}"),
-                                            ticks_run,
+                                    // Everything below described bodies or edits of the
+                                    // replaced world.
+                                    // An edit staged against the replaced world will never
+                                    // commit (the new world has a new pipeline). Say so, so the
+                                    // client retries it instead of waiting for a receipt that
+                                    // cannot come.
+                                    for (request, (session, _)) in submitted_by.drain() {
+                                        reject(
+                                            &clients_for_sim,
+                                            session,
+                                            request,
+                                            "overloaded: world reset, retry",
                                         );
+                                        actions_discarded_by_reset += 1;
+                                        rejected_total += 1;
+                                    }
+                                    submitted_at.clear();
+                                    client_repl.clear();
+                                    prev_body_y.clear();
+                                    body_stable_ticks = 0;
+                                    column_water_sent.clear();
+                                    snow_page_cursor.clear();
+                                    snow_center_page_cursor.clear();
+                                    if let Some(drops) = playground_drops.as_mut() {
+                                        *drops = playground_drop_schedules(&sim);
+                                    }
+                                    match lj.reset_world(
+                                        &sim,
+                                        &clients_for_sim,
+                                        &mut motion,
+                                        catalogue_basis.as_ref(),
+                                        reset_group,
+                                    ) {
+                                        Ok(clients) => {
+                                            world_resets += 1;
+                                            tracing::info!(
+                                                clients,
+                                                freed_ms,
+                                                built_ms,
+                                                basis_ms,
+                                                replaced_ms,
+                                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                                "admin world reset"
+                                            );
+                                            spall_protocol::AdminStatus {
+                                                request_id: req.request_id,
+                                                accepted: true,
+                                                message: format!(
+                                                    "world reset in {} ms",
+                                                    started.elapsed().as_millis()
+                                                ),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            return SimResult::error(
+                                                format!("world reset baseline capture failed: {e}"),
+                                                ticks_run,
+                                            );
+                                        }
                                     }
                                 }
-                            }
+                            },
                         }
                     }
                     spall_protocol::AdminCommand::SetWaterSpring { rate } => {
@@ -5032,8 +5042,15 @@ struct LateJoin {
 enum LateJoinResetError {
     #[error("reset transfer ID reservation failed: {0}")]
     TransferId(#[from] TransferIdError),
+    #[error("connected sessions changed after reset IDs were reserved")]
+    SessionsChanged,
     #[error("reset baseline capture failed: {0}")]
     Baseline(#[from] baseline::BaselineError),
+}
+
+struct ResetGroupReservation {
+    sessions: Vec<SessionId>,
+    transfer_ids: TransferIdReservation,
 }
 
 impl LateJoin {
@@ -5157,6 +5174,20 @@ impl LateJoin {
         self.links.values().map(|link| link.session)
     }
 
+    /// Reserves reset IDs for a stable snapshot of every connected session.
+    /// The caller must do this before replacing the simulation world.
+    fn reserve_reset_group(&mut self) -> Result<ResetGroupReservation, LateJoinResetError> {
+        let mut sessions: Vec<SessionId> = self.sessions().collect();
+        sessions.sort_by_key(|session| session.raw());
+        let transfer_ids = self
+            .transfer_ids
+            .reserve(TransferNamespace::Reset, sessions.len())?;
+        Ok(ResetGroupReservation {
+            sessions,
+            transfer_ids,
+        })
+    }
+
     /// Admin world reset: `sim` already holds the rebuilt world. Every
     /// connected client — live or mid-join — gets one full baseline flagged
     /// with [`spall_protocol::WORLD_RESET_TRANSFER_ID_BIT`], which its replica
@@ -5169,12 +5200,18 @@ impl LateJoin {
         clients: &ClientMap,
         motion: &mut MotionPublisher,
         catalogue_basis: Option<&baseline::CatalogueBasis>,
+        reservation: ResetGroupReservation,
     ) -> Result<usize, LateJoinResetError> {
-        let sessions: Vec<SessionId> = self.sessions().collect();
+        let mut current_sessions: Vec<SessionId> = self.sessions().collect();
+        current_sessions.sort_by_key(|session| session.raw());
+        if current_sessions != reservation.sessions {
+            return Err(LateJoinResetError::SessionsChanged);
+        }
+        let ResetGroupReservation {
+            sessions,
+            transfer_ids: mut reset_ids,
+        } = reservation;
         let session_count = sessions.len();
-        let mut reset_ids = self
-            .transfer_ids
-            .reserve(TransferNamespace::Reset, sessions.len())?;
         self.cached_baseline = None;
         self.pending_captures.clear();
         let phase_started = std::time::Instant::now();
@@ -7562,9 +7599,14 @@ mod tests {
     }
 
     #[test]
-    fn reset_id_exhaustion_preserves_join_phase_and_pending_transfers() {
-        let sim = Scene::BridgeCut.simulation();
-        let clients = empty_clients();
+    fn reset_id_exhaustion_preflight_preserves_world_and_late_join_state() {
+        let mut sim = Scene::BridgeCut.simulation();
+        let player = EntityId::new(9001).unwrap();
+        sim.add_player(player, [3.0, 4.0, 5.0]);
+        let world_hash = sim.world().world_hash();
+        let registry_counters = sim.world().registry().counters();
+        let journal_cursor = sim.journal_cursor();
+        let player_position = sim.player_state(player).unwrap().position_m;
         let mut lj = LateJoin::new(4, 2, 1);
         let session = sess(0, 1);
         lj.on_joined(session);
@@ -7583,9 +7625,18 @@ mod tests {
         lj.transfer_ids
             .set_next_low_for_test(crate::transfer_ids::CREATURE_LIFECYCLE_TRANSFER_ID_BIT);
 
-        let result = lj.reset_world(&sim, &clients, &mut MotionPublisher::new(60, 20), None);
+        // This is the production Admin ResetWorld preflight. Exhaustion returns
+        // before the handler captures/replaces the world or mutates transfer state.
+        let result = lj.reserve_reset_group();
 
         assert!(result.is_err());
+        assert_eq!(sim.world().world_hash(), world_hash);
+        assert_eq!(sim.world().registry().counters(), registry_counters);
+        assert_eq!(sim.journal_cursor(), journal_cursor);
+        assert_eq!(
+            sim.player_state(player).unwrap().position_m,
+            player_position
+        );
         assert!(lj.cached_baseline.is_some());
         assert!(lj.pending_captures.contains_key(&session.raw()));
         assert!(matches!(
