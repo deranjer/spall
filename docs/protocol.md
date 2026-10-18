@@ -741,8 +741,15 @@ General geometry retains its own bounds rather than inheriting animal-only caps.
 The consuming world must still budget geometry expansion and physics work.
 
 The server allocator uses one checked 61-bit low sequence for baseline, retry,
-repair and reset reservations, with namespace bits preserved for reset/split and
-reserved for lifecycle. Dropped reservations burn their range. Reset reserves
-the connected-session group before replacing the world. Split/lifecycle callers
-and retained-journal startup seeding still require the shared handoff; the
-allocator and attachment codec alone do not activate those consumers.
+repair, reset and geometry split reservations, with namespace bits preserved
+for reset/split and reserved for lifecycle. Dropped reservations burn their range.
+Reset reserves the connected-session group before replacing the world. Geometry
+reserves a bounded owned pool before the existing tick: the bound includes
+carried inflight work and newly admitted edits across all rebase rounds. Idle
+ticks reserve nothing. Bulk markers, streamed payloads and durable geometry
+records retain the same reserved ID; transaction IDs no longer generate it.
+Startup validates IDs from every topology record in the durable recovery suffix
+before restoring or publishing another checkpoint, then seeds the live allocator
+above them. The fresh in-memory journal is not the recovery source. Lifecycle
+reservations and typed runtime consumers remain closed pending complete actor
+checkpoint/baseline restore and ordered attachment transport/replay.

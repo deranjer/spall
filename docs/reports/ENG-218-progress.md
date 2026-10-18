@@ -421,3 +421,79 @@ consumers and staged dormant-body waking still follow. Protocol/wire 9, baseline
 and store 3 remain current; no legacy migration was added. Production spawning,
 combined 1024 m weather/animals, GPU, population and multiplayer recovery/destruction
 acceptance remain gated.
+
+## Geometry reservation handoff and durable startup seeding (2026-10-18)
+
+Main `65e0911` integrates worker `eb2650c`; `d3fa65f` integrates recovery
+follow-up `2699fb5`. The server reserves geometry Split IDs from the same runtime
+allocator used for baseline/reset/retry/repair, immediately before the existing
+simulation tick. The conservative bound covers carried inflight work plus the
+configured newly submitted edit limit across all rebase rounds. Offthread edit
+work needs at most one; pending prewarm alone and idle ticks need zero. The
+owned pool passes through the existing sequential commit/rebase path, preserving
+once-only physics/weather work. Unused reservations burn. Bulk output retains
+the exact ID in every child/source marker, committed result, fanout and durable
+geometry payload. No transaction-derived fallback remains. Missing IDs reject
+bulk preparation without publishing that geometry candidate.
+
+Independent review caught startup scanning the fresh in-memory journal instead
+of the recovered durable suffix. Startup now extracts IDs from every topology
+record in that suffix, validates them using allocator namespace/range checks
+before restore or checkpoint publication, and seeds the live allocator from
+those IDs plus any current entries. This does not add a persisted allocator
+counter or another journal. A real SQLite regression covers retained Split low
+ID 401 and a CRC-valid invalid-ID record: the next reservation exceeds 401,
+while the malformed record rejects startup with checkpoint count unchanged.
+
+The new full-size noisy geometry split server regression uses actual QUIC
+begin/parts/end and a replica. It compares the marker ID, every streamed ID,
+durable attachment hash and recovered world hash. An injected final checkpoint
+failure deliberately retains the suffix; restart must then issue a baseline
+ID above the retained Split low sequence. The fixture was not reduced to fit
+the inline path. Public simulation boundary tests additionally reject zero,
+wrong/mixed namespace and duplicate IDs before changing tick, world, registry,
+journal cursor or topology epoch; an idle tick needs no reservation.
+
+The initial combined test run could not start a local-network test server in
+the sandbox and stopped at the existing column-water replication test. The
+same suite was retried with local-network access. Worker E2E lint findings
+(single-match loops and borrow expressions) were corrected before acceptance.
+The worker's accidental second build target was verified and moved intact to
+ignored `.local/eng218-extra-target-handoff`; user artifacts were preserved.
+An ignored Cargo wrapper now enforces the established workspace target path.
+
+Changed implementation files: `spall_sim/src/{commit,schedule,sim}.rs`,
+`spall_sim/tests/{acceptance,bulk_split,g4_workload,transfer_reservations}.rs`,
+`spall_server/src/{persist,serve}.rs`, and the new
+`spall_server/tests/geometry_split_transfer_id.rs`. Protocol/task documentation
+and this report record the accepted boundary; dependency versions are unchanged.
+
+Coordinator checks on the integrated main checkout:
+
+- `cargo test -p spall_sim -p spall_server -p spall_protocol`: retry passed
+  **578 tests, 0 failed, 11 ignored across 64 targets**, including both new
+  simulation boundary tests and actual QUIC/SQLite restart coverage. The initial
+  sandbox run stopped at the local-server startup timeout described above.
+- `cargo check --workspace --all-targets --all-features`: passed.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store
+  -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+Logs: `.local/eng218-handoff-integrated-tests{,-retry}.log`,
+`.local/eng218-handoff-{workspace,clippy,format}.log`, and the initial isolated
+two-test boundary check `.local/eng218-transfer-boundary-tests.log` (2 passed).
+Cargo commands used `.local/eng218-cargo.ps1` to pin the target directory;
+cache hard-link warnings remain environmental. These are measured CPU/network
+test results, not the unrun hardware/1 km acceptance targets below.
+
+Next unblocked task remains ENG-218. Before durable animal production, implement
+complete actor checkpoint and baseline capture/restore: portable source geometry,
+ownership, hierarchy, frozen poses, physics evidence and allocator high-water,
+including an empty host. Typed attachments then need explicit transport framing,
+ordered replica/recovery consumers and one journal record/sequence, replacing
+the current geometry-only payload under a new current store version. Lifecycle
+bulk binding must happen before final transaction hashing/publication. No actor
+journal, fake geometry baseline, legacy migration or live spawning is accepted
+as a substitute. Current wire 9, baseline 1 and store 3 remain unchanged.
+Combined 1024 m weather/animals, GPU, population and multiplayer animal
+recovery/destruction acceptance are still unrun.
