@@ -104,8 +104,8 @@ pub use replication::{
 pub use schedule::EditTiming;
 pub use schedule::{EditPipeline, RegionKey, TickReport};
 pub use sim::{
-    CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, SERVER_REQUEST_ID_BAND, Simulation,
-    SimulationConfig, TICK_DT_S, TickError,
+    CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, CreatureCaptureError, SERVER_REQUEST_ID_BAND,
+    Simulation, SimulationConfig, TICK_DT_S, TickError,
 };
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit, warm_index_reuses};
 pub use transfer::{ChildBody, PlanChildError, plan_child};

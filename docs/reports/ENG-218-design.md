@@ -243,3 +243,25 @@ and empty source bindings, exact sparse metadata retention, malformed/stale/pend
 or resource-limit refusal without mutation, and explicit allocator/identity/hash
 checks. This prerequisite does not open geometry-only checkpoints, actor baselines,
 typed runtime replay, bulk publication or spawning; those consumers remain next.
+
+### Capture adapter clarification (2026-10-18)
+
+Read-only review confirms the host logical pose_epoch and runtime authored
+pose_token are separate: initial physical token is zero; Death advances only the
+logical epoch. Keep raw physical tokens runtime-only. Capture fences actual
+physics with its raw token and binds the host logical epoch in the portable
+record in the same immutable owner-thread window. Add an explicit logical-epoch
+argument to the whole-corpse capture adapter, returning a valid cold-restore DTO
+whose epoch is the host epoch. Existing direct capture retains its token-as-epoch
+behavior for callers already using that mapping. Never serialize a second raw
+runtime counter. Tests must cover initial token zero, pending refusal and Death
+with diverged counters; the mapped restore must admit the next logical token.
+
+A second missing prerequisite is Volume.next_revision, which cannot generally be
+recovered from resident brick revisions after retirement/eviction. The current
+source format does not retain it. This capture pass must refuse such gaps with an
+explicit SourceRevision error; a subsequent current-only source DTO/high-water
+and exact restore seam is required before claiming complete general source saves.
+No derived max+1 value may silently replace the live counter. Production saves
+and spawning remain closed. Population preflight may conservatively refuse a
+potential mask/memory budget overflow; it never relaxes existing ceilings.

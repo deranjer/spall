@@ -1399,6 +1399,25 @@ impl SimWorld {
         self.creature_sources.volume_owner.get(&volume).copied()
     }
 
+    /// Scalar admission before walking or copying any source payload.
+    pub(crate) fn creature_source_counts(&self) -> [usize; 5] {
+        let sources = &self.creature_sources;
+        [
+            sources.owners.len(),
+            sources.metadata.len(),
+            sources.volume_owner.len(),
+            sources.physics_owner.len(),
+            sources.frozen_poses.len(),
+        ]
+    }
+
+    pub(crate) fn creature_source_part_counts(&self, key: CreatureKey) -> Option<(usize, usize)> {
+        Some((
+            self.creature_sources.owners.get(&key)?.len(),
+            self.creature_sources.metadata.get(&key)?.len(),
+        ))
+    }
+
     pub(crate) fn creature_source_part(&self, key: CreatureKey, part_id: u32) -> Option<&Volume> {
         self.creature_sources.owners.get(&key)?.get(&part_id)
     }
@@ -1474,7 +1493,6 @@ impl SimWorld {
             .collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn creature_frozen_poses(
         &self,
         key: CreatureKey,

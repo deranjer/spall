@@ -830,8 +830,40 @@ resource admission only. Installation must validate source uniqueness against
 geometry and match the accompanying checkpoint's shared counter; this envelope
 never replaces that counter or allocates another ID stream.
 
-This portable envelope does not yet capture the Simulation, install actors, or
-change baseline 1/store 3 layouts. Complete canonical capture, joint prepared
-host/source/physics restore, current actor checkpoint/baseline sections and ordered
-runtime replay are still required. Geometry-only checkpoint refusal and closed
-production spawning remain in force.
+The Simulation now provides guarded read-only capture into this envelope,
+including actual applied motion and complete corpse ownership. It does not install
+actors or change baseline 1/store 3 layouts. Source revision-allocator gaps still
+refuse explicitly until a complete source high-water format exists. Joint prepared
+host/source/physics restore, actor checkpoint/baseline sections and ordered runtime
+replay remain required. Geometry-only checkpoint refusal and closed production
+spawning remain in force.
+
+
+Simulation capture (2026-10-18) preserves a distinction between host logical
+`pose_epoch` and physics' runtime authored `pose_token`. Birth can have runtime
+token zero, and Death advances the logical epoch independently. The owner-thread
+adapter reads both in one immutable window: raw runtime tokens fence physical
+capture, while the authoritative logical epoch is written into the portable
+record and cold-restore bundle. A fresh physics instance initializes its token
+from that portable epoch. No raw runtime token or counter is added to the wire.
+`capture_dynamic_corpse_owner_at_epoch` makes this mapping explicit; the existing
+direct physics capture keeps its existing token-as-portable-epoch contract.
+
+Capture validates exact host/source/metadata/reverse-index/physics-owner bijection,
+source freshness and shared volume namespace, then the actual installed Alive
+source cells/materials/revisions/hierarchy/cell scale. Corpse capture validates the
+complete physical partition. Original sparse bricks, revisions, edited flags,
+bounds and authored transforms are retained separately from current/frozen poses.
+Before output construction, two-pass population admission bounds metadata,
+nonuniform source scans, dense source payload, solids, reconstruction grids,
+components, mask count and capacity (including geometric growth and map overhead).
+Conservative mask bounds may refuse a population that would fit after exact
+partition counting; they do not raise existing limits. Physics reconstruction
+scratch retains its separate bounded per-owner grid/work ceilings.
+
+The current source DTO omits the original Volume.next_revision allocator. Capture
+therefore requires its exact current value to equal max resident revision + 1
+(or 1 for no resident bricks), and reports SourceRevision otherwise. This is an
+explicit unsupported case, not a synthesized replacement counter. A subsequent
+versioned source high-water DTO and exact restore seam are prerequisites for
+accepting general source retirement/eviction recovery or complete animal saves.

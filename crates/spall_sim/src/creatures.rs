@@ -155,6 +155,10 @@ impl CreatureHost {
         self.allocator.snapshot()
     }
 
+    pub(crate) fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }

@@ -3653,6 +3653,25 @@ impl PhysicsWorld {
         canonical_sources: &[SourcePart],
     ) -> Result<crate::articulated::DynamicCorpseRestore, crate::articulated::ArticulatedError>
     {
+        self.capture_dynamic_corpse_owner_at_epoch(
+            id,
+            expected,
+            canonical_sources,
+            expected.pose_token,
+        )
+    }
+
+    /// Captures against the actual runtime authored token while mapping the
+    /// restored assembly to its host's authoritative logical pose epoch.
+    /// Initial runtime token zero is valid; the portable epoch stays nonzero.
+    pub fn capture_dynamic_corpse_owner_at_epoch(
+        &self,
+        id: ArticulatedBodyId,
+        expected: crate::articulated::DynamicCorpseOwnerFence,
+        canonical_sources: &[SourcePart],
+        portable_pose_epoch: u64,
+    ) -> Result<crate::articulated::DynamicCorpseRestore, crate::articulated::ArticulatedError>
+    {
         use crate::articulated::{
             ArticulatedError, DynamicCorpseComponentRestore, DynamicCorpseRestore,
             MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_PARTS, MAX_ARTICULATED_SOLID_CELLS,
@@ -3667,7 +3686,7 @@ impl PhysicsWorld {
             || expected.owner_key == 0
             || expected.source_generation == 0
             || expected.topology_revision == 0
-            || expected.pose_token == 0
+            || portable_pose_epoch == 0
             || expected.next_component_serial == 0
             || match assembly.fracture_owner_key {
                 Some(key) => {
@@ -4084,7 +4103,7 @@ impl PhysicsWorld {
             owner_key: expected.owner_key,
             source_generation: expected.source_generation,
             topology_revision: expected.topology_revision,
-            pose_epoch: expected.pose_token,
+            pose_epoch: portable_pose_epoch,
             next_component_serial: expected.next_component_serial,
             source_parts: normalized_sources,
             components,
@@ -6945,6 +6964,74 @@ impl PhysicsWorld {
     /// aggregate exposes its dynamic owner body.
     pub fn articulated_body_state(&self, id: ArticulatedBodyId) -> BodyState {
         self.body_state(id.0)
+    }
+
+    /// Validates the exact original source cells and applied hierarchy used by
+    /// an Alive capture. Air padding may differ; absolute occupied cells may not.
+    pub fn validate_alive_capture_sources(
+        &self,
+        id: ArticulatedBodyId,
+        sources: &[SourcePart],
+    ) -> Result<(), crate::articulated::ArticulatedError> {
+        use crate::articulated::{ArticulatedError, MAX_ARTICULATED_DENSE_CELLS};
+        let assembly = self
+            .articulated
+            .get(&id.0)
+            .ok_or(ArticulatedError::InvalidRestore)?;
+        if assembly.dynamic_corpse
+            || sources.len() > crate::articulated::MAX_ARTICULATED_PARTS
+            || assembly.pending_pose.is_some()
+            || assembly.pending_root_pose_token.is_some()
+            || sources.windows(2).any(|p| p[0].part_id >= p[1].part_id)
+            || sources.len() != assembly.source_volume_ids.len()
+            || sources
+                .iter()
+                .map(|p| p.volume_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                != assembly.source_volume_ids
+            || sources
+                .iter()
+                .map(|p| p.grid.dims().into_iter().map(u64::from).product::<u64>())
+                .sum::<u64>()
+                > MAX_ARTICULATED_DENSE_CELLS
+            || sources.iter().filter(|p| p.grid.solid_count() != 0).count() != assembly.parts.len()
+        {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+        for actual in &assembly.parts {
+            let source = sources
+                .iter()
+                .find(|source| source.part_id == actual.part_id)
+                .ok_or(ArticulatedError::InvalidRestore)?;
+            if source.volume_id != actual.volume_id
+                || source.source_revision != actual.source_revision
+                || source.parent_id != actual.parent_id
+                || source.local_transform != actual.local_pose
+                || source.cell_m.to_bits() != actual.cell_m.to_bits()
+                || source.grid.solid_count() != actual.grid.solid_count()
+            {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            let a = actual.grid.origin();
+            let s = source.grid.origin();
+            let mut equal = true;
+            actual.grid.for_each_solid(|x, y, z, material| {
+                let index = [
+                    i128::from(a.x) + i128::from(x) - i128::from(s.x),
+                    i128::from(a.y) + i128::from(y) - i128::from(s.y),
+                    i128::from(a.z) + i128::from(z) - i128::from(s.z),
+                ];
+                let index = index.map(u32::try_from);
+                equal &= match index {
+                    [Ok(x), Ok(y), Ok(z)] => source.grid.material(x, y, z) == Some(material),
+                    _ => false,
+                };
+            });
+            if !equal {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+        }
+        Ok(())
     }
 
     /// Returns current owner tokens and root motion without exposing handles.

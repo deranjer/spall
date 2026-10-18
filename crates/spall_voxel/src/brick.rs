@@ -397,6 +397,16 @@ impl Brick {
         self.material.storage_bytes()
     }
 
+    /// Constant-time uniform storage query. Dense data is never scanned here;
+    /// callers can admit nonuniform work before examining its cells.
+    pub fn uniform_storage_material(&self) -> Option<MaterialId> {
+        match &self.material {
+            Layer::Uniform(value) => Some(*value),
+            Layer::Paletted(cells) if cells.palette_len == 1 => Some(cells.palette[0]),
+            _ => None,
+        }
+    }
+
     /// Sets one cell. Returns whether the stored value changed. Materializes to
     /// dense storage if needed; does not collapse (callers batch and collapse
     /// once).

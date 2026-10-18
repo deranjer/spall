@@ -1037,3 +1037,98 @@ Final checks also passed:
   not shipped species/population throughput. Logs use
   `.local/eng218-primary-{client-tests,clippy,measurements}.log`.
 All Cargo commands used the established target-pinned wrapper and ran serially.
+
+
+## Guarded complete-owner Simulation capture (2026-10-18)
+
+Simulation now exposes read-only `capture_creature_snapshot(catalog)` returning
+None only for a completely uninitialized host, or Some(snapshot), including an
+empty initialized allocator with its world/epoch/retired high-water. It uses the
+existing V1 envelope / V3 owners and actual shared volume counter, without a new
+stream or allocator. This pass does not open geometry-only checkpoint paths or
+production spawning.
+
+Two-pass admission first bounds the whole population's record/source/brick and
+nonuniform cell work before dense/paletted source scans. The next bounded pass
+checks source metadata and complete resident revision fences, original sparse
+content, source/geometry namespace, source grid work, solid counts, potential
+component/mask counts, per-owner and cumulative bytes. Mask estimates include
+geometric Vec capacity, BTreeMap node/key overhead and output component capacity;
+Alive dense mask cells/outer masks reserve exact known counts. Conservative bounds
+can refuse a population which exact mask counting might admit. These output
+budgets do not replace the physics adapter's separately bounded reconstruction
+scratch/grid ceilings; no measured total-heap or population-throughput claim.
+
+Host/source/metadata/reverse-index/physics-owner maps must be a complete bijection,
+including frozen-pose maps only for Corpse. Alive export checks original absolute
+cell/material coverage, cell scale, revisions, volume/part identity and applied
+hierarchy against the installed physics source parts. Corpse export uses actual
+whole-owner capture for every disjoint component mask, frame/twist, owner/source
+identity, component serial high-water and primary. The physical primary is retained
+explicitly while output components remain canonically sorted. Original sparse
+bricks, revisions, edited flags, bounds, authored transforms and empty source
+bindings remain distinct from current/frozen physical poses. No lifecycle edits,
+source synchronization or journal operations are synthesized by capture.
+
+Read-only worker review found two important contract gaps. Host logical pose_epoch
+and the raw physical authored pose_token are separate counters: initial physical
+token zero is valid; Death increments only the host epoch. The explicit
+`capture_dynamic_corpse_owner_at_epoch` adapter checks the actual raw physical
+fence and emits the caller's authoritative logical epoch for cold reconstruction.
+Raw tokens remain runtime-only; direct existing physics capture retains its
+previous token-as-epoch behavior. Actual raw-zero birth and checked Death capture,
+Alive/corpse reconstruction and subsequent mapped token admission pass.
+
+Volume.next_revision is not generally reconstructible from resident bricks after
+retirement/eviction. Current source DTOs omit it. This pass explicitly refuses any
+such source with SourceRevision rather than write a lossy snapshot or invent a
+max+1 counter. A current-only source high-water DTO plus exact restore seam is the
+next ENG-218 prerequisite before general animal save acceptance. Sources whose
+actual counter is representable are captured, including a genuinely empty source
+with its initial counter. This limitation is deliberate and visible, not complete
+Simulation checkpoint/baseline acceptance.
+
+The reviewer initially found missing Alive physics/source equality and incomplete
+mask-vector capacity accounting. Both were corrected before acceptance; a follow-up
+read-only audit found no remaining concrete blocker within this guarded scope.
+Tests exercise altered source content with valid refreshed metadata against an
+unchanged physical rig, exact negative masks, pending refusal and mutation-free
+failure; scalar metadata limits before stale hashing; independent native capacity
+refusal at the admitted 8 Mi dense-slot ceiling; empty allocator capture; actual
+three-part applied motion and checked transfer; source revision-gap refusal; and
+multi-component primary 41 with older serial 7/high-water 100 plus an empty child.
+The last Simulation case starts from a cold-restore fixture; actual fracture
+creation/roundtrip remains independently covered by the existing physics tests.
+
+Measured checks (all Cargo calls serial through `.local/eng218-cargo.ps1`):
+- `cargo check -p spall_sim --lib`: final passed; initial compilation needed an
+  explicit mask Vec type and removal of an unused import (no gate relaxed).
+- `cargo test -p spall_sim --lib creature_`: final focused run 32 passed, 0 failed.
+- `cargo test -p spall_voxel -p spall_physics -p spall_protocol -p spall_sim`:
+  661 passed, 0 failed, 11 existing ignored across 60 result targets, including
+  final Alive mapped-epoch reconstruction additions.
+Logs: `.local/eng218-capture-{check,check-retry,check-source,focused,
+focused-retry,focused-final,integrated}.log`. Existing cache hard-link warnings are
+environmental. No GPU or generated-world launch/population measurement was run.
+
+Changed files: new simulation `src/{creature_capture,creature_capture_tests}.rs`;
+simulation `src/{creature_owner_bridge,creatures,lib,sim,world}.rs`; physics
+`src/world.rs`; voxel `src/brick.rs`; protocol/validation/task notes and ENG-218
+design/progress reports. Engine dependencies and wire11/baseline1/store3 layouts
+are unchanged. Unrelated artifacts/ is preserved.
+
+Next unblocked ID: ENG-218 source revision high-water format and exact reconstruction,
+then joint prepared Simulation host/source/physics/registry restore, complete actor
+checkpoint/baseline sections and typed ordered journal/replica consumers, bulk
+publication and source-edit/fracture/terminal synchronization. Combined 1024 m
+weather/animals, shipped population, GPU and multiplayer animal restart/destruction
+remain unrun/unaccepted; production spawning remains closed.
+
+Final coordinator checks passed:
+- `cargo check --workspace --all-targets --all-features`.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`.
+- `cargo fmt --all -- --check` and `git diff --check`.
+Logs: `.local/eng218-capture-{workspace,clippy,format}.log`.
+No server/network regression rerun was needed for this pass: wire/store layouts
+and server publication paths are unchanged; workspace compilation and strict lint
+cover their callers. The current production checkpoint refusal remains unchanged.

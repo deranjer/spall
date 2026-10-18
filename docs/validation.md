@@ -1773,3 +1773,22 @@ strict allocator maps, trailing refusal and population count refusal before
 record bodies when the decoder exposes a sequence hint. The same seeded reader
 retains its no-hint incremental admission. Complete Simulation capture/restore and
 integrated animal checkpoint/baseline/replay are not established by these DTO tests.
+
+
+Guarded Simulation capture checks (2026-10-18):
+`cargo test -p spall_sim --lib creature_` covers uninitialized versus initialized
+empty hosts, allocator epoch/high-water retention, initial raw physics token zero,
+logical epoch mapping across actual checked Death, physical cold reconstruction and
+subsequent token validation, exact negative-coordinate masks, complete original
+metadata, two-component nonlowest primary with empty child source and retired
+serial gaps, and actual three-part animated source/motion capture. The multi-
+component Simulation test starts from a cold-restore fixture; actual fracture
+creation/roundtrip remains separately exercised by the physics corpse-owner tests.
+
+Pending physical poses, fresh source content inconsistent with installed physics,
+source revision-allocator gaps, excess scalar brick metadata and native byte
+capacity overflow at the admitted dense-slot ceiling must refuse without capture
+mutation. Run full voxel/physics/protocol/sim suites, workspace all-target/all-
+feature check and strict seven-package lint. These checks do not establish a
+complete Simulation installer, actor checkpoint/baseline/replay consumer or 1 km
+weather/animal launch. Source high-water format integration remains next ENG-218.

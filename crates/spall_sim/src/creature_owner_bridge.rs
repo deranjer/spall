@@ -364,6 +364,12 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     let before = record_from_sim(&sim, applied_alive);
     before.validate(&catalog).unwrap();
     assert_eq!(before.part_velocities.len(), 3);
+    let captured = sim.capture_creature_snapshot(&catalog).unwrap().unwrap();
+    assert_eq!(
+        captured.owners.records[0].part_velocities,
+        before.part_velocities
+    );
+    assert_eq!(captured.owners.records[0].parts, before.parts);
     assert_ne!(
         before.part_velocities[0].linear_velocity_m_s,
         before.part_velocities[1].linear_velocity_m_s
@@ -392,6 +398,10 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
         .clone();
     let after = record_from_sim(&sim, corpse);
     after.validate(&catalog).unwrap();
+    let captured = sim.capture_creature_snapshot(&catalog).unwrap().unwrap();
+    assert_eq!(captured.owners.records[0].state, after.state);
+    assert_eq!(captured.owners.records[0].parts, after.parts);
+    assert!(captured.owners.records[0].part_velocities.is_empty());
     let frozen_local_poses = sim
         .world
         .creature_frozen_poses(state.key)
