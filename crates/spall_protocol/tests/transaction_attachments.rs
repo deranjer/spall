@@ -6,9 +6,9 @@ use spall_protocol::{
     BASELINE_WORLD_SCHEMA, BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume,
     BaselineWorld, CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
     CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA, CREATURE_STATE_SCHEMA, ControlSeq,
-    CreatureAssetIdentity, CreatureLifecycleBulkPayloadV2, CreatureLifecycleChangeV2,
-    CreatureLifecycleCommitV2, CreatureLifecycleOperationV2, CreatureLocalPoseV1,
-    CreatureOwnershipRecordV2, CreatureSourcePartV1, CreatureStateV1, Hash32,
+    CreatureAssetIdentity, CreatureLifecycleBulkPayloadV3, CreatureLifecycleChangeV3,
+    CreatureLifecycleCommitV3, CreatureLifecycleOperationV3, CreatureLocalPoseV1,
+    CreatureOwnershipRecordV3, CreatureSourcePartV1, CreatureStateV1, Hash32,
     TRANSACTION_ATTACHMENT_SET_SCHEMA, TopologyOp, TopologyTransaction, TransactionAttachmentError,
     TransactionAttachmentSetV1, TransactionAttachmentV1, ValidatedTransactionAttachmentV1,
     decode_for_transaction,
@@ -73,8 +73,9 @@ fn split_world() -> BaselineWorld {
     }
 }
 
-fn lifecycle_commit(transaction_id: TransactionId) -> CreatureLifecycleCommitV2 {
-    let after = CreatureOwnershipRecordV2 {
+fn lifecycle_commit(transaction_id: TransactionId) -> CreatureLifecycleCommitV3 {
+    let after = CreatureOwnershipRecordV3 {
+        primary_component_serial: None,
         part_velocities: vec![],
         schema: CREATURE_OWNER_SCHEMA,
         state: CreatureStateV1 {
@@ -117,15 +118,15 @@ fn lifecycle_commit(transaction_id: TransactionId) -> CreatureLifecycleCommitV2 
         parts: vec![],
         components: vec![],
     };
-    let change = CreatureLifecycleChangeV2 {
+    let change = CreatureLifecycleChangeV3 {
         schema: CREATURE_CHANGE_SCHEMA,
         transaction_id,
         operation_ordinal: 0,
         expected_before_hash: Hash32::ZERO,
         expected_after_hash: after.canonical_hash(),
-        operation: CreatureLifecycleOperationV2::Birth { after },
+        operation: CreatureLifecycleOperationV3::Birth { after },
     };
-    CreatureLifecycleCommitV2 {
+    CreatureLifecycleCommitV3 {
         schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
         change,
         expected_before_topology_hash: Hash32::ZERO,
@@ -137,9 +138,9 @@ fn lifecycle_commit(transaction_id: TransactionId) -> CreatureLifecycleCommitV2 
 fn compact_uniform_commit(
     transaction_id: TransactionId,
     ordinal: u32,
-) -> CreatureLifecycleCommitV2 {
+) -> CreatureLifecycleCommitV3 {
     let mut commit = lifecycle_commit(transaction_id);
-    let CreatureLifecycleOperationV2::Birth { after } = &mut commit.change.operation else {
+    let CreatureLifecycleOperationV3::Birth { after } = &mut commit.change.operation else {
         unreachable!();
     };
     let bricks: Vec<_> = (0..30)
@@ -182,7 +183,7 @@ fn lifecycle_set_with_five_compact_uniform_records()
     let mut attachments = Vec::new();
     for ordinal in 0..5_u32 {
         let transfer_id = 500 + u64::from(ordinal);
-        let payload = CreatureLifecycleBulkPayloadV2::new(
+        let payload = CreatureLifecycleBulkPayloadV3::new(
             transaction_id,
             ordinal,
             compact_uniform_commit(transaction_id, ordinal),
@@ -299,7 +300,7 @@ fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
         Err(TransactionAttachmentError::Count)
     ));
 
-    let wrong_family_payload = CreatureLifecycleBulkPayloadV2::new(
+    let wrong_family_payload = CreatureLifecycleBulkPayloadV3::new(
         transaction.transaction_id,
         0,
         lifecycle_commit(transaction.transaction_id),
@@ -368,7 +369,7 @@ fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
 fn lifecycle_attachment_is_correlated_to_marker_before_candidate_acceptance() {
     let transaction_id = TransactionId::new(52).unwrap();
     let commit = lifecycle_commit(transaction_id);
-    let payload = CreatureLifecycleBulkPayloadV2::new(transaction_id, 0, commit).unwrap();
+    let payload = CreatureLifecycleBulkPayloadV3::new(transaction_id, 0, commit).unwrap();
     let transaction = TopologyTransaction {
         transaction_id,
         server_tick: Tick(12),

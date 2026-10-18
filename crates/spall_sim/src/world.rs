@@ -3567,14 +3567,15 @@ mod creature_source_owner_tests {
         use spall_core::{Tick, TransactionId};
         use spall_protocol::{
             CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA,
-            CreatureLifecycleChangeV2, CreatureLifecycleCommitV2, CreatureLifecycleOperationV2,
-            CreatureOwnershipRecordV2, Hash32, TopologyOp, TopologyTransaction,
+            CreatureLifecycleChangeV3, CreatureLifecycleCommitV3, CreatureLifecycleOperationV3,
+            CreatureOwnershipRecordV3, Hash32, TopologyOp, TopologyTransaction,
         };
 
         let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
         let catalog = crate::creatures::tests::FixtureCatalog::new();
         let state = catalog.state(1, 1001);
-        let empty_record = CreatureOwnershipRecordV2 {
+        let empty_record = CreatureOwnershipRecordV3 {
+            primary_component_serial: None,
             part_velocities: vec![],
             schema: CREATURE_OWNER_SCHEMA,
             state,
@@ -3586,15 +3587,15 @@ mod creature_source_owner_tests {
         };
         let txid = TransactionId::new(1).unwrap();
         let inline = TopologyOp::CreatureLifecycle {
-            commit: Box::new(CreatureLifecycleCommitV2 {
+            commit: Box::new(CreatureLifecycleCommitV3 {
                 schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
-                change: CreatureLifecycleChangeV2 {
+                change: CreatureLifecycleChangeV3 {
                     schema: CREATURE_CHANGE_SCHEMA,
                     transaction_id: txid,
                     operation_ordinal: 0,
                     expected_before_hash: Hash32::ZERO,
                     expected_after_hash: Hash32::ZERO,
-                    operation: CreatureLifecycleOperationV2::Birth {
+                    operation: CreatureLifecycleOperationV3::Birth {
                         after: empty_record,
                     },
                 },

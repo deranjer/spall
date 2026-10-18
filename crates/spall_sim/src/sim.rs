@@ -229,10 +229,10 @@ fn portable_birth_record(
         &spall_voxel::Volume,
         &crate::world::CreatureSourceMetadata,
     )],
-) -> Result<spall_protocol::CreatureOwnershipRecordV2, crate::creatures::CreatureScheduleError> {
+) -> Result<spall_protocol::CreatureOwnershipRecordV3, crate::creatures::CreatureScheduleError> {
     use spall_protocol::{
         BaselineCells, BaselineOwner, CREATURE_OWNER_SCHEMA, CreatureMaskCellV1,
-        CreatureOwnedComponentV1, CreatureOwnershipRecordV2, CreatureSourceMaskBrickV1,
+        CreatureOwnedComponentV1, CreatureOwnershipRecordV3, CreatureSourceMaskBrickV1,
         CreatureSourcePartV1, Hash32, baseline::BaselineBrick,
     };
 
@@ -327,7 +327,8 @@ fn portable_birth_record(
             mask.coord[0],
         )
     });
-    Ok(CreatureOwnershipRecordV2 {
+    Ok(CreatureOwnershipRecordV3 {
+        primary_component_serial: None,
         part_velocities: portable_parts
             .iter()
             .map(|part| spall_protocol::CreaturePartVelocityV2 {
@@ -932,7 +933,7 @@ mod creature_host_tests {
                 physical.angular_velocity_rad_s
             );
         }
-        let spall_protocol::CreatureLifecycleOperationV2::Death { after } =
+        let spall_protocol::CreatureLifecycleOperationV3::Death { after } =
             &commit.change.operation
         else {
             panic!("wrong lifecycle");
@@ -2185,8 +2186,8 @@ impl Simulation {
         use spall_physics::{ArticulatedBatchOperation, OccupancyGrid, SourcePart};
         use spall_protocol::{
             CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_COMMIT_SCHEMA, CreatureClipMode,
-            CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleChangeV2,
-            CreatureLifecycleCommitV2, CreatureLifecycleContextV1, CreatureLifecycleOperationV2,
+            CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleChangeV3,
+            CreatureLifecycleCommitV3, CreatureLifecycleContextV1, CreatureLifecycleOperationV3,
             CreatureLifecycleState, CreatureMotionOverlayV2, CreaturePartMotionV1,
             CreatureReductionOutcome, Record, TopologyOp, TopologyTransaction,
         };
@@ -2386,7 +2387,7 @@ impl Simulation {
             Birth {
                 tag: u64,
                 state: spall_protocol::CreatureStateV1,
-                after: spall_protocol::CreatureOwnershipRecordV2,
+                after: spall_protocol::CreatureOwnershipRecordV3,
                 allocator_before: CreatureAllocatorSnapshotV1,
                 next_volume_id: u64,
                 next_volume_after: u64,
@@ -2399,7 +2400,7 @@ impl Simulation {
             Death {
                 tag: u64,
                 key: spall_core::CreatureKey,
-                before: spall_protocol::CreatureOwnershipRecordV2,
+                before: spall_protocol::CreatureOwnershipRecordV3,
                 pre_motion: CreatureMotionOverlayV2,
                 frozen_poses: Vec<(u32, spall_physics::PartTransform)>,
                 witness_root_translation_m: [f64; 3],
@@ -2823,18 +2824,18 @@ impl Simulation {
                         next_volume_after,
                         parts,
                     } => {
-                        let change = CreatureLifecycleChangeV2 {
+                        let change = CreatureLifecycleChangeV3 {
                             schema: CREATURE_CHANGE_SCHEMA,
                             transaction_id,
                             operation_ordinal: ordinal,
                             expected_before_hash: spall_protocol::Hash32::ZERO,
                             expected_after_hash: after.canonical_hash(),
-                            operation: CreatureLifecycleOperationV2::Birth {
+                            operation: CreatureLifecycleOperationV3::Birth {
                                 after: after.clone(),
                             },
                         };
                         (
-                            CreatureLifecycleCommitV2 {
+                            CreatureLifecycleCommitV3 {
                                 schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
                                 change,
                                 expected_before_topology_hash: spall_protocol::Hash32::ZERO,
@@ -2914,15 +2915,15 @@ impl Simulation {
                                 witness.installed_angular_velocity_rad_s;
                         }
                         let after_hash = after.canonical_hash();
-                        let change = CreatureLifecycleChangeV2 {
+                        let change = CreatureLifecycleChangeV3 {
                             schema: CREATURE_CHANGE_SCHEMA,
                             transaction_id,
                             operation_ordinal: ordinal,
                             expected_before_hash: before.canonical_hash(),
                             expected_after_hash: after_hash,
-                            operation: CreatureLifecycleOperationV2::Death { after },
+                            operation: CreatureLifecycleOperationV3::Death { after },
                         };
-                        let commit = CreatureLifecycleCommitV2 {
+                        let commit = CreatureLifecycleCommitV3 {
                             schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
                             change,
                             expected_before_topology_hash: before.topology_hash(),
@@ -2951,8 +2952,8 @@ impl Simulation {
                 );
             }
             let current = match &commit.change.operation {
-                CreatureLifecycleOperationV2::Birth { .. } => None,
-                CreatureLifecycleOperationV2::Death { .. } => owner_after.as_ref(),
+                CreatureLifecycleOperationV3::Birth { .. } => None,
+                CreatureLifecycleOperationV3::Death { .. } => owner_after.as_ref(),
             };
             let allocator = birth_allocator.unwrap_or_else(|| candidate_host.allocator_snapshot());
             let (next_volume_id, next_volume_after) = birth_volume_counters.unwrap_or((

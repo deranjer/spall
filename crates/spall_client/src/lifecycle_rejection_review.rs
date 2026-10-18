@@ -87,7 +87,8 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
         }],
     };
     part.source_content_hash = part.canonical_source_content_hash();
-    let after = CreatureOwnershipRecordV2 {
+    let after = CreatureOwnershipRecordV3 {
+        primary_component_serial: None,
         part_velocities: vec![CreaturePartVelocityV2 {
             part_id: 1,
             linear_velocity_m_s: [0.0; 3],
@@ -130,13 +131,13 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
         })
         .unwrap();
     let transaction_id = spall_core::TransactionId::new(77).unwrap();
-    let change = CreatureLifecycleChangeV2 {
+    let change = CreatureLifecycleChangeV3 {
         schema: CREATURE_CHANGE_SCHEMA,
         transaction_id,
         operation_ordinal: 1,
         expected_before_hash: Hash32::ZERO,
         expected_after_hash: after.canonical_hash(),
-        operation: CreatureLifecycleOperationV2::Birth { after },
+        operation: CreatureLifecycleOperationV3::Birth { after },
     };
     let mut transaction = TopologyTransaction {
         transaction_id,
@@ -155,7 +156,7 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
                 material: MaterialId::AIR,
             },
             TopologyOp::CreatureLifecycle {
-                commit: Box::new(CreatureLifecycleCommitV2 {
+                commit: Box::new(CreatureLifecycleCommitV3 {
                     schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
                     change,
                     expected_before_topology_hash: Hash32::ZERO,

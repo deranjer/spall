@@ -197,3 +197,49 @@ coverage refusal, overlay replay without motion datagrams, checked death clearin
 the Alive list, tamper/replay rejection, bounded prefix refusal and old-format
 rejection. Complete Simulation source/allocator capture, baseline/checkpoint and
 ordered typed consumers remain subsequent ENG-218 work; spawning remains closed.
+## Complete capture and primary identity plan (2026-10-18)
+
+Whole-owner runtime corpse capture deliberately preserves the actual primary body
+first. Portable ownership V2 instead sorts component records by stable serial and
+has no explicit primary ID. A complete portable export cannot infer this identity
+from floating-point root frames (coincident components can be ambiguous). Resolve
+this missing contract by adding primary_component_serial on the existing owner:
+None selects the sole intact component; a nonzero derived serial must name exactly
+one component. Root pose/twist must match that explicitly selected component.
+Include the identity link in topology/full hashes; ordinary motion does not change
+it. Keep component arrays canonically sorted, and put the selected component first
+only while translating to the existing runtime restore DTO. No parallel primary
+sidecar or second owner record is introduced.
+
+The changed owner/set/change/operation/commit/bulk chain becomes V3/current
+schema 3 with changed canonical domains and wire 11/lifecycle kind 8; unchanged
+motion overlay V2, part velocity V2 and source/component/pose V1 DTOs keep their layouts. Superseded
+schemas reject without migration. Geometry baseline/store stay 1/3 until actual
+complete actor sections are integrated into those formats.
+
+Add a new bounded portable CreatureSnapshotV1 envelope containing its own schema,
+the existing allocator snapshot, the actual shared next-volume-ID counter, and
+the one current ownership set. It retains
+world identity/epoch and next creature ID even when no records remain. Validate
+allocator shape and exact record world/epoch plus IDs below high-water; never use
+an independent actor allocator or persist runtime handles/stamps. Source volume
+uniqueness remains the ownership-set contract; consumers must also validate the
+shared geometry volume namespace/counter at installation.
+
+Simulation capture runs read-only on the owning thread at a committed boundary.
+Before cloning/expanding grids, preflight the complete bounded population, source
+resident/dense/solid/mask work, physics reconstruction grids and owned memory.
+Verify host/source/metadata/physics maps agree exactly, preserve original sparse
+bricks with revisions/edited flags/bounds and authored hierarchy, and capture
+current applied/frozen local poses. Alive uses actual pending-safe part motion;
+Corpse uses complete runtime component masks/motion, serial high-water and primary
+identity. Preserve source generation and portable topology/pose tokens; stale or
+unsynchronized source/fracture state refuses, rather than inventing an update.
+The snapshot includes no runtime IDs and no fake body/volume ownership.
+
+Acceptance includes initialized empty allocator capture, animated Alive capture
+and codec roundtrip, complete multi-component corpse export with nonlowest primary
+and empty source bindings, exact sparse metadata retention, malformed/stale/pending
+or resource-limit refusal without mutation, and explicit allocator/identity/hash
+checks. This prerequisite does not open geometry-only checkpoints, actor baselines,
+typed runtime replay, bulk publication or spawning; those consumers remain next.

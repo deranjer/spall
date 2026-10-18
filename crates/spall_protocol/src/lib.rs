@@ -27,6 +27,7 @@ pub mod column_water;
 pub mod column_water_wire;
 pub mod creature;
 pub mod creature_owner;
+pub mod creature_snapshot;
 pub mod handshake;
 pub mod input;
 pub mod lifecycle_bulk;
@@ -38,6 +39,9 @@ pub mod snow;
 pub mod transaction_attachments;
 pub mod water;
 pub mod weather;
+pub use creature_snapshot::{
+    CREATURE_SNAPSHOT_SCHEMA, CreatureSnapshotV1, MAX_CREATURE_SNAPSHOT_BYTES,
+};
 pub use weather::{
     WEATHER_PROFILE_MS, WEATHER_SCHEMA, WEATHER_TRANSITION_MS, WeatherClock, WeatherClockSource,
     WeatherError, WeatherKind, WeatherSnapshot, WeatherState,
@@ -76,10 +80,10 @@ pub use creature_owner::{
     CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_MOTION_DOMAIN, CREATURE_OWNER_DOMAIN,
     CREATURE_OWNER_SCHEMA, CREATURE_OWNER_SET_DOMAIN, CREATURE_TOPOLOGY_DOMAIN,
     CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleCandidateV1,
-    CreatureLifecycleChangeV2, CreatureLifecycleCommitReplayReceiptV1, CreatureLifecycleCommitV2,
-    CreatureLifecycleContextV1, CreatureLifecycleOperationV2, CreatureLocalPoseV1,
+    CreatureLifecycleChangeV3, CreatureLifecycleCommitReplayReceiptV1, CreatureLifecycleCommitV3,
+    CreatureLifecycleContextV1, CreatureLifecycleOperationV3, CreatureLocalPoseV1,
     CreatureMaskCellV1, CreatureMotionOverlayV2, CreatureOwnedComponentV1, CreatureOwnershipError,
-    CreatureOwnershipRecordV2, CreatureOwnershipSetV2, CreaturePartMotionV1,
+    CreatureOwnershipRecordV3, CreatureOwnershipSetV3, CreaturePartMotionV1,
     CreaturePartVelocityV2, CreatureReductionOutcome, CreatureSourceMaskBrickV1,
     CreatureSourcePartV1, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
     MAX_CREATURE_OWNER_DENSE_CELLS, MAX_CREATURE_OWNER_MASK_BRICKS, MAX_CREATURE_OWNER_MASK_CELLS,
@@ -92,7 +96,7 @@ pub use handshake::{
 };
 pub use lifecycle_bulk::{
     CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA, CreatureLifecycleBulkError,
-    CreatureLifecycleBulkPayloadV2, MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
+    CreatureLifecycleBulkPayloadV3, MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
 };
 pub use limits::SizeLimitError;
 pub use records::{

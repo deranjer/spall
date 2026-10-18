@@ -1756,3 +1756,20 @@ seven-package Clippy before acceptance. Store crash tests need permission for
 child marker rename and local server tests need loopback access; report denied
 initial attempts separately from completed runs. Combined 1024 m weather/animals,
 GPU/population and multiplayer animal restart/destruction are separate gates.
+
+
+Ownership V3 / snapshot prerequisite checks (2026-10-18) run with
+`cargo test -p spall_protocol --test creature_owner_review`. A fractured corpse
+with serials 7/41 and retired high-water 100 must retain primary 41 through the
+codec despite canonical sorting. Missing/zero/foreign/out-of-range primary IDs and
+root pose/twist disagreement refuse; coincident frames cannot substitute for
+identity. Empty bounded/unbounded source parts preserve their hierarchy/hash,
+while an all-empty animal refuses. Old owner schemas 1/2, missing primary fields
+and prior wire 10 reject without migration.
+
+Snapshot tests require empty allocator epoch/high-water roundtrip, independent
+hash binding of creature/volume counters, exact world/epoch/counter admission,
+strict allocator maps, trailing refusal and population count refusal before
+record bodies when the decoder exposes a sequence hint. The same seeded reader
+retains its no-hint incremental admission. Complete Simulation capture/restore and
+integrated animal checkpoint/baseline/replay are not established by these DTO tests.

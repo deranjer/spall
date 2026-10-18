@@ -6,8 +6,8 @@ use spall_physics::{PartTransform, Representation};
 use spall_protocol::creature_owner::CreatureDeathWitnessV1;
 use spall_protocol::{
     BaselineCells, BaselineOwner, CREATURE_CHANGE_SCHEMA, CREATURE_OWNER_SCHEMA,
-    CreatureLifecycleChangeV2, CreatureLifecycleContextV1, CreatureLifecycleOperationV2,
-    CreatureLocalPoseV1, CreatureMaskCellV1, CreatureOwnedComponentV1, CreatureOwnershipRecordV2,
+    CreatureLifecycleChangeV3, CreatureLifecycleContextV1, CreatureLifecycleOperationV3,
+    CreatureLocalPoseV1, CreatureMaskCellV1, CreatureOwnedComponentV1, CreatureOwnershipRecordV3,
     CreaturePartBinding, CreatureReductionOutcome, CreatureSourceMaskBrickV1, CreatureSourcePartV1,
     Hash32, baseline::BaselineBrick, reduce_creature_lifecycle_candidate,
 };
@@ -25,7 +25,7 @@ fn pose(value: PartTransform) -> CreatureLocalPoseV1 {
 fn record_from_sim(
     sim: &Simulation,
     state: spall_protocol::CreatureStateV1,
-) -> CreatureOwnershipRecordV2 {
+) -> CreatureOwnershipRecordV3 {
     let local_poses = if state.lifecycle == spall_protocol::CreatureLifecycleState::Corpse {
         sim.world.creature_frozen_poses(state.key).unwrap().to_vec()
     } else {
@@ -160,7 +160,8 @@ fn record_from_sim(
     } else {
         Vec::new()
     };
-    CreatureOwnershipRecordV2 {
+    CreatureOwnershipRecordV3 {
+        primary_component_serial: None,
         part_velocities,
         schema: CREATURE_OWNER_SCHEMA,
         state,
@@ -285,13 +286,13 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     let before = record_from_sim(&sim, alive);
     before.validate(&catalog).unwrap();
     let transaction_id = TransactionId::new(1).unwrap();
-    let birth = CreatureLifecycleChangeV2 {
+    let birth = CreatureLifecycleChangeV3 {
         schema: CREATURE_CHANGE_SCHEMA,
         transaction_id,
         operation_ordinal: 0,
         expected_before_hash: Hash32::ZERO,
         expected_after_hash: before.canonical_hash(),
-        operation: CreatureLifecycleOperationV2::Birth {
+        operation: CreatureLifecycleOperationV3::Birth {
             after: before.clone(),
         },
     };
@@ -369,7 +370,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     );
     let bytes = before.encode(&catalog).unwrap();
     assert_eq!(
-        CreatureOwnershipRecordV2::decode(&bytes, &catalog).unwrap(),
+        CreatureOwnershipRecordV3::decode(&bytes, &catalog).unwrap(),
         before
     );
     let transfer = sim
@@ -418,13 +419,13 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
         after.state.angular_velocity_rad_s,
         witness.installed_angular_velocity_rad_s
     );
-    let death = CreatureLifecycleChangeV2 {
+    let death = CreatureLifecycleChangeV3 {
         schema: CREATURE_CHANGE_SCHEMA,
         transaction_id,
         operation_ordinal: 1,
         expected_before_hash: before.canonical_hash(),
         expected_after_hash: after.canonical_hash(),
-        operation: CreatureLifecycleOperationV2::Death {
+        operation: CreatureLifecycleOperationV3::Death {
             after: after.clone(),
         },
     };
@@ -594,7 +595,7 @@ fn source_material_must_belong_to_selected_asset_keys() {
 
 #[test]
 fn record_work_preflight_rejects_duplicate_masks_and_large_owned_sets() {
-    use spall_protocol::CreatureOwnershipSetV2;
+    use spall_protocol::CreatureOwnershipSetV3;
     use spall_protocol::creature_owner::MAX_CREATURE_OWNER_SET_SOLID_CELLS;
     let mut sim =
         Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
@@ -660,7 +661,7 @@ fn record_work_preflight_rejects_duplicate_masks_and_large_owned_sets() {
             cells: BaselineCells::Dense(vec![1; 32 * 32 * 32]),
         })
         .collect();
-    let set = CreatureOwnershipSetV2 {
+    let set = CreatureOwnershipSetV3 {
         schema: CREATURE_OWNER_SCHEMA,
         records: vec![oversized],
     };

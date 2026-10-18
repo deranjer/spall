@@ -34,7 +34,7 @@ pub const BASELINE_REGIONAL_WORLD_VERSION: u32 = 4;
 /// and bodies, with no digests, so a client is ready as soon as it arrives.
 pub const BASELINE_DEFERRED_REGIONAL_WORLD_VERSION: u32 = 5;
 /// Typed creature lifecycle transfer payload; intentionally not a BaselineWorld.
-pub const BASELINE_CREATURE_LIFECYCLE_WORLD_VERSION: u32 = 7;
+pub const BASELINE_CREATURE_LIFECYCLE_WORLD_VERSION: u32 = 8;
 /// Chebyshev brick radius of the geometry a deferred baseline carries around the spawn. The
 /// client's wider interest region is filled by ordinary reloads once the catalogue names those
 /// bricks, so readiness depends on a small neighbourhood instead of the whole region.

@@ -944,3 +944,96 @@ trout/crow/deer asset cost or population throughput. Measurement log:
 `.local/eng218-motion-{workspace,clippy,format}.log`. Unrelated `artifacts/` remains
 untouched. Workers exhausted their available service allowance during design;
 the coordinator completed implementation, review and validation locally.
+
+## Primary identity V3 and bounded snapshot envelope (2026-10-18)
+
+Complete-capture review exposed a missing serialized invariant: after actual
+fracture, the current primary can have a higher serial than an older surviving
+component. Physics captures primary first, whereas portable records sort by
+serial. Ownership V3 now explicitly retains `primary_component_serial`, bound
+by full/topology hashes. Root pose, rotation and both twists must match that
+component. None selects the sole intact component; derived identity must name a
+nonzero existing serial below the unchanged serial high-water. Empty source parts
+now preserve their source ID, authored hierarchy, bounds and sparse content hash
+without fabricated cells; the aggregate still requires complete nonempty masks.
+
+Changed owner/set/change/operation/commit/bulk types are V3, schemas/domains 3,
+wire/handshake 11 and lifecycle bulk kind 8. Unchanged motion overlay V2, part
+velocity V2 and source/component/pose V1 retain their layouts. There are no V2
+owner aliases or migration. Geometry baseline 1 and store 3 retain their current
+layouts; prior embedded wire 10 journals reject. This supersedes the previous
+milestone's current-version numbers without claiming a complete checkpoint.
+
+New `CreatureSnapshotV1` is a bounded portable envelope containing the existing
+allocator snapshot, actual shared next-volume-ID counter and one current owner
+set. Empty populations retain allocator world/epoch/high-water and retired gaps.
+Full hash binds allocator and shared counter as well as ownership. Safe decoding
+caps the input at 64 MiB + 128 bytes, reuses the cumulative ownership reader,
+requires strict envelope/allocator maps, checks owner world/epoch and both ID
+high-waters, validates catalog/partition semantics and refuses trailing bytes.
+It introduces no extra allocator or stream. A future installer must also match the
+geometry counter and enforce the shared geometry/source namespace atomically.
+This pass implements the portable prerequisite, not canonical Simulation capture
+or runtime installation. Those remain next; initialized-host geometry-only
+checkpoint refusal and closed spawning are unchanged.
+
+Meaningful regressions include derived serials 7/41 with actual primary 41 and
+retired high-water 100, absent/invalid primary identities, each root motion field,
+coincident component frames, empty bounded/unbounded source bindings and all-empty
+aggregate refusal; snapshot empty/high-water/epoch/hash roundtrips, wrong world and
+counter rejection, strict allocator metadata, trailing refusal and declared
+population admission before invalid record bodies when a sequence hint exists.
+Missing primary fields and superseded owner schemas refuse without migration.
+
+Coordinator validation:
+- `cargo test -p spall_protocol --test creature_owner_review`: final 28 passed.
+- `cargo test -p spall_protocol -p spall_sim --lib --tests`: passed before the final
+  additional schema/snapshot guard probes; the final integrated run below covers
+  all those changes.
+- `cargo test -p spall_protocol -p spall_sim -p spall_store -p spall_server`:
+  permitted integrated run 644 passed, 0 failed, 12 existing ignored across 68
+  result targets, including actual local multiplayer and abrupt-crash recovery.
+- `cargo check --workspace --all-targets --all-features`: passed.
+
+Initial new snapshot guard assertions failed twice because they assumed postcard
+would preserve custom error text, then assumed it exposes a sequence size hint.
+The final guard test uses an actual hint-exposing value decoder with invalid null
+record bodies and requires the count-limit diagnostic before their decoding.
+Postcard still uses the existing bounded incremental set reader; no implementation
+limit or workload was weakened. Failed attempts remain in
+`.local/eng218-primary-owner-tests{,-retry}.log`; corrected evidence is
+`.local/eng218-primary-owner-tests-final.log`. Full integrated evidence:
+`.local/eng218-primary-integrated-tests.log`. Existing incremental-cache hard-link
+warnings remain environmental.
+
+Changed files: protocol `src/{creature_snapshot,creature_owner,
+creature_owner_decode,codec,handshake,lib,lifecycle_bulk,records,segment,
+transaction_attachments}.rs`; protocol owner/commit/attachment review fixtures;
+simulation `src/{sim,world,creature_owner_bridge}.rs`; client
+`src/lifecycle_rejection_review.rs`; store `src/dto.rs`; current protocol,
+validation, design/progress and ASCII-appended task notes. No game catalog,
+renderer, solver, habitat or production spawn changes. Unrelated `artifacts/`
+remains untouched.
+
+Next unblocked task remains ENG-218: canonical read-only Simulation capture with
+complete host/source/metadata/physics bijection, bounded population preflight and
+actual applied Alive motion / whole-corpse masks. Stale source/fracture state must
+refuse. Then implement jointly prepared host/source/physics/registry restoration,
+current actor checkpoint/baseline sections and typed ordered journal/replica
+consumers, bulk scheduling and source-edit/fracture/terminal synchronization.
+Combined 1024 m weather/animals, shipped population/GPU and multiplayer animal
+restart/destruction remain unrun and unaccepted.
+
+Final checks also passed:
+- `cargo test -p spall_client --lib lifecycle_rejection_review`: 2 passed.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed after correcting two
+  formatting-only differences in the final test additions; initial format output
+  remains `.local/eng218-primary-format.log`, final output is
+  `.local/eng218-primary-format-final.log`.
+- `cargo test -p spall_protocol --test creature_commit_review -- --nocapture`:
+  12 passed; current V3 fixture 99,145 control-body bytes versus 65,536 cap,
+  99,170 raw bulk-envelope bytes / 410 compressed. These are fixture measurements,
+  not shipped species/population throughput. Logs use
+  `.local/eng218-primary-{client-tests,clippy,measurements}.log`.
+All Cargo commands used the established target-pinned wrapper and ran serially.

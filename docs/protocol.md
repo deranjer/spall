@@ -693,21 +693,21 @@ submit imprint positions. See weather.md for rates, caps and exposure rules.
 
 Canonical checkpoints retain exact fractional snow depth and climate cursors;
 geometry journal entries preserve exact cohort changes. Footprints clear on
-restart. Live and saved topology/motion records now require protocol/wire 10. Saved
+restart. Live and saved topology/motion records now require protocol/wire 11. Saved
 wire headers 5, 6, 7, 8 and 9 are rejected without migration or header rewriting.
 
 ### ENG-218 - Ordered creature lifecycle boundary
 
-Protocol/wire 10 carries a typed inline `TopologyOp::CreatureLifecycle`
-with the current `CreatureLifecycleCommitV2` and ownership/change schemas 2. The
+Protocol/wire 11 carries a typed inline `TopologyOp::CreatureLifecycle`
+with the current `CreatureLifecycleCommitV3` and ownership/change schemas 3. The
 operation must use its enclosing transaction ID and exact operation ordinal.
 Multiple operations use the existing transaction count limit. The codec checks
 the 64 KiB control limit before allocating an encoded frame. Catalog, source and
 transition validation still belong to the owning candidate consumer.
 
-Current protocol/wire 10 includes `TopologyOp::CreatureLifecycleBulk`, binding its
+Current protocol/wire 11 includes `TopologyOp::CreatureLifecycleBulk`, binding its
 exact operation ordinal, payload schema, outer commit hash and shared transfer ID.
-`CreatureLifecycleBulkPayloadV2` uses payload schema 2 and world-version tag 7 and bounded postcard/zstd
+`CreatureLifecycleBulkPayloadV3` uses payload schema 3 and world-version tag 8 and bounded postcard/zstd
 framing. The decoder checks the marker correlation prefix before nested owner
 decoding and hashing. Raw commit, cumulative source/ownership work and compressed
 assembly limits are enforced. Geometry split children and their source patch may
@@ -760,7 +760,7 @@ geometry-only checkpoint that silently omits that state. Complete live-animal
 recovery also requires independent applied part-body twists: root motion and
 frozen part poses alone cannot reproduce an animated limb's immediate checked
 death transfer. The physics reconstruction prerequisite carries those measured
-values explicitly, and the V2 owner/motion records now retain them. Complete
+values explicitly, and the current owner/motion records now retain them. Complete
 Simulation checkpoint and baseline integration remains required before enabling
 animal checkpointing.
 
@@ -777,17 +777,18 @@ volumes/material catalogs, authored transforms and allocator state still require
 Simulation capture and explicitly versioned complete checkpoint/baseline schemas.
 Ownership-set decoding reuses the existing seeded record reader with per-record
 limits and shared population limits; a fresh per-record Deserialize cannot reset
-aggregate admission. It reads the current V2 ownership layout. The safe
-`CreatureOwnershipSetV2::decode(bytes, catalog)` entry point caps the input frame,
+aggregate admission. It reads the current V3 ownership layout. The safe
+`CreatureOwnershipSetV3::decode(bytes, catalog)` entry point caps the input frame,
 rejects trailing bytes, and performs bounded parsing followed by catalog/semantic
 validation. Generic Deserialize admits resources only. Unknown ownership map fields
 (including nested fixed metadata) reject before their values; missing optional
 None metadata retains its existing map behavior. State-name byte limits apply
-before creating owned postcard strings. No new writer API, snapshot envelope,
-allocator format, checkpoint schema or production consumer is introduced here.
+before creating owned postcard strings. The population reader does not install a checkpoint or introduce a production
+consumer; its resource budgets also apply inside the snapshot envelope below.
 
-Current animated ownership uses V2 owner/set/change/overlay/commit and bulk payload
-types, without V1 aliases or migration. Every Alive owner carries a strictly
+Current animated ownership uses V3 owner/set/change/commit and bulk payload
+types, retaining unchanged motion overlay V2 and part velocity V2 DTOs. Superseded
+ownership layouts reject without aliases or migration. Every Alive owner carries a strictly
 ordered `part_velocities` entry for each original source part, with finite bounded
 installed linear/angular velocities. Corpse lists are empty; its independently
 moving component frames remain authoritative. Source-content and topology-only
@@ -802,7 +803,35 @@ installation. The unchanged checked death witness attests the resulting installe
 root transfer; the overlay and complete before hash bind its input motion.
 Replica/recovery do not rerun that physical calculation or keep another ledger.
 Nested velocity vectors are charged against local/population/attachment work and
-owned capacity before allocation or hashing. Wire 9, owner/change/commit/bulk
-schema 1, and the retired lifecycle kind 6 have no compatibility path. Geometry
+owned capacity before allocation or hashing. Wire 10 and earlier, owner/change/commit/bulk
+schemas 1/2, and retired lifecycle kinds 6/7 have no compatibility path. Geometry
 baseline 1 and store 3 layouts are unchanged; embedded old wire journals reject.
 Complete actor checkpoints, baselines and typed runtime consumers remain gated.
+
+
+Complete capture prerequisite (2026-10-18): ownership V3 records explicitly retain
+`primary_component_serial`. None names the sole intact component; derived corpses
+name an existing nonzero serial below their retained serial high-water. Arrays
+remain sorted by serial; root pose and both twists must match the named primary,
+which need not be the first component. Full and topology hashes bind that identity.
+Empty source parts retain their source identity, hierarchy, bounds and content
+hash with zero resident bricks; every complete animal still needs nonempty exact
+component masks covering all original solid cells.
+
+`CreatureSnapshotV1` schema 1 contains the existing creature allocator snapshot,
+the actual shared `next_volume_id`, and one bounded `CreatureOwnershipSetV3`.
+Even an empty set retains world identity, epoch, next creature ID and retired ID
+gaps. Its full hash binds all those values. Validation requires owner world/epoch
+agreement, creature IDs below the allocator high-water and source volume IDs below
+the shared volume counter. The decoder caps the frame at 64 MiB + 128 bytes, uses
+the existing cumulative ownership reader and strict envelope/allocator maps, then
+validates catalog/identity and refuses trailing data. Raw Deserialize enforces
+resource admission only. Installation must validate source uniqueness against
+geometry and match the accompanying checkpoint's shared counter; this envelope
+never replaces that counter or allocates another ID stream.
+
+This portable envelope does not yet capture the Simulation, install actors, or
+change baseline 1/store 3 layouts. Complete canonical capture, joint prepared
+host/source/physics restore, current actor checkpoint/baseline sections and ordered
+runtime replay are still required. Geometry-only checkpoint refusal and closed
+production spawning remain in force.

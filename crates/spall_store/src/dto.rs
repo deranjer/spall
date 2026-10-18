@@ -425,7 +425,7 @@ mod tests {
         };
         let current_tx = encode_control(&a_tx()).unwrap();
         let current_motion = encode_control(&motion).unwrap();
-        for version in [2u16, 5, 6, 7, 8, 9, 11] {
+        for version in [2u16, 5, 6, 7, 8, 9, 10, 12] {
             let mut tx = current_tx.clone();
             let mut pose = current_motion.clone();
             tx[..2].copy_from_slice(&version.to_le_bytes());
