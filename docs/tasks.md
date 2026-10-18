@@ -2193,3 +2193,18 @@ evidence, canonical Simulation source/owner+allocator snapshot, atomic complete
 checkpoint/baseline and typed ordered journal/replica. Combined1024m animal/weather,
 population/GPU/multiplayer recovery gates and spawning remain closed. Exact checks,
 failed initial map test and limits in reports/ENG-218-progress.md.
+ENG-218 2026-10-18 animated ownership V2: changed owner/set/change/overlay/commit/
+bulk types now retain exact keyed measured Alive part velocities, empty for Corpse.
+Full/motion hashes bind them; topology/source hashes exclude them. Current-only
+schemas2, wire10 and lifecyclekind7 replace changed V1/wire9/kind6 without migration;
+geometrybaseline1/store3 remain unchanged opaque-container layouts. Actual checked
+three-part animated capture/codec bridge passes; ordered one-part producer retains
+actual sampled motion; two-part inline birth refuses atomically at existing64KiB
+until typedbulk producer exists. Final protocol/sim/store/server640pass0fail12ignored
+68targets; clientrefusal2pass; workspace alltargets/allfeatures, seven-package strict
+lint, format/diff pass. Initial crash marker rename denied; same permitted workload
+passes; child diagnostics now retained. See ENG-218-progress for exact attempts.
+Next ENG-218: complete canonical Simulation source/owner+allocator capture and
+atomic actor checkpoint/baseline, typed ordered journal/replica/attachment consumers,
+then bulk scheduling and sourceedit/fracture sync. Spawn/combined1024m animalweather,
+GPU/population/multiplayer animalrestart/destruction remain gated.

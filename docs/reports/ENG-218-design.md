@@ -158,3 +158,42 @@ candidates, total geometry plus actor body-slot capacity, inline hashes and one
 journal reservation. Reserved typed bulk attachments and the live tick caller
 remain required. This internal inline producer does not implement a complete
 replica, baseline or durable actor checkpoint.
+
+## Current-only animated ownership V2 plan (2026-10-18)
+
+Implement a separate keyed CreaturePartVelocityV2 list on ownership records and
+pre-motion overlays. Alive requires exact sorted source-part coverage (including
+empty bindings), finite bounded measured linear/angular velocities; Corpse requires
+an empty list and continues using independently moving component twists. Existing
+source descriptors and frozen-pose entries retain their layout. Full/motion and
+outer commit hashes bind the new list; topology/source-content hashes omit it.
+The actual death producer samples pending-safe installed physics part motion on
+the owner thread, with no intervening mutations, and existing prepared-owner
+freshness validation fences the checked transfer. Birth zeros are valid only for
+its existing zero-motion AliveBirth installation. No other reconstruction may
+infer or default independent twists from root motion.
+
+Changed serialized owner/set/lifecycle operation/change/overlay/commit/bulk payload
+types become V2 with no V1 aliases/conversion. Owner/change/commit/bulk schemas and
+changed canonical domains advance to 2. Wire/handshake advances 9 to 10; lifecycle
+bulk kind advances 6 to 7 and superseded values refuse. Geometry baseline 1 and
+store 3 remain because their existing layouts (including opaque encoded journal
+frames) do not change here; old embedded wire frames reject. Complete actor
+checkpoint sections remain absent and guarded. A later actual checkpoint layout
+change must advance store/baseline then.
+
+Keep the existing checked installed-root-motion death witness unchanged. It
+attests the transfer result; the existing complete-before hash and outer commit
+hash bind the authoritative sampled overlay, including part velocities. Replica
+validation does not recompute physics. No duplicate input-motion ledger or witness
+vector is added. Validate this seam with a real animated physics transfer and
+freshness/refusal scenarios before claiming the producer accepted.
+
+Extend per-record, population, and attachment resource accounting for new velocity
+vectors before allocation, scan, clone or hash; retain existing ceilings. Update
+all callers and fixtures together. Required checks include independent nonrigid
+motion roundtrip, full/motion-vs-topology hash distinction, sorted/complete/finite
+coverage refusal, overlay replay without motion datagrams, checked death clearing
+the Alive list, tamper/replay rejection, bounded prefix refusal and old-format
+rejection. Complete Simulation source/allocator capture, baseline/checkpoint and
+ordered typed consumers remain subsequent ENG-218 work; spawning remains closed.

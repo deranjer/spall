@@ -13,14 +13,14 @@ use std::{fmt, marker::PhantomData};
 const MAX_DECODE_BYTES: usize = MAX_CREATURE_OWNER_RECORD_BYTES;
 const MAX_DECODE_WORK: usize = MAX_CREATURE_OWNER_DENSE_CELLS
     + MAX_CREATURE_OWNER_MASK_CELLS
-    + MAX_CREATURE_OWNER_PARTS
+    + 2 * MAX_CREATURE_OWNER_PARTS
     + MAX_CREATURE_OWNER_BRICKS
     + MAX_CREATURE_OWNER_COMPONENTS
     + MAX_CREATURE_OWNER_MASK_BRICKS;
 const MAX_SET_DECODE_WORK: usize = MAX_CREATURE_OWNER_SET_DENSE_CELLS
     + MAX_CREATURE_OWNER_SET_SOLID_CELLS
     + MAX_CREATURE_OWNER_SET_RECORDS
-    + MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS
+    + 2 * MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS
     + MAX_CREATURE_OWNER_BRICKS
     + MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_COMPONENTS
     + MAX_CREATURE_OWNER_MASK_BRICKS
@@ -38,6 +38,7 @@ impl de::Expected for ExpectedStruct {
 #[derive(Clone, Copy)]
 enum Counter {
     Parts,
+    Velocities,
     Bricks,
     DenseCells,
     Components,
@@ -48,6 +49,7 @@ enum Counter {
 #[derive(Default)]
 struct DecodeBudget {
     parts: usize,
+    velocities: usize,
     bricks: usize,
     dense_cells: usize,
     components: usize,
@@ -63,6 +65,7 @@ struct DecodeBudget {
 struct SetBudget {
     records: usize,
     parts: usize,
+    velocities: usize,
     bricks: usize,
     dense_cells: usize,
     components: usize,
@@ -91,6 +94,7 @@ impl DecodeBudget {
 
     fn begin_record<E: de::Error>(&mut self) -> Result<(), E> {
         self.parts = 0;
+        self.velocities = 0;
         self.bricks = 0;
         self.dense_cells = 0;
         self.components = 0;
@@ -132,6 +136,7 @@ impl DecodeBudget {
     fn count(&self, counter: Counter) -> usize {
         match counter {
             Counter::Parts => self.parts,
+            Counter::Velocities => self.velocities,
             Counter::Bricks => self.bricks,
             Counter::DenseCells => self.dense_cells,
             Counter::Components => self.components,
@@ -143,6 +148,7 @@ impl DecodeBudget {
     fn limit(counter: Counter) -> usize {
         match counter {
             Counter::Parts => MAX_CREATURE_OWNER_PARTS,
+            Counter::Velocities => MAX_CREATURE_OWNER_PARTS,
             Counter::Bricks => MAX_CREATURE_OWNER_BRICKS,
             Counter::DenseCells => MAX_CREATURE_OWNER_DENSE_CELLS,
             Counter::Components => MAX_CREATURE_OWNER_COMPONENTS,
@@ -161,6 +167,7 @@ impl DecodeBudget {
     fn add_count(&mut self, counter: Counter, amount: usize) {
         match counter {
             Counter::Parts => self.parts += amount,
+            Counter::Velocities => self.velocities += amount,
             Counter::Bricks => self.bricks += amount,
             Counter::DenseCells => self.dense_cells += amount,
             Counter::Components => self.components += amount,
@@ -265,6 +272,7 @@ impl SetBudget {
     fn count(&self, counter: Counter) -> usize {
         match counter {
             Counter::Parts => self.parts,
+            Counter::Velocities => self.velocities,
             Counter::Bricks => self.bricks,
             Counter::DenseCells => self.dense_cells,
             Counter::Components => self.components,
@@ -276,6 +284,7 @@ impl SetBudget {
     fn limit(counter: Counter) -> usize {
         match counter {
             Counter::Parts => MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS,
+            Counter::Velocities => MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS,
             Counter::Bricks => MAX_CREATURE_OWNER_BRICKS,
             Counter::DenseCells => MAX_CREATURE_OWNER_SET_DENSE_CELLS,
             Counter::Components => MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_COMPONENTS,
@@ -291,6 +300,7 @@ impl SetBudget {
     fn add_count(&mut self, counter: Counter, amount: usize) {
         match counter {
             Counter::Parts => self.parts += amount,
+            Counter::Velocities => self.velocities += amount,
             Counter::Bricks => self.bricks += amount,
             Counter::DenseCells => self.dense_cells += amount,
             Counter::Components => self.components += amount,
@@ -537,14 +547,36 @@ seeded_struct!(
     CreatureOwnershipSetSeed,
     CreatureOwnershipSetVisitor,
     CreatureOwnershipSetField,
-    CreatureOwnershipSetV1,
-    "CreatureOwnershipSetV1",
+    CreatureOwnershipSetV2,
+    "CreatureOwnershipSetV2",
     budget,
     {
         schema => Schema ("schema"): u16 = PlainSeed::new(),
-        records => Records ("records"): Vec<CreatureOwnershipRecordV1> = SetRecordsSeed { budget }
+        records => Records ("records"): Vec<CreatureOwnershipRecordV2> = SetRecordsSeed { budget }
     }
 );
+
+struct VelocitiesSeed<'a> {
+    budget: &'a mut DecodeBudget,
+}
+impl<'de> DeserializeSeed<'de> for VelocitiesSeed<'_> {
+    type Value = Vec<CreaturePartVelocityV2>;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        CountedVecSeed::<CreaturePartVelocityV2> {
+            budget: self.budget,
+            counter: Counter::Velocities,
+            max: MAX_CREATURE_OWNER_PARTS,
+            label: "part velocities",
+            marker: PhantomData,
+        }
+        .deserialize(d)
+    }
+}
+impl<'de> BudgetDecode<'de> for CreaturePartVelocityV2 {
+    fn decode<D: Deserializer<'de>>(d: D, _budget: &mut DecodeBudget) -> Result<Self, D::Error> {
+        Self::deserialize(d)
+    }
+}
 
 struct PartsSeed<'a> {
     budget: &'a mut DecodeBudget,
@@ -638,7 +670,7 @@ impl<'de, 'a> DeserializeSeed<'de> for MaskCellsSeed<'a> {
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for SetRecordsSeed<'a> {
-    type Value = Vec<CreatureOwnershipRecordV1>;
+    type Value = Vec<CreatureOwnershipRecordV2>;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         deserializer.deserialize_seq(SetRecordsVisitor {
@@ -648,14 +680,14 @@ impl<'de, 'a> DeserializeSeed<'de> for SetRecordsSeed<'a> {
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for SetRecordSeed<'a> {
-    type Value = CreatureOwnershipRecordV1;
+    type Value = CreatureOwnershipRecordV2;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         self.budget.add_set_record::<D::Error>()?;
         self.budget.reserve_set_bytes::<D::Error>(self.slot_bytes)?;
         self.budget.begin_record::<D::Error>()?;
         self.budget.add_work::<D::Error>(1)?;
-        <CreatureOwnershipRecordV1 as BudgetDecode>::decode(deserializer, self.budget)
+        <CreatureOwnershipRecordV2 as BudgetDecode>::decode(deserializer, self.budget)
     }
 }
 
@@ -664,7 +696,7 @@ struct SetRecordsVisitor<'a> {
 }
 
 impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
-    type Value = Vec<CreatureOwnershipRecordV1>;
+    type Value = Vec<CreatureOwnershipRecordV2>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a bounded sequence of creature ownership records")
@@ -685,7 +717,7 @@ impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
             && declared != 0
         {
             let bytes = declared
-                .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV1>())
+                .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV2>())
                 .ok_or_else(|| {
                     A::Error::custom("creature ownership set decoded-byte budget exceeded")
                 })?;
@@ -706,7 +738,7 @@ impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
             }
             let needs_slot = records.len() == records.capacity();
             let slot_bytes = if needs_slot {
-                std::mem::size_of::<CreatureOwnershipRecordV1>()
+                std::mem::size_of::<CreatureOwnershipRecordV2>()
             } else {
                 0
             };
@@ -724,7 +756,7 @@ impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
                         };
                         let extra_items = additional.saturating_sub(1);
                         let extra_bytes = extra_items
-                            .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV1>())
+                            .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV2>())
                             .ok_or_else(|| {
                                 A::Error::custom(
                                     "creature ownership set decoded-byte budget exceeded",
@@ -745,13 +777,14 @@ impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
 }
 
 seeded_struct!(
-    RecordSeed, RecordVisitor, RecordField, CreatureOwnershipRecordV1, "CreatureOwnershipRecordV1", budget,
+    RecordSeed, RecordVisitor, RecordField, CreatureOwnershipRecordV2, "CreatureOwnershipRecordV2", budget,
     {
         schema => Schema ("schema"): u16 = PlainSeed::<u16>::new(),
         state => State ("state"): CreatureStateV1 = PlainSeed::<CreatureStateV1>::new(),
         owner_key => OwnerKey ("owner_key"): u128 = PlainSeed::<u128>::new(),
         source_generation => SourceGeneration ("source_generation"): u64 = PlainSeed::<u64>::new(),
         next_component_serial => NextComponentSerial ("next_component_serial"): u64 = PlainSeed::<u64>::new(),
+        part_velocities => Velocities ("part_velocities"): Vec<CreaturePartVelocityV2> = VelocitiesSeed { budget: &mut *budget },
         parts => Parts ("parts"): Vec<CreatureSourcePartV1> = PartsSeed { budget: &mut *budget },
         components => Components ("components"): Vec<CreatureOwnedComponentV1> = ComponentsSeed { budget: &mut *budget },
     }
@@ -984,24 +1017,24 @@ impl<'de> Visitor<'de> for DigestVisitor {
 /// budgets across every nested sequence.
 pub(super) fn deserialize_record<'de, D>(
     deserializer: D,
-) -> Result<CreatureOwnershipRecordV1, D::Error>
+) -> Result<CreatureOwnershipRecordV2, D::Error>
 where
     D: Deserializer<'de>,
 {
     let mut budget = DecodeBudget::new::<D::Error>()?;
-    <CreatureOwnershipRecordV1 as BudgetDecode>::decode(deserializer, &mut budget)
+    <CreatureOwnershipRecordV2 as BudgetDecode>::decode(deserializer, &mut budget)
 }
 
 /// Decode a bounded ownership set using the record decoder with per-record
 /// and cumulative budgets. The aggregate byte budget accounts for decoded
-/// owned capacity and may be stricter than `CreatureOwnershipSetV1::validate`'s
+/// owned capacity and may be stricter than `CreatureOwnershipSetV2::validate`'s
 /// conservative estimate; each record retains its independent decode ceiling.
-pub(super) fn deserialize_set<'de, D>(deserializer: D) -> Result<CreatureOwnershipSetV1, D::Error>
+pub(super) fn deserialize_set<'de, D>(deserializer: D) -> Result<CreatureOwnershipSetV2, D::Error>
 where
     D: Deserializer<'de>,
 {
     let mut budget = DecodeBudget::new_set::<D::Error>()?;
-    <CreatureOwnershipSetV1 as BudgetDecode>::decode(deserializer, &mut budget)
+    <CreatureOwnershipSetV2 as BudgetDecode>::decode(deserializer, &mut budget)
 }
 
 #[cfg(test)]
@@ -1306,7 +1339,7 @@ mod tests {
             "state": state,
             "owner_key": 7,
             "source_generation": 1,
-            "next_component_serial": 1,
+            "next_component_serial": 1, "part_velocities": [],
             "parts": [part(1, 100, 2049), part(2, 101, 2048)],
             "components": []
         });
@@ -1348,7 +1381,7 @@ mod tests {
             },
             "owner_key": 7,
             "source_generation": 1,
-            "next_component_serial": 1,
+            "next_component_serial": 1, "part_velocities": [],
             "parts": [{
                 "part_id": 1,
                 "source_volume_id": 100,
@@ -1383,10 +1416,10 @@ mod tests {
             "schema": CREATURE_OWNER_SCHEMA,
             "records": [set_record_json(1), set_record_json(2)]
         });
-        let set: CreatureOwnershipSetV1 = serde_json::from_value(input).unwrap();
+        let set: CreatureOwnershipSetV2 = serde_json::from_value(input).unwrap();
         assert_eq!(set.records.len(), 2);
         let bytes = postcard::to_allocvec(&set).unwrap();
-        let decoded: CreatureOwnershipSetV1 = postcard::from_bytes(&bytes).unwrap();
+        let decoded: CreatureOwnershipSetV2 = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, set);
     }
 
@@ -1450,7 +1483,7 @@ mod tests {
         });
         assert_eq!(
             empty_unknown_size.unwrap(),
-            Vec::<CreatureOwnershipRecordV1>::new()
+            Vec::<CreatureOwnershipRecordV2>::new()
         );
     }
 
@@ -1495,7 +1528,7 @@ mod tests {
             "schema": CREATURE_OWNER_SCHEMA,
             "records": (1..=5).map(record).collect::<Vec<_>>()
         });
-        let error = serde_json::from_value::<CreatureOwnershipSetV1>(input).unwrap_err();
+        let error = serde_json::from_value::<CreatureOwnershipSetV2>(input).unwrap_err();
         assert!(
             error.to_string().contains("set solid-cell limit"),
             "unexpected error: {error}"
@@ -1583,7 +1616,7 @@ mod tests {
 
     #[test]
     fn optional_map_fields_default_to_none_but_required_fields_still_fail() {
-        let decoded: CreatureOwnershipRecordV1 =
+        let decoded: CreatureOwnershipRecordV2 =
             serde_json::from_value(optional_field_record_json()).unwrap();
         assert_eq!(decoded.parts[0].bounds, None);
         assert_eq!(decoded.parts[0].parent_id, None);
@@ -1595,7 +1628,7 @@ mod tests {
             .unwrap()
             .remove("part_id");
         let error =
-            serde_json::from_value::<CreatureOwnershipRecordV1>(missing_required).unwrap_err();
+            serde_json::from_value::<CreatureOwnershipRecordV2>(missing_required).unwrap_err();
         assert!(
             error.to_string().contains("part_id"),
             "unexpected error: {error}"

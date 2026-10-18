@@ -693,26 +693,26 @@ submit imprint positions. See weather.md for rates, caps and exposure rules.
 
 Canonical checkpoints retain exact fractional snow depth and climate cursors;
 geometry journal entries preserve exact cohort changes. Footprints clear on
-restart. Live and saved topology/motion records now require protocol/wire 9. Saved
-wire headers 5, 6, 7 and 8 are rejected without migration or header rewriting.
+restart. Live and saved topology/motion records now require protocol/wire 10. Saved
+wire headers 5, 6, 7, 8 and 9 are rejected without migration or header rewriting.
 
 ### ENG-218 - Ordered creature lifecycle boundary
 
-Protocol/wire 8 introduced a typed inline `TopologyOp::CreatureLifecycle`
-carrying the unchanged inner change inside `CreatureLifecycleCommitV1`. The
+Protocol/wire 10 carries a typed inline `TopologyOp::CreatureLifecycle`
+with the current `CreatureLifecycleCommitV2` and ownership/change schemas 2. The
 operation must use its enclosing transaction ID and exact operation ordinal.
 Multiple operations use the existing transaction count limit. The codec checks
 the 64 KiB control limit before allocating an encoded frame. Catalog, source and
 transition validation still belong to the owning candidate consumer.
 
-Current protocol/wire 9 adds `TopologyOp::CreatureLifecycleBulk`, binding its
+Current protocol/wire 10 includes `TopologyOp::CreatureLifecycleBulk`, binding its
 exact operation ordinal, payload schema, outer commit hash and shared transfer ID.
-`CreatureLifecycleBulkPayloadV1` uses world-version tag 6 and bounded postcard/zstd
+`CreatureLifecycleBulkPayloadV2` uses payload schema 2 and world-version tag 7 and bounded postcard/zstd
 framing. The decoder checks the marker correlation prefix before nested owner
 decoding and hashing. Raw commit, cumulative source/ownership work and compressed
 assembly limits are enforced. Geometry split children and their source patch may
 share a geometry transfer ID; lifecycle IDs may not reuse each other or geometry
-IDs. The codec and marker are implemented; network dispatch for tag 6 remains
+IDs. The codec and marker are implemented; network dispatch for tag 7 remains
 closed until atomic typed attachment consumers and the common allocator are ready.
 
 The current geometry-only replica and SimWorld replay paths reject actor-bearing
@@ -760,8 +760,9 @@ geometry-only checkpoint that silently omits that state. Complete live-animal
 recovery also requires independent applied part-body twists: root motion and
 frozen part poses alone cannot reproduce an animated limb's immediate checked
 death transfer. The physics reconstruction prerequisite carries those measured
-values explicitly; the existing serialized owner/motion schemas still require
-an explicit replacement before complete animal checkpointing is enabled.
+values explicitly, and the V2 owner/motion records now retain them. Complete
+Simulation checkpoint and baseline integration remains required before enabling
+animal checkpointing.
 
 Whole-owner corpse physics capture now returns the existing runtime
 `DynamicCorpseRestore` DTO. The owning thread supplies canonical original source
@@ -776,11 +777,32 @@ volumes/material catalogs, authored transforms and allocator state still require
 Simulation capture and explicitly versioned complete checkpoint/baseline schemas.
 Ownership-set decoding reuses the existing seeded record reader with per-record
 limits and shared population limits; a fresh per-record Deserialize cannot reset
-aggregate admission. The same V1 field order and schemas remain. The safe
-`CreatureOwnershipSetV1::decode(bytes, catalog)` entry point caps the input frame,
+aggregate admission. It reads the current V2 ownership layout. The safe
+`CreatureOwnershipSetV2::decode(bytes, catalog)` entry point caps the input frame,
 rejects trailing bytes, and performs bounded parsing followed by catalog/semantic
 validation. Generic Deserialize admits resources only. Unknown ownership map fields
 (including nested fixed metadata) reject before their values; missing optional
 None metadata retains its existing map behavior. State-name byte limits apply
 before creating owned postcard strings. No new writer API, snapshot envelope,
 allocator format, checkpoint schema or production consumer is introduced here.
+
+Current animated ownership uses V2 owner/set/change/overlay/commit and bulk payload
+types, without V1 aliases or migration. Every Alive owner carries a strictly
+ordered `part_velocities` entry for each original source part, with finite bounded
+installed linear/angular velocities. Corpse lists are empty; its independently
+moving component frames remain authoritative. Source-content and topology-only
+hashes exclude measured motion; full/motion and enclosing commit hashes bind it.
+The pre-motion overlay applies the complete measured list before validating the
+expected before hash, including when a client received no motion datagram.
+
+The owning simulation thread samples pending-safe physical part motion with its
+existing source/pose/owner capture and prepared checked-death freshness fence.
+Zero part velocities are authored only for the existing stationary AliveBirth
+installation. The unchanged checked death witness attests the resulting installed
+root transfer; the overlay and complete before hash bind its input motion.
+Replica/recovery do not rerun that physical calculation or keep another ledger.
+Nested velocity vectors are charged against local/population/attachment work and
+owned capacity before allocation or hashing. Wire 9, owner/change/commit/bulk
+schema 1, and the retired lifecycle kind 6 have no compatibility path. Geometry
+baseline 1 and store 3 layouts are unchanged; embedded old wire journals reject.
+Complete actor checkpoints, baselines and typed runtime consumers remain gated.

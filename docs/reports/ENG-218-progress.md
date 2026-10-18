@@ -852,3 +852,95 @@ Unrelated main `artifacts/` were preserved. The prior worker's untracked server
 test was retained in its ignored `.local/geometry_split_transfer_id.preserved-before-set-decode.rs`
 before checking out the already-committed version, and its reviewed history remains
 reachable at `codex/eng218-reviewed-worker-history`.
+## Animated ownership V2 integrated (2026-10-18)
+
+This milestone supersedes earlier directions to keep the ENG-217 inner ownership
+layout unchanged. Current-only V2 record/set, lifecycle operation/change, overlay,
+commit and bulk payload types replace their changed V1 counterparts without
+aliases or migration. Owner/change/commit/bulk schemas and their changed hash
+domains are 2. Protocol/handshake/wire is 10; lifecycle bulk kind is 7, replacing
+6. Geometry baseline 1 and store 3 layouts remain unchanged: their journal fields
+contain opaque current wire records, and saved wire 9 now rejects without header
+rewriting. Complete actor checkpoint/baseline sections are still absent/guarded.
+
+`CreaturePartVelocityV2` retains actual keyed installed linear/angular velocities.
+Alive records require exactly one sorted entry per source part, including empty
+bindings; Corpse requires an empty list and retains independent component motion.
+Source descriptors and existing frozen-pose records keep their layout. Full/motion
+and outer commit hashes bind the new list; source-content and topology-only hashes
+exclude it. Canonical optional overlay encoding puts its discriminator before the
+variable list. Bounded readers count velocity entries, native vector capacity and
+work at both owner and population levels; lifecycle attachment budgets include
+owner and overlay lists. Existing limits were not raised. Unknown new DTO fields
+and excess no-hint vector bodies refuse before reading their contents.
+
+The authoritative death producer samples pending-safe installed part velocities
+on the owning thread alongside owner/pose/source captures. The existing prepared
+batch fences the physics step and body/owner state before publication. Its complete
+before hash and outer commit bind that measured overlay; the unchanged checked
+physical witness attests resulting installed root motion. No duplicate input-motion
+witness list, secondary ledger or root-rigid inference was introduced. Explicit
+zero lists are limited to the existing stationary AliveBirth installation and
+fixtures declaring zero motion. Death clears the live-only list. The bridge now
+roundtrips three genuinely animated parts through the portable codec before a real
+checked transfer, with unequal measured velocities; ordered single-part production
+retains its actual physics sample in the emitted overlay.
+
+A two-part ordered producer scenario hit the existing 64 KiB inline ceiling. It
+is now an explicit atomic-refusal regression with unchanged journal, registry,
+physics count and host revision. The earlier one-part ordered acceptance remains
+one-part; no reduced workload is reported as two-part success. Typed bulk
+publication remains a launch prerequisite. The current three-part protocol fixture
+is measured separately; it is not a shipped animal/population performance result.
+
+Measured coordinator checks, all using `.local/eng218-cargo.ps1`:
+- `cargo test -p spall_sim --lib creature`: 32 passed, 0 failed.
+- `cargo test -p spall_protocol -p spall_sim -p spall_store -p spall_server`:
+  final permitted run 640 passed, 0 failed, 12 ignored across 68 result targets.
+- `cargo test -p spall_client --lib lifecycle_rejection_review`: corrected retry
+  2 passed, 0 failed; validated V2 inline/bulk actor inputs still refuse before
+  replica or geometry-only replay mutation.
+- `cargo check --workspace --all-targets --all-features`: passed.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `cargo test -p spall_protocol --test creature_commit_review -- --nocapture`:
+  12 passed; separate current V2 fixture byte measurements recorded below.
+
+Earlier attempts are retained in `.local/eng218-motion-*` logs: intermediate build
+errors/fixtures were updated with required explicit motion and current schema;
+wire golden/old-version expectations were updated, never relaxed. An excess-body
+probe initially expected the wrong diagnostic label, corrected to the actual
+pre-body count refusal. Initial client fixtures omitted required Alive motion;
+adding their declared zero entry preserved their original valid-input/rejection
+scenario. Superseded bulk schema now returns Schema before marker correlation.
+An initial store crash run failed on PermissionDenied at the child marker rename;
+its failure output previously hid the child error. The test now includes that
+bounded child log in a panic. The unchanged crash workload passes in the final
+permitted run. No crash boundary, TLS check or control ceiling was relaxed.
+Existing incremental-cache hard-link warnings are environmental.
+
+Changed files: protocol `src/{creature_owner,creature_owner_decode,codec,handshake,
+lib,lifecycle_bulk,records,segment,transaction_attachments}.rs` and its three owner,
+commit and attachment review test files; simulation `src/{sim,world,
+creature_owner_bridge}.rs`; client `src/lifecycle_rejection_review.rs`; store
+`src/dto.rs` and `tests/abrupt_crash.rs`; current protocol/validation/design/progress
+and ASCII-appended task notes. No game catalog, renderer, habitat or physics solver
+changes were needed.
+
+Next unblocked task is ENG-218: complete canonical Simulation source/owner capture
+with allocator epoch/high-water (even empty), atomic complete actor checkpoint and
+baseline restoration, typed ordered journal/attachment and replica consumers, then
+bulk producer scheduling and source-edit/fracture/terminal synchronization. Current
+checkpoint refusal and closed production spawning remain. Combined 1024 m
+weather/animals, shipped species population, GPU and multiplayer animal
+restart/destruction gates are unrun; this milestone is not a launch acceptance.
+Current V2 three-part fixture measurements: 99,144 control-body bytes versus the
+65,536-byte cap; 99,169 raw lifecycle-envelope bytes and 409 compressed bytes.
+These fixture measurements establish the retained bulk requirement, not shipped
+trout/crow/deer asset cost or population throughput. Measurement log:
+`.local/eng218-motion-measurements.log`. Final integrated evidence is
+`.local/eng218-motion-final-tests.log`; client corrected evidence is
+`.local/eng218-motion-client-refusal-retry.log`; workspace/lint/format logs use
+`.local/eng218-motion-{workspace,clippy,format}.log`. Unrelated `artifacts/` remains
+untouched. Workers exhausted their available service allowance during design;
+the coordinator completed implementation, review and validation locally.

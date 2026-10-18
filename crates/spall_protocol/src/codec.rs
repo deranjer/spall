@@ -216,9 +216,9 @@ mod tests {
             journal_seq: JournalSeq(300),
         };
         let bytes = encode_control(&record).unwrap();
-        // header: schema=9 (lifecycle bulk marker added),
+        // header: schema=10 (measured animated part motion),
         // tag=11 (DurableThrough); body: postcard varint of 300 = 0xAC 0x02
-        assert_eq!(bytes, [0x09, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
+        assert_eq!(bytes, [0x0A, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
         let back: DurableThrough = decode_control(&bytes).unwrap();
         assert_eq!(back, record);
     }

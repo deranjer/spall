@@ -1738,3 +1738,21 @@ records without reading their bodies, cumulative dense/mask counts and byte/work
 admission before allocation. This is reader admission evidence, not complete
 serialized actor saves or integrated multiplayer recovery. Parser scratch memory
 still requires bounded input frames; production spawning remains closed.
+
+Animated ownership V2 checks run with `cargo test -p spall_protocol -p spall_sim
+-p spall_store -p spall_server`. Independent nonrigid velocities must survive
+owner/set codec roundtrips while changing full/motion hashes and preserving
+topology/source hashes. Missing/duplicate/nonfinite/over-limit lists, excessive
+vector prefixes and superseded schemas/wire must refuse. Overlay replay and
+receipts bind every measured part velocity; Corpse must retire the Alive list.
+The real three-part physics/candidate bridge tests applied animation capture,
+codec roundtrip and checked transfer. The ordered single-part producer tests the
+actual sampled overlay; two-part inline admission must refuse atomically until
+typed bulk publication exists. This distinction must remain explicit.
+
+Client refusal remains exercised by `cargo test -p spall_client --lib
+lifecycle_rejection_review`. Run workspace all-target/all-feature check and strict
+seven-package Clippy before acceptance. Store crash tests need permission for
+child marker rename and local server tests need loopback access; report denied
+initial attempts separately from completed runs. Combined 1024 m weather/animals,
+GPU/population and multiplayer animal restart/destruction are separate gates.

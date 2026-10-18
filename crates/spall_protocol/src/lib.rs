@@ -76,14 +76,14 @@ pub use creature_owner::{
     CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_MOTION_DOMAIN, CREATURE_OWNER_DOMAIN,
     CREATURE_OWNER_SCHEMA, CREATURE_OWNER_SET_DOMAIN, CREATURE_TOPOLOGY_DOMAIN,
     CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleCandidateV1,
-    CreatureLifecycleChangeV1, CreatureLifecycleCommitReplayReceiptV1, CreatureLifecycleCommitV1,
-    CreatureLifecycleContextV1, CreatureLifecycleOperationV1, CreatureLocalPoseV1,
-    CreatureMaskCellV1, CreatureMotionOverlayV1, CreatureOwnedComponentV1, CreatureOwnershipError,
-    CreatureOwnershipRecordV1, CreatureOwnershipSetV1, CreaturePartMotionV1,
-    CreatureReductionOutcome, CreatureSourceMaskBrickV1, CreatureSourcePartV1,
-    MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS, MAX_CREATURE_OWNER_DENSE_CELLS,
-    MAX_CREATURE_OWNER_MASK_BRICKS, MAX_CREATURE_OWNER_MASK_CELLS, MAX_CREATURE_OWNER_PARTS,
-    MAX_CREATURE_OWNER_RECORD_BYTES, MAX_CREATURE_OWNER_SOLID_CELLS,
+    CreatureLifecycleChangeV2, CreatureLifecycleCommitReplayReceiptV1, CreatureLifecycleCommitV2,
+    CreatureLifecycleContextV1, CreatureLifecycleOperationV2, CreatureLocalPoseV1,
+    CreatureMaskCellV1, CreatureMotionOverlayV2, CreatureOwnedComponentV1, CreatureOwnershipError,
+    CreatureOwnershipRecordV2, CreatureOwnershipSetV2, CreaturePartMotionV1,
+    CreaturePartVelocityV2, CreatureReductionOutcome, CreatureSourceMaskBrickV1,
+    CreatureSourcePartV1, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
+    MAX_CREATURE_OWNER_DENSE_CELLS, MAX_CREATURE_OWNER_MASK_BRICKS, MAX_CREATURE_OWNER_MASK_CELLS,
+    MAX_CREATURE_OWNER_PARTS, MAX_CREATURE_OWNER_RECORD_BYTES, MAX_CREATURE_OWNER_SOLID_CELLS,
     reduce_creature_lifecycle_candidate,
 };
 pub use handshake::{
@@ -92,7 +92,7 @@ pub use handshake::{
 };
 pub use lifecycle_bulk::{
     CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA, CreatureLifecycleBulkError,
-    CreatureLifecycleBulkPayloadV1, MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
+    CreatureLifecycleBulkPayloadV2, MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
 };
 pub use limits::SizeLimitError;
 pub use records::{

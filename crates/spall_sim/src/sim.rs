@@ -229,10 +229,10 @@ fn portable_birth_record(
         &spall_voxel::Volume,
         &crate::world::CreatureSourceMetadata,
     )],
-) -> Result<spall_protocol::CreatureOwnershipRecordV1, crate::creatures::CreatureScheduleError> {
+) -> Result<spall_protocol::CreatureOwnershipRecordV2, crate::creatures::CreatureScheduleError> {
     use spall_protocol::{
         BaselineCells, BaselineOwner, CREATURE_OWNER_SCHEMA, CreatureMaskCellV1,
-        CreatureOwnedComponentV1, CreatureOwnershipRecordV1, CreatureSourceMaskBrickV1,
+        CreatureOwnedComponentV1, CreatureOwnershipRecordV2, CreatureSourceMaskBrickV1,
         CreatureSourcePartV1, Hash32, baseline::BaselineBrick,
     };
 
@@ -327,7 +327,15 @@ fn portable_birth_record(
             mask.coord[0],
         )
     });
-    Ok(CreatureOwnershipRecordV1 {
+    Ok(CreatureOwnershipRecordV2 {
+        part_velocities: portable_parts
+            .iter()
+            .map(|part| spall_protocol::CreaturePartVelocityV2 {
+                part_id: part.part_id,
+                linear_velocity_m_s: [0.0; 3],
+                angular_velocity_rad_s: [0.0; 3],
+            })
+            .collect(),
         schema: CREATURE_OWNER_SCHEMA,
         components: vec![CreatureOwnedComponentV1 {
             owner_key,
@@ -890,6 +898,11 @@ mod creature_host_tests {
             before_stale_death
         );
 
+        let measured = simulation
+            .world
+            .physics()
+            .articulated_part_motion_snapshot(owner)
+            .unwrap();
         let death = simulation
             .commit_creature_lifecycle_transaction(
                 Tick(2),
@@ -905,6 +918,26 @@ mod creature_host_tests {
             )
             .unwrap();
         assert_eq!(death.journal_seq.0, 2);
+        let spall_protocol::TopologyOp::CreatureLifecycle { commit } = &death.topology.ops[0]
+        else {
+            panic!("typed death missing");
+        };
+        let overlay = commit.pre_motion.as_ref().unwrap();
+        assert_eq!(overlay.part_velocities.len(), measured.len());
+        for (serialized, physical) in overlay.part_velocities.iter().zip(&measured) {
+            assert_eq!(serialized.part_id, physical.part_id);
+            assert_eq!(serialized.linear_velocity_m_s, physical.linear_velocity_m_s);
+            assert_eq!(
+                serialized.angular_velocity_rad_s,
+                physical.angular_velocity_rad_s
+            );
+        }
+        let spall_protocol::CreatureLifecycleOperationV2::Death { after } =
+            &commit.change.operation
+        else {
+            panic!("wrong lifecycle");
+        };
+        assert!(after.part_velocities.is_empty());
         assert_eq!(simulation.journal.len(), 2);
         assert_eq!(death.witnesses.len(), 1);
         assert!(matches!(
@@ -951,6 +984,84 @@ mod creature_host_tests {
             spall_protocol::CreatureLifecycleState::Corpse
         );
         assert_eq!(corpse.state_revision, state.state_revision + 1);
+    }
+
+    #[test]
+    fn two_part_birth_refuses_without_mutation_until_typed_bulk_publication_exists() {
+        let mut simulation =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        simulation
+            .initialize_creature_host(WorldId::from_u128(10))
+            .unwrap();
+        let catalog = crate::creatures::tests::FixtureCatalog::with_materials(
+            simulation.world.materials().clone(),
+        );
+        let mut candidate_registry = simulation.world.registry().clone();
+        let volume_id = candidate_registry.allocate_volume().unwrap();
+        let child_volume_id = candidate_registry.allocate_volume().unwrap();
+        let mut state = catalog.state(1, volume_id.get());
+        state
+            .source_bindings
+            .push(spall_protocol::CreaturePartBinding {
+                part_id: 2,
+                source_volume_id: child_volume_id,
+                source_revision: 1,
+            });
+        let mut view = catalog.view();
+        let assets = [spall_protocol::CreatureAssetCatalogEntry {
+            uuid: view.assets[0].uuid,
+            logical_hash: view.assets[0].logical_hash,
+            part_ids: &[1, 2],
+            clip_names: view.assets[0].clip_names,
+            portable_material_keys: view.assets[0].portable_material_keys,
+        }];
+        view.assets = &assets;
+        let before = (
+            simulation.journal.cursor(),
+            simulation.world.registry().counters(),
+            simulation.world.physics().body_count(),
+            simulation.creatures.as_ref().unwrap().revision(),
+        );
+        let birth = simulation
+            .commit_creature_lifecycle_transaction(
+                Tick(1),
+                spall_protocol::ControlSeq(1),
+                vec![AuthoritativeCreatureIntent::Birth {
+                    state: Box::new(state.clone()),
+                    parts: vec![
+                        CreatureBirthPartInput {
+                            part_id: 1,
+                            parent_id: None,
+                            local_transform: PartTransform::IDENTITY,
+                            volume: source_volume(volume_id),
+                        },
+                        CreatureBirthPartInput {
+                            part_id: 2,
+                            parent_id: Some(1),
+                            local_transform: PartTransform {
+                                translation_m: [2.0, 0.0, 0.0],
+                                ..PartTransform::IDENTITY
+                            },
+                            volume: source_volume(child_volume_id),
+                        },
+                    ],
+                    representation: Representation::MergedCuboids,
+                }],
+                None,
+                &view,
+            )
+            .err()
+            .expect("two-part inline birth must refuse");
+        assert!(birth.contains("inline control-record ceiling"), "{birth}");
+        assert_eq!(
+            before,
+            (
+                simulation.journal.cursor(),
+                simulation.world.registry().counters(),
+                simulation.world.physics().body_count(),
+                simulation.creatures.as_ref().unwrap().revision()
+            )
+        );
     }
 
     #[test]
@@ -2074,9 +2185,9 @@ impl Simulation {
         use spall_physics::{ArticulatedBatchOperation, OccupancyGrid, SourcePart};
         use spall_protocol::{
             CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_COMMIT_SCHEMA, CreatureClipMode,
-            CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleChangeV1,
-            CreatureLifecycleCommitV1, CreatureLifecycleContextV1, CreatureLifecycleOperationV1,
-            CreatureLifecycleState, CreatureMotionOverlayV1, CreaturePartMotionV1,
+            CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleChangeV2,
+            CreatureLifecycleCommitV2, CreatureLifecycleContextV1, CreatureLifecycleOperationV2,
+            CreatureLifecycleState, CreatureMotionOverlayV2, CreaturePartMotionV1,
             CreatureReductionOutcome, Record, TopologyOp, TopologyTransaction,
         };
 
@@ -2275,7 +2386,7 @@ impl Simulation {
             Birth {
                 tag: u64,
                 state: spall_protocol::CreatureStateV1,
-                after: spall_protocol::CreatureOwnershipRecordV1,
+                after: spall_protocol::CreatureOwnershipRecordV2,
                 allocator_before: CreatureAllocatorSnapshotV1,
                 next_volume_id: u64,
                 next_volume_after: u64,
@@ -2288,8 +2399,8 @@ impl Simulation {
             Death {
                 tag: u64,
                 key: spall_core::CreatureKey,
-                before: spall_protocol::CreatureOwnershipRecordV1,
-                pre_motion: CreatureMotionOverlayV1,
+                before: spall_protocol::CreatureOwnershipRecordV2,
+                pre_motion: CreatureMotionOverlayV2,
                 frozen_poses: Vec<(u32, spall_physics::PartTransform)>,
                 witness_root_translation_m: [f64; 3],
                 witness_root_rotation_xyzw: [f32; 4],
@@ -2466,6 +2577,13 @@ impl Simulation {
                         .physics()
                         .articulated_owner_snapshot(owner_id)
                         .ok_or_else(|| "death articulated owner snapshot is absent".to_owned())?;
+                    let part_motion = self
+                        .world
+                        .physics()
+                        .articulated_part_motion_snapshot(owner_id)
+                        .ok_or_else(|| {
+                            "death has pending or unavailable installed part motion".to_owned()
+                        })?;
                     let poses = self
                         .world
                         .physics()
@@ -2618,7 +2736,16 @@ impl Simulation {
                     before.components[0].rotation_xyzw = owner.root.rotation;
                     before.components[0].linear_velocity_m_s = owner.root.linvel_m_s;
                     before.components[0].angular_velocity_rad_s = owner.root.angvel_rad_s;
-                    let pre_motion = CreatureMotionOverlayV1 {
+                    before.part_velocities = part_motion
+                        .iter()
+                        .map(|motion| spall_protocol::CreaturePartVelocityV2 {
+                            part_id: motion.part_id,
+                            linear_velocity_m_s: motion.linear_velocity_m_s,
+                            angular_velocity_rad_s: motion.angular_velocity_rad_s,
+                        })
+                        .collect();
+                    let pre_motion = CreatureMotionOverlayV2 {
+                        part_velocities: before.part_velocities.clone(),
                         state_revision: state.state_revision,
                         clip_mode: state.clip_mode,
                         clip_phase_tick: state.clip_phase_tick,
@@ -2696,18 +2823,18 @@ impl Simulation {
                         next_volume_after,
                         parts,
                     } => {
-                        let change = CreatureLifecycleChangeV1 {
+                        let change = CreatureLifecycleChangeV2 {
                             schema: CREATURE_CHANGE_SCHEMA,
                             transaction_id,
                             operation_ordinal: ordinal,
                             expected_before_hash: spall_protocol::Hash32::ZERO,
                             expected_after_hash: after.canonical_hash(),
-                            operation: CreatureLifecycleOperationV1::Birth {
+                            operation: CreatureLifecycleOperationV2::Birth {
                                 after: after.clone(),
                             },
                         };
                         (
-                            CreatureLifecycleCommitV1 {
+                            CreatureLifecycleCommitV2 {
                                 schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
                                 change,
                                 expected_before_topology_hash: spall_protocol::Hash32::ZERO,
@@ -2766,6 +2893,7 @@ impl Simulation {
                             .checked_add(1)
                             .ok_or_else(|| "creature state revision exhausted".to_owned())?;
                         after.state.lifecycle = CreatureLifecycleState::Corpse;
+                        after.part_velocities.clear();
                         after.state.clip_mode = CreatureClipMode::Frozen;
                         after.state.clip_epoch = after
                             .state
@@ -2786,15 +2914,15 @@ impl Simulation {
                                 witness.installed_angular_velocity_rad_s;
                         }
                         let after_hash = after.canonical_hash();
-                        let change = CreatureLifecycleChangeV1 {
+                        let change = CreatureLifecycleChangeV2 {
                             schema: CREATURE_CHANGE_SCHEMA,
                             transaction_id,
                             operation_ordinal: ordinal,
                             expected_before_hash: before.canonical_hash(),
                             expected_after_hash: after_hash,
-                            operation: CreatureLifecycleOperationV1::Death { after },
+                            operation: CreatureLifecycleOperationV2::Death { after },
                         };
-                        let commit = CreatureLifecycleCommitV1 {
+                        let commit = CreatureLifecycleCommitV2 {
                             schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
                             change,
                             expected_before_topology_hash: before.topology_hash(),
@@ -2823,8 +2951,8 @@ impl Simulation {
                 );
             }
             let current = match &commit.change.operation {
-                CreatureLifecycleOperationV1::Birth { .. } => None,
-                CreatureLifecycleOperationV1::Death { .. } => owner_after.as_ref(),
+                CreatureLifecycleOperationV2::Birth { .. } => None,
+                CreatureLifecycleOperationV2::Death { .. } => owner_after.as_ref(),
             };
             let allocator = birth_allocator.unwrap_or_else(|| candidate_host.allocator_snapshot());
             let (next_volume_id, next_volume_after) = birth_volume_counters.unwrap_or((

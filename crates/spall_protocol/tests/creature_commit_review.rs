@@ -125,15 +125,15 @@ impl Fixture {
     }
 }
 
-fn owner(f: &Fixture) -> CreatureOwnershipRecordV1 {
+fn owner(f: &Fixture) -> CreatureOwnershipRecordV2 {
     let state = f.state();
     let q = [0.0_f32, 0.0, 0.0, 1.0];
     let pose = serde_json::json!({"translation_m": [0.0,0.0,0.0], "rotation_xyzw": q});
     let mut ids = vec![0_u16; 32768];
     ids[0] = 1;
     let raw = serde_json::json!({
-        "schema": 1, "state": state, "owner_key": 9, "source_generation": 1,
-        "next_component_serial": 1,
+        "schema": 2, "state": state, "owner_key": 9, "source_generation": 1,
+        "next_component_serial": 1, "part_velocities": [],
         "parts": [{
             "part_id": 1, "source_volume_id": 100, "source_generation": 1,
             "source_revision": 1, "cell_size_code": 1, "bounds": [[0,0,0],[0,0,0]],
@@ -148,7 +148,16 @@ fn owner(f: &Fixture) -> CreatureOwnershipRecordV1 {
                 "cells":[{"index":0,"material_id":1}]}]
         }]
     });
-    let mut record: CreatureOwnershipRecordV1 = serde_json::from_value(raw).unwrap();
+    let mut record: CreatureOwnershipRecordV2 = serde_json::from_value(raw).unwrap();
+    record.part_velocities = record
+        .parts
+        .iter()
+        .map(|part| CreaturePartVelocityV2 {
+            part_id: part.part_id,
+            linear_velocity_m_s: [0.0; 3],
+            angular_velocity_rad_s: [0.0; 3],
+        })
+        .collect();
     record.parts[0].source_content_hash = record.parts[0].canonical_source_content_hash();
     record
 }
@@ -175,14 +184,14 @@ fn context(
         existing_source_volumes: &[],
     }
 }
-fn birth(record: CreatureOwnershipRecordV1) -> CreatureLifecycleChangeV1 {
-    CreatureLifecycleChangeV1 {
-        schema: 1,
+fn birth(record: CreatureOwnershipRecordV2) -> CreatureLifecycleChangeV2 {
+    CreatureLifecycleChangeV2 {
+        schema: spall_protocol::CREATURE_CHANGE_SCHEMA,
         transaction_id: spall_core::TransactionId::new(7).unwrap(),
         operation_ordinal: 0,
         expected_before_hash: Hash32::ZERO,
         expected_after_hash: record.canonical_hash(),
-        operation: CreatureLifecycleOperationV1::Birth { after: record },
+        operation: CreatureLifecycleOperationV2::Birth { after: record },
     }
 }
 #[test]
@@ -190,6 +199,8 @@ fn authoritative_motion_overlay_allows_death_without_any_motion_datagram() {
     let f = Fixture::new();
     let client_before = owner(&f);
     let mut authoritative_before = client_before.clone();
+    authoritative_before.part_velocities[0].linear_velocity_m_s = [7.0, -3.0, 1.0];
+    authoritative_before.part_velocities[0].angular_velocity_rad_s = [0.5, 0.0, -0.25];
     authoritative_before.state.state_revision = 4;
     authoritative_before.state.pose_epoch = 7;
     authoritative_before.state.clip_epoch = 5;
@@ -203,6 +214,7 @@ fn authoritative_motion_overlay_allows_death_without_any_motion_datagram() {
 
     let mut after = authoritative_before.clone();
     after.state.lifecycle = CreatureLifecycleState::Corpse;
+    after.part_velocities.clear();
     after.state.clip_mode = CreatureClipMode::Frozen;
     after.state.state_revision += 1;
     after.state.pose_epoch += 1;
@@ -221,7 +233,8 @@ fn authoritative_motion_overlay_allows_death_without_any_motion_datagram() {
         installed_angular_velocity_rad_s: after.state.angular_velocity_rad_s,
         frozen_local_poses: vec![(1, after.parts[0].frozen_local_pose)],
     };
-    let overlay = CreatureMotionOverlayV1 {
+    let overlay = CreatureMotionOverlayV2 {
+        part_velocities: authoritative_before.part_velocities.clone(),
         state_revision: authoritative_before.state.state_revision,
         clip_mode: authoritative_before.state.clip_mode,
         clip_phase_tick: authoritative_before.state.clip_phase_tick,
@@ -254,17 +267,17 @@ fn authoritative_motion_overlay_allows_death_without_any_motion_datagram() {
             })
             .collect(),
     };
-    let change = CreatureLifecycleChangeV1 {
+    let change = CreatureLifecycleChangeV2 {
         schema: CREATURE_CHANGE_SCHEMA,
         transaction_id: spall_core::TransactionId::new(8).unwrap(),
         operation_ordinal: 0,
         expected_before_hash: authoritative_before.canonical_hash(),
         expected_after_hash: after.canonical_hash(),
-        operation: CreatureLifecycleOperationV1::Death {
+        operation: CreatureLifecycleOperationV2::Death {
             after: after.clone(),
         },
     };
-    let commit = CreatureLifecycleCommitV1 {
+    let commit = CreatureLifecycleCommitV2 {
         schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
         change,
         expected_before_topology_hash: client_before.topology_hash(),
@@ -275,6 +288,16 @@ fn authoritative_motion_overlay_allows_death_without_any_motion_datagram() {
         .validate_and_reduce(Some(&client_before), context(8, 2, 101), &f.catalog())
         .unwrap();
     assert_eq!(applied.record, after);
+    assert!(applied.record.part_velocities.is_empty());
+    let mut changed_motion = commit.clone();
+    changed_motion.pre_motion.as_mut().unwrap().part_velocities[0].linear_velocity_m_s[0] += 1.0;
+    assert_ne!(changed_motion.canonical_hash(), commit.canonical_hash());
+    assert!(
+        changed_motion
+            .validate_and_reduce(Some(&client_before), context(8, 2, 101), &f.catalog())
+            .is_err()
+    );
+
     let duplicate_receipt = CreatureLifecycleCommitReplayReceiptV1 {
         transaction_id: commit.change.transaction_id,
         operation_ordinal: commit.change.operation_ordinal,
@@ -379,11 +402,12 @@ fn birth_rejects_motion_overlay_and_death_witness() {
     let after = owner(&f);
     let mut change = birth(after.clone());
     change.transaction_id = spall_core::TransactionId::new(7).unwrap();
-    let commit = CreatureLifecycleCommitV1 {
+    let commit = CreatureLifecycleCommitV2 {
         schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
         change,
         expected_before_topology_hash: Hash32::ZERO,
-        pre_motion: Some(CreatureMotionOverlayV1 {
+        pre_motion: Some(CreatureMotionOverlayV2 {
+            part_velocities: vec![],
             state_revision: 1,
             clip_mode: CreatureClipMode::Playing,
             clip_phase_tick: 0,
@@ -411,7 +435,7 @@ fn birth_rejects_motion_overlay_and_death_witness() {
 fn birth_duplicate_uses_outer_receipt_and_rejects_divergent_identity() {
     let f = Fixture::new();
     let after = owner(&f);
-    let commit = CreatureLifecycleCommitV1 {
+    let commit = CreatureLifecycleCommitV2 {
         schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
         change: birth(after.clone()),
         expected_before_topology_hash: Hash32::ZERO,
@@ -454,7 +478,7 @@ fn birth_duplicate_uses_outer_receipt_and_rejects_divergent_identity() {
 fn outer_decode_bounds_overlay_and_witness_lists_before_accepting_items() {
     let f = Fixture::new();
     let after = owner(&f);
-    let base = CreatureLifecycleCommitV1 {
+    let base = CreatureLifecycleCommitV2 {
         schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
         change: birth(after),
         expected_before_topology_hash: Hash32::ZERO,
@@ -473,7 +497,7 @@ fn outer_decode_bounds_overlay_and_witness_lists_before_accepting_items() {
         "parts": vec![serde_json::json!({"part_id":1,"frozen_local_pose":pose}); MAX_CREATURE_OWNER_PARTS + 1],
         "components": []
     });
-    assert!(serde_json::from_value::<CreatureLifecycleCommitV1>(raw.clone()).is_err());
+    assert!(serde_json::from_value::<CreatureLifecycleCommitV2>(raw.clone()).is_err());
     raw["pre_motion"] = serde_json::Value::Null;
     raw["death_witness"] = serde_json::json!({
         "key": owner(&f).state.key, "source_generation": 1,
@@ -482,7 +506,7 @@ fn outer_decode_bounds_overlay_and_witness_lists_before_accepting_items() {
         "installed_linear_velocity_m_s": [0.0,0.0,0.0], "installed_angular_velocity_rad_s": [0.0,0.0,0.0],
         "frozen_local_poses": vec![serde_json::json!([1, pose]); MAX_CREATURE_OWNER_PARTS + 1]
     });
-    assert!(serde_json::from_value::<CreatureLifecycleCommitV1>(raw).is_err());
+    assert!(serde_json::from_value::<CreatureLifecycleCommitV2>(raw).is_err());
 }
 
 #[test]
@@ -490,7 +514,7 @@ fn validated_nonempty_birth_round_trips_as_an_ordered_operation() {
     let f = Fixture::new();
     let after = owner(&f);
     after.validate(&f.catalog()).unwrap();
-    let commit = CreatureLifecycleCommitV1 {
+    let commit = CreatureLifecycleCommitV2 {
         schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
         change: birth(after.clone()),
         expected_before_topology_hash: Hash32::ZERO,
@@ -529,7 +553,7 @@ fn validated_nonempty_birth_round_trips_as_an_ordered_operation() {
     assert_eq!(reduced.record.components[0].source_masks[0].cells.len(), 1);
 }
 
-fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV1 {
+fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV2 {
     f.assets[0].part_ids = &[1, 2, 3];
     let mut after = owner(f);
     let source = after.parts[0].clone();
@@ -537,6 +561,7 @@ fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV1 {
     after.parts.clear();
     after.state.source_bindings.clear();
     after.components[0].source_masks.clear();
+    after.part_velocities.clear();
     for index in 0..3_u32 {
         let part_id = index + 1;
         let volume = VolumeId::new(100 + u64::from(index)).unwrap();
@@ -546,6 +571,11 @@ fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV1 {
         part.parent_id = (index > 0).then_some(index);
         part.source_content_hash = part.canonical_source_content_hash();
         after.parts.push(part);
+        after.part_velocities.push(CreaturePartVelocityV2 {
+            part_id,
+            linear_velocity_m_s: [0.0; 3],
+            angular_velocity_rad_s: [0.0; 3],
+        });
         after.state.source_bindings.push(CreaturePartBinding {
             part_id,
             source_volume_id: volume,
@@ -557,7 +587,7 @@ fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV1 {
         after.components[0].source_masks.push(part_mask);
     }
     after.validate(&f.catalog()).unwrap();
-    CreatureLifecycleCommitV1 {
+    CreatureLifecycleCommitV2 {
         schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
         change: birth(after),
         expected_before_topology_hash: Hash32::ZERO,
@@ -612,13 +642,13 @@ fn mixed_geometry_and_nonempty_lifecycle_attachments_round_trip_as_one_candidate
     assert_eq!(
         reduced.record,
         match &commit.change.operation {
-            CreatureLifecycleOperationV1::Birth { after } => after.clone(),
-            CreatureLifecycleOperationV1::Death { after } => after.clone(),
+            CreatureLifecycleOperationV2::Birth { after } => after.clone(),
+            CreatureLifecycleOperationV2::Death { after } => after.clone(),
         }
     );
     assert_eq!(reduced.record.parts.len(), 3);
 
-    let lifecycle = CreatureLifecycleBulkPayloadV1::new(transaction_id, 4, commit).unwrap();
+    let lifecycle = CreatureLifecycleBulkPayloadV2::new(transaction_id, 4, commit).unwrap();
     let source = VolumeId::new(99).unwrap();
     let geometry_transfer_id = 77;
     let lifecycle_transfer_id = 88;
@@ -705,8 +735,8 @@ fn mixed_geometry_and_nonempty_lifecycle_attachments_round_trip_as_one_candidate
         Some(ValidatedTransactionAttachmentV1::CreatureLifecycle(decoded))
             if decoded.as_ref() == &lifecycle
                 && match &decoded.commit.change.operation {
-                    CreatureLifecycleOperationV1::Birth { after } => after == &reduced.record,
-                    CreatureLifecycleOperationV1::Death { after } => after == &reduced.record,
+                    CreatureLifecycleOperationV2::Birth { after } => after == &reduced.record,
+                    CreatureLifecycleOperationV2::Death { after } => after == &reduced.record,
                 }
     ));
 }
@@ -718,7 +748,7 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
     let mut f = Fixture::new();
     let commit = validated_three_part_commit(&mut f);
     let transaction_id = commit.change.transaction_id;
-    let payload = CreatureLifecycleBulkPayloadV1::new(transaction_id, 0, commit.clone()).unwrap();
+    let payload = CreatureLifecycleBulkPayloadV2::new(transaction_id, 0, commit.clone()).unwrap();
     let compressed = payload.encode_compressed().unwrap();
     let mut decoder = zstd::stream::Decoder::new(compressed.as_slice()).unwrap();
     let mut raw = Vec::new();
@@ -729,7 +759,7 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
         compressed.len()
     );
     assert!(raw.len() > limits::MAX_CONTROL_RECORD);
-    let decoded = CreatureLifecycleBulkPayloadV1::decode_compressed(
+    let decoded = CreatureLifecycleBulkPayloadV2::decode_compressed(
         &compressed,
         transaction_id,
         0,
@@ -738,6 +768,18 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
     .unwrap();
     assert_eq!(decoded, payload);
     assert_eq!(postcard::to_stdvec(&payload).unwrap(), raw);
+    let mut superseded = raw.clone();
+    superseded[0] = 1;
+    let superseded = zstd::stream::encode_all(superseded.as_slice(), 0).unwrap();
+    assert!(matches!(
+        CreatureLifecycleBulkPayloadV2::decode_compressed(
+            &superseded,
+            transaction_id,
+            0,
+            payload.commit_hash
+        ),
+        Err(CreatureLifecycleBulkError::Schema)
+    ));
 
     let marker = TopologyOp::CreatureLifecycleBulk {
         operation_ordinal: 0,
@@ -757,6 +799,13 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
         result_hashes: vec![],
     };
     tx.validate().unwrap();
+    let mut superseded_marker = tx.clone();
+    let TopologyOp::CreatureLifecycleBulk { payload_schema, .. } = &mut superseded_marker.ops[0]
+    else {
+        unreachable!()
+    };
+    *payload_schema = 1;
+    assert!(superseded_marker.validate().is_err());
     let marker_bytes = encode_control(&tx).unwrap();
     assert_eq!(
         decode_control::<TopologyTransaction>(&marker_bytes).unwrap(),
@@ -764,7 +813,7 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
     );
     assert_eq!(tx.bulk_transfer_ids(), [77]);
 
-    let wrong_correlation = CreatureLifecycleBulkPayloadV1::decode_compressed(
+    let wrong_correlation = CreatureLifecycleBulkPayloadV2::decode_compressed(
         &compressed,
         spall_core::TransactionId::new(8).unwrap(),
         0,
@@ -788,7 +837,7 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
     hostile_outer.push(0xff);
     let hostile_compressed = zstd::stream::encode_all(hostile_outer.as_slice(), 0).unwrap();
     assert!(matches!(
-        CreatureLifecycleBulkPayloadV1::decode_compressed(
+        CreatureLifecycleBulkPayloadV2::decode_compressed(
             &hostile_compressed,
             spall_core::TransactionId::new(8).unwrap(),
             0,
@@ -846,7 +895,7 @@ fn lifecycle_bulk_rejects_nested_hash_mismatch_trailing_bytes_and_bad_zstd() {
     let mut f = Fixture::new();
     let commit = validated_three_part_commit(&mut f);
     let transaction_id = commit.change.transaction_id;
-    let payload = CreatureLifecycleBulkPayloadV1::new(transaction_id, 0, commit.clone()).unwrap();
+    let payload = CreatureLifecycleBulkPayloadV2::new(transaction_id, 0, commit.clone()).unwrap();
 
     let mut changed = commit.clone();
     changed.expected_before_topology_hash = Hash32([0x5a; 32]);
@@ -860,7 +909,7 @@ fn lifecycle_bulk_rejects_nested_hash_mismatch_trailing_bytes_and_bad_zstd() {
     altered_raw.extend(postcard::to_stdvec(&changed).unwrap());
     let altered = zstd::stream::encode_all(altered_raw.as_slice(), 0).unwrap();
     assert!(matches!(
-        CreatureLifecycleBulkPayloadV1::decode_compressed(
+        CreatureLifecycleBulkPayloadV2::decode_compressed(
             &altered,
             transaction_id,
             0,
@@ -873,7 +922,7 @@ fn lifecycle_bulk_rejects_nested_hash_mismatch_trailing_bytes_and_bad_zstd() {
     trailing_raw.push(0xaa);
     let trailing = zstd::stream::encode_all(trailing_raw.as_slice(), 0).unwrap();
     assert!(matches!(
-        CreatureLifecycleBulkPayloadV1::decode_compressed(
+        CreatureLifecycleBulkPayloadV2::decode_compressed(
             &trailing,
             transaction_id,
             0,
@@ -883,7 +932,7 @@ fn lifecycle_bulk_rejects_nested_hash_mismatch_trailing_bytes_and_bad_zstd() {
     ));
 
     assert!(matches!(
-        CreatureLifecycleBulkPayloadV1::decode_compressed(
+        CreatureLifecycleBulkPayloadV2::decode_compressed(
             &[0],
             transaction_id,
             0,
@@ -894,7 +943,7 @@ fn lifecycle_bulk_rejects_nested_hash_mismatch_trailing_bytes_and_bad_zstd() {
     let compressed = payload.encode_compressed().unwrap();
     let truncated = &compressed[..compressed.len() / 2];
     assert!(
-        CreatureLifecycleBulkPayloadV1::decode_compressed(
+        CreatureLifecycleBulkPayloadV2::decode_compressed(
             truncated,
             transaction_id,
             0,
@@ -909,7 +958,7 @@ fn lifecycle_bulk_decode_caps_decompressed_payload_before_nested_decode() {
     let raw = vec![0_u8; MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED + 1];
     let compressed = zstd::stream::encode_all(raw.as_slice(), 0).unwrap();
     assert!(matches!(
-        CreatureLifecycleBulkPayloadV1::decode_compressed(
+        CreatureLifecycleBulkPayloadV2::decode_compressed(
             &compressed,
             spall_core::TransactionId::new(7).unwrap(),
             0,
@@ -924,8 +973,8 @@ fn lifecycle_bulk_decode_rejects_compact_uniform_solid_work() {
     let mut f = Fixture::new();
     let mut commit = validated_three_part_commit(&mut f);
     let record = match &mut commit.change.operation {
-        CreatureLifecycleOperationV1::Birth { after }
-        | CreatureLifecycleOperationV1::Death { after } => after,
+        CreatureLifecycleOperationV2::Birth { after }
+        | CreatureLifecycleOperationV2::Death { after } => after,
     };
     let mut brick = record.parts[0].bricks[0].clone();
     brick.cells = BaselineCells::Uniform(1);
@@ -942,7 +991,7 @@ fn lifecycle_bulk_decode_rejects_compact_uniform_solid_work() {
     raw.extend(postcard::to_stdvec(&commit).unwrap());
     let compressed = zstd::stream::encode_all(raw.as_slice(), 0).unwrap();
     assert!(matches!(
-        CreatureLifecycleBulkPayloadV1::decode_compressed(
+        CreatureLifecycleBulkPayloadV2::decode_compressed(
             &compressed,
             transaction_id,
             0,
@@ -957,8 +1006,8 @@ fn lifecycle_bulk_rejects_uniform_brick_hash_work_before_hashing() {
     let mut f = Fixture::new();
     let mut commit = validated_three_part_commit(&mut f);
     let record = match &mut commit.change.operation {
-        CreatureLifecycleOperationV1::Birth { after }
-        | CreatureLifecycleOperationV1::Death { after } => after,
+        CreatureLifecycleOperationV2::Birth { after }
+        | CreatureLifecycleOperationV2::Death { after } => after,
     };
     let mut dense_brick = record.parts[0].bricks[0].clone();
     dense_brick.cells = BaselineCells::Uniform(1);
@@ -966,7 +1015,7 @@ fn lifecycle_bulk_rejects_uniform_brick_hash_work_before_hashing() {
         record.parts[0].bricks.push(dense_brick.clone());
     }
     assert!(matches!(
-        CreatureLifecycleBulkPayloadV1::new(commit.change.transaction_id, 0, commit,),
+        CreatureLifecycleBulkPayloadV2::new(commit.change.transaction_id, 0, commit,),
         Err(CreatureLifecycleBulkError::WorkLimit)
     ));
 }

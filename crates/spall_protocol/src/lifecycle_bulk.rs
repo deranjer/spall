@@ -13,16 +13,16 @@ use crate::creature_owner::{
     MAX_CREATURE_OWNER_SET_RECORDS, MAX_CREATURE_OWNER_SET_SOLID_CELLS,
 };
 use crate::{
-    CreatureLifecycleCommitV1, Hash32, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
+    CreatureLifecycleCommitV2, Hash32, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
     MAX_CREATURE_OWNER_DENSE_CELLS, MAX_CREATURE_OWNER_MASK_BRICKS, MAX_CREATURE_OWNER_MASK_CELLS,
     MAX_CREATURE_OWNER_PARTS, MAX_CREATURE_OWNER_RECORD_BYTES, MAX_CREATURE_OWNER_SOLID_CELLS,
 };
 
-pub const CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA: u16 = 1;
+pub const CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA: u16 = 2;
 pub const MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED: usize = MAX_CREATURE_OWNER_RECORD_BYTES + 64;
 
 /// Cumulative work charged by one lifecycle attachment to its transaction set.
-/// The limits mirror `CreatureOwnershipSetV1::validate`, with explicit bounds
+/// The limits mirror `CreatureOwnershipSetV2::validate`, with explicit bounds
 /// for motion and death-witness arrays carried outside the owner record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LifecycleAttachmentWork {
@@ -34,6 +34,7 @@ pub(crate) struct LifecycleAttachmentWork {
     pub masks: usize,
     pub mask_cells: usize,
     pub overlay_poses: usize,
+    pub part_velocities: usize,
     pub witness_poses: usize,
 }
 
@@ -47,6 +48,7 @@ impl LifecycleAttachmentWork {
             solid_cells: MAX_CREATURE_OWNER_SET_SOLID_CELLS,
             masks: MAX_CREATURE_OWNER_MASK_BRICKS,
             mask_cells: MAX_CREATURE_OWNER_SET_SOLID_CELLS,
+            part_velocities: 2 * MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS,
             overlay_poses: MAX_CREATURE_OWNER_SET_RECORDS
                 * (MAX_CREATURE_OWNER_PARTS + MAX_CREATURE_OWNER_COMPONENTS),
             witness_poses: MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS,
@@ -70,20 +72,21 @@ impl LifecycleAttachmentWork {
         charge_field!(masks);
         charge_field!(mask_cells);
         charge_field!(overlay_poses);
+        charge_field!(part_velocities);
         charge_field!(witness_poses);
         Ok(())
     }
 }
 
-/// Correlated lifecycle payload carried as the compressed body of a world-version-6
+/// Correlated lifecycle payload carried as the compressed body of a world-version-7
 /// BaselineBegin/BaselinePart/BaselineEnd transfer.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CreatureLifecycleBulkPayloadV1 {
+pub struct CreatureLifecycleBulkPayloadV2 {
     pub schema: u16,
     pub transaction_id: TransactionId,
     pub operation_ordinal: u32,
     pub commit_hash: Hash32,
-    pub commit: CreatureLifecycleCommitV1,
+    pub commit: CreatureLifecycleCommitV2,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,11 +117,11 @@ pub enum CreatureLifecycleBulkError {
     Zstd(String),
 }
 
-impl CreatureLifecycleBulkPayloadV1 {
+impl CreatureLifecycleBulkPayloadV2 {
     pub fn new(
         transaction_id: TransactionId,
         operation_ordinal: u32,
-        commit: CreatureLifecycleCommitV1,
+        commit: CreatureLifecycleCommitV2,
     ) -> Result<Self, CreatureLifecycleBulkError> {
         check_commit_work(&commit)?;
         if commit.change.transaction_id != transaction_id
@@ -319,8 +322,10 @@ impl CreatureLifecycleBulkPayloadV1 {
         let decoded_bytes = raw.len();
         let (prefix, commit_bytes): (PayloadPrefixV1, &[u8]) = postcard::take_from_bytes(&raw)
             .map_err(|e| CreatureLifecycleBulkError::Postcard(e.to_string()))?;
-        if prefix.schema != CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA
-            || prefix.transaction_id != transaction_id
+        if prefix.schema != CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA {
+            return Err(CreatureLifecycleBulkError::Schema);
+        }
+        if prefix.transaction_id != transaction_id
             || prefix.operation_ordinal != operation_ordinal
             || prefix.commit_hash != commit_hash
         {
@@ -333,7 +338,7 @@ impl CreatureLifecycleBulkPayloadV1 {
                 MAX_CREATURE_OWNER_RECORD_BYTES,
             ));
         }
-        let (commit, rest): (CreatureLifecycleCommitV1, &[u8]) =
+        let (commit, rest): (CreatureLifecycleCommitV2, &[u8]) =
             postcard::take_from_bytes(commit_bytes)
                 .map_err(|e| CreatureLifecycleBulkError::Postcard(e.to_string()))?;
         if !rest.is_empty() {
@@ -341,7 +346,7 @@ impl CreatureLifecycleBulkPayloadV1 {
                 "trailing bytes after nested lifecycle commit".into(),
             ));
         }
-        let payload = CreatureLifecycleBulkPayloadV1 {
+        let payload = CreatureLifecycleBulkPayloadV2 {
             schema: prefix.schema,
             transaction_id: prefix.transaction_id,
             operation_ordinal: prefix.operation_ordinal,
@@ -390,12 +395,12 @@ impl Write for LimitedVecWriter {
     }
 }
 
-fn check_commit_work(commit: &CreatureLifecycleCommitV1) -> Result<(), CreatureLifecycleBulkError> {
+fn check_commit_work(commit: &CreatureLifecycleCommitV2) -> Result<(), CreatureLifecycleBulkError> {
     commit_work(commit).map(|_| ())
 }
 
 fn commit_work(
-    commit: &CreatureLifecycleCommitV1,
+    commit: &CreatureLifecycleCommitV2,
 ) -> Result<LifecycleAttachmentWork, CreatureLifecycleBulkError> {
     if commit.schema != crate::CREATURE_LIFECYCLE_COMMIT_SCHEMA
         || commit.change.schema != crate::CREATURE_CHANGE_SCHEMA
@@ -403,7 +408,8 @@ fn commit_work(
         return Err(CreatureLifecycleBulkError::Schema);
     }
     if commit.pre_motion.as_ref().is_some_and(|motion| {
-        motion.parts.len() > MAX_CREATURE_OWNER_PARTS
+        motion.part_velocities.len() > MAX_CREATURE_OWNER_PARTS
+            || motion.parts.len() > MAX_CREATURE_OWNER_PARTS
             || motion.components.len() > MAX_CREATURE_OWNER_COMPONENTS
     }) || commit
         .death_witness
@@ -413,15 +419,16 @@ fn commit_work(
         return Err(CreatureLifecycleBulkError::WorkLimit);
     }
     let record = match &commit.change.operation {
-        crate::CreatureLifecycleOperationV1::Birth { after }
-        | crate::CreatureLifecycleOperationV1::Death { after } => after,
+        crate::CreatureLifecycleOperationV2::Birth { after }
+        | crate::CreatureLifecycleOperationV2::Death { after } => after,
     };
     if record.schema != crate::CREATURE_OWNER_SCHEMA
         || record.state.schema != crate::CREATURE_STATE_SCHEMA
     {
         return Err(CreatureLifecycleBulkError::Schema);
     }
-    if record.parts.len() > MAX_CREATURE_OWNER_PARTS
+    if record.part_velocities.len() > MAX_CREATURE_OWNER_PARTS
+        || record.parts.len() > MAX_CREATURE_OWNER_PARTS
         || record.components.len() > MAX_CREATURE_OWNER_COMPONENTS
     {
         return Err(CreatureLifecycleBulkError::WorkLimit);
@@ -517,9 +524,11 @@ fn commit_work(
         masks: mask_bricks,
         mask_cells,
         overlay_poses: 0,
+        part_velocities: record.part_velocities.len(),
         witness_poses: 0,
     };
     if let Some(overlay) = &commit.pre_motion {
+        work.part_velocities += overlay.part_velocities.len();
         work.overlay_poses = overlay
             .parts
             .len()
