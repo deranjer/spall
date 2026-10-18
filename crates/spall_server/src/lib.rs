@@ -20,6 +20,7 @@ pub mod replication;
 pub mod residency;
 pub mod residency_pass;
 pub mod serve;
+pub mod transfer_ids;
 
 pub use action_catalog::{ToolCatalog, ToolCatalogError, ToolRule};
 pub use baseline::{

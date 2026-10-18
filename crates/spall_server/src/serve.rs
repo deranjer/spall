@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use crate::action_catalog::ToolCatalog;
 use crate::replication::{BodyDigest, ClientReplication, InterestSet, MotionBudget};
+use crate::transfer_ids::{TransferIdAllocator, TransferIdError, TransferNamespace};
 use glam::DVec3;
 use serde::Serialize;
 use spall_core::{
@@ -4995,7 +4996,7 @@ struct LateJoin {
     /// slot → highest session generation seen. A record from a lower generation
     /// is from a superseded (reconnected-past) session.
     latest_gen: HashMap<u32, u32>,
-    next_transfer_id: u64,
+    transfer_ids: TransferIdAllocator,
     catch_up_cap: usize,
     max_retries: u32,
     completed: u64,
@@ -5027,12 +5028,20 @@ struct LateJoin {
     capture_pool: CapturePool,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum LateJoinResetError {
+    #[error("reset transfer ID reservation failed: {0}")]
+    TransferId(#[from] TransferIdError),
+    #[error("reset baseline capture failed: {0}")]
+    Baseline(#[from] baseline::BaselineError),
+}
+
 impl LateJoin {
     fn new(catch_up_cap: usize, max_retries: u32, capture_workers: usize) -> Self {
         Self {
             links: HashMap::new(),
             latest_gen: HashMap::new(),
-            next_transfer_id: 1,
+            transfer_ids: TransferIdAllocator::new(),
             catch_up_cap,
             max_retries,
             completed: 0,
@@ -5160,7 +5169,12 @@ impl LateJoin {
         clients: &ClientMap,
         motion: &mut MotionPublisher,
         catalogue_basis: Option<&baseline::CatalogueBasis>,
-    ) -> Result<usize, baseline::BaselineError> {
+    ) -> Result<usize, LateJoinResetError> {
+        let sessions: Vec<SessionId> = self.sessions().collect();
+        let session_count = sessions.len();
+        let mut reset_ids = self
+            .transfer_ids
+            .reserve(TransferNamespace::Reset, sessions.len())?;
         self.cached_baseline = None;
         self.pending_captures.clear();
         let phase_started = std::time::Instant::now();
@@ -5169,14 +5183,14 @@ impl LateJoin {
         let mut full_transfers: HashMap<bool, baseline::BaselineTransfer> = HashMap::new();
         let mut new_world_hash = None;
         let keyframe = Arc::new(motion.full_snapshots(sim.world(), sim.current_tick()));
-        let sessions: Vec<SessionId> = self.sessions().collect();
-        for session in &sessions {
-            let id = self.next_id();
-            let id = TransferId(id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT);
+        for session in sessions {
+            let id = reset_ids
+                .next_id()
+                .expect("the reset reservation covers every collected session");
             let link = &self.links[&session.raw()];
             let transfer = if let Some(radius) = link.region_radius {
                 let center = sim
-                    .player_state(session_player_entity(*session))
+                    .player_state(session_player_entity(session))
                     .map_or([0.0; 3], |p| p.position_m);
                 if link.deferred {
                     // A client that holds the previous world's complete catalogue needs only
@@ -5240,9 +5254,9 @@ impl LateJoin {
                 transfer
             };
             self.baseline_bytes += transfer.payload_bytes() as u64;
-            send_to(clients, *session, Outbound::Baseline(Arc::new(transfer)));
+            send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
             if !keyframe.is_empty() {
-                send_to(clients, *session, Outbound::Motion(Arc::clone(&keyframe)));
+                send_to(clients, session, Outbound::Motion(Arc::clone(&keyframe)));
             }
             if let Some(link) = self.links.get_mut(&session.raw()) {
                 link.phase = Phase::Live;
@@ -5251,10 +5265,10 @@ impl LateJoin {
         tracing::info!(
             snapshot_ms,
             transfers_ms = phase_started.elapsed().as_millis() as u64 - snapshot_ms,
-            sessions = sessions.len(),
+            sessions = session_count,
             "world reset baselines"
         );
-        Ok(sessions.len())
+        Ok(session_count)
     }
 
     /// Every connected client currently in normal (`Live`) replication. A client
@@ -5335,10 +5349,11 @@ impl LateJoin {
             .is_some_and(|&g| session.generation() < g)
     }
 
-    fn next_id(&mut self) -> TransferId {
-        let id = TransferId(self.next_transfer_id);
-        self.next_transfer_id += 1;
-        id
+    fn reserve_id(&mut self, namespace: TransferNamespace) -> Result<TransferId, TransferIdError> {
+        self.transfer_ids
+            .reserve(namespace, 1)?
+            .next_id()
+            .ok_or(TransferIdError::Exhausted)
     }
 
     /// Handles a `BaselineAck`: the sentinel starts a late-join transfer; a real
@@ -5356,9 +5371,9 @@ impl LateJoin {
             return;
         }
         let want_baseline = ack.transfer_id == BASELINE_REQUEST_SENTINEL;
-        let Some(link) = self.links.get(&session.raw()) else {
+        if !self.links.contains_key(&session.raw()) {
             return;
-        };
+        }
 
         if want_baseline {
             let deferred_radius =
@@ -5370,11 +5385,17 @@ impl LateJoin {
             let segmented = ack.verified_manifest_hash
                 == spall_protocol::segment::baseline_cap_streamed()
                 || region_radius.is_some();
+            let id = match self.reserve_id(TransferNamespace::Baseline) {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::error!(session = session.raw(), %error, "transfer ID allocation exhausted");
+                    return;
+                }
+            };
             let link = self.links.get_mut(&session.raw()).unwrap();
             link.segmented = segmented;
             link.region_radius = region_radius;
             link.deferred = deferred;
-            let id = self.next_id();
             match self.cached_baseline.as_ref().filter(|b| {
                 region_radius.is_none()
                     && b.begin.journal_cursor == JournalSeq(sim.journal_cursor())
@@ -5428,7 +5449,9 @@ impl LateJoin {
         }
 
         // Confirmation of an in-flight transfer.
-        let matches = matches!(&link.phase, Phase::Joining { transfer_id, .. } if *transfer_id == ack.transfer_id);
+        let matches = self.links.get(&session.raw()).is_some_and(|link| {
+            matches!(&link.phase, Phase::Joining { transfer_id, .. } if *transfer_id == ack.transfer_id)
+        });
         if !matches {
             return; // stale / duplicate ack
         }
@@ -5497,15 +5520,12 @@ impl LateJoin {
             }
         }
         for raw in overflowed {
-            let (session, retries) = match self.links.get_mut(&raw) {
+            let (session, retries) = match self.links.get(&raw) {
                 Some(ClientLink {
                     session,
                     phase: Phase::Joining { retries, .. },
                     ..
-                }) => {
-                    *retries += 1;
-                    (*session, *retries)
-                }
+                }) => (*session, retries.saturating_add(1)),
                 _ => continue,
             };
             if retries > self.max_retries {
@@ -5518,10 +5538,25 @@ impl LateJoin {
                 );
                 continue;
             }
+            let id = match self.reserve_id(TransferNamespace::Baseline) {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::error!(session = session.raw(), %error, "retry transfer ID allocation exhausted");
+                    continue;
+                }
+            };
+            if let Some(ClientLink {
+                phase: Phase::Joining {
+                    retries: current, ..
+                },
+                ..
+            }) = self.links.get_mut(&raw)
+            {
+                *current = retries;
+            }
             self.retries += 1;
             // A synchronous retry supersedes any older background capture for this session.
             self.pending_captures.remove(&raw);
-            let id = self.next_id();
             let segmented = self.links.get(&raw).is_some_and(|link| link.segmented);
             let regional = self
                 .links
@@ -5593,7 +5628,13 @@ impl LateJoin {
         let Some(world) = baseline::logical_brick_repair_patch(sim, req, self.backing_ref()) else {
             return;
         };
-        let id = self.next_id();
+        let id = match self.reserve_id(TransferNamespace::Baseline) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(session = session.raw(), %error, "repair transfer ID allocation exhausted");
+                return;
+            }
+        };
         let cursor = JournalSeq(sim.journal_cursor());
         if let Ok(transfer) = baseline::transfer_from_world(world, id, InterestEpoch(1), cursor) {
             self.baseline_bytes += transfer.payload_bytes() as u64;
@@ -7520,6 +7561,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reset_id_exhaustion_preserves_join_phase_and_pending_transfers() {
+        let sim = Scene::BridgeCut.simulation();
+        let clients = empty_clients();
+        let mut lj = LateJoin::new(4, 2, 1);
+        let session = sess(0, 1);
+        lj.on_joined(session);
+        if let Some(link) = lj.links.get_mut(&session.raw()) {
+            link.phase = Phase::Joining {
+                transfer_id: TransferId(77),
+                queue: VecDeque::new(),
+                retries: 1,
+            };
+        }
+        lj.cached_baseline = Some(Arc::new(lj.capture_for(&sim, TransferId(12)).unwrap()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(sender);
+        lj.pending_captures
+            .insert(session.raw(), (TransferId(78), receiver));
+        lj.transfer_ids
+            .set_next_low_for_test(crate::transfer_ids::CREATURE_LIFECYCLE_TRANSFER_ID_BIT);
+
+        let result = lj.reset_world(&sim, &clients, &mut MotionPublisher::new(60, 20), None);
+
+        assert!(result.is_err());
+        assert!(lj.cached_baseline.is_some());
+        assert!(lj.pending_captures.contains_key(&session.raw()));
+        assert!(matches!(
+            lj.links.get(&session.raw()).map(|link| &link.phase),
+            Some(Phase::Joining {
+                transfer_id: TransferId(77),
+                retries: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            lj.transfer_ids.next_low(),
+            crate::transfer_ids::CREATURE_LIFECYCLE_TRANSFER_ID_BIT
+        );
+    }
+
     /// ENG-30 / T23 row 11, increment 30: a 1-worker [`CapturePool`] must run
     /// submitted jobs strictly one after another, never overlapping -- the
     /// whole point of bounding `LateJoin::on_baseline_ack`'s background
@@ -7618,6 +7700,13 @@ mod tests {
             lj.links.get(&joiner.raw()).map(|l| &l.phase),
             Some(Phase::Joining { .. })
         ));
+        assert!(matches!(
+            lj.links.get(&joiner.raw()).map(|l| &l.phase),
+            Some(Phase::Joining {
+                transfer_id: TransferId(1),
+                ..
+            })
+        ));
 
         let tx = || {
             Arc::new(TopologyTransaction {
@@ -7639,6 +7728,14 @@ mod tests {
         }
         assert_eq!(lj.retries, 1);
         assert!(lj.links.contains_key(&joiner.raw()));
+        assert!(matches!(
+            lj.links.get(&joiner.raw()).map(|l| &l.phase),
+            Some(Phase::Joining {
+                transfer_id: TransferId(2),
+                retries: 1,
+                ..
+            })
+        ));
 
         // Fill the fresh queue past the cap again → retry 2 > budget → dropped.
         for _ in 0..3 {
