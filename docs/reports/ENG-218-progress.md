@@ -4,8 +4,8 @@ Date: 2026-10-17. ENG-218 remains in progress. This is measured partial
 implementation evidence, not acceptance of animal replication or recovery.
 
 Current accepted main protocol/wire is 9: inline lifecycle framing plus a
-bounded typed bulk marker/codec. Dispatch and production spawning remain closed;
-the authoritative producer draft is isolated pending validation. Earlier sections
+bounded typed bulk marker/codec. The internal inline authoritative producer is
+integrated and validated; live admission, bulk dispatch and production spawning remain closed. Earlier sections
 below record the versions and test counts at their specific integration points.
 
 ## Integrated replay guard
@@ -286,3 +286,60 @@ unaccepted until their focused/full checks pass. Next unblocked work is still
 ENG-218: finish that producer, shared transfer reservations and typed journal
 attachments, then replica/baseline and durable recovery consumers. No launch,
 GPU or population acceptance is claimed.
+
+## Internal authoritative inline producer integrated
+
+Worker `4a94a2c` is integrated as main `1d304da`. The crate-private producer
+prepares a small actor-host candidate, shared registry IDs, original source
+ownership, checked physical evidence and optional geometry under one transaction
+and journal sequence. It validates all candidates before publishing geometry,
+physics, sources/host and one journal entry. It does not clone the simulation or
+physics world. Final checks include actual mapping entries, world identity,
+physics step/affected owner state, host/allocator revision, journal cursor and
+source identity/content/brick revisions/metadata. Death uses the prepared physical
+transfer outcome. Birth rejects uninstalled nonzero initial twist. Incremental
+source/physics/portable-data work limits run before expensive staging copies.
+
+Tests cover ordered Birth -> applied part pose -> checked Death, stale pose-token
+refusal, source replacement between prepare and validate, late invalid actor in a
+mixed terrain edit, and successful mixed publication with one journal append.
+The strengthened source test changes a sparse revision-1 brick while a resident
+Uniform AIR brick keeps the maximum revision at 5. An initial two-Dense-brick
+version exceeded the inline cap; the revised fixture retains the exact low-revision
+invariant without falsely claiming multi-part bulk admission. Mixed hash assertions
+use the terrain hash because the geometry-only whole-world hash deliberately
+refuses actor-source worlds. No failing fixture was counted as passed.
+
+Worker focused lifecycle tests: 9 passed. Coordinator
+`cargo test -p spall_sim`: **252 passed, 9 ignored, 30 targets**, including unit,
+integration and doc targets. Workspace all-target/all-feature check and strict
+seven-package all-target Clippy passed. Logs:
+`.local/eng218-producer-integrated-sim.log`,
+`.local/eng218-producer-integrated-workspace.log`, and
+`.local/eng218-producer-integrated-clippy.log`. The initial coordinator command was
+not executed because automatic approval review reported a usage-service failure;
+an account check showed usage available and the same approval path then accepted
+the retry. No approval was bypassed.
+
+Independent review found no concrete mismatch in candidate fences or death
+pose/twist evidence. It confirmed remaining blockers: no production tick caller,
+inline-only output, and pre-commit waking in the existing body edit schedule. A
+coordinator guard now refuses dormant mixed targets before geometry preparation,
+preventing a solver lookup on an absent body and retaining sleep, geometry,
+host, registry and journal. The focused regression passed (1 test) and strict
+Sim all-target Clippy passed; logs `.local/eng218-dormant-mixed-rejection.log`
+and `.local/eng218-dormant-mixed-clippy.log`. Ordinary edit scheduling is unchanged;
+real staged reactivation remains required, not accepted by this refusal test.
+
+Three narrow dead-code allowances mark the closed intent, result and convenience
+entry, pending a real server caller. No module-wide suppression or spawning
+activation was used. Protocol/wire 9, baseline 1 and store 3 remain current.
+The existing three-part record still rejects this inline-only producer.
+
+Next ENG-218 prerequisites are in progress in the isolated checkout: a single
+checked runtime transfer allocator for existing baseline/reset/repair paths and
+bounded typed attachment sets. They are not yet integrated. The eventual tick
+handoff must use owned reservation data before final hashing/journaling; all
+geometry split and lifecycle callers must use that same allocator. Replica,
+complete baseline/checkpoint, actor-aware journal recovery and live scheduling
+still follow. No combined 1024 m/GPU/population/multiplayer acceptance is claimed.

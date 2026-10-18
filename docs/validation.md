@@ -1681,3 +1681,10 @@ bulk and durable-recovery consumers pass the acceptance scenarios in
 [ENG-218 design](reports/ENG-218-design.md). No combined animal/weather 1024 m,
 population, GPU or multiplayer restart/destruction result is implied by the
 current CPU checks.
+
+The internal inline producer is exercised by `cargo test -p spall_sim`. Its
+focused dormant-target refusal is `cargo test -p spall_sim --lib
+dormant_mixed_target_rejects_without_waking_or_publishing`. It must retain a
+dormant body's sleep/physics state, terrain/body geometry, actor host, registry
+and journal on rejection. This is a closed admission boundary, not acceptance of
+atomic dormant-body reactivation or live animal scheduling.

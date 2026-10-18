@@ -558,6 +558,96 @@ mod creature_host_tests {
     }
 
     #[test]
+    fn dormant_mixed_target_rejects_without_waking_or_publishing() {
+        let mut simulation =
+            Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
+        simulation
+            .initialize_creature_host(WorldId::from_u128(10))
+            .unwrap();
+        let entity = simulation
+            .world
+            .spawn_body(
+                crate::fixtures::solid_block(2),
+                crate::body::BodyPose::new(glam::DQuat::IDENTITY, [0.0, 3.0, 0.0]),
+                [0.0; 3],
+                [0.0; 3],
+                2600.0,
+                0,
+            )
+            .unwrap();
+        let body = simulation.world.body(entity).unwrap();
+        let volume_id = body.volume_id;
+        let intent = crate::intent::EditIntent::cut(
+            RequestId(9),
+            entity,
+            EditTarget::Body(entity),
+            SphereBrush::new(
+                BrushPoint::from_units(BRUSH_UNIT / 2, BRUSH_UNIT / 2, BRUSH_UNIT / 2),
+                BRUSH_UNIT,
+            )
+            .unwrap(),
+        );
+        let staged = crate::stage::stage_edit(&crate::stage::StageInput::new(
+            &intent,
+            volume_id,
+            body.volume.clone(),
+            spall_voxel::EvictedBricks::new(),
+            simulation.world.anchor(),
+            simulation.world.generation(),
+            simulation.world.topology_epoch(),
+        ))
+        .unwrap();
+        assert!(simulation.world.deactivate_body(entity));
+        let catalog = crate::creatures::tests::FixtureCatalog::with_materials(
+            simulation.world.materials().clone(),
+        );
+        let source_id = simulation
+            .world
+            .registry()
+            .clone()
+            .allocate_volume()
+            .unwrap();
+        let state = catalog.state(1, source_id.get());
+        let before = (
+            simulation.world.world_hash(),
+            simulation.world.registry().counters(),
+            simulation.world.physics().body_count(),
+            simulation.journal.cursor(),
+            simulation.creatures.as_ref().unwrap().revision(),
+        );
+        let result = simulation.prepare_creature_lifecycle_transaction(
+            Tick(1),
+            spall_protocol::ControlSeq(1),
+            vec![AuthoritativeCreatureIntent::Birth {
+                state: Box::new(state),
+                parts: vec![CreatureBirthPartInput {
+                    part_id: 1,
+                    parent_id: None,
+                    local_transform: PartTransform::IDENTITY,
+                    volume: source_volume(source_id),
+                }],
+                representation: Representation::MergedCuboids,
+            }],
+            Some(&staged),
+            &catalog.view(),
+        );
+        assert!(
+            matches!(result, Err(reason) if reason.contains("staged dormant-body reactivation"))
+        );
+        assert!(simulation.world.body_is_dormant(entity));
+        assert_eq!(
+            (
+                simulation.world.world_hash(),
+                simulation.world.registry().counters(),
+                simulation.world.physics().body_count(),
+                simulation.journal.cursor(),
+                simulation.creatures.as_ref().unwrap().revision(),
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn ordered_single_part_birth_publishes_one_transaction_and_oversized_birth_rejects_atomically()
     {
         let mut simulation =
@@ -1992,6 +2082,11 @@ impl Simulation {
 
         if intents.is_empty() {
             return Err("lifecycle transaction has no actor operations".into());
+        }
+        if staged.is_some_and(|edit| {
+            matches!(edit.target, EditTarget::Body(entity) if self.world.body_is_dormant(entity))
+        }) {
+            return Err("mixed lifecycle commit requires staged dormant-body reactivation".into());
         }
         let live_host = self
             .creatures

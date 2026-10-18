@@ -879,7 +879,10 @@ Lifecycle changes belong in the existing ordered topology transaction and journa
 sharing the world ID allocators and transaction replay receipt. The accepted
 protocol/wire-9 inline operation and typed bulk marker are framing boundaries: current client and
 geometry-only replay consumers reject actor-bearing transactions before mutation.
-The full authoritative/replica/baseline/store consumer remains under implementation;
+An internal authoritative prepare/validate/publish path now supports inline birth,
+checked death and mixed geometry without publishing a partial candidate. It is
+not connected to live tick admission; dormant mixed targets reject until waking
+can be staged atomically. Bulk, replica, baseline and store consumers remain under implementation;
 production animal spawning is disabled. See
 [ENG-218 design](reports/ENG-218-design.md) and
 [measured progress](reports/ENG-218-progress.md).
