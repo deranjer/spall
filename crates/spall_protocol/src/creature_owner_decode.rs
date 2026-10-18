@@ -17,7 +17,16 @@ const MAX_DECODE_WORK: usize = MAX_CREATURE_OWNER_DENSE_CELLS
     + MAX_CREATURE_OWNER_BRICKS
     + MAX_CREATURE_OWNER_COMPONENTS
     + MAX_CREATURE_OWNER_MASK_BRICKS;
+const MAX_SET_DECODE_WORK: usize = MAX_CREATURE_OWNER_SET_DENSE_CELLS
+    + MAX_CREATURE_OWNER_SET_SOLID_CELLS
+    + MAX_CREATURE_OWNER_SET_RECORDS
+    + MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS
+    + MAX_CREATURE_OWNER_BRICKS
+    + MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_COMPONENTS
+    + MAX_CREATURE_OWNER_MASK_BRICKS
+    + MAX_CREATURE_OWNER_SET_SOLID_CELLS;
 const RECORD_FIXED_BYTES: usize = 16 * 1024;
+const SET_FIXED_BYTES: usize = 64;
 
 struct ExpectedStruct(&'static str);
 impl de::Expected for ExpectedStruct {
@@ -47,6 +56,21 @@ struct DecodeBudget {
     solid_cells: usize,
     bytes: usize,
     work: usize,
+    set: Option<SetBudget>,
+}
+
+#[derive(Default)]
+struct SetBudget {
+    records: usize,
+    parts: usize,
+    bricks: usize,
+    dense_cells: usize,
+    components: usize,
+    masks: usize,
+    mask_cells: usize,
+    solid_cells: usize,
+    bytes: usize,
+    work: usize,
 }
 
 impl DecodeBudget {
@@ -54,6 +78,55 @@ impl DecodeBudget {
         let mut budget = Self::default();
         budget.reserve_bytes(RECORD_FIXED_BYTES)?;
         Ok(budget)
+    }
+
+    fn new_set<E: de::Error>() -> Result<Self, E> {
+        let mut budget = Self {
+            set: Some(SetBudget::default()),
+            ..Self::default()
+        };
+        budget.reserve_set_bytes(SET_FIXED_BYTES)?;
+        Ok(budget)
+    }
+
+    fn begin_record<E: de::Error>(&mut self) -> Result<(), E> {
+        self.parts = 0;
+        self.bricks = 0;
+        self.dense_cells = 0;
+        self.components = 0;
+        self.masks = 0;
+        self.mask_cells = 0;
+        self.solid_cells = 0;
+        self.bytes = 0;
+        self.work = 0;
+        self.reserve_bytes(RECORD_FIXED_BYTES)
+    }
+
+    fn add_set_record<E: de::Error>(&mut self) -> Result<(), E> {
+        let set = self
+            .set
+            .as_mut()
+            .ok_or_else(|| E::custom("set decoder budget is missing"))?;
+        set.records = set
+            .records
+            .checked_add(1)
+            .filter(|records| *records <= MAX_CREATURE_OWNER_SET_RECORDS)
+            .ok_or_else(|| E::custom("creature ownership set record limit exceeded"))?;
+        Ok(())
+    }
+
+    fn reserve_set_bytes<E: de::Error>(&mut self, amount: usize) -> Result<(), E> {
+        let set = self
+            .set
+            .as_mut()
+            .ok_or_else(|| E::custom("set decoder budget is missing"))?;
+        let bytes = set
+            .bytes
+            .checked_add(amount)
+            .filter(|bytes| *bytes <= MAX_CREATURE_OWNER_SET_BYTES)
+            .ok_or_else(|| E::custom("creature ownership set decoded-byte budget exceeded"))?;
+        set.bytes = bytes;
+        Ok(())
     }
 
     fn count(&self, counter: Counter) -> usize {
@@ -79,7 +152,10 @@ impl DecodeBudget {
     }
 
     fn remaining(&self, counter: Counter) -> usize {
-        Self::limit(counter).saturating_sub(self.count(counter))
+        let local = Self::limit(counter).saturating_sub(self.count(counter));
+        self.set
+            .as_ref()
+            .map_or(local, |set| local.min(set.remaining(counter)))
     }
 
     fn add_count(&mut self, counter: Counter, amount: usize) {
@@ -91,6 +167,9 @@ impl DecodeBudget {
             Counter::Masks => self.masks += amount,
             Counter::MaskCells => self.mask_cells += amount,
         }
+        if let Some(set) = &mut self.set {
+            set.add_count(counter, amount);
+        }
     }
 
     fn reserve_bytes<E: de::Error>(&mut self, amount: usize) -> Result<(), E> {
@@ -99,6 +178,14 @@ impl DecodeBudget {
             .checked_add(amount)
             .filter(|bytes| *bytes <= MAX_DECODE_BYTES)
             .ok_or_else(|| E::custom("creature ownership decoded-byte budget exceeded"))?;
+        if let Some(set) = &self.set {
+            let total = set
+                .bytes
+                .checked_add(amount)
+                .filter(|bytes| *bytes <= MAX_CREATURE_OWNER_SET_BYTES)
+                .ok_or_else(|| E::custom("creature ownership set decoded-byte budget exceeded"))?;
+            self.set.as_mut().expect("set budget checked above").bytes = total;
+        }
         self.bytes = bytes;
         Ok(())
     }
@@ -109,6 +196,14 @@ impl DecodeBudget {
             .checked_add(amount)
             .filter(|work| *work <= MAX_DECODE_WORK)
             .ok_or_else(|| E::custom("creature ownership decode-work budget exceeded"))?;
+        if let Some(set) = &self.set {
+            let total = set
+                .work
+                .checked_add(amount)
+                .filter(|work| *work <= MAX_SET_DECODE_WORK)
+                .ok_or_else(|| E::custom("creature ownership set decode-work budget exceeded"))?;
+            self.set.as_mut().expect("set budget checked above").work = total;
+        }
         self.work = work;
         Ok(())
     }
@@ -151,7 +246,57 @@ impl DecodeBudget {
             .filter(|count| *count <= MAX_CREATURE_OWNER_SOLID_CELLS)
             .ok_or_else(|| E::custom("creature ownership solid-cell limit exceeded"))?;
         self.solid_cells = count;
+        if let Some(set) = &self.set {
+            let total = set
+                .solid_cells
+                .checked_add(amount)
+                .filter(|count| *count <= MAX_CREATURE_OWNER_SET_SOLID_CELLS)
+                .ok_or_else(|| E::custom("creature ownership set solid-cell limit exceeded"))?;
+            self.set
+                .as_mut()
+                .expect("set budget checked above")
+                .solid_cells = total;
+        }
         Ok(())
+    }
+}
+
+impl SetBudget {
+    fn count(&self, counter: Counter) -> usize {
+        match counter {
+            Counter::Parts => self.parts,
+            Counter::Bricks => self.bricks,
+            Counter::DenseCells => self.dense_cells,
+            Counter::Components => self.components,
+            Counter::Masks => self.masks,
+            Counter::MaskCells => self.mask_cells,
+        }
+    }
+
+    fn limit(counter: Counter) -> usize {
+        match counter {
+            Counter::Parts => MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS,
+            Counter::Bricks => MAX_CREATURE_OWNER_BRICKS,
+            Counter::DenseCells => MAX_CREATURE_OWNER_SET_DENSE_CELLS,
+            Counter::Components => MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_COMPONENTS,
+            Counter::Masks => MAX_CREATURE_OWNER_MASK_BRICKS,
+            Counter::MaskCells => MAX_CREATURE_OWNER_SET_SOLID_CELLS,
+        }
+    }
+
+    fn remaining(&self, counter: Counter) -> usize {
+        Self::limit(counter).saturating_sub(self.count(counter))
+    }
+
+    fn add_count(&mut self, counter: Counter, amount: usize) {
+        match counter {
+            Counter::Parts => self.parts += amount,
+            Counter::Bricks => self.bricks += amount,
+            Counter::DenseCells => self.dense_cells += amount,
+            Counter::Components => self.components += amount,
+            Counter::Masks => self.masks += amount,
+            Counter::MaskCells => self.mask_cells += amount,
+        }
     }
 }
 
@@ -377,7 +522,9 @@ macro_rules! seeded_struct {
                             if $field.is_some() { return Err(A::Error::duplicate_field($wire)); }
                             $field = Some(map.next_value_seed($field_seed)?);
                         },)+
-                        $field_enum::Ignored => { let _: de::IgnoredAny = map.next_value()?; }
+                        $field_enum::Ignored => {
+                            return Err(A::Error::custom("unknown creature ownership field"));
+                        }
                     }
                 }
                 Ok($output { $($field: map_field_value!($field, $wire, A $(, default $field_default)?)),+ })
@@ -385,6 +532,19 @@ macro_rules! seeded_struct {
         }
     };
 }
+
+seeded_struct!(
+    CreatureOwnershipSetSeed,
+    CreatureOwnershipSetVisitor,
+    CreatureOwnershipSetField,
+    CreatureOwnershipSetV1,
+    "CreatureOwnershipSetV1",
+    budget,
+    {
+        schema => Schema ("schema"): u16 = PlainSeed::new(),
+        records => Records ("records"): Vec<CreatureOwnershipRecordV1> = SetRecordsSeed { budget }
+    }
+);
 
 struct PartsSeed<'a> {
     budget: &'a mut DecodeBudget,
@@ -400,6 +560,15 @@ struct MasksSeed<'a> {
 }
 struct MaskCellsSeed<'a> {
     budget: &'a mut DecodeBudget,
+}
+
+struct SetRecordsSeed<'a> {
+    budget: &'a mut DecodeBudget,
+}
+
+struct SetRecordSeed<'a> {
+    budget: &'a mut DecodeBudget,
+    slot_bytes: usize,
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for PartsSeed<'a> {
@@ -465,6 +634,113 @@ impl<'de, 'a> DeserializeSeed<'de> for MaskCellsSeed<'a> {
             marker: PhantomData,
         }
         .deserialize(d)
+    }
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for SetRecordsSeed<'a> {
+    type Value = Vec<CreatureOwnershipRecordV1>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(SetRecordsVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for SetRecordSeed<'a> {
+    type Value = CreatureOwnershipRecordV1;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        self.budget.add_set_record::<D::Error>()?;
+        self.budget.reserve_set_bytes::<D::Error>(self.slot_bytes)?;
+        self.budget.begin_record::<D::Error>()?;
+        self.budget.add_work::<D::Error>(1)?;
+        <CreatureOwnershipRecordV1 as BudgetDecode>::decode(deserializer, self.budget)
+    }
+}
+
+struct SetRecordsVisitor<'a> {
+    budget: &'a mut DecodeBudget,
+}
+
+impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
+    type Value = Vec<CreatureOwnershipRecordV1>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a bounded sequence of creature ownership records")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        if seq
+            .size_hint()
+            .is_some_and(|declared| declared > MAX_CREATURE_OWNER_SET_RECORDS)
+        {
+            return Err(A::Error::custom(
+                "creature ownership set record limit exceeded",
+            ));
+        }
+
+        let mut records = Vec::new();
+        if let Some(declared) = seq.size_hint()
+            && declared != 0
+        {
+            let bytes = declared
+                .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV1>())
+                .ok_or_else(|| {
+                    A::Error::custom("creature ownership set decoded-byte budget exceeded")
+                })?;
+            self.budget.reserve_set_bytes::<A::Error>(bytes)?;
+            records
+                .try_reserve_exact(declared)
+                .map_err(|_| A::Error::custom("creature ownership allocation limit exceeded"))?;
+        }
+
+        loop {
+            if records.len() == MAX_CREATURE_OWNER_SET_RECORDS {
+                if seq.next_element_seed(RejectExtraSeed)?.is_some() {
+                    return Err(A::Error::custom(
+                        "creature ownership set record limit exceeded",
+                    ));
+                }
+                break;
+            }
+            let needs_slot = records.len() == records.capacity();
+            let slot_bytes = if needs_slot {
+                std::mem::size_of::<CreatureOwnershipRecordV1>()
+            } else {
+                0
+            };
+            match seq.next_element_seed(SetRecordSeed {
+                budget: self.budget,
+                slot_bytes,
+            })? {
+                Some(record) => {
+                    if needs_slot {
+                        let remaining = MAX_CREATURE_OWNER_SET_RECORDS - records.len();
+                        let additional = if records.capacity() == 0 {
+                            remaining.saturating_add(1).min(8)
+                        } else {
+                            remaining.saturating_add(1).min(records.capacity())
+                        };
+                        let extra_items = additional.saturating_sub(1);
+                        let extra_bytes = extra_items
+                            .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV1>())
+                            .ok_or_else(|| {
+                                A::Error::custom(
+                                    "creature ownership set decoded-byte budget exceeded",
+                                )
+                            })?;
+                        self.budget.reserve_set_bytes::<A::Error>(extra_bytes)?;
+                        records.try_reserve_exact(additional).map_err(|_| {
+                            A::Error::custom("creature ownership allocation limit exceeded")
+                        })?;
+                    }
+                    records.push(record);
+                }
+                None => break,
+            }
+        }
+        Ok(records)
     }
 }
 
@@ -658,6 +934,17 @@ impl<'de> DeserializeSeed<'de> for RejectExtraSeed {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(field_identifier)]
+enum DigestField {
+    #[serde(rename = "content_hash")]
+    ContentHash,
+    #[serde(rename = "solid_cells")]
+    SolidCells,
+    #[serde(other)]
+    Unknown,
+}
+
 struct DigestVisitor;
 impl<'de> Visitor<'de> for DigestVisitor {
     type Value = (Hash32, u32);
@@ -676,22 +963,22 @@ impl<'de> Visitor<'de> for DigestVisitor {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut hash = None;
         let mut cells = None;
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "content_hash" => {
+        while let Some(key) = map.next_key::<DigestField>()? {
+            match key {
+                DigestField::ContentHash => {
                     if hash.is_some() {
                         return Err(A::Error::duplicate_field("content_hash"));
                     }
                     hash = Some(map.next_value()?);
                 }
-                "solid_cells" => {
+                DigestField::SolidCells => {
                     if cells.is_some() {
                         return Err(A::Error::duplicate_field("solid_cells"));
                     }
                     cells = Some(map.next_value()?);
                 }
-                _ => {
-                    let _: de::IgnoredAny = map.next_value()?;
+                DigestField::Unknown => {
+                    return Err(A::Error::custom("unknown creature ownership field"));
                 }
             }
         }
@@ -712,6 +999,18 @@ where
 {
     let mut budget = DecodeBudget::new::<D::Error>()?;
     <CreatureOwnershipRecordV1 as BudgetDecode>::decode(deserializer, &mut budget)
+}
+
+/// Decode a bounded ownership set using the record decoder with per-record
+/// and cumulative budgets. The aggregate byte budget accounts for decoded
+/// owned capacity and may be stricter than `CreatureOwnershipSetV1::validate`'s
+/// conservative estimate; each record retains its independent decode ceiling.
+pub(super) fn deserialize_set<'de, D>(deserializer: D) -> Result<CreatureOwnershipSetV1, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut budget = DecodeBudget::new_set::<D::Error>()?;
+    <CreatureOwnershipSetV1 as BudgetDecode>::decode(deserializer, &mut budget)
 }
 
 #[cfg(test)]
@@ -869,6 +1168,71 @@ mod tests {
         accesses: Rc<Cell<usize>>,
         payload_reads: Rc<Cell<usize>>,
     }
+
+    struct RepeatedRecordsDeserializer {
+        remaining: usize,
+        record: serde_json::Value,
+        accesses: Rc<Cell<usize>>,
+        payload_reads: Rc<Cell<usize>>,
+    }
+
+    impl<'de> Deserializer<'de> for RepeatedRecordsDeserializer {
+        type Error = value::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            self.deserialize_seq(visitor)
+        }
+
+        fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_seq(RepeatedRecordsSeq {
+                remaining: self.remaining,
+                record: self.record,
+                accesses: self.accesses,
+                payload_reads: self.payload_reads,
+            })
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct tuple tuple_struct
+            map struct enum identifier ignored_any
+        }
+    }
+
+    struct RepeatedRecordsSeq {
+        remaining: usize,
+        record: serde_json::Value,
+        accesses: Rc<Cell<usize>>,
+        payload_reads: Rc<Cell<usize>>,
+    }
+
+    impl<'de> SeqAccess<'de> for RepeatedRecordsSeq {
+        type Error = value::Error;
+
+        fn next_element_seed<T: DeserializeSeed<'de>>(
+            &mut self,
+            seed: T,
+        ) -> Result<Option<T::Value>, Self::Error> {
+            self.accesses.set(self.accesses.get() + 1);
+            if self.remaining == 0 {
+                return Ok(None);
+            }
+            if self.remaining == 1 {
+                self.remaining = 0;
+                return seed
+                    .deserialize(ProbeDeserializer(self.payload_reads.clone()))
+                    .map(Some);
+            }
+            self.remaining -= 1;
+            seed.deserialize(self.record.clone())
+                .map(Some)
+                .map_err(|error| value::Error::custom(error.to_string()))
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            None
+        }
+    }
     impl<'de> Deserializer<'de> for ProbeDeserializerForSeq {
         type Error = value::Error;
         fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -1014,6 +1378,216 @@ mod tests {
                 "source_masks": []
             }]
         })
+    }
+
+    fn set_record_json(creature_id: u64) -> serde_json::Value {
+        let mut record = optional_field_record_json();
+        record["state"]["key"]["creature_id"] = serde_json::json!(creature_id);
+        record
+    }
+
+    #[test]
+    fn multirecord_set_roundtrips_through_json_and_postcard() {
+        let input = serde_json::json!({
+            "schema": CREATURE_OWNER_SCHEMA,
+            "records": [set_record_json(1), set_record_json(2)]
+        });
+        let set: CreatureOwnershipSetV1 = serde_json::from_value(input).unwrap();
+        assert_eq!(set.records.len(), 2);
+        let bytes = postcard::to_allocvec(&set).unwrap();
+        let decoded: CreatureOwnershipSetV1 = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, set);
+    }
+
+    #[test]
+    fn each_set_record_resets_local_work_before_charging_its_header() {
+        let mut budget = DecodeBudget::new_set::<value::Error>().unwrap();
+        budget.work = MAX_DECODE_WORK;
+        let decoded = SetRecordSeed {
+            budget: &mut budget,
+            slot_bytes: 0,
+        }
+        .deserialize(optional_field_record_json());
+
+        assert!(decoded.is_ok());
+        assert!(budget.work < MAX_DECODE_WORK);
+        assert_eq!(budget.work, budget.set.as_ref().unwrap().work);
+    }
+
+    #[test]
+    fn oversized_or_excess_set_records_reject_before_reading_payload() {
+        let accesses = Rc::new(Cell::new(0));
+        let payload_reads = Rc::new(Cell::new(0));
+        let mut budget = DecodeBudget::new_set::<value::Error>().unwrap();
+        let oversized_hint = SetRecordsSeed {
+            budget: &mut budget,
+        }
+        .deserialize(ProbeDeserializerForSeq {
+            hint: Some(MAX_CREATURE_OWNER_SET_RECORDS + 1),
+            present: true,
+            accesses: accesses.clone(),
+            payload_reads: payload_reads.clone(),
+        });
+        assert!(oversized_hint.is_err());
+        assert_eq!(accesses.get(), 0);
+        assert_eq!(payload_reads.get(), 0);
+
+        let mut budget = DecodeBudget::new_set::<value::Error>().unwrap();
+        budget.set.as_mut().unwrap().records = MAX_CREATURE_OWNER_SET_RECORDS;
+        let extra_unknown_size = SetRecordsSeed {
+            budget: &mut budget,
+        }
+        .deserialize(ProbeDeserializerForSeq {
+            hint: None,
+            present: true,
+            accesses: accesses.clone(),
+            payload_reads: payload_reads.clone(),
+        });
+        assert!(extra_unknown_size.is_err());
+        assert_eq!(payload_reads.get(), 0);
+
+        let mut budget = DecodeBudget::new_set::<value::Error>().unwrap();
+        budget.set.as_mut().unwrap().bytes = MAX_CREATURE_OWNER_SET_BYTES;
+        let empty_unknown_size = SetRecordsSeed {
+            budget: &mut budget,
+        }
+        .deserialize(ProbeDeserializerForSeq {
+            hint: None,
+            present: false,
+            accesses: accesses.clone(),
+            payload_reads: payload_reads.clone(),
+        });
+        assert_eq!(
+            empty_unknown_size.unwrap(),
+            Vec::<CreatureOwnershipRecordV1>::new()
+        );
+    }
+
+    #[test]
+    fn unknown_size_extra_record_after_full_set_is_not_decoded() {
+        let accesses = Rc::new(Cell::new(0));
+        let payload_reads = Rc::new(Cell::new(0));
+        let result = SetRecordsSeed {
+            budget: &mut DecodeBudget::new_set::<value::Error>().unwrap(),
+        }
+        .deserialize(RepeatedRecordsDeserializer {
+            remaining: MAX_CREATURE_OWNER_SET_RECORDS + 1,
+            record: optional_field_record_json(),
+            accesses: accesses.clone(),
+            payload_reads: payload_reads.clone(),
+        });
+
+        assert!(result.is_err());
+        assert_eq!(accesses.get(), MAX_CREATURE_OWNER_SET_RECORDS + 1);
+        assert_eq!(payload_reads.get(), 0);
+    }
+
+    #[test]
+    fn aggregate_uniform_solid_budget_spans_records() {
+        let record = |creature_id| {
+            let mut record = set_record_json(creature_id);
+            record["parts"][0]["bricks"] = serde_json::Value::Array(
+                (0..30)
+                    .map(|x| {
+                        serde_json::json!({
+                            "coord": [x, 0, 0],
+                            "revision": 1,
+                            "edited": false,
+                            "cells": {"Uniform": 1}
+                        })
+                    })
+                    .collect(),
+            );
+            record
+        };
+        let input = serde_json::json!({
+            "schema": CREATURE_OWNER_SCHEMA,
+            "records": (1..=5).map(record).collect::<Vec<_>>()
+        });
+        let error = serde_json::from_value::<CreatureOwnershipSetV1>(input).unwrap_err();
+        assert!(
+            error.to_string().contains("set solid-cell limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn aggregate_dense_and_mask_budgets_persist_across_records() {
+        let mut budget = DecodeBudget::new_set::<value::Error>().unwrap();
+        for _ in 0..2 {
+            budget.begin_record::<value::Error>().unwrap();
+            for _ in 0..(MAX_CREATURE_OWNER_DENSE_CELLS / CELLS_PER_BRICK - 1) {
+                budget.reserve_dense_cells::<value::Error>().unwrap();
+            }
+        }
+        budget.begin_record::<value::Error>().unwrap();
+        for _ in 0..2 {
+            budget.reserve_dense_cells::<value::Error>().unwrap();
+        }
+        assert_eq!(
+            budget.set.as_ref().unwrap().dense_cells,
+            MAX_CREATURE_OWNER_SET_DENSE_CELLS
+        );
+        budget.begin_record::<value::Error>().unwrap();
+        let accesses = Rc::new(Cell::new(0));
+        let payload_reads = Rc::new(Cell::new(0));
+        let dense = DenseSeed {
+            budget: &mut budget,
+        }
+        .deserialize(ProbeDeserializerForSeq {
+            hint: None,
+            present: true,
+            accesses: accesses.clone(),
+            payload_reads: payload_reads.clone(),
+        });
+        assert!(dense.is_err());
+        assert_eq!(payload_reads.get(), 0);
+
+        let mut budget = DecodeBudget::new_set::<value::Error>().unwrap();
+        for _ in 0..2 {
+            budget.begin_record::<value::Error>().unwrap();
+            for _ in 0..(MAX_CREATURE_OWNER_MASK_BRICKS / 2) {
+                budget.charge::<value::Error>(Counter::Masks, 0, 0).unwrap();
+            }
+        }
+        assert_eq!(
+            budget.set.as_ref().unwrap().masks,
+            MAX_CREATURE_OWNER_MASK_BRICKS
+        );
+        budget.begin_record::<value::Error>().unwrap();
+        let masks = CountedVecSeed::<CreatureSourceMaskBrickV1> {
+            budget: &mut budget,
+            counter: Counter::Masks,
+            max: MAX_CREATURE_OWNER_MASK_BRICKS,
+            label: "mask bricks",
+            marker: PhantomData,
+        }
+        .deserialize(ProbeDeserializerForSeq {
+            hint: Some(1),
+            present: true,
+            accesses: accesses.clone(),
+            payload_reads: payload_reads.clone(),
+        });
+        assert!(masks.is_err());
+        assert_eq!(payload_reads.get(), 0);
+
+        budget.set.as_mut().unwrap().mask_cells = MAX_CREATURE_OWNER_SET_SOLID_CELLS;
+        budget.begin_record::<value::Error>().unwrap();
+        let mask_cells = CountedVecSeed::<CreatureMaskCellV1> {
+            budget: &mut budget,
+            counter: Counter::MaskCells,
+            max: CELLS_PER_BRICK,
+            label: "mask cells",
+            marker: PhantomData,
+        }
+        .deserialize(ProbeDeserializerForSeq {
+            hint: Some(1),
+            present: true,
+            accesses: accesses.clone(),
+            payload_reads: payload_reads.clone(),
+        });
+        assert!(mask_cells.is_err());
+        assert_eq!(payload_reads.get(), 0);
     }
 
     #[test]

@@ -39,6 +39,7 @@ const CELLS_PER_BRICK: usize = 32 * 32 * 32;
 
 /// One hierarchy-local transform in stable scalar form.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatureLocalPoseV1 {
     pub translation_m: [f32; 3],
     pub rotation_xyzw: [f32; 4],
@@ -47,6 +48,7 @@ pub struct CreatureLocalPoseV1 {
 /// One portable material cell in a component mask. `index` is the linear
 /// index within the named 32³ source brick; source revision is on the mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatureMaskCellV1 {
     pub index: u16,
     pub material_id: u16,
@@ -232,6 +234,14 @@ impl<'de> Deserialize<'de> for CreatureOwnershipRecordV1 {
         D: Deserializer<'de>,
     {
         decode::deserialize_record(deserializer)
+    }
+}
+impl<'de> Deserialize<'de> for CreatureOwnershipSetV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        decode::deserialize_set(deserializer)
     }
 }
 impl<'de> Deserialize<'de> for CreatureSourcePartV1 {
@@ -1090,9 +1100,9 @@ impl CreatureOwnershipSetV1 {
         w.hash()
     }
 
-    /// Validates a bounded aggregate. `MAX_CREATURE_OWNER_SET_BYTES` is a
-    /// conservative work/memory estimate over owned vectors, not an exact
-    /// postcard byte ceiling; each encoded record has its own exact limit.
+    /// Validates a bounded aggregate. The set-byte estimate limits owned
+    /// decoded work/memory; `encode` and `decode` also enforce the exact
+    /// postcard frame ceiling. Each record retains its independent limit.
     pub fn validate(
         &self,
         catalog: &CreatureValidationCatalog<'_>,
@@ -1255,6 +1265,28 @@ impl CreatureOwnershipSetV1 {
             }
         }
         Ok(())
+    }
+
+    /// Decode a catalog-validated ownership set. Raw Serde
+    /// decoding applies resource bounds only; this entrypoint also enforces
+    /// semantic, catalog, duplicate identity and canonical-order invariants.
+    /// Serialization remains available through the existing Serde contract;
+    /// this decoder's owned-memory admission is stricter than the set's
+    /// conservative validation estimate at some resource edges.
+    pub fn decode(
+        bytes: &[u8],
+        catalog: &CreatureValidationCatalog<'_>,
+    ) -> Result<Self, CreatureOwnershipError> {
+        if bytes.len() > MAX_CREATURE_OWNER_SET_BYTES {
+            return Err(CreatureOwnershipError::Limit);
+        }
+        let (set, rest): (Self, &[u8]) = postcard::take_from_bytes(bytes)
+            .map_err(|error| CreatureOwnershipError::Encoding(error.to_string()))?;
+        if !rest.is_empty() {
+            return Err(CreatureOwnershipError::Encoding("trailing bytes".into()));
+        }
+        set.validate(catalog)?;
+        Ok(set)
     }
 }
 
