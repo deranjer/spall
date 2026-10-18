@@ -1688,3 +1688,12 @@ dormant_mixed_target_rejects_without_waking_or_publishing`. It must retain a
 dormant body's sleep/physics state, terrain/body geometry, actor host, registry
 and journal on rejection. This is a closed admission boundary, not acceptance of
 atomic dormant-body reactivation or live animal scheduling.
+
+Typed attachment framing and resource/correlation regressions run with
+`cargo test -p spall_protocol`. They include mixed geometry and a validated
+three-part Birth, missing/extra/family mismatches, divergent parent transactions,
+malformed geometry allocation lengths and cumulative compact Uniform work.
+Transfer allocation checks are `cargo test -p spall_server transfer_ids::tests`;
+reset preflight is `cargo test -p spall_server
+reset_id_exhaustion_preflight_preserves_world_and_late_join_state`. The latter
+must preserve the simulation and client-transfer state before any reset work.

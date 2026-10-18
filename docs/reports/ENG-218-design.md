@@ -126,7 +126,8 @@ publication; its no-journal publisher returns the same prepared journal entry
 for the enclosing transaction to append once. The normal commit wrapper retains
 its existing behavior and timing span.
 
-The actual `PreparedSimulationTransaction` still must combine registry/host/source
-candidates, total geometry plus actor body-slot capacity, hashes, attachment
-limits and one journal reservation. These primitives alone do not implement
-a lifecycle wire operation, complete baseline or durable actor checkpoint.
+The integrated internal `PreparedSimulationTransaction` combines registry/host/source
+candidates, total geometry plus actor body-slot capacity, inline hashes and one
+journal reservation. Reserved typed bulk attachments and the live tick caller
+remain required. This internal inline producer does not implement a complete
+replica, baseline or durable actor checkpoint.

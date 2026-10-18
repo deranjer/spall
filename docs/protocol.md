@@ -723,3 +723,26 @@ actor-aware replacements are implemented and validated. Unsupported old formats
 are rejected; legacy save upgrades and missing-table backfills have been removed
 under the user's explicit compatibility decision. Crash recovery from a valid
 complete checkpoint remains a separate requirement.
+
+The standalone schema-1 `TransactionAttachmentSetV1` groups typed geometry and
+lifecycle payloads for one transaction. Its decoder checks exact transfer-ID
+coverage and families, geometry child identities, and lifecycle marker correlation.
+A private validated set also binds the existing parent replay identity, so a
+different transaction body cannot reuse it merely by keeping its transaction ID.
+Source-patch owner authenticity and material/catalog/world validation remain the
+owning consumer's responsibility.
+
+The set retains the 64 MiB cumulative compressed limit, a conservative 256 MiB
+geometry decode/storage budget and 64 MiB lifecycle envelope budget. Geometry
+postcard lengths are scanned before nested vector allocation. Lifecycle work is
+also cumulative across the set, including the existing 1,024-owner, 16 Mi dense-cell
+and 4,000,000-solid-cell limits; compact Uniform encodings cannot bypass them.
+General geometry retains its own bounds rather than inheriting animal-only caps.
+The consuming world must still budget geometry expansion and physics work.
+
+The server allocator uses one checked 61-bit low sequence for baseline, retry,
+repair and reset reservations, with namespace bits preserved for reset/split and
+reserved for lifecycle. Dropped reservations burn their range. Reset reserves
+the connected-session group before replacing the world. Split/lifecycle callers
+and retained-journal startup seeding still require the shared handoff; the
+allocator and attachment codec alone do not activate those consumers.

@@ -5,7 +5,9 @@ implementation evidence, not acceptance of animal replication or recovery.
 
 Current accepted main protocol/wire is 9: inline lifecycle framing plus a
 bounded typed bulk marker/codec. The internal inline authoritative producer is
-integrated and validated; live admission, bulk dispatch and production spawning remain closed. Earlier sections
+integrated and validated, along with standalone typed attachment validation and
+the baseline/reset runtime allocator. Shared geometry/lifecycle allocation,
+live animal admission, bulk dispatch and production spawning remain closed. Earlier sections
 below record the versions and test counts at their specific integration points.
 
 ## Integrated replay guard
@@ -343,3 +345,79 @@ handoff must use owned reservation data before final hashing/journaling; all
 geometry split and lifecycle callers must use that same allocator. Replica,
 complete baseline/checkpoint, actor-aware journal recovery and live scheduling
 still follow. No combined 1024 m/GPU/population/multiplayer acceptance is claimed.
+
+## Transfer allocator and typed attachment prerequisites accepted
+
+Allocator worker `aa4600c` is main `f4779af`; early-reset follow-up `4d7a005`
+is main `a272e48`. A non-Clone runtime allocator uses one checked 61-bit low
+sequence for all namespace reservations. Owned ranges have constant storage;
+unused/dropped values remain burned. Zero, overflow and conflicting namespace
+bits reject. Retained-ID high-water seeding is implemented/tested but not yet
+connected to the server recovery source. LateJoin baseline/retry/repair/reset
+callers use the allocator. Geometry split and lifecycle callers still await the
+owned handoff, so common allocation across every path is not yet claimed.
+
+Review caught the production reset caller replacing the simulation before the
+LateJoin-only reservation check. The follow-up now reserves the complete sorted
+session group immediately after policy checks and before catalogue capture or
+world replacement. Allocation failure produces a rejected AdminStatus without
+changing world hash, registry, journal, player position, cached/pending transfers,
+join phase or retries. Publication consumes the owned group and rechecks sessions.
+
+Protocol worker `6608530` and `1c197b6` are main `a8d790e` and `7ac6bc1`.
+Standalone attachment schema 1 carries explicit geometry/lifecycle payload families,
+with exact marker coverage, no missing/extra/duplicate IDs, lifecycle correlation,
+and multiple child/source-patch geometry groups. The immutable decoded candidate
+binds the existing parent replay identity, not only its transaction ID. Geometry
+source-owner authenticity and material/catalog/world semantics belong to the
+owning consumer. No second ledger or actor journal was introduced.
+
+Nested geometry postcard lengths are scanned before vector allocation, using
+conservative storage estimates and observed decompression capacity. Cumulative
+compressed bytes remain 64 MiB; geometry decode/storage is bounded at 256 MiB and
+lifecycle envelopes at 64 MiB. Lifecycle owner-set work is also summed before
+canonical hash work: records, source bricks, dense/solid cells, masks, bytes,
+overlay and witness arrays. Five compact Uniform payloads, each 983,040 solids,
+now reject cumulatively above the existing 4,000,000-solid owner-set ceiling on
+encode and decode. General geometry does not inherit animal-only cell caps;
+its expansion/physics budget remains an owning-consumer gate. The tests also
+round-trip mixed geometry plus the unchanged validated three-part Birth and
+validate its source masks/poses through the reducer.
+
+Coordinator checks:
+
+- `cargo test -p spall_server` on integrated allocator: 196 passed, 2 ignored,
+  23 targets (before the early-reset follow-up). Workspace all-target/all-feature
+  check and strict server all-target Clippy passed.
+- After both protocol commits and the reset follow-up,
+  `cargo test -p spall_protocol`: 124 passed, 0 failed/ignored.
+- `cargo test -p spall_server
+  reset_id_exhaustion_preflight_preserves_world_and_late_join_state`: 1 passed.
+- `cargo test -p spall_server --test snow_replication --test late_join_session`:
+  2 passed, including real multiplayer reset behavior.
+- `cargo check --workspace --all-targets --all-features`, strict seven-package
+  all-target Clippy, workspace formatting and diff checks passed.
+
+Logs: `.local/eng218-allocator-integrated-{tests,workspace,clippy}.log`,
+`.local/eng218-attachments-integrated-{tests,workspace,clippy,format}.log`,
+`.local/eng218-reset-integrated-tests.log` and
+`.local/eng218-reset-integrated-scenarios.log`. Worker initial expected-ID/import
+and validator-order compile/test issues were corrected before acceptance.
+The worker's mistaken target-directory build was interrupted before any tests;
+its generated debug directory/compiler metadata were verified and moved intact
+inside ignored `.local/eng218-extra-target-allocator`. No results came from that
+attempt. Existing user artifacts were preserved. Cache hard-link warnings remain.
+
+Next ENG-218 work is the live geometry reservation handoff: expose a proven
+bounded potential demand from pending/inflight pipeline state, reserve owned
+Split IDs before the existing tick and consume them in the current sequential
+commit/rebase loop. Unused IDs burn; idle demand is zero. This avoids a broad
+resumable-tick rewrite and preserves once-only weather/physics updates. The bound
+must cover carried inflight work, not just newly submitted jobs. The worker is
+implementing this slice, unaccepted; startup seeding and fan-out must use the same
+recorded IDs before removing the transaction-derived path. Lifecycle bulk binding,
+typed journal replacement/current store version, actual replica/baseline/recovery
+consumers and staged dormant-body waking still follow. Protocol/wire 9, baseline 1
+and store 3 remain current; no legacy migration was added. Production spawning,
+combined 1024 m weather/animals, GPU, population and multiplayer recovery/destruction
+acceptance remain gated.
