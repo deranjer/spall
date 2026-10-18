@@ -20,6 +20,7 @@
 //!   reconnect bumps the generation and stales the old session.
 
 pub mod baseline;
+mod baseline_decode;
 pub mod canonical;
 pub mod codec;
 pub mod column_water;
@@ -34,6 +35,7 @@ pub mod records;
 pub mod segment;
 pub mod session;
 pub mod snow;
+pub mod transaction_attachments;
 pub mod water;
 pub mod weather;
 pub use weather::{
@@ -111,6 +113,12 @@ pub use snow::{
     SNOW_FOOTPRINT_TTL_TICKS, SNOW_MAX_DEPTH_Q16, SNOW_MAX_FOOTPRINTS_PER_FRAME,
     SNOW_MAX_SURFACES_PER_FRAME, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_SCHEMA, SNOW_TILE_CELLS,
     SnowFootprint, SnowSurface, SnowSurfaceFrame, SnowSurfaceId,
+};
+pub use transaction_attachments::{
+    MAX_TRANSACTION_ATTACHMENT_BYTES, MAX_TRANSACTION_GEOMETRY_DECODED_BYTES,
+    MAX_TRANSACTION_LIFECYCLE_DECODED_BYTES, TRANSACTION_ATTACHMENT_SET_SCHEMA,
+    TransactionAttachmentError, TransactionAttachmentSetV1, TransactionAttachmentV1,
+    ValidatedTransactionAttachmentSetV1, ValidatedTransactionAttachmentV1, decode_for_transaction,
 };
 pub use water::{AdminCommand, AdminRequest, AdminStatus, WaterCodecError};
 

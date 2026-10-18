@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use spall_core::TransactionId;
-use std::io::Read;
+use std::io::{Read, Write};
 
 use crate::{
     CreatureLifecycleCommitV1, Hash32, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
@@ -85,8 +85,55 @@ impl CreatureLifecycleBulkPayloadV1 {
         })
     }
 
+    /// Preflight decoded-byte cost for a containing attachment set. Structural
+    /// owner work is checked before serialized sizing so a caller can reject a
+    /// cumulative budget overrun before hashing or encoding this payload.
+    pub(crate) fn decoded_size_for_attachment_set(
+        &self,
+    ) -> Result<usize, CreatureLifecycleBulkError> {
+        if self.schema != CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA {
+            return Err(CreatureLifecycleBulkError::Schema);
+        }
+        check_commit_work(&self.commit)?;
+        if self.commit.change.transaction_id != self.transaction_id
+            || self.commit.change.operation_ordinal != self.operation_ordinal
+        {
+            return Err(CreatureLifecycleBulkError::Correlation);
+        }
+        let commit_size = postcard::experimental::serialized_size(&self.commit)
+            .map_err(|e| CreatureLifecycleBulkError::Postcard(e.to_string()))?;
+        if commit_size > MAX_CREATURE_OWNER_RECORD_BYTES {
+            return Err(CreatureLifecycleBulkError::DecompressedLimit(
+                MAX_CREATURE_OWNER_RECORD_BYTES,
+            ));
+        }
+        let prefix_size = postcard::experimental::serialized_size(&PayloadPrefixV1 {
+            schema: self.schema,
+            transaction_id: self.transaction_id,
+            operation_ordinal: self.operation_ordinal,
+            commit_hash: self.commit_hash,
+        })
+        .map_err(|e| CreatureLifecycleBulkError::Postcard(e.to_string()))?;
+        let total = prefix_size.checked_add(commit_size).ok_or(
+            CreatureLifecycleBulkError::DecompressedLimit(MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED),
+        )?;
+        if total > MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED {
+            return Err(CreatureLifecycleBulkError::DecompressedLimit(
+                MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
+            ));
+        }
+        Ok(total)
+    }
+
     /// Bounded postcard + zstd representation used by the existing bulk stream.
     pub fn encode_compressed(&self) -> Result<Vec<u8>, CreatureLifecycleBulkError> {
+        self.encode_compressed_with_limit(crate::limits::MAX_ASSEMBLED_TRANSFER)
+    }
+
+    pub(crate) fn encode_compressed_with_limit(
+        &self,
+        compressed_limit: usize,
+    ) -> Result<Vec<u8>, CreatureLifecycleBulkError> {
         if self.schema != CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA {
             return Err(CreatureLifecycleBulkError::Schema);
         }
@@ -129,12 +176,27 @@ impl CreatureLifecycleBulkPayloadV1 {
         let mut raw = Vec::with_capacity(raw_size);
         raw.extend_from_slice(&prefix_bytes);
         raw.extend_from_slice(&commit_bytes);
-        let compressed = zstd::stream::encode_all(raw.as_slice(), 0)
+        let limit = compressed_limit.min(crate::limits::MAX_ASSEMBLED_TRANSFER);
+        let writer = LimitedVecWriter {
+            bytes: Vec::new(),
+            limit,
+        };
+        let mut encoder = zstd::stream::Encoder::new(writer, 0)
             .map_err(|e| CreatureLifecycleBulkError::Zstd(e.to_string()))?;
-        if compressed.len() > crate::limits::MAX_ASSEMBLED_TRANSFER {
+        encoder
+            .write_all(&raw)
+            .map_err(|_e| CreatureLifecycleBulkError::CompressedLimit {
+                actual: limit.saturating_add(1),
+                limit,
+            })?;
+        let compressed = encoder
+            .finish()
+            .map_err(|e| CreatureLifecycleBulkError::Zstd(e.to_string()))?
+            .bytes;
+        if compressed.len() > limit {
             return Err(CreatureLifecycleBulkError::CompressedLimit {
                 actual: compressed.len(),
-                limit: crate::limits::MAX_ASSEMBLED_TRANSFER,
+                limit,
             });
         }
         Ok(compressed)
@@ -147,24 +209,46 @@ impl CreatureLifecycleBulkPayloadV1 {
         operation_ordinal: u32,
         commit_hash: Hash32,
     ) -> Result<Self, CreatureLifecycleBulkError> {
+        Self::decode_compressed_with_budget(
+            bytes,
+            transaction_id,
+            operation_ordinal,
+            commit_hash,
+            MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
+        )
+        .map(|(payload, _)| payload)
+    }
+
+    /// Decode with a caller-supplied remaining aggregate byte budget. The
+    /// budget is checked on decompressed bytes before decoding the nested owner
+    /// commit; the returned count lets a set decoder charge it exactly once.
+    pub(crate) fn decode_compressed_with_budget(
+        bytes: &[u8],
+        transaction_id: TransactionId,
+        operation_ordinal: u32,
+        commit_hash: Hash32,
+        remaining_budget: usize,
+    ) -> Result<(Self, usize), CreatureLifecycleBulkError> {
         if bytes.len() > crate::limits::MAX_ASSEMBLED_TRANSFER {
             return Err(CreatureLifecycleBulkError::CompressedLimit {
                 actual: bytes.len(),
                 limit: crate::limits::MAX_ASSEMBLED_TRANSFER,
             });
         }
+        let decompressed_cap = MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED.min(remaining_budget);
         let decoder = zstd::stream::Decoder::new(bytes)
             .map_err(|e| CreatureLifecycleBulkError::Zstd(e.to_string()))?;
         let mut raw = Vec::new();
         decoder
-            .take(MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED as u64 + 1)
+            .take(decompressed_cap as u64 + 1)
             .read_to_end(&mut raw)
             .map_err(|e| CreatureLifecycleBulkError::Zstd(e.to_string()))?;
-        if raw.len() > MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED {
+        if raw.len() > decompressed_cap {
             return Err(CreatureLifecycleBulkError::DecompressedLimit(
-                MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
+                decompressed_cap,
             ));
         }
+        let decoded_bytes = raw.len();
         let (prefix, commit_bytes): (PayloadPrefixV1, &[u8]) = postcard::take_from_bytes(&raw)
             .map_err(|e| CreatureLifecycleBulkError::Postcard(e.to_string()))?;
         if prefix.schema != CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA
@@ -205,7 +289,34 @@ impl CreatureLifecycleBulkPayloadV1 {
         if payload.commit.canonical_hash() != payload.commit_hash {
             return Err(CreatureLifecycleBulkError::CommitHash);
         }
-        Ok(payload)
+        Ok((payload, decoded_bytes))
+    }
+}
+
+struct LimitedVecWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for LimitedVecWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|len| len > self.limit)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "compressed lifecycle payload exceeds remaining budget",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
