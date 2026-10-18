@@ -19,7 +19,7 @@ use spall_jobs::{
 };
 use spall_protocol::{ActionOutcome, ActionStatus, ControlSeq, RequestId};
 
-use crate::commit::{CommitError, CommitOutcome, Committed, commit};
+use crate::commit::{CommitError, CommitOutcome, Committed};
 use crate::intent::{EditIntent, EditTarget, IntentError};
 use crate::journal::JournalSink;
 use crate::stage::{StageError, StageInput, StagedEdit, stage_edit, stage_edit_owned};
@@ -281,6 +281,21 @@ impl EditPipeline {
         self.pending.len()
     }
 
+    /// Conservative upper bound for bulk split IDs one upcoming tick may
+    /// consume. A synchronous tick can install prior inflight results plus at
+    /// most one lane's new submissions; async staging commits at most one.
+    pub fn transfer_reservation_bound(&self) -> usize {
+        if self.pending.is_empty() && self.inflight.is_empty() {
+            return 0;
+        }
+        if self.staging_worker.is_some() {
+            return 1;
+        }
+        self.inflight
+            .len()
+            .saturating_add(self.scheduler.config().lane(Lane::Edit).max_in_flight as usize)
+    }
+
     /// Whether `region` has been promoted to strictly-serial commit.
     pub fn is_serialized(&self, region: RegionKey) -> bool {
         self.serialized.contains(&region)
@@ -336,8 +351,31 @@ impl EditPipeline {
         server_tick: Tick,
         next_control_seq: &mut u64,
     ) -> Result<TickReport, CommitError> {
+        self.run_tick_with_transfer_ids(
+            world,
+            journal,
+            server_tick,
+            next_control_seq,
+            &mut VecDeque::new(),
+        )
+    }
+
+    pub fn run_tick_with_transfer_ids(
+        &mut self,
+        world: &mut SimWorld,
+        journal: &mut JournalSink,
+        server_tick: Tick,
+        next_control_seq: &mut u64,
+        transfer_ids: &mut VecDeque<spall_protocol::TransferId>,
+    ) -> Result<TickReport, CommitError> {
         if self.staging_worker.is_some() {
-            return Ok(self.run_tick_off_thread(world, journal, server_tick, next_control_seq));
+            return Ok(self.run_tick_off_thread(
+                world,
+                journal,
+                server_tick,
+                next_control_seq,
+                transfer_ids,
+            ));
         }
         let mut report = TickReport::default();
         // A structural commit advances the global topology epoch.  Results
@@ -495,6 +533,7 @@ impl EditPipeline {
                     &mut reload_retries_next_tick,
                     &mut serialized_regions_this_tick,
                     false,
+                    transfer_ids,
                 );
             }
 
@@ -521,6 +560,7 @@ impl EditPipeline {
         journal: &mut JournalSink,
         server_tick: Tick,
         next_control_seq: &mut u64,
+        transfer_ids: &mut VecDeque<spall_protocol::TransferId>,
     ) -> TickReport {
         let mut report = TickReport::default();
         let mut reload_retries_next_tick = VecDeque::new();
@@ -588,6 +628,7 @@ impl EditPipeline {
                 &mut reload_retries_next_tick,
                 &mut serialized_regions_this_tick,
                 true,
+                transfer_ids,
             );
         }
 
@@ -735,6 +776,7 @@ impl EditPipeline {
         reload_retries_next_tick: &mut VecDeque<QueuedIntent>,
         serialized_regions_this_tick: &mut HashSet<RegionKey>,
         requeue_stale_first: bool,
+        transfer_ids: &mut VecDeque<spall_protocol::TransferId>,
     ) -> bool {
         let mut rebase_requested = false;
         let request = queued.intent.request_id;
@@ -790,7 +832,14 @@ impl EditPipeline {
 
         let control_seq = ControlSeq(*next_control_seq);
         let commit_started = std::time::Instant::now();
-        match commit(world, journal, &staged, server_tick, control_seq) {
+        match crate::commit::commit_with_bulk_transfer_ids(
+            world,
+            journal,
+            &staged,
+            server_tick,
+            control_seq,
+            transfer_ids,
+        ) {
             Ok(CommitOutcome::Committed(done)) => {
                 if self.timings.len() >= 4096 {
                     self.timings.clear();
@@ -1013,6 +1062,33 @@ mod tests {
         let far =
             SphereBrush::new(BrushPoint::from_units(200 * BRUSH_UNIT, 0, 0), BRUSH_UNIT).unwrap();
         assert_ne!(RegionKey::of(vid, &far), key);
+    }
+
+    #[test]
+    fn transfer_bound_covers_inflight_carryover_and_rebases() {
+        let world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
+        let mut pipeline = EditPipeline::new(4, 3);
+        pipeline.submit_intent(cut(51, 2, 1, 2, 1), &world).unwrap();
+        let carried = pipeline.pending.pop_front().unwrap();
+        let handle = pipeline
+            .scheduler
+            .submit(JobRequest::new(
+                Lane::Edit,
+                Priority::NORMAL,
+                JobToken::new(world.generation(), world.topology_epoch()),
+                || -> StageResult { unreachable!("carried job is not dispatched in this check") },
+            ))
+            .unwrap();
+        pipeline.inflight.insert(handle.id(), carried);
+        pipeline
+            .submit_intent(cut(52, 20, 1, 20, 1), &world)
+            .unwrap();
+
+        let configured = pipeline.scheduler.config().lane(Lane::Edit).max_in_flight as usize;
+        // A carried result may commit before the new submission budget is
+        // used. Same-tick stale rebases consume from this same owned pool, so
+        // the bound includes the full configured budget in addition to carry.
+        assert_eq!(pipeline.transfer_reservation_bound(), 1 + configured);
     }
 
     #[test]

@@ -2836,6 +2836,12 @@ async fn serve_async(
 
         // T17 late-join / reconnect state.
         let mut lj = LateJoin::new(catch_up_cap, max_join_retries, capture_workers);
+        if let Err(error) = lj.seed_transfer_ids_from_journal(&sim) {
+            return SimResult::error(
+                format!("retained journal contains an invalid transfer ID: {error}"),
+                0,
+            );
+        }
         // T23 / G3 row 7, slice D: a late-join baseline or repair patch over a
         // brick the residency pass has evicted is filled from its durable
         // backing.
@@ -3423,7 +3429,20 @@ async fn serve_async(
                 }
             }
             let before_tick = started.elapsed();
-            let report = match sim.tick() {
+            // Reserve a conservative shared-ID range before the tick can
+            // mutate simulation state. Unused IDs are intentionally burned.
+            let split_id_bound = sim.transfer_reservation_bound();
+            let split_transfer_ids = match lj.reserve_ids(TransferNamespace::Split, split_id_bound)
+            {
+                Ok(ids) => ids,
+                Err(error) => {
+                    return SimResult::error(
+                        format!("split transfer ID reservation failed before tick: {error}"),
+                        ticks_run,
+                    );
+                }
+            };
+            let report = match sim.tick_with_transfer_ids(split_transfer_ids) {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
             };
@@ -3618,15 +3637,14 @@ async fn serve_async(
                     }
                 }
                 // T17 increment 2: a giant split ships its geometry out of band
-                // as a `BaselineTransfer`, keyed to the transaction by
-                // `transfer_id` (= the split's `TransactionId` | high bit).
+                // under the same allocator-reserved ID embedded in its markers.
                 let fan_out_started = std::time::Instant::now();
                 let split_transfer = committed.bulk_baseline.as_ref().and_then(|world| {
-                    let id = TransferId(
-                        committed.transaction.get() | spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT,
-                    );
+                    let id = committed
+                        .bulk_transfer_id
+                        .expect("bulk split carries its reserved marker transfer ID");
                     baseline::transfer_from_world(
-                        world.clone(),
+                        world.as_ref().clone(),
                         id,
                         InterestEpoch(1),
                         JournalSeq(sim.journal_cursor()),
@@ -5391,6 +5409,31 @@ impl LateJoin {
             .reserve(namespace, 1)?
             .next_id()
             .ok_or(TransferIdError::Exhausted)
+    }
+
+    fn reserve_ids(
+        &mut self,
+        namespace: TransferNamespace,
+        count: usize,
+    ) -> Result<Vec<TransferId>, TransferIdError> {
+        let mut reservation = self.transfer_ids.reserve(namespace, count)?;
+        (0..count)
+            .map(|_| reservation.next_id().ok_or(TransferIdError::Exhausted))
+            .collect()
+    }
+
+    fn seed_transfer_ids_from_journal(&mut self, sim: &Simulation) -> Result<(), TransferIdError> {
+        let retained = sim.journal().entries().iter().flat_map(|entry| {
+            entry.transaction.ops.iter().filter_map(|op| match op {
+                spall_protocol::TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
+                | spall_protocol::TopologyOp::SourcePatchBulkBaseline { transfer_id, .. }
+                | spall_protocol::TopologyOp::CreatureLifecycleBulk { transfer_id, .. } => {
+                    Some(TransferId(*transfer_id))
+                }
+                _ => None,
+            })
+        });
+        self.transfer_ids.seed_past_retained(retained)
     }
 
     /// Handles a `BaselineAck`: the sentinel starts a late-join transfer; a real

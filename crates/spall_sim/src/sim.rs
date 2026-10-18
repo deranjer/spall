@@ -8,7 +8,7 @@
 //! player capsules (T19). Contact-to-intent conversion (T21), replication (T10)
 //! and persistence (T16) are handled by the integrator, not here.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use glam::DVec3;
 use spall_core::{
@@ -3854,6 +3854,13 @@ impl Simulation {
         self.pipeline.is_idle()
     }
 
+    /// Conservative count of allocator IDs the upcoming edit tick may need
+    /// for oversized split baselines. This intentionally excludes unrelated
+    /// scheduled work such as physics prewarm jobs.
+    pub fn transfer_reservation_bound(&self) -> usize {
+        self.pipeline.transfer_reservation_bound()
+    }
+
     /// The committed transaction for a request id, if it committed.
     pub fn committed(&self, request_id: RequestId) -> Option<&crate::commit::Committed> {
         self.pipeline.committed(request_id)
@@ -4160,7 +4167,26 @@ impl Simulation {
     /// Advances one server tick: run the edit pipeline, then step physics and
     /// refresh extracted body state.
     pub fn tick(&mut self) -> Result<TickReport, TickError> {
-        self.tick_with_creature_rules_inner(None)
+        self.tick_with_creature_rules_inner(None, VecDeque::new())
+    }
+
+    /// Advances a server tick using transfer IDs reserved by the server's
+    /// shared allocator before any tick mutation. Unused values remain burned.
+    pub fn tick_with_transfer_ids(
+        &mut self,
+        transfer_ids: Vec<spall_protocol::TransferId>,
+    ) -> Result<TickReport, TickError> {
+        let mut seen = std::collections::HashSet::with_capacity(transfer_ids.len());
+        if transfer_ids.iter().any(|id| {
+            id.0 == 0
+                || id.0 & ((1_u64 << 61) - 1) == 0
+                || id.0 & spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT == 0
+                || id.0 & (spall_protocol::WORLD_RESET_TRANSFER_ID_BIT | (1_u64 << 61)) != 0
+                || !seen.insert(id.0)
+        }) {
+            return Err(CommitError::InvalidBulkTransferIds.into());
+        }
+        self.tick_with_creature_rules_inner(None, transfer_ids.into())
     }
 
     /// Runs the optional statically linked game scheduling policy against a
@@ -4170,23 +4196,25 @@ impl Simulation {
         &mut self,
         rules: &dyn crate::creatures::CreatureSchedulingRules,
     ) -> Result<TickReport, TickError> {
-        self.tick_with_creature_rules_inner(Some(rules))
+        self.tick_with_creature_rules_inner(Some(rules), VecDeque::new())
     }
 
     fn tick_with_creature_rules_inner(
         &mut self,
         rules: Option<&dyn crate::creatures::CreatureSchedulingRules>,
+        mut transfer_ids: VecDeque<spall_protocol::TransferId>,
     ) -> Result<TickReport, TickError> {
         self.tick = self
             .tick
             .checked_next()
             .map_err(|_: IdError| TickError::TickExhausted)?;
         let pipeline_span = crate::prof::Span::start("tick.pipeline");
-        let report = self.pipeline.run_tick(
+        let report = self.pipeline.run_tick_with_transfer_ids(
             &mut self.world,
             &mut self.journal,
             self.tick,
             &mut self.next_control_seq,
+            &mut transfer_ids,
         )?;
         drop(pipeline_span);
         let mut report = report;

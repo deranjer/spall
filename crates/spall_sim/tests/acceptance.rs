@@ -786,7 +786,12 @@ fn independent_topology_edits_rebase_within_one_tick() {
     ))
     .unwrap();
 
-    let report = sim.tick().unwrap();
+    let split_ids = (1..=sim.transfer_reservation_bound())
+        .map(|low| {
+            spall_protocol::TransferId(spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT | low as u64)
+        })
+        .collect();
+    let report = sim.tick_with_transfer_ids(split_ids).unwrap();
     assert_eq!(report.committed.len(), 2, "both edits commit in one tick");
     assert_eq!(report.committed[0].0, west, "request order is preserved");
     assert_eq!(

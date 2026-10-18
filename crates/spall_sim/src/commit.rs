@@ -66,7 +66,9 @@ pub struct Committed {
     /// `BaselineWorld` (every child volume + the source's post-cut affected
     /// bricks) the host must deliver on a bulk stream and journal alongside the
     /// transaction. `None` for every ordinary commit.
-    pub bulk_baseline: Option<spall_protocol::baseline::BaselineWorld>,
+    pub bulk_baseline: Option<Box<spall_protocol::baseline::BaselineWorld>>,
+    /// Allocator-reserved identity for the out-of-band baseline.
+    pub bulk_transfer_id: Option<TransferId>,
     /// Exact pre-edit material counts removed by this committed cut. This is
     /// game-facing outcome metadata; it does not grant items by itself.
     pub removed_materials: std::collections::BTreeMap<MaterialId, u64>,
@@ -117,6 +119,10 @@ pub enum CommitError {
     PreparedStateChanged,
     #[error("prepared physics fence could not be captured: {0}")]
     PhysicsFence(String),
+    #[error("bulk split requires a server-reserved transfer ID")]
+    MissingBulkTransferId,
+    #[error("tick transfer IDs must be unique, nonzero split-namespace IDs")]
+    InvalidBulkTransferIds,
     #[error(
         "commit needs evicted geometry that is not loaded (volume {volume}, bricks {bricks:?}); \
          the caller must reload it and re-stage"
@@ -148,6 +154,7 @@ pub(crate) struct PreparedGeometryCommit {
     pub(crate) topology: TopologyTransaction,
     pub(crate) participants: Vec<MotionSnapshot>,
     pub(crate) bulk_baseline: Option<spall_protocol::baseline::BaselineWorld>,
+    bulk_transfer_id: Option<TransferId>,
     pub(crate) bumped_epoch: bool,
     stamp_before_commit: u64,
     input_stamp: u64,
@@ -198,8 +205,33 @@ pub fn commit(
     server_tick: Tick,
     control_seq: ControlSeq,
 ) -> Result<CommitOutcome, CommitError> {
+    commit_with_bulk_transfer_ids(
+        world,
+        journal,
+        staged,
+        server_tick,
+        control_seq,
+        &mut std::collections::VecDeque::new(),
+    )
+}
+
+pub(crate) fn commit_with_bulk_transfer_ids(
+    world: &mut SimWorld,
+    journal: &mut JournalSink,
+    staged: &StagedEdit,
+    server_tick: Tick,
+    control_seq: ControlSeq,
+    bulk_transfer_ids: &mut std::collections::VecDeque<TransferId>,
+) -> Result<CommitOutcome, CommitError> {
     let _total = crate::prof::Span::start("commit.total");
-    match prepare_geometry(world, journal, staged, server_tick, control_seq)? {
+    match prepare_geometry_with_transfer_ids(
+        world,
+        journal,
+        staged,
+        server_tick,
+        control_seq,
+        bulk_transfer_ids,
+    )? {
         PrepareGeometryOutcome::Stale(reason) => Ok(CommitOutcome::Stale(reason)),
         PrepareGeometryOutcome::Ready(prepared) => {
             let validated = validate_prepared_geometry(world, journal, *prepared)?;
@@ -219,6 +251,24 @@ pub(crate) fn prepare_geometry(
     staged: &StagedEdit,
     server_tick: Tick,
     control_seq: ControlSeq,
+) -> Result<PrepareGeometryOutcome, CommitError> {
+    prepare_geometry_with_transfer_ids(
+        world,
+        journal,
+        staged,
+        server_tick,
+        control_seq,
+        &mut std::collections::VecDeque::new(),
+    )
+}
+
+pub(crate) fn prepare_geometry_with_transfer_ids(
+    world: &SimWorld,
+    journal: &JournalSink,
+    staged: &StagedEdit,
+    server_tick: Tick,
+    control_seq: ControlSeq,
+    bulk_transfer_ids: &mut std::collections::VecDeque<TransferId>,
 ) -> Result<PrepareGeometryOutcome, CommitError> {
     let _prepare = crate::prof::Span::start("commit.prepare");
     let validate = crate::prof::Span::start("commit.validate");
@@ -564,6 +614,7 @@ pub(crate) fn prepare_geometry(
     // (increment 2). `before` / `after` / `result_hashes` are unchanged and
     // remain the replica's acceptance check.
     let mut bulk_baseline = None;
+    let mut bulk_transfer_id = None;
     if !crate::replication::inline_wire_fits(&topology) {
         // Inline blobs are only chosen when each fits `MAX_SPLIT_BASELINE_BLOB`,
         // but hundreds of small children (a tree crown) can still add up past
@@ -580,9 +631,9 @@ pub(crate) fn prepare_geometry(
                 &child_ids,
                 &children,
                 staged.splits(),
-                transaction_id,
                 server_tick,
                 force_bulk,
+                bulk_transfer_ids,
             )? {
                 SplitEncoding::Inline(ops) => {
                     topology.ops = ops;
@@ -591,9 +642,14 @@ pub(crate) fn prepare_geometry(
                     }
                     force_bulk = true;
                 }
-                SplitEncoding::Bulk { ops, baseline } => {
+                SplitEncoding::Bulk {
+                    ops,
+                    baseline,
+                    transfer_id,
+                } => {
                     topology.ops = ops;
                     bulk_baseline = Some(baseline);
+                    bulk_transfer_id = Some(transfer_id);
                     break;
                 }
             }
@@ -699,6 +755,7 @@ pub(crate) fn prepare_geometry(
             journal_seq,
             topology,
             participants,
+            bulk_transfer_id,
             bulk_baseline,
             bumped_epoch,
             stamp_before_commit,
@@ -755,6 +812,7 @@ pub(crate) fn publish_validated_geometry_without_journal(
         topology,
         participants,
         bulk_baseline,
+        bulk_transfer_id,
         bumped_epoch,
         stamp_before_commit,
         input_stamp,
@@ -863,7 +921,8 @@ pub(crate) fn publish_validated_geometry_without_journal(
             topology,
             children: child_entities,
             bumped_epoch,
-            bulk_baseline,
+            bulk_baseline: bulk_baseline.map(Box::new),
+            bulk_transfer_id,
             removed_materials,
         },
         entry,
@@ -883,6 +942,7 @@ enum SplitEncoding {
     Bulk {
         ops: Vec<TopologyOp>,
         baseline: spall_protocol::baseline::BaselineWorld,
+        transfer_id: TransferId,
     },
 }
 
@@ -903,9 +963,9 @@ fn build_split_baseline_ops(
     child_ids: &[(spall_core::EntityId, VolumeId)],
     children: &[ChildBody],
     splits: bool,
-    transaction_id: spall_core::TransactionId,
     server_tick: Tick,
     force_bulk: bool,
+    transfer_ids: &mut std::collections::VecDeque<TransferId>,
 ) -> Result<SplitEncoding, CommitError> {
     use spall_protocol::baseline::{BaselineOwner, BaselineWorld};
     use spall_protocol::limits::{MAX_ASSEMBLED_TRANSFER, MAX_BULK_PART, MAX_SPLIT_BASELINE_BLOB};
@@ -956,22 +1016,24 @@ fn build_split_baseline_ops(
         return Ok(SplitEncoding::Inline(ops));
     }
 
-    // Bulk path: marker ops + one out-of-band `BaselineWorld` keyed by
-    // `transfer_id` (the split's `TransactionId` with the reserved high bit set).
-    let transfer_id = transaction_id.get() | spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT;
+    // Bulk path: marker ops + one out-of-band `BaselineWorld` keyed by an ID
+    // reserved by the authoritative server before this tick.
+    let transfer_id = transfer_ids
+        .pop_front()
+        .ok_or(CommitError::MissingBulkTransferId)?;
     let mut ops = vec![brush_op];
     for ((entity, child_vid), _child) in child_ids.iter().zip(children) {
         ops.push(TopologyOp::SplitOffBulkBaseline {
             source,
             child: *child_vid,
             child_entity: *entity,
-            transfer_id,
+            transfer_id: transfer_id.0,
         });
     }
     if splits {
         ops.push(TopologyOp::SourcePatchBulkBaseline {
             source,
-            transfer_id,
+            transfer_id: transfer_id.0,
         });
     }
 
@@ -994,7 +1056,11 @@ fn build_split_baseline_ops(
             },
         ));
     }
-    Ok(SplitEncoding::Bulk { ops, baseline })
+    Ok(SplitEncoding::Bulk {
+        ops,
+        baseline,
+        transfer_id,
+    })
 }
 
 /// A `MotionSnapshot` for every dynamic body that took part in the transaction:
