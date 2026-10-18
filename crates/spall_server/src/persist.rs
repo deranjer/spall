@@ -97,6 +97,11 @@ pub enum RecoveryChoice {
 /// Anything that can go wrong converting to/from save records.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
+    #[error(
+        "current checkpoint schema cannot retain creature ownership or allocator state; \
+         complete creature checkpoint support is required before saving an initialized host"
+    )]
+    CreatureCheckpointUnsupported,
     #[error("store: {0}")]
     Store(#[from] StoreError),
     #[error("save DTO: {0}")]
@@ -201,6 +206,7 @@ pub fn capture(
     cfg: &PersistConfig,
     journal_cursor: u64,
 ) -> Result<Checkpoint, PersistError> {
+    require_checkpoint_supported(sim)?;
     let terrain_bricks = stored_bricks(&sim.world().terrain().volume)?;
     capture_with_terrain_bricks(sim, cfg, journal_cursor, terrain_bricks)
 }
@@ -217,6 +223,7 @@ pub(crate) fn capture_with_terrain_bricks(
     journal_cursor: u64,
     terrain_bricks: Vec<StoredBrick>,
 ) -> Result<Checkpoint, PersistError> {
+    require_checkpoint_supported(sim)?;
     let world = sim.world();
     let (next_entity, next_volume, next_transaction, next_journal_seq) =
         world.registry().counters();
@@ -271,6 +278,15 @@ pub(crate) fn capture_with_terrain_bricks(
         bodies,
         bricks,
     })
+}
+
+fn require_checkpoint_supported(sim: &Simulation) -> Result<(), PersistError> {
+    // Even an empty initialized host owns a consumed ID/epoch high-water. A
+    // geometry-only checkpoint would silently reset it on the next restart.
+    if sim.creature_allocator_snapshot().is_some() {
+        return Err(PersistError::CreatureCheckpointUnsupported);
+    }
+    Ok(())
 }
 
 fn stored_body(world: &SimWorld, body: &Body, kind: StoredBodyKind) -> StoredBody {
@@ -1609,5 +1625,58 @@ fn check(name: &str, passed: bool, detail: String) -> ScenarioResult {
         name: name.to_string(),
         passed,
         detail,
+    }
+}
+
+#[cfg(test)]
+mod creature_checkpoint_boundary_tests {
+    use super::*;
+    use spall_core::{CREATURE_ALLOCATOR_SCHEMA, CreatureAllocatorSnapshotV1, WorldId};
+
+    #[test]
+    fn full_and_incremental_capture_refuse_to_drop_empty_host_high_water() {
+        let cfg = PersistConfig {
+            world_id: 901,
+            seed: 0,
+            generator_version: 1,
+        };
+        for next_creature_id in [1, 73] {
+            let mut sim = Simulation::new(spall_sim::SimulationConfig::new(
+                spall_sim::fixtures::flat_terrain_setup(),
+            ))
+            .unwrap();
+            let allocator = CreatureAllocatorSnapshotV1 {
+                schema: CREATURE_ALLOCATOR_SCHEMA,
+                world_id: WorldId::from_u128(cfg.world_id),
+                world_epoch: 4,
+                next_creature_id,
+            };
+            sim.restore_creature_allocator_snapshot(allocator).unwrap();
+            let before = (
+                sim.world().world_hash(),
+                sim.world().registry().counters(),
+                sim.journal_cursor(),
+                sim.current_tick(),
+            );
+            let terrain = stored_bricks(&sim.world().terrain().volume).unwrap();
+            assert!(matches!(
+                capture(&sim, &cfg, 0),
+                Err(PersistError::CreatureCheckpointUnsupported)
+            ));
+            assert!(matches!(
+                capture_with_terrain_bricks(&sim, &cfg, 0, terrain),
+                Err(PersistError::CreatureCheckpointUnsupported)
+            ));
+            assert_eq!(sim.creature_allocator_snapshot(), Some(allocator));
+            assert_eq!(
+                (
+                    sim.world().world_hash(),
+                    sim.world().registry().counters(),
+                    sim.journal_cursor(),
+                    sim.current_tick(),
+                ),
+                before
+            );
+        }
     }
 }
