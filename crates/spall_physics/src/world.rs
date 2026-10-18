@@ -500,7 +500,7 @@ pub enum ArticulatedBatchOperation {
         parts: Vec<SourcePart>,
         representation: Representation,
     },
-    /// Reconstruct one live owner with its applied pose and rigid motion.
+    /// Reconstruct one live owner with applied poses and measured root/part motion.
     AliveRestore {
         operation_tag: u64,
         restore: crate::articulated::AliveArticulatedRestore,
@@ -1271,6 +1271,11 @@ pub struct PhysicsWorld {
     ccd_solver: CCDSolver,
     entries: Vec<Entry>,
     articulated: HashMap<BodyId, ArticulatedEntry>,
+    /// Restored live owners temporarily use velocity-based kinematics so a
+    /// checkpoint's measured part twists are observable before the next tick.
+    /// They are returned to ordinary sampled-position control before their
+    /// first physics integration; entries are bounded by recent restores.
+    restored_velocity_based_owners: Vec<ArticulatedBodyId>,
     /// Logical fracture keys are never reusable during this world lifetime,
     /// including after their owner is retired.
     fracture_owner_keys: HashMap<u128, BodyId>,
@@ -1378,6 +1383,7 @@ impl PhysicsWorld {
             ccd_solver: CCDSolver::new(),
             entries: Vec::new(),
             articulated: HashMap::new(),
+            restored_velocity_based_owners: Vec::new(),
             fracture_owner_keys: HashMap::new(),
             step_count: 0,
             articulated_contact_witnesses: Vec::new(),
@@ -2441,6 +2447,7 @@ impl PhysicsWorld {
         assembly.velocity_based_restore = true;
         assembly.pending_root_pose_token = None;
         assembly.pending_pose = None;
+        self.restored_velocity_based_owners.push(id);
         assert_eq!(part_motion.len(), assembly.parts.len());
         for (part, motion) in assembly.parts.iter().zip(part_motion) {
             assert_eq!(part.part_id, motion.part_id);
@@ -3542,6 +3549,7 @@ impl PhysicsWorld {
             part.collider = handle;
         }
         assembly.kinematic_part_bodies = false;
+        assembly.velocity_based_restore = false;
         assembly.dynamic_corpse = true;
         assembly.density_manifest = Some(manifest);
         let entry = &mut self.entries[index];
@@ -7346,6 +7354,23 @@ impl PhysicsWorld {
 
     /// Advances the world by one fixed step.
     pub fn step(&mut self) -> StepTiming {
+        for id in std::mem::take(&mut self.restored_velocity_based_owners) {
+            let Some(assembly) = self.articulated.get(&id.0) else {
+                continue;
+            };
+            if !assembly.velocity_based_restore {
+                continue;
+            }
+            let root_body = self.entries[entry_index(id.0, self.id_namespace)].body;
+            self.bodies[root_body].set_body_type(RigidBodyType::KinematicPositionBased, true);
+            for part in &assembly.parts {
+                self.bodies[part.body].set_body_type(RigidBodyType::KinematicPositionBased, true);
+            }
+            self.articulated
+                .get_mut(&id.0)
+                .expect("restore owner remained present before its first step")
+                .velocity_based_restore = false;
+        }
         // The pipeline's own broad-phase pass reads Rapier's native
         // per-collider dirty flags directly (`ColliderChanges`), not this
         // list — so whatever's pending is already covered by the step below,
@@ -12881,12 +12906,20 @@ mod tests {
             .owner_id;
         assert!(world.articulated_part_motion_snapshot(id).is_some());
 
-        world
+        let root_move = world
             .sweep_articulated_root_translation(id, 44, 1, 2, [3.01, 0.0, 0.0])
             .unwrap();
         assert!(world.articulated_owner_snapshot(id).unwrap().pending_pose);
         assert!(world.articulated_part_motion_snapshot(id).is_none());
         world.step();
+        let root_after_root_update = world.articulated_owner_snapshot(id).unwrap();
+        assert_eq!(root_after_root_update.pose_token, 2);
+        assert!(
+            (root_after_root_update.root.translation_m[0]
+                - (3.0 + root_move.applied_translation_m[0]))
+                .abs()
+                < 1.0e-4
+        );
         let applied = world.articulated_pose_snapshot(id).unwrap();
         world
             .update_articulated_pose(
@@ -12910,6 +12943,84 @@ mod tests {
             .unwrap();
         assert!(world.articulated_owner_snapshot(id).unwrap().pending_pose);
         assert!(world.articulated_part_motion_snapshot(id).is_none());
+    }
+
+    #[test]
+    fn alive_restore_twists_are_one_shot_when_next_step_has_no_authored_pose() {
+        let mut restore = alive_restore_fixture(106);
+        restore.root_linear_velocity_m_s = [30.0, 0.0, 0.0];
+        restore.root_angular_velocity_rad_s = [0.0, 0.0, 4.0];
+        for motion in &mut restore.part_motion {
+            motion.linear_velocity_m_s = [30.0, 0.0, 0.0];
+            motion.angular_velocity_rad_s = [0.0, 0.0, 4.0];
+        }
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let id = world
+            .commit_articulated_batch(
+                world
+                    .prepare_articulated_batch(
+                        vec![ArticulatedBatchOperation::AliveRestore {
+                            operation_tag: 1,
+                            restore,
+                            representation: Representation::MergedCuboids,
+                        }],
+                        mix_density,
+                    )
+                    .unwrap(),
+            )
+            .unwrap()[0]
+            .owner_id;
+        let owner_before = world.articulated_owner_snapshot(id).unwrap();
+        let pose_before = world.articulated_pose_snapshot(id).unwrap();
+        assert_eq!(owner_before.root.linvel_m_s, [30.0, 0.0, 0.0]);
+        assert!(world.articulated[&id.0].velocity_based_restore);
+
+        world.step();
+
+        let owner_after = world.articulated_owner_snapshot(id).unwrap();
+        assert!(!world.articulated[&id.0].velocity_based_restore);
+        assert_eq!(
+            owner_after.root.translation_m,
+            owner_before.root.translation_m
+        );
+        assert_eq!(owner_after.pose_token, owner_before.pose_token);
+        assert!(!owner_after.pending_pose);
+        assert_eq!(world.articulated_pose_snapshot(id).unwrap(), pose_before);
+        assert_eq!(owner_after.root.linvel_m_s, [0.0; 3]);
+        assert_eq!(owner_after.root.angvel_rad_s, [0.0; 3]);
+        assert_eq!(
+            world
+                .raycast_articulated(id, [2.5, 0.125, 0.125], [1.0, 0.0, 0.0], 1.0)
+                .unwrap()
+                .part_id,
+            1
+        );
+        let death = world
+            .prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::CheckedDeathTransfer {
+                    operation_tag: 2,
+                    id,
+                    expected_topology_token: owner_before.topology_token,
+                    expected_pose_token: owner_before.pose_token,
+                }],
+                mix_density,
+            )
+            .unwrap()
+            .transfer_outcome(2)
+            .copied()
+            .unwrap();
+        assert!(
+            death
+                .linear_momentum_kg_m_s
+                .iter()
+                .all(|value| value.abs() < 1.0e-8)
+        );
+        assert!(
+            death
+                .angular_momentum_about_com_kg_m2_s
+                .iter()
+                .all(|value| value.abs() < 1.0e-8)
+        );
     }
 
     #[test]

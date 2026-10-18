@@ -105,6 +105,9 @@ pub struct DynamicCorpseRestore {
 
 /// Value-only reconstruction input for one live articulated owner. Part
 /// transforms are the currently applied local poses in the authored hierarchy.
+/// The owning simulation must capture root/source state and every keyed part
+/// twist together, with no intervening mutation; this runtime DTO is not a
+/// serialized checkpoint format.
 #[derive(Clone)]
 pub struct AliveArticulatedRestore {
     pub owner_key: u128,
