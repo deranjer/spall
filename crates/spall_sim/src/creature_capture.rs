@@ -14,8 +14,6 @@ pub enum CreatureCaptureError {
     Limit,
     #[error("animal has an unapplied physical pose")]
     Pending,
-    #[error("source revision allocator cannot be reconstructed from retained bricks")]
-    SourceRevision,
     #[error(transparent)]
     Physics(#[from] spall_physics::ArticulatedError),
     #[error(transparent)]
@@ -46,12 +44,11 @@ impl Simulation {
     /// Captures exact currently applied animal state on the owning thread.
     /// None means an uninitialized host; Some(empty) retains its allocator.
     /// This does not replace the guarded geometry-only checkpoint path.
-    /// Source revision-allocator gaps refuse until a complete source format
-    /// exists. Population memory/mask admission is deliberately conservative.
+    /// Population memory/mask admission is deliberately conservative.
     pub fn capture_creature_snapshot(
         &self,
         catalog: &CreatureValidationCatalog<'_>,
-    ) -> Result<Option<CreatureSnapshotV1>, CreatureCaptureError> {
+    ) -> Result<Option<CreatureSnapshotV2>, CreatureCaptureError> {
         let counts = self.world.creature_source_counts();
         let Some(host) = &self.creatures else {
             return if counts == [0; 5] {
@@ -210,17 +207,12 @@ impl Simulation {
                 }
                 let mut source_bytes = volume.resident_brick_count() * 128;
                 let mut solids = 0;
-                let mut max_revision = 0;
                 volume.for_each_resident_brick(|_, brick| {
                     if brick.uniform_storage_material().is_none() {
                         source_bytes += spall_core::CELLS_PER_BRICK * 2;
                     }
                     solids += brick.solid_cells() as usize;
-                    max_revision = max_revision.max(brick.revision().get());
                 });
-                if max_revision.checked_add(1) != Some(volume.next_revision().get()) {
-                    return Err(CreatureCaptureError::SourceRevision);
-                }
                 add(&mut record.solids, solids, MAX_CREATURE_OWNER_SOLID_CELLS)?;
                 add(
                     &mut population.solids,
@@ -267,11 +259,11 @@ impl Simulation {
             .records()
             .map(|state| self.capture_owner(state))
             .collect::<Result<Vec<_>, _>>()?;
-        let snapshot = CreatureSnapshotV1 {
+        let snapshot = CreatureSnapshotV2 {
             schema: CREATURE_SNAPSHOT_SCHEMA,
             allocator: host.allocator_snapshot(),
             next_volume_id: self.world.registry().counters().1,
-            owners: CreatureOwnershipSetV3 {
+            owners: CreatureOwnershipSetV4 {
                 schema: CREATURE_OWNER_SCHEMA,
                 records,
             },
@@ -283,7 +275,7 @@ impl Simulation {
     fn capture_owner(
         &self,
         state: &CreatureStateV1,
-    ) -> Result<CreatureOwnershipRecordV3, CreatureCaptureError> {
+    ) -> Result<CreatureOwnershipRecordV4, CreatureCaptureError> {
         let id = self.world.creature_physics_owner(state.key).unwrap();
         let owner = self
             .world
@@ -414,7 +406,7 @@ impl Simulation {
             sampled.angular_velocity_rad_s = primary.angular_velocity_rad_s;
             components.sort_by_key(|component| component.serial);
         }
-        Ok(CreatureOwnershipRecordV3 {
+        Ok(CreatureOwnershipRecordV4 {
             schema: CREATURE_OWNER_SCHEMA,
             state: sampled,
             owner_key,
@@ -429,7 +421,7 @@ impl Simulation {
     fn capture_physical_sources(
         &self,
         key: spall_core::CreatureKey,
-        parts: &[CreatureSourcePartV1],
+        parts: &[CreatureSourcePartV2],
     ) -> Result<Vec<SourcePart>, CreatureCaptureError> {
         parts
             .iter()
@@ -477,7 +469,7 @@ fn capture_source(
     metadata: &crate::world::CreatureSourceMetadata,
     applied: spall_physics::PartTransform,
     generation: u64,
-) -> CreatureSourcePartV1 {
+) -> CreatureSourcePartV2 {
     let mut bricks = Vec::with_capacity(volume.resident_brick_count());
     volume.for_each_resident_brick(|coord, brick| {
         let cells = match brick.uniform_storage_material() {
@@ -506,7 +498,8 @@ fn capture_source(
         });
     });
     bricks.sort_by_key(|brick| (brick.coord[2], brick.coord[1], brick.coord[0]));
-    let mut part = CreatureSourcePartV1 {
+    let mut part = CreatureSourcePartV2 {
+        next_brick_revision: volume.next_revision().get(),
         part_id: binding.part_id,
         source_volume_id: volume.id(),
         source_generation: generation,
@@ -525,7 +518,7 @@ fn capture_source(
     part
 }
 
-fn intact_masks(parts: &[CreatureSourcePartV1]) -> Vec<CreatureSourceMaskBrickV1> {
+fn intact_masks(parts: &[CreatureSourcePartV2]) -> Vec<CreatureSourceMaskBrickV1> {
     let occupied = parts
         .iter()
         .flat_map(|part| &part.bricks)
@@ -581,7 +574,7 @@ fn intact_masks(parts: &[CreatureSourcePartV1]) -> Vec<CreatureSourceMaskBrickV1
 }
 
 fn corpse_masks(
-    parts: &[CreatureSourcePartV1],
+    parts: &[CreatureSourcePartV2],
     cells: Vec<spall_physics::fracture::SourceCellRef>,
 ) -> Result<Vec<CreatureSourceMaskBrickV1>, CreatureCaptureError> {
     let mut grouped = BTreeMap::<_, Vec<CreatureMaskCellV1>>::new();

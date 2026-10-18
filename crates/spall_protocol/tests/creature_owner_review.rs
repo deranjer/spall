@@ -228,18 +228,18 @@ impl Fixture {
     }
 }
 
-fn owner(f: &Fixture) -> CreatureOwnershipRecordV3 {
+fn owner(f: &Fixture) -> CreatureOwnershipRecordV4 {
     let state = f.state();
     let q = [0.0_f32, 0.0, 0.0, 1.0];
     let pose = serde_json::json!({"translation_m": [0.0,0.0,0.0], "rotation_xyzw": q});
     let mut ids = vec![0_u16; 32768];
     ids[0] = 1;
     let raw = serde_json::json!({
-        "schema": 3, "state": state, "owner_key": 9, "source_generation": 1,
+        "schema": 4, "state": state, "owner_key": 9, "source_generation": 1,
         "next_component_serial": 1, "primary_component_serial": null, "part_velocities": [],
         "parts": [{
             "part_id": 1, "source_volume_id": 100, "source_generation": 1,
-            "source_revision": 1, "cell_size_code": 1, "bounds": [[0,0,0],[0,0,0]],
+            "source_revision": 1, "next_brick_revision": 2, "cell_size_code": 1, "bounds": [[0,0,0],[0,0,0]],
             "source_content_hash": vec![0_u8;32], "parent_id": null,
             "initial_local_pose": pose, "frozen_local_pose": pose,
             "bricks": [{"coord": [0,0,0], "revision": 1, "edited": true, "cells": {"Dense": ids}}]
@@ -251,7 +251,7 @@ fn owner(f: &Fixture) -> CreatureOwnershipRecordV3 {
                 "cells":[{"index":0,"material_id":1}]}]
         }]
     });
-    let mut record: CreatureOwnershipRecordV3 = serde_json::from_value(raw).unwrap();
+    let mut record: CreatureOwnershipRecordV4 = serde_json::from_value(raw).unwrap();
     record.part_velocities = record
         .parts
         .iter()
@@ -289,7 +289,7 @@ fn portable_owner_roundtrip_and_logical_storage_equivalence() {
     assert_eq!(uniform.canonical_hash(), dense.canonical_hash());
     for record in [uniform, dense] {
         let bytes = record.encode(&f.catalog()).unwrap();
-        let decoded = CreatureOwnershipRecordV3::decode(&bytes, &f.catalog()).unwrap();
+        let decoded = CreatureOwnershipRecordV4::decode(&bytes, &f.catalog()).unwrap();
         assert_eq!(record, decoded);
         assert_eq!(bytes, decoded.encode(&f.catalog()).unwrap());
     }
@@ -308,23 +308,23 @@ fn population_decode_roundtrips_distinct_sources_and_still_requires_semantic_val
     second.parts[0].source_content_hash = second.parts[0].canonical_source_content_hash();
     second.components[0].owner_key = 10;
     second.components[0].source_masks[0].volume_id = volume;
-    let set = CreatureOwnershipSetV3 {
+    let set = CreatureOwnershipSetV4 {
         schema: CREATURE_OWNER_SCHEMA,
         records: vec![first, second],
     };
     set.validate(&f.catalog()).unwrap();
     let bytes = postcard::to_allocvec(&set).unwrap();
-    let decoded = CreatureOwnershipSetV3::decode(&bytes, &f.catalog()).unwrap();
+    let decoded = CreatureOwnershipSetV4::decode(&bytes, &f.catalog()).unwrap();
     assert_eq!(decoded, set);
     assert_eq!(decoded.canonical_hash(), set.canonical_hash());
     decoded.validate(&f.catalog()).unwrap();
     assert_eq!(postcard::to_allocvec(&decoded).unwrap(), bytes);
     let mut trailing = bytes;
     trailing.push(0);
-    assert!(CreatureOwnershipSetV3::decode(&trailing, &f.catalog()).is_err());
+    assert!(CreatureOwnershipSetV4::decode(&trailing, &f.catalog()).is_err());
     let json = serde_json::to_vec(&set).unwrap();
     assert_eq!(
-        serde_json::from_slice::<CreatureOwnershipSetV3>(&json).unwrap(),
+        serde_json::from_slice::<CreatureOwnershipSetV4>(&json).unwrap(),
         set
     );
 
@@ -333,19 +333,19 @@ fn population_decode_roundtrips_distinct_sources_and_still_requires_semantic_val
     let mut duplicate = set;
     duplicate.records[1] = duplicate.records[0].clone();
     let bytes = postcard::to_allocvec(&duplicate).unwrap();
-    let decoded: CreatureOwnershipSetV3 = postcard::from_bytes(&bytes).unwrap();
+    let decoded: CreatureOwnershipSetV4 = postcard::from_bytes(&bytes).unwrap();
     assert!(decoded.validate(&f.catalog()).is_err());
-    assert!(CreatureOwnershipSetV3::decode(&bytes, &f.catalog()).is_err());
+    assert!(CreatureOwnershipSetV4::decode(&bytes, &f.catalog()).is_err());
 
-    let empty = CreatureOwnershipSetV3::empty();
+    let empty = CreatureOwnershipSetV4::empty();
     assert_eq!(
-        postcard::from_bytes::<CreatureOwnershipSetV3>(&postcard::to_allocvec(&empty).unwrap())
+        postcard::from_bytes::<CreatureOwnershipSetV4>(&postcard::to_allocvec(&empty).unwrap())
             .unwrap(),
         empty
     );
 }
 
-fn compact_cost_record(f: &Fixture, bricks: usize, material: u16) -> CreatureOwnershipRecordV3 {
+fn compact_cost_record(f: &Fixture, bricks: usize, material: u16) -> CreatureOwnershipRecordV4 {
     let mut record = owner(f);
     record.parts[0].bricks = (0..bricks)
         .map(|x| BaselineBrick {
@@ -366,12 +366,12 @@ fn population_decode_charges_compact_uniform_solids_across_records() {
     let f = Fixture::new();
     let full = compact_cost_record(&f, 30, 1); // 983,040 solids per record.
     let tail = compact_cost_record(&f, 2, 1);
-    let mut set = CreatureOwnershipSetV3 {
+    let mut set = CreatureOwnershipSetV4 {
         schema: CREATURE_OWNER_SCHEMA,
         records: vec![full.clone(), full.clone(), full.clone(), full, tail],
     };
     for record in &set.records {
-        postcard::from_bytes::<CreatureOwnershipRecordV3>(&postcard::to_allocvec(record).unwrap())
+        postcard::from_bytes::<CreatureOwnershipRecordV4>(&postcard::to_allocvec(record).unwrap())
             .unwrap();
     }
     let bytes = postcard::to_allocvec(&set).unwrap();
@@ -379,15 +379,15 @@ fn population_decode_charges_compact_uniform_solids_across_records() {
         bytes.len() < 16 * 1024,
         "compact wire must not hide expansion cost"
     );
-    postcard::from_bytes::<CreatureOwnershipSetV3>(&bytes).unwrap(); // 3,997,696 solids.
+    postcard::from_bytes::<CreatureOwnershipSetV4>(&bytes).unwrap(); // 3,997,696 solids.
     set.records[4] = compact_cost_record(&f, 3, 1); // 4,030,464 solids.
     let bytes = postcard::to_allocvec(&set).unwrap();
-    assert!(postcard::from_bytes::<CreatureOwnershipSetV3>(&bytes).is_err());
+    assert!(postcard::from_bytes::<CreatureOwnershipSetV4>(&bytes).is_err());
 
     // A set's larger allowance must not relax the one-owner solid ceiling.
     set.records = vec![compact_cost_record(&f, 31, 1)];
     assert!(
-        postcard::from_bytes::<CreatureOwnershipSetV3>(&postcard::to_allocvec(&set).unwrap())
+        postcard::from_bytes::<CreatureOwnershipSetV4>(&postcard::to_allocvec(&set).unwrap())
             .is_err()
     );
 }
@@ -395,21 +395,21 @@ fn population_decode_charges_compact_uniform_solids_across_records() {
 #[test]
 fn population_decode_limits_air_brick_metadata_across_records() {
     let f = Fixture::new();
-    let mut set = CreatureOwnershipSetV3 {
+    let mut set = CreatureOwnershipSetV4 {
         schema: CREATURE_OWNER_SCHEMA,
         records: vec![
             compact_cost_record(&f, 2048, 0),
             compact_cost_record(&f, 2048, 0),
         ],
     };
-    postcard::from_bytes::<CreatureOwnershipSetV3>(&postcard::to_allocvec(&set).unwrap()).unwrap();
+    postcard::from_bytes::<CreatureOwnershipSetV4>(&postcard::to_allocvec(&set).unwrap()).unwrap();
     set.records[1] = compact_cost_record(&f, 2049, 0);
     for record in &set.records {
-        postcard::from_bytes::<CreatureOwnershipRecordV3>(&postcard::to_allocvec(record).unwrap())
+        postcard::from_bytes::<CreatureOwnershipRecordV4>(&postcard::to_allocvec(record).unwrap())
             .unwrap();
     }
     assert!(
-        postcard::from_bytes::<CreatureOwnershipSetV3>(&postcard::to_allocvec(&set).unwrap())
+        postcard::from_bytes::<CreatureOwnershipSetV4>(&postcard::to_allocvec(&set).unwrap())
             .is_err()
     );
 }
@@ -418,14 +418,14 @@ fn population_decode_limits_air_brick_metadata_across_records() {
 fn population_decode_rejects_unknown_map_keys_before_reading_their_values() {
     let f = Fixture::new();
     let set_prefix = "{\"schema\":1,\"records\":[],\"unexpected\":";
-    let error = serde_json::from_str::<CreatureOwnershipSetV3>(set_prefix).unwrap_err();
+    let error = serde_json::from_str::<CreatureOwnershipSetV4>(set_prefix).unwrap_err();
     assert!(error.to_string().contains("unknown"), "{error}");
 
     let mut record_prefix = serde_json::to_string(&owner(&f)).unwrap();
     assert_eq!(record_prefix.pop(), Some('}'));
     record_prefix.push_str(",\"unexpected\":");
     let set_prefix = format!("{{\"schema\":1,\"records\":[{record_prefix}");
-    let error = serde_json::from_str::<CreatureOwnershipSetV3>(&set_prefix).unwrap_err();
+    let error = serde_json::from_str::<CreatureOwnershipSetV4>(&set_prefix).unwrap_err();
     assert!(error.to_string().contains("unknown"), "{error}");
 }
 
@@ -436,11 +436,11 @@ fn population_state_strings_enforce_byte_limits_before_semantic_validation() {
     record.state.species_key = "s".repeat(MAX_CREATURE_SPECIES_KEY_BYTES);
     record.state.clip_name = format!("{}a", "é".repeat(127));
     assert_eq!(record.state.clip_name.len(), MAX_CREATURE_CLIP_NAME_BYTES);
-    let mut set = CreatureOwnershipSetV3 {
+    let mut set = CreatureOwnershipSetV4 {
         schema: CREATURE_OWNER_SCHEMA,
         records: vec![record],
     };
-    postcard::from_bytes::<CreatureOwnershipSetV3>(&postcard::to_allocvec(&set).unwrap()).unwrap();
+    postcard::from_bytes::<CreatureOwnershipSetV4>(&postcard::to_allocvec(&set).unwrap()).unwrap();
     for species in [true, false] {
         let mut oversized = set.clone();
         if species {
@@ -449,9 +449,9 @@ fn population_state_strings_enforce_byte_limits_before_semantic_validation() {
             oversized.records[0].state.clip_name = "é".repeat(128);
         }
         let bytes = postcard::to_allocvec(&oversized).unwrap();
-        assert!(postcard::from_bytes::<CreatureOwnershipSetV3>(&bytes).is_err());
+        assert!(postcard::from_bytes::<CreatureOwnershipSetV4>(&bytes).is_err());
         let json = serde_json::to_vec(&oversized).unwrap();
-        assert!(serde_json::from_slice::<CreatureOwnershipSetV3>(&json).is_err());
+        assert!(serde_json::from_slice::<CreatureOwnershipSetV4>(&json).is_err());
     }
     let mut prefix = serde_json::to_string(&set.records.remove(0).state).unwrap();
     assert_eq!(prefix.pop(), Some('}'));
@@ -481,7 +481,7 @@ fn population_nested_fixed_metadata_rejects_unknown_map_fields() {
             .unwrap()
             .insert("unknown_extension".into(), serde_json::json!([1, 2, 3]));
         let value = serde_json::json!({"schema": CREATURE_OWNER_SCHEMA, "records": [record]});
-        let Err(error) = serde_json::from_value::<CreatureOwnershipSetV3>(value) else {
+        let Err(error) = serde_json::from_value::<CreatureOwnershipSetV4>(value) else {
             panic!("unknown map metadata was accepted at {path}");
         };
         assert!(error.to_string().contains("unknown"), "{path}: {error}");
@@ -498,7 +498,7 @@ fn population_decode_refuses_excess_source_binding_before_reading_its_body() {
     bindings.push(serde_json::json!("body must not be decoded"));
     record["state"]["source_bindings"] = serde_json::Value::Array(bindings);
     let value = serde_json::json!({"schema": CREATURE_OWNER_SCHEMA, "records": [record]});
-    let error = serde_json::from_str::<CreatureOwnershipSetV3>(&value.to_string()).unwrap_err();
+    let error = serde_json::from_str::<CreatureOwnershipSetV4>(&value.to_string()).unwrap_err();
     assert!(
         error.to_string().contains("source binding limit"),
         "{error}"
@@ -584,7 +584,7 @@ fn oversized_nested_part_count_is_rejected_during_decode() {
     assert!(raw.len() < MAX_CREATURE_OWNER_RECORD_BYTES);
     assert!(
         matches!(
-            CreatureOwnershipRecordV3::decode(&raw, &f.catalog()),
+            CreatureOwnershipRecordV4::decode(&raw, &f.catalog()),
             Err(CreatureOwnershipError::Encoding(_))
         ),
         "a post-allocation validation error is too late"
@@ -603,7 +603,7 @@ fn last_surviving_fragment_keeps_identity_and_retired_serial_high_water() {
     record.next_component_serial = 100;
     record.validate(&f.catalog()).unwrap();
     let bytes = record.encode(&f.catalog()).unwrap();
-    let decoded = CreatureOwnershipRecordV3::decode(&bytes, &f.catalog()).unwrap();
+    let decoded = CreatureOwnershipRecordV4::decode(&bytes, &f.catalog()).unwrap();
     assert_eq!(decoded.components[0].serial, Some(41));
     assert_eq!(decoded.next_component_serial, 100);
     let mut invalid = record.clone();
@@ -633,7 +633,7 @@ fn nonlowest_primary_survives_canonical_order_and_is_bound_to_root_and_hashes() 
     record.components.push(primary);
     record.validate(&f.catalog()).unwrap();
     let decoded =
-        CreatureOwnershipRecordV3::decode(&record.encode(&f.catalog()).unwrap(), &f.catalog())
+        CreatureOwnershipRecordV4::decode(&record.encode(&f.catalog()).unwrap(), &f.catalog())
             .unwrap();
     assert_eq!(decoded, record);
     assert_eq!(decoded.components[0].serial, Some(7));
@@ -681,12 +681,12 @@ fn superseded_owner_schema_and_missing_primary_identity_are_rejected() {
     json.as_object_mut()
         .unwrap()
         .remove("primary_component_serial");
-    assert!(serde_json::from_value::<CreatureOwnershipRecordV3>(json).is_err());
-    for schema in [1, 2, 4] {
+    assert!(serde_json::from_value::<CreatureOwnershipRecordV4>(json).is_err());
+    for schema in [1, 2, 3, 5] {
         let mut old = record.clone();
         old.schema = schema;
         assert_eq!(
-            CreatureOwnershipRecordV3::decode(&postcard::to_stdvec(&old).unwrap(), &f.catalog(),),
+            CreatureOwnershipRecordV4::decode(&postcard::to_stdvec(&old).unwrap(), &f.catalog(),),
             Err(CreatureOwnershipError::Schema)
         );
     }
@@ -707,7 +707,7 @@ fn empty_source_parts_keep_identity_hierarchy_and_hashes_without_invented_cells(
     record.validate(&f.catalog()).unwrap();
     assert_ne!(bounded, record.canonical_hash());
     assert_eq!(
-        CreatureOwnershipRecordV3::decode(&record.encode(&f.catalog()).unwrap(), &f.catalog(),)
+        CreatureOwnershipRecordV4::decode(&record.encode(&f.catalog()).unwrap(), &f.catalog(),)
             .unwrap(),
         record
     );
@@ -721,14 +721,14 @@ fn empty_source_parts_keep_identity_hierarchy_and_hashes_without_invented_cells(
 #[test]
 fn population_snapshot_retains_empty_allocator_gaps_and_checks_shared_namespace() {
     let f = Fixture::new();
-    let mut snapshot = CreatureSnapshotV1 {
+    let mut snapshot = CreatureSnapshotV2 {
         schema: CREATURE_SNAPSHOT_SCHEMA,
         allocator: context(7, 42, 900).allocator,
         next_volume_id: 900,
-        owners: CreatureOwnershipSetV3::empty(),
+        owners: CreatureOwnershipSetV4::empty(),
     };
-    let roundtrip = |value: &CreatureSnapshotV1| {
-        CreatureSnapshotV1::decode(&postcard::to_stdvec(value).unwrap(), &f.catalog()).unwrap()
+    let roundtrip = |value: &CreatureSnapshotV2| {
+        CreatureSnapshotV2::decode(&postcard::to_stdvec(value).unwrap(), &f.catalog()).unwrap()
     };
     assert_eq!(roundtrip(&snapshot), snapshot);
     let empty_hash = snapshot.canonical_hash();
@@ -757,7 +757,7 @@ fn population_snapshot_retains_empty_allocator_gaps_and_checks_shared_namespace(
             _ => unreachable!(),
         }
         assert!(
-            CreatureSnapshotV1::decode(&postcard::to_stdvec(&bad).unwrap(), &f.catalog(),).is_err(),
+            CreatureSnapshotV2::decode(&postcard::to_stdvec(&bad).unwrap(), &f.catalog(),).is_err(),
             "snapshot case {case}"
         );
     }
@@ -766,10 +766,10 @@ fn population_snapshot_retains_empty_allocator_gaps_and_checks_shared_namespace(
     assert_ne!(hash, snapshot.canonical_hash());
     let mut trailing = postcard::to_stdvec(&snapshot).unwrap();
     trailing.push(0);
-    assert!(CreatureSnapshotV1::decode(&trailing, &f.catalog()).is_err());
+    assert!(CreatureSnapshotV2::decode(&trailing, &f.catalog()).is_err());
     let mut json = serde_json::to_value(&snapshot).unwrap();
     json["allocator"]["ignored"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<CreatureSnapshotV1>(json).is_err());
+    assert!(serde_json::from_value::<CreatureSnapshotV2>(json).is_err());
 
     // Value deserialization exposes the declared sequence count. Invalid null
     // records prove the count guard runs before any record body is decoded.
@@ -779,7 +779,7 @@ fn population_snapshot_retains_empty_allocator_gaps_and_checks_shared_namespace(
         spall_protocol::creature_owner::MAX_CREATURE_OWNER_SET_RECORDS
             + 1
     ]);
-    let error = serde_json::from_value::<CreatureSnapshotV1>(excess).unwrap_err();
+    let error = serde_json::from_value::<CreatureSnapshotV2>(excess).unwrap_err();
     assert!(error.to_string().contains("record limit"), "{error}");
 }
 
@@ -805,17 +805,17 @@ fn context(
         existing_source_volumes: &[],
     }
 }
-fn birth(record: CreatureOwnershipRecordV3) -> CreatureLifecycleChangeV3 {
-    CreatureLifecycleChangeV3 {
+fn birth(record: CreatureOwnershipRecordV4) -> CreatureLifecycleChangeV4 {
+    CreatureLifecycleChangeV4 {
         schema: spall_protocol::CREATURE_CHANGE_SCHEMA,
         transaction_id: spall_core::TransactionId::new(7).unwrap(),
         operation_ordinal: 0,
         expected_before_hash: Hash32::ZERO,
         expected_after_hash: record.canonical_hash(),
-        operation: CreatureLifecycleOperationV3::Birth { after: record },
+        operation: CreatureLifecycleOperationV4::Birth { after: record },
     }
 }
-fn two_parts(f: &Fixture) -> CreatureOwnershipRecordV3 {
+fn two_parts(f: &Fixture) -> CreatureOwnershipRecordV4 {
     let mut record = owner(f);
     record.state.source_bindings.push(CreaturePartBinding {
         part_id: 2,
@@ -858,15 +858,15 @@ fn measured_nonrigid_part_velocities_roundtrip_and_fence_only_motion() {
     assert_ne!(moving.canonical_hash(), baseline.canonical_hash());
     let bytes = moving.encode(&f.catalog()).unwrap();
     assert_eq!(
-        CreatureOwnershipRecordV3::decode(&bytes, &f.catalog()).unwrap(),
+        CreatureOwnershipRecordV4::decode(&bytes, &f.catalog()).unwrap(),
         moving
     );
-    let set = CreatureOwnershipSetV3 {
+    let set = CreatureOwnershipSetV4 {
         schema: CREATURE_OWNER_SCHEMA,
         records: vec![moving.clone()],
     };
     assert_eq!(
-        CreatureOwnershipSetV3::decode(&postcard::to_allocvec(&set).unwrap(), &f.catalog())
+        CreatureOwnershipSetV4::decode(&postcard::to_allocvec(&set).unwrap(), &f.catalog())
             .unwrap(),
         set
     );
@@ -902,7 +902,7 @@ fn measured_nonrigid_part_velocities_roundtrip_and_fence_only_motion() {
     let mut old = bytes;
     old[0] = 1; // Superseded owner schema, with no conversion path.
     assert!(matches!(
-        CreatureOwnershipRecordV3::decode(&old, &f.catalog()),
+        CreatureOwnershipRecordV4::decode(&old, &f.catalog()),
         Err(CreatureOwnershipError::Schema)
     ));
 }
@@ -915,7 +915,7 @@ fn velocity_vector_refuses_an_excess_body_before_decoding_it() {
     let mut values = vec![entry; MAX_CREATURE_OWNER_PARTS];
     values.push(serde_json::json!("must not decode this body"));
     record["part_velocities"] = serde_json::Value::Array(values);
-    let error = serde_json::from_str::<CreatureOwnershipRecordV3>(&record.to_string()).unwrap_err();
+    let error = serde_json::from_str::<CreatureOwnershipRecordV4>(&record.to_string()).unwrap_err();
     assert!(
         error.to_string().contains("cumulative count limit"),
         "{error}"
@@ -964,7 +964,7 @@ fn receipt_binds_outer_transaction_ordinal_and_validated_operation() {
         .is_err()
     );
     let mut malformed = change.clone();
-    let CreatureLifecycleOperationV3::Birth { after } = &mut malformed.operation else {
+    let CreatureLifecycleOperationV4::Birth { after } = &mut malformed.operation else {
         unreachable!()
     };
     after.parts.reverse();
@@ -1044,13 +1044,13 @@ fn death_requires_witness_and_preserves_definition_and_source_data() {
         installed_angular_velocity_rad_s: after.state.angular_velocity_rad_s,
         frozen_local_poses: vec![(1, after.parts[0].frozen_local_pose)],
     };
-    let change_for = |record: CreatureOwnershipRecordV3| CreatureLifecycleChangeV3 {
+    let change_for = |record: CreatureOwnershipRecordV4| CreatureLifecycleChangeV4 {
         schema: spall_protocol::CREATURE_CHANGE_SCHEMA,
         transaction_id: spall_core::TransactionId::new(8).unwrap(),
         operation_ordinal: 0,
         expected_before_hash: current.canonical_hash(),
         expected_after_hash: record.canonical_hash(),
-        operation: CreatureLifecycleOperationV3::Death { after: record },
+        operation: CreatureLifecycleOperationV4::Death { after: record },
     };
     let valid = change_for(after.clone());
     assert!(
@@ -1072,13 +1072,18 @@ fn death_requires_witness_and_preserves_definition_and_source_data() {
         (candidate.next_creature_id, candidate.next_volume_id),
         (2, 101)
     );
-    for case in 0..3 {
+    for case in 0..4 {
         let mut invalid = after.clone();
         match case {
             0 => invalid.state.clip_phase_tick += 1,
             1 => {
                 invalid.state.species_key = "trout".into();
                 invalid.state.asset = asset(5);
+            }
+            3 => {
+                invalid.parts[0].next_brick_revision += 10;
+                invalid.parts[0].source_content_hash =
+                    invalid.parts[0].canonical_source_content_hash();
             }
             _ => {
                 let BaselineCells::Dense(cells) = &mut invalid.parts[0].bricks[0].cells else {
@@ -1132,14 +1137,14 @@ fn aggregate_brick_limit_rejects_nested_payload_before_record_validation() {
     assert!(bytes.len() < MAX_CREATURE_OWNER_RECORD_BYTES);
     assert!(
         matches!(
-            CreatureOwnershipRecordV3::decode(&bytes, &f.catalog()),
+            CreatureOwnershipRecordV4::decode(&bytes, &f.catalog()),
             Err(CreatureOwnershipError::Encoding(_))
         ),
         "per-part bounds must not defer cumulative rejection until after nested allocations"
     );
 }
 
-fn motion_overlay_for_review(record: &CreatureOwnershipRecordV3) -> CreatureMotionOverlayV2 {
+fn motion_overlay_for_review(record: &CreatureOwnershipRecordV4) -> CreatureMotionOverlayV2 {
     CreatureMotionOverlayV2 {
         part_velocities: record.part_velocities.clone(),
         state_revision: record.state.state_revision,
@@ -1176,7 +1181,7 @@ fn motion_overlay_for_review(record: &CreatureOwnershipRecordV3) -> CreatureMoti
     }
 }
 
-fn moved_death_for_review(f: &Fixture) -> (CreatureOwnershipRecordV3, CreatureLifecycleCommitV3) {
+fn moved_death_for_review(f: &Fixture) -> (CreatureOwnershipRecordV4, CreatureLifecycleCommitV4) {
     let mut before = owner(f);
     // A client may have a large phase in an old playback epoch.
     before.state.clip_phase_tick = 100;
@@ -1219,15 +1224,15 @@ fn moved_death_for_review(f: &Fixture) -> (CreatureOwnershipRecordV3, CreatureLi
             .map(|p| (p.part_id, p.frozen_local_pose))
             .collect(),
     };
-    let commit = CreatureLifecycleCommitV3 {
+    let commit = CreatureLifecycleCommitV4 {
         schema: spall_protocol::CREATURE_LIFECYCLE_COMMIT_SCHEMA,
-        change: CreatureLifecycleChangeV3 {
+        change: CreatureLifecycleChangeV4 {
             schema: spall_protocol::CREATURE_CHANGE_SCHEMA,
             transaction_id: spall_core::TransactionId::new(8).unwrap(),
             operation_ordinal: 0,
             expected_before_hash: moved.canonical_hash(),
             expected_after_hash: after.canonical_hash(),
-            operation: CreatureLifecycleOperationV3::Death { after },
+            operation: CreatureLifecycleOperationV4::Death { after },
         },
         expected_before_topology_hash: before.topology_hash(),
         pre_motion: Some(motion_overlay_for_review(&moved)),
@@ -1335,4 +1340,41 @@ fn coordinator_outer_receipt_cannot_authorize_changed_death_evidence() {
             "receipt case {case}"
         );
     }
+}
+
+#[test]
+fn source_counter_is_required_and_binds_source_and_topology_without_changing_motion() {
+    let f = Fixture::new();
+    let before = owner(&f);
+    let mut after = before.clone();
+    after.parts[0].next_brick_revision = 100;
+    after.parts[0].source_content_hash = after.parts[0].canonical_source_content_hash();
+    after.validate(&f.catalog()).unwrap();
+    assert_ne!(
+        before.parts[0].source_content_hash,
+        after.parts[0].source_content_hash
+    );
+    assert_ne!(before.canonical_hash(), after.canonical_hash());
+    assert_ne!(before.topology_hash(), after.topology_hash());
+    assert_eq!(before.motion_hash(), after.motion_hash());
+    assert_eq!(
+        CreatureOwnershipRecordV4::decode(&after.encode(&f.catalog()).unwrap(), &f.catalog())
+            .unwrap(),
+        after
+    );
+    for counter in [0, 1] {
+        let mut bad = after.clone();
+        bad.parts[0].next_brick_revision = counter;
+        bad.parts[0].source_content_hash = bad.parts[0].canonical_source_content_hash();
+        assert_eq!(
+            bad.validate(&f.catalog()),
+            Err(CreatureOwnershipError::Source)
+        );
+    }
+    let mut json = serde_json::to_value(&after).unwrap();
+    json["parts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("next_brick_revision");
+    assert!(serde_json::from_value::<CreatureOwnershipRecordV4>(json).is_err());
 }

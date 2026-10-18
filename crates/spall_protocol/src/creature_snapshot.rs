@@ -6,24 +6,24 @@ use serde::{Deserialize, Deserializer, Serialize};
 use spall_core::{CreatureAllocator, CreatureAllocatorSnapshotV1, WorldId};
 
 use crate::{
-    CanonicalWriter, CreatureOwnershipError, CreatureOwnershipSetV3, CreatureValidationCatalog,
+    CanonicalWriter, CreatureOwnershipError, CreatureOwnershipSetV4, CreatureValidationCatalog,
     Hash32, creature_owner::MAX_CREATURE_OWNER_SET_BYTES,
 };
 
-pub const CREATURE_SNAPSHOT_SCHEMA: u16 = 1;
+pub const CREATURE_SNAPSHOT_SCHEMA: u16 = 2;
 pub const MAX_CREATURE_SNAPSHOT_BYTES: usize = MAX_CREATURE_OWNER_SET_BYTES + 128;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CreatureSnapshotV1 {
+pub struct CreatureSnapshotV2 {
     pub schema: u16,
     pub allocator: CreatureAllocatorSnapshotV1,
     /// Capture of the world's existing shared volume counter, including gaps.
     /// Installation must match the accompanying geometry checkpoint counter.
     pub next_volume_id: u64,
-    pub owners: CreatureOwnershipSetV3,
+    pub owners: CreatureOwnershipSetV4,
 }
 
-impl<'de> Deserialize<'de> for CreatureSnapshotV1 {
+impl<'de> Deserialize<'de> for CreatureSnapshotV2 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // The allocator has a strict local reader without changing the core DTO
         // layout. The ownership set uses its cumulative seeded resource reader.
@@ -41,7 +41,7 @@ impl<'de> Deserialize<'de> for CreatureSnapshotV1 {
             schema: u16,
             allocator: AllocatorWire,
             next_volume_id: u64,
-            owners: CreatureOwnershipSetV3,
+            owners: CreatureOwnershipSetV4,
         }
         let wire = Wire::deserialize(deserializer)?;
         Ok(Self {
@@ -58,7 +58,7 @@ impl<'de> Deserialize<'de> for CreatureSnapshotV1 {
     }
 }
 
-impl CreatureSnapshotV1 {
+impl CreatureSnapshotV2 {
     pub fn validate(
         &self,
         catalog: &CreatureValidationCatalog<'_>,
@@ -89,7 +89,7 @@ impl CreatureSnapshotV1 {
     }
 
     pub fn canonical_hash(&self) -> Hash32 {
-        let mut writer = CanonicalWriter::with_domain(b"spall.creature-snapshot.v1");
+        let mut writer = CanonicalWriter::with_domain(b"spall.creature-snapshot.v2");
         writer
             .u16(self.schema)
             .u16(self.allocator.schema)

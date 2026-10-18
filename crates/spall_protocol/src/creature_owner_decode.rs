@@ -547,12 +547,12 @@ seeded_struct!(
     CreatureOwnershipSetSeed,
     CreatureOwnershipSetVisitor,
     CreatureOwnershipSetField,
-    CreatureOwnershipSetV3,
-    "CreatureOwnershipSetV3",
+    CreatureOwnershipSetV4,
+    "CreatureOwnershipSetV4",
     budget,
     {
         schema => Schema ("schema"): u16 = PlainSeed::new(),
-        records => Records ("records"): Vec<CreatureOwnershipRecordV3> = SetRecordsSeed { budget }
+        records => Records ("records"): Vec<CreatureOwnershipRecordV4> = SetRecordsSeed { budget }
     }
 );
 
@@ -604,9 +604,9 @@ struct SetRecordSeed<'a> {
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for PartsSeed<'a> {
-    type Value = Vec<CreatureSourcePartV1>;
+    type Value = Vec<CreatureSourcePartV2>;
     fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-        CountedVecSeed::<CreatureSourcePartV1> {
+        CountedVecSeed::<CreatureSourcePartV2> {
             budget: self.budget,
             counter: Counter::Parts,
             max: MAX_CREATURE_OWNER_PARTS,
@@ -670,7 +670,7 @@ impl<'de, 'a> DeserializeSeed<'de> for MaskCellsSeed<'a> {
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for SetRecordsSeed<'a> {
-    type Value = Vec<CreatureOwnershipRecordV3>;
+    type Value = Vec<CreatureOwnershipRecordV4>;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         deserializer.deserialize_seq(SetRecordsVisitor {
@@ -680,14 +680,14 @@ impl<'de, 'a> DeserializeSeed<'de> for SetRecordsSeed<'a> {
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for SetRecordSeed<'a> {
-    type Value = CreatureOwnershipRecordV3;
+    type Value = CreatureOwnershipRecordV4;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         self.budget.add_set_record::<D::Error>()?;
         self.budget.reserve_set_bytes::<D::Error>(self.slot_bytes)?;
         self.budget.begin_record::<D::Error>()?;
         self.budget.add_work::<D::Error>(1)?;
-        <CreatureOwnershipRecordV3 as BudgetDecode>::decode(deserializer, self.budget)
+        <CreatureOwnershipRecordV4 as BudgetDecode>::decode(deserializer, self.budget)
     }
 }
 
@@ -696,7 +696,7 @@ struct SetRecordsVisitor<'a> {
 }
 
 impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
-    type Value = Vec<CreatureOwnershipRecordV3>;
+    type Value = Vec<CreatureOwnershipRecordV4>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a bounded sequence of creature ownership records")
@@ -717,7 +717,7 @@ impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
             && declared != 0
         {
             let bytes = declared
-                .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV3>())
+                .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV4>())
                 .ok_or_else(|| {
                     A::Error::custom("creature ownership set decoded-byte budget exceeded")
                 })?;
@@ -738,7 +738,7 @@ impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
             }
             let needs_slot = records.len() == records.capacity();
             let slot_bytes = if needs_slot {
-                std::mem::size_of::<CreatureOwnershipRecordV3>()
+                std::mem::size_of::<CreatureOwnershipRecordV4>()
             } else {
                 0
             };
@@ -756,7 +756,7 @@ impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
                         };
                         let extra_items = additional.saturating_sub(1);
                         let extra_bytes = extra_items
-                            .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV3>())
+                            .checked_mul(std::mem::size_of::<CreatureOwnershipRecordV4>())
                             .ok_or_else(|| {
                                 A::Error::custom(
                                     "creature ownership set decoded-byte budget exceeded",
@@ -777,7 +777,7 @@ impl<'de, 'a> Visitor<'de> for SetRecordsVisitor<'a> {
 }
 
 seeded_struct!(
-    RecordSeed, RecordVisitor, RecordField, CreatureOwnershipRecordV3, "CreatureOwnershipRecordV3", budget,
+    RecordSeed, RecordVisitor, RecordField, CreatureOwnershipRecordV4, "CreatureOwnershipRecordV4", budget,
     {
         schema => Schema ("schema"): u16 = PlainSeed::<u16>::new(),
         state => State ("state"): CreatureStateV1 = PlainSeed::<CreatureStateV1>::new(),
@@ -786,18 +786,19 @@ seeded_struct!(
         next_component_serial => NextComponentSerial ("next_component_serial"): u64 = PlainSeed::<u64>::new(),
         primary_component_serial => PrimaryComponentSerial ("primary_component_serial"): Option<u64> = PlainSeed::<Option<u64>>::new(),
         part_velocities => Velocities ("part_velocities"): Vec<CreaturePartVelocityV2> = VelocitiesSeed { budget: &mut *budget },
-        parts => Parts ("parts"): Vec<CreatureSourcePartV1> = PartsSeed { budget: &mut *budget },
+        parts => Parts ("parts"): Vec<CreatureSourcePartV2> = PartsSeed { budget: &mut *budget },
         components => Components ("components"): Vec<CreatureOwnedComponentV1> = ComponentsSeed { budget: &mut *budget },
     }
 );
 
 seeded_struct!(
-    PartSeed, PartVisitor, PartField, CreatureSourcePartV1, "CreatureSourcePartV1", budget,
+    PartSeed, PartVisitor, PartField, CreatureSourcePartV2, "CreatureSourcePartV2", budget,
     {
         part_id => PartId ("part_id"): u32 = PlainSeed::<u32>::new(),
         source_volume_id => SourceVolumeId ("source_volume_id"): VolumeId = PlainSeed::<VolumeId>::new(),
         source_generation => SourceGeneration ("source_generation"): u64 = PlainSeed::<u64>::new(),
         source_revision => SourceRevision ("source_revision"): u64 = PlainSeed::<u64>::new(),
+        next_brick_revision => NextBrickRevision ("next_brick_revision"): u64 = PlainSeed::<u64>::new(),
         cell_size_code => CellSizeCode ("cell_size_code"): u8 = PlainSeed::<u8>::new(),
         bounds => Bounds ("bounds"): Option<[[i64; 3]; 2]> = PlainSeed::<Option<[[i64; 3]; 2]>>::new(); default None,
         source_content_hash => SourceContentHash ("source_content_hash"): Hash32 = PlainSeed::<Hash32>::new(),
@@ -1018,24 +1019,24 @@ impl<'de> Visitor<'de> for DigestVisitor {
 /// budgets across every nested sequence.
 pub(super) fn deserialize_record<'de, D>(
     deserializer: D,
-) -> Result<CreatureOwnershipRecordV3, D::Error>
+) -> Result<CreatureOwnershipRecordV4, D::Error>
 where
     D: Deserializer<'de>,
 {
     let mut budget = DecodeBudget::new::<D::Error>()?;
-    <CreatureOwnershipRecordV3 as BudgetDecode>::decode(deserializer, &mut budget)
+    <CreatureOwnershipRecordV4 as BudgetDecode>::decode(deserializer, &mut budget)
 }
 
 /// Decode a bounded ownership set using the record decoder with per-record
 /// and cumulative budgets. The aggregate byte budget accounts for decoded
-/// owned capacity and may be stricter than `CreatureOwnershipSetV3::validate`'s
+/// owned capacity and may be stricter than `CreatureOwnershipSetV4::validate`'s
 /// conservative estimate; each record retains its independent decode ceiling.
-pub(super) fn deserialize_set<'de, D>(deserializer: D) -> Result<CreatureOwnershipSetV3, D::Error>
+pub(super) fn deserialize_set<'de, D>(deserializer: D) -> Result<CreatureOwnershipSetV4, D::Error>
 where
     D: Deserializer<'de>,
 {
     let mut budget = DecodeBudget::new_set::<D::Error>()?;
-    <CreatureOwnershipSetV3 as BudgetDecode>::decode(deserializer, &mut budget)
+    <CreatureOwnershipSetV4 as BudgetDecode>::decode(deserializer, &mut budget)
 }
 
 #[cfg(test)]
@@ -1122,7 +1123,7 @@ mod tests {
             parts: MAX_CREATURE_OWNER_PARTS,
             ..DecodeBudget::default()
         };
-        let result = CountedVecSeed::<CreatureSourcePartV1> {
+        let result = CountedVecSeed::<CreatureSourcePartV2> {
             budget: &mut budget,
             counter: Counter::Parts,
             max: MAX_CREATURE_OWNER_PARTS,
@@ -1150,7 +1151,7 @@ mod tests {
         };
         let accesses = Rc::new(Cell::new(0));
         let payload_reads = Rc::new(Cell::new(0));
-        let exact = CountedVecSeed::<CreatureSourcePartV1> {
+        let exact = CountedVecSeed::<CreatureSourcePartV2> {
             budget: &mut budget,
             counter: Counter::Parts,
             max: MAX_CREATURE_OWNER_PARTS,
@@ -1163,10 +1164,10 @@ mod tests {
             accesses: accesses.clone(),
             payload_reads: payload_reads.clone(),
         });
-        assert_eq!(exact.unwrap(), Vec::<CreatureSourcePartV1>::new());
+        assert_eq!(exact.unwrap(), Vec::<CreatureSourcePartV2>::new());
         assert_eq!(payload_reads.get(), 0);
 
-        let excess = CountedVecSeed::<CreatureSourcePartV1> {
+        let excess = CountedVecSeed::<CreatureSourcePartV2> {
             budget: &mut budget,
             counter: Counter::Parts,
             max: MAX_CREATURE_OWNER_PARTS,
@@ -1298,7 +1299,7 @@ mod tests {
                 "source_volume_id": volume_id,
                 "source_generation": 1,
                 "source_revision": 1,
-                "cell_size_code": 1,
+                "next_brick_revision": 2, "cell_size_code": 1,
                 "bounds": null,
                 "source_content_hash": vec![0_u8; 32],
                 "parent_id": null,
@@ -1388,7 +1389,7 @@ mod tests {
                 "source_volume_id": 100,
                 "source_generation": 1,
                 "source_revision": 1,
-                "cell_size_code": 1,
+                "next_brick_revision": 2, "cell_size_code": 1,
                 "source_content_hash": vec![0_u8; 32],
                 "initial_local_pose": {"translation_m": [0.0,0.0,0.0], "rotation_xyzw": [0.0,0.0,0.0,1.0]},
                 "frozen_local_pose": {"translation_m": [0.0,0.0,0.0], "rotation_xyzw": [0.0,0.0,0.0,1.0]},
@@ -1417,10 +1418,10 @@ mod tests {
             "schema": CREATURE_OWNER_SCHEMA,
             "records": [set_record_json(1), set_record_json(2)]
         });
-        let set: CreatureOwnershipSetV3 = serde_json::from_value(input).unwrap();
+        let set: CreatureOwnershipSetV4 = serde_json::from_value(input).unwrap();
         assert_eq!(set.records.len(), 2);
         let bytes = postcard::to_allocvec(&set).unwrap();
-        let decoded: CreatureOwnershipSetV3 = postcard::from_bytes(&bytes).unwrap();
+        let decoded: CreatureOwnershipSetV4 = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, set);
     }
 
@@ -1484,7 +1485,7 @@ mod tests {
         });
         assert_eq!(
             empty_unknown_size.unwrap(),
-            Vec::<CreatureOwnershipRecordV3>::new()
+            Vec::<CreatureOwnershipRecordV4>::new()
         );
     }
 
@@ -1529,7 +1530,7 @@ mod tests {
             "schema": CREATURE_OWNER_SCHEMA,
             "records": (1..=5).map(record).collect::<Vec<_>>()
         });
-        let error = serde_json::from_value::<CreatureOwnershipSetV3>(input).unwrap_err();
+        let error = serde_json::from_value::<CreatureOwnershipSetV4>(input).unwrap_err();
         assert!(
             error.to_string().contains("set solid-cell limit"),
             "unexpected error: {error}"
@@ -1617,7 +1618,7 @@ mod tests {
 
     #[test]
     fn optional_map_fields_default_to_none_but_required_fields_still_fail() {
-        let decoded: CreatureOwnershipRecordV3 =
+        let decoded: CreatureOwnershipRecordV4 =
             serde_json::from_value(optional_field_record_json()).unwrap();
         assert_eq!(decoded.parts[0].bounds, None);
         assert_eq!(decoded.parts[0].parent_id, None);
@@ -1629,7 +1630,7 @@ mod tests {
             .unwrap()
             .remove("part_id");
         let error =
-            serde_json::from_value::<CreatureOwnershipRecordV3>(missing_required).unwrap_err();
+            serde_json::from_value::<CreatureOwnershipRecordV4>(missing_required).unwrap_err();
         assert!(
             error.to_string().contains("part_id"),
             "unexpected error: {error}"

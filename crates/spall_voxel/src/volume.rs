@@ -80,6 +80,15 @@ pub enum AccessError {
     BadCellIndex(u32),
 }
 
+/// A saved volume counter may advance past retired revisions, never reuse one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RevisionResumeError {
+    #[error("the next brick revision must be nonzero")]
+    Zero,
+    #[error("saved next revision {saved} precedes current high-water {current}")]
+    Rollback { saved: u64, current: u64 },
+}
+
 fn fresh_state_stamp() -> u64 {
     fresh_stamp()
 }
@@ -133,6 +142,26 @@ impl Volume {
     /// The next revision this volume will hand out to an edited brick.
     pub fn next_revision(&self) -> Revision {
         self.next_revision
+    }
+
+    /// Resumes a saved counter after installing the original resident bricks.
+    /// Retired revision gaps and the exhausted u64::MAX state are retained.
+    /// Zero/rollback failures leave this volume and its freshness stamp intact.
+    pub fn resume_revision_counter(&mut self, next: Revision) -> Result<(), RevisionResumeError> {
+        if next.0 == 0 {
+            return Err(RevisionResumeError::Zero);
+        }
+        if next < self.next_revision {
+            return Err(RevisionResumeError::Rollback {
+                saved: next.0,
+                current: self.next_revision.0,
+            });
+        }
+        if next != self.next_revision {
+            self.next_revision = next;
+            self.stamp = fresh_state_stamp();
+        }
+        Ok(())
     }
 
     pub fn resident_brick_count(&self) -> usize {

@@ -41,6 +41,7 @@ pub mod collider;
 pub mod column_water;
 pub mod commit;
 pub mod contact_damage;
+mod creature_source_restore;
 pub mod creatures;
 pub mod dormancy;
 pub mod fixtures;
@@ -55,6 +56,9 @@ pub mod registry;
 pub mod replication;
 pub mod schedule;
 pub mod sim;
+pub use creature_source_restore::{
+    CreatureSourceRestoreError, ReconstructedCreatureSources, reconstruct_creature_sources,
+};
 pub mod snow;
 pub mod snow_query;
 pub mod stage;

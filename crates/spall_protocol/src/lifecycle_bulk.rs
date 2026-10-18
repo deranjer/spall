@@ -13,16 +13,16 @@ use crate::creature_owner::{
     MAX_CREATURE_OWNER_SET_RECORDS, MAX_CREATURE_OWNER_SET_SOLID_CELLS,
 };
 use crate::{
-    CreatureLifecycleCommitV3, Hash32, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
+    CreatureLifecycleCommitV4, Hash32, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
     MAX_CREATURE_OWNER_DENSE_CELLS, MAX_CREATURE_OWNER_MASK_BRICKS, MAX_CREATURE_OWNER_MASK_CELLS,
     MAX_CREATURE_OWNER_PARTS, MAX_CREATURE_OWNER_RECORD_BYTES, MAX_CREATURE_OWNER_SOLID_CELLS,
 };
 
-pub const CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA: u16 = 3;
+pub const CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA: u16 = 4;
 pub const MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED: usize = MAX_CREATURE_OWNER_RECORD_BYTES + 64;
 
 /// Cumulative work charged by one lifecycle attachment to its transaction set.
-/// The limits mirror `CreatureOwnershipSetV3::validate`, with explicit bounds
+/// The limits mirror `CreatureOwnershipSetV4::validate`, with explicit bounds
 /// for motion and death-witness arrays carried outside the owner record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LifecycleAttachmentWork {
@@ -78,15 +78,15 @@ impl LifecycleAttachmentWork {
     }
 }
 
-/// Correlated lifecycle payload carried as the compressed body of a world-version-8
+/// Correlated lifecycle payload carried as the compressed body of a world-version-9
 /// BaselineBegin/BaselinePart/BaselineEnd transfer.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CreatureLifecycleBulkPayloadV3 {
+pub struct CreatureLifecycleBulkPayloadV4 {
     pub schema: u16,
     pub transaction_id: TransactionId,
     pub operation_ordinal: u32,
     pub commit_hash: Hash32,
-    pub commit: CreatureLifecycleCommitV3,
+    pub commit: CreatureLifecycleCommitV4,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -117,11 +117,11 @@ pub enum CreatureLifecycleBulkError {
     Zstd(String),
 }
 
-impl CreatureLifecycleBulkPayloadV3 {
+impl CreatureLifecycleBulkPayloadV4 {
     pub fn new(
         transaction_id: TransactionId,
         operation_ordinal: u32,
-        commit: CreatureLifecycleCommitV3,
+        commit: CreatureLifecycleCommitV4,
     ) -> Result<Self, CreatureLifecycleBulkError> {
         check_commit_work(&commit)?;
         if commit.change.transaction_id != transaction_id
@@ -338,7 +338,7 @@ impl CreatureLifecycleBulkPayloadV3 {
                 MAX_CREATURE_OWNER_RECORD_BYTES,
             ));
         }
-        let (commit, rest): (CreatureLifecycleCommitV3, &[u8]) =
+        let (commit, rest): (CreatureLifecycleCommitV4, &[u8]) =
             postcard::take_from_bytes(commit_bytes)
                 .map_err(|e| CreatureLifecycleBulkError::Postcard(e.to_string()))?;
         if !rest.is_empty() {
@@ -346,7 +346,7 @@ impl CreatureLifecycleBulkPayloadV3 {
                 "trailing bytes after nested lifecycle commit".into(),
             ));
         }
-        let payload = CreatureLifecycleBulkPayloadV3 {
+        let payload = CreatureLifecycleBulkPayloadV4 {
             schema: prefix.schema,
             transaction_id: prefix.transaction_id,
             operation_ordinal: prefix.operation_ordinal,
@@ -395,12 +395,12 @@ impl Write for LimitedVecWriter {
     }
 }
 
-fn check_commit_work(commit: &CreatureLifecycleCommitV3) -> Result<(), CreatureLifecycleBulkError> {
+fn check_commit_work(commit: &CreatureLifecycleCommitV4) -> Result<(), CreatureLifecycleBulkError> {
     commit_work(commit).map(|_| ())
 }
 
 fn commit_work(
-    commit: &CreatureLifecycleCommitV3,
+    commit: &CreatureLifecycleCommitV4,
 ) -> Result<LifecycleAttachmentWork, CreatureLifecycleBulkError> {
     if commit.schema != crate::CREATURE_LIFECYCLE_COMMIT_SCHEMA
         || commit.change.schema != crate::CREATURE_CHANGE_SCHEMA
@@ -419,8 +419,8 @@ fn commit_work(
         return Err(CreatureLifecycleBulkError::WorkLimit);
     }
     let record = match &commit.change.operation {
-        crate::CreatureLifecycleOperationV3::Birth { after }
-        | crate::CreatureLifecycleOperationV3::Death { after } => after,
+        crate::CreatureLifecycleOperationV4::Birth { after }
+        | crate::CreatureLifecycleOperationV4::Death { after } => after,
     };
     if record.schema != crate::CREATURE_OWNER_SCHEMA
         || record.state.schema != crate::CREATURE_STATE_SCHEMA

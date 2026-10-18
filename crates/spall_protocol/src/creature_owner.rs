@@ -18,11 +18,11 @@ use crate::{
     MAX_CREATURE_LINEAR_VELOCITY_M_S, MAX_CREATURE_POSITION_M,
 };
 
-pub const CREATURE_OWNER_SCHEMA: u16 = 3;
-pub const CREATURE_OWNER_DOMAIN: &[u8] = b"spall.creature-owner.v3";
-pub const CREATURE_OWNER_SET_DOMAIN: &[u8] = b"spall.creature-owner-set.v3";
-pub const CREATURE_CHANGE_SCHEMA: u16 = 3;
-pub const CREATURE_CHANGE_DOMAIN: &[u8] = b"spall.creature-change.v3";
+pub const CREATURE_OWNER_SCHEMA: u16 = 4;
+pub const CREATURE_OWNER_DOMAIN: &[u8] = b"spall.creature-owner.v4";
+pub const CREATURE_OWNER_SET_DOMAIN: &[u8] = b"spall.creature-owner-set.v4";
+pub const CREATURE_CHANGE_SCHEMA: u16 = 4;
+pub const CREATURE_CHANGE_DOMAIN: &[u8] = b"spall.creature-change.v4";
 pub const MAX_CREATURE_OWNER_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CREATURE_OWNER_PARTS: usize = 256;
 pub const MAX_CREATURE_OWNER_BRICKS: usize = 4096;
@@ -69,11 +69,13 @@ pub struct CreatureSourceMaskBrickV1 {
 
 /// Source part plus the original authoritative sparse volume contents.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CreatureSourcePartV1 {
+pub struct CreatureSourcePartV2 {
     pub part_id: u32,
     pub source_volume_id: VolumeId,
     pub source_generation: u64,
     pub source_revision: u64,
+    /// Actual next revision, including retired brick gaps.
+    pub next_brick_revision: u64,
     pub cell_size_code: u8,
     pub bounds: Option<[[i64; 3]; 2]>,
     pub source_content_hash: Hash32,
@@ -109,7 +111,7 @@ pub struct CreaturePartVelocityV2 {
 
 fn validate_part_velocities(
     lifecycle: crate::CreatureLifecycleState,
-    parts: &[CreatureSourcePartV1],
+    parts: &[CreatureSourcePartV2],
     velocities: &[CreaturePartVelocityV2],
 ) -> Result<(), CreatureOwnershipError> {
     if velocities.len() > MAX_CREATURE_OWNER_PARTS {
@@ -156,7 +158,7 @@ fn write_part_velocities(velocities: &[CreaturePartVelocityV2], w: &mut Canonica
 
 /// Complete portable topology and owner metadata for one creature.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CreatureOwnershipRecordV3 {
+pub struct CreatureOwnershipRecordV4 {
     pub schema: u16,
     pub state: CreatureStateV1,
     pub owner_key: u128,
@@ -168,35 +170,35 @@ pub struct CreatureOwnershipRecordV3 {
     /// Actual installed part-body motion for Alive; empty for Corpse, whose
     /// independently moving component records carry its motion instead.
     pub part_velocities: Vec<CreaturePartVelocityV2>,
-    pub parts: Vec<CreatureSourcePartV1>,
+    pub parts: Vec<CreatureSourcePartV2>,
     pub components: Vec<CreatureOwnedComponentV1>,
 }
 
 /// Canonically ordered actor/source ownership state. This has a distinct hash
 /// domain and is never a substitute for the legacy complete-world hash.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CreatureOwnershipSetV3 {
+pub struct CreatureOwnershipSetV4 {
     pub schema: u16,
-    pub records: Vec<CreatureOwnershipRecordV3>,
+    pub records: Vec<CreatureOwnershipRecordV4>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CreatureLifecycleOperationV3 {
-    Birth { after: CreatureOwnershipRecordV3 },
-    Death { after: CreatureOwnershipRecordV3 },
+pub enum CreatureLifecycleOperationV4 {
+    Birth { after: CreatureOwnershipRecordV4 },
+    Death { after: CreatureOwnershipRecordV4 },
 }
 
 /// Versioned change payload to be embedded by a later existing ordered
 /// transaction consumer. It contains no independent sequence allocator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CreatureLifecycleChangeV3 {
+pub struct CreatureLifecycleChangeV4 {
     pub schema: u16,
     pub transaction_id: TransactionId,
     pub operation_ordinal: u32,
     pub expected_before_hash: Hash32,
     pub expected_after_hash: Hash32,
-    pub operation: CreatureLifecycleOperationV3,
+    pub operation: CreatureLifecycleOperationV4,
 }
 
 /// Existing caller-owned replay and identity context. The replay receipt
@@ -241,7 +243,7 @@ pub struct CreatureDeathWitnessV1 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatureLifecycleCandidateV1 {
-    pub record: CreatureOwnershipRecordV3,
+    pub record: CreatureOwnershipRecordV4,
     pub next_creature_id: u64,
     pub next_volume_id: u64,
     pub outcome: CreatureReductionOutcome,
@@ -290,7 +292,7 @@ pub enum CreatureOwnershipError {
 #[path = "creature_owner_decode.rs"]
 mod decode;
 
-impl<'de> Deserialize<'de> for CreatureOwnershipRecordV3 {
+impl<'de> Deserialize<'de> for CreatureOwnershipRecordV4 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -298,7 +300,7 @@ impl<'de> Deserialize<'de> for CreatureOwnershipRecordV3 {
         decode::deserialize_record(deserializer)
     }
 }
-impl<'de> Deserialize<'de> for CreatureOwnershipSetV3 {
+impl<'de> Deserialize<'de> for CreatureOwnershipSetV4 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -306,17 +308,19 @@ impl<'de> Deserialize<'de> for CreatureOwnershipSetV3 {
         decode::deserialize_set(deserializer)
     }
 }
-impl<'de> Deserialize<'de> for CreatureSourcePartV1 {
+impl<'de> Deserialize<'de> for CreatureSourcePartV2 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Wire {
             part_id: u32,
             source_volume_id: VolumeId,
             source_generation: u64,
             source_revision: u64,
+            next_brick_revision: u64,
             cell_size_code: u8,
             bounds: Option<[[i64; 3]; 2]>,
             source_content_hash: Hash32,
@@ -331,6 +335,7 @@ impl<'de> Deserialize<'de> for CreatureSourcePartV1 {
             source_volume_id: wire.source_volume_id,
             source_generation: wire.source_generation,
             source_revision: wire.source_revision,
+            next_brick_revision: wire.next_brick_revision,
             cell_size_code: wire.cell_size_code,
             bounds: wire.bounds,
             source_content_hash: wire.source_content_hash,
@@ -562,7 +567,7 @@ impl<'de> Deserialize<'de> for BoundedMaterials {
     }
 }
 
-impl CreatureLifecycleChangeV3 {
+impl CreatureLifecycleChangeV4 {
     pub fn canonical_hash(&self) -> Hash32 {
         let mut w = CanonicalWriter::with_domain(CREATURE_CHANGE_DOMAIN);
         w.u16(self.schema)
@@ -571,10 +576,10 @@ impl CreatureLifecycleChangeV3 {
             .blob(&self.expected_before_hash.0)
             .blob(&self.expected_after_hash.0);
         match &self.operation {
-            CreatureLifecycleOperationV3::Birth { after } => {
+            CreatureLifecycleOperationV4::Birth { after } => {
                 w.u8(1).blob(&after.canonical_hash().0);
             }
-            CreatureLifecycleOperationV3::Death { after } => {
+            CreatureLifecycleOperationV4::Death { after } => {
                 w.u8(2).blob(&after.canonical_hash().0);
             }
         }
@@ -589,8 +594,8 @@ impl CreatureLifecycleChangeV3 {
             return Err(CreatureOwnershipError::Schema);
         }
         match &self.operation {
-            CreatureLifecycleOperationV3::Birth { after }
-            | CreatureLifecycleOperationV3::Death { after } => after.validate(catalog)?,
+            CreatureLifecycleOperationV4::Birth { after }
+            | CreatureLifecycleOperationV4::Death { after } => after.validate(catalog)?,
         }
         let size = postcard::experimental::serialized_size(self)
             .map_err(|error| CreatureOwnershipError::Encoding(error.to_string()))?;
@@ -630,16 +635,17 @@ impl CreatureLifecycleChangeV3 {
     }
 }
 
-impl CreatureSourcePartV1 {
+impl CreatureSourcePartV2 {
     /// Hashes only portable source identity and bytes. Hierarchy and moving
     /// state deliberately belong to the enclosing owner hash so death leaves
     /// this digest unchanged.
     pub fn canonical_source_content_hash(&self) -> Hash32 {
-        let mut w = CanonicalWriter::with_domain(b"spall.creature-source-content.v1");
+        let mut w = CanonicalWriter::with_domain(b"spall.creature-source-content.v2");
         w.u32(self.part_id)
             .u64(self.source_volume_id.get())
             .u64(self.source_generation)
             .u64(self.source_revision)
+            .u64(self.next_brick_revision)
             .u8(self.cell_size_code);
         write_bounds(self.bounds, &mut w);
         w.u32(self.bricks.len() as u32);
@@ -678,7 +684,7 @@ impl CreatureSourcePartV1 {
     }
 }
 
-impl CreatureOwnershipRecordV3 {
+impl CreatureOwnershipRecordV4 {
     pub fn validate(
         &self,
         catalog: &CreatureValidationCatalog<'_>,
@@ -732,6 +738,7 @@ impl CreatureOwnershipRecordV3 {
                 || part.part_id == 0
                 || part.source_generation == 0
                 || part.source_revision == 0
+                || part.next_brick_revision == 0
                 || spall_core::CellSizeCode::from_u8(part.cell_size_code).is_none()
                 || part
                     .bricks
@@ -763,6 +770,7 @@ impl CreatureOwnershipRecordV3 {
             }
             for brick in &part.bricks {
                 if brick.revision == 0
+                    || brick.revision >= part.next_brick_revision
                     || part
                         .bounds
                         .is_some_and(|bounds| !within_bounds(bounds, brick.coord))
@@ -976,6 +984,7 @@ impl CreatureOwnershipRecordV3 {
                 .u64(part.source_volume_id.get())
                 .u64(part.source_generation)
                 .u64(part.source_revision)
+                .u64(part.next_brick_revision)
                 .u8(part.cell_size_code);
             write_bounds(part.bounds, &mut w);
             w.blob(&part.source_content_hash.0);
@@ -1041,7 +1050,7 @@ impl CreatureOwnershipRecordV3 {
 }
 
 fn validate_record_work_bounds(
-    record: &CreatureOwnershipRecordV3,
+    record: &CreatureOwnershipRecordV4,
 ) -> Result<(), CreatureOwnershipError> {
     if record.part_velocities.len() > MAX_CREATURE_OWNER_PARTS {
         return Err(CreatureOwnershipError::Limit);
@@ -1160,7 +1169,7 @@ fn validate_record_work_bounds(
     Ok(())
 }
 
-impl CreatureOwnershipSetV3 {
+impl CreatureOwnershipSetV4 {
     pub fn empty() -> Self {
         Self {
             schema: CREATURE_OWNER_SCHEMA,
@@ -1379,8 +1388,8 @@ impl CreatureOwnershipSetV3 {
 }
 
 pub fn reduce_creature_lifecycle_candidate(
-    current: Option<&CreatureOwnershipRecordV3>,
-    change: &CreatureLifecycleChangeV3,
+    current: Option<&CreatureOwnershipRecordV4>,
+    change: &CreatureLifecycleChangeV4,
     context: CreatureLifecycleContextV1<'_>,
     catalog: &CreatureValidationCatalog<'_>,
 ) -> Result<CreatureLifecycleCandidateV1, CreatureOwnershipError> {
@@ -1399,11 +1408,11 @@ pub fn reduce_creature_lifecycle_candidate(
     }
     let change_hash = change.canonical_hash();
     let current_hash = current
-        .map(CreatureOwnershipRecordV3::canonical_hash)
+        .map(CreatureOwnershipRecordV4::canonical_hash)
         .unwrap_or(Hash32::ZERO);
     let after = match &change.operation {
-        CreatureLifecycleOperationV3::Birth { after }
-        | CreatureLifecycleOperationV3::Death { after } => after,
+        CreatureLifecycleOperationV4::Birth { after }
+        | CreatureLifecycleOperationV4::Death { after } => after,
     };
     if let Some(receipt) = context.replay_receipt {
         if receipt.transaction_id == context.transaction_id
@@ -1430,7 +1439,7 @@ pub fn reduce_creature_lifecycle_candidate(
     let mut next_creature_id = context.allocator.next_creature_id;
     let mut next_volume_id = context.next_volume_id;
     match &change.operation {
-        CreatureLifecycleOperationV3::Birth { after } => {
+        CreatureLifecycleOperationV4::Birth { after } => {
             if after.state.lifecycle != crate::CreatureLifecycleState::Alive
                 || after.state.clip_mode != crate::CreatureClipMode::Playing
                 || after.source_generation != 1
@@ -1491,7 +1500,7 @@ pub fn reduce_creature_lifecycle_candidate(
                 .ok_or(CreatureOwnershipError::CounterExhausted)?;
             next_volume_id = expected_volume;
         }
-        CreatureLifecycleOperationV3::Death { after } => {
+        CreatureLifecycleOperationV4::Death { after } => {
             let Some(before_record) = current else {
                 return Err(CreatureOwnershipError::Stale);
             };
@@ -1530,7 +1539,7 @@ pub fn reduce_creature_lifecycle_candidate(
 }
 
 fn validate_reducer_context(
-    current: Option<&CreatureOwnershipRecordV3>,
+    current: Option<&CreatureOwnershipRecordV4>,
     context: CreatureLifecycleContextV1<'_>,
 ) -> Result<(), CreatureOwnershipError> {
     if context.allocator.schema != spall_core::CREATURE_ALLOCATOR_SCHEMA
@@ -1562,8 +1571,8 @@ fn validate_reducer_context(
 }
 
 fn same_source_identity_and_static_definition(
-    left: &CreatureOwnershipRecordV3,
-    right: &CreatureOwnershipRecordV3,
+    left: &CreatureOwnershipRecordV4,
+    right: &CreatureOwnershipRecordV4,
 ) -> bool {
     left.parts.len() == right.parts.len()
         && left.parts.iter().zip(&right.parts).all(|(a, b)| {
@@ -1581,8 +1590,8 @@ fn same_source_identity_and_static_definition(
 }
 
 fn valid_death_transition(
-    before: &CreatureOwnershipRecordV3,
-    after: &CreatureOwnershipRecordV3,
+    before: &CreatureOwnershipRecordV4,
+    after: &CreatureOwnershipRecordV4,
     witness: &CreatureDeathWitnessV1,
 ) -> bool {
     let a = &before.state;
@@ -1852,11 +1861,11 @@ fn write_creature_state(state: &CreatureStateV1, w: &mut CanonicalWriter) {
 }
 
 /// Domain for lifecycle topology fences; intentionally excludes all motion-only fields.
-pub const CREATURE_TOPOLOGY_DOMAIN: &[u8] = b"spall.creature-topology.v3";
+pub const CREATURE_TOPOLOGY_DOMAIN: &[u8] = b"spall.creature-topology.v4";
 /// Domain for the mutable state excluded from the topology fence.
-pub const CREATURE_MOTION_DOMAIN: &[u8] = b"spall.creature-motion.v3";
+pub const CREATURE_MOTION_DOMAIN: &[u8] = b"spall.creature-motion.v4";
 
-impl CreatureOwnershipRecordV3 {
+impl CreatureOwnershipRecordV4 {
     /// Hashes source identity, exact source content, hierarchy and component
     /// ownership while excluding root/local poses, velocity and clip progress.
     pub fn topology_hash(&self) -> Hash32 {
@@ -1888,6 +1897,7 @@ impl CreatureOwnershipRecordV3 {
                 .u64(part.source_volume_id.get())
                 .u64(part.source_generation)
                 .u64(part.source_revision)
+                .u64(part.next_brick_revision)
                 .u8(part.cell_size_code);
             write_bounds(part.bounds, &mut w);
             w.blob(&part.source_content_hash.0);
@@ -1968,7 +1978,7 @@ mod topology_motion_hash_tests {
     use super::*;
     use spall_core::{CreatureGeneration, CreatureId, WorldEpoch, WorldId};
 
-    fn empty_record() -> CreatureOwnershipRecordV3 {
+    fn empty_record() -> CreatureOwnershipRecordV4 {
         let key = CreatureKey::new(
             WorldId::from_u128(1),
             WorldEpoch::INITIAL,
@@ -2004,7 +2014,7 @@ mod topology_motion_hash_tests {
             angular_velocity_rad_s: [0.0; 3],
             locomotion_tag: 0,
         };
-        CreatureOwnershipRecordV3 {
+        CreatureOwnershipRecordV4 {
             primary_component_serial: None,
             part_velocities: vec![],
             schema: CREATURE_OWNER_SCHEMA,
@@ -2036,8 +2046,8 @@ mod topology_motion_hash_tests {
     }
 }
 
-pub const CREATURE_LIFECYCLE_COMMIT_SCHEMA: u16 = 3;
-pub const CREATURE_LIFECYCLE_COMMIT_DOMAIN: &[u8] = b"spall.creature-lifecycle-commit.v3";
+pub const CREATURE_LIFECYCLE_COMMIT_SCHEMA: u16 = 4;
+pub const CREATURE_LIFECYCLE_COMMIT_DOMAIN: &[u8] = b"spall.creature-lifecycle-commit.v4";
 const MAX_COMMIT_PART_POSES: usize = MAX_CREATURE_OWNER_PARTS;
 const MAX_COMMIT_COMPONENT_MOTIONS: usize = MAX_CREATURE_OWNER_COMPONENTS;
 
@@ -2181,15 +2191,15 @@ impl<'de> Deserialize<'de> for CreatureDeathWitnessV1 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CreatureLifecycleCommitV3 {
+pub struct CreatureLifecycleCommitV4 {
     pub schema: u16,
-    pub change: CreatureLifecycleChangeV3,
+    pub change: CreatureLifecycleChangeV4,
     pub expected_before_topology_hash: Hash32,
     pub pre_motion: Option<CreatureMotionOverlayV2>,
     pub death_witness: Option<CreatureDeathWitnessV1>,
 }
 
-impl CreatureLifecycleCommitV3 {
+impl CreatureLifecycleCommitV4 {
     pub fn canonical_hash(&self) -> Hash32 {
         let mut w = CanonicalWriter::with_domain(CREATURE_LIFECYCLE_COMMIT_DOMAIN);
         w.u16(self.schema)
@@ -2260,7 +2270,7 @@ impl CreatureLifecycleCommitV3 {
 impl CreatureMotionOverlayV2 {
     fn apply_to(
         &self,
-        record: &mut CreatureOwnershipRecordV3,
+        record: &mut CreatureOwnershipRecordV4,
     ) -> Result<(), CreatureOwnershipError> {
         validate_part_velocities(record.state.lifecycle, &record.parts, &self.part_velocities)?;
         if self.state_revision < record.state.state_revision
@@ -2315,10 +2325,10 @@ fn component_order_values(component: &CreatureComponentMotionV1) -> (u128, Optio
     (component.owner_key, component.serial)
 }
 
-impl CreatureLifecycleCommitV3 {
+impl CreatureLifecycleCommitV4 {
     pub fn validate_and_reduce(
         &self,
-        current: Option<&CreatureOwnershipRecordV3>,
+        current: Option<&CreatureOwnershipRecordV4>,
         context: CreatureLifecycleContextV1<'_>,
         catalog: &CreatureValidationCatalog<'_>,
     ) -> Result<CreatureLifecycleCandidateV1, CreatureOwnershipError> {
@@ -2357,7 +2367,7 @@ impl CreatureLifecycleCommitV3 {
         }
         let mut candidate_before = current.cloned();
         match &self.change.operation {
-            CreatureLifecycleOperationV3::Birth { .. } => {
+            CreatureLifecycleOperationV4::Birth { .. } => {
                 if current.is_some()
                     || self.pre_motion.is_some()
                     || self.death_witness.is_some()
@@ -2366,7 +2376,7 @@ impl CreatureLifecycleCommitV3 {
                     return Err(CreatureOwnershipError::Stale);
                 }
             }
-            CreatureLifecycleOperationV3::Death { .. } => {
+            CreatureLifecycleOperationV4::Death { .. } => {
                 let before = candidate_before
                     .as_mut()
                     .ok_or(CreatureOwnershipError::Stale)?;
@@ -2421,9 +2431,9 @@ mod lifecycle_commit_hash_tests {
         .unwrap()
     }
 
-    fn commit() -> CreatureLifecycleCommitV3 {
+    fn commit() -> CreatureLifecycleCommitV4 {
         let key = key();
-        let after = CreatureOwnershipRecordV3 {
+        let after = CreatureOwnershipRecordV4 {
             primary_component_serial: None,
             part_velocities: vec![],
             schema: CREATURE_OWNER_SCHEMA,
@@ -2461,15 +2471,15 @@ mod lifecycle_commit_hash_tests {
             parts: vec![],
             components: vec![],
         };
-        let change = CreatureLifecycleChangeV3 {
+        let change = CreatureLifecycleChangeV4 {
             schema: CREATURE_CHANGE_SCHEMA,
             transaction_id: TransactionId::new(1).unwrap(),
             operation_ordinal: 0,
             expected_before_hash: Hash32::ZERO,
             expected_after_hash: after.canonical_hash(),
-            operation: CreatureLifecycleOperationV3::Birth { after },
+            operation: CreatureLifecycleOperationV4::Birth { after },
         };
-        CreatureLifecycleCommitV3 {
+        CreatureLifecycleCommitV4 {
             schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
             change,
             expected_before_topology_hash: Hash32::ZERO,
@@ -2533,12 +2543,12 @@ pub struct CreatureLifecycleCommitReplayReceiptV1 {
     pub commit_hash: Hash32,
 }
 
-impl CreatureLifecycleCommitV3 {
+impl CreatureLifecycleCommitV4 {
     /// Reduces with a receipt verified by the enclosing existing transaction ledger.
     /// The receipt binds the complete outer commit, including witness and overlay.
     pub fn validate_and_reduce_with_receipt(
         &self,
-        current: Option<&CreatureOwnershipRecordV3>,
+        current: Option<&CreatureOwnershipRecordV4>,
         context: CreatureLifecycleContextV1<'_>,
         catalog: &CreatureValidationCatalog<'_>,
         receipt: Option<CreatureLifecycleCommitReplayReceiptV1>,
@@ -2577,8 +2587,8 @@ impl CreatureLifecycleCommitV3 {
                 return Err(CreatureOwnershipError::DivergentReplay);
             }
             let after = match &self.change.operation {
-                CreatureLifecycleOperationV3::Birth { after }
-                | CreatureLifecycleOperationV3::Death { after } => after,
+                CreatureLifecycleOperationV4::Birth { after }
+                | CreatureLifecycleOperationV4::Death { after } => after,
             };
             after.validate(catalog)?;
             let current_record = current.ok_or(CreatureOwnershipError::DivergentReplay)?;
@@ -2592,7 +2602,7 @@ impl CreatureLifecycleCommitV3 {
             if current_record.canonical_hash() != self.change.expected_after_hash {
                 return Err(CreatureOwnershipError::DivergentReplay);
             }
-            if let CreatureLifecycleOperationV3::Death { .. } = &self.change.operation {
+            if let CreatureLifecycleOperationV4::Death { .. } = &self.change.operation {
                 let overlay = self
                     .pre_motion
                     .as_ref()

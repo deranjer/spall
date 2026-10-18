@@ -68,7 +68,8 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
     };
     let mut cells = vec![0; spall_core::CELLS_PER_BRICK];
     cells[0] = 1;
-    let mut part = CreatureSourcePartV1 {
+    let mut part = CreatureSourcePartV2 {
+        next_brick_revision: 2,
         part_id: 1,
         source_volume_id: VolumeId::new(100).unwrap(),
         source_generation: 1,
@@ -87,7 +88,7 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
         }],
     };
     part.source_content_hash = part.canonical_source_content_hash();
-    let after = CreatureOwnershipRecordV3 {
+    let after = CreatureOwnershipRecordV4 {
         primary_component_serial: None,
         part_velocities: vec![CreaturePartVelocityV2 {
             part_id: 1,
@@ -131,13 +132,13 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
         })
         .unwrap();
     let transaction_id = spall_core::TransactionId::new(77).unwrap();
-    let change = CreatureLifecycleChangeV3 {
+    let change = CreatureLifecycleChangeV4 {
         schema: CREATURE_CHANGE_SCHEMA,
         transaction_id,
         operation_ordinal: 1,
         expected_before_hash: Hash32::ZERO,
         expected_after_hash: after.canonical_hash(),
-        operation: CreatureLifecycleOperationV3::Birth { after },
+        operation: CreatureLifecycleOperationV4::Birth { after },
     };
     let mut transaction = TopologyTransaction {
         transaction_id,
@@ -156,7 +157,7 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
                 material: MaterialId::AIR,
             },
             TopologyOp::CreatureLifecycle {
-                commit: Box::new(CreatureLifecycleCommitV3 {
+                commit: Box::new(CreatureLifecycleCommitV4 {
                     schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
                     change,
                     expected_before_topology_hash: Hash32::ZERO,

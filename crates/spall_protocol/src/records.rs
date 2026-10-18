@@ -21,10 +21,10 @@ use crate::limits::{
 };
 
 /// Schema version stamped into every encoded record header. A peer on another version cannot
-/// decode a single record, so mismatched builds refuse each other at the first message. Version 11
-/// carries explicit primary component identity in current V3 lifecycle payloads.
+/// decode a single record, so mismatched builds refuse each other at the first message. Version 12
+/// carries exact source revision allocator state in current V4 lifecycle payloads.
 /// Saved journals and live peers both reject older versions without migration.
-pub const WIRE_SCHEMA_VERSION: u16 = 11;
+pub const WIRE_SCHEMA_VERSION: u16 = 12;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -505,10 +505,10 @@ pub enum TopologyOp {
     /// This op is structurally validated here; world/catalog validation and
     /// candidate application belong to the owning simulation or replica.
     CreatureLifecycle {
-        commit: Box<crate::CreatureLifecycleCommitV3>,
+        commit: Box<crate::CreatureLifecycleCommitV4>,
     },
     /// Marker for a lifecycle commit delivered through the ordered bulk stream.
-    /// World version 8 carries its bounded payload; this marker alone never applies an actor.
+    /// World version 9 carries its bounded payload; this marker alone never applies an actor.
     CreatureLifecycleBulk {
         operation_ordinal: u32,
         payload_schema: u16,
@@ -1085,8 +1085,8 @@ mod tests {
     fn lifecycle_op_round_trips_and_binds_enclosing_identity() {
         use crate::{
             CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA, CreatureAssetIdentity,
-            CreatureLifecycleCommitV3, CreatureLifecycleOperationV3, CreatureLifecycleState,
-            CreatureOwnershipRecordV3, CreatureStateV1,
+            CreatureLifecycleCommitV4, CreatureLifecycleOperationV4, CreatureLifecycleState,
+            CreatureOwnershipRecordV4, CreatureStateV1,
         };
         use spall_core::{CreatureGeneration, CreatureId, CreatureKey, WorldEpoch, WorldId};
 
@@ -1097,7 +1097,7 @@ mod tests {
             CreatureGeneration::INITIAL,
         )
         .unwrap();
-        let after = CreatureOwnershipRecordV3 {
+        let after = CreatureOwnershipRecordV4 {
             primary_component_serial: None,
             part_velocities: vec![],
             schema: CREATURE_OWNER_SCHEMA,
@@ -1136,15 +1136,15 @@ mod tests {
             components: vec![],
         };
         let transaction_id = TransactionId::new(42).unwrap();
-        let commit = CreatureLifecycleCommitV3 {
+        let commit = CreatureLifecycleCommitV4 {
             schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
-            change: crate::CreatureLifecycleChangeV3 {
+            change: crate::CreatureLifecycleChangeV4 {
                 schema: crate::CREATURE_CHANGE_SCHEMA,
                 transaction_id,
                 operation_ordinal: 0,
                 expected_before_hash: crate::Hash32::ZERO,
                 expected_after_hash: after.canonical_hash(),
-                operation: CreatureLifecycleOperationV3::Birth { after },
+                operation: CreatureLifecycleOperationV4::Birth { after },
             },
             expected_before_topology_hash: crate::Hash32::ZERO,
             pre_motion: None,
@@ -1175,12 +1175,12 @@ mod tests {
             tx
         );
         let mut old_wire = encoded.clone();
-        old_wire[..2].copy_from_slice(&10u16.to_le_bytes());
+        old_wire[..2].copy_from_slice(&11u16.to_le_bytes());
         assert!(matches!(
             crate::decode_control::<TopologyTransaction>(&old_wire),
             Err(crate::CodecError::SchemaVersion {
-                expected: 11,
-                found: 10
+                expected: 12,
+                found: 11
             })
         ));
         let mut multiple = tx.clone();
@@ -1222,7 +1222,7 @@ mod tests {
         if let TopologyOp::CreatureLifecycle { commit } = &mut oversized.ops[0] {
             commit.change.transaction_id = transaction_id;
             commit.change.operation_ordinal = 0;
-            if let CreatureLifecycleOperationV3::Birth { after } = &mut commit.change.operation {
+            if let CreatureLifecycleOperationV4::Birth { after } = &mut commit.change.operation {
                 after.state.species_key = "x".repeat(70 * 1024);
             }
         }

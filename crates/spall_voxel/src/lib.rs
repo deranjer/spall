@@ -57,4 +57,6 @@ pub use residency::{
     InterestRadii, ResidencyCache, ResidencyPlan,
 };
 pub use transform::RigidXform;
-pub use volume::{AccessError, BrickBounds, BrickState, Residency, Sample, Volume};
+pub use volume::{
+    AccessError, BrickBounds, BrickState, Residency, RevisionResumeError, Sample, Volume,
+};

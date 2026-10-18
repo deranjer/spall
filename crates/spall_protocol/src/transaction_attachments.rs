@@ -12,7 +12,7 @@ use spall_core::{EntityId, TransactionId, VolumeId};
 
 use crate::lifecycle_bulk::LifecycleAttachmentWork;
 use crate::{
-    BaselineOwner, BaselineWorld, CreatureLifecycleBulkPayloadV3, Hash32, TopologyOp,
+    BaselineOwner, BaselineWorld, CreatureLifecycleBulkPayloadV4, Hash32, TopologyOp,
     TopologyTransaction,
 };
 
@@ -38,7 +38,7 @@ pub enum TransactionAttachmentV1 {
     },
     CreatureLifecycle {
         transfer_id: u64,
-        payload: Box<CreatureLifecycleBulkPayloadV3>,
+        payload: Box<CreatureLifecycleBulkPayloadV4>,
     },
 }
 
@@ -54,7 +54,7 @@ pub struct ValidatedTransactionAttachmentSetV1 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedTransactionAttachmentV1 {
     Geometry(BaselineWorld),
-    CreatureLifecycle(Box<CreatureLifecycleBulkPayloadV3>),
+    CreatureLifecycle(Box<CreatureLifecycleBulkPayloadV4>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -264,7 +264,7 @@ pub fn decode_for_transaction(
             }
             1 => {
                 let marker = lifecycle_marker(transaction, id)?;
-                let (payload, decoded_size) = crate::lifecycle_bulk::CreatureLifecycleBulkPayloadV3::decode_compressed_with_budget(
+                let (payload, decoded_size) = crate::lifecycle_bulk::CreatureLifecycleBulkPayloadV4::decode_compressed_with_budget(
                     payload_bytes,
                     transaction.transaction_id,
                     marker.operation_ordinal,

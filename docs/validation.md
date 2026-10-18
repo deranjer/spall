@@ -1792,3 +1792,24 @@ mutation. Run full voxel/physics/protocol/sim suites, workspace all-target/all-
 feature check and strict seven-package lint. These checks do not establish a
 complete Simulation installer, actor checkpoint/baseline/replay consumer or 1 km
 weather/animal launch. Source high-water format integration remains next ENG-218.
+
+
+Exact animal source counters (2026-10-18) supersede the SourceRevision gap-refusal
+scenario above. Current sourceV2/ownerV4/snapshotV2 capture must retain each actual
+Volume.next_revision. `cargo test -p spall_sim --lib creature_` exercises a real
+solid edit -> modified-air tombstone -> retirement -> snapshot codec -> source
+reconstruction -> next edit using the original saved counter. Empty child sources
+retain consumed revisions and accept the next exact revision. An actual exhausted
+live source counter roundtrips and rejects its next edit without mutation/reuse.
+Reconstruction returns unpublished candidates and does not change the live host,
+physics, shared counters or source volumes.
+
+`cargo test -p spall_voxel --test revision_resume` checks monotonic resume and
+atomic zero/rollback refusal. `cargo test -p spall_protocol --test
+creature_owner_review` requires source/full/topology hash sensitivity to a counter
+change, unchanged motion hash, missing/zero/brick-equal counter refusal, and Death
+source-counter tamper rejection. New wire12/owner4/snapshot2 layouts have no old
+aliases/defaults/migration. Run full voxel/physics/protocol/sim/store/server tests,
+client lifecycle refusal, workspace all-target/all-feature check and strict lint.
+These remain CPU/local-transport results; no combined 1 km, GPU, shipped species
+population or multiplayer animal crash/destruction acceptance follows from them.

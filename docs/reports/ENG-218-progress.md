@@ -1132,3 +1132,101 @@ Logs: `.local/eng218-capture-{workspace,clippy,format}.log`.
 No server/network regression rerun was needed for this pass: wire/store layouts
 and server publication paths are unchanged; workspace compilation and strict lint
 cover their callers. The current production checkpoint refusal remains unchanged.
+
+
+## Exact source revision counters and reconstruction (2026-10-18)
+
+This supersedes the previous guarded capture's SourceRevision representability
+refusal. Current-only CreatureSourcePartV2 carries required next_brick_revision;
+it is positive and strictly greater than every resident brick revision. Capture
+writes the actual Volume counter. Source-content v2, full ownership v4 and topology
+v4 hashes bind it; motion-only hashes exclude it. Death's validated static-source
+comparison preserves the counter through the canonical source hash. Missing
+fields and zero/brick-equal counters reject; no old-field default or migration.
+
+Containing owner/set/operation/change/commit/bulk types and schemas/domains are V4,
+source descriptors V2, snapshot envelope V2/schema2/domain2, wire/handshake12 and
+lifecycle bulk kind9. Unchanged motion overlay/velocity V2 and local pose/component/
+mask V1 keep their layouts. Geometry baseline1/store3 remain unchanged guarded
+containers; superseded embedded wire11 frames reject. Actor-free terrain/body hash
+contracts and existing topology enum discriminants remain unchanged.
+
+`Volume::resume_revision_counter` is a checked monotonic resume primitive. Zero or
+rollback leaves the counter, resident data and state stamp unchanged. A no-change
+resume retains the stamp; advancing past retired revisions invalidates it. The
+u64::MAX value is preserved as exhausted; editing cannot reuse or wrap it.
+
+New pure `reconstruct_creature_sources(snapshot,catalog)` first validates the whole
+bounded population, then builds unpublished saved-ID source volumes with original
+bounds, cell sizes, resident brick contents/revisions/edited flags and finally the
+exact recorded counter. Uniform bricks require no dense scratch expansion;
+nonuniform reconstruction uses existing bounded per-brick scratch. It creates no
+IDs, journal operations, owner registry or physical bodies and installs nothing in
+a live Simulation. Joint host/source/physics/registry installation remains next.
+
+Tests now cover actual solid edit -> modified-air tombstone -> retirement, capture
+and codec roundtrip, source reconstruction and a next edit consuming the saved
+counter instead of the old resident maximum. An emptied source child retains its
+actual consumed revisions and uses the correct next value after reconstruction;
+the physical two-component fixture still retains primary41/older7/highwater100.
+An actual live source advanced to u64::MAX captures/reconstructs exactly and refuses
+the next edit without mutation/reuse. Invalid reconstruction candidates leave live
+sources and shared counters untouched. Protocol probes cover required fields,
+source/full/topology-versus-motion hashes, and a fully rehashed Death payload that
+illegally changes only the source counter. The Volume public test covers atomic
+zero/rollback refusal, idempotent resume and subsequent revision50 consumption.
+
+Read-only review verified capture -> field -> hashes/validation -> exact resume,
+including transitive static-source binding, and reported no remaining concrete
+blocker. Initial simulation compilation still referenced the removed SourceRevision
+error in its old refusal test; that test was replaced with successful actual-gap
+reconstruction coverage. No failing scenario, workload or size ceiling was reduced.
+
+Focused measured checks, all via `.local/eng218-cargo.ps1`, serialized:
+- `cargo test -p spall_protocol --lib --tests`: passed, including new source-counter
+  hash/required-field and Death-tamper assertions.
+- `cargo test -p spall_sim --lib creature_`: corrected focused run34 passed0failed;
+  final integrated run also includes strengthened actual exhausted/empty counters.
+- `cargo test -p spall_voxel --test revision_resume`: 1 passed, 0 failed.
+Logs `.local/eng218-source-counter-{protocol,protocol-final,sim,sim-retry,volume}.log`.
+Final wider checks/results are recorded below. Existing cache hard-link warnings
+remain environmental.
+
+Changed files: protocol src/{creature_owner,creature_owner_decode,creature_snapshot,
+codec,handshake,lib,lifecycle_bulk,records,segment,transaction_attachments}.rs and
+owner/commit/attachment tests; simulation src/{creature_capture,creature_capture_tests,
+creature_owner_bridge,creature_source_restore,lib,sim,world}.rs; client lifecycle
+rejection fixtures; store src/dto.rs; voxel src/{lib,volume}.rs and new
+ tests/revision_resume.rs; protocol/validation/tasks and ENG-218 design/progress.
+No engine dependency, species, renderer or launch configuration changed. Unrelated
+artifacts/ remains untouched.
+
+Next unblocked task ID remains ENG-218: jointly prepared atomic Simulation restore
+of host/source/physics/registry state using the existing complete snapshot, then
+actor checkpoint/baseline sections and typed ordered journal/replica consumers,
+bulk producer and source-edit/fracture/terminal synchronization. Production spawn
+and geometry-only checkpoint guards remain. Combined1024m weather/animals, GPU,
+shipped population and multiplayer animal restart/destruction remain unrun and
+unaccepted. Source-only reconstruction is not complete animal save installation.
+
+Final integrated evidence for the source-counter pass:
+- `cargo test -p spall_voxel -p spall_physics -p spall_protocol -p spall_sim -p spall_store -p spall_server`:
+  909 passed, 0 failed, 14 existing ignored across 89 result targets, including
+  real local multiplayer/restart and abrupt-crash recovery at the existing workload.
+  This is separate from unrun multiplayer animal installation/recovery acceptance.
+- Integrated log: `.local/eng218-source-counter-integrated.log`; all current counter
+  capture/reconstruction tests and actual empty/exhausted source strengthening are
+  included. No physics/TLS/crash gate or workload was reduced.
+
+Other final checks passed:
+- `cargo test -p spall_client --lib lifecycle_rejection_review`: 2 passed0failed;
+  validated V4 actor input still refuses atomically at the closed replica path.
+- `cargo check --workspace --all-targets --all-features`.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`.
+- `cargo fmt --all -- --check` and `git diff --check`.
+- `cargo test -p spall_protocol --test creature_commit_review -- --nocapture`:
+  12 passed; current V4 three-part fixture 99,148 control-body bytes versus
+  65,536 cap; 99,173 raw bulk envelope / 412 compressed bytes. This retains the
+  real bulk-producer requirement and is not a shipped species/population cost.
+Logs `.local/eng218-source-counter-{client,workspace,clippy,format,measurements}.log`.
+All Cargo commands used the established target-pinned wrapper and ran serially.

@@ -265,3 +265,35 @@ and exact restore seam is required before claiming complete general source saves
 No derived max+1 value may silently replace the live counter. Production saves
 and spawning remain closed. Population preflight may conservatively refuse a
 potential mask/memory budget overflow; it never relaxes existing ceilings.
+
+
+### Exact source counter reconstruction plan (2026-10-18)
+
+Add required next_brick_revision to current-only CreatureSourcePartV2; positive,
+strictly above every resident brick revision, including empty source volumes.
+Include it directly in canonical source/full/topology hashes and lifecycle static
+source comparisons. Change containing owner/set/operation/change/commit/bulk to
+V4 schemas/domains4, snapshot envelope V2/schema2/domain2, wire/handshake12 and
+lifecycle bulk kind9. Unchanged motion overlay/velocity V2 and pose/component V1
+stay unchanged. No aliases, omitted-field defaults or migration. Geometry baseline
+1/store3 layouts remain guarded until complete actor sections are integrated.
+
+Add a monotonic checked Volume revision-counter resume primitive, refusing zero
+or rollback without mutation. Reconstruct a fresh bounded/unbounded Volume from
+the validated original source bricks/revisions/edited flags, then resume exactly
+at the recorded next counter (not max resident revision+1). Expose a pure source
+reconstruction adapter from the existing complete snapshot and injected catalog;
+it returns unpublished runtime volumes using saved IDs, never allocates IDs or
+installs them in a Simulation. No alternate ledger or owner format. Snapshot
+validation must bound aggregate work before reconstruction copies any cells.
+
+Capture writes each actual volume.next_revision and removes the SourceRevision
+gap refusal. Preserve source freshness/physics equality checks and all budgets.
+Tests: real higher revision edit/air-tombstone retirement with retained lower
+revision geometry, full codec->source reconstruction, next edit consumes the
+saved counter; initially empty and emptied volumes preserve gaps; zero/backward/
+occupied-brick-equal counters and missing/old fields reject; source/full/topology
+hashes change with counter alone, motion does not; u64::MAX exhaustion remains
+explicit without reuse/mutation. Existing live actor checkpoint refusal and spawn
+closure remain. Next ENG-218 is joint prepared host/source/physics/registry restore,
+then complete checkpoint/baseline and ordered consumers.

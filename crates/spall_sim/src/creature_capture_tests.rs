@@ -79,7 +79,7 @@ fn capture_distinguishes_uninitialized_and_empty_retired_allocator() {
     assert_eq!(sim.world.registry().counters(), counters);
     let encoded = postcard::to_stdvec(&captured).unwrap();
     assert_eq!(
-        CreatureSnapshotV1::decode(&encoded, &fixture.view()).unwrap(),
+        CreatureSnapshotV2::decode(&encoded, &fixture.view()).unwrap(),
         captured
     );
 }
@@ -246,14 +246,14 @@ fn initial_token_zero_and_checked_death_capture_map_the_logical_epoch() {
         record.components[0].linear_velocity_m_s
     );
     assert_eq!(
-        CreatureSnapshotV1::decode(&postcard::to_stdvec(&captured).unwrap(), &fixture.view())
+        CreatureSnapshotV2::decode(&postcard::to_stdvec(&captured).unwrap(), &fixture.view())
             .unwrap(),
         captured
     );
 }
 
 #[test]
-fn pending_source_mismatch_and_revision_gaps_refuse_without_capture_mutation() {
+fn pending_and_source_mismatch_refuse_without_capture_mutation() {
     let (mut sim, fixture, state, id) = born();
     sim.world
         .physics_mut()
@@ -305,22 +305,6 @@ fn pending_source_mismatch_and_revision_gaps_refuse_without_capture_mutation() {
     ));
     assert_eq!(sim.world.creature_source_hash_for_test(), before);
 
-    let mut gap = sim
-        .world
-        .creature_source_part(state.key, 1)
-        .unwrap()
-        .clone();
-    gap.insert_brick(
-        BrickCoord::new(10, 0, 0),
-        Brick::uniform(MaterialId::AIR, Revision(100)),
-    )
-    .unwrap();
-    gap.evict_brick(BrickCoord::new(10, 0, 0));
-    replace_sources(&mut sim, &state, gap);
-    assert!(matches!(
-        sim.capture_creature_snapshot(&fixture.view()),
-        Err(CreatureCaptureError::SourceRevision)
-    ));
     assert_eq!(sim.world.registry().counters(), counters);
 }
 
@@ -419,7 +403,19 @@ fn complete_corpse_capture_retains_nonlowest_primary_empty_source_and_serial_gap
             ))
             .unwrap();
     }
-    let empty_volume = Volume::new(empty, CellSizeCode::Quarter);
+    let mut empty_volume = Volume::new(empty, CellSizeCode::Quarter);
+    for material in [MaterialId(1), MaterialId::AIR] {
+        empty_volume
+            .apply_edit(&EditPlan::filled_box(
+                empty,
+                GlobalCell::new(320, 0, 0),
+                GlobalCell::new(320, 0, 0),
+                material,
+            ))
+            .unwrap();
+    }
+    let empty_next = empty_volume.next_revision();
+    empty_volume.evict_brick(BrickCoord::new(10, 0, 0));
     let child = PartTransform {
         translation_m: [1.0, 0.0, 0.0],
         ..PartTransform::IDENTITY
@@ -536,9 +532,28 @@ fn complete_corpse_capture_retains_nonlowest_primary_empty_source_and_serial_gap
     assert_eq!(record.state.root_translation_m, [4.0, 8.0, 6.0]);
     assert_eq!(record.state.pose_epoch, 5);
     assert!(record.parts[1].bricks.is_empty());
+    assert_eq!(record.parts[1].next_brick_revision, empty_next.get());
+    let mut restored = crate::reconstruct_creature_sources(&captured, &catalog).unwrap();
+    let empty_source = &mut restored[0].parts[1].1;
+    assert_eq!(empty_source.next_revision(), empty_next);
+    empty_source
+        .apply_edit(&EditPlan::filled_box(
+            empty,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(0, 0, 0),
+            MaterialId(1),
+        ))
+        .unwrap();
+    assert_eq!(
+        empty_source
+            .brick_revision(BrickCoord::new(0, 0, 0))
+            .unwrap()
+            .unwrap(),
+        empty_next
+    );
     assert_eq!(record.parts[1].parent_id, Some(1));
     assert_eq!(
-        CreatureSnapshotV1::decode(&postcard::to_stdvec(&captured).unwrap(), &catalog).unwrap(),
+        CreatureSnapshotV2::decode(&postcard::to_stdvec(&captured).unwrap(), &catalog).unwrap(),
         captured
     );
     assert_eq!(
@@ -548,5 +563,150 @@ fn complete_corpse_capture_retains_nonlowest_primary_empty_source_and_serial_gap
             .unwrap()
             .pose_token,
         3
+    );
+}
+
+#[test]
+fn source_revision_gaps_roundtrip_and_the_next_edit_never_reuses_a_revision() {
+    let (mut sim, fixture, state, _) = born();
+    let mut original = sim
+        .world
+        .creature_source_part(state.key, 1)
+        .unwrap()
+        .clone();
+    let retired = BrickCoord::new(10, 0, 0);
+    // Real edits produce an edited-air tombstone at the highest revision; its
+    // retirement must not rewind the allocator below that consumed revision.
+    for material in [MaterialId(1), MaterialId::AIR] {
+        original
+            .apply_edit(&EditPlan::filled_box(
+                original.id(),
+                GlobalCell::new(320, 0, 0),
+                GlobalCell::new(320, 0, 0),
+                material,
+            ))
+            .unwrap();
+    }
+    assert!(
+        original
+            .snapshot_brick(retired)
+            .unwrap()
+            .unwrap()
+            .is_modified_air()
+    );
+    let next = original.next_revision();
+    original.evict_brick(retired);
+    replace_sources(&mut sim, &state, original.clone());
+    let counters = sim.world.registry().counters();
+    let captured = sim
+        .capture_creature_snapshot(&fixture.view())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        captured.owners.records[0].parts[0].next_brick_revision,
+        next.get()
+    );
+    let decoded =
+        CreatureSnapshotV2::decode(&postcard::to_stdvec(&captured).unwrap(), &fixture.view())
+            .unwrap();
+    let mut restored = crate::reconstruct_creature_sources(&decoded, &fixture.view()).unwrap();
+    assert_eq!(restored[0].key, state.key);
+    let volume = &mut restored[0].parts[0].1;
+    assert_eq!(volume.next_revision(), next);
+    let metadata = creature_source_freshness(volume, None, PartTransform::IDENTITY).unwrap();
+    assert_eq!(
+        capture_source(
+            volume,
+            &state.source_bindings[0],
+            &metadata,
+            PartTransform::IDENTITY,
+            1
+        ),
+        decoded.owners.records[0].parts[0]
+    );
+    let plan = EditPlan::filled_box(
+        original.id(),
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(0, 0, 0),
+        MaterialId(1),
+    );
+    original.apply_edit(&plan).unwrap();
+    volume.apply_edit(&plan).unwrap();
+    let coord = BrickCoord::new(0, 0, 0);
+    assert_eq!(volume.brick_revision(coord).unwrap().unwrap(), next);
+    assert_eq!(
+        volume
+            .snapshot_brick(coord)
+            .unwrap()
+            .unwrap()
+            .content_hash(),
+        original
+            .snapshot_brick(coord)
+            .unwrap()
+            .unwrap()
+            .content_hash()
+    );
+    assert_eq!(volume.next_revision(), original.next_revision());
+    assert_eq!(sim.world.registry().counters(), counters);
+    assert_eq!(
+        sim.world
+            .creature_source_part(state.key, 1)
+            .unwrap()
+            .next_revision(),
+        next
+    );
+}
+
+#[test]
+fn exhausted_source_counter_reconstructs_without_reuse_and_invalid_candidates_do_not_publish() {
+    let (mut sim, fixture, state, _) = born();
+    let mut source = sim
+        .world
+        .creature_source_part(state.key, 1)
+        .unwrap()
+        .clone();
+    source.resume_revision_counter(Revision(u64::MAX)).unwrap();
+    replace_sources(&mut sim, &state, source);
+    let snapshot = sim
+        .capture_creature_snapshot(&fixture.view())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.owners.records[0].parts[0].next_brick_revision,
+        u64::MAX
+    );
+    let decoded =
+        CreatureSnapshotV2::decode(&postcard::to_stdvec(&snapshot).unwrap(), &fixture.view())
+            .unwrap();
+    let mut restored = crate::reconstruct_creature_sources(&decoded, &fixture.view()).unwrap();
+    let volume = &mut restored[0].parts[0].1;
+    let stamp = volume.state_stamp();
+    assert_eq!(
+        volume.apply_edit(&EditPlan::filled_box(
+            volume.id(),
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(0, 0, 0),
+            MaterialId(1)
+        )),
+        Err(spall_voxel::EditError::RevisionExhausted)
+    );
+    assert_eq!(volume.next_revision(), Revision(u64::MAX));
+    assert_eq!(volume.state_stamp(), stamp);
+    assert_eq!(
+        sim.world
+            .creature_source_part(state.key, 1)
+            .unwrap()
+            .next_revision(),
+        Revision(u64::MAX)
+    );
+    let mut invalid = snapshot;
+    invalid.owners.records[0].parts[0].next_brick_revision = 1;
+    assert!(crate::reconstruct_creature_sources(&invalid, &fixture.view()).is_err());
+    assert_eq!(
+        sim.world
+            .creature_source_part(state.key, 1)
+            .unwrap()
+            .next_revision(),
+        Revision(u64::MAX)
     );
 }
