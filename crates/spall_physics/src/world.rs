@@ -2701,7 +2701,7 @@ impl PhysicsWorld {
                 derived_dense = derived_dense
                     .checked_add(dense)
                     .ok_or(ArticulatedError::WorkBudget)?;
-                if derived_dense > crate::fracture::MAX_FRACTURE_DENSE_CELLS as u64 {
+                if derived_dense > MAX_ARTICULATED_DENSE_CELLS {
                     return Err(ArticulatedError::WorkBudget);
                 }
                 let volume = usize::try_from(dense).map_err(|_| ArticulatedError::WorkBudget)?;
@@ -3629,6 +3629,465 @@ impl PhysicsWorld {
                     root_local_pose: part.assembly_pose,
                 })
                 .collect(),
+        })
+    }
+
+    /// Captures all current components of one corpse as a value-only cold-
+    /// restore DTO. `canonical_sources` must come from the owning Simulation;
+    /// physics retains only the live shards and source-volume IDs after
+    /// fracture, so it cannot reconstruct original hierarchy or empty source
+    /// bindings. For an owner not yet bound in the physics fracture-key index
+    /// (the intact checked-death case), `expected.owner_key` is the caller's
+    /// authoritative key; this method validates that it is unclaimed and does
+    /// not bind or otherwise mutate it.
+    ///
+    /// The source transforms supplied here are the current frozen local
+    /// transforms expected by `DynamicCorpseRestore`, not authored rest data.
+    /// Authored/rest metadata remains owned by Simulation and is not captured
+    /// or reconstructed by this physics API. Canonical source descriptors must
+    /// be sorted by stable part ID, matching the portable owner record.
+    pub fn capture_dynamic_corpse_owner(
+        &self,
+        id: ArticulatedBodyId,
+        expected: crate::articulated::DynamicCorpseOwnerFence,
+        canonical_sources: &[SourcePart],
+    ) -> Result<crate::articulated::DynamicCorpseRestore, crate::articulated::ArticulatedError>
+    {
+        use crate::articulated::{
+            ArticulatedError, DynamicCorpseComponentRestore, DynamicCorpseRestore,
+            MAX_ARTICULATED_DENSE_CELLS, MAX_ARTICULATED_PARTS, MAX_ARTICULATED_SOLID_CELLS,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let assembly = self
+            .articulated
+            .get(&id.0)
+            .ok_or(ArticulatedError::InvalidRestore)?;
+        if !assembly.dynamic_corpse
+            || expected.owner_key == 0
+            || expected.source_generation == 0
+            || expected.topology_revision == 0
+            || expected.pose_token == 0
+            || expected.next_component_serial == 0
+            || match assembly.fracture_owner_key {
+                Some(key) => {
+                    key != expected.owner_key || self.fracture_owner_keys.get(&key) != Some(&id.0)
+                }
+                None => self.fracture_owner_keys.contains_key(&expected.owner_key),
+            }
+            || assembly.source_generation != expected.source_generation
+            || assembly.topology_token != expected.topology_revision
+            || assembly.pose_token != expected.pose_token
+            || assembly.next_component_serial != expected.next_component_serial
+            || assembly.pending_root_pose_token.is_some()
+            || assembly.pending_pose.is_some()
+            || canonical_sources.is_empty()
+            || canonical_sources.len() > MAX_ARTICULATED_PARTS
+            || assembly.parts.is_empty()
+            || assembly.parts.len() > MAX_ARTICULATED_PARTS
+        {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+
+        // Count all source and retained-shard work before building lookup maps,
+        // output cell vectors, or cloning any grids into the returned DTO.
+        let mut source_dense = 0_u64;
+        let mut source_roots = 0_usize;
+        let mut previous_part_id = None;
+        for part in canonical_sources {
+            if part.part_id == 0
+                || previous_part_id.is_some_and(|previous| previous >= part.part_id)
+                || part.source_revision == 0
+                || !part.cell_m.is_finite()
+                || part.cell_m <= 0.0
+                || !part.local_transform.is_valid()
+                || !articulated_grid_range_valid(&part.grid, part.cell_m)
+            {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            previous_part_id = Some(part.part_id);
+            source_roots += usize::from(part.parent_id.is_none());
+            let dims = part.grid.dims();
+            source_dense = source_dense
+                .checked_add(
+                    u64::from(dims[0])
+                        .checked_mul(u64::from(dims[1]))
+                        .and_then(|v| v.checked_mul(u64::from(dims[2])))
+                        .ok_or(ArticulatedError::WorkBudget)?,
+                )
+                .ok_or(ArticulatedError::WorkBudget)?;
+        }
+        let mut shard_dense = 0_u64;
+        for part in &assembly.parts {
+            let dims = part.grid.dims();
+            shard_dense = shard_dense
+                .checked_add(
+                    u64::from(dims[0])
+                        .checked_mul(u64::from(dims[1]))
+                        .and_then(|v| v.checked_mul(u64::from(dims[2])))
+                        .ok_or(ArticulatedError::WorkBudget)?,
+                )
+                .ok_or(ArticulatedError::WorkBudget)?;
+        }
+        if source_dense > MAX_ARTICULATED_DENSE_CELLS
+            || shard_dense > MAX_ARTICULATED_DENSE_CELLS
+            || source_dense
+                .checked_add(shard_dense)
+                .is_none_or(|total| total > MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS)
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+
+        let mut source_solids = 0_u64;
+        let mut shard_solids = 0_u64;
+        for part in canonical_sources {
+            source_solids = source_solids
+                .checked_add(part.grid.solid_count())
+                .ok_or(ArticulatedError::WorkBudget)?;
+        }
+        for part in &assembly.parts {
+            shard_solids = shard_solids
+                .checked_add(part.grid.solid_count())
+                .ok_or(ArticulatedError::WorkBudget)?;
+        }
+        let output_mask_cells = shard_solids;
+        if source_solids == 0
+            || source_roots != 1
+            || source_solids > MAX_ARTICULATED_SOLID_CELLS
+            || shard_solids > MAX_ARTICULATED_SOLID_CELLS
+            || source_solids
+                .checked_add(shard_solids)
+                .and_then(|total| total.checked_add(output_mask_cells))
+                .is_none_or(|total| total > MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS)
+        {
+            return Err(ArticulatedError::WorkBudget);
+        }
+        if shard_solids != source_solids {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+
+        let mut source_input_ids = BTreeSet::new();
+        let mut source_volumes = BTreeSet::new();
+        for part in canonical_sources {
+            if !source_input_ids.insert(part.part_id) || !source_volumes.insert(part.volume_id) {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+        }
+        if source_volumes != assembly.source_volume_ids {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+        if canonical_sources.iter().any(|part| {
+            part.parent_id
+                .is_some_and(|parent| !source_input_ids.contains(&parent))
+        }) {
+            return Err(ArticulatedError::Hierarchy);
+        }
+
+        // Cold restore canonicalizes each local quaternion before flattening;
+        // capture must use the same canonical source transforms for equality.
+        let mut normalized_sources = canonical_sources.to_vec();
+        for part in &mut normalized_sources {
+            part.local_transform = part
+                .local_transform
+                .normalized()
+                .ok_or(ArticulatedError::InvalidRestore)?;
+        }
+        let mut source_parts_by_id = BTreeMap::new();
+        for part in &normalized_sources {
+            source_parts_by_id.insert(part.part_id, part);
+        }
+        let mut shard_part_ids = BTreeSet::new();
+        let mut shard_component_keys = BTreeSet::new();
+        for part in &assembly.parts {
+            if !shard_part_ids.insert((part.part_id, part.component_id)) {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            if let Some(component_id) = part.component_id {
+                if component_id.owner_key != expected.owner_key
+                    || component_id.serial == 0
+                    || component_id.serial >= assembly.next_component_serial
+                {
+                    return Err(ArticulatedError::InvalidRestore);
+                }
+                shard_component_keys.insert(component_id);
+            }
+        }
+        if shard_component_keys.len() > crate::fracture::MAX_FRACTURE_COMPONENTS {
+            return Err(ArticulatedError::WorkBudget);
+        }
+
+        let frozen_poses = flatten_source_parts(&normalized_sources)?;
+        if frozen_poses
+            .iter()
+            .any(|pose| !articulated_translation_in_range(pose.translation_m))
+        {
+            return Err(ArticulatedError::GeometryRange);
+        }
+        let frozen_by_part = normalized_sources
+            .iter()
+            .zip(frozen_poses)
+            .map(|(part, pose)| (part.part_id, pose))
+            .collect::<BTreeMap<_, _>>();
+
+        // Build the canonical provenance index only after the cumulative
+        // source/shard bounds above have been checked.
+        let mut expected_cells = BTreeSet::new();
+        for part in &normalized_sources {
+            let origin = part.grid.origin();
+            let mut range_error = false;
+            part.grid.for_each_solid(|x, y, z, material| {
+                let coords = [
+                    origin.x.checked_add(i64::from(x)),
+                    origin.y.checked_add(i64::from(y)),
+                    origin.z.checked_add(i64::from(z)),
+                ];
+                let [Some(x), Some(y), Some(z)] =
+                    coords.map(|v| v.and_then(|coordinate| i32::try_from(coordinate).ok()))
+                else {
+                    range_error = true;
+                    return;
+                };
+                if !expected_cells.insert(SourceCellRef {
+                    volume_id: part.volume_id,
+                    part_id: part.part_id,
+                    cell: [x, y, z],
+                    material,
+                    source_revision: part.source_revision,
+                }) {
+                    range_error = true;
+                }
+            });
+            if range_error {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+        }
+
+        let density_manifest = assembly
+            .density_manifest
+            .as_ref()
+            .ok_or(ArticulatedError::InvalidDensity)?;
+        let mut assigned = BTreeSet::new();
+        let mut component_parts =
+            BTreeMap::<Option<DerivedFractureComponentId>, Vec<&ArticulatedPartEntry>>::new();
+        for part in &assembly.parts {
+            let Some(source) = source_parts_by_id.get(&part.part_id).copied() else {
+                return Err(ArticulatedError::InvalidRestore);
+            };
+            let Some(expected_frozen_pose) = frozen_by_part.get(&part.part_id) else {
+                return Err(ArticulatedError::InvalidRestore);
+            };
+            if source.volume_id != part.volume_id
+                || source.source_revision != part.source_revision
+                || source.cell_m.to_bits() != part.cell_m.to_bits()
+                || part.assembly_pose.translation_m != expected_frozen_pose.translation_m
+                || part.assembly_pose.rotation_xyzw != expected_frozen_pose.rotation_xyzw
+            {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            component_parts
+                .entry(part.component_id)
+                .or_default()
+                .push(part);
+        }
+        if component_parts.is_empty()
+            || (component_parts.len() == 1
+                && component_parts.keys().next().is_some_and(Option::is_some)
+                && assembly.next_component_serial == 1)
+            || (component_parts.len() == 1
+                && component_parts.keys().next().is_some_and(Option::is_none)
+                && assembly.next_component_serial != 1)
+            || (component_parts.len() > 1 && component_parts.contains_key(&None))
+        {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+
+        let mut components = Vec::with_capacity(component_parts.len());
+        let entry_body = self
+            .entries
+            .get(entry_index(id.0, self.id_namespace))
+            .ok_or(ArticulatedError::InvalidRestore)?
+            .body;
+        let mut component_bodies = HashSet::new();
+        let mut primary_component = None;
+        for (component_id, parts) in component_parts {
+            let first = parts.first().ok_or(ArticulatedError::InvalidRestore)?;
+            if parts.iter().any(|part| part.body != first.body)
+                || !component_bodies.insert(first.body)
+            {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            if first.body == entry_body {
+                primary_component = Some(component_id);
+            }
+            let body = self
+                .bodies
+                .get(first.body)
+                .ok_or(ArticulatedError::InvalidRestore)?;
+            if !body.is_dynamic() {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            let translation = body.translation();
+            let rotation = body.rotation();
+            let linear = body.linvel();
+            let angular = body.angvel();
+            let translation_m = [translation.x, translation.y, translation.z];
+            let rotation_xyzw = [rotation.x, rotation.y, rotation.z, rotation.w];
+            let linear_velocity_m_s = [linear.x, linear.y, linear.z];
+            let angular_velocity_rad_s = [angular.x, angular.y, angular.z];
+            if !translation_m
+                .iter()
+                .chain(&rotation_xyzw)
+                .chain(&linear_velocity_m_s)
+                .chain(&angular_velocity_rad_s)
+                .all(|value| value.is_finite())
+            {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            if !articulated_translation_in_range(translation_m)
+                || !(PartTransform {
+                    translation_m: [0.0; 3],
+                    rotation_xyzw,
+                })
+                .is_valid()
+            {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            let body_rotation = normalize(rotation_xyzw);
+            let mut cells = Vec::with_capacity(
+                parts
+                    .iter()
+                    .map(|part| part.grid.solid_count() as usize)
+                    .sum(),
+            );
+            let mut packed_dense = 0_u64;
+            for part in parts {
+                let source = source_parts_by_id
+                    .get(&part.part_id)
+                    .copied()
+                    .ok_or(ArticulatedError::InvalidRestore)?;
+                let origin = part.grid.origin();
+                let mut packed_bounds = None::<([i32; 3], [i32; 3])>;
+                let mut invalid = false;
+                part.grid.for_each_solid(|x, y, z, material| {
+                    let coords = [
+                        origin.x.checked_add(i64::from(x)),
+                        origin.y.checked_add(i64::from(y)),
+                        origin.z.checked_add(i64::from(z)),
+                    ];
+                    let [Some(x), Some(y), Some(z)] =
+                        coords.map(|v| v.and_then(|coordinate| i32::try_from(coordinate).ok()))
+                    else {
+                        invalid = true;
+                        return;
+                    };
+                    let cell = SourceCellRef {
+                        volume_id: part.volume_id,
+                        part_id: part.part_id,
+                        cell: [x, y, z],
+                        material,
+                        source_revision: part.source_revision,
+                    };
+                    if source.volume_id != cell.volume_id
+                        || source.source_revision != cell.source_revision
+                        || !expected_cells.contains(&cell)
+                        || !assigned.insert(cell)
+                        || density_manifest.get(&material).is_none_or(|bits| {
+                            !f64::from_bits(*bits).is_finite() || f64::from_bits(*bits) <= 0.0
+                        })
+                    {
+                        invalid = true;
+                        return;
+                    }
+                    packed_bounds = Some(match packed_bounds {
+                        Some((minimum, maximum)) => (
+                            [minimum[0].min(x), minimum[1].min(y), minimum[2].min(z)],
+                            [maximum[0].max(x), maximum[1].max(y), maximum[2].max(z)],
+                        ),
+                        None => ([x, y, z], [x, y, z]),
+                    });
+                    cells.push(cell);
+                });
+                if invalid {
+                    return Err(ArticulatedError::InvalidRestore);
+                }
+                let (minimum, maximum) = packed_bounds.ok_or(ArticulatedError::InvalidRestore)?;
+                let dims = [
+                    i64::from(maximum[0]) - i64::from(minimum[0]) + 1,
+                    i64::from(maximum[1]) - i64::from(minimum[1]) + 1,
+                    i64::from(maximum[2]) - i64::from(minimum[2]) + 1,
+                ];
+                let dense = dims
+                    .into_iter()
+                    .try_fold(1_u64, |total, dimension| {
+                        total.checked_mul(u64::try_from(dimension).ok()?)
+                    })
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                packed_dense = packed_dense
+                    .checked_add(dense)
+                    .ok_or(ArticulatedError::WorkBudget)?;
+                if packed_dense > MAX_ARTICULATED_DENSE_CELLS {
+                    return Err(ArticulatedError::WorkBudget);
+                }
+                let frozen_pose = frozen_by_part
+                    .get(&part.part_id)
+                    .ok_or(ArticulatedError::InvalidRestore)?;
+                let packed_origin_m = [
+                    minimum[0] as f32 * source.cell_m,
+                    minimum[1] as f32 * source.cell_m,
+                    minimum[2] as f32 * source.cell_m,
+                ];
+                let local_offset = rotate(frozen_pose.rotation_xyzw, packed_origin_m);
+                let local_translation = [
+                    frozen_pose.translation_m[0] + local_offset[0],
+                    frozen_pose.translation_m[1] + local_offset[1],
+                    frozen_pose.translation_m[2] + local_offset[2],
+                ];
+                let world_offset = rotate(body_rotation, local_translation);
+                let world_translation = [
+                    translation_m[0] + world_offset[0],
+                    translation_m[1] + world_offset[1],
+                    translation_m[2] + world_offset[2],
+                ];
+                if !articulated_translation_in_range(local_translation)
+                    || !articulated_translation_in_range(world_translation)
+                {
+                    return Err(ArticulatedError::GeometryRange);
+                }
+            }
+            if cells.is_empty() {
+                return Err(ArticulatedError::InvalidRestore);
+            }
+            cells.sort_unstable();
+            components.push(DynamicCorpseComponentRestore {
+                component_id,
+                translation_m,
+                rotation_xyzw,
+                linear_velocity_m_s,
+                angular_velocity_rad_s,
+                cells,
+            });
+        }
+        if assigned != expected_cells || primary_component.is_none() {
+            return Err(ArticulatedError::InvalidRestore);
+        }
+        // Cold restore treats components[0] as the logical primary owner and
+        // installs its body in the existing BodyId slot. Preserve the actual
+        // current primary rather than assuming the lowest serial is primary.
+        components.sort_by_key(|component| {
+            (
+                component.component_id != primary_component.unwrap(),
+                component.component_id,
+            )
+        });
+
+        Ok(DynamicCorpseRestore {
+            owner_key: expected.owner_key,
+            source_generation: expected.source_generation,
+            topology_revision: expected.topology_revision,
+            pose_epoch: expected.pose_token,
+            next_component_serial: expected.next_component_serial,
+            source_parts: normalized_sources,
+            components,
         })
     }
 
@@ -9227,6 +9686,446 @@ mod tests {
             vec![3, 4]
         );
         assert!(cold.fracture_component_state(restored, ids[0]).is_err());
+    }
+
+    #[test]
+    fn whole_owner_capture_roundtrips_components_empty_binding_and_serial_gap() {
+        let cfg = PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..Default::default()
+        };
+        let mut root = one_part(grid_from_x_cells(&[0, 1, 4], 5), 8_201, 7);
+        root.part_id = 1;
+        root.local_transform = crate::articulated::PartTransform {
+            translation_m: [0.25, -0.1, 0.0],
+            rotation_xyzw: [0.0, 0.0, 0.38268343, 0.9238795],
+        };
+        let middle = crate::articulated::SourcePart {
+            part_id: 3,
+            parent_id: Some(1),
+            volume_id: VolumeId::new(8_203).unwrap(),
+            source_revision: 4,
+            grid: one_cell_grid(GlobalCell::new(0, 0, 0)),
+            cell_m: 0.5,
+            local_transform: crate::articulated::PartTransform {
+                translation_m: [0.4, 0.0, 0.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+        let empty = crate::articulated::SourcePart {
+            part_id: 4,
+            parent_id: Some(1),
+            volume_id: VolumeId::new(8_202).unwrap(),
+            source_revision: 9,
+            grid: OccupancyGrid::from_solid_mask(
+                GlobalCell::new(10, 0, 0),
+                [1, 1, 1],
+                vec![false],
+                vec![MaterialId::AIR],
+            )
+            .unwrap(),
+            cell_m: 0.25,
+            local_transform: crate::articulated::PartTransform {
+                translation_m: [0.0, 0.5, 0.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+        let sources = vec![root.clone(), middle.clone(), empty.clone()];
+        let root_cells = source_cell_refs(&root);
+        let mut component_cells: Vec<Vec<SourceCellRef>> = vec![
+            root_cells
+                .iter()
+                .copied()
+                .filter(|cell| cell.cell[0] < 2)
+                .collect(),
+            root_cells
+                .iter()
+                .copied()
+                .filter(|cell| cell.cell[0] == 4)
+                .collect(),
+        ];
+        component_cells[0].extend(source_cell_refs(&middle));
+        component_cells[0].sort_unstable();
+        let live = PhysicsWorld::new(cfg);
+        let first_id = DerivedFractureComponentId {
+            owner_key: 0x8a01,
+            serial: 1,
+        };
+        let third_id = DerivedFractureComponentId {
+            owner_key: 0x8a01,
+            serial: 3,
+        };
+        let mut restore_world = live;
+        let owner = restore_world
+            .restore_dynamic_corpse(
+                crate::articulated::DynamicCorpseRestore {
+                    owner_key: 0x8a01,
+                    source_generation: 5,
+                    topology_revision: 12,
+                    pose_epoch: 27,
+                    next_component_serial: 4,
+                    source_parts: sources.clone(),
+                    // Deliberately make serial 3 the physical primary. Cold
+                    // restore must preserve this exact ordering even though
+                    // component identities themselves sort in the opposite order.
+                    components: vec![
+                        crate::articulated::DynamicCorpseComponentRestore {
+                            component_id: Some(third_id),
+                            translation_m: [3.0, 0.0, 0.0],
+                            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                            linear_velocity_m_s: [-0.5, 0.0, 0.0],
+                            angular_velocity_rad_s: [0.0, 0.0, -0.2],
+                            cells: component_cells[1].clone(),
+                        },
+                        crate::articulated::DynamicCorpseComponentRestore {
+                            component_id: Some(first_id),
+                            translation_m: [1.0, 0.0, 0.0],
+                            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                            linear_velocity_m_s: [0.25, 0.0, 0.0],
+                            angular_velocity_rad_s: [0.0, 0.0, 0.1],
+                            cells: component_cells[0].clone(),
+                        },
+                    ],
+                },
+                Representation::MergedCuboids,
+                mix_density,
+            )
+            .unwrap();
+        let before_capture = restore_world.body_count();
+        let snapshot = restore_world.articulated_owner_snapshot(owner).unwrap();
+        let captured = restore_world
+            .capture_dynamic_corpse_owner(
+                owner,
+                crate::articulated::DynamicCorpseOwnerFence {
+                    owner_key: 0x8a01,
+                    source_generation: snapshot.source_generation,
+                    topology_revision: snapshot.topology_token,
+                    pose_token: snapshot.pose_token,
+                    next_component_serial: snapshot.next_component_serial,
+                },
+                &sources,
+            )
+            .unwrap();
+        assert_eq!(restore_world.body_count(), before_capture);
+        assert_eq!(captured.owner_key, 0x8a01);
+        assert_eq!(captured.source_generation, 5);
+        assert_eq!(captured.topology_revision, 12);
+        assert_eq!(captured.pose_epoch, 27);
+        assert_eq!(captured.next_component_serial, 4);
+        assert_eq!(captured.source_parts.len(), 3);
+        assert_eq!(captured.source_parts[2].grid.solid_count(), 0);
+        assert_eq!(
+            captured
+                .components
+                .iter()
+                .map(|component| component.component_id.unwrap())
+                .collect::<Vec<_>>(),
+            vec![third_id, first_id]
+        );
+        assert_eq!(captured.components[0].cells, component_cells[1]);
+        assert_eq!(captured.components[1].cells, component_cells[0]);
+
+        let mut cold = PhysicsWorld::new(cfg);
+        let restored = cold
+            .restore_dynamic_corpse(captured, Representation::MergedCuboids, mix_density)
+            .unwrap();
+        assert_eq!(cold.articulated_collider_count(restored), 3);
+        assert_eq!(cold.articulated_rigid_body_count(restored), 2);
+        assert_eq!(
+            cold.articulated_owner_snapshot(restored)
+                .unwrap()
+                .next_component_serial,
+            4
+        );
+        for component_id in [first_id, third_id] {
+            let before = restore_world
+                .fracture_component_state(owner, component_id)
+                .unwrap();
+            let after = cold
+                .fracture_component_state(restored, component_id)
+                .unwrap();
+            assert_eq!(before.translation_m, after.translation_m);
+            assert_eq!(before.rotation, after.rotation);
+            assert_eq!(before.linvel_m_s, after.linvel_m_s);
+            assert_eq!(before.angvel_rad_s, after.angvel_rad_s);
+            assert!((before.mass_kg - after.mass_kg).abs() < 1.0e-4);
+        }
+        let mut matching_rays = 0;
+        for index in -8..40 {
+            let x = index as f32 * 0.125;
+            let live_hit = restore_world
+                .raycast_articulated(owner, [x, 3.0, 0.125], [0.0, -1.0, 0.0], 6.0)
+                .ok();
+            let cold_hit = cold
+                .raycast_articulated(restored, [x, 3.0, 0.125], [0.0, -1.0, 0.0], 6.0)
+                .ok();
+            assert_eq!(live_hit, cold_hit);
+            matching_rays += usize::from(live_hit.is_some());
+        }
+        assert!(
+            matching_rays > 0,
+            "the restored source query should hit both shard sets"
+        );
+
+        let before_bad_capture = restore_world.body_count();
+        let mut bad_source = sources.clone();
+        bad_source[0].grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [5, 1, 1],
+            vec![true, true, false, false, true],
+            vec![fixtures::DIRT; 5],
+        )
+        .unwrap();
+        assert!(
+            restore_world
+                .capture_dynamic_corpse_owner(
+                    owner,
+                    crate::articulated::DynamicCorpseOwnerFence {
+                        owner_key: 0x8a01,
+                        source_generation: 5,
+                        topology_revision: 12,
+                        pose_token: 27,
+                        next_component_serial: 4,
+                    },
+                    &bad_source,
+                )
+                .is_err()
+        );
+        assert!(
+            restore_world
+                .capture_dynamic_corpse_owner(
+                    owner,
+                    crate::articulated::DynamicCorpseOwnerFence {
+                        owner_key: 0x8a01,
+                        source_generation: 5,
+                        topology_revision: 12,
+                        pose_token: 26,
+                        next_component_serial: 4,
+                    },
+                    &sources,
+                )
+                .is_err()
+        );
+        assert!(
+            restore_world
+                .capture_dynamic_corpse_owner(
+                    owner,
+                    crate::articulated::DynamicCorpseOwnerFence {
+                        owner_key: 0x8a02,
+                        source_generation: 5,
+                        topology_revision: 12,
+                        pose_token: 27,
+                        next_component_serial: 4,
+                    },
+                    &sources,
+                )
+                .is_err()
+        );
+        restore_world
+            .articulated
+            .get_mut(&owner.0)
+            .unwrap()
+            .pending_root_pose_token = Some(28);
+        assert!(
+            restore_world
+                .capture_dynamic_corpse_owner(
+                    owner,
+                    crate::articulated::DynamicCorpseOwnerFence {
+                        owner_key: 0x8a01,
+                        source_generation: 5,
+                        topology_revision: 12,
+                        pose_token: 27,
+                        next_component_serial: 4,
+                    },
+                    &sources,
+                )
+                .is_err()
+        );
+        restore_world
+            .articulated
+            .get_mut(&owner.0)
+            .unwrap()
+            .pending_root_pose_token = None;
+        assert_eq!(restore_world.body_count(), before_bad_capture);
+        assert!(
+            restore_world
+                .fracture_component_state(owner, first_id)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn whole_owner_capture_uses_caller_key_without_binding_for_intact_checked_death() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let mut source = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 8_211, 2);
+        let owner = world
+            .add_articulated_kinematic_parts(
+                [0.0; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                14,
+                vec![source.clone()],
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        let frozen = crate::articulated::PartTransform {
+            translation_m: [0.25, 0.0, 0.0],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        };
+        world
+            .update_articulated_pose(
+                owner,
+                ArticulatedPose {
+                    topology_token: 14,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![(source.part_id, frozen)],
+                },
+            )
+            .unwrap();
+        world.step();
+        world
+            .transfer_articulated_to_dynamic_corpse(owner, 14, 1, mix_density)
+            .unwrap();
+        assert_eq!(
+            world.articulated_owner_snapshot(owner).unwrap().owner_key,
+            None
+        );
+        assert!(!world.fracture_owner_keys.contains_key(&0x8a11));
+        source.local_transform = frozen;
+        let before = world.body_count();
+        let captured = world
+            .capture_dynamic_corpse_owner(
+                owner,
+                crate::articulated::DynamicCorpseOwnerFence {
+                    owner_key: 0x8a11,
+                    source_generation: 1,
+                    topology_revision: 14,
+                    pose_token: 1,
+                    next_component_serial: 1,
+                },
+                &[source],
+            )
+            .unwrap();
+        assert_eq!(world.body_count(), before);
+        assert_eq!(captured.owner_key, 0x8a11);
+        assert_eq!(captured.pose_epoch, 1);
+        assert_eq!(captured.components.len(), 1);
+        assert_eq!(captured.components[0].component_id, None);
+        let mut cold = PhysicsWorld::new(PhysicsConfig::default());
+        let restored = cold
+            .restore_dynamic_corpse(captured, Representation::MergedCuboids, mix_density)
+            .unwrap();
+        assert_eq!(cold.articulated_rigid_body_count(restored), 1);
+        assert_eq!(cold.articulated_collider_count(restored), 1);
+    }
+
+    #[test]
+    fn sparse_large_intact_owner_captures_and_cold_restores_with_existing_dense_limit() {
+        let dims = [1024, 1024, 1];
+        let mut mask = vec![false; dims[0] as usize * dims[1] as usize];
+        mask[0] = true;
+        mask[dims[0] as usize * (dims[1] as usize - 1) + dims[0] as usize - 1] = true;
+        let grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            dims,
+            mask,
+            vec![fixtures::STONE; dims[0] as usize * dims[1] as usize],
+        )
+        .unwrap();
+        assert!(u64::from(dims[0]) * u64::from(dims[1]) > 1_000_000);
+        let source = one_part(grid, 8_221, 3);
+        let bundle = crate::articulated::DynamicCorpseRestore {
+            owner_key: 0x8a21,
+            source_generation: 2,
+            topology_revision: 8,
+            pose_epoch: 11,
+            next_component_serial: 1,
+            components: vec![crate::articulated::DynamicCorpseComponentRestore {
+                component_id: None,
+                translation_m: [0.0; 3],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                linear_velocity_m_s: [0.0; 3],
+                angular_velocity_rad_s: [0.0; 3],
+                cells: source_cell_refs(&source),
+            }],
+            source_parts: vec![source.clone()],
+        };
+        let mut live = PhysicsWorld::new(PhysicsConfig::default());
+        let owner = live
+            .restore_dynamic_corpse(bundle, Representation::MergedCuboids, mix_density)
+            .unwrap();
+        let snapshot = live.articulated_owner_snapshot(owner).unwrap();
+        let captured = live
+            .capture_dynamic_corpse_owner(
+                owner,
+                crate::articulated::DynamicCorpseOwnerFence {
+                    owner_key: 0x8a21,
+                    source_generation: snapshot.source_generation,
+                    topology_revision: snapshot.topology_token,
+                    pose_token: snapshot.pose_token,
+                    next_component_serial: snapshot.next_component_serial,
+                },
+                &[source],
+            )
+            .unwrap();
+        let mut cold = PhysicsWorld::new(PhysicsConfig::default());
+        let restored = cold
+            .restore_dynamic_corpse(captured, Representation::MergedCuboids, mix_density)
+            .unwrap();
+        assert_eq!(live.articulated_collider_count(owner), 1);
+        assert_eq!(cold.articulated_collider_count(restored), 1);
+        let before = live.articulated_body_state(owner);
+        let after = cold.articulated_body_state(restored);
+        assert!((before.mass_kg - after.mass_kg).abs() < 1.0e-4);
+        assert_eq!(before.translation_m, after.translation_m);
+    }
+
+    #[test]
+    fn whole_owner_capture_rejects_composed_part_outside_restore_range() {
+        let mut source = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 8_231, 1);
+        source.local_transform.translation_m = [900.0, 0.0, 0.0];
+        let bundle = crate::articulated::DynamicCorpseRestore {
+            owner_key: 0x8a31,
+            source_generation: 2,
+            topology_revision: 8,
+            pose_epoch: 11,
+            next_component_serial: 1,
+            components: vec![crate::articulated::DynamicCorpseComponentRestore {
+                component_id: None,
+                translation_m: [0.0; 3],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                linear_velocity_m_s: [0.0; 3],
+                angular_velocity_rad_s: [0.0; 3],
+                cells: source_cell_refs(&source),
+            }],
+            source_parts: vec![source.clone()],
+        };
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let owner = world
+            .restore_dynamic_corpse(bundle, Representation::MergedCuboids, mix_density)
+            .unwrap();
+        let owner_snapshot = world.articulated_owner_snapshot(owner).unwrap();
+        let body = world.entries[entry_index(owner.0, world.id_namespace)].body;
+        world
+            .bodies
+            .get_mut(body)
+            .unwrap()
+            .set_translation(Vector::new(200.0, 0.0, 0.0), false);
+
+        assert!(matches!(
+            world.capture_dynamic_corpse_owner(
+                owner,
+                crate::articulated::DynamicCorpseOwnerFence {
+                    owner_key: 0x8a31,
+                    source_generation: owner_snapshot.source_generation,
+                    topology_revision: owner_snapshot.topology_token,
+                    pose_token: owner_snapshot.pose_token,
+                    next_component_serial: owner_snapshot.next_component_serial,
+                },
+                &[source],
+            ),
+            Err(crate::articulated::ArticulatedError::GeometryRange)
+        ));
     }
 
     #[test]

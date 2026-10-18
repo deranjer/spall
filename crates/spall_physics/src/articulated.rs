@@ -103,6 +103,18 @@ pub struct DynamicCorpseRestore {
     pub components: Vec<DynamicCorpseComponentRestore>,
 }
 
+/// Expected immutable owner fence for a whole-corpse capture. `pose_token` is
+/// the owner's authored pose epoch; it is deliberately independent of the
+/// global physics step counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicCorpseOwnerFence {
+    pub owner_key: u128,
+    pub source_generation: u64,
+    pub topology_revision: u64,
+    pub pose_token: u64,
+    pub next_component_serial: u64,
+}
+
 /// Value-only reconstruction input for one live articulated owner. Part
 /// transforms are the currently applied local poses in the authored hierarchy.
 /// The owning simulation must capture root/source state and every keyed part
