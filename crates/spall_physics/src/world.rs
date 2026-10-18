@@ -250,6 +250,9 @@ impl BodyState {
 /// the current topology and sampled pose.
 #[derive(Debug, Clone, Copy)]
 pub struct ArticulatedOwnerSnapshot {
+    pub owner_key: Option<u128>,
+    pub source_generation: u64,
+    pub next_component_serial: u64,
     pub topology_token: u64,
     pub pose_token: u64,
     pub pending_pose: bool,
@@ -497,6 +500,12 @@ pub enum ArticulatedBatchOperation {
         parts: Vec<SourcePart>,
         representation: Representation,
     },
+    /// Reconstruct one live owner with its applied pose and rigid motion.
+    AliveRestore {
+        operation_tag: u64,
+        restore: crate::articulated::AliveArticulatedRestore,
+        representation: Representation,
+    },
     /// Convert one live kinematic articulated owner into its dynamic corpse.
     CheckedDeathTransfer {
         operation_tag: u64,
@@ -573,6 +582,11 @@ enum PreparedArticulatedChange {
         operation_tag: u64,
         birth: PreparedArticulatedBirth,
     },
+    AliveRestore {
+        operation_tag: u64,
+        birth: PreparedArticulatedBirth,
+        restore: PreparedAliveArticulatedMetadata,
+    },
     DynamicCorpseBirth {
         operation_tag: u64,
         birth: PreparedArticulatedBirth,
@@ -601,6 +615,16 @@ struct PreparedArticulatedBirth {
     kinematic_part_bodies: bool,
     representation: Representation,
     primitive_count: usize,
+}
+
+struct PreparedAliveArticulatedMetadata {
+    pose_token: u64,
+    source_generation: u64,
+    next_component_serial: u64,
+    root_linear_velocity_m_s: [f32; 3],
+    root_angular_velocity_rad_s: [f32; 3],
+    part_motion: Vec<crate::articulated::AliveArticulatedPartMotion>,
+    owner_key: u128,
 }
 
 struct PreparedCorpseTransferPartSnapshot {
@@ -718,6 +742,7 @@ struct ArticulatedEntry {
     pending_root_pose_token: Option<u64>,
     pending_pose: Option<PendingArticulatedPose>,
     kinematic_part_bodies: bool,
+    velocity_based_restore: bool,
     dynamic_corpse: bool,
     source_generation: u64,
     fracture_owner_key: Option<u128>,
@@ -1532,6 +1557,7 @@ impl PhysicsWorld {
         for operation in &operations {
             let tag = match operation {
                 ArticulatedBatchOperation::AliveBirth { operation_tag, .. }
+                | ArticulatedBatchOperation::AliveRestore { operation_tag, .. }
                 | ArticulatedBatchOperation::CheckedDeathTransfer { operation_tag, .. }
                 | ArticulatedBatchOperation::ColdRestore { operation_tag, .. } => *operation_tag,
             };
@@ -1540,6 +1566,14 @@ impl PhysicsWorld {
             }
             let parts = match operation {
                 ArticulatedBatchOperation::AliveBirth { parts, .. } => parts.as_slice(),
+                ArticulatedBatchOperation::AliveRestore { restore, .. } => {
+                    if restore.parts.len() > MAX_ARTICULATED_PARTS
+                        || restore.part_motion.len() != restore.parts.len()
+                    {
+                        return Err(ArticulatedError::InvalidRestore);
+                    }
+                    restore.parts.as_slice()
+                }
                 ArticulatedBatchOperation::ColdRestore { restore, .. } => {
                     if restore.components.len() > crate::fracture::MAX_FRACTURE_COMPONENTS {
                         return Err(ArticulatedError::WorkBudget);
@@ -1640,6 +1674,91 @@ impl PhysicsWorld {
                     changes.push(PreparedArticulatedChange::AliveBirth {
                         operation_tag,
                         birth,
+                    });
+                }
+                ArticulatedBatchOperation::AliveRestore {
+                    operation_tag,
+                    restore,
+                    representation,
+                } => {
+                    if restore.owner_key == 0
+                        || restore.source_generation == 0
+                        || restore.topology_token == 0
+                        || restore.next_component_serial != 1
+                        || !restore
+                            .root_linear_velocity_m_s
+                            .iter()
+                            .chain(&restore.root_angular_velocity_rad_s)
+                            .all(|value| value.is_finite())
+                        || restore.parts.iter().any(|part| part.source_revision == 0)
+                        || self.fracture_owner_keys.contains_key(&restore.owner_key)
+                        || self
+                            .articulated
+                            .values()
+                            .any(|owner| owner.fracture_owner_key == Some(restore.owner_key))
+                        || !owner_keys.insert(restore.owner_key)
+                    {
+                        return Err(ArticulatedError::InvalidRestore);
+                    }
+                    let expected_part_ids = restore
+                        .parts
+                        .iter()
+                        .map(|part| part.part_id)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let motion_part_ids = restore
+                        .part_motion
+                        .iter()
+                        .map(|motion| motion.part_id)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if expected_part_ids.len() != restore.parts.len()
+                        || motion_part_ids.len() != restore.part_motion.len()
+                        || motion_part_ids != expected_part_ids
+                        || restore.part_motion.iter().any(|motion| {
+                            !motion
+                                .linear_velocity_m_s
+                                .iter()
+                                .chain(&motion.angular_velocity_rad_s)
+                                .all(|value| value.is_finite())
+                        })
+                    {
+                        return Err(ArticulatedError::InvalidRestore);
+                    }
+                    let birth = self.prepare_articulated_birth(
+                        restore.root_translation_m,
+                        restore.root_rotation_xyzw,
+                        restore.topology_token,
+                        restore.parts,
+                        representation,
+                        true,
+                        Some(&stable_density),
+                    )?;
+                    let mut part_motion = restore.part_motion;
+                    part_motion.sort_by_key(|motion| motion.part_id);
+                    if birth
+                        .source_volume_ids
+                        .iter()
+                        .any(|id| !volume_ids.insert(*id))
+                    {
+                        return Err(ArticulatedError::DuplicateVolume);
+                    }
+                    primitives = primitives
+                        .checked_add(birth.primitive_count)
+                        .ok_or(ArticulatedError::WorkBudget)?;
+                    if primitives > MAX_CORPSE_RESTORE_BATCH_PRIMITIVES {
+                        return Err(ArticulatedError::WorkBudget);
+                    }
+                    changes.push(PreparedArticulatedChange::AliveRestore {
+                        operation_tag,
+                        birth,
+                        restore: PreparedAliveArticulatedMetadata {
+                            pose_token: restore.pose_token,
+                            source_generation: restore.source_generation,
+                            next_component_serial: restore.next_component_serial,
+                            root_linear_velocity_m_s: restore.root_linear_velocity_m_s,
+                            root_angular_velocity_rad_s: restore.root_angular_velocity_rad_s,
+                            part_motion,
+                            owner_key: restore.owner_key,
+                        },
                     });
                 }
                 ArticulatedBatchOperation::ColdRestore {
@@ -1815,6 +1934,21 @@ impl PhysicsWorld {
                         return Err(ArticulatedError::StalePreparedBatch);
                     }
                 }
+                PreparedArticulatedChange::AliveRestore { birth, restore, .. } => {
+                    if self.fracture_owner_keys.contains_key(&restore.owner_key)
+                        || self
+                            .articulated
+                            .values()
+                            .any(|live| live.fracture_owner_key == Some(restore.owner_key))
+                        || !batch_owner_keys.insert(restore.owner_key)
+                        || birth
+                            .source_volume_ids
+                            .iter()
+                            .any(|id| live_volumes.contains(id) || !batch_volumes.insert(*id))
+                    {
+                        return Err(ArticulatedError::InvalidRestore);
+                    }
+                }
                 PreparedArticulatedChange::DynamicCorpseBirth { birth, .. } => {
                     if birth
                         .source_volume_ids
@@ -1869,6 +2003,18 @@ impl PhysicsWorld {
                     birth,
                 } => {
                     let owner_id = self.publish_articulated_birth(birth);
+                    outcomes.push(ArticulatedBatchOutcome {
+                        operation_tag,
+                        owner_id,
+                        transfer: None,
+                    });
+                }
+                PreparedArticulatedChange::AliveRestore {
+                    operation_tag,
+                    birth,
+                    restore,
+                } => {
+                    let owner_id = self.publish_alive_articulated_restore(birth, restore);
                     outcomes.push(ArticulatedBatchOutcome {
                         operation_tag,
                         owner_id,
@@ -2242,6 +2388,7 @@ impl PhysicsWorld {
                 pending_root_pose_token: None,
                 pending_pose: None,
                 kinematic_part_bodies,
+                velocity_based_restore: false,
                 dynamic_corpse: mass.is_some(),
                 source_generation: 1,
                 fracture_owner_key: None,
@@ -2259,6 +2406,54 @@ impl PhysicsWorld {
             self.bodies[root].set_position(pose, true);
         }
         ArticulatedBodyId(id)
+    }
+
+    fn publish_alive_articulated_restore(
+        &mut self,
+        birth: PreparedArticulatedBirth,
+        restore: PreparedAliveArticulatedMetadata,
+    ) -> ArticulatedBodyId {
+        let PreparedAliveArticulatedMetadata {
+            pose_token,
+            source_generation,
+            next_component_serial,
+            root_linear_velocity_m_s,
+            root_angular_velocity_rad_s,
+            part_motion,
+            owner_key,
+        } = restore;
+        let id = self.publish_articulated_birth(birth);
+        let root_body = self.entries[entry_index(id.0, self.id_namespace)].body;
+        self.bodies[root_body].set_body_type(RigidBodyType::KinematicVelocityBased, true);
+        let root_linear = Vector::from(root_linear_velocity_m_s);
+        let root_angular = Vector::from(root_angular_velocity_rad_s);
+        self.bodies[root_body].set_linvel(root_linear, true);
+        self.bodies[root_body].set_angvel(root_angular, true);
+
+        let assembly = self
+            .articulated
+            .get_mut(&id.0)
+            .expect("restore birth publication inserted its owner");
+        assembly.pose_token = pose_token;
+        assembly.source_generation = source_generation;
+        assembly.next_component_serial = next_component_serial;
+        assembly.fracture_owner_key = Some(owner_key);
+        assembly.velocity_based_restore = true;
+        assembly.pending_root_pose_token = None;
+        assembly.pending_pose = None;
+        assert_eq!(part_motion.len(), assembly.parts.len());
+        for (part, motion) in assembly.parts.iter().zip(part_motion) {
+            assert_eq!(part.part_id, motion.part_id);
+            let body = self
+                .bodies
+                .get_mut(part.body)
+                .expect("restore birth publication inserted each part body");
+            body.set_body_type(RigidBodyType::KinematicVelocityBased, true);
+            body.set_linvel(Vector::from(motion.linear_velocity_m_s), true);
+            body.set_angvel(Vector::from(motion.angular_velocity_rad_s), true);
+        }
+        self.fracture_owner_keys.insert(owner_key, id.0);
+        id
     }
 
     fn prepare_corpse_restore_owner(
@@ -2790,6 +2985,7 @@ impl PhysicsWorld {
                 pending_root_pose_token: None,
                 pending_pose: None,
                 kinematic_part_bodies: false,
+                velocity_based_restore: false,
                 dynamic_corpse: true,
                 source_generation,
                 fracture_owner_key: Some(owner_key),
@@ -4214,6 +4410,7 @@ impl PhysicsWorld {
                 pending_root_pose_token: None,
                 pending_pose: None,
                 kinematic_part_bodies,
+                velocity_based_restore: false,
                 dynamic_corpse: dynamic_mass.is_some(),
                 source_generation: 1,
                 fracture_owner_key: None,
@@ -4317,8 +4514,8 @@ impl PhysicsWorld {
             return Err(ArticulatedError::InvalidTransform);
         }
         if current.kinematic_part_bodies {
-            let root =
-                self.bodies[self.entries[entry_index(id, self.id_namespace)].body].position();
+            let root_body = self.entries[entry_index(id, self.id_namespace)].body;
+            let root = *self.bodies[root_body].position();
             let targets = current
                 .parts
                 .iter()
@@ -4338,7 +4535,7 @@ impl PhysicsWorld {
                         )
                         .to_scaled_axis(),
                     );
-                    (part.body, *root * local)
+                    (part.body, root * local)
                 })
                 .collect::<Vec<_>>();
             if targets.iter().any(|(_, pose)| {
@@ -4351,6 +4548,17 @@ impl PhysicsWorld {
                 return Err(ArticulatedError::GeometryRange);
             }
             self.validate_kinematic_surface_travel(&targets)?;
+            if current.velocity_based_restore {
+                self.bodies[root_body].set_body_type(RigidBodyType::KinematicPositionBased, true);
+                for part in &current.parts {
+                    self.bodies[part.body]
+                        .set_body_type(RigidBodyType::KinematicPositionBased, true);
+                }
+                self.articulated
+                    .get_mut(&id)
+                    .expect("validated assembly exists")
+                    .velocity_based_restore = false;
+            }
             for (body, pose) in targets {
                 self.bodies[body].set_next_kinematic_position(pose);
             }
@@ -5494,6 +5702,16 @@ impl PhysicsWorld {
         let mut all_targets = vec![(body, root_target)];
         all_targets.extend(part_targets.iter().copied());
         self.validate_kinematic_surface_travel(&all_targets)?;
+        if assembly.velocity_based_restore {
+            self.bodies[body].set_body_type(RigidBodyType::KinematicPositionBased, true);
+            for part in &assembly.parts {
+                self.bodies[part.body].set_body_type(RigidBodyType::KinematicPositionBased, true);
+            }
+            self.articulated
+                .get_mut(&body_id)
+                .expect("validated assembly exists")
+                .velocity_based_restore = false;
+        }
         self.bodies[body].set_next_kinematic_position(root_target);
         for (part_body, target) in part_targets {
             self.bodies[part_body].set_next_kinematic_position(target);
@@ -6269,6 +6487,9 @@ impl PhysicsWorld {
     ) -> Option<ArticulatedOwnerSnapshot> {
         let assembly = self.articulated.get(&id.0)?;
         Some(ArticulatedOwnerSnapshot {
+            owner_key: assembly.fracture_owner_key,
+            source_generation: assembly.source_generation,
+            next_component_serial: assembly.next_component_serial,
             topology_token: assembly.topology_token,
             pose_token: assembly.pose_token,
             pending_pose: assembly.pending_root_pose_token.is_some()
@@ -6295,6 +6516,50 @@ impl PhysicsWorld {
             pose_token: assembly.pose_token,
             parts,
         })
+    }
+
+    /// Returns each live kinematic source part's installed twist in stable
+    /// part-ID order. Pending pose frames and corpse owners have no snapshot.
+    /// Capture this together with the source, owner, and pose snapshots on the
+    /// owning simulation thread, with no intervening world mutation; these
+    /// independent reads do not form a cross-thread snapshot transaction.
+    pub fn articulated_part_motion_snapshot(
+        &self,
+        id: ArticulatedBodyId,
+    ) -> Option<Vec<crate::articulated::AliveArticulatedPartMotion>> {
+        let assembly = self.articulated.get(&id.0)?;
+        if !assembly.kinematic_part_bodies
+            || assembly.dynamic_corpse
+            || assembly.pending_root_pose_token.is_some()
+            || assembly.pending_pose.is_some()
+        {
+            return None;
+        }
+        let mut parts = assembly
+            .parts
+            .iter()
+            .map(|part| {
+                let body = self.bodies.get(part.body)?;
+                let linear = body.linvel();
+                let angular = body.angvel();
+                Some(crate::articulated::AliveArticulatedPartMotion {
+                    part_id: part.part_id,
+                    linear_velocity_m_s: [linear.x, linear.y, linear.z],
+                    angular_velocity_rad_s: [angular.x, angular.y, angular.z],
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if parts.iter().any(|part| {
+            !part
+                .linear_velocity_m_s
+                .iter()
+                .chain(&part.angular_velocity_rad_s)
+                .all(|value| value.is_finite())
+        }) {
+            return None;
+        }
+        parts.sort_by_key(|part| part.part_id);
+        Some(parts)
     }
 
     /// Returns live state for a currently owned stable fracture component.
@@ -8359,6 +8624,55 @@ mod tests {
             grid,
             cell_m: 0.25,
             local_transform: crate::articulated::PartTransform::IDENTITY,
+        }
+    }
+
+    fn alive_restore_fixture(owner_key: u128) -> crate::articulated::AliveArticulatedRestore {
+        use crate::articulated::{AliveArticulatedPartMotion, AliveArticulatedRestore};
+        let mut root = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 8_101, 2);
+        root.part_id = 1;
+        let mut middle = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 8_102, 3);
+        middle.part_id = 2;
+        middle.parent_id = Some(1);
+        middle.local_transform = crate::articulated::PartTransform {
+            translation_m: [0.5, 0.0, 0.0],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        };
+        let mut tip = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 8_103, 4);
+        tip.part_id = 3;
+        tip.parent_id = Some(2);
+        tip.local_transform = crate::articulated::PartTransform {
+            translation_m: [0.0, 0.5, 0.0],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        };
+        AliveArticulatedRestore {
+            owner_key,
+            source_generation: 6,
+            topology_token: 44,
+            pose_token: 1,
+            next_component_serial: 1,
+            root_translation_m: [3.0, 0.0, 0.0],
+            root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            root_linear_velocity_m_s: [0.3, 0.0, 0.0],
+            root_angular_velocity_rad_s: [0.0, 0.0, 0.2],
+            part_motion: vec![
+                AliveArticulatedPartMotion {
+                    part_id: 1,
+                    linear_velocity_m_s: [0.3, 0.0, 0.0],
+                    angular_velocity_rad_s: [0.0, 0.0, 0.2],
+                },
+                AliveArticulatedPartMotion {
+                    part_id: 2,
+                    linear_velocity_m_s: [0.3, 0.0, 0.0],
+                    angular_velocity_rad_s: [0.0, 0.0, 0.4],
+                },
+                AliveArticulatedPartMotion {
+                    part_id: 3,
+                    linear_velocity_m_s: [0.1, 0.1, 0.0],
+                    angular_velocity_rad_s: [0.0, 0.0, 0.1],
+                },
+            ],
+            parts: vec![root, middle, tip],
         }
     }
 
@@ -12326,5 +12640,348 @@ mod tests {
             "ω_y {} fits the true COM (1.25 m) better than the geometric centre (1.0 m)",
             w[1]
         );
+    }
+
+    #[test]
+    fn alive_restore_roundtrips_applied_multibody_motion_and_death_witness() {
+        use crate::articulated::{AliveArticulatedRestore, ArticulatedPose};
+
+        let source_parts = alive_restore_fixture(99).parts;
+        let mut original = PhysicsWorld::new(PhysicsConfig::default());
+        let original_id = original
+            .add_articulated_kinematic_parts(
+                [3.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                44,
+                source_parts.clone(),
+                Representation::MergedCuboids,
+            )
+            .unwrap();
+        original
+            .update_articulated_pose(
+                original_id,
+                ArticulatedPose {
+                    topology_token: 44,
+                    base_pose_token: 0,
+                    pose_token: 1,
+                    parts: vec![
+                        (1, crate::articulated::PartTransform::IDENTITY),
+                        (
+                            2,
+                            crate::articulated::PartTransform {
+                                translation_m: [0.9, 0.0, 0.0],
+                                rotation_xyzw: [0.0, 0.0, 0.09983342, 0.9950042],
+                            },
+                        ),
+                        (
+                            3,
+                            crate::articulated::PartTransform {
+                                translation_m: [0.2, 0.7, 0.0],
+                                rotation_xyzw: [0.0, 0.0, -0.04997917, 0.99875027],
+                            },
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+        original.step();
+
+        let owner = original.articulated_owner_snapshot(original_id).unwrap();
+        let applied_pose = original.articulated_pose_snapshot(original_id).unwrap();
+        let part_motion = original
+            .articulated_part_motion_snapshot(original_id)
+            .expect("an applied live pose has a portable part-motion snapshot");
+        let root_rigid_velocity = owner.root.linvel_m_s;
+        assert!(
+            part_motion.iter().any(|part| {
+                part.linear_velocity_m_s
+                    .iter()
+                    .zip(root_rigid_velocity)
+                    .any(|(part, root)| (part - root).abs() > 1.0e-4)
+                    || part
+                        .angular_velocity_rad_s
+                        .iter()
+                        .zip(owner.root.angvel_rad_s)
+                        .any(|(part, root)| (part - root).abs() > 1.0e-4)
+            }),
+            "pose animation must give at least one part a non-rigid root twist"
+        );
+
+        let mut restored_parts = source_parts;
+        for part in &mut restored_parts {
+            part.local_transform = applied_pose
+                .parts
+                .iter()
+                .find(|(part_id, _)| *part_id == part.part_id)
+                .unwrap()
+                .1;
+        }
+        let restore = AliveArticulatedRestore {
+            owner_key: 99,
+            source_generation: owner.source_generation,
+            topology_token: owner.topology_token,
+            pose_token: owner.pose_token,
+            next_component_serial: owner.next_component_serial,
+            root_translation_m: owner.root.translation_m,
+            root_rotation_xyzw: owner.root.rotation,
+            root_linear_velocity_m_s: owner.root.linvel_m_s,
+            root_angular_velocity_rad_s: owner.root.angvel_rad_s,
+            part_motion: part_motion.clone(),
+            parts: restored_parts,
+        };
+        let mut restored = PhysicsWorld::new(PhysicsConfig::default());
+        let prepared = restored
+            .prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::AliveRestore {
+                    operation_tag: 7,
+                    restore,
+                    representation: Representation::MergedCuboids,
+                }],
+                mix_density,
+            )
+            .unwrap();
+        let restored_id = restored.commit_articulated_batch(prepared).unwrap()[0].owner_id;
+        let restored_owner = restored.articulated_owner_snapshot(restored_id).unwrap();
+        assert_eq!(restored_owner.owner_key, Some(99));
+        assert_eq!(restored_owner.source_generation, owner.source_generation);
+        assert_eq!(restored_owner.next_component_serial, 1);
+        assert_eq!(restored_owner.topology_token, owner.topology_token);
+        assert_eq!(restored_owner.pose_token, owner.pose_token);
+        assert!(!restored_owner.pending_pose);
+        assert_eq!(
+            restored.articulated_pose_snapshot(restored_id).unwrap(),
+            applied_pose
+        );
+        assert_eq!(
+            restored
+                .articulated_part_motion_snapshot(restored_id)
+                .unwrap(),
+            part_motion
+        );
+        let ray_hit = restored
+            .raycast_articulated(restored_id, [2.5, 0.125, 0.125], [1.0, 0.0, 0.0], 1.0)
+            .unwrap();
+        assert_eq!(ray_hit.part_id, 1);
+
+        let original_death = original
+            .prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::CheckedDeathTransfer {
+                    operation_tag: 8,
+                    id: original_id,
+                    expected_topology_token: owner.topology_token,
+                    expected_pose_token: owner.pose_token,
+                }],
+                mix_density,
+            )
+            .unwrap()
+            .transfer_outcome(8)
+            .copied()
+            .unwrap();
+        let restored_death = restored
+            .prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::CheckedDeathTransfer {
+                    operation_tag: 9,
+                    id: restored_id,
+                    expected_topology_token: owner.topology_token,
+                    expected_pose_token: owner.pose_token,
+                }],
+                mix_density,
+            )
+            .unwrap()
+            .transfer_outcome(9)
+            .copied()
+            .unwrap();
+        assert!((original_death.mass_kg - restored_death.mass_kg).abs() < 1.0e-10);
+        for axis in 0..3 {
+            assert!(
+                (original_death.linear_momentum_kg_m_s[axis]
+                    - restored_death.linear_momentum_kg_m_s[axis])
+                    .abs()
+                    < 1.0e-8
+            );
+            assert!(
+                (original_death.angular_momentum_about_com_kg_m2_s[axis]
+                    - restored_death.angular_momentum_about_com_kg_m2_s[axis])
+                    .abs()
+                    < 1.0e-8
+            );
+        }
+        assert!(
+            restored_death
+                .linear_velocity_m_s
+                .iter()
+                .all(|v| v.is_finite())
+        );
+        assert!(
+            restored_death
+                .angular_velocity_rad_s
+                .iter()
+                .all(|v| v.is_finite())
+        );
+        let restored_outcome = restored
+            .commit_articulated_batch(
+                restored
+                    .prepare_articulated_batch(
+                        vec![ArticulatedBatchOperation::CheckedDeathTransfer {
+                            operation_tag: 10,
+                            id: restored_id,
+                            expected_topology_token: owner.topology_token,
+                            expected_pose_token: owner.pose_token,
+                        }],
+                        mix_density,
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+            .remove(0)
+            .transfer
+            .unwrap();
+        assert!((restored_outcome.mass_kg - restored_death.mass_kg).abs() < 1.0e-10);
+        let installed = restored.articulated_body_state(restored_id);
+        assert!((f64::from(installed.mass_kg) - restored_outcome.mass_kg).abs() < 1.0e-6);
+        for axis in 0..3 {
+            assert!(
+                (f64::from(installed.linvel_m_s[axis])
+                    - restored_outcome.linear_velocity_m_s[axis])
+                    .abs()
+                    < 1.0e-5
+            );
+            assert!(
+                (f64::from(installed.angvel_rad_s[axis])
+                    - restored_outcome.angular_velocity_rad_s[axis])
+                    .abs()
+                    < 1.0e-5
+            );
+        }
+        let transferred_owner = restored.articulated_owner_snapshot(restored_id).unwrap();
+        assert_eq!(transferred_owner.owner_key, Some(99));
+        assert_eq!(transferred_owner.source_generation, owner.source_generation);
+        assert_eq!(transferred_owner.next_component_serial, 1);
+    }
+
+    #[test]
+    fn alive_motion_snapshot_rejects_pending_root_and_local_pose_frames() {
+        use crate::articulated::ArticulatedPose;
+
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let id = world
+            .commit_articulated_batch(
+                world
+                    .prepare_articulated_batch(
+                        vec![ArticulatedBatchOperation::AliveRestore {
+                            operation_tag: 1,
+                            restore: alive_restore_fixture(105),
+                            representation: Representation::MergedCuboids,
+                        }],
+                        mix_density,
+                    )
+                    .unwrap(),
+            )
+            .unwrap()[0]
+            .owner_id;
+        assert!(world.articulated_part_motion_snapshot(id).is_some());
+
+        world
+            .sweep_articulated_root_translation(id, 44, 1, 2, [3.01, 0.0, 0.0])
+            .unwrap();
+        assert!(world.articulated_owner_snapshot(id).unwrap().pending_pose);
+        assert!(world.articulated_part_motion_snapshot(id).is_none());
+        world.step();
+        let applied = world.articulated_pose_snapshot(id).unwrap();
+        world
+            .update_articulated_pose(
+                id,
+                ArticulatedPose {
+                    topology_token: 44,
+                    base_pose_token: 2,
+                    pose_token: 3,
+                    parts: applied
+                        .parts
+                        .into_iter()
+                        .map(|(part_id, mut transform)| {
+                            if part_id == 2 {
+                                transform.translation_m[0] += 0.01;
+                            }
+                            (part_id, transform)
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        assert!(world.articulated_owner_snapshot(id).unwrap().pending_pose);
+        assert!(world.articulated_part_motion_snapshot(id).is_none());
+    }
+
+    #[test]
+    fn alive_restore_rejects_bad_motion_duplicate_owner_and_stale_batch_atomically() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let before = world.body_count();
+
+        let mut missing_motion = alive_restore_fixture(101);
+        missing_motion.part_motion.pop();
+        assert!(matches!(
+            world.prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::AliveRestore {
+                    operation_tag: 1,
+                    restore: missing_motion,
+                    representation: Representation::MergedCuboids,
+                }],
+                mix_density,
+            ),
+            Err(crate::articulated::ArticulatedError::InvalidRestore)
+        ));
+
+        let mut non_finite = alive_restore_fixture(102);
+        non_finite.part_motion[1].angular_velocity_rad_s[2] = f32::INFINITY;
+        assert!(matches!(
+            world.prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::AliveRestore {
+                    operation_tag: 2,
+                    restore: non_finite,
+                    representation: Representation::MergedCuboids,
+                }],
+                mix_density,
+            ),
+            Err(crate::articulated::ArticulatedError::InvalidRestore)
+        ));
+
+        let duplicate_owner = world.prepare_articulated_batch(
+            vec![
+                ArticulatedBatchOperation::AliveRestore {
+                    operation_tag: 3,
+                    restore: alive_restore_fixture(103),
+                    representation: Representation::MergedCuboids,
+                },
+                ArticulatedBatchOperation::AliveRestore {
+                    operation_tag: 4,
+                    restore: alive_restore_fixture(103),
+                    representation: Representation::MergedCuboids,
+                },
+            ],
+            mix_density,
+        );
+        assert!(matches!(
+            duplicate_owner,
+            Err(crate::articulated::ArticulatedError::InvalidRestore)
+        ));
+        assert_eq!(world.body_count(), before);
+
+        let prepared = world
+            .prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::AliveRestore {
+                    operation_tag: 5,
+                    restore: alive_restore_fixture(104),
+                    representation: Representation::MergedCuboids,
+                }],
+                mix_density,
+            )
+            .unwrap();
+        world.step();
+        assert!(matches!(
+            world.validate_articulated_batch(prepared),
+            Err(crate::articulated::ArticulatedError::StalePreparedBatch)
+        ));
+        assert_eq!(world.body_count(), before);
+        assert_eq!(world.body_count(), 0);
     }
 }

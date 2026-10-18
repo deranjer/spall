@@ -103,6 +103,31 @@ pub struct DynamicCorpseRestore {
     pub components: Vec<DynamicCorpseComponentRestore>,
 }
 
+/// Value-only reconstruction input for one live articulated owner. Part
+/// transforms are the currently applied local poses in the authored hierarchy.
+#[derive(Clone)]
+pub struct AliveArticulatedRestore {
+    pub owner_key: u128,
+    pub source_generation: u64,
+    pub topology_token: u64,
+    pub pose_token: u64,
+    pub next_component_serial: u64,
+    pub root_translation_m: [f32; 3],
+    pub root_rotation_xyzw: [f32; 4],
+    pub root_linear_velocity_m_s: [f32; 3],
+    pub root_angular_velocity_rad_s: [f32; 3],
+    pub part_motion: Vec<AliveArticulatedPartMotion>,
+    pub parts: Vec<SourcePart>,
+}
+
+/// Installed physical twist of one live articulated source part.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AliveArticulatedPartMotion {
+    pub part_id: u32,
+    pub linear_velocity_m_s: [f32; 3],
+    pub angular_velocity_rad_s: [f32; 3],
+}
+
 /// A unit-scale part-local transform in metres and `(x, y, z, w)` form.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PartTransform {
