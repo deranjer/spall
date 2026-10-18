@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use spall_core::TransactionId;
 use std::io::{Read, Write};
 
+use crate::creature_owner::{
+    MAX_CREATURE_OWNER_SET_BYTES, MAX_CREATURE_OWNER_SET_DENSE_CELLS,
+    MAX_CREATURE_OWNER_SET_RECORDS, MAX_CREATURE_OWNER_SET_SOLID_CELLS,
+};
 use crate::{
     CreatureLifecycleCommitV1, Hash32, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
     MAX_CREATURE_OWNER_DENSE_CELLS, MAX_CREATURE_OWNER_MASK_BRICKS, MAX_CREATURE_OWNER_MASK_CELLS,
@@ -16,6 +20,60 @@ use crate::{
 
 pub const CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA: u16 = 1;
 pub const MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED: usize = MAX_CREATURE_OWNER_RECORD_BYTES + 64;
+
+/// Cumulative work charged by one lifecycle attachment to its transaction set.
+/// The limits mirror `CreatureOwnershipSetV1::validate`, with explicit bounds
+/// for motion and death-witness arrays carried outside the owner record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LifecycleAttachmentWork {
+    pub decoded_bytes: usize,
+    pub records: usize,
+    pub bricks: usize,
+    pub dense_cells: usize,
+    pub solid_cells: usize,
+    pub masks: usize,
+    pub mask_cells: usize,
+    pub overlay_poses: usize,
+    pub witness_poses: usize,
+}
+
+impl LifecycleAttachmentWork {
+    pub(crate) const fn capacity() -> Self {
+        Self {
+            decoded_bytes: MAX_CREATURE_OWNER_SET_BYTES,
+            records: MAX_CREATURE_OWNER_SET_RECORDS,
+            bricks: MAX_CREATURE_OWNER_BRICKS,
+            dense_cells: MAX_CREATURE_OWNER_SET_DENSE_CELLS,
+            solid_cells: MAX_CREATURE_OWNER_SET_SOLID_CELLS,
+            masks: MAX_CREATURE_OWNER_MASK_BRICKS,
+            mask_cells: MAX_CREATURE_OWNER_SET_SOLID_CELLS,
+            overlay_poses: MAX_CREATURE_OWNER_SET_RECORDS
+                * (MAX_CREATURE_OWNER_PARTS + MAX_CREATURE_OWNER_COMPONENTS),
+            witness_poses: MAX_CREATURE_OWNER_SET_RECORDS * MAX_CREATURE_OWNER_PARTS,
+        }
+    }
+
+    pub(crate) fn charge(&mut self, used: Self) -> Result<(), CreatureLifecycleBulkError> {
+        macro_rules! charge_field {
+            ($field:ident) => {
+                self.$field = self
+                    .$field
+                    .checked_sub(used.$field)
+                    .ok_or(CreatureLifecycleBulkError::WorkLimit)?;
+            };
+        }
+        charge_field!(decoded_bytes);
+        charge_field!(records);
+        charge_field!(bricks);
+        charge_field!(dense_cells);
+        charge_field!(solid_cells);
+        charge_field!(masks);
+        charge_field!(mask_cells);
+        charge_field!(overlay_poses);
+        charge_field!(witness_poses);
+        Ok(())
+    }
+}
 
 /// Correlated lifecycle payload carried as the compressed body of a world-version-6
 /// BaselineBegin/BaselinePart/BaselineEnd transfer.
@@ -125,6 +183,14 @@ impl CreatureLifecycleBulkPayloadV1 {
         Ok(total)
     }
 
+    pub(crate) fn work_for_attachment_set(
+        &self,
+    ) -> Result<LifecycleAttachmentWork, CreatureLifecycleBulkError> {
+        let mut work = commit_work(&self.commit)?;
+        work.decoded_bytes = self.decoded_size_for_attachment_set()?;
+        Ok(work)
+    }
+
     /// Bounded postcard + zstd representation used by the existing bulk stream.
     pub fn encode_compressed(&self) -> Result<Vec<u8>, CreatureLifecycleBulkError> {
         self.encode_compressed_with_limit(crate::limits::MAX_ASSEMBLED_TRANSFER)
@@ -215,6 +281,7 @@ impl CreatureLifecycleBulkPayloadV1 {
             operation_ordinal,
             commit_hash,
             MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
+            &mut LifecycleAttachmentWork::capacity(),
         )
         .map(|(payload, _)| payload)
     }
@@ -228,6 +295,7 @@ impl CreatureLifecycleBulkPayloadV1 {
         operation_ordinal: u32,
         commit_hash: Hash32,
         remaining_budget: usize,
+        remaining_work: &mut LifecycleAttachmentWork,
     ) -> Result<(Self, usize), CreatureLifecycleBulkError> {
         if bytes.len() > crate::limits::MAX_ASSEMBLED_TRANSFER {
             return Err(CreatureLifecycleBulkError::CompressedLimit {
@@ -285,7 +353,9 @@ impl CreatureLifecycleBulkPayloadV1 {
         {
             return Err(CreatureLifecycleBulkError::Correlation);
         }
-        check_commit_work(&payload.commit)?;
+        let mut work = commit_work(&payload.commit)?;
+        work.decoded_bytes = decoded_bytes;
+        remaining_work.charge(work)?;
         if payload.commit.canonical_hash() != payload.commit_hash {
             return Err(CreatureLifecycleBulkError::CommitHash);
         }
@@ -321,6 +391,12 @@ impl Write for LimitedVecWriter {
 }
 
 fn check_commit_work(commit: &CreatureLifecycleCommitV1) -> Result<(), CreatureLifecycleBulkError> {
+    commit_work(commit).map(|_| ())
+}
+
+fn commit_work(
+    commit: &CreatureLifecycleCommitV1,
+) -> Result<LifecycleAttachmentWork, CreatureLifecycleBulkError> {
     if commit.schema != crate::CREATURE_LIFECYCLE_COMMIT_SCHEMA
         || commit.change.schema != crate::CREATURE_CHANGE_SCHEMA
     {
@@ -432,5 +508,26 @@ fn check_commit_work(commit: &CreatureLifecycleCommitV1) -> Result<(), CreatureL
     {
         return Err(CreatureLifecycleBulkError::WorkLimit);
     }
-    Ok(())
+    let mut work = LifecycleAttachmentWork {
+        decoded_bytes: 0,
+        records: 1,
+        bricks,
+        dense_cells,
+        solid_cells,
+        masks: mask_bricks,
+        mask_cells,
+        overlay_poses: 0,
+        witness_poses: 0,
+    };
+    if let Some(overlay) = &commit.pre_motion {
+        work.overlay_poses = overlay
+            .parts
+            .len()
+            .checked_add(overlay.components.len())
+            .ok_or(CreatureLifecycleBulkError::WorkLimit)?;
+    }
+    if let Some(witness) = &commit.death_witness {
+        work.witness_poses = witness.frozen_local_poses.len();
+    }
+    Ok(work)
 }

@@ -10,7 +10,7 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 use spall_core::{EntityId, TransactionId, VolumeId};
 
-use crate::records::Record;
+use crate::lifecycle_bulk::LifecycleAttachmentWork;
 use crate::{
     BaselineOwner, BaselineWorld, CreatureLifecycleBulkPayloadV1, Hash32, TopologyOp,
     TopologyTransaction,
@@ -47,6 +47,7 @@ pub enum TransactionAttachmentV1 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedTransactionAttachmentSetV1 {
     transaction_id: TransactionId,
+    transaction_replay_identity: Hash32,
     attachments: BTreeMap<u64, ValidatedTransactionAttachmentV1>,
 }
 
@@ -118,16 +119,26 @@ impl TransactionAttachmentSetV1 {
                         .map_err(|e| TransactionAttachmentError::Baseline(e.to_string()))?;
                     let raw_size = postcard::experimental::serialized_size(world)
                         .map_err(|e| TransactionAttachmentError::Encoding(e.to_string()))?;
-                    let decoded_cost = crate::baseline_decode::preflight_world_size(
+                    let _minimum_cost = crate::baseline_decode::preflight_world_size(
                         world,
                         raw_size,
                         geometry_budget,
                     )?;
+                    let raw = postcard::to_stdvec(world)
+                        .map_err(|e| TransactionAttachmentError::Encoding(e.to_string()))?;
+                    let raw_capacity_cost =
+                        crate::baseline_decode::raw_buffer_cost(raw.len(), raw.capacity())?;
+                    let heap = crate::baseline_decode::preflight_world_storage(
+                        world,
+                        geometry_budget.saturating_sub(raw_capacity_cost),
+                    )?;
+                    let decoded_cost = raw_capacity_cost
+                        .checked_add(heap)
+                        .filter(|cost| *cost <= geometry_budget)
+                        .ok_or(TransactionAttachmentError::DecodedBudget)?;
                     geometry_budget = geometry_budget
                         .checked_sub(decoded_cost)
                         .ok_or(TransactionAttachmentError::DecodedBudget)?;
-                    let raw = postcard::to_stdvec(world)
-                        .map_err(|e| TransactionAttachmentError::Encoding(e.to_string()))?;
                     let compressed_remaining = MAX_TRANSACTION_ATTACHMENT_BYTES
                         .checked_sub(output.len())
                         .and_then(|remaining| remaining.checked_sub(32))
@@ -171,6 +182,16 @@ impl ValidatedTransactionAttachmentSetV1 {
         self.transaction_id
     }
 
+    /// Check that this candidate still belongs to the exact ordered parent
+    /// transaction used during bounded decode. This validates the parent and
+    /// recomputes its existing replay identity; it creates no additional ledger.
+    pub fn matches_transaction(&self, transaction: &TopologyTransaction) -> bool {
+        transaction.transaction_id == self.transaction_id
+            && transaction
+                .replay_identity_hash()
+                .is_ok_and(|identity| identity == self.transaction_replay_identity)
+    }
+
     pub fn get(&self, transfer_id: u64) -> Option<&ValidatedTransactionAttachmentV1> {
         self.attachments.get(&transfer_id)
     }
@@ -190,8 +211,8 @@ pub fn decode_for_transaction(
     if bytes.len() > MAX_TRANSACTION_ATTACHMENT_BYTES {
         return Err(TransactionAttachmentError::CompressedBudget);
     }
-    transaction
-        .validate()
+    let transaction_replay_identity = transaction
+        .replay_identity_hash()
         .map_err(|e| TransactionAttachmentError::Encoding(e.to_string()))?;
     let (prefix, mut rest): (AttachmentPrefixV1, &[u8]) = postcard::take_from_bytes(bytes)
         .map_err(|e| TransactionAttachmentError::Encoding(e.to_string()))?;
@@ -210,7 +231,7 @@ pub fn decode_for_transaction(
     let mut candidate = BTreeMap::new();
     let mut compressed_remaining = MAX_TRANSACTION_ATTACHMENT_BYTES;
     let mut geometry_remaining = MAX_TRANSACTION_GEOMETRY_DECODED_BYTES;
-    let mut lifecycle_remaining = MAX_TRANSACTION_LIFECYCLE_DECODED_BYTES;
+    let mut lifecycle_work = LifecycleAttachmentWork::capacity();
     for _ in 0..prefix.count {
         let id: u64 = take(&mut rest)?;
         let kind: u8 = take(&mut rest)?;
@@ -248,12 +269,11 @@ pub fn decode_for_transaction(
                     transaction.transaction_id,
                     marker.operation_ordinal,
                     marker.commit_hash,
-                    lifecycle_remaining,
+                    lifecycle_work.decoded_bytes,
+                    &mut lifecycle_work,
                 )
                 .map_err(|e| TransactionAttachmentError::Lifecycle(e.to_string()))?;
-                lifecycle_remaining = lifecycle_remaining
-                    .checked_sub(decoded_size)
-                    .ok_or(TransactionAttachmentError::DecodedBudget)?;
+                let _ = decoded_size;
                 ValidatedTransactionAttachmentV1::CreatureLifecycle(Box::new(payload))
             }
             _ => return Err(TransactionAttachmentError::Correlation),
@@ -265,6 +285,7 @@ pub fn decode_for_transaction(
     }
     Ok(ValidatedTransactionAttachmentSetV1 {
         transaction_id: transaction.transaction_id,
+        transaction_replay_identity,
         attachments: candidate,
     })
 }
@@ -274,7 +295,7 @@ fn validate_typed_set(
     transaction: &TopologyTransaction,
 ) -> Result<(), TransactionAttachmentError> {
     transaction
-        .validate()
+        .replay_identity_hash()
         .map_err(|e| TransactionAttachmentError::Encoding(e.to_string()))?;
     if set.schema != TRANSACTION_ATTACHMENT_SET_SCHEMA
         || set.transaction_id != transaction.transaction_id
@@ -288,13 +309,11 @@ fn validate_typed_set(
         return Err(TransactionAttachmentError::Count);
     }
     let mut seen = BTreeSet::new();
+    let mut lifecycle_work = LifecycleAttachmentWork::capacity();
     for attachment in &set.attachments {
         let (id, kind) = match attachment {
             TransactionAttachmentV1::Geometry { transfer_id, .. } => (*transfer_id, 0),
-            TransactionAttachmentV1::CreatureLifecycle {
-                transfer_id,
-                ..
-            } => (*transfer_id, 1),
+            TransactionAttachmentV1::CreatureLifecycle { transfer_id, .. } => (*transfer_id, 1),
         };
         if !expected.contains_key(&id) || !seen.insert(id) {
             return Err(TransactionAttachmentError::DuplicateOrExtra);
@@ -319,6 +338,13 @@ fn validate_typed_set(
                 {
                     return Err(TransactionAttachmentError::Correlation);
                 }
+                lifecycle_work
+                    .charge(
+                        payload
+                            .work_for_attachment_set()
+                            .map_err(|e| TransactionAttachmentError::Lifecycle(e.to_string()))?,
+                    )
+                    .map_err(|e| TransactionAttachmentError::Lifecycle(e.to_string()))?;
             }
         }
     }

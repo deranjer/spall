@@ -598,6 +598,120 @@ fn validated_three_part_sources_require_bulk_instead_of_a_control_frame() {
 }
 
 #[test]
+fn mixed_geometry_and_nonempty_lifecycle_attachments_round_trip_as_one_candidate() {
+    let mut f = Fixture::new();
+    let mut commit = validated_three_part_commit(&mut f);
+    let transaction_id = spall_core::TransactionId::new(71).unwrap();
+    commit.change.transaction_id = transaction_id;
+    commit.change.operation_ordinal = 4;
+    let mut reducer_context = context(71, 1, 100);
+    reducer_context.operation_ordinal = 4;
+    let reduced = commit
+        .validate_and_reduce(None, reducer_context, &f.catalog())
+        .unwrap();
+    assert_eq!(
+        reduced.record,
+        match &commit.change.operation {
+            CreatureLifecycleOperationV1::Birth { after } => after.clone(),
+            CreatureLifecycleOperationV1::Death { after } => after.clone(),
+        }
+    );
+    assert_eq!(reduced.record.parts.len(), 3);
+
+    let lifecycle = CreatureLifecycleBulkPayloadV1::new(transaction_id, 4, commit).unwrap();
+    let source = VolumeId::new(99).unwrap();
+    let geometry_transfer_id = 77;
+    let lifecycle_transfer_id = 88;
+    let mut ops = Vec::new();
+    let empty_air_brick = || BaselineBrick {
+        coord: [0, 0, 0],
+        revision: 1,
+        edited: false,
+        cells: BaselineCells::Uniform(0),
+    };
+    let mut volumes = vec![BaselineVolume {
+        volume_id: source,
+        cell_size_code: 1,
+        owner: BaselineOwner::Terrain,
+        bounds: None,
+        bricks: vec![empty_air_brick()],
+    }];
+    for index in 0..3_u64 {
+        let child = VolumeId::new(100 + index).unwrap();
+        let child_entity = spall_core::EntityId::new(200 + index).unwrap();
+        ops.push(TopologyOp::SplitOffBulkBaseline {
+            source,
+            child,
+            child_entity,
+            transfer_id: geometry_transfer_id,
+        });
+        volumes.push(BaselineVolume {
+            volume_id: child,
+            cell_size_code: 1,
+            owner: BaselineOwner::Body(child_entity),
+            bounds: None,
+            bricks: vec![empty_air_brick()],
+        });
+    }
+    ops.push(TopologyOp::SourcePatchBulkBaseline {
+        source,
+        transfer_id: geometry_transfer_id,
+    });
+    ops.push(TopologyOp::CreatureLifecycleBulk {
+        operation_ordinal: 4,
+        payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        commit_hash: lifecycle.commit_hash,
+        transfer_id: lifecycle_transfer_id,
+    });
+    let transaction = TopologyTransaction {
+        transaction_id,
+        server_tick: spall_core::Tick(9),
+        control_seq: ControlSeq(10),
+        algorithm_version: 1,
+        dependencies: vec![],
+        before: vec![],
+        after: vec![],
+        ops,
+        result_hashes: vec![],
+    };
+    transaction.validate().unwrap();
+    let geometry = BaselineWorld {
+        schema: BASELINE_WORLD_SCHEMA,
+        checkpoint_tick: 9,
+        volumes,
+    };
+    let set = TransactionAttachmentSetV1 {
+        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        transaction_id,
+        attachments: vec![
+            TransactionAttachmentV1::Geometry {
+                transfer_id: geometry_transfer_id,
+                world: geometry.clone(),
+            },
+            TransactionAttachmentV1::CreatureLifecycle {
+                transfer_id: lifecycle_transfer_id,
+                payload: Box::new(lifecycle.clone()),
+            },
+        ],
+    };
+    let bytes = set.encode_for_transaction(&transaction).unwrap();
+    let decoded = decode_for_transaction(&bytes, &transaction).unwrap();
+    assert!(matches!(
+        decoded.get(geometry_transfer_id),
+        Some(ValidatedTransactionAttachmentV1::Geometry(decoded)) if decoded == &geometry
+    ));
+    assert!(matches!(
+        decoded.get(lifecycle_transfer_id),
+        Some(ValidatedTransactionAttachmentV1::CreatureLifecycle(decoded))
+            if decoded.as_ref() == &lifecycle
+                && match &decoded.commit.change.operation {
+                    CreatureLifecycleOperationV1::Birth { after } => after == &reduced.record,
+                    CreatureLifecycleOperationV1::Death { after } => after == &reduced.record,
+                }
+    ));
+}
+
+#[test]
 fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_semantics() {
     use std::io::Read;
 

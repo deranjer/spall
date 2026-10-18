@@ -7,10 +7,11 @@ use spall_protocol::{
     BaselineWorld, CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
     CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA, CREATURE_STATE_SCHEMA, ControlSeq,
     CreatureAssetIdentity, CreatureLifecycleBulkPayloadV1, CreatureLifecycleChangeV1,
-    CreatureLifecycleCommitV1, CreatureLifecycleOperationV1, CreatureOwnershipRecordV1,
-    CreatureStateV1, Hash32, TRANSACTION_ATTACHMENT_SET_SCHEMA, TopologyOp, TopologyTransaction,
-    TransactionAttachmentError, TransactionAttachmentSetV1, TransactionAttachmentV1,
-    ValidatedTransactionAttachmentV1, decode_for_transaction,
+    CreatureLifecycleCommitV1, CreatureLifecycleOperationV1, CreatureLocalPoseV1,
+    CreatureOwnershipRecordV1, CreatureSourcePartV1, CreatureStateV1, Hash32,
+    TRANSACTION_ATTACHMENT_SET_SCHEMA, TopologyOp, TopologyTransaction, TransactionAttachmentError,
+    TransactionAttachmentSetV1, TransactionAttachmentV1, ValidatedTransactionAttachmentV1,
+    decode_for_transaction,
 };
 
 fn volume(id: u64, owner: BaselineOwner) -> BaselineVolume {
@@ -132,6 +133,90 @@ fn lifecycle_commit(transaction_id: TransactionId) -> CreatureLifecycleCommitV1 
     }
 }
 
+fn compact_uniform_commit(
+    transaction_id: TransactionId,
+    ordinal: u32,
+) -> CreatureLifecycleCommitV1 {
+    let mut commit = lifecycle_commit(transaction_id);
+    let CreatureLifecycleOperationV1::Birth { after } = &mut commit.change.operation else {
+        unreachable!();
+    };
+    let bricks: Vec<_> = (0..30)
+        .map(|x| BaselineBrick {
+            coord: [x, 0, 0],
+            revision: 1,
+            edited: false,
+            cells: BaselineCells::Uniform(1),
+        })
+        .collect();
+    after.parts.push(CreatureSourcePartV1 {
+        part_id: 1,
+        source_volume_id: VolumeId::new(1).unwrap(),
+        source_generation: 1,
+        source_revision: 1,
+        cell_size_code: 0,
+        bounds: None,
+        source_content_hash: Hash32([5; 32]),
+        parent_id: None,
+        initial_local_pose: CreatureLocalPoseV1 {
+            translation_m: [0.0; 3],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        },
+        frozen_local_pose: CreatureLocalPoseV1 {
+            translation_m: [0.0; 3],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        },
+        bricks,
+    });
+    commit.change.transaction_id = transaction_id;
+    commit.change.operation_ordinal = ordinal;
+    commit.change.expected_after_hash = after.canonical_hash();
+    commit
+}
+
+fn lifecycle_set_with_five_compact_uniform_records()
+-> (TopologyTransaction, TransactionAttachmentSetV1) {
+    let transaction_id = TransactionId::new(71).unwrap();
+    let mut ops = Vec::new();
+    let mut attachments = Vec::new();
+    for ordinal in 0..5_u32 {
+        let transfer_id = 500 + u64::from(ordinal);
+        let payload = CreatureLifecycleBulkPayloadV1::new(
+            transaction_id,
+            ordinal,
+            compact_uniform_commit(transaction_id, ordinal),
+        )
+        .unwrap();
+        ops.push(TopologyOp::CreatureLifecycleBulk {
+            operation_ordinal: ordinal,
+            payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+            commit_hash: payload.commit_hash,
+            transfer_id,
+        });
+        attachments.push(TransactionAttachmentV1::CreatureLifecycle {
+            transfer_id,
+            payload: Box::new(payload),
+        });
+    }
+    let transaction = TopologyTransaction {
+        transaction_id,
+        server_tick: Tick(12),
+        control_seq: ControlSeq(1),
+        algorithm_version: 1,
+        dependencies: vec![],
+        before: vec![],
+        after: vec![],
+        ops,
+        result_hashes: vec![],
+    };
+    let set = TransactionAttachmentSetV1 {
+        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        transaction_id,
+        attachments,
+    };
+    (transaction, set)
+}
+
 #[test]
 fn typed_attachment_roundtrip_preserves_shared_geometry_split_group() {
     let transaction = split_transaction();
@@ -146,6 +231,10 @@ fn typed_attachment_roundtrip_preserves_shared_geometry_split_group() {
     let bytes = set.encode_for_transaction(&transaction).unwrap();
     let decoded = decode_for_transaction(&bytes, &transaction).unwrap();
     assert_eq!(decoded.transaction_id(), transaction.transaction_id);
+    assert!(decoded.matches_transaction(&transaction));
+    let mut divergent_same_id = transaction.clone();
+    divergent_same_id.server_tick = Tick(13);
+    assert!(!decoded.matches_transaction(&divergent_same_id));
     assert!(matches!(
         decoded.get(77),
         Some(ValidatedTransactionAttachmentV1::Geometry(world)) if *world == split_world()
@@ -319,5 +408,47 @@ fn lifecycle_attachment_is_correlated_to_marker_before_candidate_acceptance() {
     assert!(matches!(
         set.encode_for_transaction(&wrong_marker),
         Err(TransactionAttachmentError::Correlation)
+    ));
+}
+
+#[test]
+fn compact_uniform_lifecycle_work_is_cumulative_across_attachments() {
+    let (transaction, set) = lifecycle_set_with_five_compact_uniform_records();
+    assert!(matches!(
+        set.encode_for_transaction(&transaction),
+        Err(TransactionAttachmentError::Lifecycle(_))
+    ));
+
+    // Build the bounded outer framing from individually valid payloads so the
+    // decoder must enforce the same aggregate owner-work budget.
+    #[derive(serde::Serialize)]
+    struct Prefix {
+        schema: u16,
+        transaction_id: TransactionId,
+        count: u32,
+    }
+    let mut bytes = postcard::to_stdvec(&Prefix {
+        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        transaction_id: transaction.transaction_id,
+        count: set.attachments.len() as u32,
+    })
+    .unwrap();
+    for attachment in &set.attachments {
+        let TransactionAttachmentV1::CreatureLifecycle {
+            transfer_id,
+            payload,
+        } = attachment
+        else {
+            unreachable!();
+        };
+        let compressed = payload.encode_compressed().unwrap();
+        bytes.extend(postcard::to_stdvec(transfer_id).unwrap());
+        bytes.push(1);
+        bytes.extend(postcard::to_stdvec(&(compressed.len() as u32)).unwrap());
+        bytes.extend(compressed);
+    }
+    assert!(matches!(
+        decode_for_transaction(&bytes, &transaction),
+        Err(TransactionAttachmentError::Lifecycle(_))
     ));
 }

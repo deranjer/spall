@@ -20,9 +20,9 @@ pub(crate) fn decode_compressed(
     if bytes.len() > crate::limits::MAX_ASSEMBLED_TRANSFER {
         return Err(TransactionAttachmentError::CompressedBudget);
     }
-    // `read_to_end` may retain up to roughly twice its logical length in Vec
-    // capacity. Keep that temporary decompression buffer plus the eventual
-    // owned BaselineWorld within the caller's single aggregate budget.
+    // Limit logical decompressed bytes before reading, then charge the actual
+    // retained Vec capacity (with a 2x logical floor) plus the eventual owned
+    // BaselineWorld against the same aggregate budget used by encode.
     let cap = (*remaining_budget / 3).min(crate::limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED);
     let decoder = zstd::stream::Decoder::new(bytes)
         .map_err(|e| TransactionAttachmentError::Baseline(e.to_string()))?;
@@ -34,10 +34,7 @@ pub(crate) fn decode_compressed(
     if raw.len() > cap {
         return Err(TransactionAttachmentError::DecodedBudget);
     }
-    let raw_capacity_cost = raw
-        .len()
-        .checked_mul(2)
-        .ok_or(TransactionAttachmentError::DecodedBudget)?;
+    let raw_capacity_cost = raw_buffer_cost(raw.len(), raw.capacity())?;
     let heap = preflight_raw(&raw, remaining_budget.saturating_sub(raw_capacity_cost))?;
     let charge = raw_capacity_cost
         .checked_add(heap)
@@ -61,6 +58,16 @@ pub(crate) fn preflight_world_size(
         .checked_mul(2)
         .and_then(|raw_capacity| raw_capacity.checked_add(heap))
         .filter(|total| *total <= remaining)
+        .ok_or(TransactionAttachmentError::DecodedBudget)
+}
+
+pub(crate) fn raw_buffer_cost(
+    logical_len: usize,
+    capacity: usize,
+) -> Result<usize, TransactionAttachmentError> {
+    logical_len
+        .checked_mul(2)
+        .map(|floor| capacity.max(floor))
         .ok_or(TransactionAttachmentError::DecodedBudget)
 }
 
