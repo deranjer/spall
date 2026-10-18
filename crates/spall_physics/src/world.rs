@@ -12882,6 +12882,14 @@ mod tests {
         assert_eq!(transferred_owner.owner_key, Some(99));
         assert_eq!(transferred_owner.source_generation, owner.source_generation);
         assert_eq!(transferred_owner.next_component_serial, 1);
+        // The queued kinematic reset must not convert an immediately
+        // transferred corpse back into a kinematic body on the next step.
+        restored.step();
+        let assembly = &restored.articulated[&restored_id.0];
+        assert!(assembly.dynamic_corpse);
+        assert!(!assembly.velocity_based_restore);
+        let root = restored.entries[entry_index(restored_id.0, restored.id_namespace)].body;
+        assert_eq!(restored.bodies[root].body_type(), RigidBodyType::Dynamic);
     }
 
     #[test]
@@ -12972,6 +12980,11 @@ mod tests {
             .owner_id;
         let owner_before = world.articulated_owner_snapshot(id).unwrap();
         let pose_before = world.articulated_pose_snapshot(id).unwrap();
+        let part_world_poses = world.articulated[&id.0]
+            .parts
+            .iter()
+            .map(|part| (part.body, *world.bodies[part.body].position()))
+            .collect::<Vec<_>>();
         assert_eq!(owner_before.root.linvel_m_s, [30.0, 0.0, 0.0]);
         assert!(world.articulated[&id.0].velocity_based_restore);
 
@@ -12988,6 +13001,9 @@ mod tests {
         assert_eq!(world.articulated_pose_snapshot(id).unwrap(), pose_before);
         assert_eq!(owner_after.root.linvel_m_s, [0.0; 3]);
         assert_eq!(owner_after.root.angvel_rad_s, [0.0; 3]);
+        for (body, pose) in part_world_poses {
+            assert_eq!(*world.bodies[body].position(), pose);
+        }
         assert_eq!(
             world
                 .raycast_articulated(id, [2.5, 0.125, 0.125], [1.0, 0.0, 0.0], 1.0)
@@ -13021,6 +13037,53 @@ mod tests {
                 .iter()
                 .all(|value| value.abs() < 1.0e-8)
         );
+    }
+
+    #[test]
+    fn alive_restore_accepts_local_animation_before_first_step() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let prepared = world
+            .prepare_articulated_batch(
+                vec![ArticulatedBatchOperation::AliveRestore {
+                    operation_tag: 1,
+                    restore: alive_restore_fixture(107),
+                    representation: Representation::MergedCuboids,
+                }],
+                mix_density,
+            )
+            .unwrap();
+        let id = world.commit_articulated_batch(prepared).unwrap()[0].owner_id;
+        let mut parts = world.articulated_pose_snapshot(id).unwrap().parts;
+        parts[2].1.translation_m[0] = 0.01;
+        world
+            .update_articulated_pose(
+                id,
+                crate::articulated::ArticulatedPose {
+                    topology_token: 44,
+                    base_pose_token: 1,
+                    pose_token: 2,
+                    parts: parts.clone(),
+                },
+            )
+            .unwrap();
+        assert!(world.articulated_part_motion_snapshot(id).is_none());
+        world.step();
+        let pose = world.articulated_pose_snapshot(id).unwrap();
+        assert_eq!(pose.pose_token, 2);
+        assert_eq!(pose.parts, parts);
+        let assembly = &world.articulated[&id.0];
+        assert!(!assembly.velocity_based_restore);
+        let tip = assembly
+            .parts
+            .iter()
+            .find(|part| part.part_id == 3)
+            .unwrap();
+        let position = world.bodies[tip.body].translation();
+        assert!((position.x - 3.51).abs() < 1.0e-5);
+        assert!((position.y - 0.5).abs() < 1.0e-5);
+        assert!(position.z.abs() < 1.0e-5);
+        let motion = world.articulated_part_motion_snapshot(id).unwrap();
+        assert!(motion[2].linear_velocity_m_s[0] > 0.1);
     }
 
     #[test]

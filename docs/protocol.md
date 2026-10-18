@@ -753,3 +753,12 @@ before restoring or publishing another checkpoint, then seeds the live allocator
 above them. The fresh in-memory journal is not the recovery source. Lifecycle
 reservations and typed runtime consumers remain closed pending complete actor
 checkpoint/baseline restore and ordered attachment transport/replay.
+
+The current checkpoint capture refuses any initialized creature host, including
+an empty host whose allocator high-water must survive restart. It cannot emit a
+geometry-only checkpoint that silently omits that state. Complete live-animal
+recovery also requires independent applied part-body twists: root motion and
+frozen part poses alone cannot reproduce an animated limb's immediate checked
+death transfer. The physics reconstruction prerequisite carries those measured
+values explicitly; the existing serialized owner/motion schemas still require
+an explicit replacement before complete animal checkpointing is enabled.

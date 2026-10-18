@@ -1697,3 +1697,20 @@ Transfer allocation checks are `cargo test -p spall_server transfer_ids::tests`;
 reset preflight is `cargo test -p spall_server
 reset_id_exhaustion_preflight_preserves_world_and_late_join_state`. The latter
 must preserve the simulation and client-transfer state before any reset work.
+
+Animated live-owner physics reconstruction checks run with
+`cargo test -p spall_physics --lib alive_`. The fixture must contain independent
+applied part motion, compare immediate checked-death mass/momentum after restore,
+commit that transfer, and retain a dynamic corpse through the next step. A live
+restore with no new authored frame must hold every part's actual physical pose;
+root/local animation may resume before the first step. Pending-frame snapshots,
+incomplete/nonfinite motion, duplicate identity and stale batches must reject.
+This validates the runtime reconstruction primitive, not serialized animal saves.
+
+The current geometry-only checkpoint boundary is exercised by
+`cargo test -p spall_server --lib
+full_and_incremental_capture_refuse_to_drop_empty_host_high_water`. Both capture
+paths must refuse an initialized actor host, even when no records remain, while
+retaining allocator/epoch and authoritative state. Complete actor checkpoint and
+baseline capture/restore, full-owner corpse export and versioned part-motion
+serialization remain required before production spawning or combined 1 km gates.

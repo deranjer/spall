@@ -1,5 +1,24 @@
 # ENG-218 design: ordered animal lifecycle consumers
 
+## 2026-10-18 recovery contract clarification
+
+Independent applied part-body velocities are required to restore an animated
+Alive animal without changing its immediate checked-death momentum. Root twist,
+clip phase and frozen part poses cannot supply those measured values by
+themselves. The runtime physics restore prerequisite therefore requires complete
+keyed part twists, captured with owner metadata and poses on the owning thread
+while no pose frame is pending.
+
+The earlier direction below to keep the inner ownership/change layout unchanged
+does not authorize discarding this motion from a complete checkpoint or baseline.
+Before enabling those consumers, explicitly version the existing portable
+ownership/motion contract to retain and hash the complete measured part motion,
+update its reducer/callers/fixtures together, and reject superseded current
+layouts without migration. Resolve that exact DTO boundary before editing the
+serialized layout. It remains one ownership candidate and the same ordered
+transaction/journal sequence; no independent actor motion ledger or save stream.
+The runtime physics DTO does not itself implement that serialized contract.
+
 **Status:** coordinator-reviewed direction. Replay evidence, exact cold restore and common physics/geometry preparation prerequisites are integrated; the real combined ordered lifecycle consumer below remains pending implementation and acceptance. Production species spawning remains disabled until the complete consumer/recovery slice is accepted.
 
 ## Decision: make lifecycle a real ordered topology operation

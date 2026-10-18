@@ -13,7 +13,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use spall_client::net::{MovementStep, MovementTrace, ReconcileTraceRow};
 use spall_client::{BaselineScene, ClientNetConfig, run_replication_client};
@@ -78,8 +78,15 @@ fn run_session(
     let total_ticks = seconds * 60;
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("spall-timeline-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("spall-timeline-{}-{n}-{nonce}", std::process::id()));
+    // Process IDs are reused. Never consume a prior run's address or pinned
+    // certificate while the newly launched server is publishing its files.
+    std::fs::create_dir(&dir).unwrap();
     let token = JoinToken::generate().unwrap();
     let fp_path = dir.join("server.fingerprint");
     let addr_path = dir.join("server.addr");

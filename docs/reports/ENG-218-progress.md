@@ -497,3 +497,142 @@ journal, fake geometry baseline, legacy migration or live spawning is accepted
 as a substitute. Current wire 9, baseline 1 and store 3 remain unchanged.
 Combined 1024 m weather/animals, GPU, population and multiplayer animal
 recovery/destruction acceptance are still unrun.
+
+## Complete actor recovery prerequisite plan (2026-10-18)
+
+The next coherent implementation boundary is exact reconstruction of a moved
+Alive physics owner, before the Simulation snapshot API and checkpoint schema
+change. `AliveBirth` initializes rest motion and tokens; using it followed by
+fallible public mutation would not be an atomic restore. A value-only
+`AliveArticulatedRestore` and prepared batch operation will carry the applied
+source hierarchy, root pose/twist, topology/pose tokens, source generation and
+intact serial high-water. The existing owner-key index will preserve stable
+identity through immediate checked death and later fracture. Preparation must
+share current source/grid/density/primitive budgets and final batch fences;
+publication installs both root motion and each part body's measured twist before
+exposing the owner. Independent review found that reconstructing part velocities
+only from the rigid root would lose articulated animation motion. The runtime
+restore input must therefore require exactly one keyed measured linear/angular
+velocity for each part, with no missing/duplicate keys or synthesized fallback.
+A bounded value-only getter must refuse capture while any pose is pending. No
+runtime handle will enter portable DTOs.
+
+The planned physics tests compare animated multi-part capture/restore, exact
+source queries, tokens, immediate checked-death mass/momentum, invalid numeric input,
+cross-owner/source collision and stale batch atomicity. This is a prerequisite,
+not complete animal save/restore acceptance. The current geometry-only checkpoint
+must reject any initialized actor host, including an empty host with consumed
+allocator high-water, until a complete format can retain it.
+
+Subsequent Simulation capture must join actual source volumes and original
+metadata to full live physics ownership facts. A per-component fracture-planning
+snapshot is insufficient: it omits original empty bindings, full component
+partition, serial high-water and portable pose epoch. Capture/restore must retain
+all those facts, use the same `CreatureOwnershipSetV1` plus allocator snapshot,
+enforce cumulative decode/work limits, validate the injected catalog and publish
+prepared source/host/physics candidates atomically. Complete baseline/checkpoint
+consumers and typed journal/transport follow; production spawning stays closed.
+The existing serialized ownership/motion records do not retain independent part
+twists, so their explicit current schema must also change before arbitrary live
+animation recovery can be claimed. A rigid-only workload is not a substitute.
+
+Final integration review additionally found a first-step hazard in the initial
+worker draft: Rapier requires velocity-based kinematic mode to install measured
+twists, but leaving that temporary mode active without another authored frame
+would freely integrate individual limbs while the stored hierarchy remained
+unchanged. That draft was held out of main pending a reset before the next
+integration and actual no-input/animation-resume regressions. Immediate snapshot
+and death-witness checks alone do not prove correct next-step behavior.
+
+## Animated Alive physics reconstruction prerequisite accepted
+
+Worker `031374a` is main `decfd1a`; first-step correction `cea8c1c` is main
+`f313fb2`. `AliveArticulatedRestore` and `AliveRestore` in the existing prepared
+physics batch carry stable owner key, source generation, topology/pose tokens,
+intact serial high-water, applied source hierarchy, root motion and a required
+exact keyed set of measured part-body linear/angular velocities. Motion count
+is checked before key-set allocation; duplicate/missing keys, nonfinite values,
+zero source revision, identity collisions and stale candidates reject before
+solver publication. The existing source/grid/density/primitive and body-slot
+budgets remain shared. Birth still initializes its original rest state.
+
+The applied-motion getter refuses pending root/local frames, corpses and
+nonfinite twists. Owner, pose, source and motion reads must be made together on
+the owning thread with no intervening mutation. It is not a cross-thread receipt.
+The owner snapshot now exposes actual owner key, source generation and serial
+high-water rather than requiring hard-coded reconstruction values.
+
+Rapier ignores velocity setters for position-based kinematics, so reconstruction
+temporarily uses velocity-based kinematics to retain the measured twists for an
+immediate checked death. The corrected implementation queues those new owners
+for conversion back to position-based control before their first integration.
+An authored root/local frame consumes the temporary mode earlier; checked death
+also clears it so the queued conversion cannot turn a corpse back kinematic.
+No global owner scan, second physics engine or persisted runtime handle is added.
+
+The three-part animation fixture actually moves/rotates local parts and proves
+their measured twists differ from its stationary root. Original and rebuilt
+owners produce matching immediate checked-death mass, linear momentum and angular
+momentum (test tolerances: mass 1e-10 kg, momentum 1e-8 in their respective units).
+The test also commits the transfer and checks installed mass/twist and retained
+owner identity. Coordinator extensions step that corpse and verify it stays
+dynamic, compare every part body's physical pose after a no-input step, and
+resume an authored local frame before the first step, checking actual tip-body
+position and velocity. Pending root/local capture, missing/nonfinite motion,
+duplicate owner and stale-batch refusals are covered. These are bounded CPU
+fixtures, not measurements of the shipped species or 1 km population.
+
+Main `cf0e3bd` adds a separate current-checkpoint refusal for an initialized actor
+host, even an empty host with allocator ID high-water 1 or 73 and epoch 4. Both
+full and incremental capture must return `CreatureCheckpointUnsupported` while
+retaining world hash, registry, journal cursor, tick and allocator snapshot.
+This prevents silent loss in the current geometry-only format; it does not
+implement animal saving. No live spawning or protocol/store version changed.
+
+Review corrected initial missing-field/vector-cross compile errors. Worker
+focused checks progressed from 4 to 5 passes; these include one existing birth
+test. The coordinator's final focused `cargo test -p spall_physics --lib alive_`
+passed 6 tests (0 failed/ignored), including the added local-resume scenario.
+The first-step drift draft was not accepted on its immediate-witness result.
+The worker's full physics run did not retain a final aggregate exit code; only
+the coordinator's integrated results below count as the complete measured gate.
+
+The first integrated run stopped at three `prediction_timeline` QUIC certificate
+failures. Inspection confirmed its process-ID-only session directories were
+created on 2026-10-15 and reused on 2026-10-18, allowing stale address/fingerprint
+files to satisfy startup waits. The harness now uses a timestamp nonce and
+exclusive directory creation; old diagnostic folders were preserved. No TLS
+verification or workload was weakened. The complete suite was retried after
+that concrete harness correction.
+
+Coordinator final checks on integrated main:
+
+- `cargo test -p spall_physics --lib alive_`: 6 passed, 0 failed/ignored.
+- `cargo test -p spall_server --lib
+  full_and_incremental_capture_refuse_to_drop_empty_host_high_water`: 1 passed.
+- `cargo test -p spall_physics -p spall_sim -p spall_server`: corrected-harness
+  retry **613 passed, 0 failed, 12 ignored across 71 targets**. The initial
+  integrated attempt's three certificate failures remain recorded above.
+- `cargo check --workspace --all-targets --all-features`: passed.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store
+  -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+Changed code: `crates/spall_physics/src/{articulated,lib,world}.rs`,
+`crates/spall_server/src/persist.rs`, and
+`crates/spall_server/tests/prediction_timeline.rs`. Updated design/protocol,
+validation, task notes and this report record the exact acceptance boundary.
+No dependency, wire 9, baseline 1 or store 3 version changed. Logs:
+`.local/eng218-checkpoint-boundary-tests.log`,
+`.local/eng218-alive-integrated-focused.log`,
+`.local/eng218-alive-integrated-tests{,-retry}.log`, and
+`.local/eng218-alive-{workspace,clippy,format}.log`. All Cargo commands used the
+existing target-pinning wrapper. Cache hard-link warnings remain environmental.
+
+Next remains ENG-218: bounded full-owner capture (including all corpse component
+masks, twists, serial gaps and original empty source bindings), explicitly
+versioned complete serialized ownership/motion plus allocator, then atomic
+Simulation checkpoint/baseline capture/restore and typed ordered transaction
+consumers. The current single-component fracture-planning snapshot is not a
+portable full-owner export. Combined 1024 m weather/animals, GPU, population and
+multiplayer animal restart/destruction acceptance remain unrun; spawning is closed.
