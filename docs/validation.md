@@ -1727,3 +1727,14 @@ fixture above one million dense cells proves existing 4,000,000-dense-cell stora
 support, not a raised fracture planner limit or a population performance result.
 Complete Simulation exports and serialized checkpoint/baseline recovery remain
 unaccepted; production animal spawning and combined 1024 m gates remain closed.
+Ownership population reader checks run with `cargo test -p spall_protocol`.
+The public `creature_owner_review` population tests require sourceful multi-owner
+postcard/map roundtrips, safe decoder catalog/order/identity validation, trailing
+byte refusal, cumulative compact Uniform and empty-brick metadata admission, and
+retained per-record limits. Nested unknown map fields and 63/255-byte species/clip
+name limits must reject during parsing; multibyte text is measured in bytes.
+Internal decoder probes cover hostile sequence hints and unknown-size excess
+records without reading their bodies, cumulative dense/mask counts and byte/work
+admission before allocation. This is reader admission evidence, not complete
+serialized actor saves or integrated multiplayer recovery. Parser scratch memory
+still requires bounded input frames; production spawning remains closed.

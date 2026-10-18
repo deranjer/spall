@@ -285,6 +285,215 @@ fn portable_owner_roundtrip_and_logical_storage_equivalence() {
 }
 
 #[test]
+fn population_decode_roundtrips_distinct_sources_and_still_requires_semantic_validation() {
+    let f = Fixture::new();
+    let first = owner(&f);
+    let mut second = first.clone();
+    second.state.key.creature_id = CreatureId::new(2).unwrap();
+    second.owner_key = 10;
+    let volume = VolumeId::new(101).unwrap();
+    second.state.source_bindings[0].source_volume_id = volume;
+    second.parts[0].source_volume_id = volume;
+    second.parts[0].source_content_hash = second.parts[0].canonical_source_content_hash();
+    second.components[0].owner_key = 10;
+    second.components[0].source_masks[0].volume_id = volume;
+    let set = CreatureOwnershipSetV1 {
+        schema: CREATURE_OWNER_SCHEMA,
+        records: vec![first, second],
+    };
+    set.validate(&f.catalog()).unwrap();
+    let bytes = postcard::to_allocvec(&set).unwrap();
+    let decoded = CreatureOwnershipSetV1::decode(&bytes, &f.catalog()).unwrap();
+    assert_eq!(decoded, set);
+    assert_eq!(decoded.canonical_hash(), set.canonical_hash());
+    decoded.validate(&f.catalog()).unwrap();
+    assert_eq!(postcard::to_allocvec(&decoded).unwrap(), bytes);
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(CreatureOwnershipSetV1::decode(&trailing, &f.catalog()).is_err());
+    let json = serde_json::to_vec(&set).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<CreatureOwnershipSetV1>(&json).unwrap(),
+        set
+    );
+
+    // Bounded decoding cannot substitute for catalog, canonical order or
+    // identity validation at the consumer's publication boundary.
+    let mut duplicate = set;
+    duplicate.records[1] = duplicate.records[0].clone();
+    let bytes = postcard::to_allocvec(&duplicate).unwrap();
+    let decoded: CreatureOwnershipSetV1 = postcard::from_bytes(&bytes).unwrap();
+    assert!(decoded.validate(&f.catalog()).is_err());
+    assert!(CreatureOwnershipSetV1::decode(&bytes, &f.catalog()).is_err());
+
+    let empty = CreatureOwnershipSetV1::empty();
+    assert_eq!(
+        postcard::from_bytes::<CreatureOwnershipSetV1>(&postcard::to_allocvec(&empty).unwrap())
+            .unwrap(),
+        empty
+    );
+}
+
+fn compact_cost_record(f: &Fixture, bricks: usize, material: u16) -> CreatureOwnershipRecordV1 {
+    let mut record = owner(f);
+    record.parts[0].bricks = (0..bricks)
+        .map(|x| BaselineBrick {
+            coord: [x as i64, 0, 0],
+            revision: 1,
+            edited: true,
+            cells: BaselineCells::Uniform(material),
+        })
+        .collect();
+    // These deliberately incomplete masks test decode cost admission, not a
+    // valid population. Full semantic validation remains mandatory afterward.
+    record.components.clear();
+    record
+}
+
+#[test]
+fn population_decode_charges_compact_uniform_solids_across_records() {
+    let f = Fixture::new();
+    let full = compact_cost_record(&f, 30, 1); // 983,040 solids per record.
+    let tail = compact_cost_record(&f, 2, 1);
+    let mut set = CreatureOwnershipSetV1 {
+        schema: CREATURE_OWNER_SCHEMA,
+        records: vec![full.clone(), full.clone(), full.clone(), full, tail],
+    };
+    for record in &set.records {
+        postcard::from_bytes::<CreatureOwnershipRecordV1>(&postcard::to_allocvec(record).unwrap())
+            .unwrap();
+    }
+    let bytes = postcard::to_allocvec(&set).unwrap();
+    assert!(
+        bytes.len() < 16 * 1024,
+        "compact wire must not hide expansion cost"
+    );
+    postcard::from_bytes::<CreatureOwnershipSetV1>(&bytes).unwrap(); // 3,997,696 solids.
+    set.records[4] = compact_cost_record(&f, 3, 1); // 4,030,464 solids.
+    let bytes = postcard::to_allocvec(&set).unwrap();
+    assert!(postcard::from_bytes::<CreatureOwnershipSetV1>(&bytes).is_err());
+
+    // A set's larger allowance must not relax the one-owner solid ceiling.
+    set.records = vec![compact_cost_record(&f, 31, 1)];
+    assert!(
+        postcard::from_bytes::<CreatureOwnershipSetV1>(&postcard::to_allocvec(&set).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn population_decode_limits_air_brick_metadata_across_records() {
+    let f = Fixture::new();
+    let mut set = CreatureOwnershipSetV1 {
+        schema: CREATURE_OWNER_SCHEMA,
+        records: vec![
+            compact_cost_record(&f, 2048, 0),
+            compact_cost_record(&f, 2048, 0),
+        ],
+    };
+    postcard::from_bytes::<CreatureOwnershipSetV1>(&postcard::to_allocvec(&set).unwrap()).unwrap();
+    set.records[1] = compact_cost_record(&f, 2049, 0);
+    for record in &set.records {
+        postcard::from_bytes::<CreatureOwnershipRecordV1>(&postcard::to_allocvec(record).unwrap())
+            .unwrap();
+    }
+    assert!(
+        postcard::from_bytes::<CreatureOwnershipSetV1>(&postcard::to_allocvec(&set).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn population_decode_rejects_unknown_map_keys_before_reading_their_values() {
+    let f = Fixture::new();
+    let set_prefix = "{\"schema\":1,\"records\":[],\"unexpected\":";
+    let error = serde_json::from_str::<CreatureOwnershipSetV1>(set_prefix).unwrap_err();
+    assert!(error.to_string().contains("unknown"), "{error}");
+
+    let mut record_prefix = serde_json::to_string(&owner(&f)).unwrap();
+    assert_eq!(record_prefix.pop(), Some('}'));
+    record_prefix.push_str(",\"unexpected\":");
+    let set_prefix = format!("{{\"schema\":1,\"records\":[{record_prefix}");
+    let error = serde_json::from_str::<CreatureOwnershipSetV1>(&set_prefix).unwrap_err();
+    assert!(error.to_string().contains("unknown"), "{error}");
+}
+
+#[test]
+fn population_state_strings_enforce_byte_limits_before_semantic_validation() {
+    let f = Fixture::new();
+    let mut record = owner(&f);
+    record.state.species_key = "s".repeat(MAX_CREATURE_SPECIES_KEY_BYTES);
+    record.state.clip_name = format!("{}a", "é".repeat(127));
+    assert_eq!(record.state.clip_name.len(), MAX_CREATURE_CLIP_NAME_BYTES);
+    let mut set = CreatureOwnershipSetV1 {
+        schema: CREATURE_OWNER_SCHEMA,
+        records: vec![record],
+    };
+    postcard::from_bytes::<CreatureOwnershipSetV1>(&postcard::to_allocvec(&set).unwrap()).unwrap();
+    for species in [true, false] {
+        let mut oversized = set.clone();
+        if species {
+            oversized.records[0].state.species_key.push('s');
+        } else {
+            oversized.records[0].state.clip_name = "é".repeat(128);
+        }
+        let bytes = postcard::to_allocvec(&oversized).unwrap();
+        assert!(postcard::from_bytes::<CreatureOwnershipSetV1>(&bytes).is_err());
+        let json = serde_json::to_vec(&oversized).unwrap();
+        assert!(serde_json::from_slice::<CreatureOwnershipSetV1>(&json).is_err());
+    }
+    let mut prefix = serde_json::to_string(&set.records.remove(0).state).unwrap();
+    assert_eq!(prefix.pop(), Some('}'));
+    prefix.push_str(",\"unexpected\":");
+    let error = serde_json::from_str::<CreatureStateV1>(&prefix).unwrap_err();
+    assert!(error.to_string().contains("unknown"), "{error}");
+}
+
+#[test]
+fn population_nested_fixed_metadata_rejects_unknown_map_fields() {
+    let f = Fixture::new();
+    let original = serde_json::to_value(owner(&f)).unwrap();
+    for path in [
+        "/state/key",
+        "/state/asset",
+        "/state/source_bindings/0",
+        "/parts/0/initial_local_pose",
+        "/parts/0/frozen_local_pose",
+        "/components/0/source_masks/0/cells/0",
+    ] {
+        let mut record = original.clone();
+        record
+            .pointer_mut(path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown_extension".into(), serde_json::json!([1, 2, 3]));
+        let value = serde_json::json!({"schema": CREATURE_OWNER_SCHEMA, "records": [record]});
+        let Err(error) = serde_json::from_value::<CreatureOwnershipSetV1>(value) else {
+            panic!("unknown map metadata was accepted at {path}");
+        };
+        assert!(error.to_string().contains("unknown"), "{path}: {error}");
+    }
+}
+
+#[test]
+fn population_decode_refuses_excess_source_binding_before_reading_its_body() {
+    let f = Fixture::new();
+    let mut record = serde_json::to_value(owner(&f)).unwrap();
+    let binding = record["state"]["source_bindings"][0].clone();
+    let mut bindings = vec![binding; MAX_CREATURE_SOURCE_PARTS];
+    // This would fail with a type error if the over-limit item's body were read.
+    bindings.push(serde_json::json!("body must not be decoded"));
+    record["state"]["source_bindings"] = serde_json::Value::Array(bindings);
+    let value = serde_json::json!({"schema": CREATURE_OWNER_SCHEMA, "records": [record]});
+    let error = serde_json::from_str::<CreatureOwnershipSetV1>(&value.to_string()).unwrap_err();
+    assert!(
+        error.to_string().contains("source binding limit"),
+        "{error}"
+    );
+}
+
+#[test]
 fn frozen_local_pose_is_owner_state_not_source_content() {
     let f = Fixture::new();
     let original = owner(&f);

@@ -2182,3 +2182,14 @@ Not complete serialized actor capture. Next ENG-218: full Simulation source/owne
 and allocator snapshot, versioned independent Alive motion, atomic checkpoint/
 baseline and typed ordered consumers. Production spawning and combined 1024 m
 weather/animal gates stay closed. See ENG-218-progress.md for exact checks/limits.
+ENG-218 2026-10-18 bounded ownership-set reader: main a5ca1da adds seeded V1
+Deserialize preserving per-record and cumulative set budgets before allocation,
+plus frame-capped catalog-validating decode. Coordinator closes bounded names,
+strict nested maps (including duplicate mask-cell Wire reader) and excess binding
+payload reads. Public corrected retry22pass; protocol/sim393pass0fail9ignored
+across40targets. No wire9/baseline1/store3 change or runtime consumer activation.
+Next ENG-218: explicitly versioned independent Alive part motion/overlay and death
+evidence, canonical Simulation source/owner+allocator snapshot, atomic complete
+checkpoint/baseline and typed ordered journal/replica. Combined1024m animal/weather,
+population/GPU/multiplayer recovery gates and spawning remain closed. Exact checks,
+failed initial map test and limits in reports/ENG-218-progress.md.

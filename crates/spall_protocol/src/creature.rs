@@ -27,6 +27,7 @@ const QUATERNION_NORM_TOLERANCE: f32 = 1.0e-4;
 
 /// Exact content identity of a parsed SPVX source asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatureAssetIdentity {
     pub uuid: [u8; 16],
     pub logical_hash: Hash32,
@@ -35,6 +36,7 @@ pub struct CreatureAssetIdentity {
 /// One source part's logical owner binding. This is metadata only; it does not
 /// duplicate or serialize per-cell topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreaturePartBinding {
     pub part_id: u32,
     pub source_volume_id: VolumeId,
@@ -110,19 +112,31 @@ impl<'de> Deserialize<'de> for CreatureStateV1 {
     where
         D: Deserializer<'de>,
     {
+        // Match CreatureKey's scalar sequence layout while keeping ownership
+        // map readers strict without changing the core identity type.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CreatureKeyWire {
+            world_id: spall_core::WorldId,
+            world_epoch: spall_core::WorldEpoch,
+            creature_id: spall_core::CreatureId,
+            generation: spall_core::CreatureGeneration,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct CreatureStateWireV1 {
             schema: u16,
-            key: CreatureKey,
+            key: CreatureKeyWire,
             state_revision: u64,
             lifecycle: CreatureLifecycleState,
-            species_key: String,
+            species_key: BoundedStateString<MAX_CREATURE_SPECIES_KEY_BYTES>,
             species_version: u32,
             asset: CreatureAssetIdentity,
             material_manifest_hash: Hash32,
             material_mapping_version: u32,
             material_mapping_hash: Hash32,
-            clip_name: String,
+            clip_name: BoundedStateString<MAX_CREATURE_CLIP_NAME_BYTES>,
             clip_mode: CreatureClipMode,
             clip_phase_tick: u64,
             clip_subtick_remainder: u32,
@@ -140,16 +154,21 @@ impl<'de> Deserialize<'de> for CreatureStateV1 {
         let wire = CreatureStateWireV1::deserialize(deserializer)?;
         Ok(Self {
             schema: wire.schema,
-            key: wire.key,
+            key: CreatureKey {
+                world_id: wire.key.world_id,
+                world_epoch: wire.key.world_epoch,
+                creature_id: wire.key.creature_id,
+                generation: wire.key.generation,
+            },
             state_revision: wire.state_revision,
             lifecycle: wire.lifecycle,
-            species_key: wire.species_key,
+            species_key: wire.species_key.0,
             species_version: wire.species_version,
             asset: wire.asset,
             material_manifest_hash: wire.material_manifest_hash,
             material_mapping_version: wire.material_mapping_version,
             material_mapping_hash: wire.material_mapping_hash,
-            clip_name: wire.clip_name,
+            clip_name: wire.clip_name.0,
             clip_mode: wire.clip_mode,
             clip_phase_tick: wire.clip_phase_tick,
             clip_subtick_remainder: wire.clip_subtick_remainder,
@@ -166,7 +185,50 @@ impl<'de> Deserialize<'de> for CreatureStateV1 {
     }
 }
 
+// Borrowed postcard strings are checked before creating owned state. Map
+// deserializers may use parser scratch space for escaped text; callers must
+// still bound their input frame in addition to this owned-value limit.
+struct BoundedStateString<const MAX: usize>(String);
+
+impl<'de, const MAX: usize> Deserialize<'de> for BoundedStateString<MAX> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StringVisitor<const MAX: usize>;
+        impl<'de, const MAX: usize> Visitor<'de> for StringVisitor<MAX> {
+            type Value = BoundedStateString<MAX>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "a creature state string of at most {MAX} bytes")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value.len() > MAX {
+                    return Err(E::custom("creature state string byte limit exceeded"));
+                }
+                Ok(BoundedStateString(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                if value.len() > MAX {
+                    return Err(E::custom("creature state string byte limit exceeded"));
+                }
+                Ok(BoundedStateString(value))
+            }
+        }
+        deserializer.deserialize_str(StringVisitor::<MAX>)
+    }
+}
+
 struct BoundedSourceBindings(Vec<CreaturePartBinding>);
+
+struct RejectExtraBinding;
+
+impl<'de> serde::de::DeserializeSeed<'de> for RejectExtraBinding {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, _deserializer: D) -> Result<(), D::Error> {
+        Err(serde::de::Error::custom("source binding limit exceeded"))
+    }
+}
 
 impl<'de> Deserialize<'de> for BoundedSourceBindings {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -197,12 +259,15 @@ impl<'de> Deserialize<'de> for BoundedSourceBindings {
                 }
                 let mut bindings =
                     Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_CREATURE_SOURCE_PARTS));
-                while let Some(binding) = seq.next_element()? {
-                    if bindings.len() == MAX_CREATURE_SOURCE_PARTS {
-                        return Err(serde::de::Error::custom("source binding limit exceeded"));
-                    }
+                while bindings.len() < MAX_CREATURE_SOURCE_PARTS {
+                    let Some(binding) = seq.next_element()? else {
+                        return Ok(BoundedSourceBindings(bindings));
+                    };
                     bindings.push(binding);
                 }
+                // A no-hint sequence may have another item. Refuse it before
+                // its body is decoded, just as for an oversized known length.
+                let _ = seq.next_element_seed(RejectExtraBinding)?;
                 Ok(BoundedSourceBindings(bindings))
             }
         }

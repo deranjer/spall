@@ -774,3 +774,13 @@ checked-death owner is checked without binding or mutating the owner index.
 This runtime DTO is not a complete serialized ownership snapshot: original sparse
 volumes/material catalogs, authored transforms and allocator state still require
 Simulation capture and explicitly versioned complete checkpoint/baseline schemas.
+Ownership-set decoding reuses the existing seeded record reader with per-record
+limits and shared population limits; a fresh per-record Deserialize cannot reset
+aggregate admission. The same V1 field order and schemas remain. The safe
+`CreatureOwnershipSetV1::decode(bytes, catalog)` entry point caps the input frame,
+rejects trailing bytes, and performs bounded parsing followed by catalog/semantic
+validation. Generic Deserialize admits resources only. Unknown ownership map fields
+(including nested fixed metadata) reject before their values; missing optional
+None metadata retains its existing map behavior. State-name byte limits apply
+before creating owned postcard strings. No new writer API, snapshot envelope,
+allocator format, checkpoint schema or production consumer is introduced here.

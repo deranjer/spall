@@ -811,16 +811,7 @@ seeded_struct!(
 
 impl<'de> BudgetDecode<'de> for CreatureMaskCellV1 {
     fn decode<D: Deserializer<'de>>(d: D, _budget: &mut DecodeBudget) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Wire {
-            index: u16,
-            material_id: u16,
-        }
-        let wire = Wire::deserialize(d)?;
-        Ok(Self {
-            index: wire.index,
-            material_id: wire.material_id,
-        })
+        Self::deserialize(d)
     }
 }
 

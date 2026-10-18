@@ -745,3 +745,110 @@ Final coordinator checks: strict seven-package all-target Clippy retry passed
 (cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store
 -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings);
 cargo fmt --all -- --check and git diff --check passed.
+
+## Ownership-set decode plan (2026-10-18)
+
+Before complete serialized snapshot integration, add a bounded reader for the
+existing `CreatureOwnershipSetV1` layout. The set is currently Serialize-only;
+ordinary Vec<Record>::Deserialize would restart every per-record budget and
+allocate aggregate contents before validation. Reuse seeded nested record parsing
+with independent per-record ceilings plus cumulative set admission: 1,024 records,
+64 MiB conservative decoded memory, 16 Mi dense slots, 4,000,000 actual source
+solids (including compact Uniform), 4,096 source bricks, 8,192 mask bricks and
+4,000,000 mask cells. Parts/components are bounded by record count times their
+existing per-record ceiling. Account outer vector capacity before nested parsing,
+reject oversized sequence hints immediately and refuse unknown-size excess
+records without decoding their payload. Charge nested capacity/solid/scan costs
+before allocation or expansion; do not divide a record's allowance by set size.
+
+Unknown map keys in these ownership DTOs will reject immediately before reading
+their values. Traversing arbitrary IgnoredAny extension values would bypass work
+accounting. Optional None metadata behavior remains supported; required fields
+remain required. This is an explicit current-schema strictness change, not a wire
+layout or format-version change. Postcard structs cannot carry unknown map keys.
+
+Acceptance: existing single-record tests, valid multi-owner sourceful postcard
+and map roundtrips plus catalog validation; aggregate compact Uniform and air-brick
+limits across individually admissible records; per-record caps inside sets;
+hostile hints/no-hint excess payload probes and cumulative nested-resource tests.
+This reader remains separate from semantic/catalog/identity validation and does
+not supply allocator serialization, missing Alive part twists, Simulation capture,
+checkpoint/baseline or journal consumer integration. No spawning or launch gate is
+opened by this prerequisite.
+The set reader also provides `CreatureOwnershipSetV1::decode(bytes, catalog)`:
+check the raw 64 MiB frame ceiling before parsing, reject trailing bytes, perform
+bounded nested decoding, then require ordinary catalog/semantic validation.
+Generic Deserialize only establishes resource admission. The existing Serialize
+implementation is retained; no new writer API promises equivalence between the
+validator's conservative estimates and the reader's native decoded-capacity limits.
+Unknown-size map sequences can consume bounded spare vector capacity; raw transport
+frames and parser scratch space remain the caller's responsibility.
+
+Review identified unbounded state-name strings underneath the record seed. Bound
+species and clip names before ownership allocation to the existing 63/255-byte
+limits, preserving their scalar serialization. Strict nested metadata covers asset
+identity, source binding, local pose, mask cell and a same-layout local CreatureKey
+reader; core identity serialization is unchanged. Map parser scratch space for
+escaped strings is outside owned-value accounting, so outer frame bounds still
+apply. Postcard borrowed strings are checked before an owned String is created.
+## Ownership-set reader integrated (2026-10-18)
+
+Integrated worker `57b8545` as main `a5ca1da`: existing V1 owner-set layout now
+has seeded bounded deserialization and a frame-capped, catalog-validated decode
+entry point. Per-record counters reset without losing cumulative set counters;
+record capacity, fixed state allowance, dense slots, actual/Uniform solids,
+bricks, masks, mask cells and work are charged before nested allocation/scanning.
+Unknown-size excess bodies refuse before decoding; exact EOF does not reserve
+unused output capacity. The validator's estimate and decoder's native-capacity
+allowance remain distinct, documented limits; no new writer parity is promised.
+
+Coordinator changes bound state-name ownership to 63/255 bytes, close nested map
+extension traversal with strict fixed DTO/key readers, and refuse a 257th source
+binding before reading its body. Serialized scalar order and all schema versions
+stay unchanged. The initial coordinator public suite caught a real remaining
+unknown-field path: MaskCell BudgetDecode's local Wire reader ignored the strict
+public DTO attribute. It now delegates to that DTO's strict Deserialize; no
+acceptance assertion was relaxed. The public failure/retry logs retain evidence.
+Worker review also corrected record-header work charging before local reset and
+unknown-size output growth at EOF. Early worker draft fixture exceeded its own
+per-record decoded memory bound; its dense aggregate fixture was corrected to
+respect individual record admission rather than raising the bound.
+
+Measured coordinator checks (target-pinned `.local/eng218-cargo.ps1`):
+- `cargo test -p spall_protocol --test creature_owner_review`: initial 21 passed,
+  1 failed (MaskCell map hole); corrected retry 22 passed, 0 failed.
+- `cargo test -p spall_protocol -p spall_sim`: 393 passed, 0 failed, 9 ignored
+  across 40 test-result targets.
+
+Changed code: `crates/spall_protocol/src/{creature,creature_owner,
+creature_owner_decode}.rs`; public review scenarios in
+`crates/spall_protocol/tests/creature_owner_review.rs`; protocol/validation/task
+notes and this report. Public population scenarios cover real catalog-validated
+two-owner sourceful roundtrips and byte stability, duplicate identity and trailing
+bytes, compact Uniform admission at 3,997,696 solids versus 4,030,464 refusal,
+retained one-owner ceiling, 4,096 air-brick admission versus 4,097 refusal,
+63/255-byte names including multibyte text, unknown nested fields and excess
+source-binding body refusal. Resource-only fixtures deliberately omit semantic
+masks; they are not claimed as valid live populations. Internal decoder probes
+exercise cumulative dense/mask/byte/work limits and hostile sequence admissions.
+
+Next unblocked task remains ENG-218. Resolve and implement explicitly versioned
+measured Alive part-motion ownership/overlay hashing and checked-death evidence;
+corpse motion remains per-component, not per original source part. Then join
+canonical Simulation sparse sources/rest poses/allocator with physics captures,
+and implement atomic complete checkpoint/baseline plus typed ordered journal and
+replica consumers. Any later layout change must reject superseded formats without
+migration. This pass did not change wire 9, baseline 1 or store 3. No serialized
+complete animal recovery, spawning, combined 1024 m weather/animals, population,
+GPU or multiplayer animal restart/destruction gate is accepted.
+Final coordinator checks passed:
+- `cargo check --workspace --all-targets --all-features`.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`.
+- `cargo fmt --all -- --check` and `git diff --check`.
+All Cargo calls used the existing target-pinned wrapper. Logs:
+`.local/eng218-set-reader-{public-tests,public-tests-retry,integrated-tests,
+workspace,clippy,format}.log`. Existing cache hard-link warnings remain environmental.
+Unrelated main `artifacts/` were preserved. The prior worker's untracked server
+test was retained in its ignored `.local/geometry_split_transfer_id.preserved-before-set-decode.rs`
+before checking out the already-committed version, and its reviewed history remains
+reachable at `codex/eng218-reviewed-worker-history`.
