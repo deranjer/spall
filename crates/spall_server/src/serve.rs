@@ -2698,6 +2698,7 @@ async fn serve_async(
             mut pipeline,
             mut journalled_through,
             mut checkpoints_published,
+            retained_transfer_ids,
             outbox_processor,
         } = match setup_persistence_with_game_content(
             save.as_deref(),
@@ -2836,7 +2837,7 @@ async fn serve_async(
 
         // T17 late-join / reconnect state.
         let mut lj = LateJoin::new(catch_up_cap, max_join_retries, capture_workers);
-        if let Err(error) = lj.seed_transfer_ids_from_journal(&sim) {
+        if let Err(error) = lj.seed_transfer_ids_from_recovery(&sim, &retained_transfer_ids) {
             return SimResult::error(
                 format!("retained journal contains an invalid transfer ID: {error}"),
                 0,
@@ -5422,8 +5423,12 @@ impl LateJoin {
             .collect()
     }
 
-    fn seed_transfer_ids_from_journal(&mut self, sim: &Simulation) -> Result<(), TransferIdError> {
-        let retained = sim.journal().entries().iter().flat_map(|entry| {
+    fn seed_transfer_ids_from_recovery(
+        &mut self,
+        sim: &Simulation,
+        recovered: &[TransferId],
+    ) -> Result<(), TransferIdError> {
+        let current = sim.journal().entries().iter().flat_map(|entry| {
             entry.transaction.ops.iter().filter_map(|op| match op {
                 spall_protocol::TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
                 | spall_protocol::TopologyOp::SourcePatchBulkBaseline { transfer_id, .. }
@@ -5433,7 +5438,8 @@ impl LateJoin {
                 _ => None,
             })
         });
-        self.transfer_ids.seed_past_retained(retained)
+        self.transfer_ids
+            .seed_past_retained(recovered.iter().copied().chain(current))
     }
 
     /// Handles a `BaselineAck`: the sentinel starts a late-join transfer; a real
@@ -5814,6 +5820,7 @@ struct Persistence {
     pipeline: Option<PersistPipeline>,
     journalled_through: u64,
     checkpoints_published: u64,
+    retained_transfer_ids: Vec<TransferId>,
     outbox_processor: Option<OutboxProcessor>,
 }
 
@@ -5891,50 +5898,59 @@ fn setup_persistence_with_game_content(
             pipeline: None,
             journalled_through: 0,
             checkpoints_published: 0,
+            retained_transfer_ids: Vec::new(),
             outbox_processor,
         });
     };
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
-    let (sim, journalled_through, checkpoints_published) = match writer.recover() {
-        Ok(recovery) => {
-            let (mut sim, seq) = persist::restore_with_terrain_collider_mode(
-                &recovery,
-                cfg,
-                persist::RecoveryChoice::RequireClean,
-                materials.clone(),
-                AnchorPlane::at(0),
-                PhysicsConfig::default(),
-                terrain_collider_mode,
-            )
-            .map_err(|e| e.to_string())?;
-            sim.set_column_water_worker(true);
-            (sim, seq, 0)
-        }
-        // A genuinely new/empty database: seed it with the built-in scene.
-        Err(spall_store::StoreError::NoCheckpoint) => {
-            let mut sim =
-                scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
-            if let Some(setup) = game_setup.take() {
-                setup(&mut sim)?;
-            }
-            sim.set_weather_seed(cfg.seed);
-            let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
-            writer
-                .publish_checkpoint(&checkpoint)
+    let (sim, journalled_through, checkpoints_published, retained_transfer_ids) =
+        match writer.recover() {
+            Ok(recovery) => {
+                let retained_transfer_ids =
+                    persist::retained_transfer_ids(&recovery).map_err(|e| e.to_string())?;
+                // Validate every recovered composed ID before rebuilding any state
+                // or publishing a later checkpoint. Reuse the runtime allocator's
+                // namespace and range checks rather than duplicating its bit rules.
+                TransferIdAllocator::seeded_from_retained(retained_transfer_ids.iter().copied())
+                    .map_err(|e| format!("recovered transfer ID is invalid: {e}"))?;
+                let (mut sim, seq) = persist::restore_with_terrain_collider_mode(
+                    &recovery,
+                    cfg,
+                    persist::RecoveryChoice::RequireClean,
+                    materials.clone(),
+                    AnchorPlane::at(0),
+                    PhysicsConfig::default(),
+                    terrain_collider_mode,
+                )
                 .map_err(|e| e.to_string())?;
-            (sim, 0, 1)
-        }
-        // Checkpoints exist but none decoded — corruption, not an empty DB. Do
-        // not overwrite the save with a fresh scene.
-        Err(e @ spall_store::StoreError::CheckpointsUnrecoverable(_)) => {
-            return Err(format!(
-                "world database at {} is unrecoverable and must not be overwritten: {e}; \
+                sim.set_column_water_worker(true);
+                (sim, seq, 0, retained_transfer_ids)
+            }
+            // A genuinely new/empty database: seed it with the built-in scene.
+            Err(spall_store::StoreError::NoCheckpoint) => {
+                let mut sim =
+                    scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
+                if let Some(setup) = game_setup.take() {
+                    setup(&mut sim)?;
+                }
+                sim.set_weather_seed(cfg.seed);
+                let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
+                writer
+                    .publish_checkpoint(&checkpoint)
+                    .map_err(|e| e.to_string())?;
+                (sim, 0, 1, Vec::new())
+            }
+            // Checkpoints exist but none decoded — corruption, not an empty DB. Do
+            // not overwrite the save with a fresh scene.
+            Err(e @ spall_store::StoreError::CheckpointsUnrecoverable(_)) => {
+                return Err(format!(
+                    "world database at {} is unrecoverable and must not be overwritten: {e}; \
                  an operator must supply a verified recovery source",
-                path.display()
-            ));
-        }
-        Err(e) => return Err(e.to_string()),
-    };
+                    path.display()
+                ));
+            }
+            Err(e) => return Err(e.to_string()),
+        };
     // Test-only: arm the writer only now, so recovery and the first checkpoint
     // are unaffected and the fault falls on a later durable write.
     if let Some(faults) = save_faults {
@@ -5963,6 +5979,7 @@ fn setup_persistence_with_game_content(
         pipeline: Some(pipeline),
         journalled_through,
         checkpoints_published,
+        retained_transfer_ids,
         outbox_processor,
     })
 }
@@ -8446,6 +8463,123 @@ mod tests {
         assert_eq!(restored.sim.world().world_hash(), hash);
         drop(restored);
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn durable_bulk_suffix_seeds_first_split_reservation_after_restart() {
+        let db = scratch_db("bulk_transfer_restart");
+        let checkpoint_sim = Scene::BulkSplit.simulation();
+        let checkpoint = persist::capture(&checkpoint_sim, &persist_cfg(), 0).unwrap();
+        {
+            let mut writer = Writer::open(&db).unwrap();
+            writer.publish_checkpoint(&checkpoint).unwrap();
+        }
+
+        let mut live = Scene::BulkSplit.simulation();
+        for tick in 1..=40 {
+            if tick == 4 {
+                let half = BRUSH_UNIT / 2;
+                let brush = SphereBrush::new(
+                    BrushPoint::from_units(
+                        31 * BRUSH_UNIT + half,
+                        8 * BRUSH_UNIT + half,
+                        31 * BRUSH_UNIT + half,
+                    ),
+                    8 * BRUSH_UNIT,
+                )
+                .unwrap();
+                live.submit(EditIntent::cut(
+                    RequestId(1),
+                    EntityId::new(1).unwrap(),
+                    EditTarget::Terrain,
+                    brush,
+                ))
+                .unwrap();
+            }
+            let ids = (0..live.transfer_reservation_bound())
+                .map(|offset| {
+                    TransferId(spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT | (401 + offset as u64))
+                })
+                .collect();
+            live.tick_with_transfer_ids(ids).unwrap();
+        }
+        let entry = live
+            .journal()
+            .entries()
+            .first()
+            .expect("bulk split committed");
+        let retained_low = entry
+            .transaction
+            .ops
+            .iter()
+            .find_map(|op| op.bulk_transfer_id())
+            .expect("bulk marker carries transfer ID")
+            & ((1_u64 << 61) - 1);
+        assert_eq!(retained_low, 401);
+        let records = persist::journal_records(live.journal().entries()).unwrap();
+        assert!(matches!(
+            records[0].payload,
+            JournalPayload::TopologyBulkSplit { .. }
+        ));
+        Writer::open(&db).unwrap().append_journal(&records).unwrap();
+
+        let restored = setup_persistence(Some(&db), Scene::BulkSplit, &persist_cfg(), None)
+            .expect("SQLite checkpoint and durable bulk suffix restore");
+        assert_eq!(
+            restored.retained_transfer_ids,
+            vec![
+                TransferId(spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT | retained_low),
+                TransferId(spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT | retained_low),
+            ]
+        );
+        let mut late_join = LateJoin::new(16, 1, 0);
+        late_join
+            .seed_transfer_ids_from_recovery(&restored.sim, &restored.retained_transfer_ids)
+            .unwrap();
+        let next_split = late_join.reserve_id(TransferNamespace::Split).unwrap();
+        assert!(
+            next_split.0 & ((1_u64 << 61) - 1) > retained_low,
+            "the first reservation after recovery must exceed every retained suffix ID"
+        );
+
+        // A CRC-valid but namespace-invalid retained marker is rejected by the
+        // same allocator checks before the recovered world can be accepted.
+        let invalid_db = scratch_db("bulk_transfer_invalid_restart");
+        let mut invalid_writer = Writer::open(&invalid_db).unwrap();
+        invalid_writer.publish_checkpoint(&checkpoint).unwrap();
+        let mut invalid_transaction = entry.transaction.clone();
+        for op in &mut invalid_transaction.ops {
+            match op {
+                spall_protocol::TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
+                | spall_protocol::TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => {
+                    *transfer_id = 0;
+                }
+                _ => {}
+            }
+        }
+        let invalid_record = JournalRecord {
+            seq: entry.seq.0,
+            tick: entry.transaction.server_tick.get(),
+            payload: JournalPayload::topology_bulk_split(
+                &invalid_transaction,
+                &entry.participants,
+                entry.bulk_baseline.as_ref().unwrap(),
+            )
+            .unwrap(),
+        };
+        invalid_writer.append_journal(&[invalid_record]).unwrap();
+        drop(invalid_writer);
+        let error =
+            match setup_persistence(Some(&invalid_db), Scene::BulkSplit, &persist_cfg(), None) {
+                Ok(_) => panic!("invalid retained ID must fail setup"),
+                Err(error) => error,
+            };
+        assert!(error.contains("recovered transfer ID is invalid"));
+        assert_eq!(checkpoint_row_count(&invalid_db), 1);
+
+        drop(restored);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+        let _ = std::fs::remove_dir_all(invalid_db.parent().unwrap());
     }
 
     #[test]

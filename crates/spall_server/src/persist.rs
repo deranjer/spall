@@ -20,7 +20,7 @@ use spall_core::{
     Revision, Tick, VolumeId,
 };
 use spall_physics::PhysicsConfig;
-use spall_protocol::{TopologyOp, content_manifest_hash};
+use spall_protocol::{TopologyOp, TransferId, content_manifest_hash};
 use spall_sim::{
     Body, BodyPose, JournalEntry, RestoredBody, SimWorld, Simulation, WorldSetup, solid_cells,
 };
@@ -41,6 +41,34 @@ pub const STRUCTURE_GRAPH_VERSION: u32 = 1;
 /// [`PersistError::AlgorithmVersionMismatch`]: its recorded hashes use the old layout and cannot
 /// be verified, and the engine does not carry the old algorithm to migrate them.
 pub const TOPOLOGY_HASH_VERSION: u32 = 2;
+
+/// Transfer IDs still named by every topology transaction in the durable
+/// recovery suffix. Capture these before the suffix is replayed into a fresh
+/// in-memory journal; that journal is not a substitute for durable history.
+pub fn retained_transfer_ids(recovery: &Recovery) -> Result<Vec<TransferId>, PersistError> {
+    let mut retained = Vec::new();
+    for record in &recovery.journal {
+        let transaction = match &record.payload {
+            JournalPayload::Topology { .. } => record
+                .payload
+                .as_topology()
+                .expect("payload is Topology")
+                .map(|(transaction, _)| transaction)?,
+            JournalPayload::TopologyBulkSplit { .. } => record
+                .payload
+                .as_topology_bulk_split()
+                .expect("payload is TopologyBulkSplit")
+                .map(|(transaction, _, _)| transaction)?,
+            _ => continue,
+        };
+        for op in &transaction.ops {
+            if let Some(id) = op.bulk_transfer_id() {
+                retained.push(TransferId(id));
+            }
+        }
+    }
+    Ok(retained)
+}
 
 /// Identity a world save is stamped with. `anchor` and `physics` are redeployment
 /// config, re-supplied on restart exactly like `spall_sim::WorldSetup` treats
