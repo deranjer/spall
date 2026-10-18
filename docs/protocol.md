@@ -762,3 +762,15 @@ frozen part poses alone cannot reproduce an animated limb's immediate checked
 death transfer. The physics reconstruction prerequisite carries those measured
 values explicitly; the existing serialized owner/motion schemas still require
 an explicit replacement before complete animal checkpointing is enabled.
+
+Whole-owner corpse physics capture now returns the existing runtime
+`DynamicCorpseRestore` DTO. The owning thread supplies canonical original source
+bindings and frozen hierarchy-local transforms; physics validates their complete,
+disjoint cell coverage against every live component and captures real component
+poses/twists. Its expected owner/source/topology/portable-pose/serial fence must
+match, and pending frames refuse. The primary physical component remains element
+zero, followed by stable component ordering. A caller-supplied key for an intact
+checked-death owner is checked without binding or mutating the owner index.
+This runtime DTO is not a complete serialized ownership snapshot: original sparse
+volumes/material catalogs, authored transforms and allocator state still require
+Simulation capture and explicitly versioned complete checkpoint/baseline schemas.

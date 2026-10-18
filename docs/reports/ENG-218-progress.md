@@ -636,3 +636,112 @@ Simulation checkpoint/baseline capture/restore and typed ordered transaction
 consumers. The current single-component fracture-planning snapshot is not a
 portable full-owner export. Combined 1024 m weather/animals, GPU, population and
 multiplayer animal restart/destruction acceptance remain unrun; spawning is closed.
+
+## Whole-owner corpse capture plan (2026-10-18)
+
+The next physics prerequisite is a bounded read-only capture returning the
+existing `DynamicCorpseRestore` value, not the single-component fracture-planning
+snapshot. The caller supplies canonical original source grids, IDs, revisions,
+parents and current frozen hierarchy-local transforms through `SourcePart`.
+Authored/rest transforms and sparse volume metadata remain separately owned by
+Simulation; they must not be inferred from fractured shard grids. No second
+frozen-pose array or competing restore layout is needed.
+
+Capture must validate an expected owner key, source generation and portable
+topology/pose tokens, reject pending frames, enumerate actual component IDs from
+existing physics shard records, and prove that their exact source-cell masks
+are disjoint and cover the supplied current source solids. Canonical source IDs
+must match even for empty bindings. Every live component contributes its real
+body pose/twist, and the actual serial high-water survives retired serial gaps
+and a single remaining derived component. Global physics step is never a
+substitute for pose epoch; zero tokens that the current restore DTO cannot
+accept must reject rather than being synthesized.
+
+For intact checked-death owners whose physics key has not yet been bound by
+fracture/restore, stable identity is supplied by the owning caller, subject to
+existing owner-index collision checks. A read may not bind or mutate that index.
+An already bound key must match exactly. Original/shard/output work must be
+bounded before map allocation and grid cloning, and material/pose/provenance
+mismatches must refuse without mutation.
+
+Planned acceptance: intact and multiple-component capture/restore, original
+empty binding retention, one surviving derived component with a retired serial
+gap, exact query/mass/motion and hierarchy, and atomic refusal of stale tokens,
+wrong sources/materials/poses, incomplete partitions and excessive work. This
+is not serialized checkpoint or full-owner Simulation export acceptance.
+
+The runtime restore DTO selects its primary physical component from element
+zero. Capture must preserve the actual primary body's component first, then
+use stable ordering for the remainder; blindly sorting every component by serial
+can change the reported owner root after a later fracture replaced its primary.
+Portable wire canonical ordering is a separate future contract. Source and shard
+budgets must each retain existing supported limits, with explicit cumulative
+scan/output accounting rather than halving the accepted workload by counting
+the two representations against one source-only ceiling.
+
+Review found an existing limit mismatch: living/intact articulated geometry
+accepts 4,000,000 dense cells, while cold corpse restore had reused the fracture
+planner's 1,000,000-cell ceiling for derived grids. Applying that lower bound to
+capture would refuse already-supported intact owners. The approved correction
+aligns capture and cold-restore derived storage with the existing 4,000,000-cell
+articulated owner ceiling, retaining the 16 Mi-cell batch bound and all solid,
+primitive and geometry limits. Fracture planning keeps its separate 1,000,000-cell
+work limit. A sparse greater-than-one-million-cell roundtrip must prove this
+boundary; no performance or fracture-feasibility acceptance follows from it.
+
+## Whole-owner corpse capture accepted (2026-10-18)
+
+Integrated physics implementation `c3fb333` (worker `d239ce6`) adds
+`PhysicsWorld::capture_dynamic_corpse_owner` and `DynamicCorpseOwnerFence`.
+The read-only capture returns the existing owned restore DTO after validating
+canonical source identity/hierarchy/frozen transforms, bounded source and shard
+work, exact complete disjoint material/cell/revision provenance, pending-frame
+absence, owner/source/topology/portable-pose fences and serial high-water.
+It captures each actual body's pose/twist and keeps the actual primary first.
+Caller keys for intact checked-death owners are checked without binding the index;
+no registry-wide population scan, world clone or second actor ledger was added.
+
+Review corrected composed packed-origin pose-range parity with cold restore,
+primary selection after fracture, and source/shard budget accounting. Cold restore
+now admits the existing articulated 4,000,000-dense-cell storage ceiling; fracture
+planning remains at its existing 1,000,000-cell work ceiling. The sparse regression
+has more than one million dense cells and only two solids, so it is a storage
+compatibility check, not animal population or fracture performance evidence.
+
+Coordinator public-API coverage in
+`crates/spall_physics/tests/corpse_owner_capture.rs` adds two independent scenarios:
+actual fracture of primary serial 5 into 6/7 while older serial 2 survives,
+followed by capture/restore with exact per-component mass/pose/twist and hit-cell
+checks; and a negative-coordinate air-padded source whose packed solid remains
+correctly positioned. Original empty source binding and parent, pose epoch 17 at
+physics step 0, and serial high-water 8 survive the fracture roundtrip.
+
+Measured coordinator checks (all through `.local/eng218-cargo.ps1`):
+- `cargo test -p spall_physics --test corpse_owner_capture`: 2 passed.
+- `cargo test -p spall_physics -p spall_sim`: 420 passed, 0 failed,
+  10 ignored across 48 test-result targets.
+- `cargo check --workspace --all-targets --all-features`: passed.
+
+The initial strict lint attempt found an unevenly grouped hexadecimal constant
+in the new public test. Its spelling was corrected without changing its value;
+final lint/format/diff results are recorded below. Existing incremental-cache
+hard-link warnings are environmental; no runtime dependency or format changed.
+Logs are `.local/eng218-owner-capture-{public-tests,full-tests,workspace,clippy,
+clippy-retry,format}.log`.
+
+Changed implementation files: `crates/spall_physics/src/{articulated,lib,world}.rs`;
+coordinator test above; `docs/{protocol,validation,tasks}.md` and
+`docs/reports/ENG-218-{design,progress}.md` clarify the accepted boundary.
+Next unblocked work remains ENG-218: complete Simulation source/owner capture,
+explicitly versioned independent Alive part motion and bounded ownership/allocator
+snapshot, atomic checkpoint/baseline restore, and typed ordered journal/replica
+consumers. This physics API cannot reconstruct original sparse metadata or authored
+rest poses from shards. Wire 9, baseline 1 and store 3 remain unchanged; checkpoint
+refusal remains in place and production spawning remains closed. Combined 1024 m
+weather/animals, GPU, population and multiplayer animal restart/destruction gates
+remain unrun.
+
+Final coordinator checks: strict seven-package all-target Clippy retry passed
+(cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store
+-p spall_server -p spall_client -p sandbox --all-targets -- -D warnings);
+cargo fmt --all -- --check and git diff --check passed.

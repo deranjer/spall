@@ -19,6 +19,14 @@ serialized layout. It remains one ownership candidate and the same ordered
 transaction/journal sequence; no independent actor motion ledger or save stream.
 The runtime physics DTO does not itself implement that serialized contract.
 
+The motion-layout review must distinguish live part bodies from corpse source
+parts: after fracture, one original part can contribute cells to several moving
+components, so a single velocity on that original source part is not a complete
+corpse motion model. Existing component masks and twists remain authoritative
+for corpses. Independently sampled per-part body twists are required for Alive
+owners and must participate in full/motion hashes without changing topology-only
+fences. Preserve this distinction when versioning the existing owner contract.
+
 **Status:** coordinator-reviewed direction. Replay evidence, exact cold restore and common physics/geometry preparation prerequisites are integrated; the real combined ordered lifecycle consumer below remains pending implementation and acceptance. Production species spawning remains disabled until the complete consumer/recovery slice is accepted.
 
 ## Decision: make lifecycle a real ordered topology operation

@@ -1714,3 +1714,16 @@ paths must refuse an initialized actor host, even when no records remain, while
 retaining allocator/epoch and authoritative state. Complete actor checkpoint and
 baseline capture/restore, full-owner corpse export and versioned part-motion
 serialization remain required before production spawning or combined 1 km gates.
+
+Whole-owner runtime corpse capture is exercised by
+`cargo test -p spall_physics --test corpse_owner_capture` and the physics library
+`whole_owner_capture` / `sparse_large_intact_owner` cases. The public scenario
+actually fractures the primary component, retains an older non-primary serial,
+and roundtrips every component's pose, twist, mass and exact source-cell queries.
+It must preserve empty source bindings, hierarchy, portable pose epoch and serial
+high-water. Negative-coordinate air padding must not shift or wrongly reject a
+valid packed component; out-of-range composed transforms still refuse. The sparse
+fixture above one million dense cells proves existing 4,000,000-dense-cell storage
+support, not a raised fracture planner limit or a population performance result.
+Complete Simulation exports and serialized checkpoint/baseline recovery remain
+unaccepted; production animal spawning and combined 1024 m gates remain closed.
