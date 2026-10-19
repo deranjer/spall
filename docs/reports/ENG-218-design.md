@@ -297,3 +297,31 @@ hashes change with counter alone, motion does not; u64::MAX exhaustion remains
 explicit without reuse/mutation. Existing live actor checkpoint refusal and spawn
 closure remain. Next ENG-218 is joint prepared host/source/physics/registry restore,
 then complete checkpoint/baseline and ordered consumers.
+
+
+### Joint cold actor restore plan (2026-10-18)
+
+Install complete CreatureSnapshotV2 only after geometry recovery, into a
+Simulation with no initialized host and all five creature indexes empty. Require
+an explicit expected WorldId and exact agreement with the saved shared volume
+counter; preserve every registry counter and the journal cursor. Reject source
+IDs already occupied by ordinary geometry before preparation and again at commit.
+Capture the existing geometry/physics/world/origin/journal fence and bounded
+catalog fingerprint. Refuse stale, foreign, initialized-even-empty targets.
+
+Reconstruct saved sparse source volumes and revision counters, preflight the
+complete population's existing per-owner and batch grid/solid ceilings before
+allocating occupancy grids or component cell vectors, and reuse physics
+AliveRestore/ColdRestore preparation. Preserve applied local poses, measured
+part motion, logical pose epoch, owner/source IDs, component serial gaps and the
+explicit primary component (primary-first only in the runtime restore DTO).
+Retain empty source bindings as empty physical grids. Build the complete saved
+allocator host and detached source/provenance/frozen-pose maps before publication;
+preallocate owner-handle slots, fill those slots from physics outcomes, and swap
+the complete store into the fresh target. No IDs, registry rewrites or journal
+entries are produced. Validate every participant before the first mutation and
+publish immediately on the same owning thread with no later fallible checks.
+Empty populations use the same fences but no physics batch. Test whole snapshot
+roundtrips, serial/empty/counter retention, stale/foreign/collision/catalog/budget
+refusal and no partial publication. Complete checkpoint/baseline sections and
+ordered consumers remain subsequent ENG-218 work; spawning remains closed.

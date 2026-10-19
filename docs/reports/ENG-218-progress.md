@@ -1230,3 +1230,112 @@ Other final checks passed:
   real bulk-producer requirement and is not a shipped species/population cost.
 Logs `.local/eng218-source-counter-{client,workspace,clippy,format,measurements}.log`.
 All Cargo commands used the established target-pinned wrapper and ran serially.
+
+
+## 2026-10-18 joint cold Simulation restoration
+
+Implemented the next ENG-218 prerequisite in `spall_sim`: public opaque
+`prepare_creature_restore` / `commit_prepared_creature_restore`, restoring the
+existing complete CreatureSnapshotV2 after geometry recovery. This is a cold
+installer, not a checkpoint/baseline/replay consumer. It requires an uninitialized
+host and all five source indexes empty, explicit expected WorldId, exact geometry
+next-volume counter and disjoint geometry/source IDs. The existing geometry
+commit fence binds world identity, physics step/slots/body state, terrain revision,
+topology, origin, every registry counter and journal cursor. Commit repeats the
+source namespace and bounded catalog fingerprint checks before physics validation.
+
+The complete source population is reconstructed with saved IDs, sparse original
+bricks/bounds/cell size/revisions/edited flags and next revision counters. Physical
+source spans/solids are admitted for the entire population before grids or mask
+cell vectors are allocated, under the existing 4M owner / 16Mi batch dense-cell,
+1M owner / 4M batch solid and 1024-owner ceilings. Original empty sources remain
+empty bindings. Saved world positions must roundtrip exactly through the recovered
+physics frame; no silent authoritative position rounding is accepted.
+
+Living owners restore applied local poses, independent measured part twists,
+root motion, stable owner key, source generation, topology and logical pose epoch.
+Corpse components restore independent masks/poses/twists, generation and serial
+high-water, including primary41/older7/high-water100. Only the runtime DTO is
+primary-first; portable components remain serial sorted. The complete CreatureHost
+uses the saved allocator and copies existing stable records below its high-water,
+without allocating IDs or deriving replacement counters.
+
+All source/provenance/reverse-owner/frozen-pose maps and physics-owner slots are
+staged before publication. After every participant passes validation, physics
+publishes, existing owner-handle slots are filled, the complete source store is
+swapped and the complete host is installed, with no later Result path or source/
+host map-node allocation. No shared counter changes or journal append. Empty
+snapshots use the same fences and retain retired allocator epoch/high-water with
+no physics batch; initialized empty targets refuse replacement.
+
+Read-only review found no concrete blocker, including a separate follow-up of
+exact origin conversion. Tags remain strictly 1..N in the same order as staged
+keys; runtime physics handles remain unpublished/private and are never serialized.
+
+Focused final check through the target-pinned wrapper:
+`cargo test -p spall_sim --lib creature -- --nocapture`: initial corrected run47
+passed; final strengthened run48 passed, 0 failed.
+It includes codec -> complete joint restore -> recapture equality/hash for mixed
+Alive/Corpse, actual three-part animation and checked Death, fragmented cold
+fixture with nonlowest primary/empty child and serial gaps, empty allocator,
+and subsequent logical pose-token admission. The fragmented Simulation fixture
+starts from ColdRestore; actual fracture remains separately covered by physics.
+Refusal cases: stale step, different Simulation, changed registry/terrain/catalog,
+initialized host, wrong world, geometry source collision, huge sparse source span,
+invalid second physical owner and occupied physical owner key. Existing physical
+motion and source/host emptiness, counters and journal remain unchanged on refusal.
+Alternate exact origins roundtrip; changed origins invalidate prepared candidates
+and lossy origins refuse during prepare. Final strengthening also roundtrips actual
+retired revision gaps and u64::MAX through the joint installed store, and refuses
+oversized unused catalog entries/clip names on the empty-population path.
+
+Initial compile attempts corrected an Option-to-Result conversion and test-only
+terrain access/BodyState comparisons. One initial focused run had 46 passes and
+one failure because its new test expected an existing physical owner-key conflict
+to survive prepare and fail at commit; physics already rejects it earlier. The
+assertion now requires that stronger refusal and unchanged state. No gate, workload,
+TLS/crash condition or size limit changed. Retained initial result log:
+`.local/eng218-joint-restore-animals-attempt1.log`; final focused log:
+`.local/eng218-joint-restore-animals.log` and strengthened final
+`.local/eng218-joint-restore-animals-final.log`.
+
+Changed implementation/test files: simulation src/{creature_restore,
+creature_restore_tests,creatures,world,sim,lib,creature_capture,
+creature_capture_tests,creature_owner_bridge}.rs, plus the source reconstruction
+module's now-current joint-installer comment. Updated architecture/protocol/
+validation/tasks and this progress/design evidence. No wire12, baseline1, store3,
+dependency, species or renderer layout change. Unrelated artifacts/ preserved.
+
+Next unblocked task ID remains ENG-218: complete actor checkpoint/baseline
+sections with explicit format versions, atomic durable recovery and typed ordered
+journal/attachment/replica consumers, then bulk production and source-edit/fracture/
+terminal synchronization. Production spawning and initialized-host geometry-only
+checkpoint refusal remain. Combined1024m weather/animals, shipped population/GPU
+and multiplayer animal restart/destruction acceptance remain unrun and gated.
+
+
+Wider measured checks (all Cargo commands via `.local/eng218-cargo.ps1`, serialized):
+- `cargo test -p spall_voxel -p spall_physics -p spall_protocol -p spall_sim -p spall_store -p spall_server`:
+  916 passed, 0 failed, 14 existing ignored across89 result targets. Actual local
+  multiplayer/restart and abrupt-crash suites retained their existing workloads.
+  Log `.local/eng218-joint-restore-full.log`. This run preceded the final test-only
+  revision-gap/MAX assertions and unused-catalog case; final focused48 and full
+  simulation recheck below cover those additions. No implementation changed after
+  this full suite other than formatting and a module comment.
+- `cargo check --workspace --all-targets --all-features`: passed; log
+  `.local/eng218-joint-restore-workspace.log`.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`:
+  passed; log `.local/eng218-joint-restore-clippy.log`.
+Existing incremental-cache hard-link warnings remain environmental. Complete
+animal checkpoint crash cuts and two-client animal installation/recovery remain
+separate unrun gates; current geometry-only recovery tests do not establish them.
+
+- Final `cargo test -p spall_sim`: 273 passed, 0 failed, 9 existing ignored
+  across31 result targets, including the final test-only strengthening; log
+  `.local/eng218-joint-restore-sim-final.log`.
+
+- `cargo test -p spall_client --lib lifecycle_rejection_review`: 2 passed,
+  0 failed; closed replica/recovery consumers still refuse actor-bearing input
+  before geometry, clocks or queues mutate. Log `.local/eng218-joint-restore-client.log`.
+- `cargo fmt --all -- --check` and `git diff --check`: passed; format log
+  `.local/eng218-joint-restore-format.log`. No GPU or launch process was started.

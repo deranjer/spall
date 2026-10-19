@@ -1,4 +1,4 @@
-//! Pure source reconstruction for the later joint Simulation restore candidate.
+//! Pure source reconstruction shared by the joint Simulation restore candidate.
 //! Returned volumes retain saved IDs and counters; nothing is installed here.
 use spall_core::{BrickCoord, CellSizeCode, CreatureKey, MaterialId, Revision};
 use spall_protocol::{

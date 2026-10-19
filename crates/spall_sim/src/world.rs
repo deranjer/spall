@@ -318,12 +318,48 @@ pub struct SimWorld {
 }
 
 #[derive(Default)]
-struct CreatureSourceStore {
+pub(crate) struct CreatureSourceStore {
     owners: BTreeMap<CreatureKey, BTreeMap<u32, Volume>>,
     metadata: BTreeMap<CreatureKey, BTreeMap<u32, CreatureSourceMetadata>>,
     volume_owner: BTreeMap<VolumeId, (CreatureKey, u32)>,
-    physics_owner: BTreeMap<CreatureKey, spall_physics::ArticulatedBodyId>,
+    // None exists only in an unpublished restore candidate. Published stores
+    // have every slot filled, without allocating map nodes after physics commit.
+    physics_owner: BTreeMap<CreatureKey, Option<spall_physics::ArticulatedBodyId>>,
     frozen_poses: BTreeMap<CreatureKey, Vec<(u32, spall_physics::PartTransform)>>,
+}
+
+impl CreatureSourceStore {
+    pub(crate) fn stage_owner(
+        &mut self,
+        key: CreatureKey,
+        parts: Vec<(u32, Volume, CreatureSourceMetadata)>,
+        frozen: Option<Vec<(u32, spall_physics::PartTransform)>>,
+    ) {
+        let mut volumes = BTreeMap::new();
+        let mut metadata = BTreeMap::new();
+        for (part_id, volume, provenance) in parts {
+            self.volume_owner.insert(volume.id(), (key, part_id));
+            volumes.insert(part_id, volume);
+            metadata.insert(part_id, provenance);
+        }
+        self.owners.insert(key, volumes);
+        self.metadata.insert(key, metadata);
+        self.physics_owner.insert(key, None);
+        if let Some(poses) = frozen {
+            self.frozen_poses.insert(key, poses);
+        }
+    }
+
+    pub(crate) fn bind_owner(&mut self, key: CreatureKey, id: spall_physics::ArticulatedBodyId) {
+        *self
+            .physics_owner
+            .get_mut(&key)
+            .expect("prepared restore owner slot") = Some(id);
+    }
+
+    pub(crate) fn volume_ids(&self) -> impl Iterator<Item = VolumeId> + '_ {
+        self.volume_owner.keys().copied()
+    }
 }
 
 /// Immutable source provenance and authored hierarchy needed to reconstruct a
@@ -1411,6 +1447,10 @@ impl SimWorld {
         ]
     }
 
+    pub(crate) fn publish_restored_creature_sources(&mut self, sources: CreatureSourceStore) {
+        self.creature_sources = sources;
+    }
+
     pub(crate) fn creature_source_part_counts(&self, key: CreatureKey) -> Option<(usize, usize)> {
         Some((
             self.creature_sources.owners.get(&key)?.len(),
@@ -1448,14 +1488,18 @@ impl SimWorld {
         owner: spall_physics::ArticulatedBodyId,
     ) {
         debug_assert!(self.creature_sources.owners.contains_key(&key));
-        self.creature_sources.physics_owner.insert(key, owner);
+        self.creature_sources.physics_owner.insert(key, Some(owner));
     }
 
     pub(crate) fn creature_physics_owner(
         &self,
         key: CreatureKey,
     ) -> Option<spall_physics::ArticulatedBodyId> {
-        self.creature_sources.physics_owner.get(&key).copied()
+        self.creature_sources
+            .physics_owner
+            .get(&key)
+            .copied()
+            .flatten()
     }
 
     pub(crate) fn set_creature_frozen_poses(

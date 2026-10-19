@@ -877,7 +877,7 @@ interest-filtered transactions, or distant visual LOD. Those require separate me
 Animal source volumes have separate ownership from terrain and ordinary bodies.
 Lifecycle changes belong in the existing ordered topology transaction and journal,
 sharing the world ID allocators and transaction replay receipt. The accepted
-protocol/wire-9 inline operation and typed bulk marker are framing boundaries: current client and
+current protocol/wire-12 inline operation and typed bulk marker are framing boundaries: current client and
 geometry-only replay consumers reject actor-bearing transactions before mutation.
 An internal authoritative prepare/validate/publish path now supports inline birth,
 checked death and mixed geometry without publishing a partial candidate. It is
@@ -891,3 +891,13 @@ Only current protocol and save layouts are supported. Old journal headers are
 never rewritten; older DTO layouts and incomplete current store schemas are
 rejected without migration or backfill. Recovery from a complete valid checkpoint
 after corruption remains part of the durability contract.
+
+
+ENG-218 now exposes an opaque joint cold-restore candidate after geometry recovery.
+It stages saved-ID host/source/provenance/frozen-pose state and one bounded physics
+batch, fences the existing shared registry and geometry namespace, and publishes
+all participants together without new IDs or journal entries. It requires an
+uninitialized host and all source indexes empty; initialized empty hosts cannot
+be replaced. Existing geometry/physics/journal/origin fences invalidate stale or
+foreign candidates. Complete actor checkpoint/baseline and ordered journal/replica
+consumers remain the next integration work; production spawning stays disabled.

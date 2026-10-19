@@ -366,6 +366,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     before.validate(&catalog).unwrap();
     assert_eq!(before.part_velocities.len(), 3);
     let captured = sim.capture_creature_snapshot(&catalog).unwrap().unwrap();
+    crate::sim::creature_restore::assert_joint_roundtrip(&captured, &catalog);
     assert_eq!(
         captured.owners.records[0].part_velocities,
         before.part_velocities
@@ -400,6 +401,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     let after = record_from_sim(&sim, corpse);
     after.validate(&catalog).unwrap();
     let captured = sim.capture_creature_snapshot(&catalog).unwrap().unwrap();
+    crate::sim::creature_restore::assert_joint_roundtrip(&captured, &catalog);
     assert_eq!(captured.owners.records[0].state, after.state);
     assert_eq!(captured.owners.records[0].parts, after.parts);
     assert!(captured.owners.records[0].part_velocities.is_empty());

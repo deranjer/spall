@@ -1813,3 +1813,30 @@ aliases/defaults/migration. Run full voxel/physics/protocol/sim/store/server tes
 client lifecycle refusal, workspace all-target/all-feature check and strict lint.
 These remain CPU/local-transport results; no combined 1 km, GPU, shipped species
 population or multiplayer animal crash/destruction acceptance follows from them.
+
+
+Joint cold Simulation restore (2026-10-18):
+`cargo test -p spall_sim --lib creature` covers snapshot codec -> prepared joint
+installation -> complete recapture equality/hash, retaining mixed Alive/Corpse
+owners, measured multi-part animation, exact source counters, empty source parts,
+nonlowest primary component and retired serial/allocator gaps. The multi-component
+fixture starts from an existing cold-restored corpse; physics's actual fracture
+scenario remains a separate full-suite test. Empty snapshots retain allocator
+epoch/high-water and refuse initialized-empty replacement. Restore consumes no
+shared IDs and appends no journal entry.
+
+Refusal coverage includes stale physics step, foreign Simulation, registry change,
+terrain source change, initialized host, changed catalog, wrong WorldId, geometry
+source-ID collision, overly wide sparse source span, invalid second physical owner,
+and an occupied physical owner key. Refusal retains host/source emptiness, existing
+body count/motion, registry counters and journal cursor. Nonzero local frames
+roundtrip authoritative world positions; changed frames invalidate candidates and
+frames that would round saved positions refuse. Full simulation/physics/protocol/
+voxel/store/server regression, workspace all-target/all-feature check, strict lint
+and format checks remain required. These tests establish a cold installer, not
+actor checkpoint/baseline/replay, 1 km weather/animals, GPU, shipped population or
+multiplayer animal restart/destruction acceptance.
+
+The final joint-restore strengthening also requires installed-store roundtrip of
+actual retired source revision gaps and u64::MAX exhaustion, plus bounded unused
+catalog entries/clip names before fingerprinting on empty-population restoration.

@@ -6,7 +6,7 @@ use spall_physics::{
 };
 use spall_voxel::{Brick, EditPlan};
 
-fn born() -> (
+pub(crate) fn born() -> (
     Simulation,
     FixtureCatalog,
     CreatureStateV1,
@@ -551,6 +551,7 @@ fn complete_corpse_capture_retains_nonlowest_primary_empty_source_and_serial_gap
             .unwrap(),
         empty_next
     );
+    crate::sim::creature_restore::assert_joint_roundtrip(&captured, &catalog);
     assert_eq!(record.parts[1].parent_id, Some(1));
     assert_eq!(
         CreatureSnapshotV2::decode(&postcard::to_stdvec(&captured).unwrap(), &catalog).unwrap(),
@@ -602,6 +603,16 @@ fn source_revision_gaps_roundtrip_and_the_next_edit_never_reuses_a_revision() {
         .capture_creature_snapshot(&fixture.view())
         .unwrap()
         .unwrap();
+    let installed =
+        crate::sim::creature_restore::assert_joint_roundtrip(&captured, &fixture.view());
+    assert_eq!(
+        installed
+            .world
+            .creature_source_part(state.key, 1)
+            .unwrap()
+            .next_revision(),
+        next
+    );
     assert_eq!(
         captured.owners.records[0].parts[0].next_brick_revision,
         next.get()
@@ -678,6 +689,15 @@ fn exhausted_source_counter_reconstructs_without_reuse_and_invalid_candidates_do
     let decoded =
         CreatureSnapshotV2::decode(&postcard::to_stdvec(&snapshot).unwrap(), &fixture.view())
             .unwrap();
+    let installed = crate::sim::creature_restore::assert_joint_roundtrip(&decoded, &fixture.view());
+    assert_eq!(
+        installed
+            .world
+            .creature_source_part(state.key, 1)
+            .unwrap()
+            .next_revision(),
+        Revision(u64::MAX)
+    );
     let mut restored = crate::reconstruct_creature_sources(&decoded, &fixture.view()).unwrap();
     let volume = &mut restored[0].parts[0].1;
     let stamp = volume.state_stamp();

@@ -881,5 +881,36 @@ bricks/revisions/edited flags/cell size/bounds, then resumes each counter exactl
 never derives a replacement from resident maxima. The u64::MAX counter is retained
 as exhausted; subsequent edits must refuse rather than reuse a revision. This
 source adapter neither installs ownership/physics nor advances any world IDs.
-Joint prepared Simulation restoration, checkpoint/baseline and ordered runtime
-consumers remain prerequisites for animal saving, spawning and 1 km acceptance.
+Joint prepared Simulation restoration is available as described below. Complete
+checkpoint/baseline sections and ordered runtime consumers remain prerequisites
+for animal saving, spawning and 1 km acceptance.
+
+
+Joint cold animal installation (ENG-218, 2026-10-18) uses the current snapshotV2
+without changing wire12/baseline1/store3 layouts. After geometry recovery,
+`Simulation::prepare_creature_restore(expected_world, snapshot, catalog)` requires
+an uninitialized host, all five source indexes empty, exact expected WorldId and
+shared next-volume counter, and disjoint geometry/source IDs. It reconstructs the
+original volumes and their actual revision counters, admits the complete physical
+grid/mask work under existing per-owner/population ceilings, and prepares one
+AliveRestore/ColdRestore batch plus a detached host and source store. Saved world
+positions must roundtrip through the recovered physics origin exactly; otherwise
+installation refuses instead of changing authoritative positions.
+
+Applied local poses and measured Alive part velocities are retained. Corpse
+components keep masks, independent motion, source generation, serial high-water
+and named primary; portable serial order is converted to primary-first runtime
+order only during reconstruction. The host keeps the existing saved creature
+allocator and record IDs without consuming IDs. Empty populations install their
+saved allocator with no physical operations.
+
+`commit_prepared_creature_restore` revalidates world identity, geometry/physics
+fences, origin, registry counters, journal cursor, bounded catalog fingerprint,
+empty target indexes and geometry namespace, then validates physics before any
+publication. It publishes physics, fills preallocated owner-handle slots, swaps
+the complete source store and installs the complete host. No fallible checks or
+source/host map allocations follow physics publication. It changes neither shared
+registry counters nor journal entries. A stale/foreign/invalid candidate leaves
+all participants unchanged. The API never replaces even an initialized empty
+host. This does not enable actor checkpoints, baseline consumers or live spawning;
+the existing incomplete-format guard remains until their own atomic integration.

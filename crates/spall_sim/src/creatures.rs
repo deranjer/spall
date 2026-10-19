@@ -151,6 +151,23 @@ impl CreatureHost {
         })
     }
 
+    /// Rebuilds saved stable IDs below the saved high-water without allocating.
+    pub(crate) fn from_ownership_snapshot(
+        snapshot: &spall_protocol::CreatureSnapshotV2,
+        catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+    ) -> Result<Self, spall_protocol::CreatureOwnershipError> {
+        snapshot.validate(catalog)?;
+        let mut host = Self::from_allocator_snapshot(snapshot.allocator)
+            .map_err(|_| spall_protocol::CreatureOwnershipError::Allocator)?;
+        host.records = snapshot
+            .owners
+            .records
+            .iter()
+            .map(|record| (record.state.key.creature_id, record.state.clone()))
+            .collect();
+        Ok(host)
+    }
+
     pub(crate) fn allocator_snapshot(&self) -> CreatureAllocatorSnapshotV1 {
         self.allocator.snapshot()
     }

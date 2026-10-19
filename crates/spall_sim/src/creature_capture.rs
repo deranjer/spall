@@ -626,4 +626,4 @@ fn corpse_masks(
 
 #[cfg(test)]
 #[path = "creature_capture_tests.rs"]
-mod tests;
+pub(super) mod tests;

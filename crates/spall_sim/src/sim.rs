@@ -468,6 +468,10 @@ mod creature_owner_bridge;
 mod creature_capture;
 pub use creature_capture::CreatureCaptureError;
 
+#[path = "creature_restore.rs"]
+mod creature_restore;
+pub use creature_restore::{CreatureRestoreError, PreparedCreatureRestore};
+
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a
 /// band a wire `RequestId` never reaches — a client action claiming a value at
