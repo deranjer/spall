@@ -1494,3 +1494,64 @@ workload or size gate was relaxed. No 1km/GPU/population or live animal consumer
 acceptance follows. Next remains ENG-218 live catalog/residency checkpoint handoff,
 typed ordered actor journal/attachment and baseline/replica consumers, then bulk
 and source-edit/fracture/terminal synchronization.
+
+
+2026-10-19 ENG-218 streamed checkpoint catalog participant
+---------------------------------------------------------
+ResidencyPass::capture_checkpoint_with_catalog now reuses the existing complete
+logical terrain assembler (resident plus evicted), revision cache and exact
+backing digest validation, and supplies its terrain records to the existing
+catalog-validated animal/environment checkpoint builder. Both capture entrypoints
+check a runtime-only WorldInstanceToken before touching cache/backing. This wraps
+the existing SimWorld commit_identity Arc; no durable ID or ledger is introduced.
+Ordinary bodies with retained evicted bricks refuse rather than publish a partial
+body (the pass backs terrain only). New cache and cumulative counters publish
+only after the entire checkpoint succeeds. Full capture still requires resident
+geometry and catalog-free capture still refuses initialized animal hosts. No
+store4/wire12/baseline1 layout change or live serve/spawn activation.
+
+Changed source files: crates/spall_sim/src/world.rs and lib.rs;
+crates/spall_server/src/residency_pass.rs and persist.rs; existing
+tests/animal_checkpoint.rs includes new tests/support/animal_stream_checkpoint.rs
+so mixed/empty fixtures are reused rather than copied. Design, architecture,
+protocol, validation and tasks mirror this increment. Read-only integration review
+found no concrete issue in instance binding, body completeness or failure atomicity.
+
+Measured checks (all Cargo through .local/eng218-cargo.ps1, pinned workspace target):
+- cargo check -p spall_server --tests: passed before new streamed fixtures.
+- cargo test -p spall_server --test animal_checkpoint: final 19 passed, 0 failed.
+  Six new streamed cases include actual eviction and dirty backing miss; complete
+  SQLite publish/recovery/detached restore for mixed Alive/Corpse and initialized
+  empty allocator; unchanged live residency/source/registry/journal; zero-recapture
+  warm cache with unavailable backing; missing/wrong revision/wrong content cold
+  backing refusal and repair; catalog failure must not warm staged terrain cache;
+  same-ID/revision foreign world refusal and actual ordinary-body eviction refusal.
+  Terrain is directly edited then acknowledged via on_commit to isolate assembly;
+  existing residency tests cover scheduling. No live animal edit/replay claim.
+- cargo test -p spall_sim -p spall_server: 491 passed, 0 failed, 11 existing ignored
+  across 56 result targets. Same local process/crash/TLS/restart workloads retained;
+  executed with filesystem permission needed by those existing process tests.
+
+Initial new fixture compile failed on cells/edited accessor names, BodyPose ctor
+and an unused import; corrected to current APIs. First focused run 17 passed/2
+failed; diagnostic rerun 4 passed/2 failed isolated only the pre/post-eviction
+terrain collider revision (eviction intentionally rebuilds it, advancing by one).
+Comparison now explicitly requires that exact +1 transition and every other body
+field unchanged; animals, geometry, complete hash/environment remain exact. Final
+19-case run passes; no production behavior or workload/gate was weakened. Logs:
+.local/eng218-stream-focus.log, eng218-stream-tests.log; workspace/lint logs below.
+
+Remaining: live serve game-catalog handoff, typed ordered actor journal/attachment
+and baseline/replica consumers, bulk producer/scheduling and source-edit/fracture/
+terminal synchronization. Combined 1024m weather/animals, shipped species/population,
+GPU, two-client and real-process animal crash/destruction/restart remain unrun and
+unaccepted. These CPU checkpoint assembly tests do not establish those gates.
+Next unblocked task ID ENG-218; keep in_progress.
+
+Final integrated checks: cargo check --workspace --all-targets --all-features
+passed; cargo clippy -p spall_voxel -p spall_physics -p spall_protocol -p spall_sim
+-p spall_store -p spall_server -p spall_client --all-targets -- -D warnings passed.
+cargo fmt --all -- --check and git diff --check passed. Logs respectively
+.local/eng218-stream-workspace.log, eng218-stream-clippy.log and eng218-stream-fmt.log.
+Filesystem hard-link incremental-cache warnings are environmental copy fallback;
+no code lint failures. Unrelated untracked artifacts/ preserved.

@@ -114,7 +114,7 @@ pub use sim::{
 };
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit, warm_index_reuses};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
-pub use world::{RestoredBody, SimWorld, WorldError};
+pub use world::{RestoredBody, SimWorld, WorldError, WorldInstanceToken};
 pub use world::{
     WorldSetup, canonical_logical_volume_for, canonical_volume_for, solid_cells,
     volume_topology_hash_for,

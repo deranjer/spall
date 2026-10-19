@@ -763,3 +763,6 @@ fn full_actor_capture_refuses_logical_geometry_with_evicted_bricks() {
         before
     );
 }
+
+#[path = "support/animal_stream_checkpoint.rs"]
+mod streamed;

@@ -968,6 +968,11 @@ spawning and combined 1024m animal/weather launch acceptance remain gated.
 The catalog-aware full-capture adapter requires all logical geometry resident.
 It refuses world.has_evicted() before copying any terrain or actor payload, so a
 checkpoint never combines a complete logical hash with resident-only rows. The
-existing incremental ResidencyPass capture remains catalog-free and guarded;
-adding the same actor/catalog participant to its verified backing/cache path is
-a required next ENG-218 integration step before live 1km animal persistence.
+incremental ResidencyPass::capture_checkpoint_with_catalog supplies the complete
+logical terrain set from its existing verified backing/cache path to the same
+animal capture builder. Its runtime-only world-instance token prevents reuse
+across replacement worlds; no token is serialized. Missing/digest-mismatched
+backing, invalid catalog or incomplete ordinary bodies fail without publishing
+cache/counter changes. Catalog-free capture still refuses initialized hosts.
+Store4/wire12/baseline1 layouts are unchanged by this adapter. Live serve catalog
+handoff and typed animal consumers remain required before 1km acceptance.

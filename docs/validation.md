@@ -1881,3 +1881,21 @@ before output, retaining the complete actor snapshot. It may not publish a
 resident-only subset under that hash. Actor/catalog participation in the existing
 incremental ResidencyPass capture is next; live streamed-world persistence remains
 gated. The final full-server rerun includes this thirteenth checkpoint scenario.
+
+Streamed checkpoint participant (ENG-218, 2026-10-19):
+`cargo test -p spall_server --test animal_checkpoint` includes six additional
+streamed cases using the existing real mixed Alive/Corpse or initialized-empty
+fixture. Dirty canonical terrain is acknowledged through ResidencyPass::on_commit
+and evicted; catalog-aware incremental capture must exactly preserve animal
+sources/poses/motion/allocator, geometry, registry and journal cursor, without
+reloading live terrain. SQLite publish/recover plus detached catalog restore must
+retain complete state and composed hash. Pre/post-eviction geometry comparison
+accounts explicitly for the terrain collider revision advancing by one on eviction.
+These assembly tests directly edit the canonical volume; they do not establish
+live animal edit scheduling. Existing residency scenarios cover scheduled terrain
+edits. Warm cache must avoid backing reads even when backing is unavailable;
+cold missing/wrong revision/wrong content records must refuse, retain counters
+and permit repair/retry with fresh capture. A wrong catalog after terrain staging
+must not warm the cache. Same-ID/same-revision foreign worlds refuse both capture
+entrypoints; evicted ordinary bodies refuse. These are CPU checkpoint tests,
+not combined 1km, shipped population/GPU, two-client or real-process animal gates.

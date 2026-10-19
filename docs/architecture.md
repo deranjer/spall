@@ -918,6 +918,12 @@ after an initialized-host checkpoint. Live spawning/serve scheduling and baselin
 replica/attachment consumers remain closed; this is not 1km launch acceptance.
 
 The full catalog-aware checkpoint adapter refuses any evicted geometry before
-capture. Existing ResidencyPass checkpoint capture still requires an actor/catalog
-participant and remains guarded, so live animal persistence in a streamed world
-is not accepted from the fully resident checkpoint tests.
+capture. ResidencyPass::capture_checkpoint_with_catalog instead assembles complete
+logical terrain from its revision cache and digest-verified backing, then captures
+the same validated animal/environment section. Its cache is bound to the installed
+SimWorld runtime instance; another or replaced world refuses before cache/backing
+access. Cache and counters publish only after the complete checkpoint succeeds.
+Evicted ordinary bodies refuse because this pass reconstructs terrain only.
+The catalog-free entrypoint still refuses initialized hosts. Live serve catalog
+handoff and typed animal journal/baseline/replica consumers remain prerequisites;
+this checkpoint adapter alone is not live 1km animal persistence acceptance.

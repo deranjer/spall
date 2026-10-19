@@ -245,6 +245,17 @@ struct WarmStructure {
     pending_removal: Option<spall_voxel::EditOutcome>,
 }
 
+/// Runtime-only identity for caches tied to one installed world instance.
+/// Cloning retains identity; rebuilding or replacing a world creates a new one.
+#[derive(Clone)]
+pub struct WorldInstanceToken(std::sync::Arc<()>);
+
+impl WorldInstanceToken {
+    pub fn matches_world(&self, world: &SimWorld) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &world.commit_identity)
+    }
+}
+
 pub struct SimWorld {
     /// Distinguishes this authoritative world instance from another world
     /// with identical contents when a prepared commit is published later.
@@ -412,6 +423,11 @@ fn first_solid_brick_grid(volume: &Volume) -> Result<Option<OccupancyGrid>, Worl
 }
 
 impl SimWorld {
+    /// An opaque runtime token, never part of durable identity or wire state.
+    pub fn instance_token(&self) -> WorldInstanceToken {
+        WorldInstanceToken(self.commit_identity.clone())
+    }
+
     /// Builds a world from `setup` with per-brick terrain collision.
     pub fn new(setup: WorldSetup) -> Result<Self, WorldError> {
         Self::new_with_terrain_collider_mode(setup, TerrainColliderMode::PerBrick)

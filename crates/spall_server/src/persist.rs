@@ -255,6 +255,17 @@ pub(crate) fn capture_with_terrain_bricks(
     capture_checkpoint_internal(sim, cfg, journal_cursor, terrain_bricks, None)
 }
 
+/// Complete logical terrain assembled by the residency participant.
+pub(crate) fn capture_with_terrain_bricks_and_catalog(
+    sim: &Simulation,
+    cfg: &PersistConfig,
+    journal_cursor: u64,
+    terrain_bricks: Vec<StoredBrick>,
+    catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+) -> Result<Checkpoint, PersistError> {
+    capture_checkpoint_internal(sim, cfg, journal_cursor, terrain_bricks, Some(catalog))
+}
+
 fn capture_checkpoint_internal(
     sim: &Simulation,
     cfg: &PersistConfig,
@@ -282,6 +293,11 @@ fn capture_checkpoint_internal(
     bodies.push(stored_body(world, terrain, StoredBodyKind::Terrain));
 
     for body in world.bodies() {
+        if !world.evicted(body.volume.id()).is_empty() {
+            return Err(PersistError::BadField(
+                "checkpoint requires complete resident body geometry",
+            ));
+        }
         cell_sizes.insert(body.volume.cell_size().to_u8());
         bodies.push(stored_body(world, body, StoredBodyKind::Dynamic));
         bricks.extend(stored_bricks(&body.volume)?);

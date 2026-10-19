@@ -376,3 +376,18 @@ evicted digests before copying geometry. The existing verified incremental
 ResidencyPass backing/cache path has no catalog participant yet and remains closed
 to initialized animal hosts; integrate that participant before streamed-world
 animal persistence. Do not publish resident-only terrain against logical hashes.
+
+
+2026-10-19 streamed checkpoint participant: reuse ResidencyPass complete logical
+terrain assembly, revision cache and verified backing reads for catalog-aware
+animal checkpoints. Bind the pass to the installed SimWorld runtime identity
+(existing commit_identity Arc, exposed only as an opaque nonserialized token);
+refuse a foreign/replaced world before reading cache or backing. Both capture
+entrypoints share that guard. Supply the assembled terrain to the existing full
+checkpoint builder with the game catalog. Reject evicted ordinary body geometry
+since the pass only reconstructs terrain. Keep full-resident capture's global
+eviction guard. Publish cache/capture counters only after all geometry, catalog,
+animal and environment capture succeeds. No store/wire layout changes or live
+serve/spawn enablement. Verify mixed/empty animals through SQLite and detached
+restore, warm/cold backing, unavailable/digest/catalog failure atomicity, foreign
+world refusal and ordinary-body eviction refusal.
