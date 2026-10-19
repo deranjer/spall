@@ -439,6 +439,13 @@ impl CreatureDirector for AnimalDirector {
             if let Some(intent) = self.birth(sim, &placement, &mut trial) {
                 *ids = trial;
                 self.spawned[species] += 1;
+                tracing::info!(
+                    species = self.species[species].key,
+                    x = placement.root_m.x,
+                    y = placement.root_m.y,
+                    z = placement.root_m.z,
+                    "animal placed"
+                );
                 intents.push(intent);
             }
         }

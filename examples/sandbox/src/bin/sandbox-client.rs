@@ -733,7 +733,9 @@ fn run_interactive(args: Args) -> ExitCode {
         join_token: token,
         script,
         movement_script: Vec::new(),
-        creature_catalog: None,
+        creature_catalog: Some(sandbox::animals::catalog(
+            &sandbox::animals::species().expect("authored animal assets decode"),
+        )),
         late_join: args.late_join,
         baseline_scene,
         run_ticks: 0,
