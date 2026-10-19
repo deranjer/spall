@@ -768,6 +768,7 @@ fn run_quic_regional_session(defer: bool) {
                 buttons: 0,
             },
         ],
+        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::Walk,
         run_ticks: 840,

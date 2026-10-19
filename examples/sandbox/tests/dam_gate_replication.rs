@@ -94,6 +94,7 @@ fn a_real_client_sees_the_dam_gate_open_after_the_admin_command() {
         join_token: token,
         script: Vec::new(),
         movement_script: Vec::new(),
+        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::BridgeCut,
         // Final hashes must describe the same end of the run. Stopping at

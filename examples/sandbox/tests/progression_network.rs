@@ -227,6 +227,7 @@ fn client_config(
         join_token: token,
         script: Vec::new(),
         movement_script: Vec::new(),
+        creature_catalog: None,
         late_join: false,
         baseline_scene: BaselineScene::BridgeCut,
         run_ticks,

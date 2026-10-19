@@ -29,6 +29,8 @@ pub mod creature;
 pub mod creature_catalog;
 pub use creature_catalog::{OwnedCreatureAsset, OwnedCreatureCatalog, OwnedCreatureSpecies};
 pub mod creature_owner;
+pub mod creature_sync;
+pub use creature_sync::{CREATURE_SYNC_SCHEMA, CreatureSync};
 pub mod creature_snapshot;
 pub mod handshake;
 pub mod input;

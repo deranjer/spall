@@ -86,6 +86,7 @@ fn config(
         motion_interest: None,
         residency: None,
         residency_disk_path: None,
+        creatures: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,

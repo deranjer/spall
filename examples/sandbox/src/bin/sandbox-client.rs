@@ -730,6 +730,7 @@ fn run_interactive(args: Args) -> ExitCode {
         join_token: token,
         script,
         movement_script: Vec::new(),
+        creature_catalog: None,
         late_join: args.late_join,
         baseline_scene,
         run_ticks: 0,

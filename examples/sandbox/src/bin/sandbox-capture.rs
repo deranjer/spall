@@ -897,6 +897,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         motion_interest: None,
         residency: None,
         residency_disk_path: None,
+        creatures: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
@@ -947,6 +948,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
             })
             .collect(),
         movement_script: Vec::new(),
+        creature_catalog: None,
         late_join: false,
         baseline_scene: BaselineScene::CrossBridgeCut,
         run_ticks: DESTRUCTION_TICKS,
@@ -977,6 +979,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         join_token: token,
         script: Vec::new(),
         movement_script: Vec::new(),
+        creature_catalog: None,
         late_join: false,
         baseline_scene: BaselineScene::CrossBridgeCut,
         run_ticks: DESTRUCTION_TICKS,

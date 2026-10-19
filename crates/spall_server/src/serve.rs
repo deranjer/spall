@@ -662,6 +662,10 @@ pub struct ServeConfig {
     /// default) keeps the prior in-memory behaviour byte-identical;
     /// ignored when [`Self::residency`] is `None`.
     pub residency_disk_path: Option<PathBuf>,
+    /// Game-owned creature director. `None` keeps the world actor-free. A
+    /// director requires an ephemeral world (`save` unset) until typed actor
+    /// journal replay exists, and fails startup loudly otherwise.
+    pub creatures: Option<crate::creature_service::CreatureService>,
     /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
     /// damage pass. `None` keeps every prior run byte-identical (the pass is
     /// never invoked, exactly like every scene before this increment).
@@ -772,6 +776,7 @@ impl ServeConfig {
             motion_interest: None,
             residency: None,
             residency_disk_path: None,
+            creatures: None,
             contact_damage: None,
             dormancy: None,
             timing_window: None,
@@ -2668,6 +2673,7 @@ async fn serve_async(
     let world_materials = materials;
     let residency_limits = config.residency;
     let residency_disk_path = config.residency_disk_path.clone();
+    let creature_service = config.creatures.clone();
     let contact_damage_cfg = config.contact_damage;
     let contact_damage_profiles = damage_profiles;
     let dormancy_cfg = config.dormancy;
@@ -2716,6 +2722,20 @@ async fn serve_async(
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
+        if creature_service.is_some() {
+            if save.is_some() {
+                return SimResult::error(
+                    "creatures cannot run in a persistent world yet: typed actor journal replay is not implemented"
+                        .into(),
+                    0,
+                );
+            }
+            if let Err(error) =
+                sim.initialize_creature_host(spall_core::WorldId::from_u128(T10_WORLD_ID))
+            {
+                return SimResult::error(format!("creature host init failed: {error:?}"), 0);
+            }
+        }
         for (stage, elapsed) in spall_sim::prof::drain() {
             tracing::info!(
                 stage,
@@ -2837,6 +2857,7 @@ async fn serve_async(
 
         // T17 late-join / reconnect state.
         let mut lj = LateJoin::new(catch_up_cap, max_join_retries, capture_workers);
+        lj.creatures = creature_service.clone();
         if let Err(error) = lj.seed_transfer_ids_from_recovery(&sim, &retained_transfer_ids) {
             return SimResult::error(
                 format!("retained journal contains an invalid transfer ID: {error}"),
@@ -3705,6 +3726,26 @@ async fn serve_async(
                 }
             }
             drop(span_serve_commit_fanout);
+            if let Some(service) = creature_service.as_ref() {
+                match service.run_tick(&mut sim) {
+                    Ok(Some(committed)) => {
+                        committed_total += 1;
+                        lj.fan_out_transaction(
+                            Arc::new(committed.topology),
+                            None,
+                            &sim,
+                            &clients_for_sim,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return SimResult::error(
+                            format!("creature lifecycle commit failed: {error}"),
+                            ticks_run,
+                        );
+                    }
+                }
+            }
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;
@@ -4412,7 +4453,7 @@ async fn serve_async(
             committed_total,
             rejected_total,
             intent_stats,
-            final_world_hash: sim.world().world_hash().to_string(),
+            final_world_hash: sim.world().geometry_topology_hash().to_string(),
             total_solid_cells: sim.world().total_solid_cells(),
             body_count: sim.world().body_count(),
             max_detached_body_brick_span: sim
@@ -4929,6 +4970,8 @@ impl SimResult {
 enum QueuedItem {
     Tx(Arc<TopologyTransaction>),
     Blob(Arc<BaselineTransfer>),
+    /// Ordered reliable records (creature join sync).
+    Records(Arc<Vec<WireRecord>>),
 }
 
 enum Phase {
@@ -5055,6 +5098,8 @@ struct LateJoin {
     /// ENG-30 / T23 row 11, increment 30: bounds concurrent background
     /// baseline captures. See [`CapturePool`].
     capture_pool: CapturePool,
+    /// Game creature service, when the world has animals.
+    creatures: Option<crate::creature_service::CreatureService>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -5090,7 +5135,31 @@ impl LateJoin {
             cached_baseline: None,
             pending_captures: HashMap::new(),
             capture_pool: CapturePool::new(capture_workers),
+            creatures: None,
         }
+    }
+
+    /// Initial catch-up queue for a joining client: the creatures held right
+    /// now, ahead of every transaction committed after this instant.
+    fn creature_seed(&self, sim: &Simulation) -> VecDeque<QueuedItem> {
+        let mut queue = VecDeque::new();
+        let Some(service) = self.creatures.as_ref() else {
+            return queue;
+        };
+        match service.join_sync(sim) {
+            Ok(syncs) if syncs.is_empty() => {}
+            Ok(syncs) => {
+                let records: Vec<WireRecord> = syncs
+                    .into_iter()
+                    .map(|sync| WireRecord::CreatureSync(Box::new(sync)))
+                    .collect();
+                queue.push_back(QueuedItem::Records(Arc::new(records)));
+            }
+            Err(error) => {
+                tracing::error!(%error, "creature join sync failed; the client will miss existing animals");
+            }
+        }
+        queue
     }
 
     fn backing_ref(&self) -> Option<&dyn spall_sim::BrickBacking> {
@@ -5279,7 +5348,7 @@ impl LateJoin {
                     .map(|(basis, resumed)| {
                         (
                             basis,
-                            *new_world_hash.get_or_insert_with(|| sim.world().world_hash()),
+                            *new_world_hash.get_or_insert_with(|| sim.world().geometry_topology_hash()),
                             resumed,
                         )
                     });
@@ -5492,10 +5561,11 @@ impl LateJoin {
                 Some(transfer) => {
                     let transfer = transfer.reissue(id);
                     self.baseline_bytes += transfer.payload_bytes() as u64;
+                    let seed = self.creature_seed(sim);
                     if let Some(link) = self.links.get_mut(&session.raw()) {
                         link.phase = Phase::Joining {
                             transfer_id: id,
-                            queue: VecDeque::new(),
+                            queue: seed,
                             retries: 0,
                         };
                     }
@@ -5521,10 +5591,11 @@ impl LateJoin {
                             )
                         });
                     });
+                    let seed = self.creature_seed(sim);
                     if let Some(link) = self.links.get_mut(&session.raw()) {
                         link.phase = Phase::Joining {
                             transfer_id: id,
-                            queue: VecDeque::new(),
+                            queue: seed,
                             retries: 0,
                         };
                         self.pending_captures.insert(session.raw(), (id, rx));
@@ -5552,6 +5623,7 @@ impl LateJoin {
             match item {
                 QueuedItem::Tx(tx) => send_to(clients, session, Outbound::Transaction(tx)),
                 QueuedItem::Blob(t) => send_to(clients, session, Outbound::Baseline(t)),
+                QueuedItem::Records(records) => send_to(clients, session, Outbound::Water(records)),
             }
         }
         // A current motion keyframe for every body (`docs/protocol.md` step 4).
@@ -5671,10 +5743,11 @@ impl LateJoin {
             match transfer {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
+                    let seed = self.creature_seed(sim);
                     if let Some(link) = self.links.get_mut(&raw) {
                         link.phase = Phase::Joining {
                             transfer_id: id,
-                            queue: VecDeque::new(),
+                            queue: seed,
                             retries,
                         };
                     }

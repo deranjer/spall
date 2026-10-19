@@ -829,6 +829,9 @@ impl ReplicaWorld {
         self.volume_of_entity = staged.volume_of_entity;
         self.tombstoned = BTreeSet::new();
         self.applied_tx = BTreeMap::new();
+        if let Some(creatures) = self.creatures.as_mut() {
+            creatures.reset();
+        }
         self.control_gate = SequenceGate::new();
         self.pending_snapshots = BTreeMap::new();
         // A fresh baseline supersedes any transaction that was held pending a
@@ -1551,6 +1554,18 @@ impl ReplicaWorld {
         catalog: std::sync::Arc<spall_protocol::OwnedCreatureCatalog>,
     ) {
         self.creatures = Some(crate::replica_creatures::ReplicaCreatures::new(catalog));
+    }
+
+    /// Installs a join-time creature record. Rejected without a catalog.
+    pub fn apply_creature_sync(
+        &mut self,
+        sync: &spall_protocol::CreatureSync,
+    ) -> Result<(), String> {
+        let creatures = self
+            .creatures
+            .as_mut()
+            .ok_or("creature sync requires an installed creature catalog")?;
+        creatures.install_sync(sync).map_err(|e| e.to_string())
     }
 
     /// Replicated creature ownership records, if a catalog is installed.

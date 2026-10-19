@@ -59,6 +59,16 @@ impl ReplicaCreatures {
         }
     }
 
+    /// Drops every record and identity, keeping the catalog. A full baseline
+    /// replaces the world, so previous creatures must not survive it.
+    pub fn reset(&mut self) {
+        self.identity = None;
+        self.next_creature_id = 1;
+        self.next_volume_floor = 1;
+        self.records.clear();
+        self.revision = self.revision.saturating_add(1);
+    }
+
     /// Pins the world identity before any record arrives (baseline/handshake).
     pub fn bind_world(&mut self, world_id: WorldId, epoch: u64) {
         self.identity = Some((world_id, epoch));
@@ -92,6 +102,45 @@ impl ReplicaCreatures {
                 TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
             )
         })
+    }
+
+    /// Installs one server-captured record at join time. Idempotent: an equal
+    /// or newer record is kept, an older sync never rewinds a record the
+    /// ordered transaction stream already advanced.
+    pub fn install_sync(
+        &mut self,
+        sync: &spall_protocol::CreatureSync,
+    ) -> Result<(), ReplicaCreatureError> {
+        let key = sync.record.state.key;
+        match self.identity {
+            Some((world, epoch)) => {
+                if key.world_id != world || key.world_epoch.get() != epoch {
+                    return Err(ReplicaCreatureError::World);
+                }
+            }
+            None => self.identity = Some((key.world_id, key.world_epoch.get())),
+        }
+        self.catalog
+            .with_view(|catalog| sync.record.validate(catalog))??;
+        if let Some(existing) = self.records.get(&key) {
+            if existing.state.state_revision >= sync.record.state.state_revision {
+                return Ok(());
+            }
+        } else if self.records.values().any(|other| {
+            other.parts.iter().any(|part| {
+                sync.record
+                    .parts
+                    .iter()
+                    .any(|new| new.source_volume_id == part.source_volume_id)
+            })
+        }) {
+            return Err(ReplicaCreatureError::NotMonotone);
+        }
+        self.next_creature_id = self.next_creature_id.max(sync.allocator.next_creature_id);
+        self.next_volume_floor = self.next_volume_floor.max(sync.next_volume_id);
+        self.records.insert(key, sync.record.clone());
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
     }
 
     /// Applies every lifecycle op of an actor-only transaction, all or nothing.

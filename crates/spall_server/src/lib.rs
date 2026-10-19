@@ -10,6 +10,7 @@ pub mod action_catalog;
 pub mod baseline;
 mod column_water_replication;
 pub mod commit_latency;
+pub mod creature_service;
 pub mod disk_backing;
 mod input_schedule;
 pub mod mem_stats;

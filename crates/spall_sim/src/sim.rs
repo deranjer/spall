@@ -3339,6 +3339,33 @@ impl Simulation {
 
     // Closed until the ordered server caller is wired in the next ENG-218 slice.
     #[allow(dead_code)]
+    /// Commits lifecycle intents as one ordered transaction at the current
+    /// tick, taking the next control sequence from the same counter as ordinary
+    /// edits so replicas see a single monotone stream.
+    pub fn commit_creature_lifecycle_now(
+        &mut self,
+        intents: Vec<AuthoritativeCreatureIntent>,
+        catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+    ) -> Result<CommittedCreatureLifecycle, String> {
+        let control_seq = spall_protocol::ControlSeq(self.next_control_seq);
+        let committed = self.commit_creature_lifecycle_transaction(
+            self.tick,
+            control_seq,
+            intents,
+            None,
+            catalog,
+        )?;
+        self.next_control_seq += 1;
+        Ok(committed)
+    }
+
+    /// Next unallocated creature id and shared source-volume id, so a server
+    /// director can build a birth batch without mutating the host.
+    pub fn creature_birth_ids(&self) -> Option<(u64, u64)> {
+        let next_creature = self.creature_allocator_snapshot()?.next_creature_id;
+        Some((next_creature, self.world.registry().counters().1))
+    }
+
     pub fn commit_creature_lifecycle_transaction(
         &mut self,
         tick: Tick,

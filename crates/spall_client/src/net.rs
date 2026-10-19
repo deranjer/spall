@@ -419,6 +419,9 @@ pub struct ClientNetConfig {
     /// movement locally, sends `InputFrame` datagrams, and reconciles against
     /// the server's player snapshots.
     pub movement_script: Vec<MovementStep>,
+    /// Game-supplied creature catalog. With it the replica applies creature
+    /// lifecycle transactions; without it such transactions are rejected.
+    pub creature_catalog: Option<Arc<spall_protocol::OwnedCreatureCatalog>>,
     /// T17: request a full late-join baseline over a bulk transfer instead of
     /// installing the fixed `bridge_scene`. The replica reaches the server's
     /// current topology hash with no edit replay from world creation.
@@ -1703,6 +1706,12 @@ async fn run_async(
             ReplicaConfig::default(),
         )
     }));
+    if let Some(catalog) = config.creature_catalog.clone() {
+        replica
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .install_creature_catalog(catalog);
+    }
     let counters = Arc::new(Counters::default());
     *counters
         .scripted_uncommitted
@@ -1927,6 +1936,15 @@ async fn run_async(
                             eprintln!("spall-client: rejected weather state: {error}");
                         } else {
                             counters.weather_snapshots.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(Some(WireRecord::CreatureSync(sync))) => {
+                        if let Err(error) = replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_creature_sync(&sync)
+                        {
+                            eprintln!("spall-client: rejected creature sync: {error}");
                         }
                     }
                     Ok(Some(WireRecord::SnowSurfaceFrame(frame))) => {

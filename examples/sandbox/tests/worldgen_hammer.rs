@@ -129,6 +129,7 @@ fn a_hammer_swing_digs_a_crater_the_client_replica_sees() {
         join_token: token,
         script: Vec::new(),
         movement_script: Vec::new(),
+        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 1450,

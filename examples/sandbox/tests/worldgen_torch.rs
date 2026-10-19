@@ -103,6 +103,7 @@ fn a_torch_places_a_lamp_the_client_replica_sees() {
         join_token: token,
         script: Vec::new(),
         movement_script: Vec::new(),
+        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 1450,

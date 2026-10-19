@@ -668,6 +668,7 @@ fn run_serve(args: Args) -> ExitCode {
             interest_radius_bricks: args.residency_radius_bricks,
         }),
         residency_disk_path,
+        creatures: None,
         contact_damage: args
             .contact_damage
             .then_some(sandbox::game::contact_damage_config()),
