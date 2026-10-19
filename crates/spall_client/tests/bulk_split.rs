@@ -16,6 +16,7 @@ fn committed_giant_split() -> (Simulation, TopologyTransaction, BaselineWorld) {
     setup.physics.disable_ccd = true;
     let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
     let actor = EntityId::new(1).unwrap();
+    let mut next_transfer_low = 401u64;
     for tick in 1..=20u64 {
         if tick == 4 {
             let h = BRUSH_UNIT / 2;
@@ -36,12 +37,19 @@ fn committed_giant_split() -> (Simulation, TopologyTransaction, BaselineWorld) {
             ))
             .unwrap();
         }
-        sim.tick().unwrap();
+        let ids = (0..sim.transfer_reservation_bound())
+            .map(|_| {
+                let id = spall_protocol::TransferId(SPLIT_BULK_TRANSFER_ID_BIT | next_transfer_low);
+                next_transfer_low += 1;
+                id
+            })
+            .collect();
+        sim.tick_with_transfer_ids(ids).unwrap();
     }
     let entry = sim.journal().entries()[0].clone();
     let world = entry
-        .bulk_baseline
-        .clone()
+        .geometry_only_bulk()
+        .cloned()
         .expect("giant split has a bulk baseline");
     (sim, entry.transaction, world)
 }

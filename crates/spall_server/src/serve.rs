@@ -8559,17 +8559,26 @@ mod tests {
                 _ => {}
             }
         }
+        let mut invalid_set = entry.attachments.clone().unwrap();
+        let invalid_id = invalid_transaction
+            .ops
+            .iter()
+            .find_map(|op| op.bulk_transfer_id())
+            .unwrap();
+        for attachment in &mut invalid_set.attachments {
+            if let spall_protocol::TransactionAttachmentV1::Geometry { transfer_id, .. } =
+                attachment
+            {
+                *transfer_id = invalid_id;
+            }
+        }
         let invalid_record = JournalRecord {
             seq: entry.seq.0,
             tick: entry.transaction.server_tick.get(),
             payload: JournalPayload::topology_with_attachments(
                 &invalid_transaction,
                 &entry.participants,
-                &persist::geometry_attachment_set(
-                    &invalid_transaction,
-                    entry.bulk_baseline.as_ref().unwrap(),
-                )
-                .unwrap(),
+                &invalid_set,
             )
             .unwrap(),
         };

@@ -169,7 +169,7 @@ fn live_and_replayed_edits_install_equivalent_terrain_collision() {
         .replay_transaction(
             &entry.transaction,
             &entry.participants,
-            entry.bulk_baseline.as_ref(),
+            entry.geometry_only_bulk(),
         )
         .expect("journalled edit replays into the brick collider representation");
     replay

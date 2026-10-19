@@ -436,6 +436,8 @@ pub struct VolumeHash {
 /// collide with a late-join / repair transfer id (which are small, allocated by
 /// the server's own counter). The low 63 bits are the split's `TransactionId`.
 pub const SPLIT_BULK_TRANSFER_ID_BIT: u64 = 1 << 63;
+/// Reserved lifecycle bulk namespace in the common runtime transfer allocator.
+pub const CREATURE_LIFECYCLE_TRANSFER_ID_BIT: u64 = 1 << 61;
 
 /// Reserved `TransferId` bit marking a full baseline sent after an admin world
 /// reset. The receiving replica *replaces* its world with it instead of merging

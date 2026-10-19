@@ -483,14 +483,10 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
     entries
         .iter()
         .map(|e| {
-            let payload = match &e.bulk_baseline {
-                // T17 increment 2: a giant split's marker transaction plus its
-                // out-of-band `BaselineWorld`.
-                Some(world) => JournalPayload::topology_with_attachments(
-                    &e.transaction,
-                    &e.participants,
-                    &geometry_attachment_set(&e.transaction, world)?,
-                )?,
+            let payload = match &e.attachments {
+                Some(set) => {
+                    JournalPayload::topology_with_attachments(&e.transaction, &e.participants, set)?
+                }
                 None => JournalPayload::topology(&e.transaction, &e.participants)?,
             };
             Ok(JournalRecord {
@@ -500,31 +496,6 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
             })
         })
         .collect()
-}
-
-/// Adapt the geometry producer's one reserved bulk group to the typed journal.
-pub(crate) fn geometry_attachment_set(
-    transaction: &spall_protocol::TopologyTransaction,
-    world: &spall_protocol::BaselineWorld,
-) -> Result<spall_protocol::TransactionAttachmentSetV1, PersistError> {
-    let transfer_id = transaction
-        .ops
-        .iter()
-        .find_map(|op| match op {
-            TopologyOp::SplitOffBulkBaseline { transfer_id, .. } => Some(*transfer_id),
-            _ => None,
-        })
-        .ok_or(PersistError::BadField(
-            "geometry attachment without child marker",
-        ))?;
-    Ok(spall_protocol::TransactionAttachmentSetV1 {
-        schema: spall_protocol::TRANSACTION_ATTACHMENT_SET_SCHEMA,
-        transaction_id: transaction.transaction_id,
-        attachments: vec![spall_protocol::TransactionAttachmentV1::Geometry {
-            transfer_id,
-            world: world.clone(),
-        }],
-    })
 }
 
 fn geometry_replay_attachment(

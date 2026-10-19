@@ -999,7 +999,36 @@ and retains only the validated durable prefix under the existing corruption poli
 
 The store can retain bounded lifecycle and mixed attachment data, but Simulation
 replay explicitly refuses lifecycle attachments before applying the transaction.
-Existing initialized-host journal suffix guards remain. The in-memory geometry
-producer still supplies its geometry bulk_baseline; typed in-memory lifecycle
-publication, atomic Simulation replay, client baseline/replica and live catalog
-handoff remain ENG-218 work. Storage retention is not live actor replay acceptance.
+Existing initialized-host journal suffix guards remain. The in-memory journal
+now carries the same typed attachment set from preparation
+through publication and durable conversion. Bounded bulk lifecycle preparation
+accepts already reserved IDs; the live server intent/reservation caller, atomic
+Simulation replay, client baseline/replica and live catalog handoff remain ENG-218
+work. Storage retention is not live actor replay acceptance.
+
+
+Bounded authoritative bulk production (ENG-218, 2026-10-19): the internal
+Simulation preparation path accepts caller-owned geometry/lifecycle transfer
+reservations. The common lifecycle namespace value (bit61) is now exported by
+protocol and shared with the existing server allocator; no ID values change.
+Intents and supplied ID counts are bounded before traversal. IDs require nonzero
+low values, the exact namespace and unique lifecycle entries. Simulation creates
+no transfer allocator or persistent transfer counter. Global reservation/retained
+ID uniqueness remains the existing server allocator's responsibility.
+
+Inline-fit transactions retain the inline lifecycle form. Oversized transactions
+with sufficient reserved IDs convert all actor ops to V4 bulk markers, preserving
+operation ordinals and exact already-reduced/sampled commits, including checked
+Death witness and measured part motion. Final marker framing must fit64KiB, and
+the complete typed set (geometry plus actors) must pass existing correlation,
+cumulative work and actual encoding before validation/publication. Missing IDs,
+invalid sources/counters/catalogs or stale fences return without mutation.
+
+JournalEntry.attachments replaces its geometry-specific bulk field. The geometry
+producer prepares its typed set before publication as well; persist::journal_records
+encodes that same set, with no geometry-specific reconstruction after commit.
+Mixed publication emits one journal entry after both physical owners. A geometry-
+only borrow adapter refuses any actor transaction, including inline actors next
+to a sole geometry attachment. Store5/wire12/baseline1 layouts are unchanged.
+This internal producer does not enable live scheduling, baseline/replica or
+ordered animal replay; existing recovery refusals and spawning gate remain.

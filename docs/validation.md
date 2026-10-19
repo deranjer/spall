@@ -1923,3 +1923,24 @@ nested or outer trailing data reports corruption and stops the durable prefix.
 Runtime restore must return CreatureJournalUnsupported for lifecycle or mixed
 sets, with no geometry/actor partial application. These tests establish storage
 transport, not joint runtime replay, live spawning, 1km/GPU/population acceptance.
+
+
+Bounded bulk producer (ENG-218, 2026-10-19):
+`cargo test -p spall_sim --lib creature_bulk_publication_tests` verifies actual
+three-part Birth through prepare/validate/publish, distinct applied part movement
+and checked Death, exact snapshot/serialized source and part motion, one ordered
+journal entry each and complete typed handoff. Replacing the marker with the
+actual inline commit must specifically return CodecError::Size while validating
+structurally; the bulk marker must fit. The existing no-ID oversized refusal
+remains. Missing/wrong/zero-low/duplicate/excess/partial ID reservations and stale
+step/registry/catalog candidates retain complete snapshot, geometry, registry,
+physics body count and journal. A small transaction stays inline with an unused
+valid reservation. Full-size bulk_split_setup plus a three-part birth must retain
+both families and exact geometry result hashes in one transaction; missing geometry
+ID or invalid second source part publishes neither. Geometry-only adapters must
+refuse mixed actor transactions. Existing real geometry replay/multiplayer/restart
+workloads remain unchanged, now reading the prepared typed journal set. Server
+animal journal fixtures additionally pass through public persist::journal_records
+before SQLite. Internal tests supply reserved IDs directly; live server caller and
+actual global allocator handoff are still unimplemented, not inferred from these
+fixtures. No GPU/1km/shipped population/two-client animal restart acceptance.

@@ -1641,3 +1641,111 @@ failures or dependency changes. Coordinator inspected final integration/bounds,
 parent matching, failure atomicity and explicit runtime refusal. No concrete
 blocker remains within this transport scope. Required live actor consumers and
 combined launch gates listed above remain outstanding, not waived.
+
+
+2026-10-19 ENG-218 bulk producer and prepared typed journal handoff
+---------------------------------------------------------------
+Internal lifecycle preparation now accepts an owned bounded transfer reservation
+input (optional geometry ID and unique lifecycle IDs). The lifecycle bit61 value
+moves to protocol for sharing with the existing server allocator, unchanged.
+Intent count bounds precede transfer traversal; namespace/zero-low/duplicates/
+excess IDs refuse. No allocator, persistent transfer counter or callback is added
+to Simulation. These tests supply reservations directly; actual server intent and
+reservation caller/global retained-ID uniqueness handoff are still separate work.
+
+Inline-fit actor operations stay inline. If the complete transaction does not
+fit64KiB, all actor commits move unchanged into existing V4 bulk payloads and
+markers using supplied IDs, with original ordinals/hash/Death evidence and sampled
+part motion. Missing IDs (including a partial list after first staged payload)
+fail before publication. Marker transaction must fit; complete mixed attachment
+set must pass protocol correlation/cumulative work and actual encoding before
+prepare returns. Prepared/validated candidates carry attachments through existing
+fences; publication installs both participants and appends exactly one entry.
+
+JournalEntry.attachments replaces geometry-only bulk_baseline. Geometry prepare
+now stages/encodes its typed Geometry set before any publication. Existing network
+Committed.bulk_baseline remains geometry delivery output. Server journal_records
+encodes the prepared set directly; the post-commit geometry-only attachment builder
+is removed. Geometry-only borrow adapter refuses lifecycle and mixed transactions,
+including inline actor ops with a sole Geometry payload. Migrated actual geometry
+replay/restart tests and journal fixtures. Wire12/store5/baseline1 layouts unchanged;
+no live scheduling/spawning or actor replay/baseline activation.
+
+Changed code: spall_protocol src/lib.rs and records.rs (shared constant);
+spall_sim src/{sim,journal,commit,commit_review}.rs plus new
+creature_bulk_publication_tests.rs, tests/{bulk_split,logical_reload,oversized_split}.rs;
+spall_server src/{persist,serve,transfer_ids}.rs and existing
+tests/support/animal_journal_attachments.rs. Architecture/protocol/validation/tasks
+and this report/design mirror the exact boundary. The no-ID geometry prepare
+helper is now test-only; production paths all take supplied transfer reservations.
+
+Focused four scenarios passed: actual3part Birth, distinct applied animation part
+motion and checked Death with full snapshot/source/motion/hash parity and one entry
+each; missing/zero-low/wrong/conflicting/duplicate/excess/partial IDs without live
+mutation, unused valid reservation leaves small work inline; stale step/registry/
+catalog refusal; full-size bulk_split_setup plus3part Birth share complete geometry
+and actor set/result hashes, missing geometry ID and invalid second source refuse
+atomically. Actual inline reconstruction specifically returns CodecError::Size
+after structural validation; no reduced source workload. Server SQLite fixture now
+also converts its typed JournalEntry through public journal_records before storage.
+These are complementary core-producer and adapter/storage fixtures, not a live
+server actor scheduling/restart claim.
+
+Initial cargo check -p spall_sim -p spall_server --tests passed with a now-unused
+no-ID geometry helper warning; restricting that helper to tests removes it from
+production. First focused compile caught only a test local-transform f64/f32
+mismatch, corrected to f32 with the same exact small integer translations. Focused
+cargo test -p spall_sim --lib creature_bulk_publication_tests then4passed0failed.
+Final refinements bound intent count before ID iteration and reject all mixed
+transactions in the geometry-only adapter. Full checks/results follow.
+
+Remaining/next unblocked ID ENG-218: live server lifecycle intent/reservation and
+ordered network delivery handoff, joint Simulation actor replay, complete client
+baseline/replica, live catalog and source-edit/fracture/terminal synchronization.
+Initialized-host suffix/write guards remain. Combined1024m weather/animals, shipped
+population/GPU and real-process/two-client animal restart/destruction unrun and
+unaccepted; no launch or new performance budget acceptance from CPUfixtures.
+Unrelated artifacts/ preserved; ENG-218 stays in_progress.
+
+Final integration review refinements: the mixed parent takes the geometry set
+(no stale nested attachment copy) and constructs the complete final JournalEntry
+before any geometry/physics publication. Final cargo test -p spall_sim --lib
+passed162/0failed/6existingignored, including all4 new bulk cases and existing
+inline/mixed/fence scenarios. Final checkpoint/adapter run initially22passed1failed
+only in Scratch::new: timestamp-based parallel directory creation collided with
+AlreadyExists before any assertion. Added a test-local atomic name sequence plus
+bounded exclusive create retries (no engine global state), preserving owned-root
+cleanup. Unchanged cargo test -p spall_server --test animal_checkpoint retry23pass.
+Failure retained in .local/eng218-bulk-producer-adapter-initial.log.
+
+Workspace compilation caught the remaining client bulk-split test reading the
+retired journal field; migrated it to geometry_only_bulk and the existing explicit
+tick transfer reservations. Scene,20ticks, corruption and both arrival orders are
+unchanged. cargo test -p spall_client --test bulk_split:3passed0failed. Added file
+crates/spall_client/tests/bulk_split.rs to changed-file scope, plus checkpoint
+Scratch helper in crates/spall_server/tests/animal_checkpoint.rs. Initial strict
+lint caught only a clone of Copy catalog metadata in the new test; removed it
+without changing values. Initial workspace/lint failures retained in logs.
+
+Exact measured checks (Cargo via .local/eng218-cargo.ps1 / established workspace
+target, no workload/gate reductions):
+- cargo check -p spall_sim -p spall_server --tests: passed initial core check.
+- cargo test -p spall_sim --lib creature_bulk_publication_tests:4passed.
+- cargo test -p spall_protocol -p spall_sim -p spall_store -p spall_server:
+  688passed0failed12existingignored across69 result targets; unchanged process
+  crash/TLS/multiplayer/full-size geometry replay/restart workloads retained.
+  This run preceded the final publication review refinement; all simulation lib
+  scenarios and checkpoint adapters were rechecked afterward as listed above.
+- cargo test -p spall_sim --lib:162passed0failed6existingignored after final engine
+  refinement; cargo test -p spall_server --test animal_checkpoint: final23passed;
+  cargo test -p spall_client --test bulk_split:3passed.
+- cargo check --workspace --all-targets --all-features: final passed.
+- cargo clippy -p spall_voxel -p spall_physics -p spall_protocol -p spall_sim
+  -p spall_store -p spall_server -p spall_client --all-targets -- -D warnings:
+  final passed.
+- cargo fmt --all -- --check and git diff --check: passed.
+Logs .local/eng218-bulk-producer-{check,focus,tests,final-lib,adapter,client,workspace,
+clippy,fmt}.log, with explicit initial-failure logs retained. Hardlink warnings are
+filesystem incremental-cache copy fallback, not code lint failures. Coordinator
+review found no remaining concrete blocker in this internal producer/typed journal
+scope; global live caller/client/replay gates listed above remain open.

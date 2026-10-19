@@ -121,6 +121,8 @@ pub enum CommitError {
     PhysicsFence(String),
     #[error("bulk split requires a server-reserved transfer ID")]
     MissingBulkTransferId,
+    #[error("typed transaction attachments: {0}")]
+    Attachments(#[from] spall_protocol::TransactionAttachmentError),
     #[error("tick transfer IDs must be unique, nonzero split-namespace IDs")]
     InvalidBulkTransferIds,
     #[error(
@@ -154,6 +156,7 @@ pub(crate) struct PreparedGeometryCommit {
     pub(crate) topology: TopologyTransaction,
     pub(crate) participants: Vec<MotionSnapshot>,
     pub(crate) bulk_baseline: Option<spall_protocol::baseline::BaselineWorld>,
+    pub(crate) attachments: Option<spall_protocol::TransactionAttachmentSetV1>,
     bulk_transfer_id: Option<TransferId>,
     pub(crate) bumped_epoch: bool,
     stamp_before_commit: u64,
@@ -245,6 +248,7 @@ pub(crate) fn commit_with_bulk_transfer_ids(
 /// Builds an owned candidate without mutating `world` or `journal`. The
 /// candidate can be combined with other transaction participants before its
 /// final fence validation and publication.
+#[cfg(test)]
 pub(crate) fn prepare_geometry(
     world: &SimWorld,
     journal: &JournalSink,
@@ -669,6 +673,22 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
     }
     topology.validate()?;
     drop(encoding);
+    let attachments =
+        bulk_baseline
+            .as_ref()
+            .map(|world| spall_protocol::TransactionAttachmentSetV1 {
+                schema: spall_protocol::TRANSACTION_ATTACHMENT_SET_SCHEMA,
+                transaction_id,
+                attachments: vec![spall_protocol::TransactionAttachmentV1::Geometry {
+                    transfer_id: bulk_transfer_id
+                        .expect("bulk geometry owns a reserved ID")
+                        .0,
+                    world: world.clone(),
+                }],
+            });
+    if let Some(set) = &attachments {
+        set.encode_for_transaction(&topology)?;
+    }
 
     let bumped_epoch = staged.splits();
     let participants = candidate_participant_snapshots(
@@ -757,6 +777,7 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
             participants,
             bulk_transfer_id,
             bulk_baseline,
+            attachments,
             bumped_epoch,
             stamp_before_commit,
             input_stamp: staged.input_stamp,
@@ -812,6 +833,7 @@ pub(crate) fn publish_validated_geometry_without_journal(
         topology,
         participants,
         bulk_baseline,
+        attachments,
         bulk_transfer_id,
         bumped_epoch,
         stamp_before_commit,
@@ -904,7 +926,7 @@ pub(crate) fn publish_validated_geometry_without_journal(
         seq: journal_seq,
         transaction: topology.clone(),
         participants,
-        bulk_baseline: bulk_baseline.clone(),
+        attachments,
     };
 
     if let Some(index) = post_index

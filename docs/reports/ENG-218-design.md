@@ -420,3 +420,33 @@ parent tick. Invalid typed batch preflight poisons before any prefix/outbox writ
 existing auxiliary preflight retries stay unchanged. Store4 rejection is checked
 explicitly alongside older versions before journal-mode changes. Actor storage
 tests retain complete three-part payloads; runtime consumers remain closed.
+
+
+2026-10-19 bounded bulk producer and in-memory journal handoff: replace
+JournalEntry.bulk_baseline with the existing typed TransactionAttachmentSetV1,
+and migrate the real geometry prepare/publication/persistence adapter/replay tests
+so there is one attachment authority. Geometry Committed.bulk_baseline remains
+network output. Prepare validates/encodes complete sets before physics publication.
+Expose the already-used lifecycle namespace bit from protocol, preserving values.
+An internal owned transfer input supplies optional reserved geometry ID and a
+bounded unique lifecycle-ID list; no allocator, callback or runtime journal is
+introduced inside Simulation. Existing no-ID inline entrypoints delegate to the
+same path and still refuse oversized work without IDs. If final inline encoding
+is too large, convert actor ops to existing V4 bulk markers/payloads using supplied
+IDs, retain ordinals and exact sampled commits, validate the final complete typed
+set (including any geometry group), and require marker transaction to fit64KiB.
+Missing/wrong namespace/duplicate IDs, codec/work/budget/exhaustion or stale fences
+fail before world/host/source/physics/registry/journal mutation. Prepared/validated
+candidates carry the exact attachments; publication appends once after both
+participants, with no fallible encoding/ID patch after publish. Tests cover actual
+three-part Birth and checked Death, mixed geometry, exact codec/journal handoff,
+reserved-ID failure/stale atomicity and existing oversized no-ID refusal. Server
+spawning/scheduling, baseline/replica and runtime actor replay remain closed.
+No wire12/store5/baseline1 layout change.
+
+Final producer audit: bound owner count before iterating supplied IDs. The mixed
+parent takes the geometry participant's attachment set rather than cloning a
+stale nested copy; it owns the complete final set. Construct the final journal
+entry before the first geometry/physics publication, rather than rewriting the
+geometry participant's returned entry afterward. No ID/payload reconstruction or
+attachment encoding follows world publication.

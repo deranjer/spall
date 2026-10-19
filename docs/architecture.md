@@ -939,3 +939,14 @@ before use/publication; corrupt rows terminate the reported durable prefix.
 Geometry-only runtime replay remains functional. Lifecycle or mixed attachments
 are retained by the storage transport but explicitly refused by runtime replay
 until the joint Simulation consumer exists. Live animals remain gated.
+
+
+ENG-218 bulk producer now prepares exact typed attachment sets in the same
+candidate as host/source/physics/registry changes. Caller-supplied bounded transfer
+reservations precede marker hashing; oversized actor payloads use existing V4 bulk
+markers while inline work stays inline. Both geometry and lifecycle producers
+carry JournalEntry.attachments unchanged to the store adapter. Codec/work/ID
+failure or stale candidate never publishes a prefix. Real three-part Birth,
+independently animated checked Death and full-size mixed terrain split tests cover
+one-entry publication. The live server scheduling/reservation caller and client/
+recovery consumers remain closed; this is not combined 1km launch acceptance.

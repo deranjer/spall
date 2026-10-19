@@ -14,17 +14,26 @@ impl Scratch {
             .join("../../.local")
             .canonicalize()
             .unwrap();
-        let dir = base.join(format!(
-            "actor-checkpoint-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..32 {
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = base.join(format!(
+                "actor-checkpoint-{}-{}-{sequence}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Self(dir),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create owned checkpoint scratch directory: {error}"),
+            }
+        }
+        panic!("could not reserve a unique checkpoint scratch directory");
     }
+
     fn db(&self) -> std::path::PathBuf {
         self.0.join("world.db")
     }

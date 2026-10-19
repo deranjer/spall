@@ -230,7 +230,7 @@ fn prepared_fence_rejects_journal_cursor_drift_before_publication() {
             result_hashes: Vec::new(),
         },
         participants: Vec::new(),
-        bulk_baseline: None,
+        attachments: None,
     });
     let before = world_snapshot(&world, &journal);
     assert!(matches!(

@@ -125,6 +125,16 @@ fn animal_and_mixed_typed_journal_payloads_survive_sqlite_with_exact_sources_and
             tick: 1,
             payload: JournalPayload::topology_with_attachments(&tx, &[], &set).unwrap(),
         };
+        let entry = spall_sim::JournalEntry {
+            seq: JournalSeq(1),
+            transaction: tx.clone(),
+            participants: vec![],
+            attachments: Some(set.clone()),
+        };
+        assert_eq!(
+            persist::journal_records(&[entry]).unwrap(),
+            vec![row.clone()]
+        );
         let scratch = Scratch::new();
         let mut writer = Writer::open(scratch.db()).unwrap();
         writer.publish_checkpoint(&base()).unwrap();

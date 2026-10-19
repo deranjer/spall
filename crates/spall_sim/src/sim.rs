@@ -82,8 +82,17 @@ pub(crate) enum AuthoritativeCreatureIntent {
 pub(crate) struct CommittedCreatureLifecycle {
     pub transaction_id: spall_core::TransactionId,
     pub journal_seq: spall_core::JournalSeq,
+    pub attachments: Option<spall_protocol::TransactionAttachmentSetV1>,
     pub topology: spall_protocol::TopologyTransaction,
     pub witnesses: Vec<spall_protocol::CreatureDeathWitnessV1>,
+}
+
+/// Caller-owned IDs already burned by the common server transfer allocator.
+/// Unused reservations stay burned; Simulation never invents transfer IDs.
+#[derive(Default)]
+pub(crate) struct CreatureTransactionTransfers {
+    pub geometry: Option<spall_protocol::TransferId>,
+    pub lifecycle: Vec<spall_protocol::TransferId>,
 }
 
 /// Owned mixed transaction candidate. It carries bounded deltas and the
@@ -110,6 +119,7 @@ pub(crate) struct PreparedSimulationTransaction {
     )>,
     transaction_id: spall_core::TransactionId,
     journal_seq: spall_core::JournalSeq,
+    attachments: Option<spall_protocol::TransactionAttachmentSetV1>,
     topology: spall_protocol::TopologyTransaction,
     participants: Vec<spall_protocol::MotionSnapshot>,
     death_witnesses: Vec<spall_protocol::CreatureDeathWitnessV1>,
@@ -195,6 +205,7 @@ pub(crate) struct ValidatedSimulationTransaction {
     )>,
     transaction_id: spall_core::TransactionId,
     journal_seq: spall_core::JournalSeq,
+    attachments: Option<spall_protocol::TransactionAttachmentSetV1>,
     topology: spall_protocol::TopologyTransaction,
     participants: Vec<spall_protocol::MotionSnapshot>,
     death_witnesses: Vec<spall_protocol::CreatureDeathWitnessV1>,
@@ -455,6 +466,10 @@ fn creature_source_work(volume: &spall_voxel::Volume) -> Result<CreatureSourceWo
         mask_bricks,
     })
 }
+
+#[cfg(test)]
+#[path = "creature_bulk_publication_tests.rs"]
+mod creature_bulk_publication_tests;
 
 #[cfg(test)]
 #[path = "creature_lifecycle_review.rs"]
@@ -2192,6 +2207,26 @@ impl Simulation {
         staged: Option<&crate::stage::StagedEdit>,
         catalog: &spall_protocol::CreatureValidationCatalog<'_>,
     ) -> Result<PreparedSimulationTransaction, String> {
+        self.prepare_creature_lifecycle_transaction_with_transfers(
+            tick,
+            control_seq,
+            intents,
+            staged,
+            catalog,
+            CreatureTransactionTransfers::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_creature_lifecycle_transaction_with_transfers(
+        &self,
+        tick: Tick,
+        control_seq: spall_protocol::ControlSeq,
+        intents: Vec<AuthoritativeCreatureIntent>,
+        staged: Option<&crate::stage::StagedEdit>,
+        catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+        transfers: CreatureTransactionTransfers,
+    ) -> Result<PreparedSimulationTransaction, String> {
         use spall_physics::{ArticulatedBatchOperation, OccupancyGrid, SourcePart};
         use spall_protocol::{
             CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_COMMIT_SCHEMA, CreatureClipMode,
@@ -2203,6 +2238,27 @@ impl Simulation {
 
         if intents.is_empty() {
             return Err("lifecycle transaction has no actor operations".into());
+        }
+        if intents.len() > spall_physics::MAX_CORPSE_RESTORE_BATCH_OWNERS {
+            return Err("too many lifecycle owners in one transaction".into());
+        }
+        let kind_bits = spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT
+            | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT
+            | spall_protocol::CREATURE_LIFECYCLE_TRANSFER_ID_BIT;
+        let valid_id = |id: spall_protocol::TransferId, kind: u64| {
+            id.0 & kind_bits == kind && id.0 & !kind_bits != 0
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        if transfers.lifecycle.len() > intents.len()
+            || transfers.lifecycle.iter().any(|id| {
+                !valid_id(*id, spall_protocol::CREATURE_LIFECYCLE_TRANSFER_ID_BIT)
+                    || !seen.insert(id.0)
+            })
+            || transfers.geometry.is_some_and(|id| {
+                staged.is_none() || !valid_id(id, spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT)
+            })
+        {
+            return Err("invalid reserved lifecycle or geometry transfer IDs".into());
         }
         if staged.is_some_and(|edit| {
             matches!(edit.target, EditTarget::Body(entity) if self.world.body_is_dormant(entity))
@@ -2217,9 +2273,6 @@ impl Simulation {
             != spall_protocol::content_manifest_hash(self.world.materials())
         {
             return Err("creature catalog material manifest differs from simulation".into());
-        }
-        if intents.len() > spall_physics::MAX_CORPSE_RESTORE_BATCH_OWNERS {
-            return Err("too many lifecycle owners in one transaction".into());
         }
         let mut volumes_by_intent = Vec::with_capacity(intents.len());
         let mut all_source_volumes = Vec::new();
@@ -2338,12 +2391,13 @@ impl Simulation {
         let registry_counters_before = self.world.registry().counters();
         let journal_cursor = self.journal.cursor();
         let mut geometry = if let Some(staged) = staged {
-            match crate::commit::prepare_geometry(
+            match crate::commit::prepare_geometry_with_transfer_ids(
                 &self.world,
                 &self.journal,
                 staged,
                 tick,
                 control_seq,
+                &mut transfers.geometry.into_iter().collect(),
             )
             .map_err(|error| error.to_string())?
             {
@@ -3010,8 +3064,56 @@ impl Simulation {
             });
         }
         topology.validate().map_err(|error| error.to_string())?;
+        let mut attachments = geometry
+            .as_mut()
+            .and_then(|geometry| geometry.attachments.take());
         if !crate::replication::inline_wire_fits(&topology) {
-            return Err("lifecycle transaction exceeds the inline control-record ceiling".into());
+            let mut ids = transfers.lifecycle.into_iter();
+            let set =
+                attachments.get_or_insert_with(|| spall_protocol::TransactionAttachmentSetV1 {
+                    schema: spall_protocol::TRANSACTION_ATTACHMENT_SET_SCHEMA,
+                    transaction_id,
+                    attachments: Vec::new(),
+                });
+            let inline_ops = std::mem::take(&mut topology.ops);
+            for op in inline_ops {
+                if let TopologyOp::CreatureLifecycle { commit } = op {
+                    let transfer_id = ids.next().ok_or_else(|| "lifecycle transaction exceeds the inline control-record ceiling without reserved bulk IDs".to_owned())?;
+                    let ordinal = commit.change.operation_ordinal;
+                    let payload = spall_protocol::CreatureLifecycleBulkPayloadV4::new(
+                        transaction_id,
+                        ordinal,
+                        *commit,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    topology.ops.push(TopologyOp::CreatureLifecycleBulk {
+                        transfer_id: transfer_id.0,
+                        operation_ordinal: ordinal,
+                        payload_schema: spall_protocol::CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+                        commit_hash: payload.commit_hash,
+                    });
+                    set.attachments.push(
+                        spall_protocol::TransactionAttachmentV1::CreatureLifecycle {
+                            transfer_id: transfer_id.0,
+                            payload: Box::new(payload),
+                        },
+                    );
+                } else {
+                    topology.ops.push(op);
+                }
+            }
+            topology.validate().map_err(|error| error.to_string())?;
+            if !crate::replication::inline_wire_fits(&topology) {
+                return Err(
+                    "bulk lifecycle marker transaction exceeds the control-record ceiling".into(),
+                );
+            }
+        }
+        if let Some(set) = &attachments {
+            // Complete correlation, cumulative work and actual encoding must succeed
+            // before the physics candidate can publish. No payload is patched later.
+            set.encode_for_transaction(&topology)
+                .map_err(|error| error.to_string())?;
         }
         if let Some(geometry) = geometry.as_mut() {
             geometry.registry = candidate_registry.clone();
@@ -3055,6 +3157,7 @@ impl Simulation {
             transaction_id,
             journal_seq,
             topology,
+            attachments,
             participants,
             death_witnesses,
         })
@@ -3166,6 +3269,7 @@ impl Simulation {
             transaction_id: prepared.transaction_id,
             journal_seq: prepared.journal_seq,
             topology: prepared.topology,
+            attachments: prepared.attachments,
             participants: prepared.participants,
             death_witnesses: prepared.death_witnesses,
         })
@@ -3187,26 +3291,25 @@ impl Simulation {
             transaction_id,
             journal_seq,
             topology,
+            attachments,
             participants,
             death_witnesses,
         } = validated;
-        let mut entry = if let Some(geometry) = geometry {
-            let (_, entry) = crate::commit::publish_validated_geometry_without_journal(
-                &mut self.world,
-                geometry,
-            );
-            entry
+        // Finish journal ownership/copies before the first world publication.
+        // The mixed parent owns the complete final set; no markers or payloads
+        // are reconstructed from the geometry participant after it publishes.
+        let entry = crate::journal::JournalEntry {
+            seq: journal_seq,
+            transaction: topology.clone(),
+            participants,
+            attachments: attachments.clone(),
+        };
+        if let Some(geometry) = geometry {
+            crate::commit::publish_validated_geometry_without_journal(&mut self.world, geometry);
         } else {
             *self.world.registry_mut() = actor_only_registry
                 .expect("actor-only prepared transaction owns its registry candidate");
-            crate::journal::JournalEntry {
-                seq: journal_seq,
-                transaction: topology.clone(),
-                participants,
-                bulk_baseline: None,
-            }
-        };
-        entry.transaction = topology.clone();
+        }
         let outcomes = self
             .world
             .physics_mut()
@@ -3230,6 +3333,7 @@ impl Simulation {
             transaction_id,
             journal_seq,
             topology,
+            attachments,
             witnesses: death_witnesses,
         }
     }

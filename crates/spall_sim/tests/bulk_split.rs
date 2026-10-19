@@ -63,7 +63,7 @@ fn giant_split_commits_with_bulk_baseline_ops_and_replays_exactly() {
 
     let e = &entries[0];
     assert!(
-        e.bulk_baseline.is_some(),
+        e.attachments.is_some(),
         "the split's geometry travels as an out-of-band BaselineWorld"
     );
     let marker_id = e
@@ -130,7 +130,7 @@ fn giant_split_commits_with_bulk_baseline_ops_and_replays_exactly() {
             .replay_transaction(
                 &entry.transaction,
                 &entry.participants,
-                entry.bulk_baseline.as_ref(),
+                entry.geometry_only_bulk(),
             )
             .expect("journalled bulk split replays from baseline");
     }
