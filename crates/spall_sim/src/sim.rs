@@ -478,6 +478,12 @@ mod creature_lifecycle_review;
 #[path = "creature_owner_bridge.rs"]
 mod creature_owner_bridge;
 
+#[path = "creature_motion.rs"]
+mod creature_motion;
+pub use creature_motion::{
+    AliveCreature, CreatureMoveOutcome, CreatureMoveRequest, CreatureMoveTiming,
+};
+
 #[path = "creature_capture.rs"]
 mod creature_capture;
 pub use creature_capture::CreatureCaptureError;
@@ -2132,6 +2138,9 @@ pub struct Simulation {
     journal: JournalSink,
     pub(crate) tick: Tick,
     next_control_seq: u64,
+    /// Ephemeral per-creature presentation (locomotion selector, clip phase).
+    creature_presentation: std::collections::BTreeMap<spall_core::CreatureKey, (u8, u64)>,
+    creature_move_timing: CreatureMoveTiming,
     next_damage_seq: u64,
     column_water: Option<crate::column_water::AuthoritativeColumnWater>,
     /// Whether the column water steps on its own thread.
@@ -3417,6 +3426,8 @@ impl Simulation {
             creatures: None,
             tick: Tick::ZERO,
             next_control_seq: 1,
+            creature_presentation: std::collections::BTreeMap::new(),
+            creature_move_timing: CreatureMoveTiming::default(),
             next_damage_seq: 0,
             column_water: None,
             column_water_worker: false,
@@ -3485,6 +3496,8 @@ impl Simulation {
             creatures: None,
             tick,
             next_control_seq: 1,
+            creature_presentation: std::collections::BTreeMap::new(),
+            creature_move_timing: CreatureMoveTiming::default(),
             next_damage_seq: 0,
             // Column water is installed after recovery by the caller.
             column_water: None,
@@ -3553,6 +3566,7 @@ impl Simulation {
         if let Some(creatures) = &mut self.creatures {
             creatures.reset_epoch()?;
         }
+        self.creature_presentation.clear();
         let off_thread = self.pipeline.stages_off_thread();
         let old_world = std::mem::replace(&mut self.world, world);
         let old_pipeline = std::mem::replace(&mut self.pipeline, pipeline);

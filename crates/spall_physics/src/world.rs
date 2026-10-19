@@ -6806,7 +6806,39 @@ impl PhysicsWorld {
                     body_delta,
                     angular_delta,
                 );
+                // Sound culling: a cell cannot touch terrain unless some solid
+                // terrain voxel lies inside the bound of everything that cell
+                // sweeps through. The bound is the chord between the cell's start
+                // and end centers inflated by the cell's circumscribed radius and
+                // twice the rotational excursion (|v| * angle at both ends of
+                // the arc). Voxel-grid and compound terrain shapes are culled
+                // against their own spatial index; any other shape is cast.
+                let end_center = motion.position_at_time(1.0).translation;
+                let start_center = cell_start.translation;
+                let cell_radius = (grid_origin + cell_center).length();
+                let reach = half.length() + 2.0 * cell_radius * angular_delta.length() + 1.0e-3;
+                let swept = rapier3d::parry::bounding_volume::Aabb::new(
+                    start_center.min(end_center) - Vector::splat(reach),
+                    start_center.max(end_center) + Vector::splat(reach),
+                );
                 for &terrain_handle in &terrain_colliders {
+                    let terrain = &self.colliders[terrain_handle];
+                    let shape = terrain.shape();
+                    if let Some(voxels) = shape.as_voxels() {
+                        let local = swept.transform_by(&terrain.position().inverse());
+                        if voxels
+                            .voxels_intersecting_local_aabb(&local)
+                            .next()
+                            .is_none()
+                        {
+                            continue;
+                        }
+                    } else if let Some(compound) = shape.as_compound() {
+                        let local = swept.transform_by(&terrain.position().inverse());
+                        if compound.bvh().intersect_aabb(&local).next().is_none() {
+                            continue;
+                        }
+                    }
                     cell_casts += 1;
                     // The terrain candidate list came from the synchronized live
                     // broad phase above. Querying one candidate by constructing a

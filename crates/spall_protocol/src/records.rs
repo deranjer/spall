@@ -55,6 +55,7 @@ pub enum WireTag {
     WeatherSnapshot = 24,
     SnowSurfaceFrame = 25,
     CreatureSync = 26,
+    CreatureMotionFrame = 27,
 }
 
 impl WireTag {
@@ -84,6 +85,7 @@ impl WireTag {
             24 => Self::WeatherSnapshot,
             25 => Self::SnowSurfaceFrame,
             26 => Self::CreatureSync,
+            27 => Self::CreatureMotionFrame,
             _ => return None,
         })
     }

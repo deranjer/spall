@@ -11,7 +11,11 @@
 //! source volume ids must be monotone and unique. Exact allocator continuity is
 //! the server's invariant and is checked by the reducer there.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use spall_core::{
     CREATURE_ALLOCATOR_SCHEMA, CreatureAllocatorSnapshotV1, CreatureKey, VolumeId, WorldId,
@@ -37,6 +41,40 @@ pub enum ReplicaCreatureError {
     BulkUnsupported,
 }
 
+/// One received root pose, stamped with its arrival time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MotionSample {
+    at: Instant,
+    server_tick: u64,
+    translation_m: [f64; 3],
+    rotation_xyzw: [f32; 4],
+    linear_velocity_m_s: [f32; 3],
+    locomotion_tag: u8,
+    clip_phase_tick: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MotionTrack {
+    previous: Option<MotionSample>,
+    current: MotionSample,
+}
+
+/// A creature's presented pose at a render instant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreaturePresentation {
+    pub translation_m: [f64; 3],
+    pub rotation_xyzw: [f32; 4],
+    pub locomotion_tag: u8,
+    /// Clip phase in ticks at the render instant.
+    pub clip_phase_tick: f64,
+}
+
+/// How far behind the newest received sample creatures are drawn, so two
+/// samples usually bracket the render time at the 20 Hz send rate.
+pub const CREATURE_RENDER_DELAY: Duration = Duration::from_millis(110);
+/// Longest a creature is extrapolated along its velocity past its newest sample.
+const MAX_EXTRAPOLATION: Duration = Duration::from_millis(150);
+
 #[derive(Debug, Clone)]
 pub struct ReplicaCreatures {
     catalog: Arc<OwnedCreatureCatalog>,
@@ -44,6 +82,8 @@ pub struct ReplicaCreatures {
     next_creature_id: u64,
     next_volume_floor: u64,
     records: BTreeMap<CreatureKey, CreatureOwnershipRecordV4>,
+    motion: BTreeMap<u64, MotionTrack>,
+    motion_applied: u64,
     revision: u64,
 }
 
@@ -55,6 +95,8 @@ impl ReplicaCreatures {
             next_creature_id: 1,
             next_volume_floor: 1,
             records: BTreeMap::new(),
+            motion: BTreeMap::new(),
+            motion_applied: 0,
             revision: 0,
         }
     }
@@ -66,6 +108,7 @@ impl ReplicaCreatures {
         self.next_creature_id = 1;
         self.next_volume_floor = 1;
         self.records.clear();
+        self.motion.clear();
         self.revision = self.revision.saturating_add(1);
     }
 
@@ -102,6 +145,148 @@ impl ReplicaCreatures {
                 TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
             )
         })
+    }
+
+    /// Applies a presentation frame. Entries for creatures this replica does not
+    /// hold, from another world epoch, or not newer than the one already applied
+    /// are ignored. Returns how many entries were applied.
+    pub fn apply_motion(
+        &mut self,
+        frame: &spall_protocol::CreatureMotionFrame,
+        now: Instant,
+    ) -> usize {
+        if let Some((_, epoch)) = self.identity
+            && frame.world_epoch != epoch
+        {
+            return 0;
+        }
+        let mut applied = 0;
+        for entry in &frame.entries {
+            let Some(record) = self
+                .records
+                .values()
+                .find(|r| r.state.key.creature_id.get() == entry.creature_id)
+            else {
+                continue;
+            };
+            if record.state.lifecycle != spall_protocol::CreatureLifecycleState::Alive {
+                continue;
+            }
+            let sample = MotionSample {
+                at: now,
+                server_tick: frame.server_tick,
+                translation_m: entry.translation_m,
+                rotation_xyzw: entry.rotation_xyzw,
+                linear_velocity_m_s: entry.linear_velocity_m_s,
+                locomotion_tag: entry.locomotion_tag,
+                clip_phase_tick: entry.clip_phase_tick,
+            };
+            match self.motion.get_mut(&entry.creature_id) {
+                Some(track) if frame.server_tick <= track.current.server_tick => continue,
+                Some(track) => {
+                    track.previous = Some(track.current);
+                    track.current = sample;
+                }
+                None => {
+                    self.motion.insert(
+                        entry.creature_id,
+                        MotionTrack {
+                            previous: None,
+                            current: sample,
+                        },
+                    );
+                }
+            }
+            applied += 1;
+        }
+        self.motion_applied += applied as u64;
+        applied
+    }
+
+    /// The pose to draw for `record` at `now`: interpolated between the two
+    /// newest samples, held or briefly extrapolated past the newest, and the
+    /// record's own root when no motion has arrived yet.
+    pub fn presentation(
+        &self,
+        record: &CreatureOwnershipRecordV4,
+        now: Instant,
+    ) -> CreaturePresentation {
+        let state = &record.state;
+        let fallback = CreaturePresentation {
+            translation_m: state.root_translation_m,
+            rotation_xyzw: state.root_rotation_xyzw,
+            locomotion_tag: state.locomotion_tag,
+            clip_phase_tick: state.clip_phase_tick as f64,
+        };
+        let Some(track) = self.motion.get(&state.key.creature_id.get()) else {
+            return fallback;
+        };
+        let render_at = now.checked_sub(CREATURE_RENDER_DELAY).unwrap_or(now);
+        let current = track.current;
+        let phase_at = |sample: &MotionSample, at: Instant| {
+            sample.clip_phase_tick as f64
+                + at.saturating_duration_since(sample.at).as_secs_f64() * 60.0
+        };
+        if let Some(previous) = track.previous
+            && render_at < current.at
+        {
+            let span = current
+                .at
+                .saturating_duration_since(previous.at)
+                .as_secs_f64();
+            let t = if span <= 0.0 {
+                1.0
+            } else {
+                (render_at
+                    .saturating_duration_since(previous.at)
+                    .as_secs_f64()
+                    / span)
+                    .clamp(0.0, 1.0)
+            };
+            let lerp = |a: f64, b: f64| a + (b - a) * t;
+            return CreaturePresentation {
+                translation_m: [
+                    lerp(previous.translation_m[0], current.translation_m[0]),
+                    lerp(previous.translation_m[1], current.translation_m[1]),
+                    lerp(previous.translation_m[2], current.translation_m[2]),
+                ],
+                rotation_xyzw: nlerp(previous.rotation_xyzw, current.rotation_xyzw, t as f32),
+                locomotion_tag: current.locomotion_tag,
+                clip_phase_tick: phase_at(&previous, render_at),
+            };
+        }
+        let ahead = render_at
+            .saturating_duration_since(current.at)
+            .min(MAX_EXTRAPOLATION)
+            .as_secs_f64();
+        CreaturePresentation {
+            translation_m: [
+                current.translation_m[0] + f64::from(current.linear_velocity_m_s[0]) * ahead,
+                current.translation_m[1] + f64::from(current.linear_velocity_m_s[1]) * ahead,
+                current.translation_m[2] + f64::from(current.linear_velocity_m_s[2]) * ahead,
+            ],
+            rotation_xyzw: current.rotation_xyzw,
+            locomotion_tag: current.locomotion_tag,
+            clip_phase_tick: phase_at(&current, render_at),
+        }
+    }
+
+    /// Largest horizontal distance any creature is presented from where its
+    /// ownership record placed it. A rough "did anything move" measure.
+    pub fn max_displacement_m(&self, now: Instant) -> f64 {
+        self.records
+            .values()
+            .map(|record| {
+                let presented = self.presentation(record, now).translation_m;
+                let root = record.state.root_translation_m;
+                (presented[0] - root[0]).hypot(presented[2] - root[2])
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// Motion entries applied so far.
+    pub fn motion_entries_applied(&self) -> u64 {
+        self.motion_applied
     }
 
     /// Installs one server-captured record at join time. Idempotent: an equal
@@ -261,6 +446,21 @@ impl ReplicaCreatures {
         self.revision = self.revision.saturating_add(applied);
         Ok(())
     }
+}
+
+fn nlerp(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    // Take the shorter arc, then renormalize.
+    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+    let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+    let mut out = [0.0; 4];
+    for i in 0..4 {
+        out[i] = a[i] + (sign * b[i] - a[i]) * t;
+    }
+    let length = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if length <= f32::EPSILON {
+        return a;
+    }
+    out.map(|v| v / length)
 }
 
 fn commit_reduce(

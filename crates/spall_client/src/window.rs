@@ -173,6 +173,7 @@ pub trait CreatureView: Send + Sync + std::fmt::Debug {
         &self,
         creatures: &crate::replica_creatures::ReplicaCreatures,
         tick: f64,
+        now: Instant,
     ) -> Vec<CubeInstance>;
 }
 
@@ -2807,7 +2808,11 @@ impl ApplicationHandler for InteractiveApp {
                     && let Some(creatures) = replica.creatures()
                     && !creatures.is_empty()
                 {
-                    overlay.extend(view.instances(creatures, replica.now_tick_estimate()));
+                    overlay.extend(view.instances(
+                        creatures,
+                        replica.now_tick_estimate(),
+                        Instant::now(),
+                    ));
                 }
                 let outcome = match renderer.begin_frame(None, &overlay) {
                     Ok(outcome) => outcome,

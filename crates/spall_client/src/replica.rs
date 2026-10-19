@@ -1573,6 +1573,24 @@ impl ReplicaWorld {
         creatures.install_sync(sync).map_err(|e| e.to_string())
     }
 
+    /// Applies a creature presentation frame stamped with its arrival time.
+    pub fn apply_creature_motion(
+        &mut self,
+        frame: &spall_protocol::CreatureMotionFrame,
+        now: std::time::Instant,
+    ) -> usize {
+        self.creatures
+            .as_mut()
+            .map_or(0, |creatures| creatures.apply_motion(frame, now))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn creatures_mut_for_tests(
+        &mut self,
+    ) -> &mut crate::replica_creatures::ReplicaCreatures {
+        self.creatures.as_mut().expect("creature store installed")
+    }
+
     /// Replicated creature ownership records, if a catalog is installed.
     pub fn creatures(&self) -> Option<&crate::replica_creatures::ReplicaCreatures> {
         self.creatures.as_ref()

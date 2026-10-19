@@ -1,0 +1,205 @@
+//! Authoritative kinematic movement of alive creatures.
+//!
+//! The game decides where a creature wants to go and supplies the sampled part
+//! pose for this step; the engine sweeps that complete pose and root target
+//! against fixed terrain through the physics articulated-transition API and
+//! only then lets it stand. A blocked sample changes nothing. Presentation
+//! state (locomotion selector, clip phase) is remembered per creature so the
+//! server can publish it with the physically applied root; it is not part of
+//! the ownership record and is not persisted.
+use super::*;
+use spall_physics::ArticulatedPose;
+use spall_protocol::{
+    CREATURE_MOTION_SCHEMA, CreatureLifecycleState, CreatureMotionEntry, CreatureMotionFrame,
+};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatureMoveRequest {
+    pub key: spall_core::CreatureKey,
+    /// Desired root translation in world metres.
+    pub target_translation_m: [f64; 3],
+    pub target_rotation_xyzw: [f32; 4],
+    /// The complete sampled local pose of every source part, in part-id order.
+    pub parts: Vec<(u32, spall_physics::PartTransform)>,
+    pub locomotion_tag: u8,
+    pub clip_phase_tick: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CreatureMoveOutcome {
+    /// The pose and root were staged for the next physics step.
+    Staged,
+    /// Terrain blocks the swept path; nothing changed.
+    Blocked {
+        part_id: Option<u32>,
+        time_of_impact: Option<f32>,
+    },
+    /// A previous pose has not been installed yet; try again next tick.
+    Busy,
+}
+
+/// Where the swept-transition time of recent moves went, summed since the last
+/// [`Simulation::take_creature_move_timing`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CreatureMoveTiming {
+    pub moves: u64,
+    pub blocked: u64,
+    pub terrain_candidates: u64,
+    pub cell_casts: u64,
+    pub query_sync: std::time::Duration,
+    pub candidate_query: std::time::Duration,
+    pub exact_cast: std::time::Duration,
+}
+
+/// Current applied root of an alive creature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AliveCreature {
+    pub key: spall_core::CreatureKey,
+    pub translation_m: [f64; 3],
+    pub rotation_xyzw: [f32; 4],
+}
+
+impl Simulation {
+    /// Returns and clears the accumulated swept-transition timing.
+    pub fn take_creature_move_timing(&mut self) -> CreatureMoveTiming {
+        std::mem::take(&mut self.creature_move_timing)
+    }
+
+    /// Every alive creature with its physically applied root pose.
+    pub fn alive_creatures(&self) -> Vec<AliveCreature> {
+        let Some(host) = self.creatures.as_ref() else {
+            return Vec::new();
+        };
+        host.records()
+            .filter(|state| state.lifecycle == CreatureLifecycleState::Alive)
+            .filter_map(|state| {
+                let owner = self.world.creature_physics_owner(state.key)?;
+                let snapshot = self.world.physics().articulated_owner_snapshot(owner)?;
+                Some(AliveCreature {
+                    key: state.key,
+                    translation_m: self
+                        .world
+                        .physics_origin()
+                        .to_world_f64(snapshot.root.translation_m),
+                    rotation_xyzw: snapshot.root.rotation,
+                })
+            })
+            .collect()
+    }
+
+    pub fn move_creature(
+        &mut self,
+        request: CreatureMoveRequest,
+    ) -> Result<CreatureMoveOutcome, String> {
+        let state = self
+            .creatures
+            .as_ref()
+            .and_then(|host| host.record(request.key.creature_id))
+            .ok_or("creature is not hosted")?;
+        if state.key != request.key || state.lifecycle != CreatureLifecycleState::Alive {
+            return Err("creature is not alive".into());
+        }
+        let owner = self
+            .world
+            .creature_physics_owner(request.key)
+            .ok_or("creature has no physical owner")?;
+        let snapshot = self
+            .world
+            .physics()
+            .articulated_owner_snapshot(owner)
+            .ok_or("creature owner is missing from physics")?;
+        if snapshot.pending_pose {
+            return Ok(CreatureMoveOutcome::Busy);
+        }
+        let target = self
+            .world
+            .physics_origin()
+            .to_local_f32(request.target_translation_m)
+            .ok_or("target is outside the physics frame")?;
+        let update = ArticulatedPose {
+            topology_token: snapshot.topology_token,
+            base_pose_token: snapshot.pose_token,
+            pose_token: snapshot
+                .pose_token
+                .checked_add(1)
+                .ok_or("pose token exhausted")?,
+            parts: request.parts,
+        };
+        let transition = self
+            .world
+            .physics_mut()
+            .update_articulated_pose_with_swept_root_pose(
+                owner,
+                update,
+                spall_physics::PartTransform {
+                    translation_m: target,
+                    rotation_xyzw: request.target_rotation_xyzw,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let timing = &mut self.creature_move_timing;
+        timing.moves += 1;
+        timing.terrain_candidates += transition.terrain_candidates as u64;
+        timing.cell_casts += transition.cell_casts as u64;
+        timing.query_sync += transition.query_sync_time;
+        timing.candidate_query += transition.candidate_query_time;
+        timing.exact_cast += transition.exact_cast_time;
+        if transition.blocked {
+            timing.blocked += 1;
+            return Ok(CreatureMoveOutcome::Blocked {
+                part_id: transition.part_id,
+                time_of_impact: transition.time_of_impact,
+            });
+        }
+        self.creature_presentation.insert(
+            request.key,
+            (request.locomotion_tag, request.clip_phase_tick),
+        );
+        Ok(CreatureMoveOutcome::Staged)
+    }
+
+    /// Motion entries for alive creatures whose root satisfies `include`,
+    /// sorted by creature id. `None` when there is nothing to send.
+    pub fn creature_motion_frame(
+        &self,
+        include: &dyn Fn([f64; 3]) -> bool,
+    ) -> Option<CreatureMotionFrame> {
+        let host = self.creatures.as_ref()?;
+        let mut entries: Vec<CreatureMotionEntry> = host
+            .records()
+            .filter(|state| state.lifecycle == CreatureLifecycleState::Alive)
+            .filter_map(|state| {
+                let owner = self.world.creature_physics_owner(state.key)?;
+                let root = self.world.physics().articulated_owner_snapshot(owner)?.root;
+                let translation_m = self.world.physics_origin().to_world_f64(root.translation_m);
+                if !include(translation_m) {
+                    return None;
+                }
+                let (locomotion_tag, clip_phase_tick) = self
+                    .creature_presentation
+                    .get(&state.key)
+                    .copied()
+                    .unwrap_or((state.locomotion_tag, state.clip_phase_tick));
+                Some(CreatureMotionEntry {
+                    creature_id: state.key.creature_id.get(),
+                    translation_m,
+                    rotation_xyzw: root.rotation,
+                    linear_velocity_m_s: root.linvel_m_s,
+                    locomotion_tag,
+                    clip_phase_tick,
+                })
+            })
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort_by_key(|entry| entry.creature_id);
+        let world_epoch = self.creature_allocator_snapshot()?.world_epoch;
+        Some(CreatureMotionFrame {
+            schema: CREATURE_MOTION_SCHEMA,
+            world_epoch,
+            server_tick: self.tick.get(),
+            entries,
+        })
+    }
+}

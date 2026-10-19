@@ -108,8 +108,9 @@ pub use replication::{
 pub use schedule::EditTiming;
 pub use schedule::{EditPipeline, RegionKey, TickReport};
 pub use sim::{
-    AuthoritativeCreatureIntent, CONTACT_DAMAGE_ACTOR_ID, CommittedCreatureLifecycle,
-    ContactDamageReport, CreatureBirthPartInput, CreatureCaptureError, CreatureRestoreError,
+    AliveCreature, AuthoritativeCreatureIntent, CONTACT_DAMAGE_ACTOR_ID,
+    CommittedCreatureLifecycle, ContactDamageReport, CreatureBirthPartInput, CreatureCaptureError,
+    CreatureMoveOutcome, CreatureMoveRequest, CreatureMoveTiming, CreatureRestoreError,
     PreparedCreatureRestore, SERVER_REQUEST_ID_BAND, Simulation, SimulationConfig, TICK_DT_S,
     TickError,
 };

@@ -28,8 +28,12 @@ pub mod column_water_wire;
 pub mod creature;
 pub mod creature_catalog;
 pub use creature_catalog::{OwnedCreatureAsset, OwnedCreatureCatalog, OwnedCreatureSpecies};
+pub mod creature_motion;
 pub mod creature_owner;
 pub mod creature_sync;
+pub use creature_motion::{
+    CREATURE_MOTION_SCHEMA, CreatureMotionEntry, CreatureMotionFrame, MAX_CREATURE_MOTION_ENTRIES,
+};
 pub use creature_sync::{CREATURE_SYNC_SCHEMA, CreatureSync};
 pub mod creature_snapshot;
 pub mod handshake;

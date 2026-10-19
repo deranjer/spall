@@ -229,6 +229,11 @@ pub const AWAIT_SETTLE_STABLE_TICKS: u64 = 60;
 /// manifest negotiation is T16/T17; this keeps the handshake honest meanwhile.
 pub const T10_CONTENT_TAG: &[u8] = b"spall-t10-bridge-v1";
 /// World id used by the built-in T10 scene.
+/// Creature motion frames go out every this many ticks (20 Hz at 60 Hz).
+const CREATURE_MOTION_PERIOD_TICKS: u64 = 3;
+/// Only creatures within this horizontal distance of a session's player are sent.
+const CREATURE_MOTION_RADIUS_M: f64 = 320.0;
+
 pub const T10_WORLD_ID: u128 = 0x5A11_0000_0000_7010;
 
 /// Which built-in scene to serve.
@@ -3759,6 +3764,41 @@ async fn serve_async(
                             format!("creature lifecycle commit failed: {error}"),
                             ticks_run,
                         );
+                    }
+                }
+            }
+            if let Some(service) = creature_service.as_ref() {
+                if let Err(error) = service.run_motion(&mut sim) {
+                    return SimResult::error(error, ticks_run);
+                }
+                // Presentation frames at 20 Hz, to live sessions only, limited to
+                // creatures near that session's player.
+                if sim.current_tick().get() % CREATURE_MOTION_PERIOD_TICKS == 0 {
+                    for session in lj.live_sessions().collect::<Vec<_>>() {
+                        if water_backlogged(&clients_for_sim, session) {
+                            continue;
+                        }
+                        let center = sim
+                            .player_state(session_player_entity(session))
+                            .map(|player| player.position_m);
+                        let include = move |position: [f64; 3]| match center {
+                            Some(center) => {
+                                let dx = position[0] - center[0];
+                                let dz = position[2] - center[2];
+                                dx * dx + dz * dz
+                                    <= CREATURE_MOTION_RADIUS_M * CREATURE_MOTION_RADIUS_M
+                            }
+                            None => true,
+                        };
+                        if let Some(frame) = sim.creature_motion_frame(&include) {
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Water(Arc::new(vec![WireRecord::CreatureMotionFrame(
+                                    frame,
+                                )])),
+                            );
+                        }
                     }
                 }
             }

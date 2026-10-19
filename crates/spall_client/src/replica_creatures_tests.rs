@@ -234,3 +234,95 @@ fn rejected_lifecycle_leaves_the_replica_unchanged() {
     assert_eq!(replica.creatures().unwrap().revision(), revision);
     assert_eq!(replica.creatures().unwrap().len(), 1);
 }
+
+fn motion_frame(
+    world_epoch: u64,
+    server_tick: u64,
+    creature_id: u64,
+    x: f64,
+) -> spall_protocol::CreatureMotionFrame {
+    spall_protocol::CreatureMotionFrame {
+        schema: spall_protocol::CREATURE_MOTION_SCHEMA,
+        world_epoch,
+        server_tick,
+        entries: vec![spall_protocol::CreatureMotionEntry {
+            creature_id,
+            translation_m: [x, 2.0, 8.0],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            linear_velocity_m_s: [1.0, 0.0, 0.0],
+            locomotion_tag: 1,
+            clip_phase_tick: server_tick,
+        }],
+    }
+}
+
+#[test]
+fn motion_frames_interpolate_hold_and_ignore_stale_or_foreign_entries() {
+    let (mut sim, catalog) = server();
+    let mut replica = replica(&catalog);
+    let intent = birth_intent(&sim, &catalog, [12.0, 6.0, 12.0]);
+    let born = commit(&mut sim, &catalog, 1, 1, intent);
+    assert!(matches!(
+        replica.apply_transaction(&born.topology),
+        ApplyOutcome::Published { .. }
+    ));
+    let key = replica
+        .creatures()
+        .unwrap()
+        .records()
+        .next()
+        .unwrap()
+        .state
+        .key;
+    let id = key.creature_id.get();
+    let epoch = key.world_epoch.get();
+    let t0 = Instant::now();
+    let creatures = replica.creatures_mut_for_tests();
+
+    // An unknown creature and a foreign epoch change nothing.
+    assert_eq!(
+        creatures.apply_motion(&motion_frame(epoch, 10, id + 99, 0.0), t0),
+        0
+    );
+    assert_eq!(
+        creatures.apply_motion(&motion_frame(epoch + 1, 10, id, 0.0), t0),
+        0
+    );
+
+    assert_eq!(
+        creatures.apply_motion(&motion_frame(epoch, 10, id, 10.0), t0),
+        1
+    );
+    let later = t0 + Duration::from_millis(100);
+    assert_eq!(
+        creatures.apply_motion(&motion_frame(epoch, 16, id, 11.0), later),
+        1
+    );
+    // A stale tick is ignored.
+    assert_eq!(
+        creatures.apply_motion(&motion_frame(epoch, 13, id, 99.0), later),
+        0
+    );
+
+    let record = creatures.records().next().unwrap().clone();
+    // Render time = now - delay: halfway between the two arrivals.
+    let halfway = t0 + CREATURE_RENDER_DELAY + Duration::from_millis(50);
+    let mid = creatures.presentation(&record, halfway);
+    assert!(
+        (mid.translation_m[0] - 10.5).abs() < 1e-6,
+        "{:?}",
+        mid.translation_m
+    );
+    assert_eq!(mid.locomotion_tag, 1);
+    // Past the newest sample it extrapolates along velocity, capped.
+    let far = later + CREATURE_RENDER_DELAY + Duration::from_secs(5);
+    let held = creatures.presentation(&record, far);
+    assert!(
+        (held.translation_m[0] - (11.0 + 0.15)).abs() < 1e-6,
+        "{:?}",
+        held.translation_m
+    );
+    // A world reset forgets motion.
+    creatures.reset();
+    assert!(creatures.is_empty());
+}

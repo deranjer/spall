@@ -1,18 +1,20 @@
 //! Client-side drawing of replicated animals: samples the authored SPVX clip
-//! for each replicated record and emits lit cubes at the record's root pose.
+//! for each replicated record at its presented pose and emits lit cubes.
+
+use std::time::Instant;
 
 use glam::{Quat, Vec3};
 use spall_client::replica_creatures::ReplicaCreatures;
 use spall_client::window::CreatureView;
-use spall_protocol::CreatureLifecycleState;
 use spall_render::CubeInstance;
 
 use crate::animal_visual::{AnimalVisual, MAX_ANIMAL_VISUAL_CELLS, material_mapping};
-use crate::animals::{AnimalError, species};
+use crate::animals::{AnimalError, LOCOMOTION_IDLE, locomotion_clip, species};
 
 #[derive(Debug)]
 pub struct AnimalView {
-    visuals: Vec<([u8; 16], AnimalVisual)>,
+    visuals: Vec<([u8; 16], &'static str, AnimalVisual)>,
+    started: Instant,
 }
 
 impl AnimalView {
@@ -22,41 +24,60 @@ impl AnimalView {
             .into_iter()
             .map(|s| {
                 let uuid = s.asset.uuid;
+                let key = s.key;
                 AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
-                    .map(|visual| (uuid, visual))
-                    .map_err(|e| AnimalError::Asset(s.key, e.to_string()))
+                    .map(|visual| (uuid, key, visual))
+                    .map_err(|e| AnimalError::Asset(key, e.to_string()))
             })
             .collect::<Result<_, _>>()?;
-        Ok(Self { visuals })
+        Ok(Self {
+            visuals,
+            started: Instant::now(),
+        })
     }
 }
 
 impl CreatureView for AnimalView {
-    fn instances(&self, creatures: &ReplicaCreatures, tick: f64) -> Vec<CubeInstance> {
+    fn instances(
+        &self,
+        creatures: &ReplicaCreatures,
+        _tick: f64,
+        now: Instant,
+    ) -> Vec<CubeInstance> {
         let mut out = Vec::new();
         for record in creatures.records() {
             let state = &record.state;
-            let Some((_, visual)) = self
+            let Some((_, species_key, visual)) = self
                 .visuals
                 .iter()
-                .find(|(uuid, _)| *uuid == state.asset.uuid)
+                .find(|(uuid, _, _)| *uuid == state.asset.uuid)
             else {
                 continue;
             };
-            let phase = match state.lifecycle {
-                CreatureLifecycleState::Alive => tick + state.clip_phase_tick as f64,
-                _ => state.clip_phase_tick as f64,
+            let presented = creatures.presentation(record, now);
+            let clip = if presented.locomotion_tag == LOCOMOTION_IDLE {
+                state.clip_name.as_str()
+            } else {
+                locomotion_clip(species_key, presented.locomotion_tag).unwrap_or("idle")
             };
-            let duration = f64::from(visual.clip_duration(&state.clip_name).unwrap_or(1).max(1));
-            let Ok(cells) = visual.sample(&state.clip_name, phase.rem_euclid(duration)) else {
+            let duration = f64::from(visual.clip_duration(clip).unwrap_or(1).max(1));
+            // Resting animals idle on a local clock, offset per creature so a herd
+            // does not breathe in step.
+            let phase = if presented.locomotion_tag == LOCOMOTION_IDLE {
+                now.saturating_duration_since(self.started).as_secs_f64() * 60.0
+                    + (state.key.creature_id.get() % 17) as f64 * 11.0
+            } else {
+                presented.clip_phase_tick
+            };
+            let Ok(cells) = visual.sample(clip, phase.rem_euclid(duration)) else {
                 continue;
             };
-            let [x, y, z, w] = state.root_rotation_xyzw;
+            let [x, y, z, w] = presented.rotation_xyzw;
             let root_q = Quat::from_xyzw(x, y, z, w).normalize();
             let root_t = Vec3::new(
-                state.root_translation_m[0] as f32,
-                state.root_translation_m[1] as f32,
-                state.root_translation_m[2] as f32,
+                presented.translation_m[0] as f32,
+                presented.translation_m[1] as f32,
+                presented.translation_m[2] as f32,
             );
             out.extend(cells.iter().map(|cell| {
                 CubeInstance::new(

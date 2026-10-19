@@ -562,6 +562,12 @@ pub struct ClientSummary {
     /// Creature ownership records held by the replica at the end of the run.
     #[serde(default)]
     pub creatures_replicated: usize,
+    /// Creature motion entries applied over the run.
+    #[serde(default)]
+    pub creature_motion_entries: u64,
+    /// Largest horizontal distance a creature was presented from its birth root.
+    #[serde(default)]
+    pub creature_max_displacement_m: f64,
     /// Server answers to `admin_script` commands, in arrival order.
     pub admin_statuses: Vec<spall_protocol::AdminStatus>,
     /// Farthest a replicated body moved from its first observed pose, metres.
@@ -1940,6 +1946,12 @@ async fn run_async(
                         } else {
                             counters.weather_snapshots.fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+                    Ok(Some(WireRecord::CreatureMotionFrame(frame))) => {
+                        replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_creature_motion(&frame, std::time::Instant::now());
                     }
                     Ok(Some(WireRecord::CreatureSync(sync))) => {
                         if let Err(error) = replica
@@ -3566,6 +3578,10 @@ async fn run_async(
         weather_snapshots_received: counters.weather_snapshots.load(Ordering::Relaxed),
         world_resets_installed: counters.world_resets.load(Ordering::Relaxed),
         creatures_replicated: guard.creatures().map_or(0, |c| c.len()),
+        creature_motion_entries: guard.creatures().map_or(0, |c| c.motion_entries_applied()),
+        creature_max_displacement_m: guard
+            .creatures()
+            .map_or(0.0, |c| c.max_displacement_m(std::time::Instant::now())),
         admin_statuses: admin_statuses
             .lock()
             .unwrap_or_else(|e| e.into_inner())

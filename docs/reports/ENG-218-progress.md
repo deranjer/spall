@@ -1813,3 +1813,48 @@ Not done: animal movement (records are static; only the idle clip animates on th
 client), damage/death, trout (needs the live water query), per-creature motion
 frames, interest filtering of creature sync, persistence/recovery with live
 animals, and the combined two-client GPU acceptance. These remain unrun.
+
+## 2026-10-19 animal movement in the 1 km world
+
+Alive animals now move through the engine's swept articulated-pose path and their
+motion replicates to clients.
+
+- `Simulation::move_creature` (`creature_motion.rs`): the game supplies the root
+  target and the complete sampled part pose; the engine runs
+  `update_articulated_pose_with_swept_root_pose` against fixed terrain. Outcomes are
+  `Staged`, `Blocked { part_id, time_of_impact }` (nothing changes) or `Busy`
+  (previous pose not installed). `alive_creatures`, `creature_motion_frame` and
+  `take_creature_move_timing` read applied physics state and diagnostics.
+- `WireTag::CreatureMotionFrame` (27): sorted per-creature root pose, velocity,
+  locomotion selector and clip phase, sent every 3 ticks (20 Hz) to live sessions,
+  limited to 320 m around that session's player. Presentation state, not ownership;
+  it never creates or retires a creature. Clients ignore unknown creatures, foreign
+  epochs and non-newer ticks.
+- Client: `ReplicaCreatures::presentation` interpolates between the two newest
+  samples 110 ms behind the newest (arrival-time stamped), then extrapolates at most
+  150 ms. Resting animals idle on a local clock.
+- Sandbox director: deer rest, then walk (two-phase stepping so the feet clear 0.25 m
+  terrain steps), crows orbit above the highest ground under their circle. Root
+  height keeps the lowest cell of the requested pose 5 cm above ground; a blocked
+  move makes a walker rest with back-off, a bird reverse.
+
+Feasibility note (ENG-210 gate): the exact per-cell terrain transition is expensive,
+as ENG-210 recorded (deer 2.2-4.9 ms per transition, no population target agreed).
+On the natural 1 km world the first implementation measured ~80-100 ms per tick of
+movement for 36 animals (47 s of exact casts per 600 ticks). Two changes brought it
+to a stable ~2 ms average (worst ~28 ms): a sound cull in `spall_physics`
+(`update_articulated_pose_with_swept_root_pose` skips a cell's cast when no terrain
+voxel or compound sub-shape lies within the bound of everything that cell sweeps:
+chord between start/end centers + circumscribed radius + twice the rotational
+excursion), and director choices that avoid the casts failing (per-pose foot height,
+vertical-then-horizontal steps, back-off). The cull does not change any accepted or
+blocked result: 120 physics tests pass and the actual-asset `--bounded
+--kinematic-parts` probe reports 0 representation disagreements and 0 ray mismatches.
+This is a measured single-run result on one seed, not a population acceptance.
+
+Measured (release, `--worldgen natural --worldgen-size 4096 --animals 24`, seed 5,
+36 animals): 36 creatures and 5,115 motion entries applied by a headless late-joining
+client, max presented displacement 22 m; blocked moves ~3-5% after the fixes;
+GPU captures show a crow circling in successive frames. Still not done: damage and
+death, trout/water, motion-frame delta compression and interest tuning, persistence
+with live animals, a second-client GPU capture, and the combined acceptance gates.
