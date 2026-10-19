@@ -10,7 +10,7 @@ use crate::{
     Hash32, creature_owner::MAX_CREATURE_OWNER_SET_BYTES,
 };
 
-pub const CREATURE_SNAPSHOT_SCHEMA: u16 = 2;
+pub const CREATURE_SNAPSHOT_SCHEMA: u16 = 3;
 pub const MAX_CREATURE_SNAPSHOT_BYTES: usize = MAX_CREATURE_OWNER_SET_BYTES + 128;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

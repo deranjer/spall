@@ -791,7 +791,7 @@ mod creature_host_tests {
                     _ => Some(2),
                 },
                 local_transform: PartTransform::IDENTITY,
-                volume: source_volume_material(
+                volume: crate::fixtures::noisy_source_volume(
                     volume,
                     if index == 1 {
                         MaterialId(2)
@@ -1058,7 +1058,7 @@ mod creature_host_tests {
                             part_id: 1,
                             parent_id: None,
                             local_transform: PartTransform::IDENTITY,
-                            volume: source_volume(volume_id),
+                            volume: crate::fixtures::noisy_source_volume(volume_id, MaterialId(1)),
                         },
                         CreatureBirthPartInput {
                             part_id: 2,

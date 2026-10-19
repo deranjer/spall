@@ -1749,3 +1749,23 @@ clippy,fmt}.log, with explicit initial-failure logs retained. Hardlink warnings 
 filesystem incremental-cache copy fallback, not code lint failures. Coordinator
 review found no remaining concrete blocker in this internal producer/typed journal
 scope; global live caller/client/replay gates listed above remain open.
+
+## 2026-10-19 compact source bricks (owner schema 5, wire/protocol 13)
+
+Creature source bricks are serialized as canonical run-length cells
+(`Runs(Vec<(len u32, material u16)>)`, no empty or adjacent-equal runs, exact
+32768-cell coverage) instead of 32768-entry dense `u16` arrays. The in-memory
+`BaselineCells::Dense` value and every hash (source content, topology, full
+owner) are unchanged; only the wire/store byte layout changes, so owner/change/
+commit/bulk-payload/snapshot schemas move to 5/5/5/5/3 and wire/protocol to 13.
+Superseded layouts (including Dense-array bricks) reject without migration. The
+decode budget still reserves the full dense footprint before reading runs.
+
+Measured (test `compact_three_part_birth_fits_one_control_frame`): the
+three-part birth control body is 856 bytes, down from 99,144 (cap 65,536), so
+unedited animals publish inline. The bulk marker/transfer-ID path remains for
+records that still exceed the ceiling; its tests now use
+`fixtures::noisy_source_volume` (alternating solid/air, 369,292-byte control
+body, 38,647 compressed) as the worst case. Not done here: a game-owned source
+resolver so unedited parts omit bricks entirely (in-memory records still hold
+dense bricks, ~64 KiB per part). Spawning stays closed.

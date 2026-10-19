@@ -1519,3 +1519,20 @@ pub fn spawn_review_lever(
         .expect("review lever spawns");
     (base, lever)
 }
+
+/// Source volume whose single brick alternates solid and air along every row,
+/// so run-length ownership encoding cannot shrink it: the only fixture shape
+/// that still exceeds the inline control-record ceiling after compaction.
+pub fn noisy_source_volume(id: VolumeId, material: MaterialId) -> Volume {
+    let mut volume = Volume::new(id, CellSizeCode::Quarter);
+    let mut plan = EditPlan::new(id);
+    for z in 0..32 {
+        for y in 0..32 {
+            for x in (0..32).step_by(2) {
+                plan.set(GlobalCell::new(x, y, z), material);
+            }
+        }
+    }
+    volume.apply_edit(&plan).unwrap();
+    volume
+}

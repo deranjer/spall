@@ -105,7 +105,9 @@ fn base() -> spall_store::Checkpoint {
 fn animal_and_mixed_typed_journal_payloads_survive_sqlite_with_exact_sources_and_motion() {
     for mixed in [false, true] {
         let (tx, set, after) = attached(mixed);
-        // This actual three-part source record exceeds the inline record ceiling.
+        // Run-length source bricks make this actual three-part record fit one
+        // control frame; the typed bulk attachment still carries it unchanged,
+        // as larger edited sources will.
         let mut inline = tx.clone();
         let TransactionAttachmentV1::CreatureLifecycle { payload, .. } =
             set.attachments.last().unwrap()
@@ -116,10 +118,7 @@ fn animal_and_mixed_typed_journal_payloads_survive_sqlite_with_exact_sources_and
             commit: Box::new(payload.commit.clone()),
         };
         inline.validate().unwrap();
-        assert!(matches!(
-            spall_protocol::encode_control(&inline),
-            Err(spall_protocol::CodecError::Size(_))
-        ));
+        assert!(spall_protocol::encode_control(&inline).is_ok());
         let row = JournalRecord {
             seq: 1,
             tick: 1,

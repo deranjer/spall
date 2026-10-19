@@ -49,15 +49,8 @@ fn birth(cat: &Catalog, next: u64, creature: u64) -> AuthoritativeCreatureIntent
         .source_bindings
         .iter()
         .map(|binding| {
-            let mut volume = Volume::new(binding.source_volume_id, CellSizeCode::Quarter);
-            volume
-                .apply_edit(&EditPlan::filled_box(
-                    volume.id(),
-                    GlobalCell::new(0, 0, 0),
-                    GlobalCell::new(0, 0, 0),
-                    MaterialId(1),
-                ))
-                .unwrap();
+            let volume =
+                crate::fixtures::noisy_source_volume(binding.source_volume_id, MaterialId(1));
             CreatureBirthPartInput {
                 part_id: binding.part_id,
                 parent_id: if binding.part_id == 1 {
@@ -351,6 +344,18 @@ fn missing_invalid_duplicate_and_unused_reserved_ids_never_mutate_live_state() {
     };
     state.source_bindings.truncate(1);
     parts.truncate(1);
+    let mut tiny = Volume::new(
+        state.source_bindings[0].source_volume_id,
+        CellSizeCode::Quarter,
+    );
+    tiny.apply_edit(&EditPlan::filled_box(
+        tiny.id(),
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(0, 0, 0),
+        MaterialId(1),
+    ))
+    .unwrap();
+    parts[0].volume = tiny;
     let small_assets = [CreatureAssetCatalogEntry {
         part_ids: &[1],
         ..cat.assets[0]

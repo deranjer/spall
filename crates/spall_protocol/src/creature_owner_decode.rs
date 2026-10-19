@@ -853,6 +853,7 @@ impl<'de> BudgetDecode<'de> for CreatureMaskCellV1 {
 #[derive(Deserialize)]
 enum CellsVariant {
     Uniform,
+    #[serde(rename = "Runs")]
     Dense,
     Digest,
 }
@@ -865,7 +866,7 @@ impl<'de, 'a> DeserializeSeed<'de> for CellsSeed<'a> {
     fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
         d.deserialize_enum(
             "BaselineCells",
-            &["Uniform", "Dense", "Digest"],
+            &["Uniform", "Runs", "Digest"],
             CellsVisitor {
                 budget: self.budget,
             },
@@ -923,30 +924,34 @@ struct DenseVisitor<'a> {
 impl<'de, 'a> Visitor<'de> for DenseVisitor<'a> {
     type Value = Vec<u16>;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "exactly {CELLS_PER_BRICK} material ids")
+        write!(f, "canonical runs covering {CELLS_PER_BRICK} cells")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u16>, A::Error> {
-        if seq.size_hint().is_some_and(|n| n != CELLS_PER_BRICK) {
-            return Err(A::Error::custom("dense brick cell count is invalid"));
+        let invalid = || A::Error::custom("dense brick runs are invalid");
+        if seq
+            .size_hint()
+            .is_some_and(|n| n == 0 || n > CELLS_PER_BRICK)
+        {
+            return Err(invalid());
         }
         let mut cells = Vec::new();
         cells
             .try_reserve_exact(CELLS_PER_BRICK)
             .map_err(|_| A::Error::custom("creature ownership allocation limit exceeded"))?;
-        while cells.len() < CELLS_PER_BRICK {
-            let Some(id) = seq.next_element::<u16>()? else {
-                break;
-            };
-            if id != 0 {
-                self.budget.add_solid_cells::<A::Error>(1)?;
+        let mut previous: Option<u16> = None;
+        while let Some((len, id)) = seq.next_element::<(u32, u16)>()? {
+            let len = len as usize;
+            if len == 0 || previous == Some(id) || len > CELLS_PER_BRICK - cells.len() {
+                return Err(invalid());
             }
-            cells.push(id);
+            if id != 0 {
+                self.budget.add_solid_cells::<A::Error>(len)?;
+            }
+            cells.resize(cells.len() + len, id);
+            previous = Some(id);
         }
         if cells.len() != CELLS_PER_BRICK {
-            return Err(A::Error::custom("dense brick cell count is invalid"));
-        }
-        if seq.next_element_seed(RejectExtraSeed)?.is_some() {
-            return Err(A::Error::custom("dense brick cell count is invalid"));
+            return Err(invalid());
         }
         Ok(cells)
     }

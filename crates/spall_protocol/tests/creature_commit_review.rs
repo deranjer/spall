@@ -129,17 +129,15 @@ fn owner(f: &Fixture) -> CreatureOwnershipRecordV4 {
     let state = f.state();
     let q = [0.0_f32, 0.0, 0.0, 1.0];
     let pose = serde_json::json!({"translation_m": [0.0,0.0,0.0], "rotation_xyzw": q});
-    let mut ids = vec![0_u16; 32768];
-    ids[0] = 1;
     let raw = serde_json::json!({
-        "schema": 4, "state": state, "owner_key": 9, "source_generation": 1,
+        "schema": 5, "state": state, "owner_key": 9, "source_generation": 1,
         "next_component_serial": 1, "primary_component_serial": null, "part_velocities": [],
         "parts": [{
             "part_id": 1, "source_volume_id": 100, "source_generation": 1,
             "source_revision": 1, "next_brick_revision": 2, "cell_size_code": 1, "bounds": [[0,0,0],[0,0,0]],
             "source_content_hash": vec![0_u8;32], "parent_id": null,
             "initial_local_pose": pose, "frozen_local_pose": pose,
-            "bricks": [{"coord": [0,0,0], "revision": 1, "edited": true, "cells": {"Dense": ids}}]
+            "bricks": [{"coord": [0,0,0], "revision": 1, "edited": true, "cells": {"Runs": [[1, 1], [32767, 0]]}}]
         }],
         "components": [{
             "owner_key": 9, "serial": null, "translation_m": [0.0,0.0,0.0],
@@ -554,6 +552,16 @@ fn validated_nonempty_birth_round_trips_as_an_ordered_operation() {
 }
 
 fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV4 {
+    three_part_commit(f, false)
+}
+
+/// Worst case for the compact brick encoding: alternating solid/air cells have
+/// no runs to collapse, so the record genuinely exceeds the control ceiling.
+fn noisy_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV4 {
+    three_part_commit(f, true)
+}
+
+fn three_part_commit(f: &mut Fixture, noisy: bool) -> CreatureLifecycleCommitV4 {
     f.assets[0].part_ids = &[1, 2, 3];
     let mut after = owner(f);
     let source = after.parts[0].clone();
@@ -569,6 +577,13 @@ fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV4 {
         part.part_id = part_id;
         part.source_volume_id = volume;
         part.parent_id = (index > 0).then_some(index);
+        if noisy {
+            part.bricks[0].cells = spall_protocol::BaselineCells::Dense(
+                (0..32768_u16)
+                    .map(|cell| u16::from(cell % 2 == 0))
+                    .collect(),
+            );
+        }
         part.source_content_hash = part.canonical_source_content_hash();
         after.parts.push(part);
         after.part_velocities.push(CreaturePartVelocityV2 {
@@ -584,6 +599,15 @@ fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV4 {
         let mut part_mask = mask.clone();
         part_mask.part_id = part_id;
         part_mask.volume_id = volume;
+        if noisy {
+            part_mask.cells = (0..32768_u32)
+                .step_by(2)
+                .map(|index| spall_protocol::CreatureMaskCellV1 {
+                    index: index as u16,
+                    material_id: 1,
+                })
+                .collect();
+        }
         after.components[0].source_masks.push(part_mask);
     }
     after.validate(&f.catalog()).unwrap();
@@ -599,7 +623,7 @@ fn validated_three_part_commit(f: &mut Fixture) -> CreatureLifecycleCommitV4 {
 #[test]
 fn validated_three_part_sources_require_bulk_instead_of_a_control_frame() {
     let mut f = Fixture::new();
-    let commit = validated_three_part_commit(&mut f);
+    let commit = noisy_three_part_commit(&mut f);
     let reduced = commit
         .validate_and_reduce(None, context(7, 1, 100), &f.catalog())
         .unwrap();
@@ -746,7 +770,7 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
     use std::io::Read;
 
     let mut f = Fixture::new();
-    let commit = validated_three_part_commit(&mut f);
+    let commit = noisy_three_part_commit(&mut f);
     let transaction_id = commit.change.transaction_id;
     let payload = CreatureLifecycleBulkPayloadV4::new(transaction_id, 0, commit.clone()).unwrap();
     let compressed = payload.encode_compressed().unwrap();
@@ -1018,4 +1042,29 @@ fn lifecycle_bulk_rejects_uniform_brick_hash_work_before_hashing() {
         CreatureLifecycleBulkPayloadV4::new(commit.change.transaction_id, 0, commit,),
         Err(CreatureLifecycleBulkError::WorkLimit)
     ));
+}
+
+#[test]
+fn compact_three_part_birth_fits_one_control_frame() {
+    let mut f = Fixture::new();
+    let commit = validated_three_part_commit(&mut f);
+    let tx = TopologyTransaction {
+        transaction_id: commit.change.transaction_id,
+        server_tick: spall_core::Tick(9),
+        control_seq: ControlSeq(10),
+        algorithm_version: 1,
+        dependencies: vec![],
+        before: vec![],
+        after: vec![],
+        ops: vec![TopologyOp::CreatureLifecycle {
+            commit: Box::new(commit),
+        }],
+        result_hashes: vec![],
+    };
+    tx.validate().unwrap();
+    let body_bytes = postcard::experimental::serialized_size(&tx).unwrap();
+    println!("compact three-part control body: {body_bytes} bytes");
+    assert!(body_bytes < limits::MAX_CONTROL_RECORD / 8);
+    let encoded = encode_control(&tx).unwrap();
+    assert_eq!(decode_control::<TopologyTransaction>(&encoded).unwrap(), tx);
 }

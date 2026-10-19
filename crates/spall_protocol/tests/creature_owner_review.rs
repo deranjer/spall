@@ -232,17 +232,15 @@ fn owner(f: &Fixture) -> CreatureOwnershipRecordV4 {
     let state = f.state();
     let q = [0.0_f32, 0.0, 0.0, 1.0];
     let pose = serde_json::json!({"translation_m": [0.0,0.0,0.0], "rotation_xyzw": q});
-    let mut ids = vec![0_u16; 32768];
-    ids[0] = 1;
     let raw = serde_json::json!({
-        "schema": 4, "state": state, "owner_key": 9, "source_generation": 1,
+        "schema": 5, "state": state, "owner_key": 9, "source_generation": 1,
         "next_component_serial": 1, "primary_component_serial": null, "part_velocities": [],
         "parts": [{
             "part_id": 1, "source_volume_id": 100, "source_generation": 1,
             "source_revision": 1, "next_brick_revision": 2, "cell_size_code": 1, "bounds": [[0,0,0],[0,0,0]],
             "source_content_hash": vec![0_u8;32], "parent_id": null,
             "initial_local_pose": pose, "frozen_local_pose": pose,
-            "bricks": [{"coord": [0,0,0], "revision": 1, "edited": true, "cells": {"Dense": ids}}]
+            "bricks": [{"coord": [0,0,0], "revision": 1, "edited": true, "cells": {"Runs": [[1, 1], [32767, 0]]}}]
         }],
         "components": [{
             "owner_key": 9, "serial": null, "translation_m": [0.0,0.0,0.0],
@@ -682,7 +680,7 @@ fn superseded_owner_schema_and_missing_primary_identity_are_rejected() {
         .unwrap()
         .remove("primary_component_serial");
     assert!(serde_json::from_value::<CreatureOwnershipRecordV4>(json).is_err());
-    for schema in [1, 2, 3, 5] {
+    for schema in [1, 2, 3, 4] {
         let mut old = record.clone();
         old.schema = schema;
         assert_eq!(

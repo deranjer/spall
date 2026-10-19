@@ -18,10 +18,10 @@ use crate::{
     MAX_CREATURE_LINEAR_VELOCITY_M_S, MAX_CREATURE_POSITION_M,
 };
 
-pub const CREATURE_OWNER_SCHEMA: u16 = 4;
+pub const CREATURE_OWNER_SCHEMA: u16 = 5;
 pub const CREATURE_OWNER_DOMAIN: &[u8] = b"spall.creature-owner.v4";
 pub const CREATURE_OWNER_SET_DOMAIN: &[u8] = b"spall.creature-owner-set.v4";
-pub const CREATURE_CHANGE_SCHEMA: u16 = 4;
+pub const CREATURE_CHANGE_SCHEMA: u16 = 5;
 pub const CREATURE_CHANGE_DOMAIN: &[u8] = b"spall.creature-change.v4";
 pub const MAX_CREATURE_OWNER_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CREATURE_OWNER_PARTS: usize = 256;
@@ -82,6 +82,7 @@ pub struct CreatureSourcePartV2 {
     pub parent_id: Option<u32>,
     pub initial_local_pose: CreatureLocalPoseV1,
     pub frozen_local_pose: CreatureLocalPoseV1,
+    #[serde(serialize_with = "serialize_compact_bricks")]
     pub bricks: Vec<BaselineBrick>,
 }
 
@@ -505,7 +506,7 @@ impl<'de> Deserialize<'de> for BoundedBaselineCells {
         #[derive(Deserialize)]
         enum Wire {
             Uniform(u16),
-            Dense(BoundedMaterials),
+            Runs(BoundedRuns),
             Digest {
                 content_hash: Hash32,
                 solid_cells: u32,
@@ -513,7 +514,7 @@ impl<'de> Deserialize<'de> for BoundedBaselineCells {
         }
         Ok(Self(match Wire::deserialize(deserializer)? {
             Wire::Uniform(id) => BaselineCells::Uniform(id),
-            Wire::Dense(cells) => BaselineCells::Dense(cells.0),
+            Wire::Runs(runs) => BaselineCells::Dense(runs.0),
             Wire::Digest {
                 content_hash,
                 solid_cells,
@@ -525,46 +526,112 @@ impl<'de> Deserialize<'de> for BoundedBaselineCells {
     }
 }
 
-struct BoundedMaterials(Vec<u16>);
-impl<'de> Deserialize<'de> for BoundedMaterials {
+/// Run-length encoded dense brick: `(length, material)` pairs in linear-index
+/// order. Canonical form only: no empty or adjacent equal-material runs, and
+/// the lengths must cover exactly one brick. The decoded value is the same
+/// `BaselineCells::Dense` the hash contract already covers.
+#[derive(Serialize)]
+struct CompactRun(u32, u16);
+
+struct BoundedRuns(Vec<u16>);
+impl<'de> Deserialize<'de> for BoundedRuns {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct MaterialsVisitor;
-        impl<'de> Visitor<'de> for MaterialsVisitor {
-            type Value = BoundedMaterials;
+        struct RunsVisitor;
+        impl<'de> Visitor<'de> for RunsVisitor {
+            type Value = BoundedRuns;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "exactly {CELLS_PER_BRICK} material ids")
+                write!(f, "canonical runs covering exactly {CELLS_PER_BRICK} cells")
             }
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                if seq.size_hint().is_some_and(|n| n != CELLS_PER_BRICK) {
-                    return Err(serde::de::Error::custom(
-                        "dense brick cell count is invalid",
-                    ));
+                let bad = || serde::de::Error::custom("dense brick runs are invalid");
+                if seq
+                    .size_hint()
+                    .is_some_and(|n| n == 0 || n > CELLS_PER_BRICK)
+                {
+                    return Err(bad());
                 }
-                let mut out = Vec::with_capacity(CELLS_PER_BRICK);
-                while let Some(id) = seq.next_element()? {
-                    if out.len() == CELLS_PER_BRICK {
-                        return Err(serde::de::Error::custom(
-                            "dense brick cell count is invalid",
-                        ));
+                let mut out: Vec<u16> = Vec::with_capacity(CELLS_PER_BRICK);
+                let mut previous: Option<u16> = None;
+                while let Some((len, id)) = seq.next_element::<(u32, u16)>()? {
+                    let len = len as usize;
+                    if len == 0 || previous == Some(id) || len > CELLS_PER_BRICK - out.len() {
+                        return Err(bad());
                     }
-                    out.push(id);
+                    out.resize(out.len() + len, id);
+                    previous = Some(id);
                 }
                 if out.len() != CELLS_PER_BRICK {
-                    return Err(serde::de::Error::custom(
-                        "dense brick cell count is invalid",
-                    ));
+                    return Err(bad());
                 }
-                Ok(BoundedMaterials(out))
+                Ok(BoundedRuns(out))
             }
         }
-        deserializer.deserialize_seq(MaterialsVisitor)
+        deserializer.deserialize_seq(RunsVisitor)
     }
+}
+
+#[derive(Serialize)]
+enum CompactCells<'a> {
+    Uniform(u16),
+    Runs(Vec<CompactRun>),
+    Digest {
+        content_hash: &'a Hash32,
+        solid_cells: u32,
+    },
+}
+
+#[derive(Serialize)]
+struct CompactBrick<'a> {
+    coord: [i64; 3],
+    revision: u64,
+    edited: bool,
+    cells: CompactCells<'a>,
+}
+
+fn serialize_compact_bricks<S>(bricks: &[BaselineBrick], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::{Error, SerializeSeq};
+    let mut seq = serializer.serialize_seq(Some(bricks.len()))?;
+    for brick in bricks {
+        let cells = match &brick.cells {
+            BaselineCells::Uniform(id) => CompactCells::Uniform(*id),
+            BaselineCells::Dense(ids) => {
+                if ids.len() != CELLS_PER_BRICK {
+                    return Err(S::Error::custom("dense brick cell count is invalid"));
+                }
+                let mut runs: Vec<CompactRun> = Vec::new();
+                for &id in ids {
+                    match runs.last_mut() {
+                        Some(CompactRun(len, run_id)) if *run_id == id => *len += 1,
+                        _ => runs.push(CompactRun(1, id)),
+                    }
+                }
+                CompactCells::Runs(runs)
+            }
+            BaselineCells::Digest {
+                content_hash,
+                solid_cells,
+            } => CompactCells::Digest {
+                content_hash,
+                solid_cells: *solid_cells,
+            },
+        };
+        seq.serialize_element(&CompactBrick {
+            coord: brick.coord,
+            revision: brick.revision,
+            edited: brick.edited,
+            cells,
+        })?;
+    }
+    seq.end()
 }
 
 impl CreatureLifecycleChangeV4 {
@@ -2066,7 +2133,7 @@ mod topology_motion_hash_tests {
     }
 }
 
-pub const CREATURE_LIFECYCLE_COMMIT_SCHEMA: u16 = 4;
+pub const CREATURE_LIFECYCLE_COMMIT_SCHEMA: u16 = 5;
 pub const CREATURE_LIFECYCLE_COMMIT_DOMAIN: &[u8] = b"spall.creature-lifecycle-commit.v4";
 const MAX_COMMIT_PART_POSES: usize = MAX_CREATURE_OWNER_PARTS;
 const MAX_COMMIT_COMPONENT_MOTIONS: usize = MAX_CREATURE_OWNER_COMPONENTS;

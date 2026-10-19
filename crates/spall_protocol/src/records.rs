@@ -21,10 +21,10 @@ use crate::limits::{
 };
 
 /// Schema version stamped into every encoded record header. A peer on another version cannot
-/// decode a single record, so mismatched builds refuse each other at the first message. Version 12
-/// carries exact source revision allocator state in current V4 lifecycle payloads.
+/// decode a single record, so mismatched builds refuse each other at the first message. Version 13
+/// stores creature source bricks as canonical run-length cells (owner schema 5).
 /// Saved journals and live peers both reject older versions without migration.
-pub const WIRE_SCHEMA_VERSION: u16 = 12;
+pub const WIRE_SCHEMA_VERSION: u16 = 13;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1177,12 +1177,12 @@ mod tests {
             tx
         );
         let mut old_wire = encoded.clone();
-        old_wire[..2].copy_from_slice(&11u16.to_le_bytes());
+        old_wire[..2].copy_from_slice(&12u16.to_le_bytes());
         assert!(matches!(
             crate::decode_control::<TopologyTransaction>(&old_wire),
             Err(crate::CodecError::SchemaVersion {
-                expected: 12,
-                found: 11
+                expected: 13,
+                found: 12
             })
         ));
         let mut multiple = tx.clone();
