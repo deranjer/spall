@@ -120,7 +120,9 @@ The first useful deliverable is a networked destruction sandbox. It must already
 ## Read and assign work
 
 Nature and weather playtest: `cargo xtask play --release --worldgen natural
---worldgen-size 4096 --season winter` launches a 1024 m world. **F10** selects
+--worldgen-size 4096 --season winter` launches a 1024 m world. Add `--animals 24`
+to spawn that many deer and half as many crows (idle animation only; they do not
+move yet, and a world with animals cannot be saved). **F10** selects
 automatic or forced weather, previews nature sounds, adjusts nature/weather
 volume and mute, and toggles visual effects/reduced lightning. Scroll the menu
 for the remaining controls. Weather choices are server-authorized; changing a

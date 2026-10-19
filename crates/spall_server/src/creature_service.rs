@@ -45,6 +45,10 @@ impl CreatureIdPlan {
 pub trait CreatureDirector: Send {
     fn catalog(&self) -> Arc<OwnedCreatureCatalog>;
 
+    /// The world was replaced (admin reset). All creatures are gone and the
+    /// allocator epoch advanced; forget any per-world bookkeeping.
+    fn on_world_reset(&mut self) {}
+
     /// Births to commit after `tick`. Returning nothing is the common case.
     fn plan(
         &mut self,
@@ -103,6 +107,15 @@ impl CreatureService {
                 record,
             })
             .collect())
+    }
+
+    /// Tells the director the world was replaced.
+    pub fn on_world_reset(&self) -> Result<(), String> {
+        self.director
+            .lock()
+            .map_err(|_| "creature director panicked earlier".to_string())?
+            .on_world_reset();
+        Ok(())
     }
 
     /// Plans and commits this tick's births. Returns the committed lifecycle

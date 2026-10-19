@@ -2392,6 +2392,12 @@ async fn serve_async(
                 .into(),
         ));
     }
+    if config.creatures.is_some() && config.save.is_some() {
+        return Err(ServeError::Configuration(
+            "creatures cannot run in a persistent world yet: typed actor journal replay is not implemented; omit the save path"
+                .into(),
+        ));
+    }
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -3311,6 +3317,11 @@ async fn serve_async(
                                     ) {
                                         Ok(clients) => {
                                             world_resets += 1;
+                                            if let Some(service) = creature_service.as_ref()
+                                                && let Err(error) = service.on_world_reset()
+                                            {
+                                                return SimResult::error(error, ticks_run);
+                                            }
                                             tracing::info!(
                                                 clients,
                                                 freed_ms,

@@ -3337,8 +3337,6 @@ impl Simulation {
         }
     }
 
-    // Closed until the ordered server caller is wired in the next ENG-218 slice.
-    #[allow(dead_code)]
     /// Commits lifecycle intents as one ordered transaction at the current
     /// tick, taking the next control sequence from the same counter as ordinary
     /// edits so replicas see a single monotone stream.

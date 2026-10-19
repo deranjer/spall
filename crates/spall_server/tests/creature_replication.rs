@@ -26,9 +26,10 @@ use spall_server::{CustomWorld, Scene, ServeConfig, serve};
 use spall_sim::{AuthoritativeCreatureIntent, CreatureBirthPartInput, Simulation};
 use spall_voxel::{EditPlan, Volume};
 
-const SERVER_TICKS: u64 = 720; // 12 seconds at 60 Hz.
+const SERVER_TICKS: u64 = 900; // 15 seconds at 60 Hz.
 const SERVER_WORLD: u128 = spall_server::serve::T10_WORLD_ID;
 const BIRTH_TICKS: [u64; 2] = [20, 120];
+const RESET_TICK: u64 = 420;
 
 fn unique_dir() -> PathBuf {
     let nanos = SystemTime::now()
@@ -90,11 +91,17 @@ fn catalog() -> Arc<OwnedCreatureCatalog> {
 
 struct TestDirector {
     catalog: Arc<OwnedCreatureCatalog>,
+    reset_pending: bool,
+    rebirths_left: u32,
 }
 
 impl CreatureDirector for TestDirector {
     fn catalog(&self) -> Arc<OwnedCreatureCatalog> {
         self.catalog.clone()
+    }
+
+    fn on_world_reset(&mut self) {
+        self.reset_pending = true;
     }
 
     fn plan(
@@ -103,7 +110,17 @@ impl CreatureDirector for TestDirector {
         sim: &Simulation,
         ids: &mut CreatureIdPlan,
     ) -> Vec<AuthoritativeCreatureIntent> {
-        if !BIRTH_TICKS.contains(&tick) {
+        if std::mem::take(&mut self.reset_pending) {
+            self.rebirths_left = 2;
+        }
+        let rebirth = self.rebirths_left > 0;
+        if rebirth {
+            self.rebirths_left -= 1;
+        } else if !BIRTH_TICKS.contains(&tick)
+            || sim
+                .creature_allocator_snapshot()
+                .is_none_or(|a| a.world_epoch != 1)
+        {
             return Vec::new();
         }
         let creature_id = ids.creature_id();
@@ -125,7 +142,7 @@ impl CreatureDirector for TestDirector {
             schema: CREATURE_STATE_SCHEMA,
             key: CreatureKey::new(
                 WorldId::from_u128(SERVER_WORLD),
-                WorldEpoch::INITIAL,
+                WorldEpoch::new(sim.creature_allocator_snapshot().unwrap().world_epoch).unwrap(),
                 CreatureId::new(creature_id).unwrap(),
                 CreatureGeneration::INITIAL,
             )
@@ -199,6 +216,7 @@ fn client_config(
     name: &str,
     server: (SocketAddr, Fingerprint, JoinToken),
     handle: &ReplicaHandle,
+    admin_script: Vec<(u64, spall_protocol::AdminCommand)>,
 ) -> ClientNetConfig {
     let (connect_addr, fingerprint, token) = server;
     ClientNetConfig {
@@ -221,7 +239,7 @@ fn client_config(
         on_replica_ready: Some(handle.hook()),
         interactive: None,
         client_authoritative: false,
-        admin_script: Vec::new(),
+        admin_script,
     }
 }
 
@@ -248,8 +266,11 @@ fn present_and_late_joining_clients_converge_on_the_authoritative_creatures() {
     server_cfg.custom_world = Some(CustomWorld::new(vec![[4.0, 0.7, 8.0]], || {
         spall_sim::fixtures::flat_terrain_setup()
     }));
+    server_cfg.admin_commands = true;
     server_cfg.creatures = Some(CreatureService::new(Box::new(TestDirector {
         catalog: catalog(),
+        reset_pending: false,
+        rebirths_left: 0,
     })));
     let server_thread = thread::spawn(move || serve(server_cfg));
 
@@ -263,8 +284,14 @@ fn present_and_late_joining_clients_converge_on_the_authoritative_creatures() {
 
     let first = ReplicaHandle::default();
     let late = ReplicaHandle::default();
-    let first_cfg = client_config(&dir, "first", server, &first);
-    let late_cfg = client_config(&dir, "late", server, &late);
+    let first_cfg = client_config(
+        &dir,
+        "first",
+        server,
+        &first,
+        vec![(RESET_TICK, spall_protocol::AdminCommand::ResetWorld)],
+    );
+    let late_cfg = client_config(&dir, "late", server, &late, Vec::new());
     let first_thread = thread::spawn(move || run_replication_client(first_cfg));
     // Join after both births (about tick 120 = 2 s) so only sync can deliver them.
     thread::sleep(Duration::from_secs(4));
@@ -274,7 +301,9 @@ fn present_and_late_joining_clients_converge_on_the_authoritative_creatures() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let (first_records, late_records) = loop {
         let (a, b) = (first.keys(), late.keys());
-        if a.len() == 2 && a == b {
+        // Creatures 1 and 2 were born before the reset; only 3 and 4 survive it.
+        let reset_done = a.keys().copied().eq([3, 4]);
+        if a.len() == 2 && a == b && reset_done {
             break (a, b);
         }
         assert!(

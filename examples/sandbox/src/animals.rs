@@ -374,7 +374,7 @@ impl AnimalDirector {
             schema: CREATURE_STATE_SCHEMA,
             key: CreatureKey::new(
                 sim.creature_allocator_snapshot()?.world_id,
-                WorldEpoch::INITIAL,
+                WorldEpoch::new(sim.creature_allocator_snapshot()?.world_epoch).ok()?,
                 CreatureId::new(creature_id).ok()?,
                 CreatureGeneration::INITIAL,
             )
@@ -412,6 +412,11 @@ impl AnimalDirector {
 impl CreatureDirector for AnimalDirector {
     fn catalog(&self) -> Arc<OwnedCreatureCatalog> {
         self.catalog.clone()
+    }
+
+    fn on_world_reset(&mut self) {
+        self.spawned = vec![0; self.species.len()];
+        self.attempts = 0;
     }
 
     fn plan(

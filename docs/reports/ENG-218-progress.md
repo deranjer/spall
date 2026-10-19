@@ -1769,3 +1769,47 @@ records that still exceed the ceiling; its tests now use
 body, 38,647 compressed) as the worst case. Not done here: a game-owned source
 resolver so unedited parts omit bricks entirely (in-memory records still hold
 dense bricks, ~64 KiB per part). Spawning stays closed.
+
+## 2026-10-19 live animals in the 1 km world (first visible slice)
+
+Authoritative births now reach clients and render. Pieces, in dependency order:
+
+- `spall_protocol::OwnedCreatureCatalog`: game-built, long-lived catalog that lends
+  a `CreatureValidationCatalog` view; both server and client hold one.
+- `spall_client::ReplicaCreatures` (`ReplicaWorld::install_creature_catalog`):
+  applies actor-only `CreatureLifecycle` transactions atomically through the
+  shared reducer. Bulk lifecycle payload delivery and mixed geometry+actor
+  transactions are still rejected. The replica enforces monotone creature and
+  source-volume ids (it cannot see the server's exact shared counter).
+- `WireTag::CreatureSync` (26): one record per creature, seeded at the head of a
+  joining client's catch-up queue, so late joiners get existing animals before
+  the ordered transactions committed after their baseline cursor.
+- `spall_server::creature_service::{CreatureDirector, CreatureService}` and
+  `ServeConfig::creatures`: a game director plans births per tick; they commit as
+  one ordered lifecycle transaction (`Simulation::commit_creature_lifecycle_now`)
+  and fan out like any commit. Admin world reset notifies the director.
+  A persistent world with a director is refused at startup (typed actor journal
+  replay is still missing), as is a world reset's silent loss of animals: the
+  director is told and respawns.
+- Sandbox: `sandbox::animals` (decodes trout/crow/deer, builds the catalog,
+  `AnimalDirector` places deer on validated ground and crows above it, trout
+  skipped until a live water query is wired), `sandbox::animal_view::AnimalView`
+  (draws a replicated record by sampling its SPVX clip into lit overlay cubes),
+  `--animals N` on `sandbox-server` and `cargo xtask play`.
+
+Measured: `creature_replication` runs a real QUIC server, one present and one
+late-joining client, and an admin world reset: both replicas end with identical
+records (ids 3 and 4 after the reset). `animal_births` births the authored deer
+and crows on a Simulation and compares replica records to a server capture
+(topology hash exact; root within 1 mm of physics rounding). Headless 1 km run
+(`--worldgen natural --worldgen-size 4096 --animals 24`): 18 lifecycle
+transactions, 36 creatures, all replicated to a late-joining client
+(`creatures_replicated` in the client summary). GPU capture on this machine
+shows a deer standing in the world (`docs/reports/ENG-218-evidence/`).
+Each two-birth tick costs roughly 40-50 ms on the owning thread, so placement is
+bounded to two births per tick and happens once at startup.
+
+Not done: animal movement (records are static; only the idle clip animates on the
+client), damage/death, trout (needs the live water query), per-creature motion
+frames, interest filtering of creature sync, persistence/recovery with live
+animals, and the combined two-client GPU acceptance. These remain unrun.
