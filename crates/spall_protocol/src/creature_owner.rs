@@ -1196,6 +1196,35 @@ impl CreatureOwnershipSetV4 {
         &self,
         catalog: &CreatureValidationCatalog<'_>,
     ) -> Result<(), CreatureOwnershipError> {
+        self.validate_resources()?;
+        self.validate_after_resources(catalog)
+    }
+
+    pub(crate) fn validate_after_resources(
+        &self,
+        catalog: &CreatureValidationCatalog<'_>,
+    ) -> Result<(), CreatureOwnershipError> {
+        let mut keys = BTreeSet::new();
+        let mut owners = BTreeSet::new();
+        let mut volumes = BTreeSet::new();
+        for record in &self.records {
+            record.validate(catalog)?;
+            if !keys.insert(record.state.key)
+                || !owners.insert(record.owner_key)
+                || record
+                    .parts
+                    .iter()
+                    .any(|part| !volumes.insert(part.source_volume_id))
+            {
+                return Err(CreatureOwnershipError::DuplicateOwner);
+            }
+        }
+        Ok(())
+    }
+
+    /// Catalog-independent resource admission, not semantic validation.
+    /// Bounds complete aggregate traversal before encoding or hashing stored input.
+    pub fn validate_resources(&self) -> Result<(), CreatureOwnershipError> {
         if self.schema != CREATURE_OWNER_SCHEMA
             || self.records.len() > MAX_CREATURE_OWNER_SET_RECORDS
             || self
@@ -1212,6 +1241,12 @@ impl CreatureOwnershipSetV4 {
         let mut masks = 0usize;
         let mut mask_cells = 0usize;
         for record in &self.records {
+            if record.state.species_key.len() > crate::MAX_CREATURE_SPECIES_KEY_BYTES
+                || record.state.clip_name.len() > crate::MAX_CREATURE_CLIP_NAME_BYTES
+                || record.state.source_bindings.len() > crate::MAX_CREATURE_SOURCE_PARTS
+            {
+                return Err(CreatureOwnershipError::Limit);
+            }
             if record.part_velocities.len() > MAX_CREATURE_OWNER_PARTS {
                 return Err(CreatureOwnershipError::Limit);
             }
@@ -1344,21 +1379,6 @@ impl CreatureOwnershipSetV4 {
                         }
                     }
                 }
-            }
-        }
-        let mut keys = BTreeSet::new();
-        let mut owners = BTreeSet::new();
-        let mut volumes = BTreeSet::new();
-        for record in &self.records {
-            record.validate(catalog)?;
-            if !keys.insert(record.state.key)
-                || !owners.insert(record.owner_key)
-                || record
-                    .parts
-                    .iter()
-                    .any(|part| !volumes.insert(part.source_volume_id))
-            {
-                return Err(CreatureOwnershipError::DuplicateOwner);
             }
         }
         Ok(())

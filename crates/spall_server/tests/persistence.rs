@@ -460,24 +460,25 @@ fn a_mismatched_algorithm_version_is_rejected() {
 }
 
 #[test]
-fn a_save_made_under_the_v1_topology_hash_is_refused_not_misread() {
-    // Checkpoints and journals written before the chunked hash record v1 hashes. They cannot be
-    // verified under v2, so recovery must say so plainly instead of failing as corruption.
-    let s = Scratch::new("legacy_v1_hash");
-    let mut recovery = recovery_for_meta_tests(&s);
-    recovery.checkpoint.meta.topology_hash_version = 1;
-    match restore_err(&recovery, &cfg()) {
-        persist::PersistError::AlgorithmVersionMismatch {
-            field,
-            checkpoint,
-            runtime,
-        } => {
-            assert_eq!(field, "topology_hash_version");
-            assert_eq!(checkpoint, 1);
-            assert_eq!(runtime, persist::TOPOLOGY_HASH_VERSION);
-            assert_eq!(runtime, 2);
+fn saves_with_earlier_topology_hash_versions_are_refused_not_misread() {
+    // The current checkpoint composition is v3; no prior algorithm is migrated.
+    for old_version in [1, 2] {
+        let s = Scratch::new("prior_hash");
+        let mut recovery = recovery_for_meta_tests(&s);
+        recovery.checkpoint.meta.topology_hash_version = old_version;
+        match restore_err(&recovery, &cfg()) {
+            persist::PersistError::AlgorithmVersionMismatch {
+                field,
+                checkpoint,
+                runtime,
+            } => {
+                assert_eq!(field, "topology_hash_version");
+                assert_eq!(checkpoint, old_version);
+                assert_eq!(runtime, persist::TOPOLOGY_HASH_VERSION);
+                assert_eq!(runtime, 3);
+            }
+            other => panic!("expected AlgorithmVersionMismatch, got {other:?}"),
         }
-        other => panic!("expected AlgorithmVersionMismatch, got {other:?}"),
     }
 }
 

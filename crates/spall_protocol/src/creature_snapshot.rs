@@ -63,29 +63,56 @@ impl CreatureSnapshotV2 {
         &self,
         catalog: &CreatureValidationCatalog<'_>,
     ) -> Result<(), CreatureOwnershipError> {
-        if self.schema != CREATURE_SNAPSHOT_SCHEMA {
+        self.validate_resources()?;
+        self.owners.validate_after_resources(catalog)
+    }
+
+    /// Catalog-independent storage admission. Full validation remains required
+    /// before installation; this only permits bounded encoding/hash traversal.
+    pub fn validate_resources(&self) -> Result<(), CreatureOwnershipError> {
+        if self.schema != CREATURE_SNAPSHOT_SCHEMA || self.next_volume_id == 0 {
             return Err(CreatureOwnershipError::Schema);
         }
         CreatureAllocator::restore(self.allocator)
             .map_err(|_| CreatureOwnershipError::Allocator)?;
-        if self.next_volume_id == 0 {
-            return Err(CreatureOwnershipError::Allocator);
-        }
-        self.owners.validate(catalog)?;
+        self.owners.validate_resources()?;
+        let mut owners = std::collections::BTreeSet::new();
+        let mut creature_ids = std::collections::BTreeSet::new();
+        let mut volumes = std::collections::BTreeSet::new();
         for owner in &self.owners.records {
             let key = owner.state.key;
             if key.world_id != self.allocator.world_id
                 || key.world_epoch.get() != self.allocator.world_epoch
                 || key.creature_id.get() >= self.allocator.next_creature_id
-                || owner
-                    .parts
-                    .iter()
-                    .any(|part| part.source_volume_id.get() >= self.next_volume_id)
+                || !creature_ids.insert(key.creature_id)
+                || !owners.insert(owner.owner_key)
+                || owner.parts.iter().any(|part| {
+                    part.source_volume_id.get() >= self.next_volume_id
+                        || !volumes.insert(part.source_volume_id)
+                })
             {
                 return Err(CreatureOwnershipError::Allocator);
             }
         }
         Ok(())
+    }
+
+    /// Saved population identity/topology, excluding all sampled motion.
+    /// Caller must validate before hashing untrusted input.
+    pub fn topology_hash(&self) -> Hash32 {
+        let mut writer = CanonicalWriter::with_domain(b"spall.creature-snapshot-topology.v1");
+        writer
+            .u16(self.schema)
+            .u16(self.allocator.schema)
+            .blob(&self.allocator.world_id.to_le_bytes())
+            .u64(self.allocator.world_epoch)
+            .u64(self.allocator.next_creature_id)
+            .u64(self.next_volume_id)
+            .seq(self.owners.records.len());
+        for owner in &self.owners.records {
+            writer.blob(&owner.topology_hash().0);
+        }
+        writer.hash()
     }
 
     pub fn canonical_hash(&self) -> Hash32 {
@@ -118,4 +145,18 @@ impl CreatureSnapshotV2 {
         snapshot.validate(catalog)?;
         Ok(snapshot)
     }
+}
+
+/// Complete checkpoint topology. Uninitialized actor-free worlds retain their
+/// existing geometry hash vectors; initialized empty hosts retain identity.
+pub fn checkpoint_topology_hash(
+    geometry: Hash32,
+    creatures: Option<&CreatureSnapshotV2>,
+) -> Hash32 {
+    let Some(snapshot) = creatures else {
+        return geometry;
+    };
+    let mut writer = CanonicalWriter::with_domain(b"spall.checkpoint-topology.v1");
+    writer.blob(&geometry.0).blob(&snapshot.topology_hash().0);
+    writer.hash()
 }

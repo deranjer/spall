@@ -718,8 +718,8 @@ closed until atomic typed attachment consumers and the common allocator are read
 The current geometry-only replica and SimWorld replay paths reject actor-bearing
 transactions before geometry, clocks, sequence gates or replay receipts change.
 This boundary does not enable spawning or claim complete baseline or durable
-animal recovery. Baseline schema 1 and store schema 3 remain current until their
-actor-aware replacements are implemented and validated. Unsupported old formats
+animal journal recovery. Baseline schema 1 remains guarded; current store schema
+4 adds the complete checkpoint section described below. Unsupported old formats
 are rejected; legacy save upgrades and missing-table backfills have been removed
 under the user's explicit compatibility decision. Crash recovery from a valid
 complete checkpoint remains a separate requirement.
@@ -754,8 +754,8 @@ above them. The fresh in-memory journal is not the recovery source. Lifecycle
 reservations and typed runtime consumers remain closed pending complete actor
 checkpoint/baseline restore and ordered attachment transport/replay.
 
-The current checkpoint capture refuses any initialized creature host, including
-an empty host whose allocator high-water must survive restart. It cannot emit a
+The catalog-free checkpoint capture refuses any initialized creature host,
+including an empty host whose allocator high-water must survive restart. It cannot emit a
 geometry-only checkpoint that silently omits that state. Complete live-animal
 recovery also requires independent applied part-body twists: root motion and
 frozen part poses alone cannot reproduce an animated limb's immediate checked
@@ -868,8 +868,8 @@ motion-only hashes exclude it. Static-source lifecycle checks preserve it across
 Death. Current-only owner/set/change/operation/commit/bulk V4 schemas/domains4,
 snapshot V2/schema2/domain2, wire/handshake12 and lifecycle kind9 reject superseded
 layouts without aliases or migration. Unchanged overlays and part velocities stay
-V2; source masks/local poses/components keep V1. Baseline1/store3 still contain no
-accepted complete actor sections and their publication guard remains closed.
+V2; source masks/local poses/components keep V1. Baseline1 remains guarded;
+store4 now carries the complete checkpoint section described below.
 
 Simulation capture now records every actual volume.next_revision, including
 retired gaps, initially empty/emptied sources and u64::MAX exhaustion. The previous
@@ -914,3 +914,60 @@ registry counters nor journal entries. A stale/foreign/invalid candidate leaves
 all participants unchanged. The API never replaces even an initialized empty
 host. This does not enable actor checkpoints, baseline consumers or live spawning;
 the existing incomplete-format guard remains until their own atomic integration.
+
+
+Complete animal checkpoints (ENG-218, 2026-10-19) advance current-only store schema
+from3 to4, with no migration. Baseline1 and wire12 do not change. Every checkpoint
+has a required checkpoint_creatures row containing a bounded strict Option of
+StoredCreaturesV1, a matching has_host flag and BLAKE3-16 checksum. None explicitly
+means uninitialized, while Some(empty) retains the saved allocator epoch/high-water.
+The section carries the unchanged SnapshotV2, its full canonical hash and finite
+physics origin. Length is queried before SQLite copies a BLOB. Missing/empty/
+oversized/bad-CRC/flag-mismatched or invalid bounded sections invalidate that
+checkpoint; they are never converted into an absent population.
+
+Publication preflights bounded population encoding, snapshot/hash/schema, unique
+creature IDs even across generations, exact world and shared next-volume counter,
+all source cell-size codes, source content hashes and disjoint geometry/source IDs.
+The actor row joins existing body/brick/environment rows, world metadata, cursor
+and complete marker in the same SQLite transaction and checkpoint crash cuts.
+Inside BEGIN IMMEDIATE, the writer checks the prior required actor row, its bounds,
+CRC/framing/flag and bounded hash. It cannot drop an initialized host. Until typed
+animal replay is implemented, actor checkpoint publication refuses a cursor below
+the durable high-water from both journal rows and retained checkpoint cursors;
+further journal appends after an initialized-host checkpoint also refuse. Refusals
+roll back and poison the writer under the existing failure policy. Actor-free
+checkpoint/journal suffix behavior is retained.
+
+Snapshot topology hashing has an explicit v1 domain and binds allocator, source
+counter and owner topology hashes, excluding sampled motion. Checkpoint topology
+composition is version3: initialized hosts compose this with the unchanged geometry
+v2 hash in a separate domain; uninitialized actor-free worlds return the original
+geometry hash exactly. Complete SnapshotV2 canonical hashes separately bind all
+sampled motion. SimWorld::geometry_topology_hash is explicitly partial; ordinary
+world_hash refuses source owners in production as well as tests.
+
+Server persist::capture_with_catalog and restore_with_catalog require game-owned
+references. Capture retains all actual sources/motion through the guarded Simulation
+adapter. Restore verifies the section and catalog, refuses every nonempty actor
+journal suffix, rebuilds geometry detached in the persisted physics frame, verifies
+composed topology, jointly installs the saved actor candidate, then verifies exact
+complete recapture hash before returning the Simulation. Catalog-free callers
+continue to refuse initialized hosts/actor checkpoints. Structural load failures
+use the existing corruption/fallback policy and require explicit acceptance;
+semantic catalog/physics/hash failures return an error without silently selecting
+an older checkpoint. RecoverBase::AtOrBefore(tick) lets an explicit prior-checkpoint
+choice reload the correct suffix from that checkpoint's own cursor. Never reuse a
+previous checkpoint with a suffix loaded relative to the latest checkpoint.
+
+These entrypoints establish complete checkpoint restoration only. Live animal scheduling,
+actor journal/attachment/replica and baseline consumers, bulk production and
+source-edit/fracture synchronization remain closed. Production
+spawning and combined 1024m animal/weather launch acceptance remain gated.
+
+The catalog-aware full-capture adapter requires all logical geometry resident.
+It refuses world.has_evicted() before copying any terrain or actor payload, so a
+checkpoint never combines a complete logical hash with resident-only rows. The
+existing incremental ResidencyPass capture remains catalog-free and guarded;
+adding the same actor/catalog participant to its verified backing/cache path is
+a required next ENG-218 integration step before live 1km animal persistence.

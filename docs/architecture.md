@@ -882,7 +882,7 @@ geometry-only replay consumers reject actor-bearing transactions before mutation
 An internal authoritative prepare/validate/publish path now supports inline birth,
 checked death and mixed geometry without publishing a partial candidate. It is
 not connected to live tick admission; dormant mixed targets reject until waking
-can be staged atomically. Bulk, replica, baseline and store consumers remain under implementation;
+can be staged atomically. Bulk, replica, baseline and ordered store replay consumers remain under implementation;
 production animal spawning is disabled. See
 [ENG-218 design](reports/ENG-218-design.md) and
 [measured progress](reports/ENG-218-progress.md).
@@ -901,3 +901,23 @@ uninitialized host and all source indexes empty; initialized empty hosts cannot
 be replaced. Existing geometry/physics/journal/origin fences invalidate stale or
 foreign candidates. Complete actor checkpoint/baseline and ordered journal/replica
 consumers remain the next integration work; production spawning stays disabled.
+
+
+ENG-218 store schema4 now atomically carries a required complete animal checkpoint
+section alongside geometry/environment/cursor state. Catalog-aware capture and
+detached rebuild use the existing bounded SnapshotV2 and joint installer, retaining
+saved IDs/counters, independent motion, fragment masks/primary/high-water and the
+exact physics origin. A separate full snapshot hash and checkpoint topology
+composition version3 bind the population without changing actor-free geometry
+vectors. Catalog-free APIs and the geometry-only world hash remain guarded.
+Missing/invalid animal rows are corruption, not empty population. Explicit prior
+checkpoint selection reloads that checkpoint's own suffix; semantic reconstruction
+failures do not silently choose older history. Until typed actor replay exists,
+writer publication refuses unsupported animal suffixes and future journal appends
+after an initialized-host checkpoint. Live spawning/serve scheduling and baseline/
+replica/attachment consumers remain closed; this is not 1km launch acceptance.
+
+The full catalog-aware checkpoint adapter refuses any evicted geometry before
+capture. Existing ResidencyPass checkpoint capture still requires an actor/catalog
+participant and remains guarded, so live animal persistence in a streamed world
+is not accepted from the fully resident checkpoint tests.

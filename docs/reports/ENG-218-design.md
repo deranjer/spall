@@ -325,3 +325,54 @@ Empty populations use the same fences but no physics batch. Test whole snapshot
 roundtrips, serial/empty/counter retention, stale/foreign/collision/catalog/budget
 refusal and no partial publication. Complete checkpoint/baseline sections and
 ordered consumers remain subsequent ENG-218 work; spawning remains closed.
+
+
+### Complete checkpoint section plan (2026-10-19)
+
+Advance current-only store schema3 to4; reject prior saves without migration.
+Every checkpoint transaction includes a required CRC-protected creature section
+row, including explicit None for an uninitialized host. A present version1 section
+contains the existing SnapshotV2 and its full canonical hash. Bound nested decode
+and exact byte frames; catalog-independent resource/identity/counter/namespace
+admission happens before encoding/publication, with full catalog validation in the
+server capture/rebuild adapter. Missing, oversized, bad-CRC or invalid actor rows
+invalidate that checkpoint through the existing fallback/corruption policy, never
+silently dropping actors. Existing transaction crash cuts include the row.
+
+Add domain-separated snapshot topology hashing (saved allocator and owner topology
+hashes, motion excluded) and compose with the unchanged geometry hash only when
+an animal host exists. Actor-free hash vectors remain unchanged. Expose the
+explicit partial geometry hash for composition; existing geometry-only callers
+remain guarded. Store the complete snapshot hash separately to bind animal motion
+and source metadata as well as topology. No new ownership ledger or journal.
+
+Add catalog-aware capture/restore entrypoints alongside existing catalog-free
+callers, which continue to reject animal-bearing state. Rebuild geometry detached,
+validate the actor section against checkpoint world/counters/namespaces and game
+catalog, jointly install the existing restore candidate, then verify complete
+recapture hash before returning the Simulation. Actor-bearing checkpoints with
+any journal suffix explicitly refuse until typed actor runtime replay is ready;
+no suffix is skipped and no checkpoint is advertised as full recovery acceptance.
+Baseline1/wire12, live spawning and serve scheduling remain closed. Tests cover
+actual Alive/Corpse and initialized-empty checkpoint/store/rebuild roundtrips,
+failed writes/crash cuts, corruption/fallback and metadata/catalog/source/hash
+refusal. GPU/1km/two-client animal gates remain separate.
+
+
+Checkpoint implementation refinements after review: persist the finite physics
+origin with the complete section; checkpoint topology composition version3 keeps
+the geometry v2 vectors for None and composes initialized snapshot topology under
+separate v1 domains. Strengthen catalog-independent bounded validation with unique
+CreatureId (not just full generational key) before host map materialization.
+Check prior required row/CRC/framing before either durable write. Serialize actor
+cursor/retained-checkpoint high-water checks and no-journal/no-host-drop guards in
+BEGIN IMMEDIATE. Structural corruption remains fallback-eligible with an explicit
+choice. Semantic catalog/physics/hash failures remain Err; AtOrBefore reloads the
+selected checkpoint's own suffix for explicit recovery, with no implicit rewind.
+Baseline1/wire12 remain unchanged; store4 rejects3 before modifying the database.
+
+Final completeness gate: catalog-aware full capture refuses world-wide retained
+evicted digests before copying geometry. The existing verified incremental
+ResidencyPass backing/cache path has no catalog participant yet and remains closed
+to initialized animal hosts; integrate that participant before streamed-world
+animal persistence. Do not publish resident-only terrain against logical hashes.

@@ -24,9 +24,9 @@ use spall_protocol::{
 /// without modification (`docs/protocol.md`: "Unknown newer schemas are
 /// rejected without modifying the database").
 ///
-/// Schema 3 drops the grid-water checkpoint row and journal record (ENG-169);
-/// the stacked-column water has its own row. Older saves are rejected.
-pub const STORE_SCHEMA_VERSION: u32 = 3;
+/// Schema 4 adds the required complete creature checkpoint section (ENG-218).
+/// Older saves are rejected without migration.
+pub const STORE_SCHEMA_VERSION: u32 = 4;
 
 /// Largest accepted stored brick payload, compressed. `docs/protocol.md` caps a
 /// material-only brick record at 256 KiB decompressed for 64 KiB of real
@@ -47,6 +47,8 @@ pub enum DtoError {
     Baseline(#[from] BaselineDecodeError),
     #[error("invalid versioned snow tile journal state")]
     SnowTileBounds,
+    #[error("invalid creature checkpoint: {0}")]
+    Creature(String),
 }
 
 /// Encode a save record to its postcard bytes.
@@ -159,6 +161,8 @@ pub struct StoredBrick {
 /// DB transaction is the checkpoint-publication contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Checkpoint {
+    /// Required section row stores None only for an uninitialized animal host.
+    pub creatures: Option<StoredCreaturesV1>,
     /// Current versioned ecology bytes; empty when ecology is not configured.
     pub vegetation: Vec<u8>,
     /// Stacked-column water (schema 3 DTO) in its own additive checkpoint row.
@@ -177,6 +181,18 @@ pub struct Checkpoint {
     pub meta: StoredWorldMeta,
     pub bodies: Vec<StoredBody>,
     pub bricks: Vec<StoredBrick>,
+}
+
+/// Complete versioned animal state; runtime handles never enter this section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredCreaturesV1 {
+    pub schema: u16,
+    pub snapshot: spall_protocol::CreatureSnapshotV2,
+    /// Exact recovered solver frame needed to avoid changing saved world poses.
+    pub physics_origin_m: [f64; 3],
+    /// Binds complete motion as well as topology and allocator/source counters.
+    pub snapshot_hash: [u8; 32],
 }
 
 /// One ordered authoritative journal record between checkpoints.
@@ -543,6 +559,7 @@ mod tests {
     #[test]
     fn checkpoint_postcard_round_trips() {
         let cp = Checkpoint {
+            creatures: None,
             vegetation: Vec::new(),
             column_water: None,
             weather: None,

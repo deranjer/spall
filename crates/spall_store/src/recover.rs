@@ -75,6 +75,8 @@ pub enum RecoverBase {
     /// Used to verify that the committed topology-event stream, replayed from
     /// the original baseline, reproduces the live world (T11 exact replay).
     Oldest,
+    /// Explicit recovery choice; reloads the journal from this candidate's cursor.
+    AtOrBefore(u64),
 }
 
 /// Opens `path` read/write (it must exist) and recovers the durable state from
@@ -127,13 +129,17 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
 
     let complete_ticks: Vec<i64> = {
         let order = match base {
-            RecoverBase::Latest => "DESC",
+            RecoverBase::Latest | RecoverBase::AtOrBefore(_) => "DESC",
             RecoverBase::Oldest => "ASC",
         };
+        let ceiling = match base {
+            RecoverBase::AtOrBefore(tick) => Some(tick.min(i64::MAX as u64) as i64),
+            _ => None,
+        };
         let mut stmt = conn.prepare(&format!(
-            "SELECT tick FROM checkpoints WHERE complete = 1 ORDER BY tick {order}"
+            "SELECT tick FROM checkpoints WHERE complete = 1 AND (?1 IS NULL OR tick <= ?1) ORDER BY tick {order}"
         ))?;
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let rows = stmt.query_map([ceiling], |r| r.get::<_, i64>(0))?;
         rows.collect::<Result<_, _>>()?
     };
 
@@ -288,7 +294,10 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
         out
     };
 
+    let creatures = load_creatures(conn, tick)?;
+    crate::creature_checkpoint::validate_section(creatures.as_ref(), &meta, &bodies, &bricks)?;
     Ok(Checkpoint {
+        creatures,
         vegetation: load_vegetation(conn, tick)?,
         column_water: load_column_water(conn, tick)?,
         weather: load_weather(conn, tick)?,
@@ -449,4 +458,37 @@ fn load_weather(
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
     }
     Ok(state)
+}
+
+fn load_creatures(
+    conn: &Connection,
+    tick: i64,
+) -> Result<Option<crate::StoredCreaturesV1>, StoreError> {
+    let len: Option<i64> = conn
+        .query_row(
+            "SELECT length(state) FROM checkpoint_creatures WHERE tick=?",
+            [tick],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if !len.is_some_and(|n| {
+        n > 0 && n as u64 <= crate::creature_checkpoint::MAX_STORED_CREATURE_BYTES as u64
+    }) {
+        return Err(StoreError::Corrupt(
+            "missing or oversized creature checkpoint row".into(),
+        ));
+    }
+    let (host, blob, crc): (bool, Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT has_host,state,crc FROM checkpoint_creatures WHERE tick=?",
+        [tick],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if crc.as_slice() != crc16(&blob).as_slice() {
+        return Err(StoreError::Corrupt("creature checkpoint checksum".into()));
+    }
+    let section = crate::creature_checkpoint::decode_section(&blob)?;
+    if host != section.is_some() {
+        return Err(StoreError::Corrupt("creature checkpoint host flag".into()));
+    }
+    Ok(section)
 }

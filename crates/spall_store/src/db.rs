@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use spall_core::JournalSeq;
 use spall_protocol::DurableThrough;
 
@@ -258,7 +258,13 @@ impl Writer {
         let metrics = &mut self.metrics;
         let outcome = (|| -> Result<u64, StoreError> {
             let mut payload_bytes = 0u64;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let animal_checkpoint = latest_checkpoint_has_host(&tx)?;
+            if animal_checkpoint {
+                return Err(StoreError::Corrupt(
+                    "animal checkpoint journal suffix requires typed replay".into(),
+                ));
+            }
             {
                 let mut stmt = tx.prepare_cached(
                     "INSERT INTO journal (seq, tick, payload, crc) VALUES (?, ?, ?, ?)",
@@ -382,6 +388,7 @@ impl Writer {
                 "vegetation checkpoint byte limit".into(),
             ));
         }
+        let creature_blob = crate::creature_checkpoint::encode_checkpoint_section(checkpoint)?;
         let meta_blob = dto::encode(&checkpoint.meta)?;
         // Always a row, holding `None` for a dry world, so a missing row is
         // corruption and never a silently dry restore.
@@ -423,7 +430,23 @@ impl Writer {
         let metrics = &mut self.metrics;
         let outcome = (|| -> Result<(), StoreError> {
             let mut payload_bytes = 0u64;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let had_host = latest_checkpoint_has_host(&tx)?;
+            if had_host && checkpoint.creatures.is_none() {
+                return Err(StoreError::Corrupt(
+                    "cannot discard an initialized animal host checkpoint".into(),
+                ));
+            }
+            if checkpoint.creatures.is_some() {
+                let durable: i64 = tx.query_row(
+                    "SELECT MAX(hi) FROM (SELECT COALESCE(MAX(seq),0) AS hi FROM journal UNION ALL SELECT COALESCE(MAX(journal_cursor),0) AS hi FROM checkpoints WHERE complete=1)",
+                    [], |r| r.get(0))?;
+                if durable as u64 > checkpoint.journal_cursor {
+                    return Err(StoreError::Corrupt(
+                        "animal checkpoint journal suffix requires typed replay".into(),
+                    ));
+                }
+            }
             tx.execute(
                 "INSERT OR REPLACE INTO checkpoints \
                  (tick, journal_cursor, world_hash, meta, complete, created_unix_ms) \
@@ -436,6 +459,20 @@ impl Writer {
                     now_ms,
                 ],
             )?;
+            tx.execute(
+                "DELETE FROM checkpoint_creatures WHERE tick=?",
+                [checkpoint.tick as i64],
+            )?;
+            tx.execute(
+                "INSERT INTO checkpoint_creatures(tick,has_host,state,crc) VALUES(?,?,?,?)",
+                params![
+                    checkpoint.tick as i64,
+                    checkpoint.creatures.is_some(),
+                    &creature_blob,
+                    crc16(&creature_blob).as_slice()
+                ],
+            )?;
+            payload_bytes += creature_blob.len() as u64;
             tx.execute(
                 "DELETE FROM checkpoint_weather WHERE tick = ?",
                 [checkpoint.tick as i64],
@@ -672,4 +709,52 @@ fn unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn latest_checkpoint_has_host(conn: &Connection) -> Result<bool, StoreError> {
+    let row: Option<(i64, Option<bool>, Option<i64>)> = conn.query_row(
+        "SELECT c.tick,a.has_host,length(a.state) FROM checkpoints c LEFT JOIN checkpoint_creatures a ON a.tick=c.tick WHERE c.complete=1 ORDER BY c.tick DESC LIMIT 1",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((tick, Some(host), Some(len))) = row else {
+        return if row.is_none() {
+            Ok(false)
+        } else {
+            Err(StoreError::Corrupt(
+                "latest checkpoint missing creature section".into(),
+            ))
+        };
+    };
+    if len <= 0 || len as u64 > crate::creature_checkpoint::MAX_STORED_CREATURE_BYTES as u64 {
+        return Err(StoreError::Corrupt(
+            "latest creature checkpoint byte limit".into(),
+        ));
+    }
+    let (bytes, crc): (Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT state,crc FROM checkpoint_creatures WHERE tick=?",
+        [tick],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if crc.as_slice() != crc16(&bytes).as_slice() {
+        return Err(StoreError::Corrupt(
+            "latest creature checkpoint checksum".into(),
+        ));
+    }
+    let section = crate::creature_checkpoint::decode_section(&bytes)?;
+    if host != section.is_some() {
+        return Err(StoreError::Corrupt(
+            "latest creature checkpoint host flag".into(),
+        ));
+    }
+    if let Some(section) = section {
+        section
+            .snapshot
+            .validate_resources()
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        if section.schema != 1 || section.snapshot.canonical_hash().0 != section.snapshot_hash {
+            return Err(StoreError::Corrupt(
+                "latest creature checkpoint state hash".into(),
+            ));
+        }
+    }
+    Ok(host)
 }

@@ -36,11 +36,10 @@ use spall_voxel::{Brick, BrickBounds, BrickSnapshot, Volume};
 /// `spall_sim::commit::ALGORITHM_VERSION` and the T01/T07 versions).
 pub const INTEGER_BRUSH_VERSION: u32 = 1;
 pub const STRUCTURE_GRAPH_VERSION: u32 = 1;
-/// Version of the topology hash saved checkpoints and journals were verified with. `2` is the
-/// chunked layout (`spall.topology.v2`). A save written under `1` is refused on recovery with
-/// [`PersistError::AlgorithmVersionMismatch`]: its recorded hashes use the old layout and cannot
-/// be verified, and the engine does not carry the old algorithm to migrate them.
-pub const TOPOLOGY_HASH_VERSION: u32 = 2;
+/// Checkpoint topology composition version: unchanged geometry v2, composed
+/// with initialized animal snapshot topology under its explicit v1 domain.
+/// Actor-free canonical geometry vectors remain byte-for-byte unchanged.
+pub const TOPOLOGY_HASH_VERSION: u32 = 3;
 
 /// Transfer IDs still named by every topology transaction in the durable
 /// recovery suffix. Capture these before the suffix is replayed into a fresh
@@ -98,10 +97,20 @@ pub enum RecoveryChoice {
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     #[error(
-        "current checkpoint schema cannot retain creature ownership or allocator state; \
-         complete creature checkpoint support is required before saving an initialized host"
+        "catalog-free checkpoint cannot omit initialized creature ownership or allocator state; \
+         use complete catalog-validated capture"
     )]
     CreatureCheckpointUnsupported,
+    #[error("complete animal checkpoint requires an injected validation catalog")]
+    CreatureCatalogRequired,
+    #[error("animal checkpoint journal suffix requires typed actor replay")]
+    CreatureJournalUnsupported,
+    #[error(transparent)]
+    CreatureCapture(#[from] spall_sim::CreatureCaptureError),
+    #[error(transparent)]
+    CreatureRestore(#[from] spall_sim::CreatureRestoreError),
+    #[error(transparent)]
+    CreaturePortable(#[from] spall_protocol::CreatureOwnershipError),
     #[error("store: {0}")]
     Store(#[from] StoreError),
     #[error("save DTO: {0}")]
@@ -211,6 +220,25 @@ pub fn capture(
     capture_with_terrain_bricks(sim, cfg, journal_cursor, terrain_bricks)
 }
 
+/// Complete checkpoint capture with game-owned animal reference validation.
+/// This does not enable live scheduling or unsupported actor journal replay.
+pub fn capture_with_catalog(
+    sim: &Simulation,
+    cfg: &PersistConfig,
+    journal_cursor: u64,
+    catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+) -> Result<Checkpoint, PersistError> {
+    // This full-capture adapter has no residency/backing participant. Never
+    // publish logical hashes alongside a resident-only subset of geometry.
+    if sim.world().has_evicted() {
+        return Err(PersistError::BadField(
+            "catalog checkpoint requires complete resident geometry",
+        ));
+    }
+    let terrain_bricks = stored_bricks(&sim.world().terrain().volume)?;
+    capture_checkpoint_internal(sim, cfg, journal_cursor, terrain_bricks, Some(catalog))
+}
+
 /// [`capture`], except the terrain volume's brick records are supplied by the
 /// caller instead of always being recomputed by a full resident-brick walk
 /// here. Every non-terrain part (bodies, meta, hash) is captured exactly as
@@ -224,6 +252,23 @@ pub(crate) fn capture_with_terrain_bricks(
     terrain_bricks: Vec<StoredBrick>,
 ) -> Result<Checkpoint, PersistError> {
     require_checkpoint_supported(sim)?;
+    capture_checkpoint_internal(sim, cfg, journal_cursor, terrain_bricks, None)
+}
+
+fn capture_checkpoint_internal(
+    sim: &Simulation,
+    cfg: &PersistConfig,
+    journal_cursor: u64,
+    terrain_bricks: Vec<StoredBrick>,
+    catalog: Option<&spall_protocol::CreatureValidationCatalog<'_>>,
+) -> Result<Checkpoint, PersistError> {
+    let snapshot = match catalog {
+        Some(catalog) => sim.capture_creature_snapshot(catalog)?,
+        None => {
+            require_checkpoint_supported(sim)?;
+            None
+        }
+    };
     let world = sim.world();
     let (next_entity, next_volume, next_transaction, next_journal_seq) =
         world.registry().counters();
@@ -242,6 +287,13 @@ pub(crate) fn capture_with_terrain_bricks(
         bricks.extend(stored_bricks(&body.volume)?);
     }
 
+    if let Some(snapshot) = &snapshot {
+        for owner in &snapshot.owners.records {
+            for part in &owner.parts {
+                cell_sizes.insert(part.cell_size_code);
+            }
+        }
+    }
     let meta = StoredWorldMeta {
         store_schema_version: STORE_SCHEMA_VERSION,
         world_id: cfg.world_id,
@@ -258,7 +310,25 @@ pub(crate) fn capture_with_terrain_bricks(
         topology_hash_version: TOPOLOGY_HASH_VERSION,
     };
 
+    let world_hash = spall_protocol::creature_snapshot::checkpoint_topology_hash(
+        world.geometry_topology_hash(),
+        snapshot.as_ref(),
+    )
+    .0;
+    let creatures = snapshot.map(|snapshot| spall_store::StoredCreaturesV1 {
+        schema: 1,
+        snapshot_hash: snapshot.canonical_hash().0,
+        snapshot,
+        physics_origin_m: world.physics_origin().world_m(),
+    });
+    spall_store::creature_checkpoint::validate_section(
+        creatures.as_ref(),
+        &meta,
+        &bodies,
+        &bricks,
+    )?;
     Ok(Checkpoint {
+        creatures,
         vegetation: sim
             .vegetation_state()
             .map(|s| s.encode())
@@ -273,7 +343,7 @@ pub(crate) fn capture_with_terrain_bricks(
         ),
         tick: sim.current_tick().get(),
         journal_cursor,
-        world_hash: world.world_hash().0,
+        world_hash,
         meta,
         bodies,
         bricks,
@@ -490,6 +560,52 @@ pub fn restore_with_terrain_collider_mode(
     physics: PhysicsConfig,
     terrain_collider_mode: spall_sim::world::TerrainColliderMode,
 ) -> Result<(Simulation, u64), PersistError> {
+    restore_checkpoint_internal(
+        recovery,
+        cfg,
+        choice,
+        materials,
+        anchor,
+        physics,
+        terrain_collider_mode,
+        None,
+    )
+}
+
+/// Restores a complete animal checkpoint. Actor journal suffixes remain closed.
+pub fn restore_with_catalog(
+    recovery: &Recovery,
+    cfg: &PersistConfig,
+    choice: RecoveryChoice,
+    materials: MaterialManifest,
+    anchor: AnchorPlane,
+    physics: PhysicsConfig,
+    catalog: &spall_protocol::CreatureValidationCatalog<'_>,
+) -> Result<(Simulation, u64), PersistError> {
+    restore_checkpoint_internal(
+        recovery,
+        cfg,
+        choice,
+        materials,
+        anchor,
+        physics,
+        spall_sim::world::TerrainColliderMode::PerBrick,
+        Some(catalog),
+    )
+}
+
+// Existing reconstruction arguments plus an optional game catalog.
+#[allow(clippy::too_many_arguments)]
+fn restore_checkpoint_internal(
+    recovery: &Recovery,
+    cfg: &PersistConfig,
+    choice: RecoveryChoice,
+    materials: MaterialManifest,
+    anchor: AnchorPlane,
+    physics: PhysicsConfig,
+    terrain_collider_mode: spall_sim::world::TerrainColliderMode,
+    catalog: Option<&spall_protocol::CreatureValidationCatalog<'_>>,
+) -> Result<(Simulation, u64), PersistError> {
     let cp = &recovery.checkpoint;
 
     // Fail closed on a reported-corrupt recovery before anything is rebuilt.
@@ -512,6 +628,19 @@ pub fn restore_with_terrain_collider_mode(
     }
 
     validate_world_meta(&cp.meta, cfg)?;
+    spall_store::creature_checkpoint::validate_section(
+        cp.creatures.as_ref(),
+        &cp.meta,
+        &cp.bodies,
+        &cp.bricks,
+    )?;
+    if let Some(section) = &cp.creatures {
+        let catalog = catalog.ok_or(PersistError::CreatureCatalogRequired)?;
+        if !recovery.journal.is_empty() {
+            return Err(PersistError::CreatureJournalUnsupported);
+        }
+        section.snapshot.validate(catalog)?;
+    }
 
     let runtime_hash = content_manifest_hash(&materials).0;
     // A world saved under a manifest this one supersedes by appearance alone
@@ -542,7 +671,14 @@ pub fn restore_with_terrain_collider_mode(
         &cp.bricks,
     )?;
 
-    let mut world = SimWorld::new_with_terrain_collider_mode(
+    let origin = cp
+        .creatures
+        .as_ref()
+        .map_or(spall_physics::PhysicsOrigin::ZERO, |section| {
+            spall_physics::PhysicsOrigin::new(section.physics_origin_m)
+                .expect("validated finite saved origin")
+        });
+    let mut world = SimWorld::new_with_terrain_collider_mode_and_origin(
         WorldSetup {
             terrain: terrain_vol,
             terrain_collider_region: region_from(terrain_sb.collider_region),
@@ -551,6 +687,7 @@ pub fn restore_with_terrain_collider_mode(
             physics,
         },
         terrain_collider_mode,
+        origin,
     )?;
 
     for sb in cp
@@ -589,7 +726,11 @@ pub fn restore_with_terrain_collider_mode(
     // reproduce the canonical hash the checkpoint was published with before any
     // journal record is replayed onto it. A decodable row corruption (a flipped
     // tombstone bit, a swapped revision) is caught here.
-    let rebuilt = world.world_hash().0;
+    let rebuilt = spall_protocol::creature_snapshot::checkpoint_topology_hash(
+        world.geometry_topology_hash(),
+        cp.creatures.as_ref().map(|section| &section.snapshot),
+    )
+    .0;
     if rebuilt != cp.world_hash {
         return Err(PersistError::CheckpointHashMismatch {
             checkpoint: hex32(&cp.world_hash),
@@ -794,6 +935,21 @@ pub fn restore_with_terrain_collider_mode(
             spall_sim::column_water::ColumnSolverConfig::default(),
         )
         .map_err(|_| PersistError::BadField("column water recovery"))?;
+    }
+    if let Some(section) = &cp.creatures {
+        let catalog = catalog.expect("actor checkpoint catalog validated before reconstruction");
+        let prepared = sim.prepare_creature_restore(
+            spall_core::WorldId::from_u128(cfg.world_id),
+            &section.snapshot,
+            catalog,
+        )?;
+        sim.commit_prepared_creature_restore(prepared, catalog)?;
+        let captured = sim
+            .capture_creature_snapshot(catalog)?
+            .ok_or(PersistError::BadField("missing restored animal host"))?;
+        if captured.canonical_hash().0 != section.snapshot_hash {
+            return Err(PersistError::BadField("restored animal snapshot hash"));
+        }
     }
     Ok((sim, last_seq))
 }

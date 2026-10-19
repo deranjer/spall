@@ -26,6 +26,7 @@
 //!   the versioned save schema above; see its module docs for why.
 
 pub mod brick;
+pub mod creature_checkpoint;
 pub mod db;
 pub mod dto;
 pub mod fault;
@@ -39,8 +40,8 @@ pub use brick::{BrickCodecError, DENSE_CELL_BYTES, decode_cells, encode_cells};
 pub use db::{DEFAULT_MAX_BATCH_RECORDS, WalCheckpoint, Writer};
 pub use dto::{
     BrickPayload, Checkpoint, DtoError, JournalPayload, JournalRecord, MAX_STORED_BRICK_BYTES,
-    OutboxRecord, STORE_SCHEMA_VERSION, StoredBody, StoredBodyKind, StoredBrick, StoredPose,
-    StoredWorldMeta,
+    OutboxRecord, STORE_SCHEMA_VERSION, StoredBody, StoredBodyKind, StoredBrick, StoredCreaturesV1,
+    StoredPose, StoredWorldMeta,
 };
 pub use fault::{CrashPoint, FaultPlan};
 pub use metrics::WriteMetrics;

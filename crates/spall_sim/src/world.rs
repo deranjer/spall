@@ -2998,11 +2998,16 @@ impl SimWorld {
 
     /// Canonical topology hash of the whole world (terrain + every body).
     pub fn world_hash(&self) -> Hash32 {
-        #[cfg(test)]
         assert!(
             self.creature_sources.owners.is_empty(),
             "legacy world_hash is unavailable when creature source owners exist"
         );
+        self.geometry_topology_hash()
+    }
+
+    /// Partial geometry topology (terrain and ordinary bodies only). Compose
+    /// with the validated creature snapshot for a complete checkpoint hash.
+    pub fn geometry_topology_hash(&self) -> Hash32 {
         let mut volumes: Vec<(&Volume, CanonicalOwner)> =
             vec![(&self.terrain.volume, CanonicalOwner::Terrain)];
         for body in self.bodies.values() {

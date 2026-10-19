@@ -1339,3 +1339,158 @@ separate unrun gates; current geometry-only recovery tests do not establish them
   before geometry, clocks or queues mutate. Log `.local/eng218-joint-restore-client.log`.
 - `cargo fmt --all -- --check` and `git diff --check`: passed; format log
   `.local/eng218-joint-restore-format.log`. No GPU or launch process was started.
+
+
+## 2026-10-19 complete animal checkpoint section
+
+Implemented current-only store schema4, replacing3 without migration. Every
+checkpoint transaction now includes a required CRC-protected animal row and
+explicit host-presence flag, including a strict None row for uninitialized worlds.
+Some(StoredCreaturesV1) holds the existing bounded SnapshotV2, full snapshot hash
+and finite physics origin. Geometry/environment/cursor/complete marker and the
+new row publish in the same transaction and existing checkpoint failure sites.
+Original source volumes stay in the existing animal snapshot, never fake Bodies.
+
+Store publication admits bounded source/population encoding and validates schema,
+full hash, saved world/counter agreement, source cell-size coverage, original
+source content hashes and geometry/source namespace disjointness. Length is queried
+before materializing SQLite BLOBs; strict trailing framing and the seeded nested
+reader apply. Missing/empty/oversized/bad-CRC/flag-mismatched or inconsistent sections
+are corruption, not an absent population. BEGIN IMMEDIATE serializes checkpoint and
+journal guards. Both writes validate the prior required section's bounds, checksum,
+framing, presence and bounded hash. Actor checkpoints cannot drop an initialized
+host or rewind the durable high-water (including retained checkpoint cursors after
+journal pruning). Until typed actor replay exists, no actor checkpoint with a suffix
+or subsequent journal append is accepted; actor-free suffix behavior is unchanged.
+
+Catalog-aware persist::capture_with_catalog / restore_with_catalog connect the
+existing complete Simulation capture and prepared joint installer to actual files.
+Catalog-free APIs continue to refuse animal state. Restore validates game references
+before reconstructing, builds geometry detached in the saved origin, checks composed
+topology, installs the joint candidate and verifies exact complete recapture hash
+before returning the Simulation. Any actor-bearing checkpoint with a nonempty suffix
+refuses; no journal row is skipped or reinterpreted.
+
+Snapshot topology now has a separate v1 domain binding allocator/high-water and
+owner topology, excluding sampled motion. Checkpoint composition version3 combines
+it with geometry v2 only for initialized hosts; uninitialized geometry vectors stay
+unchanged. Full SnapshotV2 hashes bind motion separately. An explicit partial
+geometry hash supports composition; source-bearing ordinary world_hash now refuses
+in production as well as tests. No wire12/baseline1 or ownership DTO layout change.
+
+Catalog-independent population admission was factored from existing validation,
+keeping the same aggregate ceilings before encoding/hashing. A concrete prerequisite
+bug was found: set uniqueness used complete generational keys but CreatureHost maps
+by CreatureId, so two generations of the same ID could collapse in a restored host.
+Snapshot validation now rejects duplicate CreatureId before materialization; a
+fully rehashed storage case proves refusal without a checkpoint write. Catalog
+validation reuses admitted aggregate work through a crate-private helper.
+
+Recovery preserves the existing explicit corruption policy. Structural section
+failures are fallback-eligible at candidate loading, with a corruption report and
+explicit RecoveryChoice requirement. Semantic catalog/physics/hash failures return
+an error and do not silently rewind. RecoverBase::AtOrBefore(tick) reloads the chosen
+prior checkpoint and its own suffix; never combine previous_checkpoint with a suffix
+loaded relative to the newer checkpoint. The SQL selection filters its tick bound.
+
+Read-only review identified missing-row writer guard and pruned journal high-water
+holes; both are corrected, with bounded prior-row CRC/framing checks and dedicated
+regressions. Final follow-up found no concrete blocker in the stated checkpoint
+scope. No worker edited files or ran Cargo during the review.
+
+Focused measured check (target-pinned wrapper):
+`cargo test -p spall_server --test animal_checkpoint -- --nocapture`: 12 passed,
+0 failed. Log `.local/eng218-checkpoint-animals-final.log`. Covers mixed Alive and
+fragmented Corpse, initialized-empty allocator, exact independent motion/original
+sources/primary/serial/counters, saved origin, all checkpoint fault points, row
+corruption/fallback, metadata/catalog/hash and generation identity refusal, suffix
+closure, prior-row corruption, retained/pruned cursor and explicit older selection.
+The physical fragmented fixture begins from ColdRestore; actual fracture remains
+separately exercised in the physics suite. FaultPlan checkpoint cuts model controlled
+failures; real-process actor crash/restart is not claimed from those tests.
+
+Initial compile-only fixture names AnchorPlane::at_y / set_fault_plan were corrected
+to the existing at / set_faults APIs. Two focused attempts had6pass1fail because the
+new whole-checkpoint recapture equality included SnowState's existing dirty flag,
+which from_canonical_bytes intentionally sets for surface republication. Animal
+snapshot, geometry, metadata, weather and other fields already matched exactly.
+The test now explicitly compares those fields and all canonical snow state after
+that existing reload normalization; no animal comparison, workload, size limit or
+physics condition was reduced. Initial logs `.local/eng218-checkpoint-animals-compile.log`
+and `...-animals-attempt{1,2}.log` retained.
+
+First full six-package run:471 passed,1 failed,2 existing ignored across39 completed
+result targets before Cargo stopped. Failure was only the prior hash-version test
+asserting current version2 after the explicit checkpoint composition advanced to3.
+It now requires version3 and rejects both older versions1/2, with no migration or
+hash substitution. Log `.local/eng218-checkpoint-full-attempt1.log`; corrected full
+regression results follow below.
+
+Changed files: protocol src/{creature_owner,creature_snapshot}.rs; simulation
+src/world.rs; store src/{creature_checkpoint,db,dto,lib,recover,schema}.rs and
+ tests/{durability,abrupt_crash}.rs; server src/{persist,persist_pipeline}.rs and
+ tests/{animal_checkpoint,persist_pipeline,persistence}.rs; protocol/architecture/
+validation/tasks and ENG-218 design/progress. Unrelated artifacts/ preserved.
+
+Next unblocked task ID remains ENG-218: typed actor journal/attachment and replica/
+baseline consumers with atomic ordered suffix replay, then bulk production and
+source-edit/fracture/terminal synchronization. Live animal scheduling/spawning
+remain closed. Combined1024m weather/animals, shipped population/GPU, actual process
+animal crash/restart and two-client destruction/recovery remain unrun/unaccepted.
+
+
+Final measured checks (all Cargo commands through target-pinned
+`.local/eng218-cargo.ps1`, serialized in G:\Programming\voxel_engine\target):
+- `cargo test -p spall_voxel -p spall_physics -p spall_protocol -p spall_sim -p spall_store -p spall_server`:
+  corrected run929 passed,0 failed,14 existing ignored across90 result targets.
+  Includes all12 new animal checkpoint scenarios plus existing actual local
+  multiplayer/restart/abrupt-crash workloads. Those existing process tests are
+  actor-free and do not establish real-process animal suffix recovery.
+  Log `.local/eng218-checkpoint-full.log`.
+- `cargo check --workspace --all-targets --all-features`: passed;
+  `.local/eng218-checkpoint-workspace.log`.
+- `cargo clippy -p spall_protocol -p spall_physics -p spall_sim -p spall_store -p spall_server -p spall_client -p sandbox --all-targets -- -D warnings`:
+  passed; `.local/eng218-checkpoint-clippy.log`.
+- `cargo test -p spall_client --lib lifecycle_rejection_review`:2 passed,0 failed;
+  `.local/eng218-checkpoint-client.log`. Closed consumers still reject valid
+  actor payloads before geometry/clocks/queues change.
+Existing incremental-cache hard-link warnings are environmental. No engine
+runtime dependency changed and no GPU/game launch process was started. Exact
+final format/diff checks follow. ENG-218 remains in_progress.
+
+
+Final inspection caught a new full-capture risk in streamed worlds: stored_bricks
+copies residents while geometry_topology_hash includes retained evicted digests.
+The new catalog-aware full-capture API now refuses world.has_evicted() before
+copying geometry/actors. A regression actually evicts a terrain brick, retains the
+same logical geometry hash, requires capture refusal and checks the complete
+actor snapshot is unchanged. Read-only review found the world-wide (terrain and
+body) guard sound. The existing incremental ResidencyPass capture still has no
+actor/catalog participant and stays guarded; live catalog/residency/backing handoff
+is an explicit next ENG-218 prerequisite before streamed1km animal saves. The
+catalog-free capture error now correctly describes missing catalog participation
+rather than claiming store4 lacks a complete section.
+
+The six-package929-pass run and initial workspace/strict lint results above precede
+this final small guard and its thirteenth checkpoint test. A complete server rerun
+and refreshed workspace/lint/format checks validate the final state below; no
+other production behavior or test workload changed.
+
+
+Final state after the evicted-geometry guard:
+- `cargo test -p spall_server`:212 passed,0 failed,2 existing ignored across25
+  result targets, including all13 animal checkpoint tests and actual unchanged
+  server multiplayer/recovery scenarios. Log `.local/eng218-checkpoint-server-final.log`.
+- Refreshed `cargo check --workspace --all-targets --all-features`:passed;
+  `.local/eng218-checkpoint-workspace-final.log`.
+- Refreshed strict seven-package `cargo clippy` command above:passed;
+  `.local/eng218-checkpoint-clippy-final.log`.
+- `cargo fmt --all -- --check` and `git diff --check`:passed;
+  `.local/eng218-checkpoint-format.log`.
+All checks use the same established target-pinned wrapper. The six-package929-pass
+run predates only this final small refusal guard/test and error-text clarification;
+full final server and refreshed workspace/lint checks include them. No crash/TLS/
+workload or size gate was relaxed. No 1km/GPU/population or live animal consumer
+acceptance follows. Next remains ENG-218 live catalog/residency checkpoint handoff,
+typed ordered actor journal/attachment and baseline/replica consumers, then bulk
+and source-edit/fracture/terminal synchronization.

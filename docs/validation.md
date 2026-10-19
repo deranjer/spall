@@ -1840,3 +1840,44 @@ multiplayer animal restart/destruction acceptance.
 The final joint-restore strengthening also requires installed-store roundtrip of
 actual retired source revision gaps and u64::MAX exhaustion, plus bounded unused
 catalog entries/clip names before fingerprinting on empty-population restoration.
+
+
+Complete checkpoint section (ENG-218, 2026-10-19):
+`cargo test -p spall_server --test animal_checkpoint -- --nocapture` exercises
+catalog-validated capture -> SQLite transaction -> recover -> detached geometry
+rebuild -> joint animal install -> exact animal snapshot recapture. The fixture
+has a three-part Alive owner with different measured part twists and a restored
+two-fragment Corpse with primary41/older7/high-water100. It also checks initialized
+empty allocator/high-water, saved nonzero physics origin, source/allocator/shared
+counter equality, no catalog-free omission, motion-only exclusion from topology,
+and full snapshot hash tamper refusal. Multi-component setup uses cold restore;
+actual fracture creation remains in physics tests. Complete animal state and
+ordinary geometry/weather compare exactly; snow compares after its existing
+from_canonical_bytes normalization that marks surfaces dirty for publication.
+
+Writer tests cover MidCheckpointRows, BeforeCheckpointCommit and
+AfterCheckpointCommit with actual actor section data, missing/empty/CRC/flag row
+corruption and explicit fallback acceptance, wrong world/counter/full hash, bad
+catalog, existing/attempted journal suffix and initialized-host omission. Missing
+or corrupt latest rows cannot authorize append/replacement, and actor checkpoint
+cursors cannot rewind retained durable checkpoint high-water after journal pruning.
+Fully rehashed duplicate CreatureId across different generations rejects before
+host materialization. Explicit RecoverBase::AtOrBefore selection must reload the
+older checkpoint's own journal suffix. Schema3 open refusal remains nonmutating,
+including journal-mode headers. Full protocol/physics/voxel/sim/store/server,
+workspace/all-feature/all-target and strict lint checks remain required.
+
+Checkpoint format is now store4 with required animal rows; checkpoint topology
+composition version3 preserves actor-free geometry v2 hash vectors. Wire12 and
+baseline1 are unchanged. These checks do not establish actor journal/attachment/
+replica/baseline consumers, real-process animal crash/restart, shipped population,
+GPU or combined1024m weather/animals acceptance. Until typed actor replay exists,
+the writer refuses future journal appends after an initialized-host checkpoint;
+production spawning and live scheduling remain closed.
+
+Final checkpoint safeguard: a real terrain brick is evicted while retaining the
+same complete logical geometry hash; catalog-aware full capture must refuse
+before output, retaining the complete actor snapshot. It may not publish a
+resident-only subset under that hash. Actor/catalog participation in the existing
+incremental ResidencyPass capture is next; live streamed-world persistence remains
+gated. The final full-server rerun includes this thirteenth checkpoint scenario.
