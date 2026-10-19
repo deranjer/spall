@@ -559,6 +559,9 @@ pub struct ClientSummary {
     pub weather_snapshots_received: u64,
     /// Admin world-reset baselines installed as a replacement world.
     pub world_resets_installed: u64,
+    /// Creature ownership records held by the replica at the end of the run.
+    #[serde(default)]
+    pub creatures_replicated: usize,
     /// Server answers to `admin_script` commands, in arrival order.
     pub admin_statuses: Vec<spall_protocol::AdminStatus>,
     /// Farthest a replicated body moved from its first observed pose, metres.
@@ -3562,6 +3565,7 @@ async fn run_async(
         water_keyframe_errors: counters.water_errors.load(Ordering::Relaxed),
         weather_snapshots_received: counters.weather_snapshots.load(Ordering::Relaxed),
         world_resets_installed: counters.world_resets.load(Ordering::Relaxed),
+        creatures_replicated: guard.creatures().map_or(0, |c| c.len()),
         admin_statuses: admin_statuses
             .lock()
             .unwrap_or_else(|e| e.into_inner())

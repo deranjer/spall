@@ -1,7 +1,10 @@
 //! Game-owned configuration belongs here.
 
 pub mod animal_habitat;
+#[cfg(feature = "client")]
+pub mod animal_view;
 pub mod animal_visual;
+pub mod animals;
 pub mod appearance;
 pub mod appearance_extensions;
 pub mod appearance_v3;

@@ -1556,6 +1556,11 @@ impl ReplicaWorld {
         self.creatures = Some(crate::replica_creatures::ReplicaCreatures::new(catalog));
     }
 
+    /// Newest observed server tick, for animation clocks.
+    pub fn now_tick_estimate(&self) -> f64 {
+        self.now_tick as f64
+    }
+
     /// Installs a join-time creature record. Rejected without a catalog.
     pub fn apply_creature_sync(
         &mut self,

@@ -174,6 +174,11 @@ struct Args {
     #[arg(long)]
     await_body_settle: bool,
 
+    /// Spawn this many deer and half as many crows around the world's spawn
+    /// points. Animals need an ephemeral world (no `--save`) until typed
+    /// animal journal replay exists; the server refuses to start otherwise.
+    #[arg(long, default_value_t = 0)]
+    animals: u32,
     // --- T23 / G3 row 7: default-off resident-cache eviction ---
     /// Enable the residency pass: evict terrain bricks outside every player's
     /// interest box (this many resident bricks is the reported ceiling), reload
@@ -549,6 +554,28 @@ fn run_serve(args: Args) -> ExitCode {
     {
         let _ = std::fs::create_dir_all(parent);
     }
+    let creatures = if args.animals > 0 {
+        let anchors: Vec<[f64; 3]> = custom_world
+            .as_ref()
+            .map(|world| world.player_spawns().to_vec())
+            .filter(|spawns| !spawns.is_empty())
+            .unwrap_or_else(|| scene.player_spawns().to_vec());
+        match sandbox::animals::AnimalDirector::new(
+            anchors,
+            [args.animals, args.animals / 2, 0],
+            args.seed,
+        ) {
+            Ok(director) => Some(spall_server::creature_service::CreatureService::new(
+                Box::new(director),
+            )),
+            Err(error) => {
+                eprintln!("sandbox-server: --animals: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
     let residency_disk_path = (args.residency_budget_bricks > 0 && args.residency_disk_backing)
         .then(|| args.world.join("residency.db"));
     if let Some(db) = &residency_disk_path
@@ -668,7 +695,7 @@ fn run_serve(args: Args) -> ExitCode {
             interest_radius_bricks: args.residency_radius_bricks,
         }),
         residency_disk_path,
-        creatures: None,
+        creatures,
         contact_damage: args
             .contact_damage
             .then_some(sandbox::game::contact_damage_config()),

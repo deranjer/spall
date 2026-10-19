@@ -3730,6 +3730,11 @@ async fn serve_async(
                 match service.run_tick(&mut sim) {
                     Ok(Some(committed)) => {
                         committed_total += 1;
+                        tracing::info!(
+                            tick = sim.current_tick().get(),
+                            transaction = committed.transaction_id.get(),
+                            "creature lifecycle committed"
+                        );
                         lj.fan_out_transaction(
                             Arc::new(committed.topology),
                             None,
@@ -5348,7 +5353,8 @@ impl LateJoin {
                     .map(|(basis, resumed)| {
                         (
                             basis,
-                            *new_world_hash.get_or_insert_with(|| sim.world().geometry_topology_hash()),
+                            *new_world_hash
+                                .get_or_insert_with(|| sim.world().geometry_topology_hash()),
                             resumed,
                         )
                     });

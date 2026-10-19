@@ -59,6 +59,10 @@ pub struct PlayArgs {
     /// (use with `--spawn-at-lake` to start on the shore beside them).
     #[arg(long, requires = "worldgen")]
     spawn_raft: bool,
+    /// Spawn this many deer (and half as many crows) around the spawn points.
+    /// Animals are ephemeral for now: the world cannot be saved while they exist.
+    #[arg(long, default_value_t = 0)]
+    animals: u32,
     /// Lighting environment for the window: studio, daylight, overcast,
     /// sunset or night. Defaults to the environment saved in the
     /// `--editor-scene` file, else daylight.
@@ -233,6 +237,9 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             server_cmd.args(["--season", &args.season]);
             if args.spawn_at_lake {
                 server_cmd.arg("--spawn-at-lake");
+            }
+            if args.animals > 0 {
+                server_cmd.args(["--animals", &args.animals.to_string()]);
             }
             if args.spawn_raft {
                 server_cmd.arg("--spawn-raft");

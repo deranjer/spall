@@ -161,6 +161,19 @@ pub struct InteractiveOptions {
     pub view_distance_m: Option<f32>,
     /// Game-owned ambience catalogue indexed by stable biome code.
     pub biome_audio: BiomeAudioConfig,
+    /// Game-owned drawing of replicated creatures as lit cubes each frame.
+    pub creature_view: Option<std::sync::Arc<dyn CreatureView>>,
+}
+
+/// Turns replicated creature ownership records into cubes to draw this frame.
+/// The engine owns replication; the game owns what a species looks like.
+pub trait CreatureView: Send + Sync + std::fmt::Debug {
+    /// `tick` is the estimated present server tick, fractional, for animation.
+    fn instances(
+        &self,
+        creatures: &crate::replica_creatures::ReplicaCreatures,
+        tick: f64,
+    ) -> Vec<CubeInstance>;
 }
 
 /// One step of a scripted screenshot tour (see [`parse_shots`]).
@@ -454,6 +467,7 @@ struct InteractiveApp {
     uncapped: bool,
     ambience: Option<AmbienceAudio>,
     biome_audio: BiomeAudioConfig,
+    creature_view: Option<std::sync::Arc<dyn CreatureView>>,
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
@@ -1709,6 +1723,7 @@ impl InteractiveApp {
             uncapped: options.uncapped,
             ambience,
             biome_audio: options.biome_audio,
+            creature_view: options.creature_view,
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
@@ -2785,6 +2800,14 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         self.sky_dirty = false;
                     }
+                }
+                if let Some(view) = &self.creature_view
+                    && let Some(replica) =
+                        self.session.replica.get().and_then(|r| r.try_lock().ok())
+                    && let Some(creatures) = replica.creatures()
+                    && !creatures.is_empty()
+                {
+                    overlay.extend(view.instances(creatures, replica.now_tick_estimate()));
                 }
                 let outcome = match renderer.begin_frame(None, &overlay) {
                     Ok(outcome) => outcome,
