@@ -766,3 +766,6 @@ fn full_actor_capture_refuses_logical_geometry_with_evicted_bricks() {
 
 #[path = "support/animal_stream_checkpoint.rs"]
 mod streamed;
+
+#[path = "support/animal_journal_attachments.rs"]
+mod journal_attachments;

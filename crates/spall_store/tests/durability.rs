@@ -900,7 +900,7 @@ fn missing_or_corrupt_column_water_checkpoint_never_restores_a_silent_dry_world(
 
 #[test]
 fn unsupported_save_versions_are_rejected_before_changing_rollback_journal_mode() {
-    for version in [1, 3, STORE_SCHEMA_VERSION + 1] {
+    for version in [1, 2, 3, 4, STORE_SCHEMA_VERSION + 1] {
         let scratch = Scratch::new(&format!("rollback-schema-{version}"));
         {
             let mut writer = Writer::open(scratch.db()).unwrap();

@@ -142,7 +142,7 @@ impl BaselineWorld {
     }
 
     /// zstd-compressed postcard bytes — the form a giant bulk split's geometry
-    /// is stored in a `spall_store` `TopologyBulkSplit` journal payload (T17
+    /// is stored in a `spall_store` `TopologyAttachments` journal payload (T17
     /// increment 2). Panics only on an internal encoder error.
     pub fn encode_compressed(&self) -> Vec<u8> {
         zstd::stream::encode_all(self.encode().as_slice(), 0).expect("zstd encodes")

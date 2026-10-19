@@ -21,7 +21,13 @@ use crate::dto::{
 use crate::schema::{read_user_version, validate_schema_layout};
 
 fn decode_journal_payload(bytes: &[u8]) -> Result<JournalPayload, dto::DtoError> {
-    dto::decode(bytes)
+    let (payload, rest) = postcard::take_from_bytes(bytes)?;
+    if !rest.is_empty() {
+        return Err(dto::DtoError::Postcard(
+            postcard::Error::DeserializeBadEncoding,
+        ));
+    }
+    Ok(payload)
 }
 
 /// One non-fatal problem found during recovery.
@@ -186,8 +192,16 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
         while let Some(row) = rows.next()? {
             let seq = row.get::<_, i64>(0)? as u64;
             let tick = row.get::<_, i64>(1)? as u64;
-            let payload: Vec<u8> = row.get(2)?;
-            let crc: Vec<u8> = row.get(3)?;
+            // SQLite already owns this row buffer. Decode borrowed fields before
+            // copying; typed attachment bytes enforce their cap before allocation.
+            let payload = row
+                .get_ref(2)?
+                .as_blob()
+                .map_err(|e| StoreError::Corrupt(format!("journal payload SQL type: {e}")))?;
+            let crc = row
+                .get_ref(3)?
+                .as_blob()
+                .map_err(|e| StoreError::Corrupt(format!("journal CRC SQL type: {e}")))?;
 
             if seq != expected {
                 corruption.push(CorruptionReport::new(format!(
@@ -195,13 +209,13 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
                 )));
                 break;
             }
-            if crc16(&payload) != crc {
+            if crc16(payload) != crc {
                 corruption.push(CorruptionReport::new(format!(
                     "journal seq {seq} failed CRC; durable prefix ends at {durable_through}"
                 )));
                 break;
             }
-            let decoded: JournalPayload = match decode_journal_payload(&payload) {
+            let decoded: JournalPayload = match decode_journal_payload(payload) {
                 Ok(p) => p,
                 Err(e) => {
                     corruption.push(CorruptionReport::new(format!(
@@ -210,17 +224,18 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
                     break;
                 }
             };
-            if let Err(error) = decoded.validate_auxiliary_bounds() {
+            let record = JournalRecord {
+                seq,
+                tick,
+                payload: decoded,
+            };
+            if let Err(error) = record.validate() {
                 corruption.push(CorruptionReport::new(format!(
                     "journal seq {seq} has invalid auxiliary state: {error}"
                 )));
                 break;
             }
-            journal.push(JournalRecord {
-                seq,
-                tick,
-                payload: decoded,
-            });
+            journal.push(record);
             durable_through = seq;
             expected += 1;
         }

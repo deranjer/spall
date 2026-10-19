@@ -485,7 +485,7 @@ pub enum TopologyOp {
     /// A split whose geometry is too large even for a compressed inline blob
     /// (T17 increment 2 / ENG-64): a *marker only*. The child volume travels
     /// out of band — as a [`crate::baseline::BaselineWorld`] on a bulk stream to
-    /// replicas, and as a journal `TopologyBulkSplit` payload to disk — keyed by
+    /// replicas, and as a journal `TopologyAttachments` payload to disk — keyed by
     /// `transfer_id` (the [`crate::BaselineBegin::transfer_id`] of that
     /// transfer). The replica **holds** this transaction until the matching
     /// blob assembles.

@@ -173,7 +173,7 @@ T10 implements this for the all-resident G1 case: a committed `TopologyTransacti
 
 T17 increment 1 (ENG-64) adds the **baseline-blob split**: when the inline `CellRun` list would overflow one reliable control record (`MAX_CONTROL_RECORD`, not just the `MAX_TRANSACTION_OPS` count — ~1300 fragmented runs already blow the 64 KiB frame), the commit re-encodes the ops as `[IntegerBrush, SplitOffBaseline { source, child, child_entity, blob }*, SourcePatchBaseline { source, blob }]`. Each `blob` is a zstd-compressed postcard `spall_protocol::baseline::BaselineVolume` (the same per-brick `{coord, revision, edited, cells}` payload late-join uses) — one carries the whole child volume, one the source's post-cut affected bricks — bounded by `MAX_SPLIT_BASELINE_BLOB` (28 KiB compressed) so the record still fits the wire. `before` / `after` / `result_hashes` are unchanged and remain the replica's acceptance check; the blob rides inside `tx.ops`, so the durable journal and exact-replay reconstruct the split with no schema change.
 
-T17 increment 2 (ENG-64) handles the split whose compressed geometry is *still* over `MAX_SPLIT_BASELINE_BLOB` — the G1 64-brick collapse. The commit emits marker-only ops `[IntegerBrush, SplitOffBulkBaseline { source, child, child_entity, transfer_id }*, SourcePatchBulkBaseline { source, transfer_id }]` plus **one out-of-band `BaselineWorld`** (every child volume + the source's post-cut affected bricks). `transfer_id` is the split's `TransactionId` with a reserved high bit set so it can never collide with a late-join / repair transfer id. That world travels to replicas as a `BaselineTransfer` on a bulk stream (`BaselineBegin` control + `BaselinePart` bulk + `BaselineEnd` control, keyed by `transfer_id`), broadcast to every live client right after the marker transaction; a joining client gets both queued. The control stream is FIFO and single-reader, so a replica always processes the marker `TopologyTransaction` first, **holds** it (`ApplyOutcome::AwaitingBulkSplit`), then assembles the blob from the bulk stream and retries. To disk the pair is a new `spall_store` `JournalPayload::TopologyBulkSplit` variant (an appended postcard variant — old rows stay decodable, `STORE_SCHEMA_VERSION` unchanged); exact-replay and durable recovery feed the sibling `BaselineWorld` into `replay_transaction`. A split whose assembled `BaselineWorld` exceeds `MAX_ASSEMBLED_TRANSFER` (64 MiB) or `MAX_BASELINE_PARTS` is still refused (per-region splitting remains T18).
+T17 increment 2 (ENG-64) handles the split whose compressed geometry is *still* over `MAX_SPLIT_BASELINE_BLOB` — the G1 64-brick collapse. The commit emits marker-only ops `[IntegerBrush, SplitOffBulkBaseline { source, child, child_entity, transfer_id }*, SourcePatchBulkBaseline { source, transfer_id }]` plus **one out-of-band `BaselineWorld`** (every child volume + the source's post-cut affected bricks). `transfer_id` is reserved from the common runtime transfer allocator before final transaction hashing/journaling, using the split namespace; it is preserved across wire and durable attachments. That world travels to replicas as a `BaselineTransfer` on a bulk stream (`BaselineBegin` control + `BaselinePart` bulk + `BaselineEnd` control, keyed by `transfer_id`), broadcast to every live client right after the marker transaction; a joining client gets both queued. The control stream is FIFO and single-reader, so a replica always processes the marker `TopologyTransaction` first, **holds** it (`ApplyOutcome::AwaitingBulkSplit`), then assembles the blob from the bulk stream and retries. To disk the pair uses current store5 `JournalPayload::TopologyAttachments`, with one Geometry entry in the existing bounded `TransactionAttachmentSetV1`. Exact replay and durable recovery validate the complete typed set against its parent before feeding the geometry into `replay_transaction`; older saves reject without migration. A split whose assembled `BaselineWorld` exceeds `MAX_ASSEMBLED_TRANSFER` (64 MiB) or `MAX_BASELINE_PARTS` is still refused (per-region splitting remains T18).
 
 Physics is not lockstep. Do not promise identical trajectories from running the same inputs on every machine. Rapier's determinism guarantees have conditions, and whole-engine determinism requires more than selecting a physics feature. [Rapier determinism documentation](https://rapier.rs/docs/user_guides/rust/determinism/).
 
@@ -869,7 +869,7 @@ Death. Current-only owner/set/change/operation/commit/bulk V4 schemas/domains4,
 snapshot V2/schema2/domain2, wire/handshake12 and lifecycle kind9 reject superseded
 layouts without aliases or migration. Unchanged overlays and part velocities stay
 V2; source masks/local poses/components keep V1. Baseline1 remains guarded;
-store4 now carries the complete checkpoint section described below.
+store5 retains the complete checkpoint section introduced in store4, described below.
 
 Simulation capture now records every actual volume.next_revision, including
 retired gaps, initially empty/emptied sources and u64::MAX exhaustion. The previous
@@ -976,3 +976,30 @@ backing, invalid catalog or incomplete ordinary bodies fail without publishing
 cache/counter changes. Catalog-free capture still refuses initialized hosts.
 Store4/wire12/baseline1 layouts are unchanged by this adapter. Live serve catalog
 handoff and typed animal consumers remain required before 1km acceptance.
+
+
+Typed durable transaction attachments (ENG-218, 2026-10-19): current-only store5
+replaces store4 without migration. JournalPayload::TopologyAttachments replaces
+the geometry-only bulk journal variant. It retains current-wire parent and body
+participant controls plus existing TransactionAttachmentSetV1 bytes. The envelope
+validates every required bulk marker exactly once by family and transfer ID,
+parent transaction/operation ordinal/hash and existing cumulative decoded-work
+budgets. The geometry producer adapter supplies its existing allocator-reserved
+ID; startup retained-ID seeding decodes the same typed record. Wire12, baseline1
+and animal owner/snapshot layouts are unchanged. No second journal or ID ledger.
+
+Typed parent controls cap at64KiB; participant count caps at4096, each control
+at64KiB, total participant bytes at64MiB; attachment bytes cap at64MiB before copy.
+Recovery borrows SQLite row blobs and bounded postcard fields rather than copying
+an unchecked whole journal blob. Full journal row decoding refuses trailing data.
+Nested geometry/lifecycle decoding keeps the existing family-specific cumulative
+budgets. Typed rows must match parent server_tick; invalid records poison the
+writer before any prefix/outbox publishes. Recovery reports the invalid record
+and retains only the validated durable prefix under the existing corruption policy.
+
+The store can retain bounded lifecycle and mixed attachment data, but Simulation
+replay explicitly refuses lifecycle attachments before applying the transaction.
+Existing initialized-host journal suffix guards remain. The in-memory geometry
+producer still supplies its geometry bulk_baseline; typed in-memory lifecycle
+publication, atomic Simulation replay, client baseline/replica and live catalog
+handoff remain ENG-218 work. Storage retention is not live actor replay acceptance.

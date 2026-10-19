@@ -16,7 +16,7 @@ use spall_server::serve::{
     DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES, default_capture_workers,
 };
 use spall_server::{Scene, ServeConfig, ServeSummary, serve};
-use spall_store::{FaultPlan, JournalPayload, Recovery};
+use spall_store::{FaultPlan, Recovery};
 
 const WORLD_ID: u128 = 0x5A11_0000_0000_7010;
 
@@ -323,13 +323,18 @@ fn start_server(
 
 fn retained_bulk_record(recovery: &Recovery) -> Option<(u64, Hash32)> {
     recovery.journal.iter().find_map(|row| {
-        let saved = row.payload.as_topology_bulk_split()?;
+        let saved = row.payload.as_topology_with_attachments()?;
         let decoded = saved.as_ref().ok()?;
-        let (tx, _, world) = decoded;
+        let (tx, _, attachments) = decoded;
         let transfer_id = tx.ops.iter().find_map(|op| match op {
             TopologyOp::SplitOffBulkBaseline { transfer_id, .. } => Some(*transfer_id),
             _ => None,
         })?;
+        let spall_protocol::ValidatedTransactionAttachmentV1::Geometry(world) =
+            attachments.get(transfer_id)?
+        else {
+            return None;
+        };
         Some((transfer_id, Hash32::of(&world.encode())))
     })
 }
@@ -397,16 +402,20 @@ fn oversized_split_shares_one_wire_id_and_durable_replay_then_seeds_restart() {
     )
     .expect("the SQLite checkpoint plus durable split suffix restores");
     assert_eq!(restored.world().world_hash(), client_hash);
-    let durable_baseline_bytes = recovery
+    let durable_baseline = recovery
         .journal
         .iter()
-        .find_map(|row| match &row.payload {
-            JournalPayload::TopologyBulkSplit { baseline, .. } => Some(baseline.as_slice()),
-            _ => None,
+        .find_map(|row| {
+            let (tx, _, set) = row.payload.as_topology_with_attachments()?.ok()?;
+            let id = tx.ops.iter().find_map(TopologyOp::bulk_transfer_id)?;
+            match set.get(id)? {
+                spall_protocol::ValidatedTransactionAttachmentV1::Geometry(world) => {
+                    Some(world.clone())
+                }
+                _ => None,
+            }
         })
         .unwrap();
-    let durable_baseline =
-        spall_protocol::BaselineWorld::decode_compressed(durable_baseline_bytes).unwrap();
     assert_eq!(Hash32::of(&durable_baseline.encode()), attached_hash);
 
     // The injected failure is limited to the final checkpoint. The initial

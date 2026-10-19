@@ -218,7 +218,14 @@ impl Writer {
                     got: u64::MAX,
                 })?;
         for (offset, r) in records.iter().enumerate() {
-            r.payload.validate_auxiliary_bounds()?;
+            if let Err(error) = r.validate() {
+                // Typed transport failure closes this writer before a batch prefix
+                // can publish. Preserve existing auxiliary preflight retry behavior.
+                if matches!(r.payload, dto::JournalPayload::TopologyAttachments { .. }) {
+                    self.poison("invalid typed journal record");
+                }
+                return Err(error.into());
+            }
             let expect = start
                 .checked_add(offset as u64)
                 .ok_or(StoreError::JournalGap {
@@ -238,7 +245,7 @@ impl Writer {
                     && matches!(
                         r.payload,
                         dto::JournalPayload::Topology { .. }
-                            | dto::JournalPayload::TopologyBulkSplit { .. }
+                            | dto::JournalPayload::TopologyAttachments { .. }
                     )
             }) {
                 return Err(StoreError::OutboxJournalMismatch(event.journal_seq));

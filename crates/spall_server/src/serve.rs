@@ -8519,7 +8519,7 @@ mod tests {
         let records = persist::journal_records(live.journal().entries()).unwrap();
         assert!(matches!(
             records[0].payload,
-            JournalPayload::TopologyBulkSplit { .. }
+            JournalPayload::TopologyAttachments { .. }
         ));
         Writer::open(&db).unwrap().append_journal(&records).unwrap();
 
@@ -8552,7 +8552,9 @@ mod tests {
             match op {
                 spall_protocol::TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
                 | spall_protocol::TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => {
-                    *transfer_id = 0;
+                    *transfer_id = spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT
+                        | crate::transfer_ids::CREATURE_LIFECYCLE_TRANSFER_ID_BIT
+                        | 17;
                 }
                 _ => {}
             }
@@ -8560,10 +8562,14 @@ mod tests {
         let invalid_record = JournalRecord {
             seq: entry.seq.0,
             tick: entry.transaction.server_tick.get(),
-            payload: JournalPayload::topology_bulk_split(
+            payload: JournalPayload::topology_with_attachments(
                 &invalid_transaction,
                 &entry.participants,
-                entry.bulk_baseline.as_ref().unwrap(),
+                &persist::geometry_attachment_set(
+                    &invalid_transaction,
+                    entry.bulk_baseline.as_ref().unwrap(),
+                )
+                .unwrap(),
             )
             .unwrap(),
         };

@@ -1555,3 +1555,89 @@ cargo fmt --all -- --check and git diff --check passed. Logs respectively
 .local/eng218-stream-workspace.log, eng218-stream-clippy.log and eng218-stream-fmt.log.
 Filesystem hard-link incremental-cache warnings are environmental copy fallback;
 no code lint failures. Unrelated untracked artifacts/ preserved.
+
+
+2026-10-19 ENG-218 typed durable attachment transport
+--------------------------------------------------
+Current-only store5 replaces4 with no migration. Removed the geometry-only
+TopologyBulkSplit journal variant and its constructors/accessors plus the legacy
+row-compatibility test. TopologyAttachments retains current-wire transaction and
+participant controls plus the existing bounded TransactionAttachmentSetV1 bytes.
+Construct/decode correlates complete marker coverage, family/transfer IDs, parent,
+operation ordinal/hash and cumulative protocol work before exposing candidates.
+Source/owner/physics/checkpoint DTOs, wire12 and baseline1 are unchanged.
+
+Actual server journal_records converts the existing geometry producer's bulk
+world to one typed Geometry attachment using its already reserved marker ID.
+Retained-ID startup seeding, exact geometry replay and full-size QUIC/SQLite
+restart fixtures now use the typed record. The producer's in-memory geometry
+bulk_baseline remains geometry output; general typed in-memory lifecycle
+publication and live bulk production still need implementation. This is one
+existing ordered journal/sequence/outbox, not a parallel animal journal.
+
+New stored control decoding borrows postcard byte slices, caps parent64KiB,
+participant count4096/per-record64KiB/total64MiB and attachment bytes64MiB before
+copying; nested geometry/lifecycle decode reuses existing cumulative budgets.
+Recovery borrows SQLite row blobs, refuses outer trailing bytes and validates
+typed row ticks against parents. Invalid typed batches poison before publishing
+a valid prefix/outbox; existing auxiliary preflight retry behavior is retained.
+Geometry-only runtime replay remains supported. Animal or mixed typed attachment
+sets return CreatureJournalUnsupported before transaction application; existing
+initialized-host suffix/write guards and closed spawning remain.
+
+Changed files: crates/spall_store/src/{dto,db,recover}.rs and tests/durability.rs;
+crates/spall_server/src/{persist,serve}.rs, tests/geometry_split_transfer_id.rs,
+tests/animal_checkpoint.rs plus new tests/support/animal_journal_attachments.rs.
+Protocol baseline/records and sim world comments now name the current payload.
+Architecture/protocol/validation/design/tasks mirror the current boundary.
+
+Initial attempts: first store test compilation caught removed old variant callers;
+replaced them with current typed geometry correlation tests. New SQLite borrowed
+BLOB access needed explicit SQL-type error conversion. New animal fixture compile
+used a non-Record commit with encode_control and wrong encode/hash paths; corrected
+to the actual enclosing inline transaction, dto::encode and existing Hash32 hash.
+Focused store14pass and focused animal3pass then succeeded. First retained-ID
+negative test used17, which is a valid Baseline namespace ID; corrected to genuine
+conflicting Split+Creature bits while keeping the payload valid and correlated.
+The exact namespace refusal check remains. First full store/server run266pass1fail
+3ignored27targets stopped only on existing snow preflight retry: a new generic
+poison changed it. Scoped poisoning to the new typed transport only, preserving
+that existing behavior; no assertion/workload was weakened. Initial log retained
+as .local/eng218-typed-journal-tests-initial.log. Final checks/results follow.
+
+New tests reuse the actual three-part Alive source/motion snapshot fixture above
+the inline64KiB ceiling, separately and mixed with typed terrain geometry. They
+retain exact owner/source/part motion/hash/parent/ordinal/attachment/transfer IDs
+through SQLite. Before/AfterJournalCommit FaultPlan cuts retain none/all, not
+real-process animal crash proof. Wrong parent/ordinal/hash/missing/family, bad row
+tick and participant budgets refuse; invalid batches publish no prefix/outbox.
+CRC-valid nested and outer trailing bytes report corruption and retain only the
+validated durable prefix. Tests explicitly require runtime replay refusal.
+
+Remaining/next unblocked ID ENG-218: typed in-memory bulk producer/reservation
+handoff, joint Simulation ordered actor replay, complete client baseline/replica,
+live game-catalog handoff and source-edit/fracture/terminal synchronization. Live
+spawning, combined1024m weather/animals, shipped population/GPU, real-process and
+two-client animal restart/destruction remain unrun/unaccepted. Storage transport
+is not live actor replay. ENG-218 remains in_progress. artifacts/ untouched.
+
+Final measured validation (all Cargo through .local/eng218-cargo.ps1 with the
+established G:\Programming\voxel_engine\target, no parallel Cargo runs):
+- cargo test -p spall_store -p spall_server: corrected retry267passed0failed,
+  3existingignored across29 result targets. Existing actual child-process crash,
+  TLS/multiplayer and full-sized geometry split/restart workloads retained.
+- Final test strengthening: cargo test -p spall_store --lib:15passed;
+  cargo test -p spall_server --test animal_checkpoint:23passed. The participant
+  count test supplies a hinted decoder whose body read panics, proving refusal
+  before any body request; inline animal transactions validate successfully but
+  specifically return CodecError::Size, so oversized workload is not reduced.
+- cargo check --workspace --all-targets --all-features: passed.
+- cargo clippy -p spall_voxel -p spall_physics -p spall_protocol -p spall_sim
+  -p spall_store -p spall_server -p spall_client --all-targets -- -D warnings: passed.
+- cargo fmt --all -- --check and git diff --check: passed.
+Logs: .local/eng218-typed-journal-{tests,store,animals,workspace,clippy,fmt}.log.
+Incremental hardlink warnings use existing filesystem copy fallback; no code lint
+failures or dependency changes. Coordinator inspected final integration/bounds,
+parent matching, failure atomicity and explicit runtime refusal. No concrete
+blocker remains within this transport scope. Required live actor consumers and
+combined launch gates listed above remain outstanding, not waived.

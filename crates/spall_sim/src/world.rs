@@ -2506,7 +2506,7 @@ impl SimWorld {
 
         // T17 increment 2: a giant split's `SplitOffBulkBaseline` /
         // `SourcePatchBulkBaseline` markers get their geometry from this
-        // out-of-band world, delivered as a `spall_store` `TopologyBulkSplit`
+        // out-of-band world, delivered as a `spall_store` `TopologyAttachments`
         // journal payload (or the bulk transfer, on a live replica).
         let bulk_volume =
             |id: VolumeId| -> Result<&spall_protocol::baseline::BaselineVolume, WorldError> {

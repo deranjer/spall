@@ -391,3 +391,32 @@ animal and environment capture succeeds. No store/wire layout changes or live
 serve/spawn enablement. Verify mixed/empty animals through SQLite and detached
 restore, warm/cold backing, unavailable/digest/catalog failure atomicity, foreign
 world refusal and ordinary-body eviction refusal.
+
+
+2026-10-19 typed durable attachment participant: replace the geometry-only
+JournalPayload::TopologyBulkSplit variant with TopologyAttachments carrying the
+existing bounded TransactionAttachmentSetV1 bytes. Bump current-only store schema
+to5, reject4 and earlier without migration; wire12/baseline1 stay unchanged.
+Construct/decode attachments only against the exact saved parent transaction,
+using existing count/family/ID/replay-identity and cumulative decode budgets.
+Migrate the actual terrain journal adapter/recovery/retained-ID startup path and
+real restart tests to the typed set; no alternate actor journal. Existing geometry
+producer's in-memory bulk_baseline remains its geometry output, converted to one
+Geometry attachment with the reserved marker ID. A future bulk lifecycle producer
+still needs typed in-memory publication. Store codec tests preserve validated
+lifecycle payloads and mixed families through actual SQLite, reject missing/extra/
+wrong parent/hash/family/trailing/oversized sets before nested use. Existing live
+actor journal/recovery guards remain: this transport seam must not claim runtime
+actor replay. Replay accepts geometry-only typed sets and explicitly refuses
+lifecycle attachments until the joint Simulation consumer exists. Existing
+process crash/geometry restart tests, full store/server/protocol checks and
+workspace/lint/format must retain workloads.
+
+Typed journal implementation refinements: new transport fields use borrowed
+postcard byte slices and count admission before body/copy allocation (parent64KiB,
+participants4096/per-control64KiB/total64MiB, attachments64MiB). Recovery borrows
+SQLite row buffers and rejects outer trailing bytes. Typed rows bind row tick to
+parent tick. Invalid typed batch preflight poisons before any prefix/outbox write;
+existing auxiliary preflight retries stay unchanged. Store4 rejection is checked
+explicitly alongside older versions before journal-mode changes. Actor storage
+tests retain complete three-part payloads; runtime consumers remain closed.

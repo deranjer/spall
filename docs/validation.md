@@ -513,7 +513,7 @@ cargo xtask scenario --name oversized-split --loss-percent 0 --output .local/run
 # marker SplitOffBulkBaseline / SourcePatchBulkBaseline ops plus one out-of-band
 # BaselineWorld on a bulk stream; each replica holds the marker transaction until
 # the blob assembles. Server + both replicas converge; the tick-0 baseline replay
-# (from the journalled TopologyBulkSplit payload) reproduces the hash.
+# (from the journalled Geometry entry in TopologyAttachments) reproduces the hash.
 cargo xtask scenario --name giant-split --loss-percent 0 --output .local/runs/giant-split
 
 # T19: one `walk` server + two scripted player capsules that predict movement,
@@ -1867,7 +1867,7 @@ older checkpoint's own journal suffix. Schema3 open refusal remains nonmutating,
 including journal-mode headers. Full protocol/physics/voxel/sim/store/server,
 workspace/all-feature/all-target and strict lint checks remain required.
 
-Checkpoint format is now store4 with required animal rows; checkpoint topology
+Current store5 retains the required animal checkpoint rows introduced in store4; checkpoint topology
 composition version3 preserves actor-free geometry v2 hash vectors. Wire12 and
 baseline1 are unchanged. These checks do not establish actor journal/attachment/
 replica/baseline consumers, real-process animal crash/restart, shipped population,
@@ -1899,3 +1899,27 @@ and permit repair/retry with fresh capture. A wrong catalog after terrain stagin
 must not warm the cache. Same-ID/same-revision foreign worlds refuse both capture
 entrypoints; evicted ordinary bodies refuse. These are CPU checkpoint tests,
 not combined 1km, shipped population/GPU, two-client or real-process animal gates.
+
+
+Typed durable attachments (ENG-218, 2026-10-19):
+`cargo test -p spall_store -p spall_server` retains actual process-crash and
+multiplayer geometry split/restart workloads. The real oversized terrain split
+must retain the same allocator transfer ID and full geometry hash through typed
+journal encode, SQLite, startup ID seeding, replay and failed final checkpoint.
+Store unit tests cover current-wire controls, geometry-set completeness, wrong
+parent, truncation/trailing data, oversized parent bytes and a declared participant
+count refused before missing bodies allocate. Store4 and all older saves refuse
+without modifying the DB or journal-mode headers; no migrations or old variant.
+
+The existing animal_checkpoint fixture adds actual complete three-part Alive
+source/motion payloads above the64KiB inline ceiling, separately and mixed with a
+geometry attachment, through SQLite publish/recover/typed decode. Exact sources,
+poses/part motion/full owner hash/parent/ordinal/attachments and retained IDs must
+match. Controlled BeforeJournalCommit/AfterJournalCommit cuts recover none/all;
+these are FaultPlan cuts, not a real-process animal crash proof. Wrong parent,
+ordinal, hash, missing/family mismatches, bad row tick and participant budgets must
+refuse; a valid prefix/outbox must not publish from an invalid batch. CRC-valid
+nested or outer trailing data reports corruption and stops the durable prefix.
+Runtime restore must return CreatureJournalUnsupported for lifecycle or mixed
+sets, with no geometry/actor partial application. These tests establish storage
+transport, not joint runtime replay, live spawning, 1km/GPU/population acceptance.

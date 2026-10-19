@@ -53,10 +53,10 @@ pub fn retained_transfer_ids(recovery: &Recovery) -> Result<Vec<TransferId>, Per
                 .as_topology()
                 .expect("payload is Topology")
                 .map(|(transaction, _)| transaction)?,
-            JournalPayload::TopologyBulkSplit { .. } => record
+            JournalPayload::TopologyAttachments { .. } => record
                 .payload
-                .as_topology_bulk_split()
-                .expect("payload is TopologyBulkSplit")
+                .as_topology_with_attachments()
+                .expect("payload is TopologyAttachments")
                 .map(|(transaction, _, _)| transaction)?,
             _ => continue,
         };
@@ -486,9 +486,11 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
             let payload = match &e.bulk_baseline {
                 // T17 increment 2: a giant split's marker transaction plus its
                 // out-of-band `BaselineWorld`.
-                Some(world) => {
-                    JournalPayload::topology_bulk_split(&e.transaction, &e.participants, world)?
-                }
+                Some(world) => JournalPayload::topology_with_attachments(
+                    &e.transaction,
+                    &e.participants,
+                    &geometry_attachment_set(&e.transaction, world)?,
+                )?,
                 None => JournalPayload::topology(&e.transaction, &e.participants)?,
             };
             Ok(JournalRecord {
@@ -498,6 +500,55 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
             })
         })
         .collect()
+}
+
+/// Adapt the geometry producer's one reserved bulk group to the typed journal.
+pub(crate) fn geometry_attachment_set(
+    transaction: &spall_protocol::TopologyTransaction,
+    world: &spall_protocol::BaselineWorld,
+) -> Result<spall_protocol::TransactionAttachmentSetV1, PersistError> {
+    let transfer_id = transaction
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            TopologyOp::SplitOffBulkBaseline { transfer_id, .. } => Some(*transfer_id),
+            _ => None,
+        })
+        .ok_or(PersistError::BadField(
+            "geometry attachment without child marker",
+        ))?;
+    Ok(spall_protocol::TransactionAttachmentSetV1 {
+        schema: spall_protocol::TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        transaction_id: transaction.transaction_id,
+        attachments: vec![spall_protocol::TransactionAttachmentV1::Geometry {
+            transfer_id,
+            world: world.clone(),
+        }],
+    })
+}
+
+fn geometry_replay_attachment(
+    set: spall_protocol::ValidatedTransactionAttachmentSetV1,
+) -> Result<spall_protocol::BaselineWorld, PersistError> {
+    let mut geometry = None;
+    for (_, attachment) in set.iter() {
+        match attachment {
+            spall_protocol::ValidatedTransactionAttachmentV1::Geometry(world)
+                if geometry.is_none() =>
+            {
+                geometry = Some(world.clone());
+            }
+            spall_protocol::ValidatedTransactionAttachmentV1::CreatureLifecycle(_) => {
+                return Err(PersistError::CreatureJournalUnsupported);
+            }
+            _ => {
+                return Err(PersistError::BadField(
+                    "multiple geometry replay groups unsupported",
+                ));
+            }
+        }
+    }
+    geometry.ok_or(PersistError::BadField("missing geometry replay attachment"))
 }
 
 /// Builds one periodic 20 Hz pose-batch [`JournalRecord`] (`docs/protocol.md`:
@@ -859,11 +910,11 @@ fn restore_checkpoint_internal(
                 .as_topology()
                 .expect("payload is Topology")
                 .map(|(tx, p)| (tx, p, None))?,
-            JournalPayload::TopologyBulkSplit { .. } => record
+            JournalPayload::TopologyAttachments { .. } => record
                 .payload
-                .as_topology_bulk_split()
-                .expect("payload is TopologyBulkSplit")
-                .map(|(tx, p, w)| (tx, p, Some(w)))?,
+                .as_topology_with_attachments()
+                .expect("payload is TopologyAttachments")
+                .map(|(tx, p, set)| (tx, p, Some(set)))?,
             JournalPayload::PoseBatch { .. } => {
                 let snaps = record
                     .payload
@@ -874,7 +925,8 @@ fn restore_checkpoint_internal(
                 continue;
             }
         };
-        let (tx, participants, bulk) = topology;
+        let (tx, participants, attachments) = topology;
+        let bulk = attachments.map(geometry_replay_attachment).transpose()?;
         if tx.algorithm_version != INTEGER_BRUSH_VERSION {
             return Err(PersistError::AlgorithmVersionMismatch {
                 field: "journal transaction.algorithm_version",
@@ -1029,7 +1081,7 @@ fn replay_recovery(
         .filter(|r| {
             matches!(
                 r.payload,
-                JournalPayload::Topology { .. } | JournalPayload::TopologyBulkSplit { .. }
+                JournalPayload::Topology { .. } | JournalPayload::TopologyAttachments { .. }
             )
         })
         .count() as u64;

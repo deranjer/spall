@@ -14,7 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use spall_protocol::baseline::{BaselineDecodeError, BaselineWorld};
+#[cfg(test)]
+use spall_protocol::baseline::BaselineWorld;
 use spall_protocol::{
     CodecError, MotionSnapshot, TopologyTransaction, decode_control, encode_control,
 };
@@ -24,9 +25,9 @@ use spall_protocol::{
 /// without modification (`docs/protocol.md`: "Unknown newer schemas are
 /// rejected without modifying the database").
 ///
-/// Schema 4 adds the required complete creature checkpoint section (ENG-218).
+/// Schema 5 replaces geometry-only journal bulk with bounded typed attachments.
 /// Older saves are rejected without migration.
-pub const STORE_SCHEMA_VERSION: u32 = 4;
+pub const STORE_SCHEMA_VERSION: u32 = 5;
 
 /// Largest accepted stored brick payload, compressed. `docs/protocol.md` caps a
 /// material-only brick record at 256 KiB decompressed for 64 KiB of real
@@ -43,8 +44,10 @@ pub enum DtoError {
     Postcard(#[from] postcard::Error),
     #[error("protocol codec: {0}")]
     Codec(#[from] CodecError),
-    #[error("bulk split baseline: {0}")]
-    Baseline(#[from] BaselineDecodeError),
+    #[error("transaction attachments: {0}")]
+    Attachments(#[from] spall_protocol::TransactionAttachmentError),
+    #[error("typed journal control bounds or row tick mismatch")]
+    JournalBounds,
     #[error("invalid versioned snow tile journal state")]
     SnowTileBounds,
     #[error("invalid creature checkpoint: {0}")]
@@ -203,6 +206,20 @@ pub struct JournalRecord {
     pub payload: JournalPayload,
 }
 
+impl JournalRecord {
+    /// Validate typed transport and its row metadata before publication/recovery.
+    pub fn validate(&self) -> Result<(), DtoError> {
+        self.payload.validate_auxiliary_bounds()?;
+        if let JournalPayload::TopologyAttachments { transaction, .. } = &self.payload {
+            let tx: TopologyTransaction = decode_saved_record(transaction)?;
+            if tx.server_tick.get() != self.tick {
+                return Err(DtoError::JournalBounds);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Game-owned durable event committed atomically with its world journal row.
 /// The payload has its own game schema; the engine stores opaque bytes only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,21 +248,16 @@ pub enum JournalPayload {
         /// `encode_control(&MotionSnapshot)` bytes.
         snapshots: Vec<Vec<u8>>,
     },
-    /// T17 increment 2 (ENG-64): a giant split whose geometry did not fit even a
-    /// compressed inline op blob. `transaction` decodes to a
-    /// `TopologyTransaction` whose ops are `SplitOffBulkBaseline` /
-    /// `SourcePatchBulkBaseline` markers only; `baseline` is
-    /// `BaselineWorld::encode_compressed()` — every child volume plus the
-    /// source's post-cut affected bricks — replayed exactly like the bulk
-    /// transfer a live replica assembles. **Appended variant:** older `Topology`
-    /// / `PoseBatch` rows keep their discriminant indices and still decode.
-    TopologyBulkSplit {
-        /// `encode_control(&TopologyTransaction)` bytes (marker ops only, small).
+    /// One ordered parent transaction with its complete typed bulk attachment set.
+    /// The existing protocol envelope validates coverage and cumulative work
+    /// before nested payloads are exposed to recovery.
+    TopologyAttachments {
+        #[serde(deserialize_with = "decode_journal_control")]
         transaction: Vec<u8>,
-        /// `encode_control(&MotionSnapshot)` bytes, one per participant body.
+        #[serde(deserialize_with = "decode_journal_participants")]
         participants: Vec<Vec<u8>>,
-        /// `BaselineWorld::encode_compressed()` bytes (zstd).
-        baseline: Vec<u8>,
+        #[serde(deserialize_with = "decode_attachment_bytes")]
+        attachments: Vec<u8>,
     },
     /// Appended: canonical vegetation after this tick's topology commits.
     VegetationState(Vec<u8>),
@@ -267,10 +279,77 @@ pub enum JournalPayload {
     },
 }
 
+// Borrow the postcard byte slice and reject its length before allocating a copy.
+fn decode_attachment_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    let bytes: &'de [u8] = Deserialize::deserialize(deserializer)?;
+    if bytes.len() > spall_protocol::MAX_TRANSACTION_ATTACHMENT_BYTES {
+        return Err(serde::de::Error::custom(
+            "attachment compressed-byte budget exceeded",
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+fn decode_journal_control<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    let bytes: &'de [u8] = Deserialize::deserialize(d)?;
+    if bytes.len() > spall_protocol::limits::MAX_CONTROL_RECORD {
+        return Err(serde::de::Error::custom(
+            "journal control-byte budget exceeded",
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+fn decode_journal_participants<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<Vec<u8>>, D::Error> {
+    struct Participants;
+    impl<'de> serde::de::Visitor<'de> for Participants {
+        type Value = Vec<Vec<u8>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("bounded participant controls")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            if seq
+                .size_hint()
+                .is_some_and(|n| n > spall_protocol::limits::MAX_TRANSACTION_REFS)
+            {
+                return Err(serde::de::Error::custom(
+                    "journal participant count exceeded",
+                ));
+            }
+            let mut result = Vec::new();
+            let mut remaining = spall_protocol::MAX_TRANSACTION_ATTACHMENT_BYTES;
+            while let Some(bytes) = seq.next_element::<&'de [u8]>()? {
+                if result.len() >= spall_protocol::limits::MAX_TRANSACTION_REFS
+                    || bytes.len() > spall_protocol::limits::MAX_CONTROL_RECORD
+                    || bytes.len() > remaining
+                {
+                    return Err(serde::de::Error::custom(
+                        "journal participant budget exceeded",
+                    ));
+                }
+                remaining -= bytes.len();
+                result.push(bytes.to_vec());
+            }
+            Ok(result)
+        }
+    }
+    d.deserialize_seq(Participants)
+}
+
 impl JournalPayload {
     /// The store checks the version/size envelope; simulation validates the
     /// canonical cohort contents while replaying this ordered journal entry.
     pub fn validate_auxiliary_bounds(&self) -> Result<(), DtoError> {
+        if let Some(decoded) = self.as_topology_with_attachments() {
+            decoded?;
+        }
         if let Self::SnowTileState {
             world_epoch, state, ..
         } = self
@@ -296,45 +375,69 @@ impl JournalPayload {
         })
     }
 
-    /// Build a `TopologyBulkSplit` payload: the marker transaction, its
-    /// participants, and the out-of-band `BaselineWorld` (T17 increment 2).
-    pub fn topology_bulk_split(
+    /// Encode the complete typed set against its exact ordered parent.
+    pub fn topology_with_attachments(
         transaction: &TopologyTransaction,
         participants: &[MotionSnapshot],
-        baseline: &BaselineWorld,
+        attachments: &spall_protocol::TransactionAttachmentSetV1,
     ) -> Result<Self, DtoError> {
-        Ok(Self::TopologyBulkSplit {
+        if participants.len() > spall_protocol::limits::MAX_TRANSACTION_REFS {
+            return Err(DtoError::JournalBounds);
+        }
+        let attachments = attachments.encode_for_transaction(transaction)?;
+        Ok(Self::TopologyAttachments {
             transaction: encode_control(transaction)?,
             participants: participants
                 .iter()
                 .map(encode_control)
                 .collect::<Result<_, _>>()?,
-            baseline: baseline.encode_compressed(),
+            attachments,
         })
     }
 
-    /// Decode a `TopologyBulkSplit` payload. Returns `None` for any other
-    /// variant.
+    /// Decode and correlate all attachment families before handing off a candidate.
     #[allow(clippy::type_complexity)]
-    pub fn as_topology_bulk_split(
+    pub fn as_topology_with_attachments(
         &self,
-    ) -> Option<Result<(TopologyTransaction, Vec<MotionSnapshot>, BaselineWorld), DtoError>> {
-        let Self::TopologyBulkSplit {
+    ) -> Option<
+        Result<
+            (
+                TopologyTransaction,
+                Vec<MotionSnapshot>,
+                spall_protocol::ValidatedTransactionAttachmentSetV1,
+            ),
+            DtoError,
+        >,
+    > {
+        let Self::TopologyAttachments {
             transaction,
             participants,
-            baseline,
+            attachments,
         } = self
         else {
             return None;
         };
         Some((|| {
+            if transaction.len() > spall_protocol::limits::MAX_CONTROL_RECORD
+                || participants.len() > spall_protocol::limits::MAX_TRANSACTION_REFS
+                || participants
+                    .iter()
+                    .any(|p| p.len() > spall_protocol::limits::MAX_CONTROL_RECORD)
+                || participants
+                    .iter()
+                    .map(Vec::len)
+                    .try_fold(0usize, usize::checked_add)
+                    .is_none_or(|n| n > spall_protocol::MAX_TRANSACTION_ATTACHMENT_BYTES)
+            {
+                return Err(DtoError::JournalBounds);
+            }
             let tx = decode_saved_record::<TopologyTransaction>(transaction)?;
             let parts = participants
                 .iter()
                 .map(|b| decode_saved_record::<MotionSnapshot>(b))
                 .collect::<Result<Vec<_>, _>>()?;
-            let world = BaselineWorld::decode_compressed(baseline)?;
-            Ok((tx, parts, world))
+            let set = spall_protocol::decode_for_transaction(attachments, &tx)?;
+            Ok((tx, parts, set))
         })())
     }
 
@@ -461,13 +564,13 @@ mod tests {
                 batch.as_pose_batch().unwrap().is_err(),
                 "motion schema {version}"
             );
-            let bulk = JournalPayload::TopologyBulkSplit {
+            let bulk = JournalPayload::TopologyAttachments {
                 transaction: tx,
                 participants: vec![pose],
-                baseline: a_baseline_world().encode_compressed(),
+                attachments: geometry_set().encode_for_transaction(&bulk_tx()).unwrap(),
             };
             assert!(
-                bulk.as_topology_bulk_split().unwrap().is_err(),
+                bulk.as_topology_with_attachments().unwrap().is_err(),
                 "bulk topology schema {version}"
             );
         }
@@ -485,14 +588,17 @@ mod tests {
         };
         assert_eq!(poses.as_pose_batch().unwrap().unwrap(), vec![motion]);
         let world = a_baseline_world();
-        let bulk = JournalPayload::TopologyBulkSplit {
-            transaction: current_tx,
-            participants: vec![current_motion],
-            baseline: world.encode_compressed(),
-        };
+        let bulk =
+            JournalPayload::topology_with_attachments(&bulk_tx(), &[motion], &geometry_set())
+                .unwrap();
+        let (tx, parts, set) = bulk.as_topology_with_attachments().unwrap().unwrap();
+        assert_eq!(tx, bulk_tx());
+        assert_eq!(parts, vec![motion]);
         assert_eq!(
-            bulk.as_topology_bulk_split().unwrap().unwrap(),
-            (a_tx(), vec![motion], world)
+            set.get(77),
+            Some(&spall_protocol::ValidatedTransactionAttachmentV1::Geometry(
+                world
+            ))
         );
     }
     fn a_baseline_world() -> BaselineWorld {
@@ -517,43 +623,100 @@ mod tests {
         }
     }
 
-    #[test]
-    fn journal_topology_bulk_split_round_trips() {
-        let world = a_baseline_world();
-        let payload = JournalPayload::topology_bulk_split(&a_tx(), &[], &world).unwrap();
-        let (tx, parts, w) = payload.as_topology_bulk_split().unwrap().unwrap();
-        assert_eq!(tx, a_tx());
-        assert!(parts.is_empty());
-        assert_eq!(w, world);
-        // The variant is disjoint from the other accessors.
-        assert!(payload.as_topology().is_none());
-        assert!(payload.as_pose_batch().is_none());
+    fn bulk_tx() -> TopologyTransaction {
+        let mut tx = a_tx();
+        tx.ops = vec![TopologyOp::SplitOffBulkBaseline {
+            source: VolumeId::new(1).unwrap(),
+            child: VolumeId::new(2).unwrap(),
+            child_entity: spall_core::EntityId::new(5).unwrap(),
+            transfer_id: 77,
+        }];
+        tx
+    }
+    fn geometry_set() -> spall_protocol::TransactionAttachmentSetV1 {
+        spall_protocol::TransactionAttachmentSetV1 {
+            schema: spall_protocol::TRANSACTION_ATTACHMENT_SET_SCHEMA,
+            transaction_id: bulk_tx().transaction_id,
+            attachments: vec![spall_protocol::TransactionAttachmentV1::Geometry {
+                transfer_id: 77,
+                world: a_baseline_world(),
+            }],
+        }
     }
 
     #[test]
-    fn appending_the_bulk_split_variant_keeps_old_rows_decodable() {
-        // A `Topology` row encoded before the new variant existed still round
-        // trips. Compare against the historical variant-zero layout; save
-        // schema 2 changes checkpoint publication, not these journal bytes.
-        let payload = JournalPayload::Topology {
-            transaction: encode_control(&a_tx()).unwrap(),
-            participants: vec![vec![1, 2, 3]],
+    fn typed_geometry_journal_roundtrips_and_binds_parent_and_complete_set() {
+        let tx = bulk_tx();
+        let payload = JournalPayload::topology_with_attachments(&tx, &[], &geometry_set()).unwrap();
+        let bytes = encode(&payload).unwrap();
+        let decoded: JournalPayload = decode(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+        let (parent, parts, set) = decoded.as_topology_with_attachments().unwrap().unwrap();
+        assert_eq!(parent, tx);
+        assert!(parts.is_empty());
+        assert!(set.matches_transaction(&tx));
+        assert_eq!(
+            set.get(77),
+            Some(&spall_protocol::ValidatedTransactionAttachmentV1::Geometry(
+                a_baseline_world()
+            ))
+        );
+        assert!(payload.as_topology().is_none());
+        assert!(payload.as_pose_batch().is_none());
+        let mut missing = geometry_set();
+        missing.attachments.clear();
+        assert!(JournalPayload::topology_with_attachments(&tx, &[], &missing).is_err());
+        let mut extra = geometry_set();
+        extra.attachments.push(extra.attachments[0].clone());
+        assert!(JournalPayload::topology_with_attachments(&tx, &[], &extra).is_err());
+        let mut wrong = tx.clone();
+        wrong.transaction_id = TransactionId::new(8).unwrap();
+        assert!(JournalPayload::topology_with_attachments(&wrong, &[], &geometry_set()).is_err());
+        for mutate in 0..3 {
+            let mut bad = payload.clone();
+            let JournalPayload::TopologyAttachments {
+                transaction,
+                attachments,
+                ..
+            } = &mut bad
+            else {
+                unreachable!()
+            };
+            match mutate {
+                0 => *transaction = encode_control(&wrong).unwrap(),
+                1 => {
+                    attachments.pop();
+                }
+                _ => attachments.push(0),
+            }
+            assert!(bad.as_topology_with_attachments().unwrap().is_err());
+            assert!(bad.validate_auxiliary_bounds().is_err());
+        }
+    }
+
+    #[test]
+    fn typed_journal_controls_are_bounded_before_copying_or_participant_bodies() {
+        let payload = JournalPayload::TopologyAttachments {
+            transaction: vec![0; spall_protocol::limits::MAX_CONTROL_RECORD + 1],
+            participants: vec![],
+            attachments: vec![],
         };
         let bytes = encode(&payload).unwrap();
-        let back: JournalPayload = decode(&bytes).unwrap();
-        assert_eq!(back, payload);
-        #[derive(Serialize)]
-        enum LegacyJournal {
-            Topology {
-                transaction: Vec<u8>,
-                participants: Vec<Vec<u8>>,
-            },
+        assert!(decode::<JournalPayload>(&bytes).is_err());
+        struct Bodies;
+        impl Iterator for Bodies {
+            type Item = &'static [u8];
+            fn next(&mut self) -> Option<Self::Item> {
+                panic!("participant body read before count admission")
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                let n = spall_protocol::limits::MAX_TRANSACTION_REFS + 1;
+                (n, Some(n))
+            }
         }
-        let old = LegacyJournal::Topology {
-            transaction: encode_control(&a_tx()).unwrap(),
-            participants: vec![vec![1, 2, 3]],
-        };
-        assert_eq!(encode(&old).unwrap(), bytes);
+        let d = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(Bodies);
+        let error = decode_journal_participants(d).unwrap_err();
+        assert!(error.to_string().contains("participant count exceeded"));
     }
 
     #[test]
