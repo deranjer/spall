@@ -10,6 +10,7 @@ pub mod interactive;
 pub mod net;
 pub mod predict;
 pub mod replica;
+pub mod replica_creatures;
 pub mod residency;
 pub mod segmented;
 pub mod sky;

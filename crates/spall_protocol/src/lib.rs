@@ -26,6 +26,8 @@ pub mod codec;
 pub mod column_water;
 pub mod column_water_wire;
 pub mod creature;
+pub mod creature_catalog;
+pub use creature_catalog::{OwnedCreatureAsset, OwnedCreatureCatalog, OwnedCreatureSpecies};
 pub mod creature_owner;
 pub mod creature_snapshot;
 pub mod handshake;

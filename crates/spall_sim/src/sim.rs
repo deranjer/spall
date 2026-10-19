@@ -29,11 +29,12 @@ use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, TerrainColliderMode, WorldSetup};
 use spall_voxel::Sample;
 
-pub(crate) struct CreatureBirthPartInput {
-    pub(crate) part_id: u32,
-    pub(crate) parent_id: Option<u32>,
-    pub(crate) local_transform: spall_physics::PartTransform,
-    pub(crate) volume: spall_voxel::Volume,
+/// One source part of an authoritative creature birth.
+pub struct CreatureBirthPartInput {
+    pub part_id: u32,
+    pub parent_id: Option<u32>,
+    pub local_transform: spall_physics::PartTransform,
+    pub volume: spall_voxel::Volume,
 }
 
 fn creature_source_freshness(
@@ -61,9 +62,8 @@ fn creature_source_freshness(
 /// Server-owned input to the ordered actor lifecycle transaction. These
 /// inputs are deliberately crate-private: network callers can never supply a
 /// physics death witness or register a live creature directly.
-// Constructed by the upcoming server-owned lifecycle intent adapter.
-#[allow(dead_code)]
-pub(crate) enum AuthoritativeCreatureIntent {
+/// Server-owned lifecycle request applied atomically at a tick boundary.
+pub enum AuthoritativeCreatureIntent {
     Birth {
         state: Box<spall_protocol::CreatureStateV1>,
         parts: Vec<CreatureBirthPartInput>,
@@ -77,9 +77,8 @@ pub(crate) enum AuthoritativeCreatureIntent {
     },
 }
 
-// Returned to the upcoming server caller for ordered-frame publication.
-#[allow(dead_code)]
-pub(crate) struct CommittedCreatureLifecycle {
+/// Result of a committed lifecycle transaction, for ordered publication.
+pub struct CommittedCreatureLifecycle {
     pub transaction_id: spall_core::TransactionId,
     pub journal_seq: spall_core::JournalSeq,
     pub attachments: Option<spall_protocol::TransactionAttachmentSetV1>,
@@ -3340,7 +3339,7 @@ impl Simulation {
 
     // Closed until the ordered server caller is wired in the next ENG-218 slice.
     #[allow(dead_code)]
-    pub(crate) fn commit_creature_lifecycle_transaction(
+    pub fn commit_creature_lifecycle_transaction(
         &mut self,
         tick: Tick,
         control_seq: spall_protocol::ControlSeq,

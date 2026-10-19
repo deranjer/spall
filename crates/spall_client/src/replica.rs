@@ -384,6 +384,8 @@ pub struct ReplicaWorld {
     /// The existing replay guard binds each ID to its logical payload, excluding
     /// the recipient-specific control-stream sequence used by repair resends.
     applied_tx: BTreeMap<u64, Hash32>,
+    /// Ownership records of replicated creatures; `None` until the game installs a catalog.
+    creatures: Option<crate::replica_creatures::ReplicaCreatures>,
     control_gate: SequenceGate,
     /// Newest held snapshot for a body that does not exist yet: entity → (snap,
     /// server tick it was received at).
@@ -689,6 +691,7 @@ impl ReplicaWorld {
             volume_of_entity: BTreeMap::new(),
             tombstoned: BTreeSet::new(),
             applied_tx: BTreeMap::new(),
+            creatures: None,
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
             pending_repair_txns: BTreeMap::new(),
@@ -728,6 +731,7 @@ impl ReplicaWorld {
             volume_of_entity: BTreeMap::new(),
             tombstoned: BTreeSet::new(),
             applied_tx: BTreeMap::new(),
+            creatures: None,
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
             pending_repair_txns: BTreeMap::new(),
@@ -1540,6 +1544,20 @@ impl ReplicaWorld {
             .fold(0.0_f64, f64::max)
     }
 
+    /// Installs the game-supplied creature catalog, enabling replay of actor
+    /// lifecycle operations. Replaces any previous store.
+    pub fn install_creature_catalog(
+        &mut self,
+        catalog: std::sync::Arc<spall_protocol::OwnedCreatureCatalog>,
+    ) {
+        self.creatures = Some(crate::replica_creatures::ReplicaCreatures::new(catalog));
+    }
+
+    /// Replicated creature ownership records, if a catalog is installed.
+    pub fn creatures(&self) -> Option<&crate::replica_creatures::ReplicaCreatures> {
+        self.creatures.as_ref()
+    }
+
     // --- transaction application --------------------------------------------
 
     /// Applies one committed transaction. See [`ApplyOutcome`].
@@ -1554,12 +1572,13 @@ impl ReplicaWorld {
                 };
             }
         };
-        if tx.ops.iter().any(|op| {
-            matches!(
-                op,
-                TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
-            )
-        }) {
+        let has_lifecycle = crate::replica_creatures::ReplicaCreatures::has_lifecycle_ops(tx);
+        let actor_only = has_lifecycle
+            && tx
+                .ops
+                .iter()
+                .all(|op| matches!(op, TopologyOp::CreatureLifecycle { .. }));
+        if has_lifecycle && (!actor_only || self.creatures.is_none()) {
             return ApplyOutcome::Rejected {
                 reason: "creature lifecycle replay requires an installed actor candidate path"
                     .into(),
@@ -1602,6 +1621,33 @@ impl ReplicaWorld {
         }
         self.now_tick = self.now_tick.max(tx.server_tick.get());
         let _ = self.control_gate.observe(tx.control_seq.0);
+
+        if actor_only {
+            // Actor-only transactions carry no geometry preconditions: apply the
+            // ordered lifecycle ops atomically, then record the replay identity.
+            let floor = self
+                .volumes
+                .keys()
+                .next_back()
+                .map_or(1, |highest| highest.saturating_add(1));
+            let creatures = self
+                .creatures
+                .as_mut()
+                .expect("actor_only implies an installed creature store");
+            return match creatures.apply_transaction(tx, floor) {
+                Ok(()) => {
+                    self.applied_tx.insert(tx.transaction_id.get(), identity);
+                    ApplyOutcome::Published {
+                        transaction: tx.transaction_id,
+                        new_bodies: Vec::new(),
+                        tombstoned: Vec::new(),
+                    }
+                }
+                Err(error) => ApplyOutcome::Rejected {
+                    reason: format!("creature lifecycle rejected: {error}"),
+                },
+            };
+        }
 
         // The distant terrain catalogue is still arriving: a transaction may
         // touch a brick whose digest is not known yet, and its result hash covers
