@@ -14,8 +14,8 @@ spall_protocol = { path = "../spall_protocol" }
 spall_net = { path = "../spall_net" }
 spall_physics = { path = "../spall_physics" }
 spall_render = { path = "../spall_render" }
-spall_sim = { path = "../spall_sim" }
-spall_voxel = { path = "../spall_voxel" }
+spall_sim = { path = "../spall_sim", features = ["fixtures"] }
+spall_voxel = { path = "../spall_voxel", features = ["fixtures"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -31,3 +31,6 @@ image.workspace = true
 yakui.workspace = true
 yakui-wgpu.workspace = true
 yakui-winit.workspace = true
+
+[dev-dependencies]
+spall_mesh = { path = "../spall_mesh", features = ["fixtures"] }

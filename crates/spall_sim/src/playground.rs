@@ -42,10 +42,20 @@ use spall_core::{CellSizeCode, GlobalCell, MaterialId, VolumeId};
 use spall_voxel::{EditPlan, Volume};
 
 use crate::body::BodyPose;
-use crate::fixtures::{
-    DEBRIS_BLUE, DEBRIS_GREEN, DEBRIS_ORANGE, DEBRIS_PURPLE, DEBRIS_RED, DEBRIS_YELLOW,
-};
 use crate::world::SimWorld;
+
+/// Debris red, id 15.
+pub const DEBRIS_RED: MaterialId = MaterialId(15);
+/// Debris orange, id 16.
+pub const DEBRIS_ORANGE: MaterialId = MaterialId(16);
+/// Debris yellow, id 17.
+pub const DEBRIS_YELLOW: MaterialId = MaterialId(17);
+/// Debris green, id 18.
+pub const DEBRIS_GREEN: MaterialId = MaterialId(18);
+/// Debris blue, id 19.
+pub const DEBRIS_BLUE: MaterialId = MaterialId(19);
+/// Debris purple, id 20.
+pub const DEBRIS_PURPLE: MaterialId = MaterialId(20);
 
 /// Bright, distinct debris colours (`spall_sim::fixtures::playground_manifest`)
 /// -- deliberately not the muted structural palette the rest of the

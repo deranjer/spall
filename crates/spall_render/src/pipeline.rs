@@ -784,6 +784,7 @@ impl ScenePipeline {
         self.indirect.resources(device, queue, volume, materials)
     }
 
+    #[cfg_attr(not(feature = "capture"), allow(dead_code))]
     pub(crate) fn dispatch_indirect<'a>(
         &'a self,
         encoder: &'a mut wgpu::CommandEncoder,
@@ -795,6 +796,7 @@ impl ScenePipeline {
             .dispatch(encoder, resources, trace_timestamps, denoise_timestamps);
     }
 
+    #[cfg_attr(not(feature = "capture"), allow(dead_code))]
     pub(crate) fn dispatch_indirect_temporal<'a>(
         &'a self,
         encoder: &'a mut wgpu::CommandEncoder,

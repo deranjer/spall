@@ -3297,6 +3297,7 @@ dependencies = [
  "spall_core",
  "spall_jobs",
  "spall_mesh",
+ "spall_render",
  "spall_voxel",
  "thiserror 2.0.20",
  "wgpu",
@@ -3344,6 +3345,7 @@ dependencies = [
  "spall_jobs",
  "spall_physics",
  "spall_protocol",
+ "spall_sim",
  "spall_structure",
  "spall_voxel",
  "spall_worldgen",
@@ -3361,6 +3363,7 @@ dependencies = [
  "serde_json",
  "spall_core",
  "spall_protocol",
+ "spall_store",
  "thiserror 2.0.20",
  "zstd",
 ]

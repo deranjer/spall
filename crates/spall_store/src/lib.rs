@@ -30,6 +30,7 @@ pub mod creature_checkpoint;
 pub mod db;
 pub mod dto;
 pub mod fault;
+#[cfg(any(test, feature = "fault-injection"))]
 pub mod inject;
 pub mod metrics;
 pub mod recover;

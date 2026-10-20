@@ -125,18 +125,9 @@ pub const PLAYGROUND_BRICK: MaterialId = MaterialId(12);
 pub const PLAYGROUND_SANDSTONE: MaterialId = MaterialId(13);
 /// Playground slate (jump-course platforms), id 14.
 pub const PLAYGROUND_SLATE: MaterialId = MaterialId(14);
-/// Debris red, id 15.
-pub const DEBRIS_RED: MaterialId = MaterialId(15);
-/// Debris orange, id 16.
-pub const DEBRIS_ORANGE: MaterialId = MaterialId(16);
-/// Debris yellow, id 17.
-pub const DEBRIS_YELLOW: MaterialId = MaterialId(17);
-/// Debris green, id 18.
-pub const DEBRIS_GREEN: MaterialId = MaterialId(18);
-/// Debris blue, id 19.
-pub const DEBRIS_BLUE: MaterialId = MaterialId(19);
-/// Debris purple, id 20.
-pub const DEBRIS_PURPLE: MaterialId = MaterialId(20);
+pub use crate::playground::{
+    DEBRIS_BLUE, DEBRIS_GREEN, DEBRIS_ORANGE, DEBRIS_PURPLE, DEBRIS_RED, DEBRIS_YELLOW,
+};
 
 /// Every non-debris, non-air material [`crate::fixtures::playground_scene`]
 /// paints the terrain with, plus a bright palette [`crate::playground`]'s
