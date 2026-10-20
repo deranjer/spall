@@ -9,3 +9,10 @@
 
 # Packaged builds
 /dist/
+
+# Raw evidence policy: summaries (*.md) are tracked; raw run output is not.
+# Already-tracked files stay tracked until removed deliberately.
+/artifacts/
+artifacts/
+docs/reports/**/*.jsonl
+docs/reports/**/*.log
