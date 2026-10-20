@@ -36,11 +36,11 @@ impl Simulation {
     ) -> Result<PreparedSimulationTransaction, String> {
         use spall_physics::{ArticulatedBatchOperation, OccupancyGrid, SourcePart};
         use spall_protocol::{
-            CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_COMMIT_SCHEMA, CreatureClipMode,
-            CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleChangeV4,
-            CreatureLifecycleCommitV4, CreatureLifecycleContextV1, CreatureLifecycleOperationV4,
-            CreatureLifecycleState, CreatureMotionOverlayV2, CreaturePartMotionV1,
-            CreatureReductionOutcome, Record, TopologyOp, TopologyTransaction,
+            CreatureClipMode, CreatureComponentMotionV1, CreatureDeathWitnessV1,
+            CreatureLifecycleChangeV4, CreatureLifecycleCommitV4, CreatureLifecycleContextV1,
+            CreatureLifecycleOperationV4, CreatureLifecycleState, CreatureMotionOverlayV2,
+            CreaturePartMotionV1, CreatureReductionOutcome, Record, TopologyOp,
+            TopologyTransaction, WIRE_SCHEMA_VERSION,
         };
 
         if intents.is_empty() {
@@ -695,7 +695,7 @@ impl Simulation {
                         parts,
                     } => {
                         let change = CreatureLifecycleChangeV4 {
-                            schema: CREATURE_CHANGE_SCHEMA,
+                            schema: WIRE_SCHEMA_VERSION,
                             transaction_id,
                             operation_ordinal: ordinal,
                             expected_before_hash: spall_protocol::Hash32::ZERO,
@@ -706,7 +706,7 @@ impl Simulation {
                         };
                         (
                             CreatureLifecycleCommitV4 {
-                                schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+                                schema: WIRE_SCHEMA_VERSION,
                                 change,
                                 expected_before_topology_hash: spall_protocol::Hash32::ZERO,
                                 pre_motion: None,
@@ -786,7 +786,7 @@ impl Simulation {
                         }
                         let after_hash = after.canonical_hash();
                         let change = CreatureLifecycleChangeV4 {
-                            schema: CREATURE_CHANGE_SCHEMA,
+                            schema: WIRE_SCHEMA_VERSION,
                             transaction_id,
                             operation_ordinal: ordinal,
                             expected_before_hash: before.canonical_hash(),
@@ -794,7 +794,7 @@ impl Simulation {
                             operation: CreatureLifecycleOperationV4::Death { after },
                         };
                         let commit = CreatureLifecycleCommitV4 {
-                            schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+                            schema: WIRE_SCHEMA_VERSION,
                             change,
                             expected_before_topology_hash: before.topology_hash(),
                             pre_motion: Some(pre_motion),
@@ -878,7 +878,7 @@ impl Simulation {
             let mut ids = transfers.lifecycle.into_iter();
             let set =
                 attachments.get_or_insert_with(|| spall_protocol::TransactionAttachmentSetV1 {
-                    schema: spall_protocol::TRANSACTION_ATTACHMENT_SET_SCHEMA,
+                    schema: spall_protocol::WIRE_SCHEMA_VERSION,
                     transaction_id,
                     attachments: Vec::new(),
                 });
@@ -896,7 +896,7 @@ impl Simulation {
                     topology.ops.push(TopologyOp::CreatureLifecycleBulk {
                         transfer_id: transfer_id.0,
                         operation_ordinal: ordinal,
-                        payload_schema: spall_protocol::CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+                        payload_schema: spall_protocol::WIRE_SCHEMA_VERSION,
                         commit_hash: payload.commit_hash,
                     });
                     set.attachments.push(

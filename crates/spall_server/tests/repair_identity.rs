@@ -76,7 +76,7 @@ fn diverge_brick(replica: &mut ReplicaWorld, world: &BaselineWorld, brick_index:
     assert!(matches!(terrain.owner, BaselineOwner::Terrain));
     let b = &terrain.bricks[brick_index];
     let corrupt = BaselineWorld {
-        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         checkpoint_tick: world.checkpoint_tick,
         volumes: vec![BaselineVolume {
             volume_id: terrain.volume_id,

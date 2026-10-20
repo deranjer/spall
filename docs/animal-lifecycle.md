@@ -178,8 +178,8 @@ or reset. Actor population identity/state is checkpointed.
 
 ## Lifecycle and replication records (proposed, not implemented)
 
-Define an independent `CREATURE_STATE_SCHEMA = 1`, separate from wire,
-baseline, SPVX, and save schema versions. All records use bounded postcard DTOs
+Creature records carry `WIRE_SCHEMA_VERSION` on the wire and `STORE_SCHEMA_VERSION` in saves; there are
+no per-family schema numbers before the first public release (SPVX asset files keep their own major/minor). All records use bounded postcard DTOs
 with explicit integer widths, units, tagged enum variants, and validation caps;
 wire envelopes continue to use existing record framing/limits. Do not serialize
 Rust enum layout, native-endian structs, ECS or Rapier handles. Proposed

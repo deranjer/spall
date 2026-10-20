@@ -1,9 +1,7 @@
 use super::*;
 use crate::{creatures::tests::FixtureCatalog, sim::creature_capture::tests::born};
 use spall_core::{CellSizeCode, CreatureAllocatorSnapshotV1, Revision, VolumeId};
-use spall_protocol::{
-    BaselineCells, CREATURE_OWNER_SCHEMA, CREATURE_SNAPSHOT_SCHEMA, CreatureOwnershipSetV4,
-};
+use spall_protocol::{BaselineCells, CreatureOwnershipSetV4, WIRE_SCHEMA_VERSION};
 
 pub(super) fn target(snapshot: &CreatureSnapshotV2) -> Simulation {
     let mut sim =
@@ -89,16 +87,16 @@ fn joint_restore_empty_population_preserves_retired_allocator_and_refuses_replac
         Simulation::new(SimulationConfig::new(crate::fixtures::flat_terrain_setup())).unwrap();
     let fixture = FixtureCatalog::with_materials(sim.world.materials().clone());
     let snapshot = CreatureSnapshotV2 {
-        schema: CREATURE_SNAPSHOT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         allocator: CreatureAllocatorSnapshotV1 {
-            schema: 1,
+            schema: spall_core::STORE_SCHEMA_VERSION_U16,
             world_id: WorldId::from_u128(10),
             world_epoch: 7,
             next_creature_id: 101,
         },
         next_volume_id: sim.world.registry().counters().1,
         owners: CreatureOwnershipSetV4 {
-            schema: CREATURE_OWNER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             records: vec![],
         },
     };

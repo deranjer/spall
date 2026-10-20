@@ -234,7 +234,7 @@ pub fn transfer_from_snapshot(
     interest_epoch: InterestEpoch,
 ) -> Result<BaselineTransfer, BaselineError> {
     let world = BaselineWorld {
-        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         checkpoint_tick: snapshot.checkpoint_tick,
         volumes: snapshot
             .volumes
@@ -818,7 +818,7 @@ pub fn logical_world_baseline(
     }
     volumes.sort_by_key(|v| v.volume_id.get());
     BaselineWorld {
-        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         checkpoint_tick: sim.current_tick().get(),
         volumes,
     }
@@ -1003,7 +1003,7 @@ pub fn logical_brick_repair_patch(
         bricks: vec![brick],
     };
     Some(BaselineWorld {
-        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         checkpoint_tick: sim.current_tick().get(),
         volumes: vec![bv],
     })

@@ -14,15 +14,11 @@
 //! [`MotionSnapshot`](crate::MotionSnapshot) keyframe per body, exactly as
 //! `docs/protocol.md` step 4 of "Late join" describes.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use spall_core::{CELLS_PER_BRICK, EntityId, MaterialId, VolumeId};
 
 use crate::limits::{MAX_SPLIT_BASELINE_BLOB, MAX_SPLIT_BASELINE_DECOMPRESSED};
-
-/// Schema version of the [`BaselineWorld`] payload. Independent of the wire
-/// record schema and the save schema (`docs/protocol.md`: "Version the wire
-/// schema independently of the world save schema").
-pub const BASELINE_WORLD_SCHEMA: u16 = 1;
 
 /// Who owns a baseline volume's cells: a serializable twin of
 /// [`crate::CanonicalOwner`] (which is a pure hashing type and intentionally not
@@ -121,7 +117,7 @@ impl BaselineWorld {
     /// brick minimum per volume, and the volume sort order the canonical hash
     /// assumes.
     pub fn validate(&self) -> Result<(), BaselineDecodeError> {
-        if self.schema != BASELINE_WORLD_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(BaselineDecodeError::Schema(self.schema));
         }
         let mut last_id = 0u64;
@@ -256,7 +252,7 @@ mod tests {
 
     fn a_world() -> BaselineWorld {
         BaselineWorld {
-            schema: BASELINE_WORLD_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             checkpoint_tick: 42,
             volumes: vec![
                 BaselineVolume {

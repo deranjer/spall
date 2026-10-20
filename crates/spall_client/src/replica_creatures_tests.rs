@@ -7,9 +7,9 @@ use spall_core::{
 };
 use spall_physics::{PartTransform, Representation};
 use spall_protocol::{
-    CREATURE_STATE_SCHEMA, ControlSeq, CreatureAssetIdentity, CreatureClipMode,
-    CreatureLifecycleState, CreaturePartBinding, CreatureStateV1, Hash32, OwnedCreatureAsset,
-    OwnedCreatureSpecies, content_manifest_hash,
+    ControlSeq, CreatureAssetIdentity, CreatureClipMode, CreatureLifecycleState,
+    CreaturePartBinding, CreatureStateV1, Hash32, OwnedCreatureAsset, OwnedCreatureSpecies,
+    WIRE_SCHEMA_VERSION, content_manifest_hash,
 };
 use spall_sim::{
     AuthoritativeCreatureIntent, CommittedCreatureLifecycle, CreatureBirthPartInput, Simulation,
@@ -72,7 +72,7 @@ fn birth_intent(
         .with_view(|view| view.material_mapping_hash)
         .unwrap();
     let state = CreatureStateV1 {
-        schema: CREATURE_STATE_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         key: CreatureKey::new(
             WorldId::from_u128(WORLD),
             WorldEpoch::INITIAL,
@@ -242,7 +242,7 @@ fn motion_frame(
     x: f64,
 ) -> spall_protocol::CreatureMotionFrame {
     spall_protocol::CreatureMotionFrame {
-        schema: spall_protocol::CREATURE_MOTION_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         world_epoch,
         server_tick,
         entries: vec![spall_protocol::CreatureMotionEntry {

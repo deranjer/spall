@@ -7,13 +7,11 @@
 //! (units of 2^-32 cell^3), never float bytes. Velocities, pressure and
 //! sleep state are not stored: recovery is at rest.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 
 use crate::water::{MAX_WATER_SOURCE_CELLS, WaterCodecError};
 
-/// Schema number of this record. 1 and 2 are the dense MAC `WaterState`; 3 had
-/// no discharge springs and is rejected (older saves are not migrated).
-pub const COLUMN_WATER_VERSION: u16 = 4;
 /// Fixed-point scale of a discharge: stored flow = round(cells^3/s * 2^16).
 pub const DISCHARGE_FIXED_ONE: u32 = 1 << 16;
 /// Fixed-point scale: stored volume = round(cells^3 * 2^32).
@@ -103,7 +101,7 @@ impl ColumnWaterState {
         let bad = |what: &str| {
             WaterCodecError::InvalidChunk(format!("invalid canonical column water state: {what}"))
         };
-        if self.version != COLUMN_WATER_VERSION {
+        if self.version != WIRE_SCHEMA_VERSION {
             return Err(bad("version"));
         }
         if self.frame_seq == 0 || self.gated_rate > 3 {
@@ -184,7 +182,7 @@ impl ColumnWaterDelta {
     pub fn validate(&self, y_lo: i32, y_hi: i32) -> Result<(), WaterCodecError> {
         // Reuse the state validator on a shell carrying just these regions.
         let shell = ColumnWaterState {
-            version: COLUMN_WATER_VERSION,
+            version: WIRE_SCHEMA_VERSION,
             y_lo,
             y_hi,
             frame_seq: self.frame_seq.max(1),
@@ -246,7 +244,7 @@ mod tests {
 
     fn state() -> ColumnWaterState {
         ColumnWaterState {
-            version: COLUMN_WATER_VERSION,
+            version: WIRE_SCHEMA_VERSION,
             y_lo: 0,
             y_hi: 128,
             frame_seq: 1,

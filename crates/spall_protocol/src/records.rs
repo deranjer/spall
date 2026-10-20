@@ -20,11 +20,11 @@ use crate::limits::{
     SizeLimitError,
 };
 
-/// Schema version stamped into every encoded record header. A peer on another version cannot
-/// decode a single record, so mismatched builds refuse each other at the first message. Version 13
-/// stores creature source bricks as canonical run-length cells (owner schema 5).
-/// Saved journals and live peers both reject older versions without migration.
-pub const WIRE_SCHEMA_VERSION: u16 = 13;
+/// Schema version stamped into every encoded record header: the wire version itself
+/// ([`crate::PROTOCOL_VERSION`]). A peer on another version cannot decode a single record, so
+/// mismatched builds refuse each other at the first message. Saved journals and live peers both
+/// reject other versions without migration.
+pub const WIRE_SCHEMA_VERSION: u16 = crate::handshake::PROTOCOL_VERSION;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -643,7 +643,7 @@ impl Record for TopologyTransaction {
                         detail: "operation ordinal does not fit u32",
                     })?;
                 if *operation_ordinal != expected_ordinal
-                    || *payload_schema != crate::CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA
+                    || *payload_schema != crate::WIRE_SCHEMA_VERSION
                     || *transfer_id == 0
                     || !lifecycle_transfer_ids.insert(*transfer_id)
                 {
@@ -657,8 +657,8 @@ impl Record for TopologyTransaction {
                     field: "TopologyOp.CreatureLifecycle.operation_ordinal",
                     detail: "operation ordinal does not fit u32",
                 })?;
-                if commit.schema != crate::CREATURE_LIFECYCLE_COMMIT_SCHEMA
-                    || commit.change.schema != crate::CREATURE_CHANGE_SCHEMA
+                if commit.schema != crate::WIRE_SCHEMA_VERSION
+                    || commit.change.schema != crate::WIRE_SCHEMA_VERSION
                     || commit.change.transaction_id != txid
                     || commit.change.operation_ordinal != ordinal
                 {
@@ -1090,9 +1090,9 @@ mod tests {
     #[test]
     fn lifecycle_op_round_trips_and_binds_enclosing_identity() {
         use crate::{
-            CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA, CreatureAssetIdentity,
-            CreatureLifecycleCommitV4, CreatureLifecycleOperationV4, CreatureLifecycleState,
-            CreatureOwnershipRecordV4, CreatureStateV1,
+            CreatureAssetIdentity, CreatureLifecycleCommitV4, CreatureLifecycleOperationV4,
+            CreatureLifecycleState, CreatureOwnershipRecordV4, CreatureStateV1,
+            WIRE_SCHEMA_VERSION,
         };
         use spall_core::{CreatureGeneration, CreatureId, CreatureKey, WorldEpoch, WorldId};
 
@@ -1106,9 +1106,9 @@ mod tests {
         let after = CreatureOwnershipRecordV4 {
             primary_component_serial: None,
             part_velocities: vec![],
-            schema: CREATURE_OWNER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             state: CreatureStateV1 {
-                schema: 1,
+                schema: WIRE_SCHEMA_VERSION,
                 key,
                 state_revision: 1,
                 lifecycle: CreatureLifecycleState::Alive,
@@ -1143,9 +1143,9 @@ mod tests {
         };
         let transaction_id = TransactionId::new(42).unwrap();
         let commit = CreatureLifecycleCommitV4 {
-            schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             change: crate::CreatureLifecycleChangeV4 {
-                schema: crate::CREATURE_CHANGE_SCHEMA,
+                schema: crate::WIRE_SCHEMA_VERSION,
                 transaction_id,
                 operation_ordinal: 0,
                 expected_before_hash: crate::Hash32::ZERO,
@@ -1181,13 +1181,11 @@ mod tests {
             tx
         );
         let mut old_wire = encoded.clone();
-        old_wire[..2].copy_from_slice(&12u16.to_le_bytes());
+        old_wire[..2].copy_from_slice(&(WIRE_SCHEMA_VERSION - 1).to_le_bytes());
         assert!(matches!(
             crate::decode_control::<TopologyTransaction>(&old_wire),
-            Err(crate::CodecError::SchemaVersion {
-                expected: 13,
-                found: 12
-            })
+            Err(crate::CodecError::SchemaVersion { expected, found })
+                if expected == WIRE_SCHEMA_VERSION && found == WIRE_SCHEMA_VERSION - 1
         ));
         let mut multiple = tx.clone();
         let mut second = commit.clone();

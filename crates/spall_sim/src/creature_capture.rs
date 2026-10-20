@@ -260,11 +260,11 @@ impl Simulation {
             .map(|state| self.capture_owner(state))
             .collect::<Result<Vec<_>, _>>()?;
         let snapshot = CreatureSnapshotV2 {
-            schema: CREATURE_SNAPSHOT_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             allocator: host.allocator_snapshot(),
             next_volume_id: self.world.registry().counters().1,
             owners: CreatureOwnershipSetV4 {
-                schema: CREATURE_OWNER_SCHEMA,
+                schema: WIRE_SCHEMA_VERSION,
                 records,
             },
         };
@@ -407,7 +407,7 @@ impl Simulation {
             components.sort_by_key(|component| component.serial);
         }
         Ok(CreatureOwnershipRecordV4 {
-            schema: CREATURE_OWNER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             state: sampled,
             owner_key,
             source_generation: owner.source_generation,

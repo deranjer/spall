@@ -87,7 +87,7 @@ impl Fixture {
     }
     fn state(&self) -> CreatureStateV1 {
         CreatureStateV1 {
-            schema: CREATURE_STATE_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             key: CreatureKey::new(
                 WorldId::from_u128(900),
                 WorldEpoch::INITIAL,

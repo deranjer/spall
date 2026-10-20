@@ -15,8 +15,9 @@ use crate::limits;
 use crate::records::{Record, RecordError, WireTag};
 use crate::session::SessionId;
 
-/// Current wire protocol version. Bumped on any breaking record-layout change.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// The one wire version. Client and server ship together, so every record, capability and
+/// handshake shares this number; any layout change bumps it. Pre-release: no per-record versions.
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Fixed simulation and snapshot rates (Hz).
 pub const SERVER_TICK_HZ: u16 = 60;

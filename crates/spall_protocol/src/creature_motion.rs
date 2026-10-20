@@ -8,11 +8,11 @@
 //! entries for creatures it does not hold or that are not newer than the one it
 //! already applied.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 
 use crate::records::{Record, RecordError, WireTag};
 
-pub const CREATURE_MOTION_SCHEMA: u16 = 1;
 pub const MAX_CREATURE_MOTION_ENTRIES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -41,7 +41,7 @@ impl Record for CreatureMotionFrame {
     const TAG: WireTag = WireTag::CreatureMotionFrame;
 
     fn validate(&self) -> Result<(), RecordError> {
-        if self.schema != CREATURE_MOTION_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(RecordError::Inconsistent(
                 "unsupported creature motion schema",
             ));
@@ -97,7 +97,7 @@ mod tests {
 
     fn frame(entries: Vec<CreatureMotionEntry>) -> CreatureMotionFrame {
         CreatureMotionFrame {
-            schema: CREATURE_MOTION_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             world_epoch: 1,
             server_tick: 100,
             entries,

@@ -3,41 +3,6 @@
 use super::*;
 
 impl Simulation {
-    /// Initializes the deterministic state for a legacy save with no weather checkpoint.
-    pub fn initialize_legacy_weather(&mut self, seed: u64) {
-        self.weather_seed = seed;
-        let source = if self.vegetation.is_some() {
-            spall_protocol::WeatherClockSource::Vegetation
-        } else {
-            spall_protocol::WeatherClockSource::ServerFallback
-        };
-        let time_ms = self
-            .vegetation
-            .as_ref()
-            .map_or(self.tick.get().saturating_mul(1000) / 60, |v| {
-                v.state.time_ms
-            });
-        self.weather = spall_protocol::WeatherState::for_clock(
-            seed,
-            self.weather.world_epoch,
-            self.tick.get(),
-            spall_protocol::WeatherClock {
-                time_ms,
-                source,
-                start_season: self
-                    .vegetation
-                    .as_ref()
-                    .map_or(self.weather.start_season, |v| v.state.start_season as u8),
-                season_ms: self
-                    .vegetation
-                    .as_ref()
-                    .map_or(self.weather.season_ms, |v| v.state.season_ms),
-            },
-            self.weather.world_revision,
-        );
-        self.weather_dirty = true;
-    }
-
     /// Set the deterministic world seed before the first authoritative tick.
     pub fn set_weather_seed(&mut self, seed: u64) {
         self.weather_seed = seed;
@@ -112,7 +77,7 @@ impl Simulation {
         state.validate().map_err(|e| e.to_string())?;
         self.weather_seed = state.weather_seed;
         let mut state = state;
-        state.schema = spall_protocol::WEATHER_SCHEMA;
+        state.schema = spall_protocol::WIRE_SCHEMA_VERSION;
         self.weather = state;
         self.weather_dirty = false;
         Ok(())

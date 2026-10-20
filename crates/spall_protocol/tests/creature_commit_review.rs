@@ -88,7 +88,7 @@ impl Fixture {
     }
     fn state(&self) -> CreatureStateV1 {
         CreatureStateV1 {
-            schema: CREATURE_STATE_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             key: CreatureKey::new(
                 WorldId::from_u128(900),
                 WorldEpoch::INITIAL,
@@ -130,7 +130,7 @@ fn owner(f: &Fixture) -> CreatureOwnershipRecordV4 {
     let q = [0.0_f32, 0.0, 0.0, 1.0];
     let pose = serde_json::json!({"translation_m": [0.0,0.0,0.0], "rotation_xyzw": q});
     let raw = serde_json::json!({
-        "schema": 5, "state": state, "owner_key": 9, "source_generation": 1,
+        "schema": spall_protocol::WIRE_SCHEMA_VERSION, "state": state, "owner_key": 9, "source_generation": 1,
         "next_component_serial": 1, "primary_component_serial": null, "part_velocities": [],
         "parts": [{
             "part_id": 1, "source_volume_id": 100, "source_generation": 1,
@@ -170,7 +170,7 @@ fn context(
         operation_ordinal: 0,
         replay_receipt: None,
         allocator: spall_core::CreatureAllocatorSnapshotV1 {
-            schema: 1,
+            schema: spall_core::STORE_SCHEMA_VERSION_U16,
             world_id: WorldId::from_u128(900),
             world_epoch: 1,
             next_creature_id: next_creature,
@@ -184,7 +184,7 @@ fn context(
 }
 fn birth(record: CreatureOwnershipRecordV4) -> CreatureLifecycleChangeV4 {
     CreatureLifecycleChangeV4 {
-        schema: spall_protocol::CREATURE_CHANGE_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         transaction_id: spall_core::TransactionId::new(7).unwrap(),
         operation_ordinal: 0,
         expected_before_hash: Hash32::ZERO,
@@ -266,7 +266,7 @@ fn authoritative_motion_overlay_allows_death_without_any_motion_datagram() {
             .collect(),
     };
     let change = CreatureLifecycleChangeV4 {
-        schema: CREATURE_CHANGE_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: spall_core::TransactionId::new(8).unwrap(),
         operation_ordinal: 0,
         expected_before_hash: authoritative_before.canonical_hash(),
@@ -276,7 +276,7 @@ fn authoritative_motion_overlay_allows_death_without_any_motion_datagram() {
         },
     };
     let commit = CreatureLifecycleCommitV4 {
-        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         change,
         expected_before_topology_hash: client_before.topology_hash(),
         pre_motion: Some(overlay.clone()),
@@ -401,7 +401,7 @@ fn birth_rejects_motion_overlay_and_death_witness() {
     let mut change = birth(after.clone());
     change.transaction_id = spall_core::TransactionId::new(7).unwrap();
     let commit = CreatureLifecycleCommitV4 {
-        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         change,
         expected_before_topology_hash: Hash32::ZERO,
         pre_motion: Some(CreatureMotionOverlayV2 {
@@ -434,7 +434,7 @@ fn birth_duplicate_uses_outer_receipt_and_rejects_divergent_identity() {
     let f = Fixture::new();
     let after = owner(&f);
     let commit = CreatureLifecycleCommitV4 {
-        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         change: birth(after.clone()),
         expected_before_topology_hash: Hash32::ZERO,
         pre_motion: None,
@@ -477,7 +477,7 @@ fn outer_decode_bounds_overlay_and_witness_lists_before_accepting_items() {
     let f = Fixture::new();
     let after = owner(&f);
     let base = CreatureLifecycleCommitV4 {
-        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         change: birth(after),
         expected_before_topology_hash: Hash32::ZERO,
         pre_motion: None,
@@ -513,7 +513,7 @@ fn validated_nonempty_birth_round_trips_as_an_ordered_operation() {
     let after = owner(&f);
     after.validate(&f.catalog()).unwrap();
     let commit = CreatureLifecycleCommitV4 {
-        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         change: birth(after.clone()),
         expected_before_topology_hash: Hash32::ZERO,
         pre_motion: None,
@@ -612,7 +612,7 @@ fn three_part_commit(f: &mut Fixture, noisy: bool) -> CreatureLifecycleCommitV4 
     }
     after.validate(&f.catalog()).unwrap();
     CreatureLifecycleCommitV4 {
-        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         change: birth(after),
         expected_before_topology_hash: Hash32::ZERO,
         pre_motion: None,
@@ -713,7 +713,7 @@ fn mixed_geometry_and_nonempty_lifecycle_attachments_round_trip_as_one_candidate
     });
     ops.push(TopologyOp::CreatureLifecycleBulk {
         operation_ordinal: 4,
-        payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        payload_schema: WIRE_SCHEMA_VERSION,
         commit_hash: lifecycle.commit_hash,
         transfer_id: lifecycle_transfer_id,
     });
@@ -730,12 +730,12 @@ fn mixed_geometry_and_nonempty_lifecycle_attachments_round_trip_as_one_candidate
     };
     transaction.validate().unwrap();
     let geometry = BaselineWorld {
-        schema: BASELINE_WORLD_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         checkpoint_tick: 9,
         volumes,
     };
     let set = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id,
         attachments: vec![
             TransactionAttachmentV1::Geometry {
@@ -807,7 +807,7 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
 
     let marker = TopologyOp::CreatureLifecycleBulk {
         operation_ordinal: 0,
-        payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        payload_schema: WIRE_SCHEMA_VERSION,
         commit_hash: payload.commit_hash,
         transfer_id: 77,
     };
@@ -852,7 +852,7 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
     // Deliberately invalid nested bytes prove correlation is checked before
     // the nested commit decoder is entered.
     let mut hostile_outer = postcard::to_stdvec(&(
-        CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        WIRE_SCHEMA_VERSION,
         transaction_id,
         0_u32,
         payload.commit_hash,
@@ -904,7 +904,7 @@ fn lifecycle_bulk_payload_is_correlated_bounded_and_uses_existing_transfer_seman
             },
             TopologyOp::CreatureLifecycleBulk {
                 operation_ordinal: 1,
-                payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+                payload_schema: WIRE_SCHEMA_VERSION,
                 commit_hash: payload.commit_hash,
                 transfer_id: 77,
             },
@@ -924,7 +924,7 @@ fn lifecycle_bulk_rejects_nested_hash_mismatch_trailing_bytes_and_bad_zstd() {
     let mut changed = commit.clone();
     changed.expected_before_topology_hash = Hash32([0x5a; 32]);
     let mut altered_raw = postcard::to_stdvec(&(
-        CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        WIRE_SCHEMA_VERSION,
         transaction_id,
         0_u32,
         payload.commit_hash,
@@ -1005,13 +1005,8 @@ fn lifecycle_bulk_decode_rejects_compact_uniform_solid_work() {
     record.parts[0].bricks = vec![brick; 32];
     let transaction_id = commit.change.transaction_id;
     let commit_hash = commit.canonical_hash();
-    let mut raw = postcard::to_stdvec(&(
-        CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
-        transaction_id,
-        0_u32,
-        commit_hash,
-    ))
-    .unwrap();
+    let mut raw =
+        postcard::to_stdvec(&(WIRE_SCHEMA_VERSION, transaction_id, 0_u32, commit_hash)).unwrap();
     raw.extend(postcard::to_stdvec(&commit).unwrap());
     let compressed = zstd::stream::encode_all(raw.as_slice(), 0).unwrap();
     assert!(matches!(

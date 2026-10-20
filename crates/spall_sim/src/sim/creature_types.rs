@@ -214,9 +214,9 @@ pub(super) fn portable_birth_record(
     )],
 ) -> Result<spall_protocol::CreatureOwnershipRecordV4, crate::creatures::CreatureScheduleError> {
     use spall_protocol::{
-        BaselineCells, BaselineOwner, CREATURE_OWNER_SCHEMA, CreatureMaskCellV1,
-        CreatureOwnedComponentV1, CreatureOwnershipRecordV4, CreatureSourceMaskBrickV1,
-        CreatureSourcePartV2, Hash32, baseline::BaselineBrick,
+        BaselineCells, BaselineOwner, CreatureMaskCellV1, CreatureOwnedComponentV1,
+        CreatureOwnershipRecordV4, CreatureSourceMaskBrickV1, CreatureSourcePartV2, Hash32,
+        WIRE_SCHEMA_VERSION, baseline::BaselineBrick,
     };
 
     let mut portable_parts = Vec::with_capacity(parts.len());
@@ -321,7 +321,7 @@ pub(super) fn portable_birth_record(
                 angular_velocity_rad_s: [0.0; 3],
             })
             .collect(),
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         components: vec![CreatureOwnedComponentV1 {
             owner_key,
             serial: None,

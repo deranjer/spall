@@ -538,7 +538,7 @@ pub(crate) mod tests {
 
         pub(crate) fn state(&self, id: u64, volume: u64) -> CreatureStateV1 {
             CreatureStateV1 {
-                schema: spall_protocol::CREATURE_STATE_SCHEMA,
+                schema: spall_protocol::WIRE_SCHEMA_VERSION,
                 key: CreatureKey::new(
                     WorldId::from_u128(10),
                     WorldEpoch::INITIAL,

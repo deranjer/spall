@@ -65,11 +65,11 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 
     #[error(
-        "database schema version {found} is newer than supported {supported}; refusing to touch it"
+        "incompatible save: schema version {found} was created by a newer build (this build reads {supported}); refusing to touch it"
     )]
     SchemaTooNew { found: u32, supported: u32 },
     #[error(
-        "database schema version {found} predates supported {supported}; refusing unsupported format"
+        "incompatible save: schema version {found} was created by an older pre-release build (this build reads {supported}); saves are not migrated before the first public release, start a new world"
     )]
     SchemaTooOld { found: u32, supported: u32 },
     #[error("database did not enter WAL mode (got {0:?})")]

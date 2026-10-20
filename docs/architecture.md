@@ -265,8 +265,9 @@ re-enters through the existing baseline/repair path.
 
 `spall_store` (`-> spall_protocol`) owns the durable save schema and SQLite I/O
 only, never simulation objects. It exposes: a versioned save schema
-(`STORE_SCHEMA_VERSION`; a `PRAGMA user_version` guard rejects a newer database
-untouched), zstd-compressed brick payloads with one-brick-bounded decode, a
+(`STORE_SCHEMA_VERSION`, the one save version shared with the ecology and creature
+checkpoint formats; a `PRAGMA user_version` guard rejects any other database untouched, with an
+"incompatible save" error), zstd-compressed brick payloads with one-brick-bounded decode, a
 single WAL `Writer` that verifies `journal_mode=WAL` + `synchronous=FULL` on
 open and returns a `DurableThrough` only after a successful `COMMIT`, checkpoint
 publication (all body/brick rows + the journal cursor + a `complete=1` marker

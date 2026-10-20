@@ -13,9 +13,9 @@ use spall_core::{
 };
 use spall_physics::{PartTransform, Representation};
 use spall_protocol::{
-    CREATURE_STATE_SCHEMA, CreatureAssetIdentity, CreatureClipMode, CreatureLifecycleState,
-    CreaturePartBinding, CreatureStateV1, Hash32, OwnedCreatureAsset, OwnedCreatureCatalog,
-    OwnedCreatureSpecies, content_manifest_hash,
+    CreatureAssetIdentity, CreatureClipMode, CreatureLifecycleState, CreaturePartBinding,
+    CreatureStateV1, Hash32, OwnedCreatureAsset, OwnedCreatureCatalog, OwnedCreatureSpecies,
+    WIRE_SCHEMA_VERSION, content_manifest_hash,
 };
 use spall_server::creature_service::{
     CreatureAction, CreatureActionOutcome, CreatureDirector, CreatureIdPlan,
@@ -470,7 +470,7 @@ impl AnimalDirector {
             .with_view(|view| view.material_mapping_hash)
             .ok()?;
         let state = CreatureStateV1 {
-            schema: CREATURE_STATE_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             key: CreatureKey::new(
                 sim.creature_allocator_snapshot()?.world_id,
                 WorldEpoch::new(sim.creature_allocator_snapshot()?.world_epoch).ok()?,

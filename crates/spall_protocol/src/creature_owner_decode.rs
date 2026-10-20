@@ -1314,7 +1314,7 @@ mod tests {
             })
         };
         let state = serde_json::json!({
-            "schema": 1,
+            "schema": WIRE_SCHEMA_VERSION,
             "key": {"world_id": 9, "world_epoch": 1, "creature_id": 1, "generation": 1},
             "state_revision": 1,
             "lifecycle": "Alive",
@@ -1342,7 +1342,7 @@ mod tests {
             "locomotion_tag": 0
         });
         let input = serde_json::json!({
-            "schema": 1,
+            "schema": WIRE_SCHEMA_VERSION,
             "state": state,
             "owner_key": 7,
             "source_generation": 1,
@@ -1360,9 +1360,9 @@ mod tests {
 
     fn optional_field_record_json() -> serde_json::Value {
         serde_json::json!({
-            "schema": 1,
+            "schema": WIRE_SCHEMA_VERSION,
             "state": {
-                "schema": 1,
+                "schema": WIRE_SCHEMA_VERSION,
                 "key": {"world_id": 9, "world_epoch": 1, "creature_id": 1, "generation": 1},
                 "state_revision": 1,
                 "lifecycle": "Alive",
@@ -1420,7 +1420,7 @@ mod tests {
     #[test]
     fn multirecord_set_roundtrips_through_json_and_postcard() {
         let input = serde_json::json!({
-            "schema": CREATURE_OWNER_SCHEMA,
+            "schema": WIRE_SCHEMA_VERSION,
             "records": [set_record_json(1), set_record_json(2)]
         });
         let set: CreatureOwnershipSetV4 = serde_json::from_value(input).unwrap();
@@ -1532,7 +1532,7 @@ mod tests {
             record
         };
         let input = serde_json::json!({
-            "schema": CREATURE_OWNER_SCHEMA,
+            "schema": WIRE_SCHEMA_VERSION,
             "records": (1..=5).map(record).collect::<Vec<_>>()
         });
         let error = serde_json::from_value::<CreatureOwnershipSetV4>(input).unwrap_err();

@@ -2,6 +2,7 @@
 //!
 //! This DTO is a prerequisite for checkpoint/baseline integration; it does not
 //! install simulation state or create a separate allocator.
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Deserializer, Serialize};
 use spall_core::{CreatureAllocator, CreatureAllocatorSnapshotV1, WorldId};
 
@@ -10,7 +11,6 @@ use crate::{
     Hash32, creature_owner::MAX_CREATURE_OWNER_SET_BYTES,
 };
 
-pub const CREATURE_SNAPSHOT_SCHEMA: u16 = 3;
 pub const MAX_CREATURE_SNAPSHOT_BYTES: usize = MAX_CREATURE_OWNER_SET_BYTES + 128;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -70,7 +70,7 @@ impl CreatureSnapshotV2 {
     /// Catalog-independent storage admission. Full validation remains required
     /// before installation; this only permits bounded encoding/hash traversal.
     pub fn validate_resources(&self) -> Result<(), CreatureOwnershipError> {
-        if self.schema != CREATURE_SNAPSHOT_SCHEMA || self.next_volume_id == 0 {
+        if self.schema != WIRE_SCHEMA_VERSION || self.next_volume_id == 0 {
             return Err(CreatureOwnershipError::Schema);
         }
         CreatureAllocator::restore(self.allocator)

@@ -24,7 +24,7 @@ pub fn validate_section(
         .chain(bricks.iter().map(|brick| brick.volume_id))
         .collect();
     if section.physics_origin_m.iter().any(|v| !v.is_finite())
-        || section.schema != 1
+        || section.schema != spall_core::STORE_SCHEMA_VERSION_U16
         || section.snapshot.allocator.world_id.to_u128() != meta.world_id
         || section.snapshot.next_volume_id != meta.next_volume
         || section.snapshot.canonical_hash().0 != section.snapshot_hash

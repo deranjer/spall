@@ -10,7 +10,7 @@
 use super::*;
 use spall_physics::ArticulatedPose;
 use spall_protocol::{
-    CREATURE_MOTION_SCHEMA, CreatureLifecycleState, CreatureMotionEntry, CreatureMotionFrame,
+    CreatureLifecycleState, CreatureMotionEntry, CreatureMotionFrame, WIRE_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -314,7 +314,7 @@ impl Simulation {
         entries.sort_by_key(|entry| entry.creature_id);
         let world_epoch = self.creature_allocator_snapshot()?.world_epoch;
         Some(CreatureMotionFrame {
-            schema: CREATURE_MOTION_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             world_epoch,
             server_tick: self.tick.get(),
             entries,

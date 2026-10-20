@@ -1,5 +1,5 @@
 //! Public API reset/restore identity checks, independent of host internals.
-use spall_core::{CREATURE_ALLOCATOR_SCHEMA, CreatureAllocatorSnapshotV1, WorldId};
+use spall_core::{CreatureAllocatorSnapshotV1, STORE_SCHEMA_VERSION_U16, WorldId};
 use spall_sim::{Simulation, SimulationConfig, fixtures};
 
 fn simulation() -> Simulation {
@@ -15,7 +15,7 @@ fn replacement_never_discards_a_fresh_worlds_later_actor_counters() {
     let mut fresh = simulation();
     fresh
         .restore_creature_allocator_snapshot(CreatureAllocatorSnapshotV1 {
-            schema: CREATURE_ALLOCATOR_SCHEMA,
+            schema: STORE_SCHEMA_VERSION_U16,
             world_id: world,
             world_epoch: 5,
             next_creature_id: 100,
@@ -40,7 +40,7 @@ fn replacement_never_discards_a_fresh_worlds_later_actor_counters() {
 fn exhausted_epoch_replacement_leaves_allocator_unchanged() {
     let mut active = simulation();
     let saved = CreatureAllocatorSnapshotV1 {
-        schema: CREATURE_ALLOCATOR_SCHEMA,
+        schema: STORE_SCHEMA_VERSION_U16,
         world_id: WorldId::from_u128(902),
         world_epoch: u64::MAX,
         next_creature_id: 123,

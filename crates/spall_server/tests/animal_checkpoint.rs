@@ -177,7 +177,7 @@ fn fixture(empty: bool) -> (Simulation, Catalog) {
                 });
             }
             let state = CreatureStateV1 {
-                schema: CREATURE_STATE_SCHEMA,
+                schema: WIRE_SCHEMA_VERSION,
                 key: CreatureKey::new(
                     WorldId::from_u128(10),
                     WorldEpoch::INITIAL,
@@ -239,7 +239,7 @@ fn fixture(empty: bool) -> (Simulation, Catalog) {
                 vec![component(None, root, masks, [0.5, 0.0, 0.0])]
             };
             records.push(CreatureOwnershipRecordV4 {
-                schema: CREATURE_OWNER_SCHEMA,
+                schema: WIRE_SCHEMA_VERSION,
                 state,
                 owner_key,
                 source_generation: if corpse { 9 } else { 1 },
@@ -270,16 +270,16 @@ fn fixture(empty: bool) -> (Simulation, Catalog) {
         .resume_registry(c.0, next + 10, c.2, c.3)
         .unwrap();
     let snapshot = CreatureSnapshotV2 {
-        schema: CREATURE_SNAPSHOT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         allocator: CreatureAllocatorSnapshotV1 {
-            schema: 1,
+            schema: spall_core::STORE_SCHEMA_VERSION_U16,
             world_id: WorldId::from_u128(10),
             world_epoch: 1,
             next_creature_id: 100,
         },
         next_volume_id: next + 10,
         owners: CreatureOwnershipSetV4 {
-            schema: CREATURE_OWNER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             records,
         },
     };

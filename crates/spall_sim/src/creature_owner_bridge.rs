@@ -5,11 +5,11 @@ use spall_core::{CellSizeCode, GlobalCell, TransactionId, VolumeId};
 use spall_physics::{PartTransform, Representation};
 use spall_protocol::creature_owner::CreatureDeathWitnessV1;
 use spall_protocol::{
-    BaselineCells, BaselineOwner, CREATURE_CHANGE_SCHEMA, CREATURE_OWNER_SCHEMA,
-    CreatureLifecycleChangeV4, CreatureLifecycleContextV1, CreatureLifecycleOperationV4,
-    CreatureLocalPoseV1, CreatureMaskCellV1, CreatureOwnedComponentV1, CreatureOwnershipRecordV4,
-    CreaturePartBinding, CreatureReductionOutcome, CreatureSourceMaskBrickV1, CreatureSourcePartV2,
-    Hash32, baseline::BaselineBrick, reduce_creature_lifecycle_candidate,
+    BaselineCells, BaselineOwner, CreatureLifecycleChangeV4, CreatureLifecycleContextV1,
+    CreatureLifecycleOperationV4, CreatureLocalPoseV1, CreatureMaskCellV1,
+    CreatureOwnedComponentV1, CreatureOwnershipRecordV4, CreaturePartBinding,
+    CreatureReductionOutcome, CreatureSourceMaskBrickV1, CreatureSourcePartV2, Hash32,
+    WIRE_SCHEMA_VERSION, baseline::BaselineBrick, reduce_creature_lifecycle_candidate,
 };
 use spall_voxel::{EditPlan, Volume};
 
@@ -164,7 +164,7 @@ fn record_from_sim(
     CreatureOwnershipRecordV4 {
         primary_component_serial: None,
         part_velocities,
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         state,
         owner_key: OWNER_KEY,
         source_generation: 1,
@@ -288,7 +288,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
     before.validate(&catalog).unwrap();
     let transaction_id = TransactionId::new(1).unwrap();
     let birth = CreatureLifecycleChangeV4 {
-        schema: CREATURE_CHANGE_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id,
         operation_ordinal: 0,
         expected_before_hash: Hash32::ZERO,
@@ -433,7 +433,7 @@ fn eng216_birth_death_values_roundtrip_through_portable_reducer() {
         witness.installed_angular_velocity_rad_s
     );
     let death = CreatureLifecycleChangeV4 {
-        schema: CREATURE_CHANGE_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id,
         operation_ordinal: 1,
         expected_before_hash: before.canonical_hash(),
@@ -675,7 +675,7 @@ fn record_work_preflight_rejects_duplicate_masks_and_large_owned_sets() {
         })
         .collect();
     let set = CreatureOwnershipSetV4 {
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         records: vec![oversized],
     };
     assert_eq!(

@@ -154,7 +154,7 @@ impl CreatureService {
             .records
             .into_iter()
             .map(|record| spall_protocol::CreatureSync {
-                schema: spall_protocol::CREATURE_SYNC_SCHEMA,
+                schema: spall_protocol::WIRE_SCHEMA_VERSION,
                 allocator: snapshot.allocator,
                 next_volume_id: snapshot.next_volume_id,
                 record,

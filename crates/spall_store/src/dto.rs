@@ -20,14 +20,11 @@ use spall_protocol::{
     CodecError, MotionSnapshot, TopologyTransaction, decode_control, encode_control,
 };
 
-/// Version of the on-disk save schema. Bumped on any change to the types in
-/// this module. A database written by a newer schema is rejected on open
-/// without modification (`docs/protocol.md`: "Unknown newer schemas are
-/// rejected without modifying the database").
-///
-/// Schema 5 replaces geometry-only journal bulk with bounded typed attachments.
-/// Older saves are rejected without migration.
-pub const STORE_SCHEMA_VERSION: u32 = 5;
+/// Version of the on-disk save schema: the single pre-release save version, defined in
+/// `spall_core` so crates below the store can stamp it too. Bumped on any change to a persisted
+/// layout. A database written by another version is rejected on open without modification
+/// (`SchemaTooOld`/`SchemaTooNew`); there is no migration before the first public release.
+pub use spall_core::STORE_SCHEMA_VERSION;
 
 /// Largest accepted stored brick payload, compressed. `docs/protocol.md` caps a
 /// material-only brick record at 256 KiB decompressed for 64 KiB of real
@@ -544,7 +541,19 @@ mod tests {
         };
         let current_tx = encode_control(&a_tx()).unwrap();
         let current_motion = encode_control(&motion).unwrap();
-        for version in [2u16, 5, 6, 7, 8, 9, 10, 11, 12, 14] {
+        for version in [
+            2u16,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            spall_protocol::WIRE_SCHEMA_VERSION + 1,
+        ] {
             let mut tx = current_tx.clone();
             let mut pose = current_motion.clone();
             tx[..2].copy_from_slice(&version.to_le_bytes());
@@ -606,7 +615,7 @@ mod tests {
             BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume,
         };
         BaselineWorld {
-            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             checkpoint_tick: 9,
             volumes: vec![BaselineVolume {
                 volume_id: VolumeId::new(2).unwrap(),
@@ -635,7 +644,7 @@ mod tests {
     }
     fn geometry_set() -> spall_protocol::TransactionAttachmentSetV1 {
         spall_protocol::TransactionAttachmentSetV1 {
-            schema: spall_protocol::TRANSACTION_ATTACHMENT_SET_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             transaction_id: bulk_tx().transaction_id,
             attachments: vec![spall_protocol::TransactionAttachmentV1::Geometry {
                 transfer_id: 77,

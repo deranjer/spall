@@ -28,7 +28,7 @@ Handshake includes protocol version, exact content manifest hash, world ID, gene
 | ProgressionRequest | nonzero request ID, recipe catalog version, expected inventory revision, and inspect/craft operation; authenticated control stream only |
 | ProgressionResponse | request ID, current catalog/inventory revisions, outcome/rejection code, and complete sorted inventory snapshot |
 
-Never serialize Rapier handles, ECS entities, pointers, platform-sized integers, or raw Rust structs. DTOs use explicit numeric sizes, tags, units, and bounds. Version the wire schema independently of the world save schema. Protocol mismatch is initially a clear rejection, not speculative compatibility code.
+Never serialize Rapier handles, ECS entities, pointers, platform-sized integers, or raw Rust structs. DTOs use explicit numeric sizes, tags, units, and bounds. Pre-release there are exactly two version numbers: `PROTOCOL_VERSION` (wire; every record header carries it as `WIRE_SCHEMA_VERSION`, which is the same value) and `STORE_SCHEMA_VERSION` (save). Client and server ship together, so a mismatch is a clear rejection, not speculative compatibility code. Per-record and per-family schema numbers return at the first public release, when real saves and third-party clients need protecting.
 
 Progression requests are game-facing control records, not world edits. In
 per-player credential mode, the server passes the authenticated `PlayerId` to
@@ -76,7 +76,7 @@ The assembler validates before staging and reads at most the declared cell
 count plus one byte. Bad headers, corrupt streams and overlong output clear
 staging without publishing a partial frame.
 
-`WaterDelta` uses independent record schema 1, tag 18. It names the domain
+`WaterDelta` (tag 18) names the domain
 origin, installed base sequence, new sequence/tick, ordinal/count, relative
 fluid brick coordinate and zstd quantized fractions. Fluid bricks are 16 cells
 per axis with edge clipping; at most 4096 changed bricks, 4160 compressed bytes
@@ -123,11 +123,10 @@ The stacked-column water (`docs/water-agent-handoff.md`) is the production
 model. The dense MAC `WaterState` above is gone: `grid_mac` was removed in
 ENG-169 and its wire and storage types with it (`WaterSnapshot` and `WaterDelta`
 records, tags 15 and 18 now reserved; the checkpoint `water` row; the
-`WaterState` journal payload; the schema-1 migration). Protocol version 5, store
-schema 3; older saves are rejected. The column-water checkpoint row is always
+`WaterState` journal payload; the schema-1 migration). Older saves are rejected. The column-water checkpoint row is always
 written (`None` for a dry world), so a missing row is corruption, never a
 silently dry restore. Each replicated span also carries the quantized
-horizontal water velocity (`ColumnWaterUpdate` schema 2: `flow_x`, `flow_z` as
+horizontal water velocity (`ColumnWaterUpdate`: `flow_x`, `flow_z` as
 `i8` in 1/16 m/s) so clients predict swimming against the same current as the
 server. It adds three contracts and no change to the save schema version.
 
@@ -250,7 +249,7 @@ no crash-recovery promise.
 
 Retire journal records only after a newer durable checkpoint covers them and no snapshot transfer needs them. Cap retention; lagging joins get a fresh baseline. Persist modified-air bricks explicitly so procedural regeneration cannot restore mined blocks. Initial baselines transfer authoritative terrain rather than trusting client-side generation to be bit-identical.
 
-Use explicit versioned DTOs and fixture worlds when changing save formats. Unsupported schemas are rejected without modifying the database; no save-format migration paths are retained.
+Use explicit versioned DTOs and fixture worlds when changing save formats. Unsupported schemas are rejected without modifying the database; no save-format migration paths are retained. An older save fails to open with an "incompatible save, created by an older pre-release build" error (`StoreError::SchemaTooOld`, `PersistError::SchemaMismatch`); there is no migration before the first public release.
 
 ## Network budget and overload behavior
 
@@ -308,9 +307,12 @@ baselines for an interest-crossing split.
 
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
-`spall_protocol` record headers use `WIRE_SCHEMA_VERSION = 1`. The connection
-protocol is `PROTOCOL_VERSION = 2` after adding server-authenticated player
-principals to the pre-stream authentication exchange.
+`spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
+`PROTOCOL_VERSION` (currently 14): one wire version for the handshake and every record, bumped on
+any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 6, defined in
+`spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
+exist (creature owner/change/snapshot/sync/motion/state, column water, weather, snow,
+transaction attachments, lifecycle bulk, `BASELINE_WORLD_SCHEMA`) are now that same value.
 
 **Endianness.** Every canonical hash pre-image and every frame header field is
 little-endian, fixed width. Canonical sequences carry a `u32` LE length prefix;
@@ -360,8 +362,8 @@ digest by the stamps of the storage chunks it was computed from (`spall_voxel`'s
 and shared by clones; a different cache is equally conformant as long as the digests are equal.
 
 *Versioning.* v1 hashed every brick in one stream under the tag `spall.topology.v1`. v2 changes
-every hash value, so it is not interchangeable: the wire schema moved to 4
-(`WIRE_SCHEMA_VERSION`, stamped in every record header, so a v1 peer cannot decode a single
+every hash value, so it is not interchangeable: the wire version was bumped
+(`WIRE_SCHEMA_VERSION`, stamped in every record header, so a peer on the old version cannot decode a single
 record) and saved worlds record `topology_hash_version = 2`. **A save written under v1 is
 refused on recovery** with an algorithm-version mismatch; its recorded checkpoint and journal
 hashes cannot be verified under v2 and the engine does not carry the v1 algorithm to migrate
@@ -467,9 +469,13 @@ then send `BaselineBegin.world_version = 3`, reusing segment schema 2: a
 manifest followed by individually hashed/compressed frames. The cumulative
 compressed ceiling is 256 MiB; each bulk part remains <=1 MiB, each decoded
 segment <=4 MiB by default, and the manifest's decoded total <=16 GiB.
-Version 1 and version 2 retain their 64 MiB compressed ceilings; the legacy
+Emitted world versions today: 1 (single blob: repairs and split blobs), 3 (streamed), 4 (regional) and 5
+(deferred regional). Version 2 (non-streamed segmented) is no longer produced by the server
+(its constant is still referenced by `serve.rs` and the client accepts it); the former
+version-9 creature-lifecycle constant was unused and has been deleted.
+Version 1 and version 2 retain their 64 MiB compressed ceilings; the
 single-blob decompression bound remains 256 MiB. Unsupported clients receive
-the legacy format, never an unnegotiated larger transfer. Repairs and bulk
+the single-blob format, never an unnegotiated larger transfer. Repairs and bulk
 split blobs keep the existing format.
 
 The server expands immutable brick snapshots one segment at a time. The client
@@ -516,9 +522,8 @@ baseline validation are unchanged. The distinct BBR impaired fixture must not
 be reported as proof that the default CUBIC impaired workload passes, or as a
 G3/G4 fairness/congestion acceptance result.
 
-The legacy baseline transfer body is `spall_protocol::baseline::BaselineWorld`
-(`BASELINE_WORLD_SCHEMA = 1`, versioned independently of the wire and save
-schemas): per volume the `VolumeId`, cell-size code, owner (terrain / body
+The single-blob baseline transfer body (world version 1: repairs and split blobs) is
+`spall_protocol::baseline::BaselineWorld` (its `schema` is `WIRE_SCHEMA_VERSION`): per volume the `VolumeId`, cell-size code, owner (terrain / body
 entity), optional brick bounds, and every resident brick as
 `{coord, revision, edited, cells}` where `cells` is `Uniform(u16)` or a
 `Dense` vector of exactly `CELLS_PER_BRICK` raw material ids. It carries
