@@ -4,7 +4,7 @@
 //! This module expands compact rectangles into a small dynamic vertex buffer;
 //! it does not infer snow exposure from camera or geometry state.
 
-pub const MAX_SNOW_PATCHES: usize = 8_192;
+pub const MAX_SNOW_PATCHES: usize = 40_960;
 pub const MAX_SNOW_FOOTPRINTS: usize = 1_024;
 
 /// A softly bounded ambient/sun estimate for snow, kept deliberately below a

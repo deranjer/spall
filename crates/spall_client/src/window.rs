@@ -5665,6 +5665,8 @@ const FOG_END_FRACTION: f32 = 0.97;
 /// kept a core busy and the upload queue full (a deep forest ran at half the
 /// frame rate with it, measured), for foliage that is a few hundred
 /// milliseconds late at most.
+/// Minimum time between ground-snow geometry rebuilds (each costs ~10 ms).
+const SNOW_REBUILD_INTERVAL: Duration = Duration::from_millis(750);
 const FOLIAGE_REBUILD_INTERVAL: Duration = Duration::from_millis(400);
 
 /// Trees farther than this (metres) are drawn with half-resolution crowns.
@@ -5885,6 +5887,9 @@ pub(super) struct WorldRenderer {
     snow_generation: Option<u64>,
     snow_presentation: crate::snow::SnowPresentation,
     snow_upload_key: Option<(u64, u64, [i64; 3], bool)>,
+    /// When ground snow geometry was last rebuilt; rebuilds cost several ms, so
+    /// arriving snow frames and camera movement are coalesced.
+    snow_rebuilt_at: Option<Instant>,
     reduced_weather_flashes: bool,
     environment: Environment,
     day_cycle_enabled: bool,
@@ -6346,6 +6351,7 @@ impl WorldRenderer {
             snow_generation: None,
             snow_presentation: crate::snow::SnowPresentation::new(),
             snow_upload_key: None,
+            snow_rebuilt_at: None,
             day_clock_label: "Waiting for server time".to_owned(),
             device,
             queue,
@@ -6786,15 +6792,29 @@ impl WorldRenderer {
                 camera.position.to_array().map(|v| (v / 8.0).floor() as i64),
                 self.ground_snow_enabled,
             );
-            if self.snow_upload_key != Some(snow_key) {
+            let snow_toggled = self.snow_upload_key.map(|k| k.3) != Some(snow_key.3);
+            let snow_settled = self
+                .snow_rebuilt_at
+                .is_none_or(|at| at.elapsed() >= SNOW_REBUILD_INTERVAL);
+            if self.snow_upload_key != Some(snow_key) && (snow_toggled || snow_settled) {
+                self.snow_rebuilt_at = Some(Instant::now());
                 if self.ground_snow_enabled
                     && let Some((_, terrain)) = &self.vegetation_terrain
                 {
+                    let snow_started = Instant::now();
                     let (patches, tracks) = self.snow_presentation.update(
                         &self.snow_frames,
                         terrain,
                         camera.position.to_array(),
                     );
+                    let snow_ms = snow_started.elapsed().as_secs_f32() * 1000.0;
+                    if snow_ms > 8.0 {
+                        tracing::info!(
+                            snow_ms,
+                            patches = patches.len(),
+                            "ground snow rebuild exceeded one 120 Hz frame"
+                        );
+                    }
                     self.scene
                         .set_snow_patches(&self.device, &self.queue, patches, tracks)
                         .map_err(|error| ClientError::Render(error.to_string()))?;
