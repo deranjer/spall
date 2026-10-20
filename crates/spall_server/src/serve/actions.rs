@@ -6,7 +6,7 @@ pub(super) fn actor_for(session: SessionId) -> EntityId {
     EntityId::new(1 + u64::from(session.slot().0)).unwrap_or(EntityId::new(1).unwrap())
 }
 
-/// **Development-scenario path** (`ServeConfig::dev_unvalidated_actions`). Trusts
+/// **Development-scenario path** (`HarnessConfig::dev_unvalidated_actions`). Trusts
 /// `claimed_target` / `claimed_brush` verbatim so a fixture harness can script
 /// arbitrary cuts. `None` only for a genuinely unrepresentable target.
 pub(super) fn dev_intent_from_request(

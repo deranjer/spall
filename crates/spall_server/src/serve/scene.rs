@@ -62,7 +62,7 @@ pub enum Scene {
     /// [`spall_sim::spawn_push_test_box`].
     PushTest,
     /// A game-supplied world (see [`CustomWorld`] and
-    /// [`ServeConfig::custom_world`]), e.g. a scene authored in the editor.
+    /// [`HostConfig::custom_world`]), e.g. a scene authored in the editor.
     /// Never selected by name; the host must supply the world.
     Custom,
 }

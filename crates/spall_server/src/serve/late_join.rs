@@ -45,7 +45,7 @@ pub(super) struct ClientLink {
 /// for the measurement this pool's default size is derived from. A job past
 /// the worker count is queued, never rejected or dropped: this bounds
 /// *concurrency*, not the number of simultaneously in-flight joins (that is
-/// [`ServeConfig::catch_up_cap`] / [`ServeConfig::max_join_retries`]'s job).
+/// [`HostConfig::catch_up_cap`] / [`HostConfig::max_join_retries`]'s job).
 ///
 /// Rayon (mentioned only as a design inspiration in this workspace's README,
 /// not an actual `[workspace.dependencies]` entry -- confirmed via `cargo

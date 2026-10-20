@@ -1,38 +1,19 @@
 use super::*;
 
-/// Inputs to [`serve`].
+/// Production server configuration for [`serve`]: what a real host decides.
 #[derive(Debug, Clone)]
-pub struct ServeConfig {
+pub struct HostConfig {
     pub listen: SocketAddr,
     pub scene: Scene,
     /// Derived terrain collision mode. Per-brick is the adopted default;
     /// whole-terrain is available for controlled legacy comparisons.
     pub terrain_collider_mode: TerrainColliderMode,
     pub join_token: JoinToken,
-    /// Hard cap on server ticks for this run.
-    pub max_ticks: u64,
-    /// Stop early after the pipeline is idle this many consecutive ticks
-    /// (once at least one transaction has committed). `0` disables early stop.
-    pub quiescence_ticks: u64,
-    /// Once `max_ticks` is spent, keep serving for up to this long while a regional client is
-    /// still receiving what the server owes it (see the module docs). `0` ends the run at
-    /// `max_ticks` regardless. Hitting the limit is reported in the summary
-    /// (`drain_timed_out`), never silent.
-    pub drain_timeout: Duration,
-    /// Wait for this many clients before the tick loop starts.
-    pub min_clients: usize,
     /// Refuse connections past this many.
     pub max_clients: usize,
-    /// Fail if `min_clients` have not connected within this long.
-    pub startup_timeout: Duration,
     /// Real-time pacing at 60 Hz. `false` runs ticks back to back (headless).
     pub paced: bool,
     pub log_json: PathBuf,
-    pub summary_json: Option<PathBuf>,
-    /// Write the server certificate fingerprint (hex) here for clients.
-    pub fingerprint_out: Option<PathBuf>,
-    /// Write the OS-resolved bound `ip:port` here once listening.
-    pub addr_out: Option<PathBuf>,
     pub transport: TransportConfig,
     /// On-disk world database (T16). When set, the run recovers from it on
     /// start (if it exists), journals every committed transaction, and
@@ -56,28 +37,11 @@ pub struct ServeConfig {
     /// [`default_capture_workers`] for how the default is derived and
     /// `docs/reports/G3.md` increment 30 for the measurement behind it.
     pub capture_workers: usize,
-    /// **Development only.** Skip the server-side action-claim validation
-    /// (`resolve_intent`) and take each `ActionRequest`'s `claimed_target` /
-    /// `claimed_brush` verbatim. This is the "explicitly scoped authenticated
-    /// development scenario path" from ENG-47: it still requires the join token
-    /// and a live session, but it lets a fixture harness script arbitrary cuts
-    /// that no real aim ray would produce. Never enable it on a shared host —
-    /// with it on, any authenticated peer can edit any cell of any body.
-    pub dev_unvalidated_actions: bool,
     /// **Development only.** Accept `AdminRequest`s (world reset) from any
     /// authenticated session. Off by default; a reset is still refused when the
     /// world is persisted or residency-managed, since neither can be rebuilt
     /// from the scene without discarding durable state.
     pub admin_commands: bool,
-    /// Test-only. A fault plan armed on the world [`Writer`] *after* initial
-    /// recovery / first checkpoint, so an injected disk fault lands on a
-    /// periodic or clean-shutdown durable write. `None` in production.
-    pub save_faults: Option<spall_store::FaultPlan>,
-    /// ENG-61: a gate scenario that must show a detached body *come to rest*
-    /// keeps stepping physics past edit-quiescence until every detached body is
-    /// asleep (still bounded by [`Self::max_ticks`]). Off by default so ordinary
-    /// runs still stop as soon as the edit pipeline is idle.
-    pub await_body_settle: bool,
     /// T20: per-client interest relevance + motion bandwidth policy. `None`
     /// keeps the pre-T20 behaviour — one 20 Hz motion batch broadcast
     /// unfiltered to every client. `Some(_)` filters each client's motion to
@@ -120,19 +84,90 @@ pub struct ServeConfig {
     /// Dormancy never changes authoritative geometry, ownership, damage, or
     /// `world_hash`, but a deactivated body **leaves the live physics world**
     /// — a gate scenario that reads physics state directly (e.g.
-    /// [`Self::await_body_settle`]'s `max_penetration_m`) must keep this off,
+    /// [`HarnessConfig::await_body_settle`]'s `max_penetration_m`) must keep this off,
     /// which is why it defaults to `None` for every existing gate fixture.
     pub dormancy: Option<spall_sim::DormancyConfig>,
-    /// Optional bounded timing window for the owning server tick. Warmup ticks
-    /// are excluded; measured ticks include ingress through replication and
-    /// residency, ending immediately before pacing sleep.
-    pub timing_window: Option<TimingWindow>,
     /// Optional credential registry path polled for atomic rotation/revocation
     /// updates. Only used by player-credential authentication.
     pub credential_registry_file: Option<PathBuf>,
     /// The world and player spawns for [`Scene::Custom`]; ignored for every
     /// other scene. `serve` fails fast if `scene` is `Custom` and this is `None`.
     pub custom_world: Option<CustomWorld>,
+}
+
+/// Bounded-run and test-harness concerns for [`serve`]: run limits, scripted
+/// output files, fault injection, and development-only validation bypasses.
+/// [`HarnessConfig::default`] is the bounded headless run that
+/// [`ServeConfig::headless`] has always used.
+#[derive(Debug, Clone)]
+pub struct HarnessConfig {
+    /// Hard cap on server ticks for this run.
+    pub max_ticks: u64,
+    /// Stop early after the pipeline is idle this many consecutive ticks
+    /// (once at least one transaction has committed). `0` disables early stop.
+    pub quiescence_ticks: u64,
+    /// Once `max_ticks` is spent, keep serving for up to this long while a regional client is
+    /// still receiving what the server owes it (see the module docs). `0` ends the run at
+    /// `max_ticks` regardless. Hitting the limit is reported in the summary
+    /// (`drain_timed_out`), never silent.
+    pub drain_timeout: Duration,
+    /// Wait for this many clients before the tick loop starts.
+    pub min_clients: usize,
+    /// Fail if `min_clients` have not connected within this long.
+    pub startup_timeout: Duration,
+    pub summary_json: Option<PathBuf>,
+    /// Write the server certificate fingerprint (hex) here for clients.
+    pub fingerprint_out: Option<PathBuf>,
+    /// Write the OS-resolved bound `ip:port` here once listening.
+    pub addr_out: Option<PathBuf>,
+    /// **Development only.** Skip the server-side action-claim validation
+    /// (`resolve_intent`) and take each `ActionRequest`'s `claimed_target` /
+    /// `claimed_brush` verbatim. This is the "explicitly scoped authenticated
+    /// development scenario path" from ENG-47: it still requires the join token
+    /// and a live session, but it lets a fixture harness script arbitrary cuts
+    /// that no real aim ray would produce. Never enable it on a shared host —
+    /// with it on, any authenticated peer can edit any cell of any body.
+    pub dev_unvalidated_actions: bool,
+    /// Test-only. A fault plan armed on the world [`Writer`] *after* initial
+    /// recovery / first checkpoint, so an injected disk fault lands on a
+    /// periodic or clean-shutdown durable write. `None` in production.
+    pub save_faults: Option<spall_store::FaultPlan>,
+    /// ENG-61: a gate scenario that must show a detached body *come to rest*
+    /// keeps stepping physics past edit-quiescence until every detached body is
+    /// asleep (still bounded by [`Self::max_ticks`]). Off by default so ordinary
+    /// runs still stop as soon as the edit pipeline is idle.
+    pub await_body_settle: bool,
+    /// Optional bounded timing window for the owning server tick. Warmup ticks
+    /// are excluded; measured ticks include ingress through replication and
+    /// residency, ending immediately before pacing sleep.
+    pub timing_window: Option<TimingWindow>,
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            max_ticks: 1_200,
+            quiescence_ticks: 45,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            min_clients: 1,
+            startup_timeout: Duration::from_secs(15),
+            summary_json: None,
+            fingerprint_out: None,
+            addr_out: None,
+            save_faults: None,
+            dev_unvalidated_actions: false,
+            await_body_settle: false,
+            timing_window: None,
+        }
+    }
+}
+
+/// Inputs to [`serve`]: the production [`HostConfig`] plus the
+/// [`HarnessConfig`] that bounds and instruments a run.
+#[derive(Debug, Clone)]
+pub struct ServeConfig {
+    pub server: HostConfig,
+    pub harness: HarnessConfig,
 }
 
 /// A bounded, explicit server timing window. The server records at most
@@ -182,41 +217,32 @@ impl ServeConfig {
     /// A headless bounded config for `scene` on `listen` with `token`.
     pub fn headless(listen: SocketAddr, scene: Scene, token: JoinToken) -> Self {
         Self {
-            listen,
-            scene,
-            terrain_collider_mode: TerrainColliderMode::PerBrick,
-            join_token: token,
-            max_ticks: 1_200,
-            quiescence_ticks: 45,
-            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
-            min_clients: 1,
-            max_clients: 8,
-            startup_timeout: Duration::from_secs(15),
-            paced: false,
-            log_json: PathBuf::from(".local/runs/server.jsonl"),
-            summary_json: None,
-            fingerprint_out: None,
-            addr_out: None,
-            transport: TransportConfig::for_tests(),
-            save: None,
-            checkpoint_interval_ticks: 1_800,
-            seed: 0,
-            catch_up_cap: DEFAULT_CATCH_UP_CAP,
-            max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
-            capture_workers: default_capture_workers(),
-            dev_unvalidated_actions: false,
-            admin_commands: false,
-            save_faults: None,
-            await_body_settle: false,
-            motion_interest: None,
-            residency: None,
-            residency_disk_path: None,
-            creatures: None,
-            contact_damage: None,
-            dormancy: None,
-            timing_window: None,
-            credential_registry_file: None,
-            custom_world: None,
+            server: HostConfig {
+                listen,
+                scene,
+                terrain_collider_mode: TerrainColliderMode::PerBrick,
+                join_token: token,
+                max_clients: 8,
+                paced: false,
+                log_json: PathBuf::from(".local/runs/server.jsonl"),
+                transport: TransportConfig::for_tests(),
+                save: None,
+                checkpoint_interval_ticks: 1_800,
+                seed: 0,
+                catch_up_cap: DEFAULT_CATCH_UP_CAP,
+                max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+                capture_workers: default_capture_workers(),
+                admin_commands: false,
+                motion_interest: None,
+                residency: None,
+                residency_disk_path: None,
+                creatures: None,
+                contact_damage: None,
+                dormancy: None,
+                credential_registry_file: None,
+                custom_world: None,
+            },
+            harness: HarnessConfig::default(),
         }
     }
 }

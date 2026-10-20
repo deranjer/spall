@@ -128,7 +128,7 @@ pub struct ServeSummary {
     pub large_collapse_p95_ms: f64,
     pub large_collapse_samples: u64,
     /// T23 / G3 row 7, slice D: residency pass activity. All `0` when
-    /// `ServeConfig.residency` is `None` (the default).
+    /// `HostConfig::residency` is `None` (the default).
     pub residency_evictions_total: u64,
     pub residency_reloads_total: u64,
     /// Fewest / most / final resident terrain bricks the pass observed.
@@ -142,14 +142,14 @@ pub struct ServeSummary {
     /// dense-material bytes across the whole world (terrain + every body
     /// volume), sampled every tick the residency pass runs
     /// ([`spall_server::residency_pass::total_resident_dense_bytes`]). All `0`
-    /// when `ServeConfig.residency` is `None`, matching every other residency
+    /// when `HostConfig::residency` is `None`, matching every other residency
     /// counter's convention.
     pub resident_dense_bytes_min: u64,
     pub resident_dense_bytes_max: u64,
     pub resident_dense_bytes_final: u64,
     /// T23 / G3 row 7 item 3: the residency backing's on-disk footprint in
     /// bytes -- the durable-side counterpart to `resident_dense_bytes_*`.
-    /// `Some(_)` only when `ServeConfig.residency_disk_path` installed a real
+    /// `Some(_)` only when `HostConfig::residency_disk_path` installed a real
     /// disk-backed store; `None` for the in-process `MemoryBacking` default
     /// and when residency is off.
     pub residency_backing_disk_bytes: Option<u64>,

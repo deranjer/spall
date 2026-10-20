@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use spall_client::net::{MovementStep, MovementTrace, ReconcileTraceRow};
 use spall_client::{BaselineScene, ClientNetConfig, run_replication_client};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
+use spall_server::{HarnessConfig, HostConfig};
 use spall_server::{Scene, ServeConfig, serve};
 
 fn wait_for_file(path: &PathBuf, deadline: Duration) -> String {
@@ -92,41 +93,45 @@ fn run_session(
     let addr_path = dir.join("server.addr");
 
     let server_cfg = ServeConfig {
-        listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        scene,
-        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
-        join_token: token,
-        max_ticks: total_ticks + 600,
-        quiescence_ticks: 0,
-        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
-        min_clients: 1,
-        max_clients: 1,
-        startup_timeout: Duration::from_secs(20),
-        paced: true,
-        log_json: dir.join("server.jsonl"),
-        summary_json: Some(dir.join("server.summary.json")),
-        fingerprint_out: Some(fp_path.clone()),
-        addr_out: Some(addr_path.clone()),
-        transport: TransportConfig::for_tests(),
-        save: None,
-        checkpoint_interval_ticks: 0,
-        seed: 0,
-        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
-        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
-        capture_workers: spall_server::serve::default_capture_workers(),
-        dev_unvalidated_actions: false,
-        admin_commands: false,
-        save_faults: None,
-        await_body_settle: false,
-        motion_interest: None,
-        residency: None,
-        residency_disk_path: None,
-        creatures: None,
-        contact_damage: None,
-        dormancy: None,
-        timing_window: None,
-        credential_registry_file: None,
-        custom_world: None,
+        server: HostConfig {
+            listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            scene,
+            terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
+            join_token: token,
+            max_clients: 1,
+            paced: true,
+            log_json: dir.join("server.jsonl"),
+            transport: TransportConfig::for_tests(),
+            save: None,
+            checkpoint_interval_ticks: 0,
+            seed: 0,
+            catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+            max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+            capture_workers: spall_server::serve::default_capture_workers(),
+            admin_commands: false,
+            motion_interest: None,
+            residency: None,
+            residency_disk_path: None,
+            creatures: None,
+            contact_damage: None,
+            dormancy: None,
+            credential_registry_file: None,
+            custom_world: None,
+        },
+        harness: HarnessConfig {
+            max_ticks: total_ticks + 600,
+            quiescence_ticks: 0,
+            drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
+            min_clients: 1,
+            startup_timeout: Duration::from_secs(20),
+            summary_json: Some(dir.join("server.summary.json")),
+            fingerprint_out: Some(fp_path.clone()),
+            addr_out: Some(addr_path.clone()),
+            dev_unvalidated_actions: false,
+            save_faults: None,
+            await_body_settle: false,
+            timing_window: None,
+        },
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
     let fp_hex = wait_for_file(&fp_path, Duration::from_secs(20));

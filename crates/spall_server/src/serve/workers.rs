@@ -16,7 +16,7 @@ pub(super) enum Inbound {
     /// baseline; a real id confirms one is installed.
     Baseline(SessionId, BaselineAck),
     /// A development admin command (world reset); gated by
-    /// [`ServeConfig::admin_commands`].
+    /// [`HostConfig::admin_commands`].
     Admin(SessionId, spall_protocol::AdminRequest),
     Gone(SessionId),
 }

@@ -374,13 +374,13 @@ fn two_network_clients_receive_generated_vegetation_and_the_same_season() {
         spall_server::Scene::Custom,
         token,
     );
-    config.custom_world = Some(world);
-    config.max_ticks = 240;
-    config.quiescence_ticks = 0;
-    config.paced = true;
-    config.fingerprint_out = Some(fp.clone());
-    config.addr_out = Some(addr.clone());
-    config.log_json = dir.join("server.jsonl");
+    config.server.custom_world = Some(world);
+    config.harness.max_ticks = 240;
+    config.harness.quiescence_ticks = 0;
+    config.server.paced = true;
+    config.harness.fingerprint_out = Some(fp.clone());
+    config.harness.addr_out = Some(addr.clone());
+    config.server.log_json = dir.join("server.jsonl");
     let server = std::thread::spawn(move || {
         spall_server::serve_with_game_content(
             config,
@@ -471,20 +471,20 @@ fn a_regional_client_receives_only_the_plants_around_its_player() {
         spall_server::Scene::Custom,
         token,
     );
-    config.custom_world = Some(world);
+    config.server.custom_world = Some(world);
     // A client joins late and then runs 600 ticks; the server must outlast it on a
     // slow machine (on CI 900 ended before a slow join finished: "connection lost"
     // in every run), so it runs 1500.
-    config.max_ticks = 2400;
+    config.harness.max_ticks = 2400;
     // The default test transport drops a connection that is silent for 6 s, and
     // on CI this test (a 512 world, two clients, beside a dozen others on a few
     // cores) stalls longer than that: "connection lost" in every run.
-    config.transport.idle_timeout = Duration::from_secs(60);
-    config.quiescence_ticks = 0;
-    config.paced = true;
-    config.fingerprint_out = Some(fp.clone());
-    config.addr_out = Some(addr.clone());
-    config.log_json = dir.join("server.jsonl");
+    config.server.transport.idle_timeout = Duration::from_secs(60);
+    config.harness.quiescence_ticks = 0;
+    config.server.paced = true;
+    config.harness.fingerprint_out = Some(fp.clone());
+    config.harness.addr_out = Some(addr.clone());
+    config.server.log_json = dir.join("server.jsonl");
     let server = std::thread::spawn(move || {
         spall_server::serve_with_game_content(
             config,

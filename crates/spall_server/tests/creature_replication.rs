@@ -255,19 +255,19 @@ fn present_and_late_joining_clients_converge_on_the_authoritative_creatures() {
         Scene::Custom,
         token,
     );
-    server_cfg.max_ticks = SERVER_TICKS;
-    server_cfg.quiescence_ticks = 0;
-    server_cfg.paced = true;
-    server_cfg.startup_timeout = Duration::from_secs(20);
-    server_cfg.log_json = dir.join("server.jsonl");
-    server_cfg.summary_json = Some(dir.join("server.summary.json"));
-    server_cfg.fingerprint_out = Some(fingerprint_path.clone());
-    server_cfg.addr_out = Some(addr_path.clone());
-    server_cfg.custom_world = Some(CustomWorld::new(vec![[4.0, 0.7, 8.0]], || {
+    server_cfg.harness.max_ticks = SERVER_TICKS;
+    server_cfg.harness.quiescence_ticks = 0;
+    server_cfg.server.paced = true;
+    server_cfg.harness.startup_timeout = Duration::from_secs(20);
+    server_cfg.server.log_json = dir.join("server.jsonl");
+    server_cfg.harness.summary_json = Some(dir.join("server.summary.json"));
+    server_cfg.harness.fingerprint_out = Some(fingerprint_path.clone());
+    server_cfg.harness.addr_out = Some(addr_path.clone());
+    server_cfg.server.custom_world = Some(CustomWorld::new(vec![[4.0, 0.7, 8.0]], || {
         spall_sim::fixtures::flat_terrain_setup()
     }));
-    server_cfg.admin_commands = true;
-    server_cfg.creatures = Some(CreatureService::new(Box::new(TestDirector {
+    server_cfg.server.admin_commands = true;
+    server_cfg.server.creatures = Some(CreatureService::new(Box::new(TestDirector {
         catalog: catalog(),
         reset_pending: false,
         rebirths_left: 0,

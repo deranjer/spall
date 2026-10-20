@@ -14,7 +14,7 @@
 //! has been idle for `quiescence_ticks` consecutive ticks after at least one
 //! commit, then tells every client goodbye and tears the endpoint down. When the tick
 //! budget is what ends it, the run first lets regional clients drain
-//! ([`ServeConfig::drain_timeout`]): it keeps serving while one is still receiving a
+//! ([`HarnessConfig::drain_timeout`]): it keeps serving while one is still receiving a
 //! catalogue, transactions or repair patches the server already owes it, so a
 //! slow link is judged on whether it converges, not on how fast the ticks ran.
 
@@ -142,7 +142,7 @@ pub const DEFAULT_CATCH_UP_CAP: usize = 512;
 pub const DEFAULT_MAX_JOIN_RETRIES: u32 = 3;
 
 /// Default size of the background baseline-capture worker pool
-/// ([`LateJoin`]'s `capture_pool`), when [`ServeConfig::capture_workers`] is
+/// ([`LateJoin`]'s `capture_pool`), when [`HostConfig::capture_workers`] is
 /// left unset by a caller.
 ///
 /// ENG-30 / T23 row 11, increment 30: increment 29 traced a deterministic
@@ -277,10 +277,10 @@ pub const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
 /// the grace has to outlast that, plus an impaired link's round trip.
 const DRAIN_GRACE: Duration = Duration::from_secs(6);
 
-/// Default for [`ServeConfig::drain_timeout`].
+/// Default for [`HarnessConfig::drain_timeout`].
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// ENG-61: with [`ServeConfig::await_body_settle`], how many consecutive ticks
+/// ENG-61: with [`HarnessConfig::await_body_settle`], how many consecutive ticks
 /// every detached body's origin must hold still (< 1 mm/tick) — on top of being
 /// asleep — before the run is allowed to stop on edit-quiescence. One second at
 /// 60 Hz: long enough that the reported rest is real, short enough to keep the

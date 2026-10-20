@@ -8,6 +8,7 @@ struct HarvestOutboxV1 {
     removed: std::collections::BTreeMap<spall_core::MaterialId, u64>,
 }
 use spall_net::{JoinToken, PlayerCredential, TransportConfig};
+use spall_server::{HarnessConfig, HostConfig};
 use spall_server::{Scene, ServeConfig, ServerConfig, TimingWindow};
 use spall_sim::world::TerrainColliderMode;
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
@@ -648,64 +649,70 @@ fn run_serve(args: Args) -> ExitCode {
     };
 
     let config = ServeConfig {
-        listen: args.listen,
-        scene,
-        terrain_collider_mode: if args.whole_terrain_collider {
-            TerrainColliderMode::WholeTerrain
-        } else {
-            TerrainColliderMode::PerBrick
-        },
-        join_token: token,
-        max_ticks: args.ticks,
-        quiescence_ticks: args.quiescence_ticks,
-        drain_timeout: std::time::Duration::from_secs(args.drain_timeout_secs),
-        min_clients: args.min_clients,
-        max_clients: args.max_clients,
-        startup_timeout: Duration::from_secs(30),
-        paced: args.paced,
-        log_json: args.log_json,
-        summary_json: args.summary_json,
-        fingerprint_out: args.fingerprint_out,
-        addr_out: args.addr_out,
-        transport: TransportConfig {
-            congestion: if args.experimental_bbr {
-                spall_net::config::CongestionControl::Bbr
+        server: HostConfig {
+            listen: args.listen,
+            scene,
+            terrain_collider_mode: if args.whole_terrain_collider {
+                TerrainColliderMode::WholeTerrain
             } else {
-                spall_net::config::CongestionControl::Cubic
+                TerrainColliderMode::PerBrick
             },
-            ..TransportConfig::default()
+            join_token: token,
+            max_clients: args.max_clients,
+            paced: args.paced,
+            log_json: args.log_json,
+            transport: TransportConfig {
+                congestion: if args.experimental_bbr {
+                    spall_net::config::CongestionControl::Bbr
+                } else {
+                    spall_net::config::CongestionControl::Cubic
+                },
+                ..TransportConfig::default()
+            },
+            save,
+            checkpoint_interval_ticks: args.checkpoint_interval_ticks,
+            seed: args.seed,
+            catch_up_cap: args.catch_up_cap,
+            max_join_retries: args.max_join_retries,
+            capture_workers: args
+                .capture_workers
+                .unwrap_or_else(spall_server::serve::default_capture_workers),
+            admin_commands: args.allow_admin_commands,
+            motion_interest,
+            residency: (args.residency_budget_bricks > 0).then_some(
+                spall_server::ResidencyLimits {
+                    budget_bricks: args.residency_budget_bricks,
+                    max_dense_bytes: if args.residency_budget_dense_bytes == 0 {
+                        u64::MAX
+                    } else {
+                        args.residency_budget_dense_bytes
+                    },
+                    interest_radius_bricks: args.residency_radius_bricks,
+                },
+            ),
+            residency_disk_path,
+            creatures,
+            contact_damage: args
+                .contact_damage
+                .then_some(sandbox::game::contact_damage_config()),
+            dormancy,
+            credential_registry_file: args.player_credentials_file.clone(),
+            custom_world,
         },
-        save,
-        checkpoint_interval_ticks: args.checkpoint_interval_ticks,
-        seed: args.seed,
-        catch_up_cap: args.catch_up_cap,
-        max_join_retries: args.max_join_retries,
-        capture_workers: args
-            .capture_workers
-            .unwrap_or_else(spall_server::serve::default_capture_workers),
-        dev_unvalidated_actions: args.dev_unvalidated_actions,
-        admin_commands: args.allow_admin_commands,
-        save_faults: None,
-        await_body_settle: args.await_body_settle,
-        motion_interest,
-        residency: (args.residency_budget_bricks > 0).then_some(spall_server::ResidencyLimits {
-            budget_bricks: args.residency_budget_bricks,
-            max_dense_bytes: if args.residency_budget_dense_bytes == 0 {
-                u64::MAX
-            } else {
-                args.residency_budget_dense_bytes
-            },
-            interest_radius_bricks: args.residency_radius_bricks,
-        }),
-        residency_disk_path,
-        creatures,
-        contact_damage: args
-            .contact_damage
-            .then_some(sandbox::game::contact_damage_config()),
-        dormancy,
-        timing_window,
-        credential_registry_file: args.player_credentials_file.clone(),
-        custom_world,
+        harness: HarnessConfig {
+            max_ticks: args.ticks,
+            quiescence_ticks: args.quiescence_ticks,
+            drain_timeout: std::time::Duration::from_secs(args.drain_timeout_secs),
+            min_clients: args.min_clients,
+            startup_timeout: Duration::from_secs(30),
+            summary_json: args.summary_json,
+            fingerprint_out: args.fingerprint_out,
+            addr_out: args.addr_out,
+            dev_unvalidated_actions: args.dev_unvalidated_actions,
+            save_faults: None,
+            await_body_settle: args.await_body_settle,
+            timing_window,
+        },
     };
     tracing::info!(
         damage_rules_version = sandbox::game::DAMAGE_RULES_VERSION,

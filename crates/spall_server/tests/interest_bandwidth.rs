@@ -17,6 +17,7 @@ use spall_client::{
     BaselineScene, ClientNetConfig, ScriptedAction, cut_request, run_replication_client,
 };
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
+use spall_server::{HarnessConfig, HostConfig};
 use spall_server::{MotionInterest, Scene, ServeConfig, serve};
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -53,41 +54,45 @@ fn base_config(
     motion_interest: MotionInterest,
 ) -> ServeConfig {
     ServeConfig {
-        listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        scene: Scene::BridgeCut,
-        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
-        join_token: token,
-        max_ticks: 300,
-        quiescence_ticks: 30,
-        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
-        min_clients: 1,
-        max_clients: 4,
-        startup_timeout: Duration::from_secs(20),
-        paced: true,
-        log_json: dir.join("server.jsonl"),
-        summary_json: Some(dir.join("server.summary.json")),
-        fingerprint_out: Some(dir.join("server.fingerprint")),
-        addr_out: Some(dir.join("server.addr")),
-        transport: TransportConfig::for_tests(),
-        save: None,
-        checkpoint_interval_ticks: 0,
-        seed: 0,
-        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
-        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
-        capture_workers: spall_server::serve::default_capture_workers(),
-        dev_unvalidated_actions: true,
-        admin_commands: false,
-        save_faults: None,
-        await_body_settle: false,
-        motion_interest: Some(motion_interest),
-        residency: None,
-        residency_disk_path: None,
-        creatures: None,
-        contact_damage: None,
-        dormancy: None,
-        timing_window: None,
-        credential_registry_file: None,
-        custom_world: None,
+        server: HostConfig {
+            listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            scene: Scene::BridgeCut,
+            terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
+            join_token: token,
+            max_clients: 4,
+            paced: true,
+            log_json: dir.join("server.jsonl"),
+            transport: TransportConfig::for_tests(),
+            save: None,
+            checkpoint_interval_ticks: 0,
+            seed: 0,
+            catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+            max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+            capture_workers: spall_server::serve::default_capture_workers(),
+            admin_commands: false,
+            motion_interest: Some(motion_interest),
+            residency: None,
+            residency_disk_path: None,
+            creatures: None,
+            contact_damage: None,
+            dormancy: None,
+            credential_registry_file: None,
+            custom_world: None,
+        },
+        harness: HarnessConfig {
+            max_ticks: 300,
+            quiescence_ticks: 30,
+            drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
+            min_clients: 1,
+            startup_timeout: Duration::from_secs(20),
+            summary_json: Some(dir.join("server.summary.json")),
+            fingerprint_out: Some(dir.join("server.fingerprint")),
+            addr_out: Some(dir.join("server.addr")),
+            dev_unvalidated_actions: true,
+            save_faults: None,
+            await_body_settle: false,
+            timing_window: None,
+        },
     }
 }
 
@@ -143,8 +148,8 @@ fn a_scene_covering_interest_set_changes_nothing_and_reports_egress() {
             static_anchor_m: Some([0.0, 0.0, 0.0]),
         },
     );
-    let fp_path = cfg.fingerprint_out.clone().unwrap();
-    let addr_path = cfg.addr_out.clone().unwrap();
+    let fp_path = cfg.harness.fingerprint_out.clone().unwrap();
+    let addr_path = cfg.harness.addr_out.clone().unwrap();
     let server_thread = std::thread::spawn(move || serve(cfg));
 
     let fp = Fingerprint::from_hex(&wait_for_file(&fp_path, Duration::from_secs(15))).unwrap();
@@ -216,8 +221,8 @@ fn a_far_interest_anchor_culls_body_motion_but_never_geometry() {
             static_anchor_m: Some([1000.0, 0.0, 0.0]),
         },
     );
-    let fp_path = cfg.fingerprint_out.clone().unwrap();
-    let addr_path = cfg.addr_out.clone().unwrap();
+    let fp_path = cfg.harness.fingerprint_out.clone().unwrap();
+    let addr_path = cfg.harness.addr_out.clone().unwrap();
     let server_thread = std::thread::spawn(move || serve(cfg));
 
     let fp = Fingerprint::from_hex(&wait_for_file(&fp_path, Duration::from_secs(15))).unwrap();

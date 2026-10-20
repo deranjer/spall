@@ -17,35 +17,35 @@ pub(super) async fn serve_async(
     mut outbox_encoder: Option<CommittedEditOutboxEncoder>,
     outbox_processor: Option<OutboxProcessor>,
 ) -> Result<ServeSummary, ServeError> {
-    if matches!(config.scene, Scene::Custom)
+    if matches!(config.server.scene, Scene::Custom)
         && config
+            .server
             .custom_world
             .as_ref()
             .is_none_or(|world| world.player_spawns().is_empty())
     {
         return Err(ServeError::Configuration(
-            "Scene::Custom requires ServeConfig::custom_world with at least one player spawn"
-                .into(),
+            "Scene::Custom requires HostConfig::custom_world with at least one player spawn".into(),
         ));
     }
-    if config.creatures.is_some() && config.save.is_some() {
+    if config.server.creatures.is_some() && config.server.save.is_some() {
         return Err(ServeError::Configuration(
             "creatures cannot run in a persistent world yet: typed actor journal replay is not implemented; omit the save path"
                 .into(),
         ));
     }
-    let mut log = JsonlLog::create(&config.log_json)?;
+    let mut log = JsonlLog::create(&config.server.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
         ProcessRole::Server,
         Some(format!(
             "scene={:?}, listen={}, max_ticks={}",
-            config.scene, config.listen, config.max_ticks
+            config.server.scene, config.server.listen, config.harness.max_ticks
         )),
     ))?;
 
     let identity = DevIdentity::generate()?;
-    if let Some(path) = &config.fingerprint_out {
+    if let Some(path) = &config.harness.fingerprint_out {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -55,7 +55,7 @@ pub(super) async fn serve_async(
     }
 
     let handshake = server_handshake(&materials, asset_manifest_hash);
-    let credential_registry_file = config.credential_registry_file.clone();
+    let credential_registry_file = config.server.credential_registry_file.clone();
     if credential_registry_file.is_some() && player_credentials.is_none() {
         return Err(ServeError::Configuration(
             "credential registry reload requires player-credential authentication".into(),
@@ -63,25 +63,25 @@ pub(super) async fn serve_async(
     }
     let server = Arc::new(if let Some(credentials) = player_credentials {
         NetServer::bind_with_player_credentials(
-            config.listen,
+            config.server.listen,
             &identity,
             credentials,
             handshake,
-            config.transport,
+            config.server.transport,
         )
         .await?
     } else {
         NetServer::bind(
-            config.listen,
+            config.server.listen,
             &identity,
-            config.join_token,
+            config.server.join_token,
             handshake,
-            config.transport,
+            config.server.transport,
         )
         .await?
     });
     let bound = server.local_addr()?;
-    if let Some(path) = &config.addr_out {
+    if let Some(path) = &config.harness.addr_out {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -208,7 +208,7 @@ pub(super) async fn serve_async(
         let inbound_drops = inbound_drops.clone();
         let stop_rx = stop_rx.clone();
         let accept_stop_rx = accept_stop_rx.clone();
-        let admission = AdmissionGate::new(config.max_clients);
+        let admission = AdmissionGate::new(config.server.max_clients);
         tokio::spawn(async move {
             let mut connected = 0usize;
             loop {
@@ -259,10 +259,10 @@ pub(super) async fn serve_async(
     };
 
     // Wait for the first `min_clients` (or time out).
-    if config.min_clients > 0 {
+    if config.harness.min_clients > 0 {
         let wait = async {
             loop {
-                if *count_rx.borrow() >= config.min_clients {
+                if *count_rx.borrow() >= config.harness.min_clients {
                     return;
                 }
                 if count_rx.changed().await.is_err() {
@@ -270,13 +270,13 @@ pub(super) async fn serve_async(
                 }
             }
         };
-        if tokio::time::timeout(config.startup_timeout, wait)
+        if tokio::time::timeout(config.harness.startup_timeout, wait)
             .await
             .is_err()
         {
             let _ = stop_tx.send(true);
             server.close();
-            return Err(ServeError::StartupTimeout(config.startup_timeout));
+            return Err(ServeError::StartupTimeout(config.harness.startup_timeout));
         }
     }
     log.write(&ProcessRecord::new(
@@ -290,39 +290,39 @@ pub(super) async fn serve_async(
 
     // The sim runs on a blocking thread; it owns `inbound_rx` and fans out
     // through the per-client senders.
-    let paced = config.paced;
-    let max_ticks = config.max_ticks;
-    let quiescence = config.quiescence_ticks;
-    let await_body_settle = config.await_body_settle;
-    let motion_interest = config.motion_interest;
-    let scene = config.scene;
-    let custom_world = config.custom_world.clone();
-    let terrain_collider_mode = config.terrain_collider_mode;
+    let paced = config.server.paced;
+    let max_ticks = config.harness.max_ticks;
+    let quiescence = config.harness.quiescence_ticks;
+    let await_body_settle = config.harness.await_body_settle;
+    let motion_interest = config.server.motion_interest;
+    let scene = config.server.scene;
+    let custom_world = config.server.custom_world.clone();
+    let terrain_collider_mode = config.server.terrain_collider_mode;
     let clients_for_sim = clients.clone();
-    let save = config.save.clone();
-    let save_faults = config.save_faults.clone();
-    let checkpoint_interval = config.checkpoint_interval_ticks;
-    let catch_up_cap = config.catch_up_cap.max(1);
-    let max_join_retries = config.max_join_retries;
-    let capture_workers = config.capture_workers.max(1);
-    let dev_unvalidated_actions = config.dev_unvalidated_actions;
-    let admin_commands = config.admin_commands;
+    let save = config.server.save.clone();
+    let save_faults = config.harness.save_faults.clone();
+    let checkpoint_interval = config.server.checkpoint_interval_ticks;
+    let catch_up_cap = config.server.catch_up_cap.max(1);
+    let max_join_retries = config.server.max_join_retries;
+    let capture_workers = config.server.capture_workers.max(1);
+    let dev_unvalidated_actions = config.harness.dev_unvalidated_actions;
+    let admin_commands = config.server.admin_commands;
     // A world reset rebuilds from the scene; startup-only game content cannot
     // be reinstalled, so its presence refuses the reset instead.
     let reset_materials = materials.clone();
     let startup_game_setup = game_setup.is_some();
     let action_catalog = tool_catalog;
     let world_materials = materials;
-    let residency_limits = config.residency;
-    let residency_disk_path = config.residency_disk_path.clone();
-    let creature_service = config.creatures.clone();
-    let contact_damage_cfg = config.contact_damage;
+    let residency_limits = config.server.residency;
+    let residency_disk_path = config.server.residency_disk_path.clone();
+    let creature_service = config.server.creatures.clone();
+    let contact_damage_cfg = config.server.contact_damage;
     let contact_damage_profiles = damage_profiles;
-    let dormancy_cfg = config.dormancy;
-    let timing_window = config.timing_window;
+    let dormancy_cfg = config.server.dormancy;
+    let timing_window = config.harness.timing_window;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
-        seed: config.seed,
+        seed: config.server.seed,
         generator_version: 1,
     };
 
@@ -544,7 +544,7 @@ pub(super) async fn serve_async(
         // Diagnostic: per-session input arrival, logged every 300 ticks.
         let mut input_windows: HashMap<u64, InputArrivalWindow> = HashMap::new();
         // The tick budget grows one tick at a time while regional clients drain (see
-        // `ServeConfig::drain_timeout`); `iteration` counts ticks of this loop.
+        // `HarnessConfig::drain_timeout`); `iteration` counts ticks of this loop.
         let mut tick_budget = max_ticks;
         let mut vegetation_job: Option<std::sync::mpsc::Receiver<VegetationFrames>> = None;
         // Keyframes built so far, and the sessions that have been sent the climate raster
@@ -569,7 +569,7 @@ pub(super) async fn serve_async(
         let mut phase_worst = [Duration::ZERO; 3];
         let mut span_totals: HashMap<&'static str, (Duration, Duration)> = HashMap::new();
         let mut iteration = 0u64;
-        let drain_timeout = config.drain_timeout;
+        let drain_timeout = config.harness.drain_timeout;
         let mut drain_started: Option<std::time::Instant> = None;
         let mut drain_quiet_since: Option<std::time::Instant> = None;
         let mut drain_timed_out = false;
@@ -898,7 +898,7 @@ pub(super) async fn serve_async(
                                         reset_materials.clone(),
                                         custom_world.as_ref(),
                                     );
-                                    fresh.set_weather_seed(config.seed);
+                                    fresh.set_weather_seed(config.server.seed);
                                     let built_ms = started.elapsed().as_millis() as u64;
                                     if let Err(e) = sim.replace_world(fresh) {
                                         return SimResult::error(
@@ -2229,7 +2229,7 @@ pub(super) async fn serve_async(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
-    if tokio::time::timeout(config.transport.idle_timeout, drain)
+    if tokio::time::timeout(config.server.transport.idle_timeout, drain)
         .await
         .is_err()
     {
@@ -2444,7 +2444,7 @@ pub(super) async fn serve_async(
         physics_samples: sim_result.timing.physics_samples,
         physics_window_complete: sim_result.timing.window_complete,
     };
-    if let Some(path) = &config.summary_json {
+    if let Some(path) = &config.harness.summary_json {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

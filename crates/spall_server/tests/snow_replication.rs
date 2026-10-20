@@ -358,17 +358,17 @@ fn two_quic_clients_share_authoritative_snow_footprints_and_reset_epoch() {
         Scene::Custom,
         token,
     );
-    server_cfg.max_ticks = SERVER_TICKS;
-    server_cfg.quiescence_ticks = 0;
-    server_cfg.paced = true;
-    server_cfg.startup_timeout = Duration::from_secs(20);
-    server_cfg.log_json = dir.join("server.jsonl");
-    server_cfg.summary_json = Some(dir.join("server.summary.json"));
-    server_cfg.fingerprint_out = Some(fingerprint_path.clone());
-    server_cfg.addr_out = Some(addr_path.clone());
-    server_cfg.dev_unvalidated_actions = true;
-    server_cfg.admin_commands = true;
-    server_cfg.custom_world = Some(world);
+    server_cfg.harness.max_ticks = SERVER_TICKS;
+    server_cfg.harness.quiescence_ticks = 0;
+    server_cfg.server.paced = true;
+    server_cfg.harness.startup_timeout = Duration::from_secs(20);
+    server_cfg.server.log_json = dir.join("server.jsonl");
+    server_cfg.harness.summary_json = Some(dir.join("server.summary.json"));
+    server_cfg.harness.fingerprint_out = Some(fingerprint_path.clone());
+    server_cfg.harness.addr_out = Some(addr_path.clone());
+    server_cfg.harness.dev_unvalidated_actions = true;
+    server_cfg.server.admin_commands = true;
+    server_cfg.server.custom_world = Some(world);
     let server_thread = thread::spawn(move || serve(server_cfg));
 
     let fingerprint =
