@@ -2,6 +2,7 @@ pub mod g4;
 mod netcheck;
 mod play;
 mod process;
+mod proportionality;
 mod session;
 
 use clap::{Args, Parser, Subcommand};
@@ -54,6 +55,16 @@ enum CommandKind {
     /// → recovery, with crash-point and disk-fault injection. Writes
     /// `summary.json` with the measured bytes/write rate.
     CrashTest(CrashTestArgs),
+    /// AGENTS.md Proportionality rules 3, 5, 7 and 9 (also run by `check`).
+    Proportionality(ProportionalityArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProportionalityArgs {
+    /// Print an allowlist grandfathering the current tree (coordinator use;
+    /// entries may only shrink without user approval).
+    #[arg(long)]
+    print_allowlist: bool,
 }
 
 #[derive(Debug, Args)]
@@ -140,6 +151,8 @@ enum XtaskError {
     Process(#[from] ProcessFailure),
     #[error(transparent)]
     Jsonl(#[from] spall_core::JsonlError),
+    #[error("{0}")]
+    Proportionality(String),
     #[error("graphical capability unavailable: {0}")]
     Capability(String),
 }
@@ -180,6 +193,7 @@ fn run(cli: Cli) -> Result<(), XtaskError> {
         CommandKind::Capture(args) => capture(args),
         CommandKind::Bench(_) => unavailable("bench", "G1/G2 measurement work"),
         CommandKind::CrashTest(args) => crash_test(args),
+        CommandKind::Proportionality(args) => proportionality(args.print_allowlist),
     }
 }
 
@@ -261,7 +275,12 @@ fn run_cargo(arguments: &[&str]) -> Result<(), XtaskError> {
     }
 }
 
+fn proportionality(print_allowlist: bool) -> Result<(), XtaskError> {
+    proportionality::run(&workspace_root(), print_allowlist).map_err(XtaskError::Proportionality)
+}
+
 fn check() -> Result<(), XtaskError> {
+    proportionality(false)?;
     run_cargo(&["fmt", "--all", "--", "--check"])?;
     run_cargo(&[
         "clippy",
