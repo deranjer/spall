@@ -1,7 +1,8 @@
-//! Bounded headless captures of the authored articulated animal fixtures.
+//! Bounded headless captures of the authored articulated animal and player fixtures.
 //!
 //! `cargo run -p sandbox --features client --example animal-preview -- --bounded
-//! --out .local/animal-preview` writes four stills per clip, contact sheets,
+//! --out .local/animal-preview` writes four stills per clip, one contact sheet
+//! per specimen (a row per clip),
 //! and a deterministic JSON inventory. It starts no game, world, or network.
 
 use std::{collections::BTreeMap, error::Error, path::PathBuf};
@@ -18,18 +19,18 @@ use spall_render::{
 const WIDTH: u32 = 384;
 const HEIGHT: u32 = 384;
 const POSES_PER_CLIP: usize = 4;
-const BOUNDED_FRAME_COUNT: usize = 3 * 2 * POSES_PER_CLIP;
 
 struct Specimen {
     name: &'static str,
-    action: &'static str,
+    /// Captured clips, one contact-sheet row each.
+    clips: &'static [&'static str],
     bytes: &'static [u8],
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let (output, bounded) = arguments()?;
     if !bounded {
-        return Err("pass --bounded to run the fixed 24-frame preview".into());
+        return Err("pass --bounded to run the fixed bounded preview".into());
     }
     std::fs::create_dir_all(&output)?;
     let manifest = sandbox::game::manifest();
@@ -37,20 +38,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     let specimens = [
         Specimen {
             name: "trout",
-            action: "swim",
+            clips: &["idle", "swim"],
             bytes: include_bytes!("../assets/animals/trout.spvox"),
         },
         Specimen {
             name: "crow",
-            action: "flap",
+            clips: &["idle", "flap"],
             bytes: include_bytes!("../assets/animals/crow.spvox"),
         },
         Specimen {
             name: "deer",
-            action: "walk",
+            clips: &["idle", "walk"],
             bytes: include_bytes!("../assets/animals/deer.spvox"),
         },
+        Specimen {
+            name: "player",
+            clips: &["idle", "walk", "run", "swim"],
+            bytes: include_bytes!("../assets/characters/player.spvox"),
+        },
     ];
+    let frame_count: usize =
+        specimens.iter().map(|s| s.clips.len()).sum::<usize>() * POSES_PER_CLIP;
     let visuals: Vec<_> = specimens
         .iter()
         .map(|s| {
@@ -65,26 +73,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .collect::<Result<_, Box<dyn Error>>>()?;
 
-    let mut frames = Vec::with_capacity(BOUNDED_FRAME_COUNT);
+    let mut frames = Vec::with_capacity(frame_count);
     for (specimen, visual) in &visuals {
-        for clip_name in ["idle", specimen.action] {
+        for (row, &clip_name) in specimen.clips.iter().enumerate() {
             let duration = visual
                 .clip_duration(clip_name)
                 .ok_or("required clip is missing")?;
             for sample in 0..POSES_PER_CLIP {
                 let tick = (u64::from(duration) * sample as u64 / POSES_PER_CLIP as u64) as f64;
                 let cells = visual.sample(clip_name, tick)?;
-                frames.push((specimen.name, clip_name, tick as u32, cells));
+                frames.push((specimen.name, row, clip_name, tick as u32, cells));
             }
         }
     }
-    if frames.len() != BOUNDED_FRAME_COUNT {
+    if frames.len() != frame_count {
         return Err("bounded frame count changed".into());
     }
     // One fixed camera/floor per animal exposes motion instead of cancelling
     // root translation by automatically following each sampled pose.
     let mut specimen_bounds = BTreeMap::<&str, (Vec3, Vec3)>::new();
-    for (animal, _, _, cells) in &frames {
+    for (animal, _, _, _, cells) in &frames {
         let bounds = specimen_bounds
             .entry(animal)
             .or_insert((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)));
@@ -100,7 +108,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut materials = spall_render::materials_from_manifest(&manifest);
     let mut tint_slots = BTreeMap::<(MaterialId, [u8; 3]), u32>::new();
-    for (_, _, _, cells) in &frames {
+    for (_, _, _, _, cells) in &frames {
         for cell in cells {
             if let Some(tint) = cell.tint_srgb {
                 let key = (cell.material, tint);
@@ -134,7 +142,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let mut sheets = BTreeMap::<&str, RgbaImage>::new();
     let mut reports = Vec::with_capacity(frames.len());
-    for (frame_index, (animal, clip, tick, cells)) in frames.iter().enumerate() {
+    let rows: BTreeMap<&str, usize> = specimens.iter().map(|s| (s.name, s.clips.len())).collect();
+    for (frame_index, (animal, row, clip, tick, cells)) in frames.iter().enumerate() {
         let (min, max) = specimen_bounds[animal];
         let center = (min + max) * 0.5;
         let radius = ((max - min).length() * 0.5).max(0.25);
@@ -169,15 +178,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         image::save_buffer(&frame_path, &rgba, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
         let image = RgbaImage::from_raw(WIDTH, HEIGHT, rgba)
             .ok_or("renderer returned wrong image dimensions")?;
-        let sheet = sheets
-            .entry(animal)
-            .or_insert_with(|| RgbaImage::new(WIDTH * POSES_PER_CLIP as u32, HEIGHT * 2));
-        let row = usize::from(*clip != "idle");
+        let sheet = sheets.entry(animal).or_insert_with(|| {
+            RgbaImage::new(WIDTH * POSES_PER_CLIP as u32, HEIGHT * rows[animal] as u32)
+        });
         imageops::replace(
             sheet,
             &image,
             (frame_index % POSES_PER_CLIP) as i64 * i64::from(WIDTH),
-            row as i64 * i64::from(HEIGHT),
+            *row as i64 * i64::from(HEIGHT),
         );
         reports.push(serde_json::json!({
             "animal": animal,
@@ -192,7 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "frame {}/{}: {animal} {clip} tick {tick}, {} cells",
             frame_index + 1,
-            BOUNDED_FRAME_COUNT,
+            frame_count,
             cells.len()
         );
     }
@@ -204,9 +212,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": 1,
             "bounded": true,
-            "frames": BOUNDED_FRAME_COUNT,
+            "frames": frame_count,
             "frame_size": [WIDTH, HEIGHT],
-            "clips_per_animal": ["idle", "swim/flap/walk"],
+            "clips": specimens.iter().map(|s| (s.name, s.clips)).collect::<BTreeMap<_, _>>(),
             "render_path": "spall_render::GameRenderer headless offscreen",
             "adapter": ctx.adapter_name(),
             "backend": format!("{:?}", ctx.backend()),
@@ -215,8 +223,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
     println!(
-        "wrote {} bounded frame captures and three contact sheets to {}",
-        BOUNDED_FRAME_COUNT,
+        "wrote {} bounded frame captures and {} contact sheets to {}",
+        frame_count,
+        specimens.len(),
         output.display()
     );
     Ok(())
@@ -232,7 +241,7 @@ fn arguments() -> Result<(PathBuf, bool), Box<dyn Error>> {
             "--out" => output = args.next().ok_or("--out requires a directory")?.into(),
             "--help" | "-h" => {
                 println!(
-                    "animal-preview --bounded [--out DIRECTORY]\nCaptures exactly 24 frames and three contact sheets."
+                    "animal-preview --bounded [--out DIRECTORY]\nCaptures four poses per clip and one contact sheet per specimen."
                 );
                 std::process::exit(0);
             }
