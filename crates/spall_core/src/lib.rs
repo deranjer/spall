@@ -18,8 +18,8 @@ pub use ids::{
     TransactionId, VolumeId, WorldId,
 };
 pub use input::{
-    BUTTON_JUMP, PLAYER_ENTITY_BASE, PlayerInput, is_player_entity, player_entity_for,
-    slot_of_player,
+    BUTTON_JUMP, BUTTON_SPRINT, PLAYER_ENTITY_BASE, PlayerInput, is_player_entity,
+    player_entity_for, slot_of_player,
 };
 pub use material::{
     MAX_MATERIALS, ManifestError, MaterialDef, MaterialFlags, MaterialId, MaterialManifest,

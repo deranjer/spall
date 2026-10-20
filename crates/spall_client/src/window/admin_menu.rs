@@ -17,7 +17,7 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
     ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),
-    ("Shift", "Fly faster"),
+    ("Shift", "Sprint (walking) / fly faster (flying)"),
     ("F", "Toggle flight"),
     ("R", "Recentre the view on your player"),
     ("F10", "Open / close this menu"),
@@ -29,6 +29,7 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
     ("F5", "Toggle visibility-aware skylight"),
     ("F6", "Toggle diffuse bounce"),
     ("F7", "Cycle lighting quality"),
+    ("F8", "Toggle third-person view"),
     ("F9", "Copy a debug report to the clipboard"),
 ];
 

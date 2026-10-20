@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use spall_core::{BUTTON_JUMP, BrickCoord, GlobalCell, MaterialId};
+use spall_core::{BUTTON_JUMP, BUTTON_SPRINT, BrickCoord, GlobalCell, MaterialId};
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::CharacterParams;
 use spall_render::{
@@ -223,6 +223,15 @@ pub fn run_interactive_window_with_options(
     let mut render_materials = terrain_render_materials(&materials);
     let debug_material = render_materials.len() as u32;
     render_materials.push(spall_render::Material::new([0.02, 0.9, 0.9], 0.5, 0.0).emissive(2.0));
+    // Tinted copies of manifest materials for the game's player bodies.
+    let player_tint_base = render_materials.len() as u32;
+    if let Some(view) = &options.player_view {
+        for (material, tint) in view.tints() {
+            let mut tinted = render_materials[usize::from(material.0)].jitter(0.0);
+            tinted.base_color = tint.map(srgb_to_linear);
+            render_materials.push(tinted);
+        }
+    }
 
     // A user event (rather than a plain `()` event loop) so the network
     // thread ending — a failed connect, or the server closing the session —
@@ -246,6 +255,7 @@ pub fn run_interactive_window_with_options(
         !net_config_streams_residency,
     )?;
     app.material_names = material_names;
+    app.player_tint_base = player_tint_base;
 
     let net_thread = std::thread::Builder::new()
         .name("spall-client-net".into())

@@ -13,6 +13,8 @@ use crate::EntityId;
 
 /// Held-button bit: jump. Discriminants are permanent; new buttons take new bits.
 pub const BUTTON_JUMP: u32 = 1 << 0;
+/// Held-button bit: sprint. Raises ground speed to the run speed.
+pub const BUTTON_SPRINT: u32 = 1 << 1;
 
 /// Reserved id band for players. A player's [`EntityId`] is
 /// `PLAYER_ENTITY_BASE + connection_slot` so the server and every client derive
@@ -67,6 +69,11 @@ impl PlayerInput {
     /// `true` if the jump button is held.
     pub fn wants_jump(self) -> bool {
         self.buttons & BUTTON_JUMP != 0
+    }
+
+    /// `true` if the sprint button is held.
+    pub fn wants_sprint(self) -> bool {
+        self.buttons & BUTTON_SPRINT != 0
     }
 
     /// Heading angle (radians) of `view_dir` about `+Y`, measured so that a

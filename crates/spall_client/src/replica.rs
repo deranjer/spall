@@ -52,6 +52,17 @@ use replay::*;
 pub(crate) use replay::{advance_pose_about, body_pivot_m, pivot_world};
 pub use staged::StagedBaseline;
 
+/// Another player's capsule as the replica presents it; see
+/// [`ReplicaWorld::remote_players`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RemotePlayer {
+    pub entity: EntityId,
+    /// The capsule's lowest point (`CharacterState::position_m`).
+    pub feet_m: [f64; 3],
+    /// Newest replicated velocity.
+    pub velocity_m_s: [f32; 3],
+}
+
 /// Tunables for a [`ReplicaWorld`].
 #[derive(Debug, Clone, Copy)]
 pub struct ReplicaConfig {
@@ -144,6 +155,9 @@ pub struct ReplicaWorld {
     volumes: BTreeMap<u64, Volume>,
     owner: BTreeMap<u64, CanonicalOwner>,
     bodies: BTreeMap<u64, ReplicaBody>,
+    /// Motion history of other players' capsules (player-band entity ids), which
+    /// have no voxel body to attach to.
+    remote_players: BTreeMap<u64, MotionTrack>,
     volume_of_entity: BTreeMap<u64, u64>,
     /// Retired body ids; a late packet can never resurrect one.
     tombstoned: BTreeSet<u64>,
@@ -233,6 +247,7 @@ impl ReplicaWorld {
             volumes,
             owner,
             bodies: BTreeMap::new(),
+            remote_players: BTreeMap::new(),
             volume_of_entity: BTreeMap::new(),
             tombstoned: BTreeSet::new(),
             applied_tx: BTreeMap::new(),
@@ -273,6 +288,7 @@ impl ReplicaWorld {
             volumes: BTreeMap::new(),
             owner: BTreeMap::new(),
             bodies: BTreeMap::new(),
+            remote_players: BTreeMap::new(),
             volume_of_entity: BTreeMap::new(),
             tombstoned: BTreeSet::new(),
             applied_tx: BTreeMap::new(),
@@ -1656,6 +1672,13 @@ impl ReplicaWorld {
     pub fn ingest_snapshot(&mut self, snap: &MotionSnapshot) -> bool {
         self.now_tick = self.now_tick.max(snap.server_tick.get());
         let id = snap.body.get();
+        if spall_core::is_player_entity(snap.body) {
+            self.remote_players
+                .entry(id)
+                .or_default()
+                .accept(MotionState::from(snap));
+            return true;
+        }
         if self.tombstoned.contains(&id) {
             return false;
         }
@@ -1701,6 +1724,35 @@ impl ReplicaWorld {
         let max_extra = self.config.max_extrapolation_s * self.config.server_tick_hz;
         track.sample(render_tick - delay_ticks, max_extra)
     }
+
+    /// Other players' capsules at fractional server tick `render_tick`,
+    /// interpolated like a far body (`interpolation_delay_s` behind the newest).
+    /// A player that has sent nothing for [`Self::REMOTE_PLAYER_STALE_S`] has left
+    /// and is not listed. The local player is normally absent: its snapshots
+    /// reconcile the predictor instead of reaching the replica.
+    pub fn remote_players(&self, render_tick: f64) -> Vec<RemotePlayer> {
+        let hz = self.config.server_tick_hz;
+        let delay_ticks = self.config.interpolation_delay_s * hz;
+        let max_extra = self.config.max_extrapolation_s * hz;
+        self.remote_players
+            .iter()
+            .filter_map(|(&id, track)| {
+                let latest = track.latest?;
+                if render_tick - latest.server_tick as f64 > Self::REMOTE_PLAYER_STALE_S * hz {
+                    return None;
+                }
+                let pose = track.sample(render_tick - delay_ticks, max_extra)?;
+                Some(RemotePlayer {
+                    entity: EntityId::new(id).ok()?,
+                    feet_m: pose.translation_m,
+                    velocity_m_s: latest.linear_velocity,
+                })
+            })
+            .collect()
+    }
+
+    /// How long without a snapshot before a remote player stops being drawn.
+    pub const REMOTE_PLAYER_STALE_S: f64 = 2.0;
 
     /// Bodies within this distance of the player are drawn at the server's
     /// *present* estimate, fully.

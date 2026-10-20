@@ -13,6 +13,11 @@ pub(super) struct InteractiveApp {
     ambience: Option<AmbienceAudio>,
     pub(super) biome_audio: BiomeAudioConfig,
     pub(super) creature_view: Option<std::sync::Arc<dyn CreatureView>>,
+    pub(super) player_view: Option<std::sync::Arc<dyn PlayerView>>,
+    /// `F8`: the camera sits behind the player, who is drawn in view.
+    pub(super) third_person: bool,
+    /// Render-table index of the player view's first tint material.
+    pub(super) player_tint_base: u32,
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
@@ -215,6 +220,9 @@ impl InteractiveApp {
             ambience,
             biome_audio: options.biome_audio,
             creature_view: options.creature_view,
+            player_view: options.player_view,
+            third_person: false,
+            player_tint_base: 0,
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
@@ -694,7 +702,9 @@ impl InteractiveApp {
                 .map(|v| self.camera_follow.eye(v, Instant::now(), true));
             self.session.input.set_movement([0.0; 3]);
             self.session.input.set_button(BUTTON_JUMP, false);
+            self.session.input.set_button(BUTTON_SPRINT, false);
         } else {
+            self.session.input.set_button(BUTTON_SPRINT, self.held.fast);
             self.publish_movement();
         }
         self.last_fly_update = Some(Instant::now());

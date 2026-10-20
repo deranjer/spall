@@ -27,6 +27,8 @@ pub use spall_core::PlayerInput;
 pub mod tuning {
     /// Ground move speed, m/s.
     pub const WALK_SPEED_M_S: f32 = 4.5;
+    /// Ground move speed while the sprint button is held, m/s (1.73× walk).
+    pub const RUN_SPEED_M_S: f32 = 7.8;
     /// Upward speed imparted by a jump, m/s (≈ 1.0 m apex under `GRAVITY_M_S2`).
     pub const JUMP_SPEED_M_S: f32 = 5.7;
     /// Downward acceleration applied to the capsule, m/s². Characters use a
@@ -209,6 +211,21 @@ impl WaterSample {
     }
 }
 
+/// How far the water stands over a character whose feet are at `feet_y`;
+/// negative above the surface, `-inf` where there is no (finite) water.
+fn water_depth_m(water: Option<WaterSample>, feet_y: f64) -> f32 {
+    water
+        .map(|w| (w.surface_y - feet_y) as f32)
+        .filter(|d| d.is_finite())
+        .unwrap_or(f32::NEG_INFINITY)
+}
+
+/// `true` if a character with its feet at `feet_y` swims in `water`: the same
+/// test [`step_character_in_water`] uses to switch from walking to swimming.
+pub fn is_swimming(water: Option<WaterSample>, feet_y: f64) -> bool {
+    water_depth_m(water, feet_y) >= tuning::SWIM_ENTER_DEPTH_M
+}
+
 /// [`step_character`] with water: `water` is the surface and current in the
 /// column the capsule stands in, or `None` where there is no water. Server and
 /// client must pass the same value for the same position. A current carries a
@@ -242,10 +259,7 @@ pub fn step_character_in_water(
     }
     // How far the water stands over the feet; negative above it. Not finite
     // water (a bad query) counts as dry.
-    let depth_m = water
-        .map(|w| (w.surface_y - state.position_m[1]) as f32)
-        .filter(|d| d.is_finite())
-        .unwrap_or(f32::NEG_INFINITY);
+    let depth_m = water_depth_m(water, state.position_m[1]);
     let flow = water.map_or([0.0; 2], |w| {
         w.flow_m_s.map(|v| {
             if v.is_finite() {
@@ -273,9 +287,16 @@ pub fn step_character_in_water(
     } else {
         0.0
     };
+    // Sprinting only changes the ground speed; the kernel is the one place the
+    // server and the client predictor both read it.
+    let ground_speed = if input.wants_sprint() {
+        tuning::RUN_SPEED_M_S
+    } else {
+        tuning::WALK_SPEED_M_S
+    };
     let wish_horiz = [
-        wish[0] * tuning::WALK_SPEED_M_S * wade + flow[0] * push,
-        wish[1] * tuning::WALK_SPEED_M_S * wade + flow[1] * push,
+        wish[0] * ground_speed * wade + flow[0] * push,
+        wish[1] * ground_speed * wade + flow[1] * push,
     ];
 
     // Ground input chooses horizontal velocity. Once airborne, preserve the
@@ -444,7 +465,7 @@ mod tests {
     use crate::occupancy::OccupancyGrid;
     use crate::world::{BodyId, BodyKind, BodySpec, PhysicsConfig, PhysicsWorld};
     use crate::{Representation, fixtures};
-    use spall_core::{BUTTON_JUMP, CellSizeCode, GlobalCell, VolumeId};
+    use spall_core::{BUTTON_JUMP, BUTTON_SPRINT, CellSizeCode, GlobalCell, VolumeId};
     use spall_voxel::{EditPlan, Volume, fixtures as vox};
 
     const DT: f32 = 1.0 / 60.0;
@@ -499,6 +520,75 @@ mod tests {
     /// Feet spawn at the centre of the 16 m × 16 m floor.
     fn spawn(top: f64) -> CharacterState {
         CharacterState::at([8.0, top, 8.0])
+    }
+
+    fn forward_input(buttons: u32) -> PlayerInput {
+        PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [0.0, 0.0, -1.0],
+            buttons,
+        }
+    }
+
+    fn free_move(_: [f64; 3], desired: [f32; 3]) -> CharacterMove {
+        CharacterMove {
+            translation_m: desired,
+            grounded: true,
+        }
+    }
+
+    #[test]
+    fn sprint_raises_ground_speed_to_run_speed_and_only_on_the_ground() {
+        let grounded = CharacterState {
+            grounded: true,
+            ..CharacterState::at([0.0; 3])
+        };
+        let walk = step_character(grounded, forward_input(0), DT, free_move);
+        let run = step_character(grounded, forward_input(BUTTON_SPRINT), DT, free_move);
+        let speed = |s: CharacterState| s.velocity_m_s[0].hypot(s.velocity_m_s[2]);
+        assert!((speed(walk) - tuning::WALK_SPEED_M_S).abs() < 1e-4);
+        assert!((speed(run) - tuning::RUN_SPEED_M_S).abs() < 1e-4);
+        let ratio = tuning::RUN_SPEED_M_S / tuning::WALK_SPEED_M_S;
+        assert!((1.7..=1.8).contains(&ratio), "run/walk = {ratio}");
+
+        // Airborne keeps its takeoff momentum: pressing sprint mid-air adds none.
+        let airborne = CharacterState {
+            grounded: false,
+            velocity_m_s: [0.0, 0.0, -tuning::WALK_SPEED_M_S],
+            ..CharacterState::at([0.0; 3])
+        };
+        let held = step_character(airborne, forward_input(BUTTON_SPRINT), DT, |_, d| {
+            CharacterMove {
+                translation_m: d,
+                grounded: false,
+            }
+        });
+        assert_eq!(held.velocity_m_s[2], -tuning::WALK_SPEED_M_S);
+
+        // Swimming ignores sprint.
+        let water = Some(WaterSample::still(5.0));
+        let swim = |buttons| {
+            let mut s = CharacterState::at([0.0, 5.0 - tuning::FLOAT_DEPTH_M as f64, 0.0]);
+            for _ in 0..120 {
+                s = step_character_in_water(s, forward_input(buttons), DT, water, |_, d| {
+                    CharacterMove {
+                        translation_m: d,
+                        grounded: false,
+                    }
+                });
+            }
+            speed(s)
+        };
+        assert!((swim(BUTTON_SPRINT) - swim(0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn is_swimming_matches_the_depth_the_kernel_swims_at() {
+        let water = Some(WaterSample::still(10.0));
+        let deep = 10.0 - f64::from(tuning::SWIM_ENTER_DEPTH_M);
+        assert!(is_swimming(water, deep - 0.01));
+        assert!(!is_swimming(water, deep + 0.01));
+        assert!(!is_swimming(None, 0.0));
     }
 
     #[test]

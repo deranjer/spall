@@ -8,7 +8,7 @@ pub(super) struct HeldKeys {
     right: bool,
     jump: bool,
     descend: bool,
-    fast: bool,
+    pub(super) fast: bool,
 }
 
 impl HeldKeys {
@@ -140,7 +140,22 @@ impl ApplicationHandler for InteractiveApp {
                         }
                     }
                     KeyCode::ControlLeft | KeyCode::ControlRight => self.held.descend = held,
-                    KeyCode::ShiftLeft | KeyCode::ShiftRight => self.held.fast = held,
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                        self.held.fast = held;
+                        if self.fly_eye.is_none() {
+                            self.session.input.set_button(BUTTON_SPRINT, held);
+                        }
+                    }
+                    KeyCode::F8 if held && !event.repeat => {
+                        if self.player_view.is_some() {
+                            self.third_person = !self.third_person;
+                            println!(
+                                "spall-interactive: third-person view {}",
+                                if self.third_person { "ON" } else { "OFF" }
+                            );
+                        }
+                        return;
+                    }
                     KeyCode::F12 if held && !event.repeat => {
                         let stamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -431,6 +446,37 @@ impl ApplicationHandler for InteractiveApp {
                         Instant::now(),
                     ));
                 }
+                let water = self
+                    .session
+                    .column_surface
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .query();
+                if let Some(player_view) = &self.player_view
+                    && let Some(mut replica) =
+                        self.session.replica.get().and_then(|r| r.try_lock().ok())
+                {
+                    let tick = replica.render_tick(Instant::now());
+                    let bodies: Vec<PlayerBody> = replica
+                        .remote_players(tick)
+                        .into_iter()
+                        .map(|p| PlayerBody {
+                            entity: p.entity.get(),
+                            feet_m: p.feet_m,
+                            velocity_m_s: p.velocity_m_s,
+                            in_water: player_swims(&water, p.feet_m),
+                            look_yaw: None,
+                        })
+                        .collect();
+                    drop(replica);
+                    if !bodies.is_empty() {
+                        overlay.extend(player_view.instances(
+                            &bodies,
+                            self.player_tint_base,
+                            Instant::now(),
+                        ));
+                    }
+                }
                 let outcome = match renderer.begin_frame(None, &overlay) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -494,9 +540,11 @@ impl ApplicationHandler for InteractiveApp {
                                 self.last_built_pos = None;
                             }
                         }
+                        let mut followed_eye = None;
                         let cam = fresh_view.map(|v| {
                             let followed =
                                 self.camera_follow.eye(v, render_now, local_poses.is_none());
+                            followed_eye = Some(followed);
                             if let Some(eye) = &mut self.fly_eye {
                                 let dt = self
                                     .last_fly_update
@@ -562,6 +610,50 @@ impl ApplicationHandler for InteractiveApp {
                                 &self.render_materials,
                                 eye,
                             ));
+                        }
+                        // Third person: the hammer and torch still aim from the eye
+                        // (`cam`); only the drawn camera moves back, and the local
+                        // body appears. First person never draws it.
+                        let mut render_cam = cam;
+                        if self.third_person
+                            && self.fly_eye.is_none()
+                            && let (Some(player_view), Some(v), Some(eye), Some((_, dir))) =
+                                (&self.player_view, fresh_view, followed_eye, cam)
+                        {
+                            let reach = self
+                                .session
+                                .replica
+                                .get()
+                                .and_then(|r| r.try_lock().ok())
+                                .and_then(|replica| {
+                                    replica
+                                        .terrain_volume()
+                                        .map(|volume| third_person_distance(volume, eye, dir))
+                                })
+                                .unwrap_or(THIRD_PERSON_DISTANCE_M);
+                            render_cam = Some((third_person_eye(eye, dir, reach), dir));
+                            let eye_height =
+                                f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
+                            let feet = [
+                                f64::from(eye.x),
+                                f64::from(eye.y) - eye_height,
+                                f64::from(eye.z),
+                            ];
+                            let local = PlayerBody {
+                                entity: 0,
+                                feet_m: feet,
+                                velocity_m_s: v.predicted.velocity_m_s,
+                                in_water: player_swims(&water, feet),
+                                look_yaw: Some(self.yaw),
+                            };
+                            overlay.extend(player_view.instances(
+                                &[local],
+                                self.player_tint_base,
+                                render_now,
+                            ));
+                            renderer
+                                .scene
+                                .set_overlay(&renderer.device, &renderer.queue, &overlay);
                         }
                         renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(
                             || CrosshairView {
@@ -692,7 +784,7 @@ impl ApplicationHandler for InteractiveApp {
                         });
                         match renderer.finish_frame(
                             acquired,
-                            cam.as_ref(),
+                            render_cam.as_ref(),
                             &body_mesh_updates,
                             &live_body_meshes,
                             None,
