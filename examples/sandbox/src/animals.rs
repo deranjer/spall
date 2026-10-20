@@ -224,6 +224,12 @@ struct Walker {
     blocked_streak: u32,
     /// Heading the animal was last asked to face (about +Y).
     yaw: f64,
+    /// Where the animal last stood, for choosing a detour when blocked.
+    at: [f64; 3],
+    /// Extra root height for the next horizontal step, to hop a block.
+    lift: f64,
+    /// The last requested root target, for diagnostics.
+    last_target: [f64; 3],
 }
 
 struct Placement {
@@ -339,6 +345,46 @@ impl AnimalDirector {
         None
     }
 
+    /// Ground height near `reference_y_m` at a column: climbs out of solid terrain
+    /// a few cells, then descends to the first solid cell. Much cheaper than a
+    /// scan from the top of the world, and what stepping needs.
+    fn ground_near_m(
+        sim: &Simulation,
+        x_cell: i64,
+        z_cell: i64,
+        reference_y_m: f64,
+    ) -> Option<f64> {
+        let body = sim.world().terrain();
+        let (min, max) = body.collider_region;
+        if x_cell < min.x || x_cell > max.x || z_cell < min.z || z_cell > max.z {
+            return None;
+        }
+        let start = (((reference_y_m + 1.5) / 0.25).floor() as i64).clamp(min.y, max.y);
+        let mut y = start;
+        let mut climbed = 0;
+        while matches!(
+            body.volume.sample(GlobalCell::new(x_cell, y, z_cell)),
+            Ok(Sample::Filled(_))
+        ) {
+            y += 1;
+            climbed += 1;
+            if y > max.y || climbed > 12 {
+                return None;
+            }
+        }
+        for _ in 0..64 {
+            if y < min.y {
+                return None;
+            }
+            match body.volume.sample(GlobalCell::new(x_cell, y, z_cell)) {
+                Ok(Sample::Filled(_)) => return Some((y + 1) as f64 * 0.25),
+                Ok(Sample::Empty { .. }) => y -= 1,
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Root height at which the pose's lowest cells clear the ground under each
     /// of them by [`GROUND_CLEARANCE_M`], with the pose turned by `yaw`. The
     /// ground is sampled under every foot cell, not under the root, so a leg
@@ -347,6 +393,7 @@ impl AnimalDirector {
         sim: &Simulation,
         cells: &[crate::animal_visual::AnimalCell],
         root_xz: [f64; 2],
+        reference_y_m: f64,
         yaw: f64,
     ) -> Option<f64> {
         let lowest = cells
@@ -358,7 +405,9 @@ impl AnimalDirector {
         let mut needed = f64::NEG_INFINITY;
         for cell in cells {
             let bottom = cell.center.y - cell.size.y * 0.5;
-            if bottom > lowest + 0.15 {
+            // Every cell in the lower body can touch a block beside the feet, so
+            // each one limits how low the root may sit.
+            if bottom > lowest + 0.9 {
                 continue;
             }
             let (x, z) = (f64::from(cell.center.x), f64::from(cell.center.z));
@@ -371,7 +420,7 @@ impl AnimalDirector {
             let ground = match columns.get(&key) {
                 Some(ground) => *ground,
                 None => {
-                    let ground = Self::ground_y_m(sim, key.0, key.1)?;
+                    let ground = Self::ground_near_m(sim, key.0, key.1, reference_y_m)?;
                     columns.insert(key, ground);
                     ground
                 }
@@ -558,8 +607,24 @@ impl CreatureDirector for AnimalDirector {
             return;
         };
         match outcome {
-            CreatureMoveOutcome::Blocked { .. } => {
+            CreatureMoveOutcome::Blocked {
+                part_id,
+                time_of_impact,
+            } => {
                 self.stats[walker.species].1 += 1;
+                if self.stats[walker.species].1 <= 40 && walker.species == 0 {
+                    tracing::info!(
+                        id = key.creature_id.get(),
+                        at = ?walker.at,
+                        target = ?walker.last_target,
+                        yaw = walker.yaw,
+                        lift = walker.lift,
+                        streak = walker.blocked_streak,
+                        ?part_id,
+                        ?time_of_impact,
+                        "deer move blocked"
+                    );
+                }
                 // The pose did not change. Birds turn around; walkers stop and re-plan.
                 walker.gait = match walker.gait {
                     Gait::Orbit {
@@ -575,11 +640,39 @@ impl CreatureDirector for AnimalDirector {
                             radius,
                         }
                     }
+                    Gait::Walk { until, .. } => {
+                        walker.blocked_streak = walker.blocked_streak.saturating_add(1);
+                        let streak = walker.blocked_streak;
+                        if streak == 1 {
+                            // First try hopping whatever is in the way.
+                            walker.lift = 0.3;
+                            walker.gait
+                        } else if streak <= 8 {
+                            // Then try other headings, alternating sides and widening.
+                            walker.lift = 0.0;
+                            const TURNS: [f64; 6] = [0.8, -0.8, 1.6, -1.6, 2.4, -2.4];
+                            let angle = walker.yaw + TURNS[(streak as usize - 2) % TURNS.len()];
+                            // yaw maps +X to (cos, -sin), so heading (cos, -sin) is the
+                            // direction the animal faces after turning by `angle`.
+                            Gait::Walk {
+                                target: [
+                                    walker.at[0] + 4.0 * angle.cos(),
+                                    walker.at[2] - 4.0 * angle.sin(),
+                                ],
+                                until,
+                            }
+                        } else {
+                            // Truly stuck: stand for a while and start over.
+                            walker.lift = 0.0;
+                            walker.blocked_streak = 0;
+                            Gait::Rest {
+                                until: self.last_tick + 180,
+                            }
+                        }
+                    }
                     _ => {
                         walker.blocked_streak = walker.blocked_streak.saturating_add(1);
                         Gait::Rest {
-                            // Back off so a creature wedged against terrain does not
-                            // pay for a failed sweep every few ticks.
                             until: self.last_tick + 120 * u64::from(walker.blocked_streak.min(8)),
                         }
                     }
@@ -587,7 +680,14 @@ impl CreatureDirector for AnimalDirector {
             }
             CreatureMoveOutcome::Staged => {
                 self.stats[walker.species].0 += 1;
-                walker.blocked_streak = 0;
+                walker.lift = 0.0;
+                // Only real horizontal progress ends a blocked streak; a creature
+                // bobbing up and down against an obstacle is still stuck.
+                let moved = (walker.last_target[0] - walker.at[0])
+                    .hypot(walker.last_target[2] - walker.at[2]);
+                if moved > 0.05 {
+                    walker.blocked_streak = 0;
+                }
             }
             CreatureMoveOutcome::Busy => {}
         }
@@ -614,9 +714,9 @@ impl CreatureDirector for AnimalDirector {
             let species_key = self.species[walker.species].key;
             // The pose about to be requested; foot heights come from the ground
             // under each of its lowest cells (see `support_y`).
-            let next_phase = walker.clip_phase + MOVE_PERIOD_TICKS;
             let move_clip = locomotion_clip(species_key, LOCOMOTION_MOVE).unwrap_or("idle");
             let here = alive.translation_m;
+            walker.at = here;
             // Decide the next root target and whether the animal is moving.
             let (target, moving, yaw) = match walker.gait {
                 Gait::Rest { until } => {
@@ -637,10 +737,15 @@ impl CreatureDirector for AnimalDirector {
                     let (dx, dz) = (target[0] - here[0], target[1] - here[2]);
                     let distance = dx.hypot(dz);
                     let visual = &self.visuals[walker.species];
-                    let cells = visual
-                        .sample(move_clip, next_phase as f64)
-                        .unwrap_or_default();
-                    let needed_here = Self::support_y(sim, &cells, [here[0], here[2]], walker.yaw);
+                    // A limb swinging between two poses can dip lower than both of them,
+                    // so the support height must hold for the poses in between too.
+                    let mut cells = Vec::new();
+                    for step in 0..=2_u64 {
+                        let phase = walker.clip_phase + step * MOVE_PERIOD_TICKS / 2;
+                        cells.extend(visual.sample(move_clip, phase as f64).unwrap_or_default());
+                    }
+                    let needed_here =
+                        Self::support_y(sim, &cells, [here[0], here[2]], here[1], walker.yaw);
                     let wrap = |angle: f64| {
                         (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
                             - std::f64::consts::PI
@@ -674,16 +779,20 @@ impl CreatureDirector for AnimalDirector {
                             here[2] + dz / distance * step,
                         ];
                         let yaw_next = walker.yaw + turn;
-                        let needed_next = Self::support_y(sim, &cells, next, yaw_next);
+                        let needed_next = Self::support_y(sim, &cells, next, here[1], yaw_next);
                         match (needed_here, needed_next) {
                             (Some(from), Some(to)) if (to - from).abs() <= 0.5 => {
-                                if to > here[1] + 0.02 {
+                                if to + walker.lift > here[1] + 0.02 {
                                     // Step up: rise first so the feet clear the edge.
-                                    ([here[0], to, here[2]], true, Some(walker.yaw))
+                                    ([here[0], to + walker.lift, here[2]], true, Some(walker.yaw))
                                 } else {
                                     // Level or step down: move on at this height; the drop
                                     // happens on the next update.
-                                    ([next[0], from.max(to), next[1]], true, Some(yaw_next))
+                                    (
+                                        [next[0], from.max(to) + walker.lift, next[1]],
+                                        true,
+                                        Some(yaw_next),
+                                    )
                                 }
                             }
                             _ => {
@@ -747,6 +856,7 @@ impl CreatureDirector for AnimalDirector {
                 f64::from(2.0 * y.atan2(w))
             });
             walker.yaw = yaw;
+            walker.last_target = target;
             self.walkers.insert(id, walker);
             let (sin, cos) = ((yaw * 0.5).sin(), (yaw * 0.5).cos());
             requests.push(CreatureMoveRequest {
@@ -828,6 +938,9 @@ impl CreatureDirector for AnimalDirector {
                             moving: false,
                             blocked_streak: 0,
                             yaw: placement.yaw_rad,
+                            at: placement.root_m.to_array(),
+                            lift: 0.0,
+                            last_target: [0.0; 3],
                         },
                     );
                 }

@@ -8205,6 +8205,14 @@ impl PhysicsWorld {
         }
     }
 
+    /// Every collider of every articulated assembly (creatures).
+    fn articulated_colliders(&self) -> std::collections::HashSet<ColliderHandle> {
+        self.articulated
+            .values()
+            .flat_map(|assembly| assembly.parts.iter().map(|part| part.collider))
+            .collect()
+    }
+
     /// Records which body owns `collider`, so a query can tell whose it is without the handle.
     fn tag_collider(&mut self, collider: ColliderHandle, id: BodyId) {
         if let Some(c) = self.colliders.get_mut(collider) {
@@ -8240,9 +8248,14 @@ impl PhysicsWorld {
             position_m[2] as f32,
         );
         let pos = Pose::from_translation(feet + Vector::new(0.0, centre, 0.0));
-        let excluded_predicate =
-            |_handle: ColliderHandle, collider: &Collider| !excluded.excludes(collider);
-        let filter = if excluded.is_empty() {
+        // Players pass through articulated creatures: the client predicts its own
+        // movement without them, so letting the server block on one would
+        // rubber-band the player.
+        let creature_colliders = self.articulated_colliders();
+        let excluded_predicate = |handle: ColliderHandle, collider: &Collider| {
+            !excluded.excludes(collider) && !creature_colliders.contains(&handle)
+        };
+        let filter = if excluded.is_empty() && creature_colliders.is_empty() {
             QueryFilter::default()
         } else {
             QueryFilter::default().predicate(&excluded_predicate)
@@ -8409,9 +8422,11 @@ impl PhysicsWorld {
             position_m[2] as f32,
         );
         let pos = Pose::from_translation(feet + Vector::new(0.0, centre, 0.0));
-        let excluded_predicate =
-            move |handle: ColliderHandle, _collider: &Collider| !exclude.contains(&handle);
-        let filter = if exclude.is_empty() {
+        let creature_colliders = self.articulated_colliders();
+        let excluded_predicate = |handle: ColliderHandle, _collider: &Collider| {
+            !exclude.contains(&handle) && !creature_colliders.contains(&handle)
+        };
+        let filter = if exclude.is_empty() && creature_colliders.is_empty() {
             QueryFilter::default()
         } else {
             QueryFilter::default().predicate(&excluded_predicate)

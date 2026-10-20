@@ -472,7 +472,9 @@ struct InteractiveApp {
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
-    ambience_track: Option<PathBuf>,
+    /// Ambience layers last sent to the audio thread, volumes in twentieths.
+    ambience_layers: Vec<(PathBuf, u8)>,
+    ambience_mix_at: Option<Instant>,
     weather_audio: Option<AmbienceAudio>,
     weather_track: Option<PathBuf>,
     nature_volume: f32,
@@ -1728,7 +1730,8 @@ impl InteractiveApp {
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
-            ambience_track: None,
+            ambience_layers: Vec::new(),
+            ambience_mix_at: None,
             weather_audio: AmbienceAudio::start(0.3),
             weather_track: None,
             nature_volume: 0.2,
@@ -1912,31 +1915,60 @@ impl InteractiveApp {
                     .as_ref()
                     .map(|view| view.predicted.position_m)
             });
-        let track = if let Some(index) = self.nature_preview {
-            self.biome_audio.tracks.get(index).cloned().flatten()
+        // Mixed layers, not one track: a stream carries into the meadow beside it.
+        // Recomputed a few times a second; each layer fades on the audio thread.
+        let due = self
+            .ambience_mix_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_millis(250));
+        if !due && self.nature_preview.is_none() {
+            return;
+        }
+        let mix: Vec<(PathBuf, f32)> = if let Some(index) = self.nature_preview {
+            self.biome_audio
+                .tracks
+                .get(index)
+                .cloned()
+                .flatten()
+                .map(|path| vec![(path, 1.0)])
+                .unwrap_or_default()
         } else {
-            position.and_then(|position| {
-                let field = self.ambience_field.as_ref()?;
-                let grid = self.ambience_grid.as_ref()?;
-                let biome = crate::audio::biome_at(field, grid, position)?;
-                self.biome_audio.track(biome).cloned()
-            })
+            position
+                .and_then(|position| {
+                    let field = self.ambience_field.as_ref()?;
+                    let grid = self.ambience_grid.as_ref()?;
+                    Some(crate::audio::ambience_mix(
+                        field,
+                        grid,
+                        position,
+                        &self.biome_audio,
+                    ))
+                })
+                .unwrap_or_default()
         };
-        if track != self.ambience_track {
+        self.ambience_mix_at = Some(Instant::now());
+        // Quantize so a drifting listener does not resend an unchanged mix.
+        let quantized: Vec<(PathBuf, u8)> = mix
+            .iter()
+            .map(|(path, volume)| (path.clone(), (volume * 20.0).round() as u8))
+            .collect();
+        if quantized != self.ambience_layers {
             let sent = self
                 .ambience
                 .as_ref()
-                .map(|audio| audio.set_track(track.clone()));
+                .map(|audio| audio.set_mix(mix.clone()));
             match sent {
-                Some(Err(std::sync::mpsc::TrySendError::Full(_))) => return,
+                Some(Err(std::sync::mpsc::TrySendError::Full(_))) => {
+                    self.ambience_mix_at = None;
+                    return;
+                }
                 Some(Err(std::sync::mpsc::TrySendError::Disconnected(_))) => {
                     tracing::warn!("ambience worker stopped; continuing without audio");
                     self.ambience = None;
                 }
                 _ => {}
             }
-            tracing::info!(track = ?track, "biome ambience selection changed");
-            self.ambience_track = track;
+            tracing::info!(layers = ?quantized, "ambience mix changed");
+            self.ambience_layers = quantized;
         }
     }
 

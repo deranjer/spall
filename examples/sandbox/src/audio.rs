@@ -22,6 +22,18 @@ pub const TRACK_NAMES: [&str; 13] = [
     "pine-wind.ogg",
 ];
 
+/// How far each recording carries. Water is audible from much further than wind
+/// or birdsong, so a stream is heard well before the bank and fades gradually.
+fn track_range_m(name: &str) -> f32 {
+    match name {
+        "riparian-stream.ogg" => 85.0,
+        "ocean-waves.ogg" => 130.0,
+        "beach-waves.ogg" => 110.0,
+        "swamp-ambience.ogg" => 60.0,
+        _ => spall_client::audio::DEFAULT_RANGE_M,
+    }
+}
+
 /// Finds assets beside the executable first (portable/editor launches), then
 /// falls back to the sandbox source tree (Cargo developer runs from any CWD).
 pub fn config() -> BiomeAudioConfig {
@@ -47,6 +59,7 @@ pub fn config() -> BiomeAudioConfig {
         .map(|name| name.map(|name| root.join(name)))
         .collect(),
         thunder: Some(root.join("weather/thunder-clap.ogg")),
+        ranges_m: TRACK_NAMES.iter().map(|name| track_range_m(name)).collect(),
     }
 }
 

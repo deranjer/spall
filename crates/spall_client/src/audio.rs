@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use rodio::{Decoder, OutputStreamBuilder, Sink};
 
-const CROSSFADE: Duration = Duration::from_millis(900);
 const UPDATE: Duration = Duration::from_millis(25);
 
 /// Game-owned Ogg paths, indexed by the stable biome code in world generation.
@@ -23,7 +22,18 @@ pub struct BiomeAudioConfig {
     /// Weather beds indexed by the stable WeatherKind code; game-owned assets.
     pub weather_tracks: Vec<Option<PathBuf>>,
     pub thunder: Option<PathBuf>,
+    /// How far (metres) each biome track carries, indexed like `tracks`. A track
+    /// without an entry carries [`DEFAULT_RANGE_M`].
+    pub ranges_m: Vec<f32>,
 }
+
+/// Distance at which a biome track has faded to silence unless configured.
+pub const DEFAULT_RANGE_M: f32 = 45.0;
+/// Most ambience layers mixed at once.
+const MAX_LAYERS: usize = 4;
+/// Time constant of a layer's volume approaching its target, so a layer fades
+/// in and out over a few seconds instead of switching.
+const LAYER_RAMP: Duration = Duration::from_millis(1200);
 
 /// Resolves a world-space listener position into the replicated climate field.
 /// Bounds are checked before `CoverGrid::at`, whose public lookup otherwise
@@ -60,6 +70,94 @@ impl BiomeAudioConfig {
     pub fn track(&self, biome: u8) -> Option<&PathBuf> {
         self.tracks.get(usize::from(biome)).and_then(Option::as_ref)
     }
+
+    pub fn range_m(&self, biome: u8) -> f32 {
+        self.ranges_m
+            .get(usize::from(biome))
+            .copied()
+            .filter(|range| range.is_finite() && *range > 0.0)
+            .unwrap_or(DEFAULT_RANGE_M)
+    }
+}
+
+/// Side of one climate-field square in metres (`FIELD_CELLS` quarter-metre cells).
+const FIELD_SQUARE_M: f64 = 4.0;
+/// Furthest any biome is searched for, whatever its configured range.
+const MAX_SEARCH_M: f64 = 130.0;
+
+/// The ambience layers to play at `position_m`: every biome track whose biome
+/// lies within that track's range, each at a volume that falls off smoothly
+/// with the distance to the nearest climate square of that biome. The biome
+/// under the listener is always full volume, so a stream carries into the
+/// meadow beside it and fades out gradually instead of cutting at its bank.
+pub fn ambience_mix(
+    field: &spall_ecology::cover::CoverField,
+    grid: &spall_ecology::cover::CoverGrid,
+    position_m: [f64; 3],
+    config: &BiomeAudioConfig,
+) -> Vec<(PathBuf, f32)> {
+    let mut nearest: Vec<(u8, f64)> = Vec::new();
+    let mut note = |biome: u8, distance: f64| match nearest.iter_mut().find(|(b, _)| *b == biome) {
+        Some(entry) => entry.1 = entry.1.min(distance),
+        None => nearest.push((biome, distance)),
+    };
+    if let Some(biome) = biome_at(field, grid, position_m) {
+        note(biome, 0.0);
+    }
+    // Exact nearest-square search over the window the longest track can reach.
+    let reach = config
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.is_some())
+        .map(|(biome, _)| f64::from(config.range_m(biome as u8)))
+        .fold(0.0_f64, f64::max)
+        .min(MAX_SEARCH_M);
+    let steps = (reach / FIELD_SQUARE_M).ceil() as i64;
+    let centre_x = (position_m[0] / FIELD_SQUARE_M).floor();
+    let centre_z = (position_m[2] / FIELD_SQUARE_M).floor();
+    if centre_x.is_finite() && centre_z.is_finite() {
+        for dz in -steps..=steps {
+            for dx in -steps..=steps {
+                let square_x = centre_x + dx as f64;
+                let square_z = centre_z + dz as f64;
+                let middle = [
+                    (square_x + 0.5) * FIELD_SQUARE_M,
+                    position_m[1],
+                    (square_z + 0.5) * FIELD_SQUARE_M,
+                ];
+                // Distance to the nearest point of the square, not its middle.
+                let off_x = ((middle[0] - position_m[0]).abs() - FIELD_SQUARE_M * 0.5).max(0.0);
+                let off_z = ((middle[2] - position_m[2]).abs() - FIELD_SQUARE_M * 0.5).max(0.0);
+                let distance = off_x.hypot(off_z);
+                if distance > reach {
+                    continue;
+                }
+                if let Some(biome) = biome_at(field, grid, middle) {
+                    note(biome, distance);
+                }
+            }
+        }
+    }
+    let mut layers: Vec<(PathBuf, f32)> = Vec::new();
+    for (biome, distance) in nearest {
+        let Some(path) = config.track(biome) else {
+            continue;
+        };
+        let volume = (1.0 - distance / f64::from(config.range_m(biome)))
+            .clamp(0.0, 1.0)
+            .powf(1.4) as f32;
+        if volume < 0.02 {
+            continue;
+        }
+        match layers.iter_mut().find(|(existing, _)| existing == path) {
+            Some(entry) => entry.1 = entry.1.max(volume),
+            None => layers.push((path.clone(), volume)),
+        }
+    }
+    layers.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    layers.truncate(MAX_LAYERS);
+    layers
 }
 
 /// Checks the shipped loop format and decodes initial samples without opening
@@ -92,18 +190,10 @@ pub fn validate_loop_boundary(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn existing_slot(paths: &[Option<PathBuf>; 2], request: &Option<PathBuf>) -> Option<usize> {
-    request.as_ref().and_then(|path| {
-        paths
-            .iter()
-            .position(|stored| stored.as_ref() == Some(path))
-    })
-}
-
 /// Sends desired tracks to a worker that owns the audio device and both sinks.
 #[derive(Clone)]
 pub struct AmbienceAudio {
-    tx: SyncSender<Option<PathBuf>>,
+    tx: SyncSender<Vec<(PathBuf, f32)>>,
     one_shots: SyncSender<PathBuf>,
     gain: Arc<AtomicU32>,
 }
@@ -134,10 +224,20 @@ impl AmbienceAudio {
     }
 
     pub fn set_track(&self, path: Option<PathBuf>) -> Result<(), TrySendError<Option<PathBuf>>> {
-        match self.tx.try_send(path) {
-            Ok(()) => Ok(()),
-            Err(error) => Err(error),
-        }
+        let mix = path.iter().map(|path| (path.clone(), 1.0)).collect();
+        self.tx.try_send(mix).map_err(|error| match error {
+            TrySendError::Full(_) => TrySendError::Full(path.clone()),
+            TrySendError::Disconnected(_) => TrySendError::Disconnected(path.clone()),
+        })
+    }
+
+    /// Replaces the set of looping layers and their target volumes (0..=1).
+    /// Each layer fades toward its target; a layer left out fades to silence.
+    pub fn set_mix(
+        &self,
+        mix: Vec<(PathBuf, f32)>,
+    ) -> Result<(), TrySendError<Vec<(PathBuf, f32)>>> {
+        self.tx.try_send(mix)
     }
 
     pub fn set_gain(&self, gain: f32) {
@@ -158,8 +258,22 @@ fn safe_gain(gain: f32) -> f32 {
     }
 }
 
+struct Layer {
+    path: PathBuf,
+    sink: Sink,
+    volume: f32,
+    target: f32,
+}
+
+/// One step of a layer volume approaching its target with time constant
+/// [`LAYER_RAMP`].
+fn ramp(volume: f32, target: f32, dt: Duration) -> f32 {
+    let blend = 1.0 - (-dt.as_secs_f32() / LAYER_RAMP.as_secs_f32()).exp();
+    volume + (target - volume) * blend
+}
+
 fn run_audio(
-    rx: mpsc::Receiver<Option<PathBuf>>,
+    rx: mpsc::Receiver<Vec<(PathBuf, f32)>>,
     shot_rx: mpsc::Receiver<PathBuf>,
     gain: Arc<AtomicU32>,
 ) {
@@ -170,64 +284,58 @@ fn run_audio(
             return;
         }
     };
-    let sinks = [
-        Sink::connect_new(stream.mixer()),
-        Sink::connect_new(stream.mixer()),
-    ];
     let thunder = Sink::connect_new(stream.mixer());
-    let mut paths: [Option<PathBuf>; 2] = [None, None];
-    let mut volumes = [0.0_f32; 2];
-    let mut fade = Crossfade {
-        from: [0.0; 2],
-        to: [0.0; 2],
-    };
-    let mut fade_started = Instant::now();
+    let mut layers: Vec<Layer> = Vec::new();
+    let mut last_update = Instant::now();
 
     loop {
         match rx.recv_timeout(UPDATE) {
             Ok(request) => {
-                if let Some(index) = existing_slot(&paths, &request) {
-                    let mut to = [0.0, 0.0];
-                    to[index] = 1.0;
-                    fade = Crossfade { from: volumes, to };
-                    fade_started = Instant::now();
-                } else if let Some(path) = request {
-                    let index = if volumes[0] <= volumes[1] { 0 } else { 1 };
+                for layer in &mut layers {
+                    layer.target = 0.0;
+                }
+                for (path, volume) in request.into_iter().take(MAX_LAYERS) {
+                    let volume = safe_gain(volume);
+                    if let Some(layer) = layers.iter_mut().find(|layer| layer.path == path) {
+                        layer.target = volume;
+                        continue;
+                    }
+                    // Make room by dropping the quietest layer that is already leaving.
+                    if layers.len() >= MAX_LAYERS {
+                        let leaving = layers
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, layer)| layer.target == 0.0)
+                            .min_by(|a, b| a.1.volume.total_cmp(&b.1.volume))
+                            .map(|(index, _)| index);
+                        match leaving {
+                            Some(index) => {
+                                layers.remove(index);
+                            }
+                            None => continue,
+                        }
+                    }
                     match std::fs::File::open(&path)
                         .map_err(|error| error.to_string())
                         .and_then(|file| {
                             Decoder::new_looped(file).map_err(|error| error.to_string())
                         }) {
                         Ok(source) => {
-                            sinks[index].clear();
-                            // The inactive slot may retain part of a previous
-                            // rapid fade. It has been cut above, so reflect zero
-                            // in the new transition's starting level.
-                            volumes[index] = 0.0;
-                            sinks[index].set_volume(0.0);
-                            sinks[index].append(source);
-                            sinks[index].play();
-                            paths[index] = Some(path);
-                            let mut to = [0.0, 0.0];
-                            to[index] = 1.0;
-                            fade = Crossfade { from: volumes, to };
-                            fade_started = Instant::now();
+                            let sink = Sink::connect_new(stream.mixer());
+                            sink.set_volume(0.0);
+                            sink.append(source);
+                            sink.play();
+                            layers.push(Layer {
+                                path,
+                                sink,
+                                volume: 0.0,
+                                target: volume,
+                            });
                         }
                         Err(error) => {
-                            tracing::warn!(%error, "could not load biome ambience; fading to silence");
-                            fade = Crossfade {
-                                from: volumes,
-                                to: [0.0, 0.0],
-                            };
-                            fade_started = Instant::now();
+                            tracing::warn!(%error, "could not load biome ambience; skipping layer");
                         }
                     }
-                } else {
-                    fade = Crossfade {
-                        from: volumes,
-                        to: [0.0, 0.0],
-                    };
-                    fade_started = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -251,34 +359,18 @@ fn run_audio(
         }
         let gain = f32::from_bits(gain.load(Ordering::Relaxed));
         thunder.set_volume(gain);
-        let t = (fade_started.elapsed().as_secs_f32() / CROSSFADE.as_secs_f32()).clamp(0.0, 1.0);
-        volumes = fade.sample(t);
-        for index in 0..2 {
-            sinks[index].set_volume(volumes[index] * gain);
-            if t >= 1.0 && fade.to[index] == 0.0 && volumes[index] == 0.0 {
-                sinks[index].clear();
-                paths[index] = None;
-            }
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(last_update);
+        last_update = now;
+        for layer in &mut layers {
+            layer.volume = ramp(layer.volume, layer.target, dt);
+            layer.sink.set_volume(layer.volume * gain);
         }
+        layers.retain(|layer| layer.target > 0.0 || layer.volume > 0.005);
     }
-    drop(sinks);
+    drop(layers);
     drop(thunder);
     drop(stream);
-}
-
-/// Pure value used by boundary tests and the audio worker's interpolation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Crossfade {
-    from: [f32; 2],
-    to: [f32; 2],
-}
-
-impl Crossfade {
-    fn sample(self, t: f32) -> [f32; 2] {
-        std::array::from_fn(|index| {
-            self.from[index] + (self.to[index] - self.from[index]) * t.clamp(0.0, 1.0)
-        })
-    }
 }
 
 #[cfg(test)]
@@ -295,35 +387,86 @@ mod tests {
     }
 
     #[test]
-    fn crossfade_switches_tracks_and_fades_to_silence() {
-        let switch = Crossfade {
-            from: [1.0, 0.0],
-            to: [0.0, 1.0],
+    fn layer_volume_approaches_its_target_without_overshoot() {
+        let step = Duration::from_millis(100);
+        let mut volume = 0.0;
+        let mut previous = volume;
+        for _ in 0..60 {
+            volume = ramp(volume, 1.0, step);
+            assert!(volume >= previous && volume <= 1.0);
+            previous = volume;
+        }
+        assert!(volume > 0.99, "{volume}");
+        for _ in 0..60 {
+            volume = ramp(volume, 0.0, step);
+        }
+        assert!(volume < 0.01, "{volume}");
+        // About one time constant covers 63% of the way.
+        let one = ramp(0.0, 1.0, LAYER_RAMP);
+        assert!((one - 0.632).abs() < 0.01, "{one}");
+    }
+
+    fn two_biome_field() -> (
+        spall_ecology::cover::CoverField,
+        spall_ecology::cover::CoverGrid,
+    ) {
+        // A 64 x 64 raster of 4 m squares: biome 0 everywhere except a two-square
+        // wide north-south strip of biome 1 (a stream) at x = 60..68 m.
+        let width = 64usize;
+        let rle = |plane: &[u8]| {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < plane.len() {
+                let value = plane[i];
+                let mut run = 1;
+                while i + run < plane.len() && plane[i + run] == value && run < 255 {
+                    run += 1;
+                }
+                out.push(run as u8);
+                out.push(value);
+                i += run;
+            }
+            out
         };
-        assert_eq!(switch.sample(0.0), [1.0, 0.0]);
-        assert_eq!(switch.sample(1.0), [0.0, 1.0]);
-        let silence = Crossfade {
-            from: [0.0, 1.0],
-            to: [0.0, 0.0],
+        let biome: Vec<u8> = (0..width * width)
+            .map(|index| u8::from(matches!(index % width, 15 | 16)))
+            .collect();
+        let zeros = vec![0u8; width * width];
+        let mut bytes = rle(&biome);
+        for _ in 0..3 {
+            bytes.extend(rle(&zeros));
+        }
+        let field = spall_ecology::cover::CoverField {
+            width: width as u32,
+            rle: bytes,
         };
-        assert_eq!(silence.sample(1.0), [0.0, 0.0]);
-        let return_to_a = Crossfade {
-            from: switch.sample(0.5),
-            to: [1.0, 0.0],
-        };
-        assert_eq!(return_to_a.sample(0.0), [0.5, 0.5]);
-        assert_eq!(return_to_a.sample(1.0), [1.0, 0.0]);
+        let grid = field.expand().unwrap();
+        (field, grid)
     }
 
     #[test]
-    fn returning_to_loaded_track_reuses_its_sink() {
-        let paths = [Some(PathBuf::from("A.ogg")), Some(PathBuf::from("B.ogg"))];
-        assert_eq!(
-            existing_slot(&paths, &Some(PathBuf::from("A.ogg"))),
-            Some(0)
-        );
-        assert_eq!(existing_slot(&paths, &Some(PathBuf::from("C.ogg"))), None);
-        assert_eq!(existing_slot(&paths, &None), None);
+    fn a_nearby_stream_is_mixed_in_and_fades_with_distance() {
+        let (field, grid) = two_biome_field();
+        let config = BiomeAudioConfig {
+            tracks: vec![Some("meadow.ogg".into()), Some("stream.ogg".into())],
+            ranges_m: vec![45.0, 90.0],
+            ..Default::default()
+        };
+        let volume_of = |x: f64, name: &str| {
+            ambience_mix(&field, &grid, [x, 10.0, 100.0], &config)
+                .into_iter()
+                .find(|(path, _)| path.to_str() == Some(name))
+                .map_or(0.0, |(_, v)| v)
+        };
+        // Standing on the stream bank: full volume. 30 m away: still clearly audible.
+        assert!(volume_of(61.0, "stream.ogg") > 0.99);
+        let near = volume_of(30.0, "stream.ogg");
+        let far = volume_of(10.0, "stream.ogg");
+        assert!(near > 0.2, "30 m from a 90 m stream: {near}");
+        assert!(far < near, "{far} vs {near}");
+        // Out of range the stream drops out entirely, and the meadow stays.
+        assert_eq!(volume_of(-100.0 + 0.0, "stream.ogg"), 0.0);
+        assert!(volume_of(10.0, "meadow.ogg") > 0.99);
     }
 
     #[test]

@@ -292,3 +292,44 @@ fn a_player_walking_into_moving_animals_never_stalls_the_tick() {
         .expect("tick loop stalled with a player among moving animals");
     eprintln!("worst tick with player + animals: {worst:?}");
 }
+
+#[test]
+fn players_walk_through_creatures_instead_of_being_blocked_by_them() {
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE, PlayerInput};
+    use spall_protocol::InputSeq;
+
+    let mut sim = simulation();
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [1, 0, 0], 4)
+        .unwrap()
+        .with_radius_m(0.0, 0.5);
+    let service = CreatureService::new(Box::new(director));
+    for _ in 0..30 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+    }
+    let deer = sim.alive_creatures()[0].translation_m;
+    let player = EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap();
+    // Start well clear of the deer, in line with it, and walk straight through.
+    sim.add_player(player, [deer[0] - 2.5, 0.6, deer[2]]);
+    let start = sim.player_state(player).unwrap().position_m;
+    for tick in 0..90_u64 {
+        sim.set_player_input(
+            player,
+            PlayerInput {
+                movement: [0.0, 0.0, 1.0],
+                view_dir: [1.0, 0.0, 0.0],
+                buttons: 0,
+            },
+            InputSeq(tick + 1),
+        );
+        sim.tick().unwrap();
+    }
+    let end = sim.player_state(player).unwrap().position_m;
+    let travelled = end[0] - start[0];
+    assert!(
+        end[0] > deer[0] + 0.5,
+        "player stopped at x={:.2} short of the deer at x={:.2} (travelled {travelled:.2} m)",
+        end[0],
+        deer[0]
+    );
+}
