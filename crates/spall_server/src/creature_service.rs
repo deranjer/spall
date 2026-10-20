@@ -42,6 +42,31 @@ impl CreatureIdPlan {
     }
 }
 
+/// A movement the director wants applied this tick.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreatureAction {
+    /// Exact swept pose and root transition (flying creatures, small populations).
+    Swept(spall_sim::CreatureMoveRequest),
+    /// Character-capsule locomotion with the pose staged without terrain casts.
+    Walk(spall_sim::CreatureWalkRequest),
+}
+
+impl CreatureAction {
+    fn key(&self) -> spall_core::CreatureKey {
+        match self {
+            Self::Swept(request) => request.key,
+            Self::Walk(request) => request.key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CreatureActionOutcome {
+    Swept(spall_sim::CreatureMoveOutcome),
+    /// `None`: a previous pose is not installed yet.
+    Walked(Option<spall_sim::CreatureWalkOutcome>),
+}
+
 pub trait CreatureDirector: Send {
     fn catalog(&self) -> Arc<OwnedCreatureCatalog>;
 
@@ -51,15 +76,15 @@ pub trait CreatureDirector: Send {
 
     /// Movement for creatures that are alive, applied after this tick's births
     /// through the engine's swept articulated-pose path. Default: none.
-    fn motion(&mut self, _tick: u64, _sim: &Simulation) -> Vec<spall_sim::CreatureMoveRequest> {
+    fn motion(&mut self, _tick: u64, _sim: &Simulation) -> Vec<CreatureAction> {
         Vec::new()
     }
 
-    /// What the engine did with a move this director requested.
-    fn on_move_outcome(
+    /// What the engine did with an action this director requested.
+    fn on_action_outcome(
         &mut self,
         _key: spall_core::CreatureKey,
-        _outcome: spall_sim::CreatureMoveOutcome,
+        _outcome: CreatureActionOutcome,
     ) {
     }
 
@@ -177,15 +202,23 @@ impl CreatureService {
 
     fn run_motion_inner(&self, sim: &mut Simulation) -> Result<(), String> {
         let tick = sim.current_tick().get();
-        let requests = self
+        let actions = self
             .director
             .lock()
             .map_err(|_| "creature director panicked earlier".to_string())?
             .motion(tick, sim);
-        let mut outcomes = Vec::with_capacity(requests.len());
-        for request in requests {
-            let key = request.key;
-            match sim.move_creature(request) {
+        let mut outcomes = Vec::with_capacity(actions.len());
+        for action in actions {
+            let key = action.key();
+            let result = match action {
+                CreatureAction::Swept(request) => {
+                    sim.move_creature(request).map(CreatureActionOutcome::Swept)
+                }
+                CreatureAction::Walk(request) => sim
+                    .walk_creature(request)
+                    .map(CreatureActionOutcome::Walked),
+            };
+            match result {
                 Ok(outcome) => outcomes.push((key, outcome)),
                 Err(error) => {
                     tracing::warn!(creature = key.creature_id.get(), %error, "creature move rejected");
@@ -198,10 +231,10 @@ impl CreatureService {
             .map_err(|_| "creature director panicked earlier".to_string())?;
         if let Ok(mut stats) = self.motion_stats.lock() {
             for (key, outcome) in &outcomes {
-                if let spall_sim::CreatureMoveOutcome::Blocked {
+                if let CreatureActionOutcome::Swept(spall_sim::CreatureMoveOutcome::Blocked {
                     part_id,
                     time_of_impact,
-                } = outcome
+                }) = outcome
                 {
                     let entry = stats
                         .blocked
@@ -214,7 +247,7 @@ impl CreatureService {
             }
         }
         for (key, outcome) in outcomes {
-            director.on_move_outcome(key, outcome);
+            director.on_action_outcome(key, outcome);
         }
         Ok(())
     }

@@ -482,6 +482,7 @@ mod creature_owner_bridge;
 mod creature_motion;
 pub use creature_motion::{
     AliveCreature, CreatureMoveOutcome, CreatureMoveRequest, CreatureMoveTiming,
+    CreatureWalkOutcome, CreatureWalkRequest,
 };
 
 #[path = "creature_capture.rs"]

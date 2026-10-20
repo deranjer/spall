@@ -38,6 +38,39 @@ pub enum CreatureMoveOutcome {
     Busy,
 }
 
+/// A ground creature's step, resolved with a character capsule around it.
+///
+/// The capsule is the same kinematic character controller players use (wall
+/// slide, autostep over terrain stairs, ground snap). Its result moves the root;
+/// the complete part pose is then staged without per-cell terrain casts, so
+/// limbs may overlap terrain the capsule does not cover. This is the locomotion
+/// collision proxy for walking animals; flying creatures use the exact swept path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatureWalkRequest {
+    pub key: spall_core::CreatureKey,
+    /// Desired horizontal step this update, metres (x, z).
+    pub desired_step_m: [f32; 2],
+    pub target_rotation_xyzw: [f32; 4],
+    /// The complete sampled local pose of every source part, in part-id order.
+    pub parts: Vec<(u32, spall_physics::PartTransform)>,
+    pub locomotion_tag: u8,
+    pub clip_phase_tick: u64,
+    /// Vertical offset from the root to the lowest point the creature stands on
+    /// (negative), metres.
+    pub feet_offset_m: f32,
+    pub capsule_radius_m: f32,
+    /// Half the height of the capsule's cylindrical segment.
+    pub capsule_half_height_m: f32,
+}
+
+/// What a walk step achieved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreatureWalkOutcome {
+    /// Root translation applied this step, metres.
+    pub moved_m: [f64; 3],
+    pub grounded: bool,
+}
+
 /// Where the swept-transition time of recent moves went, summed since the last
 /// [`Simulation::take_creature_move_timing`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -60,6 +93,91 @@ pub struct AliveCreature {
 }
 
 impl Simulation {
+    /// Moves a walking creature with a character capsule (see
+    /// [`CreatureWalkRequest`]). `Ok(None)` means a previous pose has not been
+    /// installed yet; try again next tick.
+    pub fn walk_creature(
+        &mut self,
+        request: CreatureWalkRequest,
+    ) -> Result<Option<CreatureWalkOutcome>, String> {
+        let state = self
+            .creatures
+            .as_ref()
+            .and_then(|host| host.record(request.key.creature_id))
+            .ok_or("creature is not hosted")?;
+        if state.key != request.key || state.lifecycle != CreatureLifecycleState::Alive {
+            return Err("creature is not alive".into());
+        }
+        let owner = self
+            .world
+            .creature_physics_owner(request.key)
+            .ok_or("creature has no physical owner")?;
+        let snapshot = self
+            .world
+            .physics()
+            .articulated_owner_snapshot(owner)
+            .ok_or("creature owner is missing from physics")?;
+        if snapshot.pending_pose {
+            return Ok(None);
+        }
+        let origin = self.world.physics_origin();
+        let root = origin.to_world_f64(snapshot.root.translation_m);
+        let feet = [root[0], root[1] + f64::from(request.feet_offset_m), root[2]];
+        // Fall a little each step so the capsule follows the ground down.
+        const FALL_M: f32 = 0.3;
+        let swept = self.world.physics().sweep_character(
+            spall_physics::CharacterParams {
+                half_height_m: request.capsule_half_height_m,
+                radius_m: request.capsule_radius_m,
+                mass_kg: 60.0,
+            },
+            feet,
+            [
+                request.desired_step_m[0],
+                -FALL_M,
+                request.desired_step_m[1],
+            ],
+            0.1,
+        );
+        let moved = [
+            f64::from(swept.translation_m[0]),
+            f64::from(swept.translation_m[1]),
+            f64::from(swept.translation_m[2]),
+        ];
+        let target_world = [root[0] + moved[0], root[1] + moved[1], root[2] + moved[2]];
+        let target = origin
+            .to_local_f32(target_world)
+            .ok_or("target is outside the physics frame")?;
+        let update = ArticulatedPose {
+            topology_token: snapshot.topology_token,
+            base_pose_token: snapshot.pose_token,
+            pose_token: snapshot
+                .pose_token
+                .checked_add(1)
+                .ok_or("pose token exhausted")?,
+            parts: request.parts,
+        };
+        self.world
+            .physics_mut()
+            .update_articulated_pose_trusted(
+                owner,
+                update,
+                spall_physics::PartTransform {
+                    translation_m: target,
+                    rotation_xyzw: request.target_rotation_xyzw,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        self.creature_presentation.insert(
+            request.key,
+            (request.locomotion_tag, request.clip_phase_tick),
+        );
+        Ok(Some(CreatureWalkOutcome {
+            moved_m: moved,
+            grounded: swept.grounded,
+        }))
+    }
+
     /// Returns and clears the accumulated swept-transition timing.
     pub fn take_creature_move_timing(&mut self) -> CreatureMoveTiming {
         std::mem::take(&mut self.creature_move_timing)
