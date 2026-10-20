@@ -83,20 +83,20 @@ fn a_hammer_swing_digs_a_crater_the_client_replica_sees() {
     let dir = scratch();
     let token = JoinToken::generate().unwrap();
     let mut config = ServeConfig::headless("127.0.0.1:0".parse().unwrap(), Scene::Custom, token);
-    config.custom_world = Some(scene.into_custom_world());
+    config.server.custom_world = Some(scene.into_custom_world());
     // The server stops after this many ticks (25 s paced). The client joins and
     // baselines at a variable pace, so a short budget can end before the swing
     // is even sent; this leaves a wide margin.
-    config.max_ticks = 1500;
-    config.quiescence_ticks = 0;
-    config.min_clients = 1;
-    config.max_clients = 1;
-    config.paced = true;
-    config.startup_timeout = Duration::from_secs(60);
-    config.log_json = dir.join("server.jsonl");
-    config.fingerprint_out = Some(dir.join("server.fingerprint"));
-    config.addr_out = Some(dir.join("server.addr"));
-    config.transport = patient_transport();
+    config.harness.max_ticks = 1500;
+    config.harness.quiescence_ticks = 0;
+    config.harness.min_clients = 1;
+    config.server.max_clients = 1;
+    config.server.paced = true;
+    config.harness.startup_timeout = Duration::from_secs(60);
+    config.server.log_json = dir.join("server.jsonl");
+    config.harness.fingerprint_out = Some(dir.join("server.fingerprint"));
+    config.harness.addr_out = Some(dir.join("server.addr"));
+    config.server.transport = patient_transport();
     // Timestamp the server's commit of the cut, to split server time from the
     // network and the client's apply.
     let committed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));

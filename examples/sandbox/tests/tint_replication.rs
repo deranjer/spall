@@ -179,18 +179,18 @@ fn tinted_terrain_and_detached_bodies_replicate_to_early_and_late_clients() {
     let dir = scratch();
     let token = JoinToken::generate().unwrap();
     let mut config = ServeConfig::headless("127.0.0.1:0".parse().unwrap(), Scene::Custom, token);
-    config.custom_world = Some(scene.into_custom_world());
-    config.max_ticks = 500;
-    config.quiescence_ticks = 0;
-    config.min_clients = 1;
-    config.max_clients = 4;
-    config.paced = true;
-    config.startup_timeout = Duration::from_secs(30);
-    config.log_json = dir.join("server.jsonl");
-    config.fingerprint_out = Some(dir.join("server.fingerprint"));
-    config.addr_out = Some(dir.join("server.addr"));
-    config.transport = patient_transport();
-    config.dev_unvalidated_actions = true;
+    config.server.custom_world = Some(scene.into_custom_world());
+    config.harness.max_ticks = 500;
+    config.harness.quiescence_ticks = 0;
+    config.harness.min_clients = 1;
+    config.server.max_clients = 4;
+    config.server.paced = true;
+    config.harness.startup_timeout = Duration::from_secs(30);
+    config.server.log_json = dir.join("server.jsonl");
+    config.harness.fingerprint_out = Some(dir.join("server.fingerprint"));
+    config.harness.addr_out = Some(dir.join("server.addr"));
+    config.server.transport = patient_transport();
+    config.harness.dev_unvalidated_actions = true;
     let server = std::thread::spawn(move || {
         spall_server::serve_with_game_content(config, game::tool_catalog(), game::manifest())
     });

@@ -110,19 +110,19 @@ fn serve_config(dir: &std::path::Path, ticks: u64) -> ServeConfig {
         Scene::BridgeCut,
         JoinToken::generate().unwrap(),
     );
-    config.max_ticks = ticks;
-    config.quiescence_ticks = 0;
-    config.min_clients = 0;
-    config.max_clients = 8;
-    config.startup_timeout = Duration::from_secs(10);
-    config.paced = true;
-    config.log_json = dir.join("server.jsonl");
-    config.fingerprint_out = Some(dir.join("fingerprint.txt"));
-    config.addr_out = Some(dir.join("address.txt"));
-    config.save = Some(dir.join("world.db"));
-    config.checkpoint_interval_ticks = 60;
-    config.transport = TransportConfig::for_tests();
-    config.credential_registry_file = Some(dir.join("player-credentials.txt"));
+    config.harness.max_ticks = ticks;
+    config.harness.quiescence_ticks = 0;
+    config.harness.min_clients = 0;
+    config.server.max_clients = 8;
+    config.harness.startup_timeout = Duration::from_secs(10);
+    config.server.paced = true;
+    config.server.log_json = dir.join("server.jsonl");
+    config.harness.fingerprint_out = Some(dir.join("fingerprint.txt"));
+    config.harness.addr_out = Some(dir.join("address.txt"));
+    config.server.save = Some(dir.join("world.db"));
+    config.server.checkpoint_interval_ticks = 60;
+    config.server.transport = TransportConfig::for_tests();
+    config.server.credential_registry_file = Some(dir.join("player-credentials.txt"));
     config
 }
 

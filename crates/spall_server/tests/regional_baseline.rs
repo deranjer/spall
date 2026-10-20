@@ -705,7 +705,7 @@ fn run_quic_regional_session(defer: bool) {
     let fp = dir.join("fingerprint");
     let addr = dir.join("addr");
     let mut config = ServeConfig::headless("127.0.0.1:0".parse().unwrap(), Scene::Custom, token);
-    config.custom_world = Some(CustomWorld::new(vec![[4.0, 0.5, 4.0]], || {
+    config.server.custom_world = Some(CustomWorld::new(vec![[4.0, 0.5, 4.0]], || {
         let mut setup = fixtures::flat_terrain_setup();
         let id = VolumeId::new(1).unwrap();
         let mut volume = Volume::new(id, CellSizeCode::Quarter);
@@ -722,14 +722,14 @@ fn run_quic_regional_session(defer: bool) {
         setup.terrain_collider_region = (GlobalCell::new(0, 0, 0), GlobalCell::new(255, 31, 31));
         setup
     }));
-    config.max_ticks = 840;
-    config.quiescence_ticks = 0;
-    config.paced = true;
-    config.dev_unvalidated_actions = true;
-    config.admin_commands = true;
-    config.log_json = dir.join("server.jsonl");
-    config.fingerprint_out = Some(fp.clone());
-    config.addr_out = Some(addr.clone());
+    config.harness.max_ticks = 840;
+    config.harness.quiescence_ticks = 0;
+    config.server.paced = true;
+    config.harness.dev_unvalidated_actions = true;
+    config.server.admin_commands = true;
+    config.server.log_json = dir.join("server.jsonl");
+    config.harness.fingerprint_out = Some(fp.clone());
+    config.harness.addr_out = Some(addr.clone());
     let thread = std::thread::spawn(move || serve(config));
     let start = Instant::now();
     while !(fp.exists() && addr.exists()) {

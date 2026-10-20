@@ -21,7 +21,7 @@
 //! implements `spall_sim::BrickBackingWriter` — the same trait `MemoryBacking`
 //! implements (T23/G3 row 7 item 1's unification point) — so `ResidencyPass`
 //! is unchanged either way; only which backing `serve()` installs differs
-//! (`ServeConfig::residency_disk_path`).
+//! (`HostConfig::residency_disk_path`).
 
 use std::path::Path;
 
