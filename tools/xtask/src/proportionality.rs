@@ -184,6 +184,15 @@ pub struct Observed {
     pub ungated: Vec<(String, usize, String)>,
 }
 
+/// The two sanctioned pre-release version numbers (and their direct aliases):
+/// rule 3 allows these wherever they live, so moving one is not a violation.
+const SANCTIONED_VERSIONS: &[&str] = &[
+    "PROTOCOL_VERSION",
+    "WIRE_SCHEMA_VERSION",
+    "STORE_SCHEMA_VERSION",
+    "STORE_SCHEMA_VERSION_U16",
+];
+
 /// Compares observations with the allowlist. Returns `(failures, warnings)`.
 pub fn evaluate(observed: &Observed, allow: &Allowlist) -> (Vec<String>, Vec<String>) {
     let mut failures = Vec::new();
@@ -204,7 +213,9 @@ pub fn evaluate(observed: &Observed, allow: &Allowlist) -> (Vec<String>, Vec<Str
         }
     }
     for (path, name) in &observed.consts {
-        if !allow.consts.contains(&(path.clone(), name.clone())) {
+        if !SANCTIONED_VERSIONS.contains(&name.as_str())
+            && !allow.consts.contains(&(path.clone(), name.clone()))
+        {
             failures.push(format!(
                 "AGENTS.md Proportionality rule 3: new version/schema constant `{name}` in \
                  {path}. Pre-release there is one PROTOCOL_VERSION and one STORE_SCHEMA_VERSION; \
@@ -259,7 +270,9 @@ pub fn render_allowlist(observed: &Observed) -> String {
         }
     }
     for (path, name) in &observed.consts {
-        out.push_str(&format!("const {path} {name}\n"));
+        if !SANCTIONED_VERSIONS.contains(&name.as_str()) {
+            out.push_str(&format!("const {path} {name}\n"));
+        }
     }
     for (path, literal) in &observed.domains {
         out.push_str(&format!("domain {path} {literal}\n"));
@@ -436,6 +449,17 @@ mod tests {
         let (failures, warnings) = evaluate(&o, &allow());
         assert!(failures.is_empty(), "{failures:?}");
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn sanctioned_versions_may_live_anywhere() {
+        let mut o = Observed::default();
+        o.consts
+            .insert(("moved.rs".into(), "STORE_SCHEMA_VERSION".into()));
+        o.consts
+            .insert(("moved.rs".into(), "PROTOCOL_VERSION".into()));
+        let (failures, _) = evaluate(&o, &allow());
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
