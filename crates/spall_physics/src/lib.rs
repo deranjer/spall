@@ -19,13 +19,11 @@
 //! No GPU, window, or network dependency. This crate does not run the server
 //! tick; body/collider ownership and the authoritative edit path are T08.
 
-pub mod articulated;
 pub mod character;
 pub mod collider;
 pub mod coordinates;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
-pub mod fracture;
 pub mod mass;
 pub mod merge;
 pub mod metrics;
@@ -36,12 +34,6 @@ pub mod region_set;
 pub mod report;
 pub mod world;
 
-pub use articulated::{
-    AliveArticulatedPartMotion, AliveArticulatedRestore, ArticulatedBodyId, ArticulatedError,
-    ArticulatedMove, ArticulatedPose, ArticulatedPoseSnapshot, ArticulatedTransition,
-    DynamicCorpseComponentRestore, DynamicCorpseOwnerFence, DynamicCorpseRestore, PartTransform,
-    SourceCellHit, SourcePart,
-};
 pub use character::{
     CharacterMove, CharacterParams, CharacterState, PlayerInput, WaterSample, step_character,
     step_character_in_water,
@@ -51,14 +43,7 @@ pub use collider::{
     choose_representation,
 };
 pub use coordinates::PhysicsOrigin;
-pub use fracture::{
-    DerivedFractureComponentId, FRACTURE_PLAN_VERSION, FractureComponent, FractureError,
-    FracturePartSnapshot, FractureSnapshot, FractureSnapshotToken, PreparedFracturePlan,
-    SourceCellRef, prepare_fracture,
-};
-pub use mass::{
-    BodyMassProperties, MassProperties, analytic_mass_properties, articulated_mass_properties,
-};
+pub use mass::{BodyMassProperties, MassProperties, analytic_mass_properties};
 pub use merge::{BoxSpan, greedy_boxes};
 pub use metrics::{DurationSamples, PercentileSummary};
 pub use occupancy::{ExtractError, OccupancyGrid};
@@ -67,13 +52,6 @@ pub use region_set::{PhysicsRegionSet, PhysicsRegionSetError, RegionalBodyState}
 #[cfg(any(test, feature = "fixtures"))]
 pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
 pub use world::{
-    ArticulatedBatchOperation, ArticulatedBatchOutcome, ArticulatedContactWitness,
-    ArticulatedOwnerSnapshot, BodyCommitFence, BodyId, BodyKind, BodySpec, BodyState,
-    CONTACT_WITNESS_VERSION, ColliderExclusion, ContactCellAttribution, ContactImpulse,
-    ContactWitnessUnattributed, CorpseEditOutcome, CorpseTransferOutcome, FractureCommitOutcome,
-    MAX_CONTACT_WITNESSES_PER_STEP, MAX_CORPSE_RESTORE_BATCH_DENSE_CELLS,
-    MAX_CORPSE_RESTORE_BATCH_OWNERS, MAX_CORPSE_RESTORE_BATCH_PRIMITIVES,
-    MAX_CORPSE_RESTORE_BATCH_SOLID_CELLS, PhysicsConfig, PhysicsWorld, PreparedArticulatedBatch,
-    PreparedBodySpec, PreparedCollider, PreparedDynamicCorpseBatch, SourceContactWitness,
-    StepTiming, ValidatedArticulatedBatch,
+    BodyCommitFence, BodyId, BodyKind, BodySpec, BodyState, ColliderExclusion, ContactImpulse,
+    PhysicsConfig, PhysicsWorld, PreparedBodySpec, PreparedCollider, StepTiming,
 };

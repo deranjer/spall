@@ -26,17 +26,10 @@ pub mod codec;
 pub mod column_water;
 pub mod column_water_wire;
 pub mod creature;
-pub mod creature_catalog;
-pub use creature_catalog::{OwnedCreatureAsset, OwnedCreatureCatalog, OwnedCreatureSpecies};
 pub mod creature_motion;
-pub mod creature_owner;
-pub mod creature_sync;
 pub use creature_motion::{CreatureMotionEntry, CreatureMotionFrame, MAX_CREATURE_MOTION_ENTRIES};
-pub use creature_sync::CreatureSync;
-pub mod creature_snapshot;
 pub mod handshake;
 pub mod input;
-pub mod lifecycle_bulk;
 pub mod limits;
 pub mod records;
 pub mod segment;
@@ -45,7 +38,6 @@ pub mod snow;
 pub mod transaction_attachments;
 pub mod water;
 pub mod weather;
-pub use creature_snapshot::{CreatureSnapshotV2, MAX_CREATURE_SNAPSHOT_BYTES};
 pub use weather::{
     WEATHER_PROFILE_MS, WEATHER_TRANSITION_MS, WeatherClock, WeatherClockSource, WeatherError,
     WeatherKind, WeatherSnapshot, WeatherState,
@@ -69,42 +61,16 @@ pub use codec::{
 pub use column_water::{ColumnWaterDelta, ColumnWaterState};
 pub use column_water_wire::{ColumnWaterReplica, ColumnWaterUpdate};
 pub use creature::{
-    CREATURE_MATERIAL_MAPPING_FORMAT, CreatureAssetCatalogEntry, CreatureAssetIdentity,
-    CreatureClipMode, CreatureLifecycleState, CreatureMaterialMappingEntry, CreaturePartBinding,
-    CreatureSpeciesCatalogEntry, CreatureStateError, CreatureStateV1, CreatureValidationCatalog,
-    MAX_CREATURE_ANGULAR_VELOCITY_RAD_S, MAX_CREATURE_ASSET_CLIPS,
-    MAX_CREATURE_ASSET_MATERIAL_KEYS, MAX_CREATURE_ASSET_PARTS, MAX_CREATURE_CATALOG_ASSETS,
-    MAX_CREATURE_CATALOG_SPECIES, MAX_CREATURE_CLIP_NAME_BYTES, MAX_CREATURE_LINEAR_VELOCITY_M_S,
-    MAX_CREATURE_POSITION_M, MAX_CREATURE_SOURCE_PARTS, MAX_CREATURE_SPECIES_KEY_BYTES,
-    MAX_CREATURE_STATE_BYTES, creature_material_mapping_hash,
-};
-pub use creature_owner::{
-    CREATURE_CHANGE_DOMAIN, CREATURE_LIFECYCLE_COMMIT_DOMAIN, CREATURE_MOTION_DOMAIN,
-    CREATURE_OWNER_DOMAIN, CREATURE_OWNER_SET_DOMAIN, CREATURE_TOPOLOGY_DOMAIN,
-    CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleCandidateV1,
-    CreatureLifecycleChangeV4, CreatureLifecycleCommitReplayReceiptV1, CreatureLifecycleCommitV4,
-    CreatureLifecycleContextV1, CreatureLifecycleOperationV4, CreatureLocalPoseV1,
-    CreatureMaskCellV1, CreatureMotionOverlayV2, CreatureOwnedComponentV1, CreatureOwnershipError,
-    CreatureOwnershipRecordV4, CreatureOwnershipSetV4, CreaturePartMotionV1,
-    CreaturePartVelocityV2, CreatureReductionOutcome, CreatureSourceMaskBrickV1,
-    CreatureSourcePartV2, MAX_CREATURE_OWNER_BRICKS, MAX_CREATURE_OWNER_COMPONENTS,
-    MAX_CREATURE_OWNER_DENSE_CELLS, MAX_CREATURE_OWNER_MASK_BRICKS, MAX_CREATURE_OWNER_MASK_CELLS,
-    MAX_CREATURE_OWNER_PARTS, MAX_CREATURE_OWNER_RECORD_BYTES, MAX_CREATURE_OWNER_SOLID_CELLS,
-    reduce_creature_lifecycle_candidate,
+    CreatureDespawn, CreatureRecord, CreatureSpawn, MAX_CREATURE_SPECIES_KEY_BYTES,
 };
 pub use handshake::{
     AlgorithmVersions, Handshake, Incompatibility, NegotiatedLimits, PROTOCOL_VERSION,
     check_compatible,
 };
-pub use lifecycle_bulk::{
-    CreatureLifecycleBulkError, CreatureLifecycleBulkPayloadV4,
-    MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
-};
 pub use limits::SizeLimitError;
 pub use records::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, BaselineAck, BaselineBegin,
-    BaselineEnd, BaselinePart, BaselineRegion, BrickRevision, CREATURE_LIFECYCLE_TRANSFER_ID_BIT,
-    ClaimedTarget, ControlSeq, DurableThrough, InputFrame, InputSeq, InterestEpoch, InventoryEntry,
+    BaselineEnd, BaselinePart, BaselineRegion, BrickRevision, ClaimedTarget, ControlSeq, DurableThrough, InputFrame, InputSeq, InterestEpoch, InventoryEntry,
     MotionSnapshot, ProgressionOperation, ProgressionOutcome, ProgressionRejectCode,
     ProgressionRequest, ProgressionResponse, RecentInput, Record, RecordError, RepairKey,
     RepairRequest, RequestId, SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq, TopologyOp,
@@ -122,7 +88,7 @@ pub use snow::{
 };
 pub use transaction_attachments::{
     MAX_TRANSACTION_ATTACHMENT_BYTES, MAX_TRANSACTION_GEOMETRY_DECODED_BYTES,
-    MAX_TRANSACTION_LIFECYCLE_DECODED_BYTES, TransactionAttachmentError,
+    TransactionAttachmentError,
     TransactionAttachmentSetV1, TransactionAttachmentV1, ValidatedTransactionAttachmentSetV1,
     ValidatedTransactionAttachmentV1, decode_for_transaction,
 };

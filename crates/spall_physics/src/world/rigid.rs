@@ -137,12 +137,6 @@ impl PhysicsWorld {
         grid: &OccupancyGrid,
         rep: Representation,
     ) -> Duration {
-        // An articulated body owns several source colliders. Rebuilding only
-        // its compatibility/primary handle would leave stale child shapes.
-        assert!(
-            !self.articulated.contains_key(&id),
-            "single-grid rebuild is invalid for ArticulatedBodyId; use rebuild_articulated_part_grid"
-        );
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "rebuild_collider on a retired body");
         if entry.retired {
@@ -208,10 +202,6 @@ impl PhysicsWorld {
     /// its collider is already massless); otherwise the shape's own mass would
     /// be added on top of `props`.
     pub fn set_mass_properties(&mut self, id: BodyId, props: BodyMassProperties) {
-        assert!(
-            !self.articulated.contains_key(&id),
-            "mass properties are not supported by kinematic articulated assemblies"
-        );
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "set_mass_properties on a retired body");
         if entry.retired {
@@ -239,17 +229,9 @@ impl PhysicsWorld {
         }
         entry.restitution = restitution.clamp(0.0, 1.0);
         if !entry.dormant {
-            if let Some(assembly) = self.articulated.get(&id) {
-                for part in &assembly.parts {
-                    let collider = &mut self.colliders[part.collider];
-                    collider.set_restitution(entry.restitution);
-                    collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
-                }
-            } else {
-                let collider = &mut self.colliders[entry.collider];
-                collider.set_restitution(entry.restitution);
-                collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
-            }
+            let collider = &mut self.colliders[entry.collider];
+            collider.set_restitution(entry.restitution);
+            collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
         }
     }
 
@@ -266,7 +248,6 @@ impl PhysicsWorld {
         }
         entry.retired = true;
         let body = entry.body;
-        self.articulated.remove(&id);
         self.bodies.remove(
             body,
             &mut self.islands,
@@ -296,12 +277,6 @@ impl PhysicsWorld {
     /// pose / velocity and passes them back on reactivation. Idempotent; a no-op
     /// on a retired body.
     pub fn deactivate_body(&mut self, id: BodyId) {
-        // Dormancy snapshots currently own one grid/collider and cannot restore
-        // a per-part assembly without losing its stable source IDs.
-        assert!(
-            !self.articulated.contains_key(&id),
-            "articulated assemblies do not support single-grid dormancy; use retire_articulated_body"
-        );
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired || entry.dormant {
             return;
@@ -337,10 +312,6 @@ impl PhysicsWorld {
         linvel_m_s: [f32; 3],
         angvel_rad_s: [f32; 3],
     ) {
-        assert!(
-            !self.articulated.contains_key(&id),
-            "single-grid reactivation is invalid for ArticulatedBodyId; use an articulated lifecycle operation"
-        );
         let entry = &self.entries[entry_index(id, self.id_namespace)];
         if entry.retired || !entry.dormant {
             return;
@@ -388,10 +359,6 @@ impl PhysicsWorld {
     /// nothing collides with the obsolete solid shape in the meantime. A no-op
     /// on a retired body.
     pub fn remove_collider(&mut self, id: BodyId) {
-        assert!(
-            !self.articulated.contains_key(&id),
-            "single-grid collider removal is invalid for ArticulatedBodyId; use retire_articulated_body"
-        );
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
@@ -437,13 +404,7 @@ impl PhysicsWorld {
             return;
         }
         entry.query_only = true;
-        if let Some(assembly) = self.articulated.get(&id) {
-            for part in &assembly.parts {
-                if let Some(collider) = self.colliders.get_mut(part.collider) {
-                    collider.set_solver_groups(query_only_solver_groups());
-                }
-            }
-        } else if let Some(collider) = self.colliders.get_mut(entry.collider) {
+        if let Some(collider) = self.colliders.get_mut(entry.collider) {
             collider.set_solver_groups(query_only_solver_groups());
         }
     }
@@ -518,22 +479,22 @@ impl PhysicsWorld {
     pub fn snapshot_body_commit_fence(
         &self,
         ids: &[BodyId],
-    ) -> Result<BodyCommitFence, crate::articulated::ArticulatedError> {
+    ) -> Result<BodyCommitFence, BodyFenceError> {
         let mut seen = std::collections::BTreeSet::new();
         let mut bodies = Vec::with_capacity(ids.len());
         for id in ids {
             if !seen.insert(id.0) || (id.0 >> 32) as u32 != self.id_namespace {
-                return Err(crate::articulated::ArticulatedError::Hierarchy);
+                return Err(BodyFenceError);
             }
             let index = (id.0 as u32) as usize;
             let entry = self
                 .entries
                 .get(index)
-                .ok_or(crate::articulated::ArticulatedError::Hierarchy)?;
+                .ok_or(BodyFenceError)?;
             let body = self
                 .bodies
                 .get(entry.body)
-                .ok_or(crate::articulated::ArticulatedError::Hierarchy)?;
+                .ok_or(BodyFenceError)?;
             let collider =
                 self.colliders
                     .get(entry.collider)
@@ -674,10 +635,6 @@ impl PhysicsWorld {
     /// split child at its parent's transform so world geometry is unchanged at
     /// the split instant.
     pub fn set_body_pose(&mut self, id: BodyId, translation_m: [f32; 3], rotation: [f32; 4]) {
-        assert!(
-            !self.articulated.contains_key(&id),
-            "use set_articulated_root_pose for an articulated body"
-        );
         let (body, primary) = {
             let entry = &self.entries[entry_index(id, self.id_namespace)];
             (entry.body, entry.collider)
@@ -694,12 +651,7 @@ impl PhysicsWorld {
         // A query-only mirror (for example, client-predicted collision against
         // replicated debris) may move without ever stepping this PhysicsWorld.
         // Mark its collider so `sync_queries` refits the broad-phase AABB.
-        if let Some(assembly) = self.articulated.get(&id) {
-            self.pending_modified
-                .extend(assembly.parts.iter().map(|part| part.collider));
-        } else {
-            self.pending_modified.push(primary);
-        }
+        self.pending_modified.push(primary);
     }
 
     /// Applies a linear impulse (N·s) to a body at its centre of mass and wakes
@@ -707,10 +659,6 @@ impl PhysicsWorld {
     /// impulse or an impact from an adjacent edit — for the sleep/wake
     /// feasibility scenario. No-op for `Fixed` bodies.
     pub fn apply_impulse(&mut self, id: BodyId, impulse_n_s: [f32; 3]) {
-        assert!(
-            !self.articulated.contains_key(&id),
-            "kinematic articulated roots do not accept impulses"
-        );
         let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_impulse(
             Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
@@ -723,10 +671,6 @@ impl PhysicsWorld {
     /// body's installed inertia tensor — the direct motion check for
     /// mixed-material inertia. No-op for `Fixed` bodies.
     pub fn apply_torque_impulse(&mut self, id: BodyId, torque_impulse_n_m_s: [f32; 3]) {
-        assert!(
-            !self.articulated.contains_key(&id),
-            "kinematic articulated roots do not accept impulses"
-        );
         let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_torque_impulse(
             Vector::new(
@@ -749,10 +693,6 @@ impl PhysicsWorld {
         impulse_n_s: [f32; 3],
         point_world_m: [f32; 3],
     ) {
-        assert!(
-            !self.articulated.contains_key(&id),
-            "kinematic articulated roots do not accept impulses"
-        );
         let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_impulse_at_point(
             Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
@@ -764,10 +704,6 @@ impl PhysicsWorld {
     /// Sets a body's linear and angular velocity, m/s and rad/s. Used to hand a
     /// split child its inherited velocity.
     pub fn set_body_velocity(&mut self, id: BodyId, linvel_m_s: [f32; 3], angvel_rad_s: [f32; 3]) {
-        assert!(
-            !self.articulated.contains_key(&id),
-            "use set_articulated_root_pose to move a kinematic articulated root"
-        );
         let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.set_linvel(
             Vector::new(linvel_m_s[0], linvel_m_s[1], linvel_m_s[2]),

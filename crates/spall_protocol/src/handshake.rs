@@ -17,7 +17,7 @@ use crate::session::SessionId;
 
 /// The one wire version. Client and server ship together, so every record, capability and
 /// handshake shares this number; any layout change bumps it. Pre-release: no per-record versions.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 
 /// Fixed simulation and snapshot rates (Hz).
 pub const SERVER_TICK_HZ: u16 = 60;
@@ -213,10 +213,10 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_handshake_matches_wire_and_refuses_previous_wire_versions() {
+    fn handshake_matches_wire_and_refuses_previous_wire_versions() {
         assert_eq!(PROTOCOL_VERSION, crate::WIRE_SCHEMA_VERSION);
         let server = server_handshake();
-        for old_version in [7, 8, 9, 10, 11] {
+        for old_version in [7, 11, 14] {
             let mut old = server.clone();
             old.protocol_version = old_version;
             assert!(matches!(
