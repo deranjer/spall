@@ -8,6 +8,7 @@ description = "Spall QUIC transport adapter: TLS-pinned dev sessions, framed rel
 [features]
 # Exposes deliberately unguarded stream helpers (e.g. `Connection::open_bi_unguarded`)
 # so integration tests can drive a peer past the negotiated bulk-stream cap.
+# Also exposes the `proxy`, `fault` and `harness` fault-injection modules.
 # Never enabled by production dependents.
 test-util = []
 

@@ -7,9 +7,11 @@
 //! camera-local occupancy/material cache and one-bounce compute prototype.
 
 pub mod camera;
+#[cfg(feature = "capture")]
 pub mod capture;
 pub mod context;
 pub mod environment;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod game_renderer;
 pub mod indirect;
@@ -28,6 +30,7 @@ pub mod water;
 pub mod weather;
 
 pub use camera::{Aabb, Camera, Frustum};
+#[cfg(feature = "capture")]
 pub use capture::{
     BandTrace, CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, CollapseFrame,
     CollapseSequenceOptions, CollapseSequenceReport, FrameLoopOptions, FrameLoopReport,
@@ -39,6 +42,7 @@ pub use capture::{
 };
 pub use context::{RenderContext, RenderError};
 pub use environment::{Environment, EnvironmentPreset};
+#[cfg(any(test, feature = "fixtures"))]
 pub use fixtures::{
     DaylightTerrainScene, EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics,
     MovingBodyOverlap, OCCLUDER_MAX_M, OCCLUDER_MIN_M, PanningCamera, RECEIVER_MAX_M,

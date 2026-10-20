@@ -28,10 +28,13 @@ pub mod config;
 pub mod conn;
 pub mod dedup;
 pub mod endpoint;
+#[cfg(any(test, feature = "test-util"))]
 pub mod fault;
 pub mod framing;
+#[cfg(any(test, feature = "test-util"))]
 pub mod harness;
 pub mod message;
+#[cfg(any(test, feature = "test-util"))]
 pub mod proxy;
 pub mod tls;
 
@@ -43,10 +46,13 @@ pub use conn::{
 };
 pub use dedup::{DedupVerdict, StreamDeduper};
 pub use endpoint::{NetServer, connect};
+#[cfg(any(test, feature = "test-util"))]
 pub use fault::{AppFaultPlan, FaultChannel, FaultStats};
 pub use framing::{FrameError, read_framed, write_framed};
+#[cfg(any(test, feature = "test-util"))]
 pub use harness::{ClientOutcome, TransportCheckParams, TransportCheckReport, run_transport_check};
 pub use message::{AuthReject, ClientHello, NetMessage, ServerAccept, ServerAuthReply, WireRecord};
+#[cfg(any(test, feature = "test-util"))]
 pub use proxy::{PacketFaultPlan, PacketStats, UdpProxy};
 pub use tls::{DevIdentity, Fingerprint, JoinToken, PlayerCredential};
 

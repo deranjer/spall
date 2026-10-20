@@ -24,6 +24,7 @@ pub mod brush;
 pub mod builtin_assets;
 pub mod chunk_store;
 pub mod edit;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod logical;
 pub mod query;

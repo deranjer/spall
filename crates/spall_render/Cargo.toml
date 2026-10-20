@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Offscreen capture/readback harness (acceptance captures, frame series).
+capture = []
+# Lighting/overlap scene builders; they drive the capture harness.
+fixtures = ["capture"]
+
 [dependencies]
 spall_core.workspace = true
 spall_mesh.workspace = true
@@ -15,6 +21,9 @@ thiserror.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+# Integration tests (tests/*.rs) use the gated capture harness and fixtures.
+spall_render = { path = ".", features = ["capture", "fixtures"] }
+spall_mesh = { workspace = true, features = ["fixtures"] }
 spall_voxel.workspace = true
 spall_jobs.workspace = true
 naga = { version = "=30.0.1", features = ["wgsl-in", "spv-out"] }

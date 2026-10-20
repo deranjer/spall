@@ -36,6 +36,7 @@ pub mod build;
 pub mod culled;
 pub mod enumerate;
 pub mod face;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod greedy;
 pub mod lod;

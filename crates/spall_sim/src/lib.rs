@@ -44,6 +44,7 @@ pub mod contact_damage;
 mod creature_source_restore;
 pub mod creatures;
 pub mod dormancy;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod footprints;
 pub mod intent;

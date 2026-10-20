@@ -8,13 +8,13 @@ rust-version.workspace = true
 spall_ecology.workspace = true
 spall_core = { path = "../spall_core" }
 spall_protocol = { path = "../spall_protocol" }
-spall_net = { path = "../spall_net" }
+spall_net = { path = "../spall_net", features = ["test-util"] }
 spall_physics = { path = "../spall_physics" }
-spall_sim = { path = "../spall_sim" }
+spall_sim = { path = "../spall_sim", features = ["fixtures"] }
 spall_jobs = { path = "../spall_jobs" }
-spall_store = { path = "../spall_store" }
+spall_store = { path = "../spall_store", features = ["fault-injection"] }
 spall_structure = { path = "../spall_structure" }
-spall_voxel = { path = "../spall_voxel" }
+spall_voxel = { path = "../spall_voxel", features = ["fixtures"] }
 glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -37,7 +37,15 @@ required-features = ["persist-bench"]
 [[bin]]
 name = "region-support-reload-bench"
 path = "src/bin/region_support_reload_bench.rs"
+required-features = ["bench"]
+
+[[bin]]
+name = "active-region-bench"
+path = "src/bin/active_region_bench.rs"
+required-features = ["bench"]
 
 [features]
 # Pulls in the offline persistence crash-suite binary (`cargo xtask crash-test`).
-persist-bench = []
+persist-bench = ["bench"]
+# Offline benchmark binaries.
+bench = ["spall_physics/fixtures"]
