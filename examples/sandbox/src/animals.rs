@@ -52,8 +52,8 @@ pub const GROUND_CLEARANCE_M: f64 = 0.05;
 /// Locomotion selectors carried in motion frames.
 pub const LOCOMOTION_IDLE: u8 = 0;
 pub const LOCOMOTION_MOVE: u8 = 1;
-/// A creature is moved this often (10 Hz at 60 Hz), staggered by id.
-const MOVE_PERIOD_TICKS: u64 = 6;
+/// A creature is moved this often (7.5 Hz at 60 Hz), staggered by id.
+const MOVE_PERIOD_TICKS: u64 = 8;
 const MOVE_DT_S: f64 = MOVE_PERIOD_TICKS as f64 / 60.0;
 
 /// The clip a species plays while moving.
@@ -282,7 +282,7 @@ impl AnimalDirector {
             rng: seed ^ 0x9E37_79B9_7F4A_7C15,
             max_per_tick: 2,
             max_attempts: 4_000,
-            radius_m: (8.0, 78.0),
+            radius_m: (6.0, 50.0),
             walkers: std::collections::BTreeMap::new(),
             last_tick: 0,
         })

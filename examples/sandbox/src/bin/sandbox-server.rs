@@ -560,6 +560,9 @@ fn run_serve(args: Args) -> ExitCode {
             .map(|world| world.player_spawns().to_vec())
             .filter(|spawns| !spawns.is_empty())
             .unwrap_or_else(|| scene.player_spawns().to_vec());
+        // Crowd the first spawn so a single player sees the animals without
+        // having to find them; other spawns would dilute the count.
+        let anchors: Vec<[f64; 3]> = anchors.into_iter().take(1).collect();
         match sandbox::animals::AnimalDirector::new(
             anchors,
             [args.animals, args.animals / 2, 0],
