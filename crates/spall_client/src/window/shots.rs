@@ -13,7 +13,13 @@ pub enum ShotStep {
     /// Land and look from the player.
     Walk,
     /// Hold actual player input for a bounded walking/rendering measurement.
-    Move { seconds: f32, movement: [f32; 3] },
+    Move {
+        seconds: f32,
+        movement: [f32; 3],
+        sprint: bool,
+    },
+    /// Third-person view on or off, as `F8` does.
+    ThirdPerson(bool),
     /// Toggle the admin menu.
     Menu,
     /// Copy the debug report, as `F9` does.
@@ -73,7 +79,7 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| format!("bad move `{step}`"))?;
                 match v.as_slice() {
-                    [seconds, x, z]
+                    [seconds, x, z] | [seconds, x, z, _]
                         if seconds.is_finite()
                             && *seconds > 0.
                             && *seconds <= 120.
@@ -85,6 +91,7 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
                         Ok(ShotStep::Move {
                             seconds: *seconds,
                             movement: [*x, 0., *z],
+                            sprint: v.get(3).is_some_and(|s| *s != 0.),
                         })
                     }
                     _ => Err(format!(
@@ -105,6 +112,8 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
             _ if step.starts_with("env:") => EnvironmentPreset::from_key(&step[4..])
                 .map(ShotStep::Environment)
                 .ok_or_else(|| format!("unknown environment `{step}`")),
+            "third:on" => Ok(ShotStep::ThirdPerson(true)),
+            "third:off" => Ok(ShotStep::ThirdPerson(false)),
             "sky:on" => Ok(ShotStep::Skylight(true)),
             "sky:off" => Ok(ShotStep::Skylight(false)),
             "bounce:on" => Ok(ShotStep::Bounce(true)),

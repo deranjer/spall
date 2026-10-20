@@ -537,12 +537,22 @@ impl InteractiveApp {
                 }
                 2.0
             }
-            ShotStep::Move { seconds, movement } => {
+            ShotStep::Move {
+                seconds,
+                movement,
+                sprint,
+            } => {
                 if self.fly_eye.is_some() {
                     self.toggle_flight();
                 }
                 self.session.input.set_movement(movement);
+                self.session.input.set_button(BUTTON_SPRINT, sprint);
                 seconds
+            }
+            ShotStep::ThirdPerson(on) => {
+                self.third_person = on && self.player_view.is_some();
+                self.script_at = Some(now + Duration::from_secs(1));
+                return;
             }
             ShotStep::Menu => {
                 self.admin_menu_open = !self.admin_menu_open;
