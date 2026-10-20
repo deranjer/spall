@@ -375,7 +375,6 @@ impl AnimalDirector {
                 ..ValidationLimits::default()
             },
         )
-        .map_err(|e| eprintln!("DBG reject {e:?} at {center:?}"))
         .ok()?;
         Some(Placement {
             species,

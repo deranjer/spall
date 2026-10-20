@@ -199,3 +199,92 @@ fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
         "animals barely moved: {moved:?}"
     );
 }
+
+#[test]
+fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
+    use sandbox::animal_view::AnimalView;
+    use spall_client::window::CreatureView;
+
+    let mut sim = simulation();
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [4, 2, 0], 5)
+        .unwrap()
+        .with_radius_m(0.0, 1.5);
+    let service = CreatureService::new(Box::new(director));
+    let mut replica = spall_client::replica::ReplicaWorld::from_baseline(
+        {
+            let mut setup = fixtures::flat_terrain_setup();
+            setup.materials = sandbox::game::manifest();
+            setup.terrain
+        },
+        spall_client::replica::ReplicaConfig::default(),
+    );
+    replica.install_creature_catalog(service.catalog().clone());
+    for _ in 0..200 {
+        sim.tick().unwrap();
+        if let Some(birth) = service.run_tick(&mut sim).unwrap() {
+            replica.apply_transaction(&birth.topology);
+        }
+    }
+    let creatures = replica.creatures().unwrap();
+    assert_eq!(creatures.len(), 6);
+    let view = AnimalView::new().unwrap();
+    let started = std::time::Instant::now();
+    let mut cubes = 0;
+    for _ in 0..200 {
+        cubes = view
+            .instances(creatures, 0.0, std::time::Instant::now())
+            .len();
+    }
+    let per_call = started.elapsed() / 200;
+    eprintln!("AnimalView: {cubes} cubes for 6 animals, {per_call:?} per frame");
+    // 36 animals scale linearly; budget well under a 60 Hz frame even uncapped.
+    assert!(
+        per_call * 6 < std::time::Duration::from_millis(2),
+        "{per_call:?} per 6 animals"
+    );
+}
+
+#[test]
+fn a_player_walking_into_moving_animals_never_stalls_the_tick() {
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE, PlayerInput};
+    use spall_protocol::InputSeq;
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut sim = simulation();
+        let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [3, 2, 0], 21)
+            .unwrap()
+            .with_radius_m(0.0, 1.0);
+        let service = CreatureService::new(Box::new(director));
+        let player = EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap();
+        sim.add_player(player, [1.0, 0.6, 3.0]);
+        let mut worst = std::time::Duration::ZERO;
+        for tick in 0..2400_u64 {
+            // Walk +X into the herd, then turn around and come back, repeatedly.
+            let heading = if (tick / 300) % 2 == 0 {
+                [1.0, 0.0, 0.0]
+            } else {
+                [-1.0, 0.0, 0.0]
+            };
+            sim.set_player_input(
+                player,
+                PlayerInput {
+                    movement: [0.0, 0.0, 1.0],
+                    view_dir: heading,
+                    buttons: 0,
+                },
+                InputSeq(tick + 1),
+            );
+            let started = std::time::Instant::now();
+            sim.tick().unwrap();
+            service.run_tick(&mut sim).unwrap();
+            service.run_motion(&mut sim).unwrap();
+            worst = worst.max(started.elapsed());
+        }
+        done_tx.send(worst).unwrap();
+    });
+    let worst = done_rx
+        .recv_timeout(std::time::Duration::from_secs(90))
+        .expect("tick loop stalled with a player among moving animals");
+    eprintln!("worst tick with player + animals: {worst:?}");
+}
