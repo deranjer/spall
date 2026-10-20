@@ -36,26 +36,14 @@ pub struct JournalEntry {
 }
 
 impl JournalEntry {
-    /// Borrow the sole geometry payload for the geometry-only replay adapter.
-    /// Mixed or lifecycle sets deliberately do not satisfy this adapter.
+    /// Borrow the sole geometry payload of a bulk split.
     pub fn geometry_only_bulk(&self) -> Option<&BaselineWorld> {
         let set = self.attachments.as_ref()?;
-        if set.transaction_id != self.transaction.transaction_id
-            || set.attachments.len() != 1
-            || self.transaction.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    spall_protocol::TopologyOp::CreatureLifecycle { .. }
-                        | spall_protocol::TopologyOp::CreatureLifecycleBulk { .. }
-                )
-            })
-        {
+        if set.transaction_id != self.transaction.transaction_id || set.attachments.len() != 1 {
             return None;
         }
-        match &set.attachments[0] {
-            spall_protocol::TransactionAttachmentV1::Geometry { world, .. } => Some(world),
-            _ => None,
-        }
+        let spall_protocol::TransactionAttachmentV1::Geometry { world, .. } = &set.attachments[0];
+        Some(world)
     }
 }
 

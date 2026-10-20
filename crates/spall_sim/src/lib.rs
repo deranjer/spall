@@ -41,7 +41,6 @@ pub mod collider;
 pub mod column_water;
 pub mod commit;
 pub mod contact_damage;
-mod creature_source_restore;
 pub mod creatures;
 pub mod dormancy;
 #[cfg(any(test, feature = "fixtures"))]
@@ -57,9 +56,6 @@ pub mod registry;
 pub mod replication;
 pub mod schedule;
 pub mod sim;
-pub use creature_source_restore::{
-    CreatureSourceRestoreError, ReconstructedCreatureSources, reconstruct_creature_sources,
-};
 pub mod snow;
 pub mod snow_query;
 pub mod stage;
@@ -80,11 +76,7 @@ pub use contact_damage::{
     ContactEvent, PlannedDamage,
 };
 pub use creatures::{
-    CreatureHostInitError, CreatureIntent, CreatureIntentKind, CreatureIntentWriter,
-    CreatureRuleError, CreatureScheduleContext, CreatureScheduleError, CreatureScheduleReport,
-    CreatureScheduleSnapshot, CreatureScheduleToken, CreatureSchedulingRules,
-    MAX_CREATURE_HOST_RECORDS, MAX_CREATURE_SCHEDULE_BINDINGS, MAX_CREATURE_SCHEDULE_INTENTS,
-    MAX_CREATURE_SCHEDULE_SNAPSHOTS,
+    Creature, CreatureHostInitError, CreatureSpawnError, MAX_CREATURE_HOST_RECORDS,
 };
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
@@ -109,11 +101,9 @@ pub use replication::{
 pub use schedule::EditTiming;
 pub use schedule::{EditPipeline, RegionKey, TickReport};
 pub use sim::{
-    AliveCreature, AuthoritativeCreatureIntent, CONTACT_DAMAGE_ACTOR_ID,
-    CommittedCreatureLifecycle, ContactDamageReport, CreatureBirthPartInput, CreatureCaptureError,
-    CreatureMoveOutcome, CreatureMoveRequest, CreatureMoveTiming, CreatureRestoreError,
-    CreatureWalkOutcome, CreatureWalkRequest, PreparedCreatureRestore, SERVER_REQUEST_ID_BAND,
-    Simulation, SimulationConfig, TICK_DT_S, TickError,
+    CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, CreatureMoveOutcome, CreatureMoveRequest,
+    CreaturePose, CreatureWalkOutcome, CreatureWalkRequest, SERVER_REQUEST_ID_BAND, Simulation,
+    SimulationConfig, TICK_DT_S, TickError,
 };
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit, warm_index_reuses};
 pub use transfer::{ChildBody, PlanChildError, plan_child};

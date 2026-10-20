@@ -1,58 +1,46 @@
-//! Authoritative kinematic movement of alive creatures.
+//! Spawning, despawning and moving creatures.
 //!
-//! The game decides where a creature wants to go and supplies the sampled part
-//! pose for this step; the engine sweeps that complete pose and root target
-//! against fixed terrain through the physics articulated-transition API and
-//! only then lets it stand. A blocked sample changes nothing. Presentation
-//! state (locomotion selector, clip phase) is remembered per creature so the
-//! server can publish it with the physically applied root; it is not part of
-//! the ownership record and is not persisted.
+//! The game decides where a creature wants to go. The engine sweeps a capsule
+//! around it against fixed terrain (the same kinematic controller players use:
+//! wall slide, autostep over terrain stairs, ground snap) and keeps the resulting
+//! root pose. Presentation state (locomotion selector, clip phase) is stored with
+//! the pose so the server can publish it.
 use super::*;
-use spall_physics::ArticulatedPose;
-use spall_protocol::{
-    CreatureLifecycleState, CreatureMotionEntry, CreatureMotionFrame, WIRE_SCHEMA_VERSION,
-};
+use spall_protocol::{CreatureMotionEntry, CreatureMotionFrame, CreatureRecord, WIRE_SCHEMA_VERSION};
 
+use crate::creatures::{CreatureHost, CreatureHostInitError, CreatureSpawnError};
+
+/// A flying creature's step: the capsule is swept from where it is to the target.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatureMoveRequest {
-    pub key: spall_core::CreatureKey,
+    pub creature_id: u64,
     /// Desired root translation in world metres.
     pub target_translation_m: [f64; 3],
     pub target_rotation_xyzw: [f32; 4],
-    /// The complete sampled local pose of every source part, in part-id order.
-    pub parts: Vec<(u32, spall_physics::PartTransform)>,
     pub locomotion_tag: u8,
     pub clip_phase_tick: u64,
+    /// Vertical offset from the root to the capsule's lowest point (negative), metres.
+    pub feet_offset_m: f32,
+    pub capsule_radius_m: f32,
+    /// Half the height of the capsule's cylindrical segment.
+    pub capsule_half_height_m: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CreatureMoveOutcome {
-    /// The pose and root were staged for the next physics step.
-    Staged,
-    /// Terrain blocks the swept path; nothing changed.
-    Blocked {
-        part_id: Option<u32>,
-        time_of_impact: Option<f32>,
-    },
-    /// A previous pose has not been installed yet; try again next tick.
-    Busy,
+    /// The creature reached the target.
+    Moved,
+    /// Terrain blocks the path; nothing changed.
+    Blocked,
 }
 
 /// A ground creature's step, resolved with a character capsule around it.
-///
-/// The capsule is the same kinematic character controller players use (wall
-/// slide, autostep over terrain stairs, ground snap). Its result moves the root;
-/// the complete part pose is then staged without per-cell terrain casts, so
-/// limbs may overlap terrain the capsule does not cover. This is the locomotion
-/// collision proxy for walking animals; flying creatures use the exact swept path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatureWalkRequest {
-    pub key: spall_core::CreatureKey,
+    pub creature_id: u64,
     /// Desired horizontal step this update, metres (x, z).
     pub desired_step_m: [f32; 2],
     pub target_rotation_xyzw: [f32; 4],
-    /// The complete sampled local pose of every source part, in part-id order.
-    pub parts: Vec<(u32, spall_physics::PartTransform)>,
     pub locomotion_tag: u8,
     pub clip_phase_tick: u64,
     /// Vertical offset from the root to the lowest point the creature stands on
@@ -71,58 +59,80 @@ pub struct CreatureWalkOutcome {
     pub grounded: bool,
 }
 
-/// Where the swept-transition time of recent moves went, summed since the last
-/// [`Simulation::take_creature_move_timing`].
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct CreatureMoveTiming {
-    pub moves: u64,
-    pub blocked: u64,
-    pub terrain_candidates: u64,
-    pub cell_casts: u64,
-    pub query_sync: std::time::Duration,
-    pub candidate_query: std::time::Duration,
-    pub exact_cast: std::time::Duration,
-}
-
-/// Current applied root of an alive creature.
+/// Current root pose of a creature.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AliveCreature {
-    pub key: spall_core::CreatureKey,
+pub struct CreaturePose {
+    pub creature_id: u64,
     pub translation_m: [f64; 3],
     pub rotation_xyzw: [f32; 4],
 }
 
+/// A flying step that the sweep shortens by more than this fraction is blocked.
+const BLOCKED_FRACTION: f64 = 0.01;
+
 impl Simulation {
+    /// Installs an empty creature host.
+    pub fn initialize_creature_host(&mut self) -> Result<(), CreatureHostInitError> {
+        if self.creatures.is_some() {
+            return Err(CreatureHostInitError::AlreadyInitialized);
+        }
+        self.creatures = Some(CreatureHost::default());
+        Ok(())
+    }
+
+    /// The first creature id not yet used, so a director can plan a spawn batch.
+    pub fn next_creature_id(&self) -> Option<u64> {
+        self.creatures.as_ref().map(CreatureHost::next_creature_id)
+    }
+
+    /// Spawns every record, or none. Ids must be unused and ascending.
+    pub fn spawn_creatures(&mut self, records: Vec<CreatureRecord>) -> Result<(), CreatureSpawnError> {
+        let host = self.creatures.as_mut().ok_or(CreatureSpawnError::NoHost)?;
+        let mut candidate = host.clone();
+        for record in records {
+            candidate.spawn(record, self.tick.get())?;
+        }
+        *host = candidate;
+        Ok(())
+    }
+
+    /// Removes a creature. `false` if it was not there.
+    pub fn despawn_creature(&mut self, creature_id: u64) -> bool {
+        self.creatures
+            .as_mut()
+            .is_some_and(|host| host.despawn(creature_id))
+    }
+
+    /// Every creature as it is now, sorted by id. This is the join list.
+    pub fn creature_records(&self) -> Vec<CreatureRecord> {
+        self.creatures
+            .as_ref()
+            .map(|host| host.iter().map(|c| c.record.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every creature's root pose.
+    pub fn creature_poses(&self) -> Vec<CreaturePose> {
+        let Some(host) = self.creatures.as_ref() else {
+            return Vec::new();
+        };
+        host.iter()
+            .map(|creature| CreaturePose {
+                creature_id: creature.record.creature_id,
+                translation_m: creature.record.translation_m,
+                rotation_xyzw: creature.record.rotation_xyzw,
+            })
+            .collect()
+    }
+
     /// Moves a walking creature with a character capsule (see
-    /// [`CreatureWalkRequest`]). `Ok(None)` means a previous pose has not been
-    /// installed yet; try again next tick.
+    /// [`CreatureWalkRequest`]).
     pub fn walk_creature(
         &mut self,
         request: CreatureWalkRequest,
-    ) -> Result<Option<CreatureWalkOutcome>, String> {
-        let state = self
-            .creatures
-            .as_ref()
-            .and_then(|host| host.record(request.key.creature_id))
-            .ok_or("creature is not hosted")?;
-        if state.key != request.key || state.lifecycle != CreatureLifecycleState::Alive {
-            return Err("creature is not alive".into());
-        }
-        let owner = self
-            .world
-            .creature_physics_owner(request.key)
-            .ok_or("creature has no physical owner")?;
-        let snapshot = self
-            .world
-            .physics()
-            .articulated_owner_snapshot(owner)
-            .ok_or("creature owner is missing from physics")?;
-        if snapshot.pending_pose {
-            return Ok(None);
-        }
-        let origin = self.world.physics_origin();
-        let root = origin.to_world_f64(snapshot.root.translation_m);
-        let feet = [root[0], root[1] + f64::from(request.feet_offset_m), root[2]];
+    ) -> Result<CreatureWalkOutcome, String> {
+        let here = self.creature_root(request.creature_id)?;
+        let feet = [here[0], here[1] + f64::from(request.feet_offset_m), here[2]];
         // Fall a little each step so the capsule follows the ground down.
         const FALL_M: f32 = 0.3;
         let swept = self.world.physics().sweep_character(
@@ -132,190 +142,124 @@ impl Simulation {
                 mass_kg: 60.0,
             },
             feet,
-            [
-                request.desired_step_m[0],
-                -FALL_M,
-                request.desired_step_m[1],
-            ],
+            [request.desired_step_m[0], -FALL_M, request.desired_step_m[1]],
             0.1,
         );
-        let moved = [
-            f64::from(swept.translation_m[0]),
-            f64::from(swept.translation_m[1]),
-            f64::from(swept.translation_m[2]),
-        ];
-        let target_world = [root[0] + moved[0], root[1] + moved[1], root[2] + moved[2]];
-        let target = origin
-            .to_local_f32(target_world)
-            .ok_or("target is outside the physics frame")?;
-        let update = ArticulatedPose {
-            topology_token: snapshot.topology_token,
-            base_pose_token: snapshot.pose_token,
-            pose_token: snapshot
-                .pose_token
-                .checked_add(1)
-                .ok_or("pose token exhausted")?,
-            parts: request.parts,
-        };
-        self.world
-            .physics_mut()
-            .update_articulated_pose_trusted(
-                owner,
-                update,
-                spall_physics::PartTransform {
-                    translation_m: target,
-                    rotation_xyzw: request.target_rotation_xyzw,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        self.creature_presentation.insert(
-            request.key,
-            (request.locomotion_tag, request.clip_phase_tick),
-        );
-        Ok(Some(CreatureWalkOutcome {
+        let moved = swept.translation_m.map(f64::from);
+        self.apply_creature_move(
+            request.creature_id,
+            [here[0] + moved[0], here[1] + moved[1], here[2] + moved[2]],
+            request.target_rotation_xyzw,
+            request.locomotion_tag,
+            request.clip_phase_tick,
+        )?;
+        Ok(CreatureWalkOutcome {
             moved_m: moved,
             grounded: swept.grounded,
-        }))
+        })
     }
 
-    /// Returns and clears the accumulated swept-transition timing.
-    pub fn take_creature_move_timing(&mut self) -> CreatureMoveTiming {
-        std::mem::take(&mut self.creature_move_timing)
-    }
-
-    /// Every alive creature with its physically applied root pose.
-    pub fn alive_creatures(&self) -> Vec<AliveCreature> {
-        let Some(host) = self.creatures.as_ref() else {
-            return Vec::new();
-        };
-        host.records()
-            .filter(|state| state.lifecycle == CreatureLifecycleState::Alive)
-            .filter_map(|state| {
-                let owner = self.world.creature_physics_owner(state.key)?;
-                let snapshot = self.world.physics().articulated_owner_snapshot(owner)?;
-                Some(AliveCreature {
-                    key: state.key,
-                    translation_m: self
-                        .world
-                        .physics_origin()
-                        .to_world_f64(snapshot.root.translation_m),
-                    rotation_xyzw: snapshot.root.rotation,
-                })
-            })
-            .collect()
-    }
-
+    /// Moves a flying creature straight to its target if the capsule fits along
+    /// the way; otherwise leaves it where it is.
     pub fn move_creature(
         &mut self,
         request: CreatureMoveRequest,
     ) -> Result<CreatureMoveOutcome, String> {
-        let state = self
-            .creatures
-            .as_ref()
-            .and_then(|host| host.record(request.key.creature_id))
-            .ok_or("creature is not hosted")?;
-        if state.key != request.key || state.lifecycle != CreatureLifecycleState::Alive {
-            return Err("creature is not alive".into());
-        }
-        let owner = self
-            .world
-            .creature_physics_owner(request.key)
-            .ok_or("creature has no physical owner")?;
-        let snapshot = self
-            .world
-            .physics()
-            .articulated_owner_snapshot(owner)
-            .ok_or("creature owner is missing from physics")?;
-        if snapshot.pending_pose {
-            return Ok(CreatureMoveOutcome::Busy);
-        }
-        let target = self
-            .world
-            .physics_origin()
-            .to_local_f32(request.target_translation_m)
-            .ok_or("target is outside the physics frame")?;
-        let update = ArticulatedPose {
-            topology_token: snapshot.topology_token,
-            base_pose_token: snapshot.pose_token,
-            pose_token: snapshot
-                .pose_token
-                .checked_add(1)
-                .ok_or("pose token exhausted")?,
-            parts: request.parts,
-        };
-        let transition = self
-            .world
-            .physics_mut()
-            .update_articulated_pose_with_swept_root_pose(
-                owner,
-                update,
-                spall_physics::PartTransform {
-                    translation_m: target,
-                    rotation_xyzw: request.target_rotation_xyzw,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        let timing = &mut self.creature_move_timing;
-        timing.moves += 1;
-        timing.terrain_candidates += transition.terrain_candidates as u64;
-        timing.cell_casts += transition.cell_casts as u64;
-        timing.query_sync += transition.query_sync_time;
-        timing.candidate_query += transition.candidate_query_time;
-        timing.exact_cast += transition.exact_cast_time;
-        if transition.blocked {
-            timing.blocked += 1;
-            return Ok(CreatureMoveOutcome::Blocked {
-                part_id: transition.part_id,
-                time_of_impact: transition.time_of_impact,
-            });
-        }
-        self.creature_presentation.insert(
-            request.key,
-            (request.locomotion_tag, request.clip_phase_tick),
+        let here = self.creature_root(request.creature_id)?;
+        let feet = [here[0], here[1] + f64::from(request.feet_offset_m), here[2]];
+        let wanted = [
+            request.target_translation_m[0] - here[0],
+            request.target_translation_m[1] - here[1],
+            request.target_translation_m[2] - here[2],
+        ];
+        let swept = self.world.physics().sweep_character(
+            spall_physics::CharacterParams {
+                half_height_m: request.capsule_half_height_m,
+                radius_m: request.capsule_radius_m,
+                mass_kg: 1.0,
+            },
+            feet,
+            wanted.map(|v| v as f32),
+            0.1,
         );
-        Ok(CreatureMoveOutcome::Staged)
+        let wanted_len = wanted.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let got = swept.translation_m.map(f64::from);
+        let off = (0..3).map(|i| (got[i] - wanted[i]).powi(2)).sum::<f64>().sqrt();
+        if off > wanted_len * BLOCKED_FRACTION + 1.0e-4 {
+            return Ok(CreatureMoveOutcome::Blocked);
+        }
+        self.apply_creature_move(
+            request.creature_id,
+            request.target_translation_m,
+            request.target_rotation_xyzw,
+            request.locomotion_tag,
+            request.clip_phase_tick,
+        )?;
+        Ok(CreatureMoveOutcome::Moved)
     }
 
-    /// Motion entries for alive creatures whose root satisfies `include`,
-    /// sorted by creature id. `None` when there is nothing to send.
+    fn creature_root(&self, creature_id: u64) -> Result<[f64; 3], String> {
+        self.creatures
+            .as_ref()
+            .and_then(|host| host.get(creature_id))
+            .map(|creature| creature.record.translation_m)
+            .ok_or_else(|| "creature is not hosted".to_owned())
+    }
+
+    fn apply_creature_move(
+        &mut self,
+        creature_id: u64,
+        translation_m: [f64; 3],
+        rotation_xyzw: [f32; 4],
+        locomotion_tag: u8,
+        clip_phase_tick: u64,
+    ) -> Result<(), String> {
+        let tick = self.tick.get();
+        let creature = self
+            .creatures
+            .as_mut()
+            .and_then(|host| host.get_mut(creature_id))
+            .ok_or("creature is not hosted")?;
+        let elapsed_s = (tick.saturating_sub(creature.moved_at_tick).max(1) as f64)
+            / f64::from(1.0 / TICK_DT_S);
+        let before = creature.record.translation_m;
+        creature.velocity_m_s = [
+            ((translation_m[0] - before[0]) / elapsed_s) as f32,
+            ((translation_m[1] - before[1]) / elapsed_s) as f32,
+            ((translation_m[2] - before[2]) / elapsed_s) as f32,
+        ];
+        creature.moved_at_tick = tick;
+        creature.record.translation_m = translation_m;
+        creature.record.rotation_xyzw = rotation_xyzw;
+        creature.record.locomotion_tag = locomotion_tag;
+        creature.record.clip_phase_tick = clip_phase_tick;
+        Ok(())
+    }
+
+    /// Motion entries for creatures whose root satisfies `include`, sorted by
+    /// creature id. `None` when there is nothing to send.
     pub fn creature_motion_frame(
         &self,
         include: &dyn Fn([f64; 3]) -> bool,
     ) -> Option<CreatureMotionFrame> {
         let host = self.creatures.as_ref()?;
-        let mut entries: Vec<CreatureMotionEntry> = host
-            .records()
-            .filter(|state| state.lifecycle == CreatureLifecycleState::Alive)
-            .filter_map(|state| {
-                let owner = self.world.creature_physics_owner(state.key)?;
-                let root = self.world.physics().articulated_owner_snapshot(owner)?.root;
-                let translation_m = self.world.physics_origin().to_world_f64(root.translation_m);
-                if !include(translation_m) {
-                    return None;
-                }
-                let (locomotion_tag, clip_phase_tick) = self
-                    .creature_presentation
-                    .get(&state.key)
-                    .copied()
-                    .unwrap_or((state.locomotion_tag, state.clip_phase_tick));
-                Some(CreatureMotionEntry {
-                    creature_id: state.key.creature_id.get(),
-                    translation_m,
-                    rotation_xyzw: root.rotation,
-                    linear_velocity_m_s: root.linvel_m_s,
-                    locomotion_tag,
-                    clip_phase_tick,
-                })
+        let entries: Vec<CreatureMotionEntry> = host
+            .iter()
+            .filter(|creature| include(creature.record.translation_m))
+            .map(|creature| CreatureMotionEntry {
+                creature_id: creature.record.creature_id,
+                translation_m: creature.record.translation_m,
+                rotation_xyzw: creature.record.rotation_xyzw,
+                linear_velocity_m_s: creature.velocity_m_s,
+                locomotion_tag: creature.record.locomotion_tag,
+                clip_phase_tick: creature.record.clip_phase_tick,
             })
             .collect();
         if entries.is_empty() {
             return None;
         }
-        entries.sort_by_key(|entry| entry.creature_id);
-        let world_epoch = self.creature_allocator_snapshot()?.world_epoch;
         Some(CreatureMotionFrame {
             schema: WIRE_SCHEMA_VERSION,
-            world_epoch,
             server_tick: self.tick.get(),
             entries,
         })

@@ -165,18 +165,6 @@ pub(crate) struct PreparedGeometryCommit {
     removed_materials: std::collections::BTreeMap<MaterialId, u64>,
 }
 
-impl PreparedGeometryCommit {
-    /// Number of additional physics body slots this geometry candidate will
-    /// publish. Terrain slots count only when a newly introduced terrain
-    /// collider is actually planned; reused fixed slots already exist.
-    pub(crate) fn additional_body_slots(&self) -> usize {
-        self.children.len()
-            + self.terrain_brick_rebuild.as_ref().map_or(0, |plans| {
-                plans.iter().filter(|plan| plan.adds_body_slot()).count()
-            })
-    }
-}
-
 struct PreparedChildPublication {
     child: ChildBody,
     cell_m: f32,
