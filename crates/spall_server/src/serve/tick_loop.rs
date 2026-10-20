@@ -1381,23 +1381,7 @@ pub(super) async fn serve_async(
                             despawned = roster.despawned.len(),
                             "creature roster changed"
                         );
-                        // Despawns first, then spawns, in one ordered batch.
-                        let records: Vec<WireRecord> = roster
-                            .despawned
-                            .iter()
-                            .map(|&creature_id| {
-                                WireRecord::CreatureDespawn(spall_protocol::CreatureDespawn {
-                                    schema: spall_protocol::WIRE_SCHEMA_VERSION,
-                                    creature_id,
-                                })
-                            })
-                            .chain(roster.spawned.into_iter().map(|creature| {
-                                WireRecord::CreatureSpawn(spall_protocol::CreatureSpawn {
-                                    schema: spall_protocol::WIRE_SCHEMA_VERSION,
-                                    creature,
-                                })
-                            }))
-                            .collect();
+                        let records = roster.into_wire_records();
                         lj.fan_out_creature_records(records, &clients_for_sim);
                     }
                     Err(error) => {

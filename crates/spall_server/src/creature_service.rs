@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use spall_protocol::{CreatureRecord, CreatureSpawn, WIRE_SCHEMA_VERSION};
+use spall_protocol::{CreatureDespawn, CreatureRecord, CreatureSpawn, WIRE_SCHEMA_VERSION};
 use spall_sim::Simulation;
 
 /// Sequential id source for one batch of spawns.
@@ -92,6 +92,23 @@ pub struct CreatureRoster {
 impl CreatureRoster {
     pub fn is_empty(&self) -> bool {
         self.despawned.is_empty() && self.spawned.is_empty()
+    }
+
+    /// The change as ordered wire records: despawns first, then spawns.
+    pub fn into_wire_records(self) -> Vec<spall_net::WireRecord> {
+        let despawns = self.despawned.into_iter().map(|creature_id| {
+            spall_net::WireRecord::CreatureDespawn(CreatureDespawn {
+                schema: WIRE_SCHEMA_VERSION,
+                creature_id,
+            })
+        });
+        let spawns = self.spawned.into_iter().map(|creature| {
+            spall_net::WireRecord::CreatureSpawn(CreatureSpawn {
+                schema: WIRE_SCHEMA_VERSION,
+                creature,
+            })
+        });
+        despawns.chain(spawns).collect()
     }
 }
 
