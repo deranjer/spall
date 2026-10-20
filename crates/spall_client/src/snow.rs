@@ -69,12 +69,15 @@ impl SnowPresentation {
 
     /// Returns merged exposed-face rectangles and clipped footprint marks.
     /// `camera` is in world metres; the volume uses quarter-metre cells.
-    pub fn update<'a>(
+    pub fn update<'a, F: std::borrow::Borrow<SnowSurfaceFrame>>(
         &'a mut self,
-        frames: &[SnowSurfaceFrame],
+        frames: &[F],
         volume: &Volume,
         camera: [f32; 3],
     ) -> (&'a [SnowSurfacePatch], &'a [SnowFootprintMark]) {
+        let frames: Vec<&SnowSurfaceFrame> =
+            frames.iter().map(std::borrow::Borrow::borrow).collect();
+        let frames = frames.as_slice();
         if camera.iter().any(|value| !value.is_finite())
             || (volume.cell_size().metres() - f64::from(CELL_M)).abs() > f64::EPSILON
         {
@@ -105,6 +108,7 @@ impl SnowPresentation {
         let radius_m = self.radius_m;
         let mut nearby: Vec<&SnowSurfaceFrame> = frames
             .iter()
+            .copied()
             .filter(|frame| {
                 frame.schema == SNOW_SCHEMA
                     && frame.world_epoch == current_epoch
@@ -213,7 +217,7 @@ impl SnowPresentation {
     }
 }
 
-fn cache_key(frames: &[SnowSurfaceFrame], volume_stamp: u64, camera_bucket: [i64; 3]) -> u64 {
+fn cache_key(frames: &[&SnowSurfaceFrame], volume_stamp: u64, camera_bucket: [i64; 3]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let mut write = |value: u64| {
         for byte in value.to_le_bytes() {

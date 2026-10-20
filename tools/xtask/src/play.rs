@@ -68,11 +68,15 @@ pub struct PlayArgs {
     /// `--editor-scene` file, else daylight.
     #[arg(long)]
     environment: Option<String>,
-    /// Accepted for older scripts: play is uncapped (vsync off) by default now.
-    #[arg(long, hide = true)]
+    /// Soft frame-rate cap for the uncapped window, frames per second. Play runs
+    /// without vsync, limited to this so a loading world cannot starve the
+    /// desktop; the HUD line still reports the rate the work alone could reach.
+    #[arg(long, default_value_t = 300)]
+    fps_cap: u32,
+    /// Remove the soft cap entirely (rendering-throughput measurement only).
+    #[arg(long)]
     uncapped: bool,
-    /// Cap the frame rate to the display (vsync on). Play runs uncapped by
-    /// default so the frame rate shows what the game actually costs.
+    /// Present with vsync (frame rate follows the display) instead of the soft cap.
     #[arg(long)]
     vsync: bool,
     /// How far (metres) terrain and water are drawn, 16 to 120 (default 96).
@@ -327,8 +331,12 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         eprintln!("xtask play: environment={environment}");
         client_cmd.args(["--environment", environment]);
     }
-    if args.uncapped || !args.vsync {
+    if !args.vsync {
         client_cmd.arg("--uncapped");
+        client_cmd.env(
+            "SPALL_MAX_FPS",
+            if args.uncapped { 0 } else { args.fps_cap }.to_string(),
+        );
     }
     if let Some(metres) = args.view_distance {
         client_cmd.args(["--view-distance", &metres.to_string()]);

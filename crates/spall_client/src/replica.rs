@@ -433,7 +433,9 @@ pub struct ReplicaWorld {
     catalogue_deferred: Vec<TopologyTransaction>,
     weather: Option<spall_protocol::WeatherState>,
     weather_epoch_floor: u64,
-    snow: BTreeMap<(i32, i32, i32), spall_protocol::SnowSurfaceFrame>,
+    /// Shared so the renderer can take a snapshot without copying every frame
+    /// while holding the replica lock the network and prediction threads need.
+    snow: BTreeMap<(i32, i32, i32), std::sync::Arc<spall_protocol::SnowSurfaceFrame>>,
     snow_lru: VecDeque<(i32, i32, i32)>,
     snow_cache_bytes: usize,
     snow_epoch_floor: u64,
@@ -942,7 +944,7 @@ impl ReplicaWorld {
                 .snow_cache_bytes
                 .saturating_add(snow_frame_bytes(&frame));
             self.snow_lru.push_back(key);
-            self.snow.insert(key, frame);
+            self.snow.insert(key, std::sync::Arc::new(frame));
             while self.snow.len() > MAX_SNOW_CACHE_FRAMES
                 || self.snow_cache_bytes > MAX_SNOW_CACHE_BYTES
             {
@@ -957,7 +959,12 @@ impl ReplicaWorld {
     }
 
     pub fn snow_frames(&self) -> impl Iterator<Item = &spall_protocol::SnowSurfaceFrame> {
-        self.snow.values()
+        self.snow.values().map(|frame| frame.as_ref())
+    }
+
+    /// Cheap shared handles to every cached frame (reference-count bumps only).
+    pub fn snow_frames_shared(&self) -> Vec<std::sync::Arc<spall_protocol::SnowSurfaceFrame>> {
+        self.snow.values().cloned().collect()
     }
 
     pub fn snow_frame(
@@ -966,7 +973,9 @@ impl ReplicaWorld {
         tile_z: i32,
         top_cell_y: i32,
     ) -> Option<&spall_protocol::SnowSurfaceFrame> {
-        self.snow.get(&(tile_x, tile_z, top_cell_y))
+        self.snow
+            .get(&(tile_x, tile_z, top_cell_y))
+            .map(|frame| frame.as_ref())
     }
 
     /// Changes only when an atomic snow frame or full world replacement lands.

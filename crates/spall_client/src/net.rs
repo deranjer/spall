@@ -147,6 +147,18 @@ impl MoverProfile {
     }
 }
 
+/// A mover section this slow delays input delivery and shows up as a prediction
+/// pop; say so, with the section, so the cause is in the log.
+fn note_mover_stall(section: &'static str, spent: Duration) {
+    if spent >= Duration::from_millis(30) {
+        tracing::warn!(
+            section,
+            ms = spent.as_secs_f64() * 1e3,
+            "mover loop section stalled (input delivery delayed)"
+        );
+    }
+}
+
 /// Advances the replica's observed server tick and, when transactions are held
 /// for repairs, retries them: the steady water stream then lets a repair
 /// request the server dropped be sent again once its cooldown has elapsed,
@@ -2852,11 +2864,23 @@ async fn run_async(
             // Diagnostic: where one mover iteration's wall time goes. Logged,
             // never replicated or persisted.
             let mut profile = MoverProfile::default();
+            let mut last_iteration: Option<std::time::Instant> = None;
             loop {
                 if *stop_rx.borrow() {
                     return;
                 }
                 let now = std::time::Instant::now();
+                // The loop should come round every few milliseconds. A long gap is an
+                // input-delivery hole (the server's ack catches up, prediction history
+                // empties, and the reconcile pops the player), whatever caused it.
+                if let Some(previous) = last_iteration.replace(now)
+                    && now.duration_since(previous) >= Duration::from_millis(60)
+                {
+                    tracing::warn!(
+                        gap_ms = now.duration_since(previous).as_secs_f64() * 1e3,
+                        "mover loop did not run for a while (input delivery delayed)"
+                    );
+                }
                 // The timeline rate comes from the lead controller (1.0 until
                 // a reconcile has reported a lead); read under a brief lock.
                 let timeline_rate = pred.lock().unwrap_or_else(|e| e.into_inner()).lead.rate();
@@ -2873,7 +2897,11 @@ async fn run_async(
                 // fresh `&Volume` each tick for its own window cache.
                 let section = std::time::Instant::now();
                 let terrain = cached_terrain_snapshot(&replica, &terrain_cache);
-                profile.snapshot.add(section.elapsed());
+                {
+                    let spent = section.elapsed();
+                    note_mover_stall("snapshot", spent);
+                    profile.snapshot.add(spent);
+                }
                 let terrain_volume = terrain.as_ref().map(|t| t.volume.clone());
                 let section = std::time::Instant::now();
                 let (body_collisions, traced_samplers) = {
@@ -2929,7 +2957,11 @@ async fn run_async(
                     body_collision_versions.retain(|entity, _| live.contains(entity));
                     (bodies, traced_samplers)
                 };
-                profile.bodies.add(section.elapsed());
+                {
+                    let spent = section.elapsed();
+                    note_mover_stall("bodies", spent);
+                    profile.bodies.add(spent);
+                }
                 let section = std::time::Instant::now();
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
@@ -3191,7 +3223,11 @@ async fn run_async(
                         window_stats,
                     )
                 };
-                profile.predictor.add(section.elapsed());
+                {
+                    let spent = section.elapsed();
+                    note_mover_stall("predictor", spent);
+                    profile.predictor.add(spent);
+                }
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
                 }
@@ -3233,7 +3269,11 @@ async fn run_async(
                         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                         pass.step(&mut guard, feet)
                     };
-                    profile.residency.add(section.elapsed());
+                    {
+                    let spent = section.elapsed();
+                    note_mover_stall("residency", spent);
+                    profile.residency.add(spent);
+                }
                     counters
                         .residency_evictions
                         .store(pass.evictions_total(), Ordering::Relaxed);

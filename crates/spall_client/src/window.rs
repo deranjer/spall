@@ -1663,7 +1663,8 @@ impl Hud {
 impl InteractiveApp {
     /// The shortest time between frames. With vsync the display paces and this
     /// is zero. Uncapped play is limited to `SPALL_MAX_FPS` frames a second
-    /// (default 240; 0 means no limit at all).
+    /// (default 300; 0 means no limit at all). The report line shows the frame
+    /// rate the work alone could reach.
     fn max_frame_interval(&self) -> Duration {
         if !self.uncapped {
             return Duration::ZERO;
@@ -1671,7 +1672,7 @@ impl InteractiveApp {
         let fps = std::env::var("SPALL_MAX_FPS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(240.0);
+            .unwrap_or(300.0);
         if fps <= 0.0 {
             Duration::ZERO
         } else {
@@ -2799,7 +2800,7 @@ impl ApplicationHandler for InteractiveApp {
                 if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
                     let snow_generation = replica.snow_generation();
                     if renderer.snow_generation != Some(snow_generation) {
-                        renderer.snow_frames = replica.snow_frames().cloned().collect();
+                        renderer.snow_frames = replica.snow_frames_shared();
                         renderer.snow_generation = Some(snow_generation);
                     }
                     let generation = replica.terrain_generation();
@@ -3314,6 +3315,18 @@ impl ApplicationHandler for InteractiveApp {
                         window_stats,
                     );
                     let line = format!("{line} | {}", self.pose_stats.take_report());
+                    // What the frame work alone costs, without the frame limiter's
+                    // wait: the rate this machine could reach uncapped.
+                    let line = if self.frame_history.is_empty() {
+                        line
+                    } else {
+                        let busy = self.frame_history.iter().sum::<f32>()
+                            / self.frame_history.len() as f32;
+                        format!(
+                            "{line} | work {busy:.2} ms/frame = {:.0} fps uncapped potential",
+                            1000.0 / busy.max(0.01)
+                        )
+                    };
                     let line = match view {
                         Some(v) => format!(
                             "{line} | feet ({:.2}, {:.2}, {:.2}) m",
@@ -5918,7 +5931,7 @@ pub(super) struct WorldRenderer {
     weather_exposure: f32,
     weather_effects_enabled: bool,
     ground_snow_enabled: bool,
-    snow_frames: Vec<spall_protocol::SnowSurfaceFrame>,
+    snow_frames: Vec<std::sync::Arc<spall_protocol::SnowSurfaceFrame>>,
     snow_generation: Option<u64>,
     snow_presentation: crate::snow::SnowPresentation,
     snow_upload_key: Option<(u64, u64, [i64; 3], bool)>,
