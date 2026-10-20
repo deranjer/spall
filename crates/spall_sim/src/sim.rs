@@ -12,8 +12,8 @@ use std::collections::{HashSet, VecDeque};
 
 use glam::DVec3;
 use spall_core::{
-    BRUSH_UNIT, BrushPoint, EntityId, GlobalCell, IdError, MaterialId,
-    PlayerInput, SphereBrush, Tick,
+    BRUSH_UNIT, BrushPoint, EntityId, GlobalCell, IdError, MaterialId, PlayerInput, SphereBrush,
+    Tick,
 };
 use spall_physics::PhysicsOrigin;
 use spall_physics::{CharacterParams, CharacterState};

@@ -487,14 +487,8 @@ impl PhysicsWorld {
                 return Err(BodyFenceError);
             }
             let index = (id.0 as u32) as usize;
-            let entry = self
-                .entries
-                .get(index)
-                .ok_or(BodyFenceError)?;
-            let body = self
-                .bodies
-                .get(entry.body)
-                .ok_or(BodyFenceError)?;
+            let entry = self.entries.get(index).ok_or(BodyFenceError)?;
+            let body = self.bodies.get(entry.body).ok_or(BodyFenceError)?;
             let collider =
                 self.colliders
                     .get(entry.collider)

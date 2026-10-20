@@ -41,7 +41,10 @@ fn spawn_and_despawn_follow_the_stream_and_a_join_list_is_idempotent() {
         creatures.spawn(&spawn(2, 20.0)).unwrap();
     }
     assert_eq!(
-        creatures.records().map(|c| c.creature_id).collect::<Vec<_>>(),
+        creatures
+            .records()
+            .map(|c| c.creature_id)
+            .collect::<Vec<_>>(),
         [1, 2]
     );
     // A live spawn after the list, then a despawn, in stream order.
@@ -49,7 +52,10 @@ fn spawn_and_despawn_follow_the_stream_and_a_join_list_is_idempotent() {
     assert!(creatures.despawn(2));
     assert!(!creatures.despawn(2));
     assert_eq!(
-        creatures.records().map(|c| c.creature_id).collect::<Vec<_>>(),
+        creatures
+            .records()
+            .map(|c| c.creature_id)
+            .collect::<Vec<_>>(),
         [1, 3]
     );
     assert!(creatures.get(2).is_none());

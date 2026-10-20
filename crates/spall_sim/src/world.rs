@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use glam::DQuat;
 use spall_core::{
-    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, MaterialId, PlayerInput,
-    Revision, VolumeId,
+    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, MaterialId, PlayerInput, Revision,
+    VolumeId,
 };
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{

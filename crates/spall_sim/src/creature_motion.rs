@@ -6,7 +6,9 @@
 //! root pose. Presentation state (locomotion selector, clip phase) is stored with
 //! the pose so the server can publish it.
 use super::*;
-use spall_protocol::{CreatureMotionEntry, CreatureMotionFrame, CreatureRecord, WIRE_SCHEMA_VERSION};
+use spall_protocol::{
+    CreatureMotionEntry, CreatureMotionFrame, CreatureRecord, WIRE_SCHEMA_VERSION,
+};
 
 use crate::creatures::{CreatureHost, CreatureHostInitError, CreatureSpawnError};
 
@@ -91,7 +93,10 @@ impl Simulation {
     }
 
     /// Spawns every record, or none. Ids must be unused and ascending.
-    pub fn spawn_creatures(&mut self, records: Vec<CreatureRecord>) -> Result<(), CreatureSpawnError> {
+    pub fn spawn_creatures(
+        &mut self,
+        records: Vec<CreatureRecord>,
+    ) -> Result<(), CreatureSpawnError> {
         let host = self.creatures.as_mut().ok_or(CreatureSpawnError::NoHost)?;
         let mut candidate = host.clone();
         for record in records {
@@ -147,7 +152,11 @@ impl Simulation {
                 mass_kg: 60.0,
             },
             feet,
-            [request.desired_step_m[0], -FALL_M, request.desired_step_m[1]],
+            [
+                request.desired_step_m[0],
+                -FALL_M,
+                request.desired_step_m[1],
+            ],
             0.1,
         );
         let moved = swept.translation_m.map(f64::from);
@@ -189,7 +198,10 @@ impl Simulation {
         );
         let wanted_len = wanted.iter().map(|v| v * v).sum::<f64>().sqrt();
         let got = swept.translation_m.map(f64::from);
-        let off = (0..3).map(|i| (got[i] - wanted[i]).powi(2)).sum::<f64>().sqrt();
+        let off = (0..3)
+            .map(|i| (got[i] - wanted[i]).powi(2))
+            .sum::<f64>()
+            .sqrt();
         if off > wanted_len * BLOCKED_FRACTION + 1.0e-4 {
             return Ok(CreatureMoveOutcome::Blocked);
         }

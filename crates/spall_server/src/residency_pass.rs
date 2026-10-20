@@ -79,8 +79,8 @@ use spall_store::{Checkpoint, StoredBrick};
 use spall_voxel::{Brick, MemoryReport};
 
 use crate::persist::{
-    PersistConfig, PersistError, capture_with_terrain_bricks,
-    stored_brick_from_backing, stored_brick_from_snapshot,
+    PersistConfig, PersistError, capture_with_terrain_bricks, stored_brick_from_backing,
+    stored_brick_from_snapshot,
 };
 
 /// Consecutive ticks a terrain brick must be resident *and* outside every

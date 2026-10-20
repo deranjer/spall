@@ -69,8 +69,12 @@ pub trait CreatureDirector: Send {
     fn on_action_outcome(&mut self, _creature_id: u64, _outcome: CreatureActionOutcome) {}
 
     /// Spawns after `tick`, with ids from `ids`. Returning nothing is the common case.
-    fn plan(&mut self, tick: u64, sim: &Simulation, ids: &mut CreatureIdPlan)
-    -> Vec<CreatureRecord>;
+    fn plan(
+        &mut self,
+        tick: u64,
+        sim: &Simulation,
+        ids: &mut CreatureIdPlan,
+    ) -> Vec<CreatureRecord>;
 
     /// Creatures to remove after `tick`. Default: none.
     fn despawns(&mut self, _tick: u64, _sim: &Simulation) -> Vec<u64> {

@@ -1,8 +1,6 @@
 //! Creature entities: spawn and despawn bookkeeping, join list, motion frames.
 use spall_protocol::CreatureRecord;
-use spall_sim::{
-    CreatureSpawnError, CreatureWalkRequest, Simulation, SimulationConfig, fixtures,
-};
+use spall_sim::{CreatureSpawnError, CreatureWalkRequest, Simulation, SimulationConfig, fixtures};
 
 fn record(id: u64, x: f64) -> CreatureRecord {
     CreatureRecord {
@@ -87,7 +85,10 @@ fn join_list_and_motion_frames_follow_the_current_creatures() {
     // Motion frames list only creatures inside the filter, sorted by id.
     let all = sim.creature_motion_frame(&|_| true).unwrap();
     assert_eq!(
-        all.entries.iter().map(|e| e.creature_id).collect::<Vec<_>>(),
+        all.entries
+            .iter()
+            .map(|e| e.creature_id)
+            .collect::<Vec<_>>(),
         [1, 2]
     );
     let near = sim.creature_motion_frame(&|p| p[0] < 5.0).unwrap();
@@ -96,7 +97,10 @@ fn join_list_and_motion_frames_follow_the_current_creatures() {
     // A despawned creature is gone from both.
     assert!(sim.despawn_creature(1));
     assert_eq!(sim.creature_records().len(), 1);
-    assert_eq!(sim.creature_motion_frame(&|_| true).unwrap().entries.len(), 1);
+    assert_eq!(
+        sim.creature_motion_frame(&|_| true).unwrap().entries.len(),
+        1
+    );
     assert!(sim.creature_motion_frame(&|_| false).is_none());
 
     // Moving a creature that is not hosted is refused.

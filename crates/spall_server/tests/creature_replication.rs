@@ -87,7 +87,11 @@ impl CreatureDirector for TestDirector {
     }
 
     fn despawns(&mut self, tick: u64, _sim: &Simulation) -> Vec<u64> {
-        if tick == DESPAWN_TICK { vec![1] } else { Vec::new() }
+        if tick == DESPAWN_TICK {
+            vec![1]
+        } else {
+            Vec::new()
+        }
     }
 }
 

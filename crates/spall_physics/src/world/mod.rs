@@ -390,7 +390,6 @@ pub struct PhysicsWorld {
     pending_removed: Vec<ColliderHandle>,
 }
 
-
 /// How close (metres) a dynamic body must be to the character's capsule to be
 /// carried along by a push even when the tick reported no contact.
 const CARRY_MARGIN_M: f32 = 0.05;

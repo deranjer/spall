@@ -1009,8 +1009,7 @@ mod tests {
         drop(sender);
         lj.pending_captures
             .insert(session.raw(), (TransferId(78), receiver));
-        lj.transfer_ids
-            .set_next_low_for_test(1_u64 << 61);
+        lj.transfer_ids.set_next_low_for_test(1_u64 << 61);
 
         // This is the production Admin ResetWorld preflight. Exhaustion returns
         // before the handler captures/replaces the world or mutates transfer state.

@@ -102,7 +102,7 @@ server_id!(
     TransactionId
 );
 server_id!(
-    /// Stable identity of one creature across lifecycle transitions and world resets.
+    /// Identity of one creature. Never reused within a server run, not even across a world reset.
     CreatureId
 );
 

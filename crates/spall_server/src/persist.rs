@@ -520,7 +520,6 @@ pub fn restore_with_terrain_collider_mode(
     physics: PhysicsConfig,
     terrain_collider_mode: spall_sim::world::TerrainColliderMode,
 ) -> Result<(Simulation, u64), PersistError> {
-
     let cp = &recovery.checkpoint;
 
     // Fail closed on a reported-corrupt recovery before anything is rebuilt.
