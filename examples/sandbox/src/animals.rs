@@ -17,10 +17,12 @@ use spall_protocol::{
     CreaturePartBinding, CreatureStateV1, Hash32, OwnedCreatureAsset, OwnedCreatureCatalog,
     OwnedCreatureSpecies, content_manifest_hash,
 };
-use spall_server::creature_service::{CreatureDirector, CreatureIdPlan};
+use spall_server::creature_service::{
+    CreatureAction, CreatureActionOutcome, CreatureDirector, CreatureIdPlan,
+};
 use spall_sim::{
     AuthoritativeCreatureIntent, CreatureBirthPartInput, CreatureMoveOutcome, CreatureMoveRequest,
-    Simulation,
+    CreatureWalkRequest, Simulation,
 };
 use spall_voxel::{Brick, EditPlan, Sample};
 use thiserror::Error;
@@ -52,6 +54,9 @@ pub const GROUND_CLEARANCE_M: f64 = 0.05;
 /// Locomotion selectors carried in motion frames.
 pub const LOCOMOTION_IDLE: u8 = 0;
 pub const LOCOMOTION_MOVE: u8 = 1;
+/// Footprint capsule for walking animals (about a deer: 1.06 m tall, 0.56 m wide).
+const WALK_CAPSULE_RADIUS_M: f32 = 0.28;
+const WALK_CAPSULE_HALF_HEIGHT_M: f32 = 0.25;
 /// A creature is moved this often (7.5 Hz at 60 Hz), staggered by id.
 const MOVE_PERIOD_TICKS: u64 = 8;
 const MOVE_DT_S: f64 = MOVE_PERIOD_TICKS as f64 / 60.0;
@@ -184,25 +189,6 @@ fn part_cells(
     cells
 }
 
-/// Lowest point of the animal in its idle pose, relative to the root, in metres.
-fn idle_foot_offset_m(asset: &Asset) -> f32 {
-    let visual = crate::animal_visual::AnimalVisual::new(
-        asset.clone(),
-        &crate::animal_visual::material_mapping(&crate::game::manifest()),
-        crate::animal_visual::MAX_ANIMAL_VISUAL_CELLS,
-    );
-    visual
-        .ok()
-        .and_then(|v| v.sample("idle", 0.0).ok())
-        .and_then(|cells| {
-            cells
-                .iter()
-                .map(|c| c.center.y - c.size.y * 0.5)
-                .reduce(f32::min)
-        })
-        .unwrap_or(0.0)
-}
-
 #[derive(Debug, Clone, Copy)]
 enum Gait {
     /// Stand still until this tick.
@@ -220,16 +206,16 @@ struct Walker {
     gait: Gait,
     clip_phase: u64,
     moving: bool,
-    /// Consecutive blocked moves, for back-off.
-    blocked_streak: u32,
     /// Heading the animal was last asked to face (about +Y).
     yaw: f64,
-    /// Where the animal last stood, for choosing a detour when blocked.
+    /// Where the animal last stood, for choosing a detour when stuck.
     at: [f64; 3],
-    /// Extra root height for the next horizontal step, to hop a block.
-    lift: f64,
-    /// The last requested root target, for diagnostics.
-    last_target: [f64; 3],
+    /// Horizontal step asked for last update, metres.
+    last_desired: f64,
+    /// Consecutive updates that achieved far less than asked.
+    stuck: u32,
+    /// Detours tried since the animal last made progress.
+    detours: u32,
 }
 
 struct Placement {
@@ -243,8 +229,8 @@ struct Placement {
 pub struct AnimalDirector {
     catalog: Arc<OwnedCreatureCatalog>,
     species: Vec<AnimalSpecies>,
-    foot_offsets: Vec<f32>,
-    visuals: Vec<crate::animal_visual::AnimalVisual>,
+    /// Root-to-lowest-foot offset over every pose of the idle and move clips.
+    walk_feet: Vec<f32>,
     anchors: Vec<[f64; 3]>,
     targets: Vec<u32>,
     spawned: Vec<u32>,
@@ -264,10 +250,6 @@ impl AnimalDirector {
     pub fn new(anchors: Vec<[f64; 3]>, targets: [u32; 3], seed: u64) -> Result<Self, AnimalError> {
         let species = species()?;
         let catalog = catalog(&species);
-        let foot_offsets = species
-            .iter()
-            .map(|s| idle_foot_offset_m(&s.asset))
-            .collect();
         let materials = crate::animal_visual::material_mapping(&crate::game::manifest());
         let visuals = species
             .iter()
@@ -280,11 +262,31 @@ impl AnimalDirector {
                 .map_err(|e| AnimalError::Asset(s.key, e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let walk_feet = species
+            .iter()
+            .zip(&visuals)
+            .map(|(species, visual)| {
+                let mut lowest = f32::INFINITY;
+                for clip in [
+                    "idle",
+                    locomotion_clip(species.key, LOCOMOTION_MOVE).unwrap_or("idle"),
+                ] {
+                    let duration = visual.clip_duration(clip).unwrap_or(1).max(1);
+                    for phase in (0..duration).step_by(2) {
+                        if let Ok(cells) = visual.sample(clip, f64::from(phase)) {
+                            for cell in cells {
+                                lowest = lowest.min(cell.center.y - cell.size.y * 0.5);
+                            }
+                        }
+                    }
+                }
+                if lowest.is_finite() { lowest } else { -0.5 }
+            })
+            .collect();
         Ok(Self {
             catalog,
             species,
-            foot_offsets,
-            visuals,
+            walk_feet,
             anchors,
             targets: targets.to_vec(),
             spawned: vec![0; 3],
@@ -345,91 +347,6 @@ impl AnimalDirector {
         None
     }
 
-    /// Ground height near `reference_y_m` at a column: climbs out of solid terrain
-    /// a few cells, then descends to the first solid cell. Much cheaper than a
-    /// scan from the top of the world, and what stepping needs.
-    fn ground_near_m(
-        sim: &Simulation,
-        x_cell: i64,
-        z_cell: i64,
-        reference_y_m: f64,
-    ) -> Option<f64> {
-        let body = sim.world().terrain();
-        let (min, max) = body.collider_region;
-        if x_cell < min.x || x_cell > max.x || z_cell < min.z || z_cell > max.z {
-            return None;
-        }
-        let start = (((reference_y_m + 1.5) / 0.25).floor() as i64).clamp(min.y, max.y);
-        let mut y = start;
-        let mut climbed = 0;
-        while matches!(
-            body.volume.sample(GlobalCell::new(x_cell, y, z_cell)),
-            Ok(Sample::Filled(_))
-        ) {
-            y += 1;
-            climbed += 1;
-            if y > max.y || climbed > 12 {
-                return None;
-            }
-        }
-        for _ in 0..64 {
-            if y < min.y {
-                return None;
-            }
-            match body.volume.sample(GlobalCell::new(x_cell, y, z_cell)) {
-                Ok(Sample::Filled(_)) => return Some((y + 1) as f64 * 0.25),
-                Ok(Sample::Empty { .. }) => y -= 1,
-                _ => return None,
-            }
-        }
-        None
-    }
-
-    /// Root height at which the pose's lowest cells clear the ground under each
-    /// of them by [`GROUND_CLEARANCE_M`], with the pose turned by `yaw`. The
-    /// ground is sampled under every foot cell, not under the root, so a leg
-    /// that reaches over a 0.25 m terrain step is accounted for.
-    fn support_y(
-        sim: &Simulation,
-        cells: &[crate::animal_visual::AnimalCell],
-        root_xz: [f64; 2],
-        reference_y_m: f64,
-        yaw: f64,
-    ) -> Option<f64> {
-        let lowest = cells
-            .iter()
-            .map(|c| c.center.y - c.size.y * 0.5)
-            .reduce(f32::min)?;
-        let (sin, cos) = yaw.sin_cos();
-        let mut columns = std::collections::BTreeMap::new();
-        let mut needed = f64::NEG_INFINITY;
-        for cell in cells {
-            let bottom = cell.center.y - cell.size.y * 0.5;
-            // Every cell in the lower body can touch a block beside the feet, so
-            // each one limits how low the root may sit.
-            if bottom > lowest + 0.9 {
-                continue;
-            }
-            let (x, z) = (f64::from(cell.center.x), f64::from(cell.center.z));
-            let world_x = root_xz[0] + x * cos + z * sin;
-            let world_z = root_xz[1] - x * sin + z * cos;
-            let key = (
-                (world_x / 0.25).floor() as i64,
-                (world_z / 0.25).floor() as i64,
-            );
-            let ground = match columns.get(&key) {
-                Some(ground) => *ground,
-                None => {
-                    let ground = Self::ground_near_m(sim, key.0, key.1, reference_y_m)?;
-                    columns.insert(key, ground);
-                    ground
-                }
-            };
-            needed = needed.max(ground - f64::from(bottom));
-        }
-        needed.is_finite().then_some(needed + GROUND_CLEARANCE_M)
-    }
-
     fn find_placement(&mut self, sim: &Simulation, species: usize) -> Option<Placement> {
         if self.anchors.is_empty() {
             return None;
@@ -449,7 +366,7 @@ impl AnimalDirector {
         let ground = Self::ground_y_m(sim, x_cell, z_cell)?;
         // Hover a few centimetres above the ground: a swept pose that starts in
         // exact contact with terrain reports an impact at time zero.
-        let foot = f64::from(-self.foot_offsets[species]) + GROUND_CLEARANCE_M;
+        let foot = f64::from(-self.walk_feet[species]) + GROUND_CLEARANCE_M;
         let height_above_ground = match habitat {
             AnimalHabitat::Flying => 3.0 + self.unit() * 6.0,
             _ => 0.0,
@@ -596,281 +513,6 @@ impl CreatureDirector for AnimalDirector {
         self.catalog.clone()
     }
 
-    fn on_world_reset(&mut self) {
-        self.spawned = vec![0; self.species.len()];
-        self.attempts = 0;
-        self.walkers.clear();
-    }
-
-    fn on_move_outcome(&mut self, key: spall_core::CreatureKey, outcome: CreatureMoveOutcome) {
-        let Some(walker) = self.walkers.get_mut(&key.creature_id.get()) else {
-            return;
-        };
-        match outcome {
-            CreatureMoveOutcome::Blocked {
-                part_id,
-                time_of_impact,
-            } => {
-                self.stats[walker.species].1 += 1;
-                if self.stats[walker.species].1 <= 40 && walker.species == 0 {
-                    tracing::info!(
-                        id = key.creature_id.get(),
-                        at = ?walker.at,
-                        target = ?walker.last_target,
-                        yaw = walker.yaw,
-                        lift = walker.lift,
-                        streak = walker.blocked_streak,
-                        ?part_id,
-                        ?time_of_impact,
-                        "deer move blocked"
-                    );
-                }
-                // The pose did not change. Birds turn around; walkers stop and re-plan.
-                walker.gait = match walker.gait {
-                    Gait::Orbit {
-                        theta,
-                        omega,
-                        radius,
-                    } => {
-                        // Something solid (a tree) is in the circle: fly higher.
-                        walker.home[1] += 1.5;
-                        Gait::Orbit {
-                            theta,
-                            omega,
-                            radius,
-                        }
-                    }
-                    Gait::Walk { until, .. } => {
-                        walker.blocked_streak = walker.blocked_streak.saturating_add(1);
-                        let streak = walker.blocked_streak;
-                        if streak == 1 {
-                            // First try hopping whatever is in the way.
-                            walker.lift = 0.3;
-                            walker.gait
-                        } else if streak <= 8 {
-                            // Then try other headings, alternating sides and widening.
-                            walker.lift = 0.0;
-                            const TURNS: [f64; 6] = [0.8, -0.8, 1.6, -1.6, 2.4, -2.4];
-                            let angle = walker.yaw + TURNS[(streak as usize - 2) % TURNS.len()];
-                            // yaw maps +X to (cos, -sin), so heading (cos, -sin) is the
-                            // direction the animal faces after turning by `angle`.
-                            Gait::Walk {
-                                target: [
-                                    walker.at[0] + 4.0 * angle.cos(),
-                                    walker.at[2] - 4.0 * angle.sin(),
-                                ],
-                                until,
-                            }
-                        } else {
-                            // Truly stuck: stand for a while and start over.
-                            walker.lift = 0.0;
-                            walker.blocked_streak = 0;
-                            Gait::Rest {
-                                until: self.last_tick + 180,
-                            }
-                        }
-                    }
-                    _ => {
-                        walker.blocked_streak = walker.blocked_streak.saturating_add(1);
-                        Gait::Rest {
-                            until: self.last_tick + 120 * u64::from(walker.blocked_streak.min(8)),
-                        }
-                    }
-                };
-            }
-            CreatureMoveOutcome::Staged => {
-                self.stats[walker.species].0 += 1;
-                walker.lift = 0.0;
-                // Only real horizontal progress ends a blocked streak; a creature
-                // bobbing up and down against an obstacle is still stuck.
-                let moved = (walker.last_target[0] - walker.at[0])
-                    .hypot(walker.last_target[2] - walker.at[2]);
-                if moved > 0.05 {
-                    walker.blocked_streak = 0;
-                }
-            }
-            CreatureMoveOutcome::Busy => {}
-        }
-    }
-
-    fn motion(&mut self, tick: u64, sim: &Simulation) -> Vec<CreatureMoveRequest> {
-        self.last_tick = tick;
-        if tick.is_multiple_of(1200) {
-            tracing::info!(
-                deer = ?self.stats[0],
-                crow = ?self.stats[1],
-                "animal moves (staged, blocked, walks started) per species"
-            );
-        }
-        let mut requests = Vec::new();
-        for alive in sim.alive_creatures() {
-            let id = alive.key.creature_id.get();
-            if !(tick + id).is_multiple_of(MOVE_PERIOD_TICKS) {
-                continue;
-            }
-            let Some(mut walker) = self.walkers.get(&id).copied() else {
-                continue;
-            };
-            let species_key = self.species[walker.species].key;
-            // The pose about to be requested; foot heights come from the ground
-            // under each of its lowest cells (see `support_y`).
-            let move_clip = locomotion_clip(species_key, LOCOMOTION_MOVE).unwrap_or("idle");
-            let here = alive.translation_m;
-            walker.at = here;
-            // Decide the next root target and whether the animal is moving.
-            let (target, moving, yaw) = match walker.gait {
-                Gait::Rest { until } => {
-                    if tick >= until {
-                        let angle = self.unit() * std::f64::consts::TAU;
-                        let distance = 4.0 + self.unit() * 14.0;
-                        walker.gait = Gait::Walk {
-                            target: [
-                                here[0] + distance * angle.cos(),
-                                here[2] + distance * angle.sin(),
-                            ],
-                            until: tick + 60 * 20,
-                        };
-                    }
-                    (here, false, None)
-                }
-                Gait::Walk { target, until } => {
-                    let (dx, dz) = (target[0] - here[0], target[1] - here[2]);
-                    let distance = dx.hypot(dz);
-                    let visual = &self.visuals[walker.species];
-                    // A limb swinging between two poses can dip lower than both of them,
-                    // so the support height must hold for the poses in between too.
-                    let mut cells = Vec::new();
-                    for step in 0..=2_u64 {
-                        let phase = walker.clip_phase + step * MOVE_PERIOD_TICKS / 2;
-                        cells.extend(visual.sample(move_clip, phase as f64).unwrap_or_default());
-                    }
-                    let needed_here =
-                        Self::support_y(sim, &cells, [here[0], here[2]], here[1], walker.yaw);
-                    let wrap = |angle: f64| {
-                        (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
-                            - std::f64::consts::PI
-                    };
-                    let want = f64::atan2(-dz, dx);
-                    let turn = wrap(want - walker.yaw);
-                    let rest = |walker: &mut Walker, until: u64| {
-                        walker.gait = Gait::Rest { until };
-                    };
-                    if distance < 0.4 || tick >= until {
-                        rest(&mut walker, tick + 60 + (self.next() % 240));
-                        (here, false, None)
-                    } else if let Some(needed) = needed_here
-                        && here[1] > needed + 0.02
-                    {
-                        // Over a ledge: drop onto the ground before going on.
-                        ([here[0], needed, here[2]], true, Some(walker.yaw))
-                    } else if let Some(needed) = needed_here
-                        && turn.abs() > 0.35
-                    {
-                        // Turn toward the target in place, a bounded angle per step.
-                        (
-                            [here[0], needed, here[2]],
-                            true,
-                            Some(walker.yaw + turn.clamp(-0.35, 0.35)),
-                        )
-                    } else {
-                        let step = (1.4 * MOVE_DT_S).min(distance);
-                        let next = [
-                            here[0] + dx / distance * step,
-                            here[2] + dz / distance * step,
-                        ];
-                        let yaw_next = walker.yaw + turn;
-                        let needed_next = Self::support_y(sim, &cells, next, here[1], yaw_next);
-                        match (needed_here, needed_next) {
-                            (Some(from), Some(to)) if (to - from).abs() <= 0.5 => {
-                                if to + walker.lift > here[1] + 0.02 {
-                                    // Step up: rise first so the feet clear the edge.
-                                    ([here[0], to + walker.lift, here[2]], true, Some(walker.yaw))
-                                } else {
-                                    // Level or step down: move on at this height; the drop
-                                    // happens on the next update.
-                                    (
-                                        [next[0], from.max(to) + walker.lift, next[1]],
-                                        true,
-                                        Some(yaw_next),
-                                    )
-                                }
-                            }
-                            _ => {
-                                // Too steep or off the known world: stop and rest.
-                                rest(&mut walker, tick + 60 + (self.next() % 180));
-                                (here, false, None)
-                            }
-                        }
-                    }
-                }
-                Gait::Orbit {
-                    theta,
-                    omega,
-                    radius,
-                } => {
-                    let theta = theta + omega * MOVE_DT_S;
-                    walker.gait = Gait::Orbit {
-                        theta,
-                        omega,
-                        radius,
-                    };
-                    (
-                        [
-                            walker.home[0] + radius * theta.cos(),
-                            walker.home[1],
-                            walker.home[2] + radius * theta.sin(),
-                        ],
-                        true,
-                        // Tangent of the circle, nose along the direction of travel.
-                        Some(f64::atan2(
-                            -theta.cos() * omega.signum(),
-                            -theta.sin() * omega.signum(),
-                        )),
-                    )
-                }
-            };
-            if moving {
-                walker.clip_phase += MOVE_PERIOD_TICKS;
-            }
-            let was_moving = walker.moving;
-            walker.moving = moving;
-            self.walkers.insert(id, walker);
-            if !moving && !was_moving {
-                continue;
-            }
-            // A creature that just stopped sends one stationary pose so clients
-            // switch from the move clip back to idle.
-            let (clip, tag, phase) = if moving {
-                let clip = locomotion_clip(species_key, LOCOMOTION_MOVE).unwrap_or("idle");
-                (clip, LOCOMOTION_MOVE, walker.clip_phase)
-            } else {
-                ("idle", LOCOMOTION_IDLE, 0)
-            };
-            let Ok(parts) = pose_parts(&self.species[walker.species].asset, clip, phase as f64)
-            else {
-                continue;
-            };
-            // Standing still keeps the current heading (rotation about Y only).
-            let yaw = yaw.unwrap_or_else(|| {
-                let [_, y, _, w] = alive.rotation_xyzw;
-                f64::from(2.0 * y.atan2(w))
-            });
-            walker.yaw = yaw;
-            walker.last_target = target;
-            self.walkers.insert(id, walker);
-            let (sin, cos) = ((yaw * 0.5).sin(), (yaw * 0.5).cos());
-            requests.push(CreatureMoveRequest {
-                key: alive.key,
-                target_translation_m: target,
-                target_rotation_xyzw: [0.0, sin as f32, 0.0, cos as f32],
-                parts,
-                locomotion_tag: tag,
-                clip_phase_tick: phase,
-            });
-        }
-        requests
-    }
-
     fn plan(
         &mut self,
         tick: u64,
@@ -936,11 +578,11 @@ impl CreatureDirector for AnimalDirector {
                             gait,
                             clip_phase: 0,
                             moving: false,
-                            blocked_streak: 0,
+                            last_desired: 0.0,
+                            stuck: 0,
+                            detours: 0,
                             yaw: placement.yaw_rad,
                             at: placement.root_m.to_array(),
-                            lift: 0.0,
-                            last_target: [0.0; 3],
                         },
                     );
                 }
@@ -957,5 +599,196 @@ impl CreatureDirector for AnimalDirector {
             }
         }
         intents
+    }
+
+    fn on_world_reset(&mut self) {
+        self.spawned = vec![0; self.species.len()];
+        self.attempts = 0;
+        self.walkers.clear();
+    }
+
+    fn on_action_outcome(&mut self, key: spall_core::CreatureKey, outcome: CreatureActionOutcome) {
+        let Some(walker) = self.walkers.get_mut(&key.creature_id.get()) else {
+            return;
+        };
+        match outcome {
+            CreatureActionOutcome::Swept(CreatureMoveOutcome::Blocked { .. }) => {
+                self.stats[walker.species].1 += 1;
+                // A bird whose circle hits something solid (a tree) flies higher.
+                if matches!(walker.gait, Gait::Orbit { .. }) {
+                    walker.home[1] += 1.5;
+                }
+            }
+            CreatureActionOutcome::Swept(CreatureMoveOutcome::Staged) => {
+                self.stats[walker.species].0 += 1;
+            }
+            CreatureActionOutcome::Swept(CreatureMoveOutcome::Busy)
+            | CreatureActionOutcome::Walked(None) => {}
+            CreatureActionOutcome::Walked(Some(walked)) => {
+                self.stats[walker.species].0 += 1;
+                let moved = walked.moved_m[0].hypot(walked.moved_m[2]);
+                if walker.last_desired > 0.02 && moved < walker.last_desired * 0.35 {
+                    walker.stuck += 1;
+                    self.stats[walker.species].1 += 1;
+                } else if walker.last_desired > 0.02 {
+                    walker.stuck = 0;
+                    walker.detours = 0;
+                }
+            }
+        }
+    }
+
+    fn motion(&mut self, tick: u64, sim: &Simulation) -> Vec<CreatureAction> {
+        self.last_tick = tick;
+        if tick.is_multiple_of(1200) {
+            tracing::info!(
+                deer = ?self.stats[0],
+                crow = ?self.stats[1],
+                "animal moves (applied, stuck or blocked) per species"
+            );
+        }
+        let wrap = |angle: f64| {
+            (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+        };
+        let mut actions = Vec::new();
+        for alive in sim.alive_creatures() {
+            let id = alive.key.creature_id.get();
+            if !(tick + id).is_multiple_of(MOVE_PERIOD_TICKS) {
+                continue;
+            }
+            let Some(mut walker) = self.walkers.get(&id).copied() else {
+                continue;
+            };
+            let species_key = self.species[walker.species].key;
+            let move_clip = locomotion_clip(species_key, LOCOMOTION_MOVE).unwrap_or("idle");
+            let here = alive.translation_m;
+            walker.at = here;
+            let flying = matches!(walker.gait, Gait::Orbit { .. });
+            // `desired` is the horizontal step for a walker; `target` the root target
+            // for a flyer. Neither is set while resting.
+            let mut desired = [0.0_f64; 2];
+            let mut fly_target = here;
+            let mut yaw = walker.yaw;
+            let mut moving = false;
+            match walker.gait {
+                Gait::Rest { until } => {
+                    if tick >= until {
+                        let angle = self.unit() * std::f64::consts::TAU;
+                        let distance = 4.0 + self.unit() * 14.0;
+                        walker.gait = Gait::Walk {
+                            target: [
+                                here[0] + distance * angle.cos(),
+                                here[2] - distance * angle.sin(),
+                            ],
+                            until: tick + 60 * 20,
+                        };
+                    }
+                }
+                Gait::Walk { target, until } => {
+                    let (dx, dz) = (target[0] - here[0], target[1] - here[2]);
+                    let distance = dx.hypot(dz);
+                    if distance < 0.4 || tick >= until {
+                        walker.gait = Gait::Rest {
+                            until: tick + 60 + (self.next() % 240),
+                        };
+                    } else if walker.stuck >= 3 {
+                        // Not getting anywhere: try another heading, wider each time,
+                        // and stand for a while if every one fails.
+                        walker.stuck = 0;
+                        walker.detours += 1;
+                        if walker.detours > 6 {
+                            walker.detours = 0;
+                            walker.gait = Gait::Rest { until: tick + 180 };
+                        } else {
+                            const TURNS: [f64; 6] = [0.8, -0.8, 1.6, -1.6, 2.4, -2.4];
+                            let angle = walker.yaw + TURNS[(walker.detours as usize - 1) % 6];
+                            walker.gait = Gait::Walk {
+                                target: [here[0] + 5.0 * angle.cos(), here[2] - 5.0 * angle.sin()],
+                                until,
+                            };
+                        }
+                    } else {
+                        let want = f64::atan2(-dz, dx);
+                        let turn = wrap(want - walker.yaw);
+                        moving = true;
+                        if turn.abs() > 0.35 {
+                            // Turn toward the target in place, a bounded angle per step.
+                            yaw = walker.yaw + turn.clamp(-0.35, 0.35);
+                        } else {
+                            yaw = walker.yaw + turn;
+                            let step = (1.4 * MOVE_DT_S).min(distance);
+                            desired = [dx / distance * step, dz / distance * step];
+                        }
+                    }
+                }
+                Gait::Orbit {
+                    theta,
+                    omega,
+                    radius,
+                } => {
+                    let theta = theta + omega * MOVE_DT_S;
+                    walker.gait = Gait::Orbit {
+                        theta,
+                        omega,
+                        radius,
+                    };
+                    fly_target = [
+                        walker.home[0] + radius * theta.cos(),
+                        walker.home[1],
+                        walker.home[2] + radius * theta.sin(),
+                    ];
+                    // Tangent of the circle, nose along the direction of travel.
+                    yaw = f64::atan2(-theta.cos() * omega.signum(), -theta.sin() * omega.signum());
+                    moving = true;
+                }
+            }
+            if moving {
+                walker.clip_phase += MOVE_PERIOD_TICKS;
+            }
+            let was_moving = walker.moving;
+            walker.moving = moving;
+            walker.last_desired = desired[0].hypot(desired[1]);
+            walker.yaw = yaw;
+            self.walkers.insert(id, walker);
+            if !moving && !was_moving {
+                continue;
+            }
+            // A creature that just stopped sends one stationary pose so clients
+            // switch from the move clip back to idle.
+            let (clip, tag, phase) = if moving {
+                (move_clip, LOCOMOTION_MOVE, walker.clip_phase)
+            } else {
+                ("idle", LOCOMOTION_IDLE, 0)
+            };
+            let Ok(parts) = pose_parts(&self.species[walker.species].asset, clip, phase as f64)
+            else {
+                continue;
+            };
+            let (sin, cos) = ((yaw * 0.5).sin(), (yaw * 0.5).cos());
+            let rotation = [0.0, sin as f32, 0.0, cos as f32];
+            if flying {
+                actions.push(CreatureAction::Swept(CreatureMoveRequest {
+                    key: alive.key,
+                    target_translation_m: fly_target,
+                    target_rotation_xyzw: rotation,
+                    parts,
+                    locomotion_tag: tag,
+                    clip_phase_tick: phase,
+                }));
+            } else {
+                actions.push(CreatureAction::Walk(CreatureWalkRequest {
+                    key: alive.key,
+                    desired_step_m: [desired[0] as f32, desired[1] as f32],
+                    target_rotation_xyzw: rotation,
+                    parts,
+                    locomotion_tag: tag,
+                    clip_phase_tick: phase,
+                    feet_offset_m: self.walk_feet[walker.species],
+                    capsule_radius_m: WALK_CAPSULE_RADIUS_M,
+                    capsule_half_height_m: WALK_CAPSULE_HALF_HEIGHT_M,
+                }));
+            }
+        }
+        actions
     }
 }

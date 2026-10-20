@@ -6559,6 +6559,33 @@ impl PhysicsWorld {
         root_target: PartTransform,
     ) -> Result<crate::articulated::ArticulatedTransition, crate::articulated::ArticulatedError>
     {
+        self.update_articulated_pose_impl(id, update, root_target, true)
+    }
+
+    /// Stages the same complete pose and root target **without** casting the
+    /// source cells against terrain. For a caller that has already resolved the
+    /// root's motion against terrain with a conservative proxy (a character
+    /// capsule around the creature); the pose and root are still validated and
+    /// versioned exactly like the swept path. Terrain is not consulted, so
+    /// limbs may overlap terrain the proxy does not cover.
+    pub fn update_articulated_pose_trusted(
+        &mut self,
+        id: ArticulatedBodyId,
+        update: ArticulatedPose,
+        root_target: PartTransform,
+    ) -> Result<crate::articulated::ArticulatedTransition, crate::articulated::ArticulatedError>
+    {
+        self.update_articulated_pose_impl(id, update, root_target, false)
+    }
+
+    fn update_articulated_pose_impl(
+        &mut self,
+        id: ArticulatedBodyId,
+        update: ArticulatedPose,
+        root_target: PartTransform,
+        terrain_cast: bool,
+    ) -> Result<crate::articulated::ArticulatedTransition, crate::articulated::ArticulatedError>
+    {
         use crate::articulated::{ArticulatedError, ArticulatedTransition};
         if !root_target.is_valid() {
             return Err(ArticulatedError::InvalidRootPose);
@@ -6693,7 +6720,7 @@ impl PhysicsWorld {
         // The exact nonlinear source-cell casts below remain authoritative.
         let mut swept_bounds = Vec::with_capacity(targets.len());
         for ((part_body, collider_handle, _, _, body_target), (_, grid, cell_m)) in
-            targets.iter().zip(&source_parts)
+            targets.iter().zip(&source_parts).filter(|_| terrain_cast)
         {
             let body_start = *self.bodies[*part_body].position();
             let collider_local = self.colliders[*collider_handle]
@@ -6750,7 +6777,7 @@ impl PhysicsWorld {
         );
         let mut terrain_colliders = Vec::with_capacity(candidate_limit.min(4096));
         let mut seen_candidates = HashSet::with_capacity(candidate_limit.min(4096));
-        for (min, max) in &swept_bounds {
+        for (min, max) in swept_bounds.iter().filter(|_| terrain_cast) {
             let bounds = rapier3d::parry::bounding_volume::Aabb::new(*min, *max);
             for (handle, _) in query.intersect_aabb_conservative(bounds) {
                 if !seen_candidates.contains(&handle) {
@@ -6778,8 +6805,11 @@ impl PhysicsWorld {
         // grid at every time (up to Parry's documented iterative TOI tolerance).
         let mut cell_casts = 0usize;
         let casts_started = Instant::now();
-        for ((part_id, (_, _, collider_start, _, body_target)), (body, grid, cell_m)) in
-            part_ids.iter().zip(&targets).zip(&source_parts)
+        for ((part_id, (_, _, collider_start, _, body_target)), (body, grid, cell_m)) in part_ids
+            .iter()
+            .zip(&targets)
+            .zip(&source_parts)
+            .filter(|_| terrain_cast)
         {
             let body_start = *self.bodies[*body].position();
             let body_delta = body_target.translation - body_start.translation;

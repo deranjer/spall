@@ -111,8 +111,8 @@ pub use sim::{
     AliveCreature, AuthoritativeCreatureIntent, CONTACT_DAMAGE_ACTOR_ID,
     CommittedCreatureLifecycle, ContactDamageReport, CreatureBirthPartInput, CreatureCaptureError,
     CreatureMoveOutcome, CreatureMoveRequest, CreatureMoveTiming, CreatureRestoreError,
-    PreparedCreatureRestore, SERVER_REQUEST_ID_BAND, Simulation, SimulationConfig, TICK_DT_S,
-    TickError,
+    CreatureWalkOutcome, CreatureWalkRequest, PreparedCreatureRestore, SERVER_REQUEST_ID_BAND,
+    Simulation, SimulationConfig, TICK_DT_S, TickError,
 };
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit, warm_index_reuses};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
