@@ -1,7 +1,3 @@
-mod alive_restore;
-mod articulated_motion;
-mod articulated_source;
-mod batch_restore;
 mod rigid_contacts;
 
 use super::*;
@@ -12,33 +8,6 @@ use spall_voxel::{EditPlan, Volume, fixtures};
 const CELL_M: f64 = 0.25;
 const STONE_RHO: f64 = 1000.0;
 const DIRT_RHO: f64 = 3000.0;
-
-#[test]
-fn transition_cast_errors_reject_but_supported_clear_casts_remain_clear() {
-    assert_eq!(
-        require_supported_transition_cast(
-            7,
-            Ok::<Option<usize>, rapier3d::parry::query::Unsupported>(None),
-        ),
-        Ok(None)
-    );
-    assert_eq!(
-        require_supported_transition_cast(
-            7,
-            Err::<Option<usize>, _>(rapier3d::parry::query::Unsupported,)
-        ),
-        Err(crate::articulated::ArticulatedError::UnsupportedTerrainTransitionCast { part_id: 7 })
-    );
-}
-
-#[test]
-fn transition_candidate_budget_is_derived_from_the_exact_cast_cap() {
-    assert_eq!(transition_candidate_limit(0), MAX_TRANSITION_CELL_CASTS);
-    assert_eq!(transition_candidate_limit(1), 1_000_000);
-    assert_eq!(transition_candidate_limit(217), 4_608);
-    assert_eq!(transition_candidate_limit(285), 3_508);
-    assert_eq!(transition_candidate_limit(1_000_001), 0);
-}
 
 fn mix_density(m: MaterialId) -> f64 {
     if m == fixtures::STONE {
@@ -69,120 +38,6 @@ fn mixed_density_grid() -> OccupancyGrid {
     ))
     .unwrap();
     OccupancyGrid::from_region(&v, GlobalCell::new(0, 0, 0), GlobalCell::new(7, 3, 3)).unwrap()
-}
-
-fn one_cell_grid(origin: GlobalCell) -> OccupancyGrid {
-    OccupancyGrid::from_solid_mask(origin, [1, 1, 1], vec![true], vec![fixtures::STONE]).unwrap()
-}
-
-fn one_part(grid: OccupancyGrid, volume: u64, revision: u64) -> crate::articulated::SourcePart {
-    crate::articulated::SourcePart {
-        part_id: 7,
-        parent_id: None,
-        volume_id: VolumeId::new(volume).unwrap(),
-        source_revision: revision,
-        grid,
-        cell_m: 0.25,
-        local_transform: crate::articulated::PartTransform::IDENTITY,
-    }
-}
-
-fn alive_restore_fixture(owner_key: u128) -> crate::articulated::AliveArticulatedRestore {
-    use crate::articulated::{AliveArticulatedPartMotion, AliveArticulatedRestore};
-    let mut root = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 8_101, 2);
-    root.part_id = 1;
-    let mut middle = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 8_102, 3);
-    middle.part_id = 2;
-    middle.parent_id = Some(1);
-    middle.local_transform = crate::articulated::PartTransform {
-        translation_m: [0.5, 0.0, 0.0],
-        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-    };
-    let mut tip = one_part(one_cell_grid(GlobalCell::new(0, 0, 0)), 8_103, 4);
-    tip.part_id = 3;
-    tip.parent_id = Some(2);
-    tip.local_transform = crate::articulated::PartTransform {
-        translation_m: [0.0, 0.5, 0.0],
-        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-    };
-    AliveArticulatedRestore {
-        owner_key,
-        source_generation: 6,
-        topology_token: 44,
-        pose_token: 1,
-        next_component_serial: 1,
-        root_translation_m: [3.0, 0.0, 0.0],
-        root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-        root_linear_velocity_m_s: [0.3, 0.0, 0.0],
-        root_angular_velocity_rad_s: [0.0, 0.0, 0.2],
-        part_motion: vec![
-            AliveArticulatedPartMotion {
-                part_id: 1,
-                linear_velocity_m_s: [0.3, 0.0, 0.0],
-                angular_velocity_rad_s: [0.0, 0.0, 0.2],
-            },
-            AliveArticulatedPartMotion {
-                part_id: 2,
-                linear_velocity_m_s: [0.3, 0.0, 0.0],
-                angular_velocity_rad_s: [0.0, 0.0, 0.4],
-            },
-            AliveArticulatedPartMotion {
-                part_id: 3,
-                linear_velocity_m_s: [0.1, 0.1, 0.0],
-                angular_velocity_rad_s: [0.0, 0.0, 0.1],
-            },
-        ],
-        parts: vec![root, middle, tip],
-    }
-}
-
-fn source_cell_refs(part: &crate::articulated::SourcePart) -> Vec<SourceCellRef> {
-    let origin = part.grid.origin();
-    let mut cells = Vec::new();
-    part.grid.for_each_solid(|x, y, z, material| {
-        cells.push(SourceCellRef {
-            volume_id: part.volume_id,
-            part_id: part.part_id,
-            cell: [
-                (origin.x + i64::from(x)) as i32,
-                (origin.y + i64::from(y)) as i32,
-                (origin.z + i64::from(z)) as i32,
-            ],
-            material,
-            source_revision: part.source_revision,
-        });
-    });
-    cells.sort();
-    cells
-}
-
-fn grid_from_x_cells(xs: &[usize], width: usize) -> OccupancyGrid {
-    let mut mask = vec![false; width];
-    for &x in xs {
-        mask[x] = true;
-    }
-    OccupancyGrid::from_solid_mask(
-        GlobalCell::new(0, 0, 0),
-        [width as u32, 1, 1],
-        mask,
-        vec![fixtures::STONE; width],
-    )
-    .unwrap()
-}
-
-fn restore_component(
-    id: Option<DerivedFractureComponentId>,
-    state: BodyState,
-    cells: Vec<SourceCellRef>,
-) -> crate::articulated::DynamicCorpseComponentRestore {
-    crate::articulated::DynamicCorpseComponentRestore {
-        component_id: id,
-        translation_m: state.translation_m,
-        rotation_xyzw: state.rotation,
-        linear_velocity_m_s: state.linvel_m_s,
-        angular_velocity_rad_s: state.angvel_rad_s,
-        cells,
-    }
 }
 
 fn pushed_cube_speed(density_kg_m3: f64) -> (f32, f32) {

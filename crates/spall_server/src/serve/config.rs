@@ -61,9 +61,9 @@ pub struct HostConfig {
     /// default) keeps the prior in-memory behaviour byte-identical;
     /// ignored when [`Self::residency`] is `None`.
     pub residency_disk_path: Option<PathBuf>,
-    /// Game-owned creature director. `None` keeps the world actor-free. A
-    /// director requires an ephemeral world (`save` unset) until typed actor
-    /// journal replay exists, and fails startup loudly otherwise.
+    /// Game-owned creature director. `None` keeps the world free of animals. A
+    /// director requires an ephemeral world (`save` unset): animals are not
+    /// saved, and startup fails loudly rather than drop them.
     pub creatures: Option<crate::creature_service::CreatureService>,
     /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
     /// damage pass. `None` keeps every prior run byte-identical (the pass is

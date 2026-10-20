@@ -510,9 +510,7 @@ mod tests {
             match op {
                 spall_protocol::TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
                 | spall_protocol::TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => {
-                    *transfer_id = spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT
-                        | crate::transfer_ids::CREATURE_LIFECYCLE_TRANSFER_ID_BIT
-                        | 17;
+                    *transfer_id = spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT | (1_u64 << 61) | 17;
                 }
                 _ => {}
             }
@@ -524,11 +522,8 @@ mod tests {
             .find_map(|op| op.bulk_transfer_id())
             .unwrap();
         for attachment in &mut invalid_set.attachments {
-            if let spall_protocol::TransactionAttachmentV1::Geometry { transfer_id, .. } =
-                attachment
-            {
-                *transfer_id = invalid_id;
-            }
+            let spall_protocol::TransactionAttachmentV1::Geometry { transfer_id, .. } = attachment;
+            *transfer_id = invalid_id;
         }
         let invalid_record = JournalRecord {
             seq: entry.seq.0,

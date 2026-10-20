@@ -12,8 +12,8 @@ use std::collections::{HashSet, VecDeque};
 
 use glam::DVec3;
 use spall_core::{
-    BRUSH_UNIT, BrushPoint, CreatureAllocatorSnapshotV1, EntityId, GlobalCell, IdError, MaterialId,
-    PlayerInput, SphereBrush, Tick, WorldId,
+    BRUSH_UNIT, BrushPoint, EntityId, GlobalCell, IdError, MaterialId, PlayerInput, SphereBrush,
+    Tick,
 };
 use spall_physics::PhysicsOrigin;
 use spall_physics::{CharacterParams, CharacterState};
@@ -29,37 +29,12 @@ use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, TerrainColliderMode, WorldSetup};
 use spall_voxel::Sample;
 
-mod creature_types;
-pub use creature_types::{
-    AuthoritativeCreatureIntent, CommittedCreatureLifecycle, CreatureBirthPartInput,
-};
-
-#[cfg(test)]
-#[path = "creature_bulk_publication_tests.rs"]
-mod creature_bulk_publication_tests;
-
-#[cfg(test)]
-#[path = "creature_lifecycle_review.rs"]
-mod creature_lifecycle_review;
-
-#[cfg(test)]
-#[path = "creature_owner_bridge.rs"]
-mod creature_owner_bridge;
-
 #[path = "creature_motion.rs"]
 mod creature_motion;
 pub use creature_motion::{
-    AliveCreature, CreatureMoveOutcome, CreatureMoveRequest, CreatureMoveTiming,
-    CreatureWalkOutcome, CreatureWalkRequest,
+    CreatureMoveOutcome, CreatureMoveRequest, CreaturePose, CreatureWalkOutcome,
+    CreatureWalkRequest,
 };
-
-#[path = "creature_capture.rs"]
-mod creature_capture;
-pub use creature_capture::CreatureCaptureError;
-
-#[path = "creature_restore.rs"]
-mod creature_restore;
-pub use creature_restore::{CreatureRestoreError, PreparedCreatureRestore};
 
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a
@@ -163,9 +138,6 @@ pub struct Simulation {
     journal: JournalSink,
     pub(crate) tick: Tick,
     next_control_seq: u64,
-    /// Ephemeral per-creature presentation (locomotion selector, clip phase).
-    creature_presentation: std::collections::BTreeMap<spall_core::CreatureKey, (u8, u64)>,
-    creature_move_timing: CreatureMoveTiming,
     next_damage_seq: u64,
     column_water: Option<crate::column_water::AuthoritativeColumnWater>,
     /// Whether the column water steps on its own thread.
@@ -185,8 +157,7 @@ pub struct Simulation {
     footfall_candidates: Vec<crate::footprints::FootfallCandidate>,
     /// The world a reset replaced, being freed on another thread (see [`Retiring`]).
     retiring: Retiring,
-    /// Empty unless the owning application explicitly installs an actor host.
-    /// No public actor-registration or startup-spawn path exists in this slice.
+    /// Empty unless the owning application explicitly installs a creature host.
     creatures: Option<crate::creatures::CreatureHost>,
 }
 
@@ -230,7 +201,6 @@ impl Retiring {
 
 mod construction;
 mod contact_dormancy;
-mod creature_lifecycle;
 mod edit_queries;
 mod helpers;
 mod players;
@@ -238,7 +208,6 @@ mod snow_glue;
 mod tick;
 mod water;
 mod weather;
-use creature_types::*;
 use helpers::*;
 
 #[cfg(test)]
@@ -247,8 +216,6 @@ mod bounding_sphere_brush_tests;
 mod contact_normal_tests;
 #[cfg(test)]
 mod covering_spheres_tests;
-#[cfg(test)]
-mod creature_host_tests;
 #[cfg(test)]
 mod dam_gate_tests;
 #[cfg(test)]

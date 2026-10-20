@@ -372,9 +372,7 @@ pub(super) async fn serve_async(
                     0,
                 );
             }
-            if let Err(error) =
-                sim.initialize_creature_host(spall_core::WorldId::from_u128(T10_WORLD_ID))
-            {
+            if let Err(error) = sim.initialize_creature_host() {
                 return SimResult::error(format!("creature host init failed: {error:?}"), 0);
             }
         }
@@ -1375,24 +1373,20 @@ pub(super) async fn serve_async(
             drop(span_serve_commit_fanout);
             if let Some(service) = creature_service.as_ref() {
                 match service.run_tick(&mut sim) {
-                    Ok(Some(committed)) => {
-                        committed_total += 1;
+                    Ok(roster) if roster.is_empty() => {}
+                    Ok(roster) => {
                         tracing::info!(
                             tick = sim.current_tick().get(),
-                            transaction = committed.transaction_id.get(),
-                            "creature lifecycle committed"
+                            spawned = roster.spawned.len(),
+                            despawned = roster.despawned.len(),
+                            "creature roster changed"
                         );
-                        lj.fan_out_transaction(
-                            Arc::new(committed.topology),
-                            None,
-                            &sim,
-                            &clients_for_sim,
-                        );
+                        let records = roster.into_wire_records();
+                        lj.fan_out_creature_records(records, &clients_for_sim);
                     }
-                    Ok(None) => {}
                     Err(error) => {
                         return SimResult::error(
-                            format!("creature lifecycle commit failed: {error}"),
+                            format!("creature roster update failed: {error}"),
                             ticks_run,
                         );
                     }

@@ -54,8 +54,9 @@ pub enum WireTag {
     ColumnWaterUpdate = 23,
     WeatherSnapshot = 24,
     SnowSurfaceFrame = 25,
-    CreatureSync = 26,
+    CreatureSpawn = 26,
     CreatureMotionFrame = 27,
+    CreatureDespawn = 28,
 }
 
 impl WireTag {
@@ -84,8 +85,9 @@ impl WireTag {
             23 => Self::ColumnWaterUpdate,
             24 => Self::WeatherSnapshot,
             25 => Self::SnowSurfaceFrame,
-            26 => Self::CreatureSync,
+            26 => Self::CreatureSpawn,
             27 => Self::CreatureMotionFrame,
+            28 => Self::CreatureDespawn,
             _ => return None,
         })
     }
@@ -440,8 +442,6 @@ pub struct VolumeHash {
 /// collide with a late-join / repair transfer id (which are small, allocated by
 /// the server's own counter). The low 63 bits are the split's `TransactionId`.
 pub const SPLIT_BULK_TRANSFER_ID_BIT: u64 = 1 << 63;
-/// Reserved lifecycle bulk namespace in the common runtime transfer allocator.
-pub const CREATURE_LIFECYCLE_TRANSFER_ID_BIT: u64 = 1 << 61;
 
 /// Reserved `TransferId` bit marking a full baseline sent after an admin world
 /// reset. The receiving replica *replaces* its world with it instead of merging
@@ -507,20 +507,6 @@ pub enum TopologyOp {
     /// [`TopologyOp::SplitOffBulkBaseline`] children, under the same
     /// `transfer_id`.
     SourcePatchBulkBaseline { source: VolumeId, transfer_id: u64 },
-    /// Versioned actor lifecycle payload in the same ordered transaction.
-    /// This op is structurally validated here; world/catalog validation and
-    /// candidate application belong to the owning simulation or replica.
-    CreatureLifecycle {
-        commit: Box<crate::CreatureLifecycleCommitV4>,
-    },
-    /// Marker for a lifecycle commit delivered through the ordered bulk stream.
-    /// World version 9 carries its bounded payload; this marker alone never applies an actor.
-    CreatureLifecycleBulk {
-        operation_ordinal: u32,
-        payload_schema: u16,
-        commit_hash: Hash32,
-        transfer_id: u64,
-    },
 }
 
 impl TopologyOp {
@@ -529,8 +515,7 @@ impl TopologyOp {
     pub fn bulk_transfer_id(&self) -> Option<u64> {
         match self {
             TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
-            | TopologyOp::SourcePatchBulkBaseline { transfer_id, .. }
-            | TopologyOp::CreatureLifecycleBulk { transfer_id, .. } => Some(*transfer_id),
+            | TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => Some(*transfer_id),
             _ => None,
         }
     }
@@ -616,56 +601,16 @@ impl Record for TopologyTransaction {
                 });
             }
         }
-        let txid = self.transaction_id;
-        let mut lifecycle_transfer_ids = std::collections::BTreeSet::new();
-        let mut transfer_uses = std::collections::BTreeMap::<u64, [u8; 3]>::new();
-        for (ordinal, op) in self.ops.iter().enumerate() {
+        let mut transfer_uses = std::collections::BTreeMap::<u64, [u8; 2]>::new();
+        for op in &self.ops {
             let transfer_use = match op {
                 TopologyOp::SplitOffBulkBaseline { transfer_id, .. } => Some((*transfer_id, 0)),
                 TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => Some((*transfer_id, 1)),
-                TopologyOp::CreatureLifecycleBulk { transfer_id, .. } => Some((*transfer_id, 2)),
                 _ => None,
             };
             if let Some((id, kind)) = transfer_use {
                 let counts = transfer_uses.entry(id).or_default();
                 counts[kind] = counts[kind].saturating_add(1);
-            }
-            if let TopologyOp::CreatureLifecycleBulk {
-                operation_ordinal,
-                payload_schema,
-                transfer_id,
-                ..
-            } = op
-            {
-                let expected_ordinal =
-                    u32::try_from(ordinal).map_err(|_| RecordError::OutOfRange {
-                        field: "TopologyOp.CreatureLifecycleBulk.operation_ordinal",
-                        detail: "operation ordinal does not fit u32",
-                    })?;
-                if *operation_ordinal != expected_ordinal
-                    || *payload_schema != crate::WIRE_SCHEMA_VERSION
-                    || *transfer_id == 0
-                    || !lifecycle_transfer_ids.insert(*transfer_id)
-                {
-                    return Err(RecordError::Inconsistent(
-                        "creature lifecycle bulk schema, ordinal, or transfer id is invalid",
-                    ));
-                }
-            }
-            if let TopologyOp::CreatureLifecycle { commit } = op {
-                let ordinal = u32::try_from(ordinal).map_err(|_| RecordError::OutOfRange {
-                    field: "TopologyOp.CreatureLifecycle.operation_ordinal",
-                    detail: "operation ordinal does not fit u32",
-                })?;
-                if commit.schema != crate::WIRE_SCHEMA_VERSION
-                    || commit.change.schema != crate::WIRE_SCHEMA_VERSION
-                    || commit.change.transaction_id != txid
-                    || commit.change.operation_ordinal != ordinal
-                {
-                    return Err(RecordError::Inconsistent(
-                        "creature lifecycle envelope schema, transaction id, or ordinal mismatch",
-                    ));
-                }
             }
         }
         if transfer_uses.values().any(|counts| {
@@ -673,7 +618,7 @@ impl Record for TopologyTransaction {
                 .iter()
                 .map(|count| usize::from(*count))
                 .sum::<usize>();
-            total > 1 && !(counts[0] > 0 && counts[1] <= 1 && counts[2] == 0)
+            total > 1 && !(counts[0] > 0 && counts[1] <= 1)
         }) {
             return Err(RecordError::Inconsistent(
                 "bulk transfer id is reused outside one geometry split group",
@@ -739,9 +684,7 @@ impl TopologyTransaction {
                 // material-checked where it decodes.
                 TopologyOp::SplitOff { .. }
                 | TopologyOp::SplitOffBulkBaseline { .. }
-                | TopologyOp::SourcePatchBulkBaseline { .. }
-                | TopologyOp::CreatureLifecycle { .. }
-                | TopologyOp::CreatureLifecycleBulk { .. } => continue,
+                | TopologyOp::SourcePatchBulkBaseline { .. } => continue,
                 // A split baseline blob carries whole bricks: decode it and
                 // check every material it names against the manifest.
                 TopologyOp::SplitOffBaseline { blob, .. }
@@ -1085,160 +1028,6 @@ mod tests {
             material: MaterialId(1),
         };
         assert!(tx.validate().is_ok());
-    }
-
-    #[test]
-    fn lifecycle_op_round_trips_and_binds_enclosing_identity() {
-        use crate::{
-            CreatureAssetIdentity, CreatureLifecycleCommitV4, CreatureLifecycleOperationV4,
-            CreatureLifecycleState, CreatureOwnershipRecordV4, CreatureStateV1,
-            WIRE_SCHEMA_VERSION,
-        };
-        use spall_core::{CreatureGeneration, CreatureId, CreatureKey, WorldEpoch, WorldId};
-
-        let key = CreatureKey::new(
-            WorldId::from_u128(11),
-            WorldEpoch::INITIAL,
-            CreatureId::new(3).unwrap(),
-            CreatureGeneration::INITIAL,
-        )
-        .unwrap();
-        let after = CreatureOwnershipRecordV4 {
-            primary_component_serial: None,
-            part_velocities: vec![],
-            schema: WIRE_SCHEMA_VERSION,
-            state: CreatureStateV1 {
-                schema: WIRE_SCHEMA_VERSION,
-                key,
-                state_revision: 1,
-                lifecycle: CreatureLifecycleState::Alive,
-                species_key: "deer".into(),
-                species_version: 1,
-                asset: CreatureAssetIdentity {
-                    uuid: [7; 16],
-                    logical_hash: crate::Hash32([8; 32]),
-                },
-                material_manifest_hash: crate::Hash32([9; 32]),
-                material_mapping_version: 1,
-                material_mapping_hash: crate::Hash32([10; 32]),
-                clip_name: "idle".into(),
-                clip_mode: crate::CreatureClipMode::Playing,
-                clip_phase_tick: 0,
-                clip_subtick_remainder: 0,
-                clip_epoch: 1,
-                source_bindings: vec![],
-                aggregate_topology_revision: 1,
-                pose_epoch: 1,
-                root_translation_m: [0.0; 3],
-                root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                linear_velocity_m_s: [0.0; 3],
-                angular_velocity_rad_s: [0.0; 3],
-                locomotion_tag: 0,
-            },
-            owner_key: 17,
-            source_generation: 1,
-            next_component_serial: 1,
-            parts: vec![],
-            components: vec![],
-        };
-        let transaction_id = TransactionId::new(42).unwrap();
-        let commit = CreatureLifecycleCommitV4 {
-            schema: WIRE_SCHEMA_VERSION,
-            change: crate::CreatureLifecycleChangeV4 {
-                schema: crate::WIRE_SCHEMA_VERSION,
-                transaction_id,
-                operation_ordinal: 0,
-                expected_before_hash: crate::Hash32::ZERO,
-                expected_after_hash: after.canonical_hash(),
-                operation: CreatureLifecycleOperationV4::Birth { after },
-            },
-            expected_before_topology_hash: crate::Hash32::ZERO,
-            pre_motion: None,
-            death_witness: None,
-        };
-        let mut tx = TopologyTransaction {
-            transaction_id,
-            server_tick: Tick(5),
-            control_seq: ControlSeq(1),
-            algorithm_version: 1,
-            dependencies: vec![],
-            before: vec![],
-            after: vec![],
-            ops: vec![TopologyOp::CreatureLifecycle {
-                commit: Box::new(commit.clone()),
-            }],
-            result_hashes: vec![],
-        };
-
-        assert!(tx.validate().is_ok());
-        let encoded = crate::encode_control(&tx).unwrap();
-        assert_eq!(
-            u16::from_le_bytes([encoded[0], encoded[1]]),
-            WIRE_SCHEMA_VERSION
-        );
-        assert_eq!(
-            crate::decode_control::<TopologyTransaction>(&encoded).unwrap(),
-            tx
-        );
-        let mut old_wire = encoded.clone();
-        old_wire[..2].copy_from_slice(&(WIRE_SCHEMA_VERSION - 1).to_le_bytes());
-        assert!(matches!(
-            crate::decode_control::<TopologyTransaction>(&old_wire),
-            Err(crate::CodecError::SchemaVersion { expected, found })
-                if expected == WIRE_SCHEMA_VERSION && found == WIRE_SCHEMA_VERSION - 1
-        ));
-        let mut multiple = tx.clone();
-        let mut second = commit.clone();
-        second.change.operation_ordinal = 1;
-        multiple.ops.push(TopologyOp::CreatureLifecycle {
-            commit: Box::new(second),
-        });
-        assert!(
-            multiple.validate().is_ok(),
-            "bounded multiple lifecycle ops are valid structurally"
-        );
-        let initial_hash = commit.canonical_hash();
-        let mut altered = commit.clone();
-        altered.expected_before_topology_hash = crate::Hash32([1; 32]);
-        assert_ne!(altered.canonical_hash(), initial_hash);
-
-        if let TopologyOp::CreatureLifecycle { commit } = &mut tx.ops[0] {
-            commit.change.operation_ordinal = 1;
-        }
-        assert!(matches!(tx.validate(), Err(RecordError::Inconsistent(_))));
-        if let TopologyOp::CreatureLifecycle { commit } = &mut tx.ops[0] {
-            commit.change.operation_ordinal = 0;
-            commit.change.transaction_id = TransactionId::new(43).unwrap();
-        }
-        assert!(matches!(tx.validate(), Err(RecordError::Inconsistent(_))));
-
-        let mut wrong_schema = tx.clone();
-        if let TopologyOp::CreatureLifecycle { commit } = &mut wrong_schema.ops[0] {
-            commit.change.transaction_id = transaction_id;
-            commit.schema += 1;
-        }
-        assert!(matches!(
-            wrong_schema.validate(),
-            Err(RecordError::Inconsistent(_))
-        ));
-
-        let mut oversized = tx.clone();
-        if let TopologyOp::CreatureLifecycle { commit } = &mut oversized.ops[0] {
-            commit.change.transaction_id = transaction_id;
-            commit.change.operation_ordinal = 0;
-            if let CreatureLifecycleOperationV4::Birth { after } = &mut commit.change.operation {
-                after.state.species_key = "x".repeat(70 * 1024);
-            }
-        }
-        assert!(oversized.validate().is_ok());
-        assert!(matches!(
-            oversized.replay_identity_hash(),
-            Err(crate::CodecError::FrameTooLarge { .. })
-        ));
-        assert!(matches!(
-            crate::encode_control(&oversized),
-            Err(crate::CodecError::Size(_))
-        ));
     }
 
     #[test]

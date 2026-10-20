@@ -89,7 +89,6 @@ fn a_walking_player_travels_across_the_generated_meadow() {
             view_dir: [0.0, 0.0, -1.0],
             buttons: 0,
         }],
-        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 1000,

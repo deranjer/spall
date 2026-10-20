@@ -6,15 +6,12 @@ use spall_sim::{Simulation, SimulationConfig, fixtures};
 fn invalid_transfer_reservations_do_not_advance_the_tick_or_world() {
     let split = SPLIT_BULK_TRANSFER_ID_BIT;
     let reset = WORLD_RESET_TRANSFER_ID_BIT;
-    let lifecycle = 1_u64 << 61;
     for ids in [
         vec![TransferId(0)],
         vec![TransferId(1)],
         vec![TransferId(reset | 1)],
-        vec![TransferId(lifecycle | 1)],
         vec![TransferId(split)],
         vec![TransferId(split | reset | 1)],
-        vec![TransferId(split | lifecycle | 1)],
         vec![TransferId(split | 1), TransferId(split | 1)],
     ] {
         let mut sim =

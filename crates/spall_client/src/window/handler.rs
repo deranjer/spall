@@ -423,11 +423,10 @@ impl ApplicationHandler for InteractiveApp {
                 if let Some(view) = &self.creature_view
                     && let Some(replica) =
                         self.session.replica.get().and_then(|r| r.try_lock().ok())
-                    && let Some(creatures) = replica.creatures()
-                    && !creatures.is_empty()
+                    && !replica.creatures().is_empty()
                 {
                     overlay.extend(view.instances(
-                        creatures,
+                        replica.creatures(),
                         replica.now_tick_estimate(),
                         Instant::now(),
                     ));

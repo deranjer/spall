@@ -7,7 +7,7 @@ use super::*;
 pub(super) enum QueuedItem {
     Tx(Arc<TopologyTransaction>),
     Blob(Arc<BaselineTransfer>),
-    /// Ordered reliable records (creature join sync).
+    /// Ordered reliable records (creature spawns and despawns).
     Records(Arc<Vec<WireRecord>>),
 }
 
@@ -177,26 +177,39 @@ impl LateJoin {
     }
 
     /// Initial catch-up queue for a joining client: the creatures held right
-    /// now, ahead of every transaction committed after this instant.
+    /// now, ahead of every spawn and transaction committed after this instant.
     pub(super) fn creature_seed(&self, sim: &Simulation) -> VecDeque<QueuedItem> {
         let mut queue = VecDeque::new();
         let Some(service) = self.creatures.as_ref() else {
             return queue;
         };
-        match service.join_sync(sim) {
-            Ok(syncs) if syncs.is_empty() => {}
-            Ok(syncs) => {
-                let records: Vec<WireRecord> = syncs
-                    .into_iter()
-                    .map(|sync| WireRecord::CreatureSync(Box::new(sync)))
-                    .collect();
-                queue.push_back(QueuedItem::Records(Arc::new(records)));
-            }
-            Err(error) => {
-                tracing::error!(%error, "creature join sync failed; the client will miss existing animals");
-            }
+        let records: Vec<WireRecord> = service
+            .join_records(sim)
+            .into_iter()
+            .map(WireRecord::CreatureSpawn)
+            .collect();
+        if !records.is_empty() {
+            queue.push_back(QueuedItem::Records(Arc::new(records)));
         }
         queue
+    }
+
+    /// Announces creature spawns/despawns: live clients get them now, clients
+    /// still installing a baseline get them after it, in order.
+    pub(super) fn fan_out_creature_records(
+        &mut self,
+        records: Vec<WireRecord>,
+        clients: &ClientMap,
+    ) {
+        let records = Arc::new(records);
+        for link in self.links.values_mut() {
+            match &mut link.phase {
+                Phase::Live => send_to(clients, link.session, Outbound::Water(records.clone())),
+                Phase::Joining { queue, .. } => {
+                    queue.push_back(QueuedItem::Records(records.clone()))
+                }
+            }
+        }
     }
 
     pub(super) fn backing_ref(&self) -> Option<&dyn spall_sim::BrickBacking> {
@@ -543,8 +556,7 @@ impl LateJoin {
         let current = sim.journal().entries().iter().flat_map(|entry| {
             entry.transaction.ops.iter().filter_map(|op| match op {
                 spall_protocol::TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
-                | spall_protocol::TopologyOp::SourcePatchBulkBaseline { transfer_id, .. }
-                | spall_protocol::TopologyOp::CreatureLifecycleBulk { transfer_id, .. } => {
+                | spall_protocol::TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => {
                     Some(TransferId(*transfer_id))
                 }
                 _ => None,
@@ -997,8 +1009,7 @@ mod tests {
         drop(sender);
         lj.pending_captures
             .insert(session.raw(), (TransferId(78), receiver));
-        lj.transfer_ids
-            .set_next_low_for_test(crate::transfer_ids::CREATURE_LIFECYCLE_TRANSFER_ID_BIT);
+        lj.transfer_ids.set_next_low_for_test(1_u64 << 61);
 
         // This is the production Admin ResetWorld preflight. Exhaustion returns
         // before the handler captures/replaces the world or mutates transfer state.
@@ -1022,10 +1033,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(
-            lj.transfer_ids.next_low(),
-            crate::transfer_ids::CREATURE_LIFECYCLE_TRANSFER_ID_BIT
-        );
+        assert_eq!(lj.transfer_ids.next_low(), 1_u64 << 61);
     }
 
     /// ENG-30 / T23 row 11, increment 30: a 1-worker [`CapturePool`] must run

@@ -120,9 +120,7 @@ impl Replica {
                 TopologyOp::SplitOffBaseline { .. }
                 | TopologyOp::SourcePatchBaseline { .. }
                 | TopologyOp::SplitOffBulkBaseline { .. }
-                | TopologyOp::SourcePatchBulkBaseline { .. }
-                | TopologyOp::CreatureLifecycle { .. }
-                | TopologyOp::CreatureLifecycleBulk { .. } => {
+                | TopologyOp::SourcePatchBulkBaseline { .. } => {
                     panic!("test applier does not handle this topology op")
                 }
             }

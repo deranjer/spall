@@ -143,7 +143,6 @@ fn run_session(
         join_token: token,
         script: Vec::new(),
         movement_script: script,
-        creature_catalog: None,
         late_join,
         baseline_scene: BaselineScene::Walk,
         run_ticks: total_ticks,

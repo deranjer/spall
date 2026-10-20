@@ -265,8 +265,8 @@ re-enters through the existing baseline/repair path.
 
 `spall_store` (`-> spall_protocol`) owns the durable save schema and SQLite I/O
 only, never simulation objects. It exposes: a versioned save schema
-(`STORE_SCHEMA_VERSION`, the one save version shared with the ecology and creature
-checkpoint formats; a `PRAGMA user_version` guard rejects any other database untouched, with an
+(`STORE_SCHEMA_VERSION`, the one save version shared with the ecology
+formats; a `PRAGMA user_version` guard rejects any other database untouched, with an
 "incompatible save" error), zstd-compressed brick payloads with one-brick-bounded decode, a
 single WAL `Writer` that verifies `journal_mode=WAL` + `synchronous=FULL` on
 open and returns a `DurableThrough` only after a successful `COMMIT`, checkpoint
@@ -561,81 +561,16 @@ geometry even outside current interest. Global water/ecology replication is unch
 reduces initial terrain geometry transfer/client residency; it is not server region generation,
 interest-filtered transactions, or distant visual LOD. Those require separate measured work.
 
-## ENG-218 animal ownership integration boundary
+## Animals
 
-Animal source volumes have separate ownership from terrain and ordinary bodies.
-Lifecycle changes belong in the existing ordered topology transaction and journal,
-sharing the world ID allocators and transaction replay receipt. The accepted
-current protocol/wire-12 inline operation and typed bulk marker are framing boundaries: current client and
-geometry-only replay consumers reject actor-bearing transactions before mutation.
-An internal authoritative prepare/validate/publish path now supports inline birth,
-checked death and mixed geometry without publishing a partial candidate. It is
-not connected to live tick admission; dormant mixed targets reject until waking
-can be staged atomically. Bulk, replica, baseline and ordered store replay consumers remain under implementation;
-production animal spawning is disabled. See
-[ENG-218 design](reports/ENG-218-design.md) and
-[measured progress](reports/ENG-218-progress.md).
-
-Only current protocol and save layouts are supported. Old journal headers are
-never rewritten; older DTO layouts and incomplete current store schemas are
-rejected without migration or backfill. Recovery from a complete valid checkpoint
-after corruption remains part of the durability contract.
-
-
-ENG-218 now exposes an opaque joint cold-restore candidate after geometry recovery.
-It stages saved-ID host/source/provenance/frozen-pose state and one bounded physics
-batch, fences the existing shared registry and geometry namespace, and publishes
-all participants together without new IDs or journal entries. It requires an
-uninitialized host and all source indexes empty; initialized empty hosts cannot
-be replaced. Existing geometry/physics/journal/origin fences invalidate stale or
-foreign candidates. Complete actor checkpoint/baseline and ordered journal/replica
-consumers remain the next integration work; production spawning stays disabled.
-
-
-ENG-218 current store schema5 retains the schema4 atomic format and carries a required complete animal checkpoint
-section alongside geometry/environment/cursor state. Catalog-aware capture and
-detached rebuild use the existing bounded SnapshotV2 and joint installer, retaining
-saved IDs/counters, independent motion, fragment masks/primary/high-water and the
-exact physics origin. A separate full snapshot hash and checkpoint topology
-composition version3 bind the population without changing actor-free geometry
-vectors. Catalog-free APIs and the geometry-only world hash remain guarded.
-Missing/invalid animal rows are corruption, not empty population. Explicit prior
-checkpoint selection reloads that checkpoint's own suffix; semantic reconstruction
-failures do not silently choose older history. Until typed actor replay exists,
-writer publication refuses unsupported animal suffixes and future journal appends
-after an initialized-host checkpoint. Live spawning/serve scheduling and baseline/
-replica/attachment consumers remain closed; this is not 1km launch acceptance.
-
-The full catalog-aware checkpoint adapter refuses any evicted geometry before
-capture. ResidencyPass::capture_checkpoint_with_catalog instead assembles complete
-logical terrain from its revision cache and digest-verified backing, then captures
-the same validated animal/environment section. Its cache is bound to the installed
-SimWorld runtime instance; another or replaced world refuses before cache/backing
-access. Cache and counters publish only after the complete checkpoint succeeds.
-Evicted ordinary bodies refuse because this pass reconstructs terrain only.
-The catalog-free entrypoint still refuses initialized hosts. Live serve catalog
-handoff and typed animal journal/baseline/replica consumers remain prerequisites;
-this checkpoint adapter alone is not live 1km animal persistence acceptance.
-
-
-ENG-218 typed journal transport now uses store5 TopologyAttachments with the
-existing bounded typed attachment-set protocol. Actual terrain journal conversion,
-recovery and retained transfer-ID startup seeding use this path; the previous
-geometry-only durable variant is removed. SQLite rows retain parent/participants
-and complete attachment set atomically with the existing outbox, CRC and durable
-sequence. Decoder budgets, parent/marker correlation and row-tick validation fail
-before use/publication; corrupt rows terminate the reported durable prefix.
-Geometry-only runtime replay remains functional. Lifecycle or mixed attachments
-are retained by the storage transport but explicitly refused by runtime replay
-until the joint Simulation consumer exists. Live animals remain gated.
-
-
-ENG-218 bulk producer now prepares exact typed attachment sets in the same
-candidate as host/source/physics/registry changes. Caller-supplied bounded transfer
-reservations precede marker hashing; oversized actor payloads use existing V4 bulk
-markers while inline work stays inline. Both geometry and lifecycle producers
-carry JournalEntry.attachments unchanged to the store adapter. Codec/work/ID
-failure or stale candidate never publishes a prefix. Real three-part Birth,
-independently animated checked Death and full-size mixed terrain split tests cover
-one-entry publication. The live server scheduling/reservation caller and client/
-recovery consumers remain closed; this is not combined 1km launch acceptance.
+An animal is a plain server-authoritative entity: `CreatureRecord` (id, species
+key, root pose, locomotion tag, clip phase). It is drawn from the species' SPVX
+asset and owns no world voxels, so it is not part of any volume hash, journal
+entry or transaction. `spall_sim` keeps the records (`creatures.rs`) and moves
+them by sweeping a capsule against terrain with the same kinematic controller
+players use (`creature_motion.rs`); the game's `CreatureDirector`
+(`spall_server::creature_service`) decides where each one goes. Spawn and despawn
+are replicated records, and positions travel in `CreatureMotionFrame`s; see
+[protocol](protocol.md#creatures). Players and bodies do not collide with
+animals. Worlds with animals cannot be saved. The design and the planned hunting
+path are in [animal lifecycle](animal-lifecycle.md).

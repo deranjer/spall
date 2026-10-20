@@ -325,7 +325,6 @@ fn client_config(
         join_token: token,
         script: Vec::new(),
         movement_script,
-        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::Walk,
         run_ticks: SERVER_TICKS,

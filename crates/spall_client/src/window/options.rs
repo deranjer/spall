@@ -22,7 +22,7 @@ pub struct InteractiveOptions {
     pub creature_view: Option<std::sync::Arc<dyn CreatureView>>,
 }
 
-/// Turns replicated creature ownership records into cubes to draw this frame.
+/// Turns replicated creatures into cubes to draw this frame.
 /// The engine owns replication; the game owns what a species looks like.
 pub trait CreatureView: Send + Sync + std::fmt::Debug {
     /// `tick` is the estimated present server tick, fractional, for animation.
