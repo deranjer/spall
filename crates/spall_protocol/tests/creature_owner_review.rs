@@ -191,7 +191,7 @@ impl Fixture {
     }
     fn state(&self) -> CreatureStateV1 {
         CreatureStateV1 {
-            schema: CREATURE_STATE_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             key: CreatureKey::new(
                 WorldId::from_u128(900),
                 WorldEpoch::INITIAL,
@@ -233,7 +233,7 @@ fn owner(f: &Fixture) -> CreatureOwnershipRecordV4 {
     let q = [0.0_f32, 0.0, 0.0, 1.0];
     let pose = serde_json::json!({"translation_m": [0.0,0.0,0.0], "rotation_xyzw": q});
     let raw = serde_json::json!({
-        "schema": 5, "state": state, "owner_key": 9, "source_generation": 1,
+        "schema": spall_protocol::WIRE_SCHEMA_VERSION, "state": state, "owner_key": 9, "source_generation": 1,
         "next_component_serial": 1, "primary_component_serial": null, "part_velocities": [],
         "parts": [{
             "part_id": 1, "source_volume_id": 100, "source_generation": 1,
@@ -307,7 +307,7 @@ fn population_decode_roundtrips_distinct_sources_and_still_requires_semantic_val
     second.components[0].owner_key = 10;
     second.components[0].source_masks[0].volume_id = volume;
     let set = CreatureOwnershipSetV4 {
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         records: vec![first, second],
     };
     set.validate(&f.catalog()).unwrap();
@@ -365,7 +365,7 @@ fn population_decode_charges_compact_uniform_solids_across_records() {
     let full = compact_cost_record(&f, 30, 1); // 983,040 solids per record.
     let tail = compact_cost_record(&f, 2, 1);
     let mut set = CreatureOwnershipSetV4 {
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         records: vec![full.clone(), full.clone(), full.clone(), full, tail],
     };
     for record in &set.records {
@@ -394,7 +394,7 @@ fn population_decode_charges_compact_uniform_solids_across_records() {
 fn population_decode_limits_air_brick_metadata_across_records() {
     let f = Fixture::new();
     let mut set = CreatureOwnershipSetV4 {
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         records: vec![
             compact_cost_record(&f, 2048, 0),
             compact_cost_record(&f, 2048, 0),
@@ -435,7 +435,7 @@ fn population_state_strings_enforce_byte_limits_before_semantic_validation() {
     record.state.clip_name = format!("{}a", "é".repeat(127));
     assert_eq!(record.state.clip_name.len(), MAX_CREATURE_CLIP_NAME_BYTES);
     let mut set = CreatureOwnershipSetV4 {
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         records: vec![record],
     };
     postcard::from_bytes::<CreatureOwnershipSetV4>(&postcard::to_allocvec(&set).unwrap()).unwrap();
@@ -478,7 +478,7 @@ fn population_nested_fixed_metadata_rejects_unknown_map_fields() {
             .as_object_mut()
             .unwrap()
             .insert("unknown_extension".into(), serde_json::json!([1, 2, 3]));
-        let value = serde_json::json!({"schema": CREATURE_OWNER_SCHEMA, "records": [record]});
+        let value = serde_json::json!({"schema": WIRE_SCHEMA_VERSION, "records": [record]});
         let Err(error) = serde_json::from_value::<CreatureOwnershipSetV4>(value) else {
             panic!("unknown map metadata was accepted at {path}");
         };
@@ -495,7 +495,7 @@ fn population_decode_refuses_excess_source_binding_before_reading_its_body() {
     // This would fail with a type error if the over-limit item's body were read.
     bindings.push(serde_json::json!("body must not be decoded"));
     record["state"]["source_bindings"] = serde_json::Value::Array(bindings);
-    let value = serde_json::json!({"schema": CREATURE_OWNER_SCHEMA, "records": [record]});
+    let value = serde_json::json!({"schema": WIRE_SCHEMA_VERSION, "records": [record]});
     let error = serde_json::from_str::<CreatureOwnershipSetV4>(&value.to_string()).unwrap_err();
     assert!(
         error.to_string().contains("source binding limit"),
@@ -720,7 +720,7 @@ fn empty_source_parts_keep_identity_hierarchy_and_hashes_without_invented_cells(
 fn population_snapshot_retains_empty_allocator_gaps_and_checks_shared_namespace() {
     let f = Fixture::new();
     let mut snapshot = CreatureSnapshotV2 {
-        schema: CREATURE_SNAPSHOT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         allocator: context(7, 42, 900).allocator,
         next_volume_id: 900,
         owners: CreatureOwnershipSetV4::empty(),
@@ -791,7 +791,7 @@ fn context(
         operation_ordinal: 0,
         replay_receipt: None,
         allocator: spall_core::CreatureAllocatorSnapshotV1 {
-            schema: 1,
+            schema: spall_core::STORE_SCHEMA_VERSION_U16,
             world_id: WorldId::from_u128(900),
             world_epoch: 1,
             next_creature_id: next_creature,
@@ -805,7 +805,7 @@ fn context(
 }
 fn birth(record: CreatureOwnershipRecordV4) -> CreatureLifecycleChangeV4 {
     CreatureLifecycleChangeV4 {
-        schema: spall_protocol::CREATURE_CHANGE_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         transaction_id: spall_core::TransactionId::new(7).unwrap(),
         operation_ordinal: 0,
         expected_before_hash: Hash32::ZERO,
@@ -860,7 +860,7 @@ fn measured_nonrigid_part_velocities_roundtrip_and_fence_only_motion() {
         moving
     );
     let set = CreatureOwnershipSetV4 {
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         records: vec![moving.clone()],
     };
     assert_eq!(
@@ -1043,7 +1043,7 @@ fn death_requires_witness_and_preserves_definition_and_source_data() {
         frozen_local_poses: vec![(1, after.parts[0].frozen_local_pose)],
     };
     let change_for = |record: CreatureOwnershipRecordV4| CreatureLifecycleChangeV4 {
-        schema: spall_protocol::CREATURE_CHANGE_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         transaction_id: spall_core::TransactionId::new(8).unwrap(),
         operation_ordinal: 0,
         expected_before_hash: current.canonical_hash(),
@@ -1223,9 +1223,9 @@ fn moved_death_for_review(f: &Fixture) -> (CreatureOwnershipRecordV4, CreatureLi
             .collect(),
     };
     let commit = CreatureLifecycleCommitV4 {
-        schema: spall_protocol::CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         change: CreatureLifecycleChangeV4 {
-            schema: spall_protocol::CREATURE_CHANGE_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             transaction_id: spall_core::TransactionId::new(8).unwrap(),
             operation_ordinal: 0,
             expected_before_hash: moved.canonical_hash(),

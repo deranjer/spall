@@ -73,7 +73,6 @@ pub struct ColumnWaterUpdate {
 
 impl Record for ColumnWaterUpdate {
     const TAG: WireTag = WireTag::ColumnWaterUpdate;
-    const SCHEMA_VERSION: u16 = 2;
     fn validate(&self) -> Result<(), RecordError> {
         if self.window >= WINDOWS_PER_REGION
             || self.frame_seq == 0

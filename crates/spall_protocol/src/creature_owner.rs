@@ -4,6 +4,7 @@
 //! but this module does not allocate transaction/journal sequences or publish
 //! state to any of those consumers.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Deserializer, Serialize, de::SeqAccess, de::Visitor};
 use spall_core::{CreatureAllocatorSnapshotV1, CreatureKey, MaterialId, TransactionId, VolumeId};
 use std::{
@@ -18,10 +19,8 @@ use crate::{
     MAX_CREATURE_LINEAR_VELOCITY_M_S, MAX_CREATURE_POSITION_M,
 };
 
-pub const CREATURE_OWNER_SCHEMA: u16 = 5;
 pub const CREATURE_OWNER_DOMAIN: &[u8] = b"spall.creature-owner.v4";
 pub const CREATURE_OWNER_SET_DOMAIN: &[u8] = b"spall.creature-owner-set.v4";
-pub const CREATURE_CHANGE_SCHEMA: u16 = 5;
 pub const CREATURE_CHANGE_DOMAIN: &[u8] = b"spall.creature-change.v4";
 pub const MAX_CREATURE_OWNER_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CREATURE_OWNER_PARTS: usize = 256;
@@ -657,7 +656,7 @@ impl CreatureLifecycleChangeV4 {
         &self,
         catalog: &CreatureValidationCatalog<'_>,
     ) -> Result<(), CreatureOwnershipError> {
-        if self.schema != CREATURE_CHANGE_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(CreatureOwnershipError::Schema);
         }
         match &self.operation {
@@ -757,7 +756,7 @@ impl CreatureOwnershipRecordV4 {
         catalog: &CreatureValidationCatalog<'_>,
     ) -> Result<(), CreatureOwnershipError> {
         validate_record_work_bounds(self)?;
-        if self.schema != CREATURE_OWNER_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(CreatureOwnershipError::Schema);
         }
         self.state.validate(catalog)?;
@@ -1239,7 +1238,7 @@ fn validate_record_work_bounds(
 impl CreatureOwnershipSetV4 {
     pub fn empty() -> Self {
         Self {
-            schema: CREATURE_OWNER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             records: Vec::new(),
         }
     }
@@ -1292,7 +1291,7 @@ impl CreatureOwnershipSetV4 {
     /// Catalog-independent resource admission, not semantic validation.
     /// Bounds complete aggregate traversal before encoding or hashing stored input.
     pub fn validate_resources(&self) -> Result<(), CreatureOwnershipError> {
-        if self.schema != CREATURE_OWNER_SCHEMA
+        if self.schema != WIRE_SCHEMA_VERSION
             || self.records.len() > MAX_CREATURE_OWNER_SET_RECORDS
             || self
                 .records
@@ -1480,7 +1479,7 @@ pub fn reduce_creature_lifecycle_candidate(
     context: CreatureLifecycleContextV1<'_>,
     catalog: &CreatureValidationCatalog<'_>,
 ) -> Result<CreatureLifecycleCandidateV1, CreatureOwnershipError> {
-    if change.schema != CREATURE_CHANGE_SCHEMA
+    if change.schema != WIRE_SCHEMA_VERSION
         || change.transaction_id != context.transaction_id
         || change.operation_ordinal != context.operation_ordinal
     {
@@ -1554,7 +1553,7 @@ pub fn reduce_creature_lifecycle_candidate(
                 || after.state.key.world_id != context.allocator.world_id
                 || after.state.key.world_epoch.get() != context.allocator.world_epoch
                 || after.state.key.creature_id.get() != context.allocator.next_creature_id
-                || context.allocator.schema != spall_core::CREATURE_ALLOCATOR_SCHEMA
+                || context.allocator.schema != spall_core::STORE_SCHEMA_VERSION_U16
                 || context.allocator.next_creature_id == 0
                 || context.allocator.world_id.is_nil()
                 || context.allocator.world_epoch == 0
@@ -1629,7 +1628,7 @@ fn validate_reducer_context(
     current: Option<&CreatureOwnershipRecordV4>,
     context: CreatureLifecycleContextV1<'_>,
 ) -> Result<(), CreatureOwnershipError> {
-    if context.allocator.schema != spall_core::CREATURE_ALLOCATOR_SCHEMA
+    if context.allocator.schema != spall_core::STORE_SCHEMA_VERSION_U16
         || context.allocator.world_id.is_nil()
         || context.allocator.world_epoch == 0
         || context.allocator.next_creature_id == 0
@@ -2074,7 +2073,7 @@ mod topology_motion_hash_tests {
         )
         .unwrap();
         let state = CreatureStateV1 {
-            schema: 1,
+            schema: WIRE_SCHEMA_VERSION,
             key,
             state_revision: 1,
             lifecycle: crate::CreatureLifecycleState::Alive,
@@ -2104,7 +2103,7 @@ mod topology_motion_hash_tests {
         CreatureOwnershipRecordV4 {
             primary_component_serial: None,
             part_velocities: vec![],
-            schema: CREATURE_OWNER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             state,
             owner_key: 1,
             source_generation: 1,
@@ -2133,7 +2132,6 @@ mod topology_motion_hash_tests {
     }
 }
 
-pub const CREATURE_LIFECYCLE_COMMIT_SCHEMA: u16 = 5;
 pub const CREATURE_LIFECYCLE_COMMIT_DOMAIN: &[u8] = b"spall.creature-lifecycle-commit.v4";
 const MAX_COMMIT_PART_POSES: usize = MAX_CREATURE_OWNER_PARTS;
 const MAX_COMMIT_COMPONENT_MOTIONS: usize = MAX_CREATURE_OWNER_COMPONENTS;
@@ -2422,7 +2420,7 @@ impl CreatureLifecycleCommitV4 {
         if context.replay_receipt.is_some() {
             return Err(CreatureOwnershipError::DivergentReplay);
         }
-        if self.schema != CREATURE_LIFECYCLE_COMMIT_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(CreatureOwnershipError::Schema);
         }
         // Check all declared work before sizing or cloning potentially large values.
@@ -2523,9 +2521,9 @@ mod lifecycle_commit_hash_tests {
         let after = CreatureOwnershipRecordV4 {
             primary_component_serial: None,
             part_velocities: vec![],
-            schema: CREATURE_OWNER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             state: CreatureStateV1 {
-                schema: 1,
+                schema: WIRE_SCHEMA_VERSION,
                 key,
                 state_revision: 1,
                 lifecycle: crate::CreatureLifecycleState::Alive,
@@ -2559,7 +2557,7 @@ mod lifecycle_commit_hash_tests {
             components: vec![],
         };
         let change = CreatureLifecycleChangeV4 {
-            schema: CREATURE_CHANGE_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             transaction_id: TransactionId::new(1).unwrap(),
             operation_ordinal: 0,
             expected_before_hash: Hash32::ZERO,
@@ -2567,7 +2565,7 @@ mod lifecycle_commit_hash_tests {
             operation: CreatureLifecycleOperationV4::Birth { after },
         };
         CreatureLifecycleCommitV4 {
-            schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             change,
             expected_before_topology_hash: Hash32::ZERO,
             pre_motion: None,
@@ -2643,7 +2641,7 @@ impl CreatureLifecycleCommitV4 {
         if context.replay_receipt.is_some() {
             return Err(CreatureOwnershipError::DivergentReplay);
         }
-        if self.schema != CREATURE_LIFECYCLE_COMMIT_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(CreatureOwnershipError::Schema);
         }
         if self.pre_motion.as_ref().is_some_and(|o| {

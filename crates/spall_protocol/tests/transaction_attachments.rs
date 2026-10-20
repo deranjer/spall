@@ -3,14 +3,12 @@ use spall_core::{
     WorldEpoch, WorldId,
 };
 use spall_protocol::{
-    BASELINE_WORLD_SCHEMA, BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume,
-    BaselineWorld, CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
-    CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA, CREATURE_STATE_SCHEMA, ControlSeq,
+    BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume, BaselineWorld, ControlSeq,
     CreatureAssetIdentity, CreatureLifecycleBulkPayloadV4, CreatureLifecycleChangeV4,
     CreatureLifecycleCommitV4, CreatureLifecycleOperationV4, CreatureLocalPoseV1,
-    CreatureOwnershipRecordV4, CreatureSourcePartV2, CreatureStateV1, Hash32,
-    TRANSACTION_ATTACHMENT_SET_SCHEMA, TopologyOp, TopologyTransaction, TransactionAttachmentError,
-    TransactionAttachmentSetV1, TransactionAttachmentV1, ValidatedTransactionAttachmentV1,
+    CreatureOwnershipRecordV4, CreatureSourcePartV2, CreatureStateV1, Hash32, TopologyOp,
+    TopologyTransaction, TransactionAttachmentError, TransactionAttachmentSetV1,
+    TransactionAttachmentV1, ValidatedTransactionAttachmentV1, WIRE_SCHEMA_VERSION,
     decode_for_transaction,
 };
 
@@ -63,7 +61,7 @@ fn split_transaction() -> TopologyTransaction {
 
 fn split_world() -> BaselineWorld {
     BaselineWorld {
-        schema: BASELINE_WORLD_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         checkpoint_tick: 12,
         volumes: vec![
             volume(1, BaselineOwner::Terrain),
@@ -77,9 +75,9 @@ fn lifecycle_commit(transaction_id: TransactionId) -> CreatureLifecycleCommitV4 
     let after = CreatureOwnershipRecordV4 {
         primary_component_serial: None,
         part_velocities: vec![],
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         state: CreatureStateV1 {
-            schema: CREATURE_STATE_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             key: CreatureKey::new(
                 WorldId::from_u128(9),
                 WorldEpoch::INITIAL,
@@ -119,7 +117,7 @@ fn lifecycle_commit(transaction_id: TransactionId) -> CreatureLifecycleCommitV4 
         components: vec![],
     };
     let change = CreatureLifecycleChangeV4 {
-        schema: CREATURE_CHANGE_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id,
         operation_ordinal: 0,
         expected_before_hash: Hash32::ZERO,
@@ -127,7 +125,7 @@ fn lifecycle_commit(transaction_id: TransactionId) -> CreatureLifecycleCommitV4 
         operation: CreatureLifecycleOperationV4::Birth { after },
     };
     CreatureLifecycleCommitV4 {
-        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         change,
         expected_before_topology_hash: Hash32::ZERO,
         pre_motion: None,
@@ -192,7 +190,7 @@ fn lifecycle_set_with_five_compact_uniform_records()
         .unwrap();
         ops.push(TopologyOp::CreatureLifecycleBulk {
             operation_ordinal: ordinal,
-            payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+            payload_schema: WIRE_SCHEMA_VERSION,
             commit_hash: payload.commit_hash,
             transfer_id,
         });
@@ -213,7 +211,7 @@ fn lifecycle_set_with_five_compact_uniform_records()
         result_hashes: vec![],
     };
     let set = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id,
         attachments,
     };
@@ -224,7 +222,7 @@ fn lifecycle_set_with_five_compact_uniform_records()
 fn typed_attachment_roundtrip_preserves_shared_geometry_split_group() {
     let transaction = split_transaction();
     let set = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         attachments: vec![TransactionAttachmentV1::Geometry {
             transfer_id: 77,
@@ -260,7 +258,7 @@ fn typed_attachment_roundtrip_preserves_shared_geometry_split_group() {
 fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
     let transaction = split_transaction();
     let empty = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         attachments: vec![],
     };
@@ -270,7 +268,7 @@ fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
     ));
 
     let extra_id = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         attachments: vec![TransactionAttachmentV1::Geometry {
             transfer_id: 999,
@@ -283,7 +281,7 @@ fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
     ));
 
     let duplicate_id = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         attachments: vec![
             TransactionAttachmentV1::Geometry {
@@ -308,7 +306,7 @@ fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
     )
     .unwrap();
     let wrong_family = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         attachments: vec![TransactionAttachmentV1::CreatureLifecycle {
             transfer_id: 77,
@@ -323,7 +321,7 @@ fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
     let mut missing = split_world();
     missing.volumes.pop();
     let set = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         attachments: vec![TransactionAttachmentV1::Geometry {
             transfer_id: 77,
@@ -338,7 +336,7 @@ fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
     let mut wrong_owner = split_world();
     wrong_owner.volumes[1].owner = BaselineOwner::Body(EntityId::new(999).unwrap());
     let set = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         attachments: vec![TransactionAttachmentV1::Geometry {
             transfer_id: 77,
@@ -353,7 +351,7 @@ fn geometry_attachment_rejects_missing_extra_and_wrong_owner_volumes() {
     let mut extra = split_world();
     extra.volumes.push(volume(4, BaselineOwner::Terrain));
     let set = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         attachments: vec![TransactionAttachmentV1::Geometry {
             transfer_id: 77,
@@ -381,14 +379,14 @@ fn lifecycle_attachment_is_correlated_to_marker_before_candidate_acceptance() {
         after: vec![],
         ops: vec![TopologyOp::CreatureLifecycleBulk {
             operation_ordinal: 0,
-            payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+            payload_schema: WIRE_SCHEMA_VERSION,
             commit_hash: payload.commit_hash,
             transfer_id: 88,
         }],
         result_hashes: vec![],
     };
     let set = TransactionAttachmentSetV1 {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id,
         attachments: vec![TransactionAttachmentV1::CreatureLifecycle {
             transfer_id: 88,
@@ -431,7 +429,7 @@ fn compact_uniform_lifecycle_work_is_cumulative_across_attachments() {
         count: u32,
     }
     let mut bytes = postcard::to_stdvec(&Prefix {
-        schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id: transaction.transaction_id,
         count: set.attachments.len() as u32,
     })

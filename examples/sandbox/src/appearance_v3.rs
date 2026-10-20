@@ -1,10 +1,8 @@
-//! The appearance variants of the first shipped variant manifest
-//! ([`crate::game::manifest_v3_variants`]), frozen.
+//! The base appearance table: the variants of [`crate::game::manifest_v3_variants`].
 //!
-//! **Never edit this file.** These ids, names and colours are what worlds saved
-//! and replicated under that manifest mean; the manifest hash pins them. Later
-//! variants are appended in `appearance_extensions.rs` under new ids; recolouring
-//! or remapping one of these needs an explicit versioned manifest migration.
+//! An ordinary table. The manifest hash covers these ids, names and colours, so changing a row
+//! changes that hash; pre-release that is fine and dependent fixtures are regenerated. Later
+//! variants are appended in `appearance_extensions.rs` under new ids.
 
 /// `(id, portable material key, name, authored sRGB tint)`.
 pub const V3: &[(u16, &str, &str, [u8; 3])] = &[

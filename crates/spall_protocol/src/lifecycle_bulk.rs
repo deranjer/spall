@@ -4,6 +4,7 @@
 //! transaction release remain closed until simulation and journal consumers
 //! validate and publish the complete attachment atomically.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use spall_core::TransactionId;
 use std::io::{Read, Write};
@@ -18,7 +19,6 @@ use crate::{
     MAX_CREATURE_OWNER_PARTS, MAX_CREATURE_OWNER_RECORD_BYTES, MAX_CREATURE_OWNER_SOLID_CELLS,
 };
 
-pub const CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA: u16 = 5;
 pub const MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED: usize = MAX_CREATURE_OWNER_RECORD_BYTES + 64;
 
 /// Cumulative work charged by one lifecycle attachment to its transaction set.
@@ -138,7 +138,7 @@ impl CreatureLifecycleBulkPayloadV4 {
         }
         let commit_hash = commit.canonical_hash();
         Ok(Self {
-            schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             transaction_id,
             operation_ordinal,
             commit_hash,
@@ -152,7 +152,7 @@ impl CreatureLifecycleBulkPayloadV4 {
     pub(crate) fn decoded_size_for_attachment_set(
         &self,
     ) -> Result<usize, CreatureLifecycleBulkError> {
-        if self.schema != CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(CreatureLifecycleBulkError::Schema);
         }
         check_commit_work(&self.commit)?;
@@ -203,7 +203,7 @@ impl CreatureLifecycleBulkPayloadV4 {
         &self,
         compressed_limit: usize,
     ) -> Result<Vec<u8>, CreatureLifecycleBulkError> {
-        if self.schema != CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(CreatureLifecycleBulkError::Schema);
         }
         check_commit_work(&self.commit)?;
@@ -322,7 +322,7 @@ impl CreatureLifecycleBulkPayloadV4 {
         let decoded_bytes = raw.len();
         let (prefix, commit_bytes): (PayloadPrefixV1, &[u8]) = postcard::take_from_bytes(&raw)
             .map_err(|e| CreatureLifecycleBulkError::Postcard(e.to_string()))?;
-        if prefix.schema != CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA {
+        if prefix.schema != WIRE_SCHEMA_VERSION {
             return Err(CreatureLifecycleBulkError::Schema);
         }
         if prefix.transaction_id != transaction_id
@@ -402,8 +402,8 @@ fn check_commit_work(commit: &CreatureLifecycleCommitV4) -> Result<(), CreatureL
 fn commit_work(
     commit: &CreatureLifecycleCommitV4,
 ) -> Result<LifecycleAttachmentWork, CreatureLifecycleBulkError> {
-    if commit.schema != crate::CREATURE_LIFECYCLE_COMMIT_SCHEMA
-        || commit.change.schema != crate::CREATURE_CHANGE_SCHEMA
+    if commit.schema != crate::WIRE_SCHEMA_VERSION
+        || commit.change.schema != crate::WIRE_SCHEMA_VERSION
     {
         return Err(CreatureLifecycleBulkError::Schema);
     }
@@ -422,8 +422,8 @@ fn commit_work(
         crate::CreatureLifecycleOperationV4::Birth { after }
         | crate::CreatureLifecycleOperationV4::Death { after } => after,
     };
-    if record.schema != crate::CREATURE_OWNER_SCHEMA
-        || record.state.schema != crate::CREATURE_STATE_SCHEMA
+    if record.schema != crate::WIRE_SCHEMA_VERSION
+        || record.state.schema != crate::WIRE_SCHEMA_VERSION
     {
         return Err(CreatureLifecycleBulkError::Schema);
     }

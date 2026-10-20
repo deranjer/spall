@@ -859,7 +859,7 @@ fn missing_or_corrupt_column_water_checkpoint_never_restores_a_silent_dry_world(
             let mut writer = Writer::open(scratch.db()).unwrap();
             let mut cp = checkpoint(100, 0);
             cp.column_water = Some(spall_protocol::ColumnWaterState {
-                version: spall_protocol::column_water::COLUMN_WATER_VERSION,
+                version: spall_protocol::WIRE_SCHEMA_VERSION,
                 y_lo: 0,
                 y_hi: 32,
                 frame_seq: 1,
@@ -1076,5 +1076,37 @@ fn weather_clock_checkpoint_and_journal_survive_restart_exactly() {
     assert_eq!(
         recovered.journal[0].payload,
         JournalPayload::WeatherState(clock_next)
+    );
+}
+
+#[test]
+fn a_save_from_an_older_pre_release_build_is_refused_with_a_clear_error() {
+    let s = Scratch::new("schema_old");
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(10, 0)).unwrap();
+    }
+    raw_user_version_bump(&s.db(), STORE_SCHEMA_VERSION - 1);
+    let before = std::fs::read(s.db()).unwrap();
+
+    let opened = Writer::open(s.db());
+    let err = match opened {
+        Err(err @ StoreError::SchemaTooOld { .. }) => err,
+        Err(other) => panic!("expected SchemaTooOld, got {other:?}"),
+        Ok(_) => panic!("an older save must not open"),
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("incompatible save") && text.contains("older pre-release build"),
+        "unclear error: {text}"
+    );
+    assert!(matches!(
+        recover(s.db()),
+        Err(StoreError::SchemaTooOld { .. })
+    ));
+    assert_eq!(
+        std::fs::read(s.db()).unwrap(),
+        before,
+        "refusing an old save must not modify it"
     );
 }

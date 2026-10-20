@@ -14,9 +14,9 @@ pub mod units;
 
 pub use coord::{BRICK_EDGE, BrickCoord, CELLS_PER_BRICK, CoordOverflow, GlobalCell, LocalCell};
 pub use ids::{
-    CREATURE_ALLOCATOR_SCHEMA, CreatureAllocator, CreatureAllocatorSnapshotV1, CreatureGeneration,
-    CreatureId, CreatureKey, EntityId, IdAllocator, IdError, JournalSeq, Revision, Tick,
-    TransactionId, VolumeId, WorldEpoch, WorldId,
+    CreatureAllocator, CreatureAllocatorSnapshotV1, CreatureGeneration, CreatureId, CreatureKey,
+    EntityId, IdAllocator, IdError, JournalSeq, Revision, Tick, TransactionId, VolumeId,
+    WorldEpoch, WorldId,
 };
 pub use input::{
     BUTTON_JUMP, PLAYER_ENTITY_BASE, PlayerInput, is_player_entity, player_entity_for,
@@ -41,6 +41,14 @@ use std::{
 use thiserror::Error;
 
 pub const PROCESS_METADATA_VERSION: u32 = 1;
+
+/// The one durable-state version: the SQLite `user_version`, every stored DTO header, the
+/// ecology/vegetation state and the creature allocator/checkpoint schema. Pre-release there is no
+/// migration: any change to a persisted layout bumps this, and a save written by another value
+/// is refused as incompatible. Lives in `spall_core` so crates below `spall_store` can stamp it.
+pub const STORE_SCHEMA_VERSION: u32 = 6;
+/// [`STORE_SCHEMA_VERSION`] for `u16` record headers.
+pub const STORE_SCHEMA_VERSION_U16: u16 = STORE_SCHEMA_VERSION as u16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessRecord {

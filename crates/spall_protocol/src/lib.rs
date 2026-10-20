@@ -31,10 +31,8 @@ pub use creature_catalog::{OwnedCreatureAsset, OwnedCreatureCatalog, OwnedCreatu
 pub mod creature_motion;
 pub mod creature_owner;
 pub mod creature_sync;
-pub use creature_motion::{
-    CREATURE_MOTION_SCHEMA, CreatureMotionEntry, CreatureMotionFrame, MAX_CREATURE_MOTION_ENTRIES,
-};
-pub use creature_sync::{CREATURE_SYNC_SCHEMA, CreatureSync};
+pub use creature_motion::{CreatureMotionEntry, CreatureMotionFrame, MAX_CREATURE_MOTION_ENTRIES};
+pub use creature_sync::CreatureSync;
 pub mod creature_snapshot;
 pub mod handshake;
 pub mod input;
@@ -47,19 +45,16 @@ pub mod snow;
 pub mod transaction_attachments;
 pub mod water;
 pub mod weather;
-pub use creature_snapshot::{
-    CREATURE_SNAPSHOT_SCHEMA, CreatureSnapshotV2, MAX_CREATURE_SNAPSHOT_BYTES,
-};
+pub use creature_snapshot::{CreatureSnapshotV2, MAX_CREATURE_SNAPSHOT_BYTES};
 pub use weather::{
-    WEATHER_PROFILE_MS, WEATHER_SCHEMA, WEATHER_TRANSITION_MS, WeatherClock, WeatherClockSource,
-    WeatherError, WeatherKind, WeatherSnapshot, WeatherState,
+    WEATHER_PROFILE_MS, WEATHER_TRANSITION_MS, WeatherClock, WeatherClockSource, WeatherError,
+    WeatherKind, WeatherSnapshot, WeatherState,
 };
 
 pub use input::{frame_input, player_entity, recent_input, session_player_entity};
 
 pub use baseline::{
-    BASELINE_WORLD_SCHEMA, BaselineBrick, BaselineCells, BaselineDecodeError, BaselineOwner,
-    BaselineVolume, BaselineWorld,
+    BaselineBrick, BaselineCells, BaselineDecodeError, BaselineOwner, BaselineVolume, BaselineWorld,
 };
 pub use canonical::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, CanonicalWriter,
@@ -74,19 +69,18 @@ pub use codec::{
 pub use column_water::{ColumnWaterDelta, ColumnWaterState};
 pub use column_water_wire::{ColumnWaterReplica, ColumnWaterUpdate};
 pub use creature::{
-    CREATURE_MATERIAL_MAPPING_FORMAT, CREATURE_STATE_SCHEMA, CreatureAssetCatalogEntry,
-    CreatureAssetIdentity, CreatureClipMode, CreatureLifecycleState, CreatureMaterialMappingEntry,
-    CreaturePartBinding, CreatureSpeciesCatalogEntry, CreatureStateError, CreatureStateV1,
-    CreatureValidationCatalog, MAX_CREATURE_ANGULAR_VELOCITY_RAD_S, MAX_CREATURE_ASSET_CLIPS,
+    CREATURE_MATERIAL_MAPPING_FORMAT, CreatureAssetCatalogEntry, CreatureAssetIdentity,
+    CreatureClipMode, CreatureLifecycleState, CreatureMaterialMappingEntry, CreaturePartBinding,
+    CreatureSpeciesCatalogEntry, CreatureStateError, CreatureStateV1, CreatureValidationCatalog,
+    MAX_CREATURE_ANGULAR_VELOCITY_RAD_S, MAX_CREATURE_ASSET_CLIPS,
     MAX_CREATURE_ASSET_MATERIAL_KEYS, MAX_CREATURE_ASSET_PARTS, MAX_CREATURE_CATALOG_ASSETS,
     MAX_CREATURE_CATALOG_SPECIES, MAX_CREATURE_CLIP_NAME_BYTES, MAX_CREATURE_LINEAR_VELOCITY_M_S,
     MAX_CREATURE_POSITION_M, MAX_CREATURE_SOURCE_PARTS, MAX_CREATURE_SPECIES_KEY_BYTES,
     MAX_CREATURE_STATE_BYTES, creature_material_mapping_hash,
 };
 pub use creature_owner::{
-    CREATURE_CHANGE_DOMAIN, CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_COMMIT_DOMAIN,
-    CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_MOTION_DOMAIN, CREATURE_OWNER_DOMAIN,
-    CREATURE_OWNER_SCHEMA, CREATURE_OWNER_SET_DOMAIN, CREATURE_TOPOLOGY_DOMAIN,
+    CREATURE_CHANGE_DOMAIN, CREATURE_LIFECYCLE_COMMIT_DOMAIN, CREATURE_MOTION_DOMAIN,
+    CREATURE_OWNER_DOMAIN, CREATURE_OWNER_SET_DOMAIN, CREATURE_TOPOLOGY_DOMAIN,
     CreatureComponentMotionV1, CreatureDeathWitnessV1, CreatureLifecycleCandidateV1,
     CreatureLifecycleChangeV4, CreatureLifecycleCommitReplayReceiptV1, CreatureLifecycleCommitV4,
     CreatureLifecycleContextV1, CreatureLifecycleOperationV4, CreatureLocalPoseV1,
@@ -103,8 +97,8 @@ pub use handshake::{
     check_compatible,
 };
 pub use lifecycle_bulk::{
-    CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA, CreatureLifecycleBulkError,
-    CreatureLifecycleBulkPayloadV4, MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
+    CreatureLifecycleBulkError, CreatureLifecycleBulkPayloadV4,
+    MAX_CREATURE_LIFECYCLE_BULK_DECOMPRESSED,
 };
 pub use limits::SizeLimitError;
 pub use records::{
@@ -117,21 +111,20 @@ pub use records::{
     TopologyTransaction, TransferId, VolumeHash, WIRE_SCHEMA_VERSION, WORLD_RESET_TRANSFER_ID_BIT,
     WireTag,
 };
-pub use segment::BASELINE_CREATURE_LIFECYCLE_WORLD_VERSION;
 pub use session::{
     GenerationExhausted, PlayerId, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,
     StaleSession, StreamKind, StreamSeq,
 };
 pub use snow::{
     SNOW_FOOTPRINT_TTL_TICKS, SNOW_MAX_DEPTH_Q16, SNOW_MAX_FOOTPRINTS_PER_FRAME,
-    SNOW_MAX_SURFACES_PER_FRAME, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_SCHEMA, SNOW_TILE_CELLS,
-    SnowFootprint, SnowSurface, SnowSurfaceFrame, SnowSurfaceId,
+    SNOW_MAX_SURFACES_PER_FRAME, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_TILE_CELLS, SnowFootprint,
+    SnowSurface, SnowSurfaceFrame, SnowSurfaceId,
 };
 pub use transaction_attachments::{
     MAX_TRANSACTION_ATTACHMENT_BYTES, MAX_TRANSACTION_GEOMETRY_DECODED_BYTES,
-    MAX_TRANSACTION_LIFECYCLE_DECODED_BYTES, TRANSACTION_ATTACHMENT_SET_SCHEMA,
-    TransactionAttachmentError, TransactionAttachmentSetV1, TransactionAttachmentV1,
-    ValidatedTransactionAttachmentSetV1, ValidatedTransactionAttachmentV1, decode_for_transaction,
+    MAX_TRANSACTION_LIFECYCLE_DECODED_BYTES, TransactionAttachmentError,
+    TransactionAttachmentSetV1, TransactionAttachmentV1, ValidatedTransactionAttachmentSetV1,
+    ValidatedTransactionAttachmentV1, decode_for_transaction,
 };
 pub use water::{AdminCommand, AdminRequest, AdminStatus, WaterCodecError};
 

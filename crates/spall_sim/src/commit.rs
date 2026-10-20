@@ -677,7 +677,7 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
         bulk_baseline
             .as_ref()
             .map(|world| spall_protocol::TransactionAttachmentSetV1 {
-                schema: spall_protocol::TRANSACTION_ATTACHMENT_SET_SCHEMA,
+                schema: spall_protocol::WIRE_SCHEMA_VERSION,
                 transaction_id,
                 attachments: vec![spall_protocol::TransactionAttachmentV1::Geometry {
                     transfer_id: bulk_transfer_id
@@ -1062,7 +1062,7 @@ fn build_split_baseline_ops(
     let mut world_volumes: Vec<_> = volumes.into_iter().map(|(bv, _)| bv).collect();
     world_volumes.sort_by_key(|v| v.volume_id.get());
     let baseline = BaselineWorld {
-        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         checkpoint_tick: server_tick.get(),
         volumes: world_volumes,
     };

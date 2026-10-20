@@ -728,7 +728,7 @@ impl HierarchyCatalog {
     fn state(&self, volumes: [spall_core::VolumeId; 3]) -> spall_protocol::CreatureStateV1 {
         let mapping_hash = spall_protocol::creature_material_mapping_hash(&self.mapping).unwrap();
         spall_protocol::CreatureStateV1 {
-            schema: spall_protocol::CREATURE_STATE_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             key: spall_core::CreatureKey::new(
                 WorldId::from_u128(10),
                 spall_core::WorldEpoch::INITIAL,

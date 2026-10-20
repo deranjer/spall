@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn volume_count_over_limit_rejects_before_reading_any_volume() {
         let mut raw = Vec::new();
-        raw.extend(postcard::to_stdvec(&crate::BASELINE_WORLD_SCHEMA).unwrap());
+        raw.extend(postcard::to_stdvec(&crate::WIRE_SCHEMA_VERSION).unwrap());
         raw.extend(postcard::to_stdvec(&12_u64).unwrap());
         raw.extend(postcard::to_stdvec(&(crate::limits::MAX_TRANSACTION_OPS + 1)).unwrap());
         assert!(matches!(
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn dense_length_over_limit_rejects_before_reading_any_cell() {
         let mut raw = Vec::new();
-        raw.extend(postcard::to_stdvec(&crate::BASELINE_WORLD_SCHEMA).unwrap());
+        raw.extend(postcard::to_stdvec(&crate::WIRE_SCHEMA_VERSION).unwrap());
         raw.extend(postcard::to_stdvec(&12_u64).unwrap());
         raw.extend(postcard::to_stdvec(&1_usize).unwrap());
         raw.extend(postcard::to_stdvec(&1_u64).unwrap()); // volume id

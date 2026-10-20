@@ -62,7 +62,7 @@ fn capture_distinguishes_uninitialized_and_empty_retired_allocator() {
             .is_none()
     );
     let allocator = CreatureAllocatorSnapshotV1 {
-        schema: 1,
+        schema: spall_core::STORE_SCHEMA_VERSION_U16,
         world_id: WorldId::from_u128(10),
         world_epoch: 7,
         next_creature_id: 101,

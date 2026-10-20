@@ -14,9 +14,9 @@ fn attached(
     let id = TransactionId::new(1).unwrap();
     let ordinal = if mixed { 1 } else { 0 };
     let commit = CreatureLifecycleCommitV4 {
-        schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         change: CreatureLifecycleChangeV4 {
-            schema: CREATURE_CHANGE_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             transaction_id: id,
             operation_ordinal: ordinal,
             expected_before_hash: Hash32::ZERO,
@@ -44,7 +44,7 @@ fn attached(
         attachments.push(TransactionAttachmentV1::Geometry {
             transfer_id: geometry_id,
             world: BaselineWorld {
-                schema: BASELINE_WORLD_SCHEMA,
+                schema: WIRE_SCHEMA_VERSION,
                 checkpoint_tick: 1,
                 volumes: vec![BaselineVolume {
                     volume_id: VolumeId::new(900).unwrap(),
@@ -64,7 +64,7 @@ fn attached(
     ops.push(TopologyOp::CreatureLifecycleBulk {
         transfer_id: actor_id,
         operation_ordinal: ordinal,
-        payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+        payload_schema: WIRE_SCHEMA_VERSION,
         commit_hash: payload.commit_hash,
     });
     attachments.push(TransactionAttachmentV1::CreatureLifecycle {
@@ -85,7 +85,7 @@ fn attached(
     (
         tx,
         TransactionAttachmentSetV1 {
-            schema: TRANSACTION_ATTACHMENT_SET_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             transaction_id: id,
             attachments,
         },

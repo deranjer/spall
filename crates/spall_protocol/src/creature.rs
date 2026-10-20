@@ -2,6 +2,7 @@
 //!
 //! These values are versioned and canonical-round-trippable, but are not a
 //! wire record, checkpoint section, journal event, or actor replication channel.
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Deserializer, Serialize, de::SeqAccess, de::Visitor};
 use spall_core::{CreatureKey, MaterialId, MaterialManifest, VolumeId};
 use std::fmt;
@@ -9,7 +10,6 @@ use thiserror::Error;
 
 use crate::canonical::{CanonicalWriter, Hash32, content_manifest_hash};
 
-pub const CREATURE_STATE_SCHEMA: u16 = 1;
 pub const MAX_CREATURE_SPECIES_KEY_BYTES: usize = 63;
 pub const MAX_CREATURE_CLIP_NAME_BYTES: usize = 255;
 pub const MAX_CREATURE_SOURCE_PARTS: usize = 256;
@@ -351,7 +351,7 @@ impl CreatureStateV1 {
         &self,
         catalog: &CreatureValidationCatalog<'_>,
     ) -> Result<(), CreatureStateError> {
-        if self.schema != CREATURE_STATE_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(CreatureStateError::Schema);
         }
         self.key
@@ -601,7 +601,7 @@ mod tests {
 
     fn valid_state() -> CreatureStateV1 {
         CreatureStateV1 {
-            schema: CREATURE_STATE_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             key: CreatureKey::new(
                 WorldId::from_u128(17),
                 WorldEpoch::INITIAL,

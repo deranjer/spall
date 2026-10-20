@@ -28,7 +28,7 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
     }];
     let mapping_hash = creature_material_mapping_hash(&mapping).unwrap();
     let state = CreatureStateV1 {
-        schema: CREATURE_STATE_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         key: CreatureKey::new(
             WorldId::from_u128(900),
             WorldEpoch::INITIAL,
@@ -95,7 +95,7 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
             linear_velocity_m_s: [0.0; 3],
             angular_velocity_rad_s: [0.0; 3],
         }],
-        schema: CREATURE_OWNER_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         state,
         owner_key: 9,
         source_generation: 1,
@@ -133,7 +133,7 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
         .unwrap();
     let transaction_id = spall_core::TransactionId::new(77).unwrap();
     let change = CreatureLifecycleChangeV4 {
-        schema: CREATURE_CHANGE_SCHEMA,
+        schema: WIRE_SCHEMA_VERSION,
         transaction_id,
         operation_ordinal: 1,
         expected_before_hash: Hash32::ZERO,
@@ -158,7 +158,7 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
             },
             TopologyOp::CreatureLifecycle {
                 commit: Box::new(CreatureLifecycleCommitV4 {
-                    schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+                    schema: WIRE_SCHEMA_VERSION,
                     change,
                     expected_before_topology_hash: Hash32::ZERO,
                     pre_motion: None,
@@ -173,7 +173,7 @@ fn mixed_transaction(bulk: bool) -> TopologyTransaction {
         };
         transaction.ops[1] = TopologyOp::CreatureLifecycleBulk {
             operation_ordinal: 1,
-            payload_schema: CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+            payload_schema: WIRE_SCHEMA_VERSION,
             commit_hash: commit.canonical_hash(),
             transfer_id: 77,
         };

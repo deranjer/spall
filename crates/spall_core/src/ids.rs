@@ -192,8 +192,6 @@ impl CreatureKey {
     }
 }
 
-pub const CREATURE_ALLOCATOR_SCHEMA: u16 = 1;
-
 /// Explicit in-memory capture/restore value for the creature counter.
 /// This is not a store/checkpoint schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,7 +253,7 @@ impl CreatureAllocator {
 
     pub const fn snapshot(&self) -> CreatureAllocatorSnapshotV1 {
         CreatureAllocatorSnapshotV1 {
-            schema: CREATURE_ALLOCATOR_SCHEMA,
+            schema: crate::STORE_SCHEMA_VERSION_U16,
             world_id: self.world_id,
             world_epoch: self.world_epoch.get(),
             next_creature_id: self.ids.peek(),
@@ -263,7 +261,7 @@ impl CreatureAllocator {
     }
 
     pub fn restore(snapshot: CreatureAllocatorSnapshotV1) -> Result<Self, IdError> {
-        if snapshot.schema != CREATURE_ALLOCATOR_SCHEMA || snapshot.world_id.is_nil() {
+        if snapshot.schema != crate::STORE_SCHEMA_VERSION_U16 || snapshot.world_id.is_nil() {
             return Err(IdError::Reserved);
         }
         Ok(Self {
@@ -453,7 +451,7 @@ mod tests {
         assert_eq!(restored.allocate().unwrap().creature_id.get(), 3);
         assert_eq!(
             CreatureAllocator::restore(CreatureAllocatorSnapshotV1 {
-                schema: CREATURE_ALLOCATOR_SCHEMA,
+                schema: crate::STORE_SCHEMA_VERSION_U16,
                 world_id: world,
                 world_epoch: 0,
                 next_creature_id: 1,
@@ -466,7 +464,7 @@ mod tests {
     fn creature_allocator_exhaustion_and_epoch_exhaustion_do_not_wrap() {
         let world = WorldId::from_u128(0x1234);
         let mut exhausted_id = CreatureAllocator::restore(CreatureAllocatorSnapshotV1 {
-            schema: CREATURE_ALLOCATOR_SCHEMA,
+            schema: crate::STORE_SCHEMA_VERSION_U16,
             world_id: world,
             world_epoch: 1,
             next_creature_id: u64::MAX,
@@ -474,7 +472,7 @@ mod tests {
         .unwrap();
         assert_eq!(exhausted_id.allocate(), Err(IdError::Exhausted));
         let mut exhausted_epoch = CreatureAllocator::restore(CreatureAllocatorSnapshotV1 {
-            schema: CREATURE_ALLOCATOR_SCHEMA,
+            schema: crate::STORE_SCHEMA_VERSION_U16,
             world_id: world,
             world_epoch: u64::MAX,
             next_creature_id: 1,

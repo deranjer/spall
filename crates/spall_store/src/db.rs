@@ -757,7 +757,9 @@ fn latest_checkpoint_has_host(conn: &Connection) -> Result<bool, StoreError> {
             .snapshot
             .validate_resources()
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        if section.schema != 1 || section.snapshot.canonical_hash().0 != section.snapshot_hash {
+        if section.schema != spall_core::STORE_SCHEMA_VERSION_U16
+            || section.snapshot.canonical_hash().0 != section.snapshot_hash
+        {
             return Err(StoreError::Corrupt(
                 "latest creature checkpoint state hash".into(),
             ));

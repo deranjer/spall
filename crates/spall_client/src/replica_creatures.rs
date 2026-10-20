@@ -18,7 +18,7 @@ use std::{
 };
 
 use spall_core::{
-    CREATURE_ALLOCATOR_SCHEMA, CreatureAllocatorSnapshotV1, CreatureKey, VolumeId, WorldId,
+    CreatureAllocatorSnapshotV1, CreatureKey, STORE_SCHEMA_VERSION_U16, VolumeId, WorldId,
 };
 use spall_protocol::{
     CreatureLifecycleCommitV4, CreatureLifecycleContextV1, CreatureLifecycleOperationV4,
@@ -431,7 +431,7 @@ impl ReplicaCreatures {
                         operation_ordinal: commit.change.operation_ordinal,
                         replay_receipt: None,
                         allocator: CreatureAllocatorSnapshotV1 {
-                            schema: CREATURE_ALLOCATOR_SCHEMA,
+                            schema: STORE_SCHEMA_VERSION_U16,
                             world_id: key.world_id,
                             world_epoch: key.world_epoch.get(),
                             next_creature_id: allocator_next,

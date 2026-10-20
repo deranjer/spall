@@ -19,9 +19,10 @@ use spall_fluid::columns::{
     CELL_SIZE_M, ColumnConfig, ColumnStepMetrics, ColumnWorld, RegionKey, VolumeTerrain,
 };
 use spall_physics::WaterSample;
+use spall_protocol::WIRE_SCHEMA_VERSION;
 use spall_protocol::column_water::{
-    COLUMN_WATER_VERSION, ColumnRegionRecord, ColumnSpanRecord, ColumnWaterDelta, ColumnWaterState,
-    volume_from_fixed, volume_to_fixed,
+    ColumnRegionRecord, ColumnSpanRecord, ColumnWaterDelta, ColumnWaterState, volume_from_fixed,
+    volume_to_fixed,
 };
 use spall_protocol::column_water_wire::{dequantize_flow, quantize_flow};
 use spall_voxel::Volume;
@@ -1071,7 +1072,7 @@ impl AuthoritativeColumnWater {
             }
         }
         ColumnWaterState {
-            version: COLUMN_WATER_VERSION,
+            version: WIRE_SCHEMA_VERSION,
             y_lo: setup.y_lo,
             y_hi: setup.y_hi,
             frame_seq: core.seq,

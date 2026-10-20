@@ -4,8 +4,9 @@
 //! never treated as exposed air.
 
 use spall_core::GlobalCell;
+use spall_protocol::WIRE_SCHEMA_VERSION;
 use spall_protocol::snow::{
-    SNOW_MAX_DEPTH_Q16, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_SCHEMA, SNOW_TILE_CELLS, SnowSurface,
+    SNOW_MAX_DEPTH_Q16, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_TILE_CELLS, SnowSurface,
     SnowSurfaceFrame,
 };
 use spall_render::{SnowFootprintMark, SnowSurfacePatch};
@@ -110,7 +111,7 @@ impl SnowPresentation {
             .iter()
             .copied()
             .filter(|frame| {
-                frame.schema == SNOW_SCHEMA
+                frame.schema == WIRE_SCHEMA_VERSION
                     && frame.world_epoch == current_epoch
                     && tile_distance_squared(frame, camera) <= radius_m * radius_m
             })
@@ -410,7 +411,7 @@ mod presentation_tests {
 
     fn frame(top_cell_y: i32, depth_q16: u16) -> SnowSurfaceFrame {
         SnowSurfaceFrame {
-            schema: SNOW_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             world_epoch: 1,
             world_revision: 1,
             effective_tick: 120,

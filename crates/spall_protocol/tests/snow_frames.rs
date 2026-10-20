@@ -33,7 +33,7 @@ fn layered_tile() -> SnowSurfaceFrame {
         })
         .collect();
     SnowSurfaceFrame {
-        schema: 1,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         world_epoch: 1,
         world_revision: 2,
         effective_tick: 100,

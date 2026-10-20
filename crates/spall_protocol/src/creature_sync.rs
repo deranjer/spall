@@ -6,13 +6,12 @@
 //! a complete portable ownership record plus the allocator floor needed to
 //! validate later births, and is installed idempotently.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use spall_core::CreatureAllocatorSnapshotV1;
 
 use crate::CreatureOwnershipRecordV4;
 use crate::records::{Record, RecordError, WireTag};
-
-pub const CREATURE_SYNC_SCHEMA: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreatureSync {
@@ -28,12 +27,12 @@ impl Record for CreatureSync {
     const TAG: WireTag = WireTag::CreatureSync;
 
     fn validate(&self) -> Result<(), RecordError> {
-        if self.schema != CREATURE_SYNC_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(RecordError::Inconsistent(
                 "unsupported creature sync schema",
             ));
         }
-        if self.allocator.schema != spall_core::CREATURE_ALLOCATOR_SCHEMA
+        if self.allocator.schema != spall_core::STORE_SCHEMA_VERSION_U16
             || self.allocator.world_id.is_nil()
             || self.allocator.world_epoch == 0
             || self.allocator.next_creature_id == 0

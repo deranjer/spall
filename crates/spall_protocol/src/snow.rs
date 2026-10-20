@@ -4,10 +4,10 @@
 //! authoritative: clients may derive the matching upward-facing triangles from
 //! replica geometry, but must not infer exposure themselves.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use crate::records::{Record, RecordError, WireTag};
 use serde::{Deserialize, Serialize};
 
-pub const SNOW_SCHEMA: u16 = 1;
 pub const SNOW_TILE_CELLS: i32 = 16;
 pub const SNOW_MAX_DEPTH_Q16: u16 = 8192; // 0.125 m, Q16 metres.
 pub const SNOW_MIN_FOOTPRINT_DEPTH_Q16: u16 = 132; // At least 2 mm.
@@ -78,7 +78,7 @@ impl Record for SnowSurfaceFrame {
     const TAG: WireTag = WireTag::SnowSurfaceFrame;
 
     fn validate(&self) -> Result<(), RecordError> {
-        if self.schema != SNOW_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(RecordError::Inconsistent("unsupported snow schema"));
         }
         if self.world_epoch == 0 || self.snapshot_seq == 0 {
@@ -170,7 +170,7 @@ mod tests {
         let mut mask = [0u64; 4];
         mask[0] = 1;
         SnowSurfaceFrame {
-            schema: SNOW_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             world_epoch: 1,
             world_revision: 0,
             effective_tick: 20,

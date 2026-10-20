@@ -141,8 +141,8 @@ pub enum PersistError {
     )]
     UnrecoverableCorruption { reports: String, fallback: String },
     #[error(
-        "save schema version mismatch: checkpoint {checkpoint}, runtime {runtime} \
-         (a schema migration is required — do not replay this database in place)"
+        "incompatible save: checkpoint schema version {checkpoint}, this build reads {runtime} \
+         (created by a different pre-release build; saves are not migrated, start a new world)"
     )]
     SchemaMismatch { checkpoint: u32, runtime: u32 },
     #[error(
@@ -332,7 +332,7 @@ fn capture_checkpoint_internal(
     )
     .0;
     let creatures = snapshot.map(|snapshot| spall_store::StoredCreaturesV1 {
-        schema: 1,
+        schema: spall_core::STORE_SCHEMA_VERSION_U16,
         snapshot_hash: snapshot.canonical_hash().0,
         snapshot,
         physics_origin_m: world.physics_origin().world_m(),
@@ -950,11 +950,11 @@ fn restore_checkpoint_internal(
             .encode()
             .map_err(|_| PersistError::BadField("vegetation clock encode"))?;
     }
-    let had_weather_state = weather_state.is_some();
-    if let Some(state) = weather_state {
-        sim.restore_weather(state)
-            .map_err(|_| PersistError::BadField("weather recovery"))?;
-    }
+    // Every checkpoint this build writes carries weather; an older save is refused by the schema
+    // version before recovery gets here.
+    let state = weather_state.ok_or(PersistError::BadField("checkpoint without weather state"))?;
+    sim.restore_weather(state)
+        .map_err(|_| PersistError::BadField("weather recovery"))?;
     sim.restore_snow_state(
         &snow
             .to_canonical_bytes()
@@ -963,9 +963,6 @@ fn restore_checkpoint_internal(
     .map_err(|_| PersistError::BadField("snow recovery"))?;
     sim.restore_vegetation(&vegetation_state)
         .map_err(|_| PersistError::BadField("vegetation recovery"))?;
-    if !had_weather_state {
-        sim.initialize_legacy_weather(cfg.seed);
-    }
     sim.validate_weather_clock_source()
         .map_err(|_| PersistError::BadField("weather clock source"))?;
     if let Some(state) = &column_water_state {
@@ -1826,7 +1823,7 @@ fn check(name: &str, passed: bool, detail: String) -> ScenarioResult {
 #[cfg(test)]
 mod creature_checkpoint_boundary_tests {
     use super::*;
-    use spall_core::{CREATURE_ALLOCATOR_SCHEMA, CreatureAllocatorSnapshotV1, WorldId};
+    use spall_core::{CreatureAllocatorSnapshotV1, STORE_SCHEMA_VERSION_U16, WorldId};
 
     #[test]
     fn full_and_incremental_capture_refuse_to_drop_empty_host_high_water() {
@@ -1841,7 +1838,7 @@ mod creature_checkpoint_boundary_tests {
             ))
             .unwrap();
             let allocator = CreatureAllocatorSnapshotV1 {
-                schema: CREATURE_ALLOCATOR_SCHEMA,
+                schema: STORE_SCHEMA_VERSION_U16,
                 world_id: WorldId::from_u128(cfg.world_id),
                 world_epoch: 4,
                 next_creature_id,

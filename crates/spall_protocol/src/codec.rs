@@ -163,7 +163,7 @@ mod tests {
     use super::*;
     use crate::records::{
         ActionOutcome, ActionStatus, DurableThrough, InputSeq, MotionSnapshot, RequestId,
-        SnapshotSeq,
+        SnapshotSeq, WIRE_SCHEMA_VERSION,
     };
     use spall_core::{EntityId, JournalSeq, Pose, QuantizedQuat, Revision, Tick};
 
@@ -216,9 +216,11 @@ mod tests {
             journal_seq: JournalSeq(300),
         };
         let bytes = encode_control(&record).unwrap();
-        // header: schema=13 (run-length source bricks),
-        // tag=11 (DurableThrough); body: postcard varint of 300 = 0xAC 0x02
-        assert_eq!(bytes, [0x0D, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
+        // header: schema=wire version, tag=11 (DurableThrough); body: postcard varint of 300 =
+        // 0xAC 0x02
+        let mut expected = WIRE_SCHEMA_VERSION.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[0x0B, 0x00, 0xAC, 0x02]);
+        assert_eq!(bytes, expected);
         let back: DurableThrough = decode_control(&bytes).unwrap();
         assert_eq!(back, record);
     }

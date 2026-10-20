@@ -3649,9 +3649,9 @@ mod creature_source_owner_tests {
     fn geometry_replay_rejects_inline_and_bulk_lifecycle_before_mutation() {
         use spall_core::{Tick, TransactionId};
         use spall_protocol::{
-            CREATURE_CHANGE_SCHEMA, CREATURE_LIFECYCLE_COMMIT_SCHEMA, CREATURE_OWNER_SCHEMA,
             CreatureLifecycleChangeV4, CreatureLifecycleCommitV4, CreatureLifecycleOperationV4,
             CreatureOwnershipRecordV4, Hash32, TopologyOp, TopologyTransaction,
+            WIRE_SCHEMA_VERSION,
         };
 
         let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
@@ -3660,7 +3660,7 @@ mod creature_source_owner_tests {
         let empty_record = CreatureOwnershipRecordV4 {
             primary_component_serial: None,
             part_velocities: vec![],
-            schema: CREATURE_OWNER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             state,
             owner_key: 1,
             source_generation: 1,
@@ -3671,9 +3671,9 @@ mod creature_source_owner_tests {
         let txid = TransactionId::new(1).unwrap();
         let inline = TopologyOp::CreatureLifecycle {
             commit: Box::new(CreatureLifecycleCommitV4 {
-                schema: CREATURE_LIFECYCLE_COMMIT_SCHEMA,
+                schema: WIRE_SCHEMA_VERSION,
                 change: CreatureLifecycleChangeV4 {
-                    schema: CREATURE_CHANGE_SCHEMA,
+                    schema: WIRE_SCHEMA_VERSION,
                     transaction_id: txid,
                     operation_ordinal: 0,
                     expected_before_hash: Hash32::ZERO,
@@ -3689,7 +3689,7 @@ mod creature_source_owner_tests {
         };
         let bulk = TopologyOp::CreatureLifecycleBulk {
             operation_ordinal: 0,
-            payload_schema: spall_protocol::CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA,
+            payload_schema: spall_protocol::WIRE_SCHEMA_VERSION,
             commit_hash: Hash32::ZERO,
             transfer_id: 1,
         };

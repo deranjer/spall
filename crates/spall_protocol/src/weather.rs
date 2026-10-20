@@ -1,7 +1,7 @@
+use crate::records::WIRE_SCHEMA_VERSION;
 use crate::records::{Record, RecordError, WireTag};
 use serde::{Deserialize, Serialize};
 
-pub const WEATHER_SCHEMA: u16 = 2;
 pub const WEATHER_MAX_CLOCK_MS: u64 = 100_000_000_000_000;
 pub const WEATHER_TRANSITION_MS: u64 = 300_000;
 pub const WEATHER_PROFILE_MS: u64 = 1_800_000;
@@ -111,7 +111,7 @@ impl WeatherState {
             0
         };
         Self {
-            schema: WEATHER_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             world_epoch: epoch,
             world_revision: revision,
             effective_tick: tick,
@@ -144,7 +144,7 @@ impl WeatherState {
         let previous_kind = self.override_kind;
         let previous_lightning_id = self.lightning_id;
         let previous_lightning_tick = self.lightning_tick;
-        self.schema = WEATHER_SCHEMA;
+        self.schema = WIRE_SCHEMA_VERSION;
         self.override_kind = kind;
         if let Some(kind) = kind {
             self.kind = kind;
@@ -188,7 +188,7 @@ impl WeatherState {
         }
     }
     pub fn validate(&self) -> Result<(), WeatherError> {
-        if self.schema != WEATHER_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(WeatherError::Schema(self.schema));
         }
         if self.start_season > 3 || self.season_ms == 0 || self.season_ms > WEATHER_MAX_CLOCK_MS {
@@ -339,7 +339,7 @@ mod tests {
         let mut s = WeatherState::initial(1, 1, c);
         s.schema += 1;
         assert!(s.validate().is_err());
-        s.schema = WEATHER_SCHEMA;
+        s.schema = WIRE_SCHEMA_VERSION;
         s.lightning_tick = 1;
         assert!(s.validate().is_err());
         s.lightning_tick = 0;

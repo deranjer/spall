@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use spall_core::{GlobalCell, MaterialId};
 use spall_voxel::{EditPlan, Sample, Volume};
 use spall_worldgen::{Biome, ColumnMap};
-
-/// Version 2 moved the ground carpet out of the organisms: grass, sedge,
+/// Vegetation state header: the single save version ([`spall_core::STORE_SCHEMA_VERSION`]).
+/// Grass, sedge, clover and tussock are stateless cover ([`crate::cover`]), not organisms.
 /// clover and tussock are stateless cover now ([`crate::cover`]).
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = spall_core::STORE_SCHEMA_VERSION_U16;
 /// Sized for a 1 km world: about 10 to 20 thousand trees and the living
 /// understory (cover is stateless and not counted here).
 pub const MAX_TREES: usize = 24_576;

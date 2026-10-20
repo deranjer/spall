@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use spall_protocol::{
-    Record, SNOW_MAX_DEPTH_Q16, SNOW_SCHEMA, SNOW_TILE_CELLS, SnowFootprint, SnowSurface,
-    SnowSurfaceFrame, SnowSurfaceId, WeatherKind, WeatherState,
+    Record, SNOW_MAX_DEPTH_Q16, SNOW_TILE_CELLS, SnowFootprint, SnowSurface, SnowSurfaceFrame,
+    SnowSurfaceId, WIRE_SCHEMA_VERSION, WeatherKind, WeatherState,
 };
 
 const Q32_PER_METRE: u64 = 1u64 << 32;
@@ -928,7 +928,7 @@ impl SnowState {
             .collect();
         let footprints = self.footprints.get(&key).cloned().unwrap_or_default();
         let frame = SnowSurfaceFrame {
-            schema: SNOW_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             world_epoch,
             world_revision,
             effective_tick: tick,

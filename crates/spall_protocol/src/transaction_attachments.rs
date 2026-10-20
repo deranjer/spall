@@ -4,6 +4,7 @@
 //! transfer or apply a transaction; those remain the responsibility of the
 //! owning simulation/replica after the complete set has been validated.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
@@ -16,7 +17,6 @@ use crate::{
     TopologyTransaction,
 };
 
-pub const TRANSACTION_ATTACHMENT_SET_SCHEMA: u16 = 1;
 pub const MAX_TRANSACTION_ATTACHMENT_BYTES: usize = crate::limits::MAX_ASSEMBLED_TRANSFER;
 pub const MAX_TRANSACTION_GEOMETRY_DECODED_BYTES: usize =
     crate::limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED;
@@ -217,9 +217,7 @@ pub fn decode_for_transaction(
     let (prefix, mut rest): (AttachmentPrefixV1, &[u8]) = postcard::take_from_bytes(bytes)
         .map_err(|e| TransactionAttachmentError::Encoding(e.to_string()))?;
     let expected = expected_markers(transaction)?;
-    if prefix.schema != TRANSACTION_ATTACHMENT_SET_SCHEMA
-        || prefix.transaction_id != transaction.transaction_id
-    {
+    if prefix.schema != WIRE_SCHEMA_VERSION || prefix.transaction_id != transaction.transaction_id {
         return Err(TransactionAttachmentError::Header);
     }
     if prefix.count as usize != expected.len()
@@ -297,9 +295,7 @@ fn validate_typed_set(
     transaction
         .replay_identity_hash()
         .map_err(|e| TransactionAttachmentError::Encoding(e.to_string()))?;
-    if set.schema != TRANSACTION_ATTACHMENT_SET_SCHEMA
-        || set.transaction_id != transaction.transaction_id
-    {
+    if set.schema != WIRE_SCHEMA_VERSION || set.transaction_id != transaction.transaction_id {
         return Err(TransactionAttachmentError::Header);
     }
     let expected = expected_markers(transaction)?;
@@ -331,7 +327,7 @@ fn validate_typed_set(
             }
             TransactionAttachmentV1::CreatureLifecycle { payload, .. } => {
                 let marker = lifecycle_marker(transaction, id)?;
-                if payload.schema != crate::CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA
+                if payload.schema != crate::WIRE_SCHEMA_VERSION
                     || payload.transaction_id != transaction.transaction_id
                     || payload.operation_ordinal != marker.operation_ordinal
                     || payload.commit_hash != marker.commit_hash
@@ -396,9 +392,7 @@ fn lifecycle_marker(
                 payload_schema,
                 commit_hash,
                 transfer_id: marker_id,
-            } if *marker_id == transfer_id
-                && *payload_schema == crate::CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA =>
-            {
+            } if *marker_id == transfer_id && *payload_schema == crate::WIRE_SCHEMA_VERSION => {
                 Some(LifecycleMarker {
                     operation_ordinal: *operation_ordinal,
                     commit_hash: *commit_hash,

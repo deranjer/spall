@@ -2951,7 +2951,7 @@ mod tests {
             WeatherClock, WeatherClockSource, WeatherState,
         };
         let world = BaselineWorld {
-            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             checkpoint_tick: 500,
             volumes: vec![BaselineVolume {
                 volume_id: VolumeId::new(1).unwrap(),
@@ -2994,7 +2994,7 @@ mod tests {
             .apply_weather(delayed)
             .expect("motion tick must not fence the independent weather stream");
         let frame = |world_epoch, snapshot_seq, effective_tick| spall_protocol::SnowSurfaceFrame {
-            schema: spall_protocol::SNOW_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             world_epoch,
             world_revision: 0,
             effective_tick,
@@ -3025,7 +3025,7 @@ mod tests {
             let mut mask = [0; 4];
             mask[0] = 1;
             spall_protocol::SnowSurfaceFrame {
-                schema: spall_protocol::SNOW_SCHEMA,
+                schema: spall_protocol::WIRE_SCHEMA_VERSION,
                 world_epoch: epoch,
                 world_revision: 0,
                 effective_tick: 1,
@@ -3422,7 +3422,7 @@ mod tests {
                 replica.provide_bulk_split_world(
                     88,
                     spall_protocol::BaselineWorld {
-                        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+                        schema: spall_protocol::WIRE_SCHEMA_VERSION,
                         checkpoint_tick: 4,
                         volumes: vec![patch],
                     },
@@ -3676,7 +3676,7 @@ mod tests {
             result_hashes: vec![],
         };
         let patch = |coord: BrickCoord, revision: u64| spall_protocol::BaselineWorld {
-            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             checkpoint_tick: 12,
             volumes: vec![BaselineVolume {
                 volume_id,
@@ -3747,7 +3747,7 @@ mod tests {
         }
         let patch = |coord: BrickCoord, revision: u64, material: MaterialId| {
             spall_protocol::BaselineWorld {
-                schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+                schema: spall_protocol::WIRE_SCHEMA_VERSION,
                 checkpoint_tick: 12,
                 volumes: vec![BaselineVolume {
                     volume_id,
@@ -3900,7 +3900,7 @@ mod tests {
             result_hashes: vec![],
         };
         let patch = spall_protocol::BaselineWorld {
-            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             checkpoint_tick: 20,
             volumes: vec![volume_of(
                 volume_id,
@@ -4237,7 +4237,7 @@ mod tests {
         });
 
         let world = BaselineWorld {
-            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             checkpoint_tick: 500,
             volumes: vec![BaselineVolume {
                 volume_id: VolumeId::new(7).unwrap(),
@@ -4337,7 +4337,7 @@ mod tests {
         let mut cells = vec![MaterialId::AIR.0; spall_core::CELLS_PER_BRICK];
         cells[..10].fill(MaterialId(1).0);
         let patch = BaselineWorld {
-            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            schema: spall_protocol::WIRE_SCHEMA_VERSION,
             checkpoint_tick: 3,
             volumes: vec![BaselineVolume {
                 volume_id: terrain_id,

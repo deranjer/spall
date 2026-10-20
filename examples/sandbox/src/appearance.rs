@@ -9,7 +9,7 @@
 //! differ only in colour. Importing an editor scene maps each tinted cell to the
 //! nearest variant of its material; an untinted cell keeps the base material.
 //!
-//! Variant identity is **explicit and append-only**. `appearance_v3.rs` freezes
+//! Variant identity is **explicit**. `appearance_v3.rs` holds
 //! the variants of the first variant manifest (ids 100..=136, names, colours);
 //! `appearance_extensions.rs`, written by
 //! `cargo run -p spall_editor --example appearance_palette`, holds later ones
