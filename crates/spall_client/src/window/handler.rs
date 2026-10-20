@@ -435,16 +435,24 @@ impl ApplicationHandler for InteractiveApp {
                         self.sky_dirty = false;
                     }
                 }
-                if let Some(view) = &self.creature_view
-                    && let Some(replica) =
+                // The replica lock is only tried, never waited on, so the frame
+                // never stalls behind the network thread. A busy frame reuses
+                // the last creatures and players instead of not drawing them.
+                if let Some(view) = &self.creature_view {
+                    if let Some(replica) =
                         self.session.replica.get().and_then(|r| r.try_lock().ok())
-                    && !replica.creatures().is_empty()
-                {
-                    overlay.extend(view.instances(
-                        replica.creatures(),
-                        replica.now_tick_estimate(),
-                        Instant::now(),
-                    ));
+                    {
+                        self.last_creature_cubes = if replica.creatures().is_empty() {
+                            Vec::new()
+                        } else {
+                            view.instances(
+                                replica.creatures(),
+                                replica.now_tick_estimate(),
+                                Instant::now(),
+                            )
+                        };
+                    }
+                    overlay.extend_from_slice(&self.last_creature_cubes);
                 }
                 let water = self
                     .session
@@ -452,26 +460,26 @@ impl ApplicationHandler for InteractiveApp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .query();
-                if let Some(player_view) = &self.player_view
-                    && let Some(mut replica) =
+                if let Some(player_view) = &self.player_view {
+                    if let Some(mut replica) =
                         self.session.replica.get().and_then(|r| r.try_lock().ok())
-                {
-                    let tick = replica.render_tick(Instant::now());
-                    let bodies: Vec<PlayerBody> = replica
-                        .remote_players(tick)
-                        .into_iter()
-                        .map(|p| PlayerBody {
-                            entity: p.entity.get(),
-                            feet_m: p.feet_m,
-                            velocity_m_s: p.velocity_m_s,
-                            in_water: player_swims(&water, p.feet_m),
-                            look_yaw: None,
-                        })
-                        .collect();
-                    drop(replica);
-                    if !bodies.is_empty() {
+                    {
+                        let tick = replica.render_tick(Instant::now());
+                        self.last_remote_players = replica
+                            .remote_players(tick)
+                            .into_iter()
+                            .map(|p| PlayerBody {
+                                entity: p.entity.get(),
+                                feet_m: p.feet_m,
+                                velocity_m_s: p.velocity_m_s,
+                                in_water: player_swims(&water, p.feet_m),
+                                look_yaw: None,
+                            })
+                            .collect();
+                    }
+                    if !self.last_remote_players.is_empty() {
                         overlay.extend(player_view.instances(
-                            &bodies,
+                            &self.last_remote_players,
                             self.player_tint_base,
                             Instant::now(),
                         ));
@@ -620,17 +628,34 @@ impl ApplicationHandler for InteractiveApp {
                             && let (Some(player_view), Some(v), Some(eye), Some((_, dir))) =
                                 (&self.player_view, fresh_view, followed_eye, cam)
                         {
-                            let reach = self
+                            let target = self
                                 .session
                                 .replica
                                 .get()
                                 .and_then(|r| r.try_lock().ok())
-                                .and_then(|replica| {
+                                .map(|replica| {
                                     replica
                                         .terrain_volume()
-                                        .map(|volume| third_person_distance(volume, eye, dir))
-                                })
-                                .unwrap_or(THIRD_PERSON_DISTANCE_M);
+                                        .map_or(THIRD_PERSON_DISTANCE_M, |volume| {
+                                            third_person_distance(volume, eye, dir)
+                                        })
+                                });
+                            // Pull in at once so terrain never ends up inside the
+                            // camera, ease back out, and hold the last distance on
+                            // a frame that found the replica busy.
+                            let dt = self.third_person_at.map_or(0.0, |at| {
+                                render_now.saturating_duration_since(at).as_secs_f32()
+                            });
+                            self.third_person_at = Some(render_now);
+                            if let Some(target) = target {
+                                let current = self.third_person_distance_m;
+                                self.third_person_distance_m = if target < current {
+                                    target
+                                } else {
+                                    current + (target - current) * (dt * 4.0).min(1.0)
+                                };
+                            }
+                            let reach = self.third_person_distance_m;
                             render_cam = Some((third_person_eye(eye, dir, reach), dir));
                             let eye_height =
                                 f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;

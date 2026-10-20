@@ -18,6 +18,14 @@ pub(super) struct InteractiveApp {
     pub(super) third_person: bool,
     /// Render-table index of the player view's first tint material.
     pub(super) player_tint_base: u32,
+    /// Last drawn creature cubes and remote players. A frame that finds the
+    /// replica lock busy reuses them instead of dropping them for a frame.
+    pub(super) last_creature_cubes: Vec<spall_render::CubeInstance>,
+    pub(super) last_remote_players: Vec<super::options::PlayerBody>,
+    /// Third-person camera distance (metres): pulled in at once when terrain
+    /// is in the way, eased back out, and held when the replica is busy.
+    pub(super) third_person_distance_m: f32,
+    pub(super) third_person_at: Option<Instant>,
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
@@ -223,6 +231,10 @@ impl InteractiveApp {
             player_view: options.player_view,
             third_person: false,
             player_tint_base: 0,
+            last_creature_cubes: Vec::new(),
+            last_remote_players: Vec::new(),
+            third_person_distance_m: super::camera::THIRD_PERSON_DISTANCE_M,
+            third_person_at: None,
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
