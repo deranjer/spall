@@ -71,7 +71,7 @@ pub struct CreaturePresentation {
 
 /// How far behind the newest received sample creatures are drawn, so two
 /// samples usually bracket the render time at the 20 Hz send rate.
-pub const CREATURE_RENDER_DELAY: Duration = Duration::from_millis(110);
+pub const CREATURE_RENDER_DELAY: Duration = Duration::from_millis(220);
 /// Longest a creature is extrapolated along its velocity past its newest sample.
 const MAX_EXTRAPOLATION: Duration = Duration::from_millis(150);
 
@@ -183,6 +183,18 @@ impl ReplicaCreatures {
             };
             match self.motion.get_mut(&entry.creature_id) {
                 Some(track) if frame.server_tick <= track.current.server_tick => continue,
+                // The server only moves a creature every few ticks but sends its pose
+                // more often. An unchanged pose must not become a new keyframe, or the
+                // presented motion would hold, jump and hold. Keep the arrival time of
+                // the sample that introduced the pose.
+                Some(track)
+                    if track.current.translation_m == sample.translation_m
+                        && track.current.rotation_xyzw == sample.rotation_xyzw
+                        && track.current.locomotion_tag == sample.locomotion_tag =>
+                {
+                    track.current.server_tick = sample.server_tick;
+                    continue;
+                }
                 Some(track) => {
                     track.previous = Some(track.current);
                     track.current = sample;
