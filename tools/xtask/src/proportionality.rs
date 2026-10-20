@@ -22,6 +22,8 @@ use std::{
 const MAX_FILE_LINES: usize = 2_000;
 const ALLOWLIST_PATH: &str = "tools/xtask/proportionality-allowlist.txt";
 const SCAN_ROOTS: [&str; 3] = ["crates/", "examples/", "tools/"];
+/// This file quotes the patterns it scans for; it is not scanned itself.
+const SELF_PATH: &str = "tools/xtask/src/proportionality.rs";
 
 /// Grandfathered state parsed from the allowlist file.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -290,7 +292,10 @@ pub fn observe(root: &Path) -> Result<Observed, String> {
         if path.starts_with("docs/") && (path.ends_with(".jsonl") || path.ends_with(".log")) {
             observed.logs.insert(path.clone());
         }
-        if !path.ends_with(".rs") || !SCAN_ROOTS.iter().any(|r| path.starts_with(r)) {
+        if !path.ends_with(".rs")
+            || path == SELF_PATH
+            || !SCAN_ROOTS.iter().any(|r| path.starts_with(r))
+        {
             continue;
         }
         let Ok(source) = std::fs::read_to_string(root.join(&path)) else {
@@ -444,7 +449,11 @@ mod tests {
         o.ungated.push(("c.rs".into(), 3, "fault".into()));
         let (failures, warnings) = evaluate(&o, &allow());
         assert_eq!(failures.len(), 5, "{failures:?}");
-        assert!(failures.iter().any(|f| f.contains("rule 7") && f.contains("grew")));
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("rule 7") && f.contains("grew"))
+        );
         assert!(failures.iter().any(|f| f.contains("rule 9")));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("rule 5"));
