@@ -21,8 +21,8 @@ The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It c
 Animated animal source fixtures (trout, crow and deer) have a bounded renderer
 preview: `cargo run -p sandbox --features client --example animal-preview -- --bounded`.
 It writes pose captures under `.local/animal-preview`. Live deer and crows can be
-spawned in a worldgen sandbox with `--animals N` (below); trout, death/damage and
-persistence recovery with animals remain open in [the animal plan](docs/animals.md).
+spawned in a worldgen sandbox with `--animals N` (below); trout, hunting and
+saving a world with animals remain open in [the animal plan](docs/animals.md).
 
 Visit the small animated zoo with
 `cargo run -p sandbox --features client --example animal-zoo`.
@@ -124,8 +124,8 @@ The first useful deliverable is a networked destruction sandbox. It must already
 Nature and weather playtest: `cargo xtask play --release --worldgen natural
 --worldgen-size 4096 --season winter` launches a 1024 m world. Add `--animals 24`
 to spawn that many deer and half as many crows (server-authoritative; they walk or fly
-under kinematic movement, and `--save` with animals is refused until actor
-journal replay exists; trout are not spawned yet). **F10** selects
+under kinematic movement, and `--save` with animals is refused; trout are not
+spawned yet). **F10** selects
 automatic or forced weather, previews nature sounds, adjusts nature/weather
 volume and mute, and toggles visual effects/reduced lightning. Scroll the menu
 for the remaining controls. Weather choices are server-authorized; changing a

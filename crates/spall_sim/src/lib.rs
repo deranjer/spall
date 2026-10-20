@@ -75,9 +75,7 @@ pub use contact_damage::{
     ContactDamageConfig, ContactDamageMaterialProfile, ContactDamagePlan, ContactDamagePolicy,
     ContactEvent, PlannedDamage,
 };
-pub use creatures::{
-    Creature, CreatureHostInitError, CreatureSpawnError, MAX_CREATURE_HOST_RECORDS,
-};
+pub use creatures::{CreatureHostInitError, CreatureSpawnError};
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use spall_core::{CreatureAllocator, CreatureId};
 use spall_protocol::CreatureRecord;
 
-pub const MAX_CREATURE_HOST_RECORDS: usize = 1_024;
+const MAX_CREATURE_HOST_RECORDS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CreatureHostInitError {
@@ -34,10 +34,10 @@ pub enum CreatureSpawnError {
 
 /// A creature's authoritative state.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Creature {
-    pub record: CreatureRecord,
+pub(crate) struct Creature {
+    pub(crate) record: CreatureRecord,
     /// Average velocity over the last applied move, m/s.
-    pub velocity_m_s: [f32; 3],
+    pub(crate) velocity_m_s: [f32; 3],
     pub(crate) moved_at_tick: u64,
 }
 
