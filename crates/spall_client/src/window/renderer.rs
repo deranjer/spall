@@ -989,7 +989,7 @@ impl WorldRenderer {
         {
             timer.map_after_submit(slot);
         }
-        // A minimal isolated reproduction (`examples/poc_local`, ENG-69)
+        // A minimal isolated reproduction (ENG-69; the since-deleted `examples/poc_local`)
         // found that on this app's Vulkan backend, `desired_maximum_frame_latency: 1`
         // above did not actually stop the CPU from racing ~2 frames ahead of
         // the display — a measured, sustained 0.2ms/16ms/33ms three-frame

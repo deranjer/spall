@@ -16,3 +16,6 @@
 artifacts/
 docs/reports/**/*.jsonl
 docs/reports/**/*.log
+
+# Raw ENG-103 grid-solver evidence (solver removed in ENG-169); kept on disk and in history only.
+docs/reports/ENG-103-evidence/
