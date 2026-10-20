@@ -80,6 +80,11 @@ impl Simulation {
         Ok(())
     }
 
+    /// Whether a creature host is installed. A world with animals cannot be saved.
+    pub fn has_creature_host(&self) -> bool {
+        self.creatures.is_some()
+    }
+
     /// The first creature id not yet used, so a director can plan a spawn batch.
     pub fn next_creature_id(&self) -> Option<u64> {
         self.creatures.as_ref().map(CreatureHost::next_creature_id)

@@ -604,7 +604,6 @@ mod tests {
     fn dummy_checkpoint() -> Checkpoint {
         use spall_store::{STORE_SCHEMA_VERSION, StoredWorldMeta};
         Checkpoint {
-            creatures: None,
             vegetation: Vec::new(),
             snow: None,
             tick: 1,

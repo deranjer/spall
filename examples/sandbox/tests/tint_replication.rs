@@ -123,7 +123,6 @@ fn client_config(
         join_token: token,
         script,
         movement_script: Vec::new(),
-        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::BridgeCut,
         run_ticks,

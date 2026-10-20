@@ -80,7 +80,7 @@ use spall_voxel::{Brick, MemoryReport};
 
 use crate::persist::{
     PersistConfig, PersistError, capture_with_terrain_bricks,
-    capture_with_terrain_bricks_and_catalog, stored_brick_from_backing, stored_brick_from_snapshot,
+    stored_brick_from_backing, stored_brick_from_snapshot,
 };
 
 /// Consecutive ticks a terrain brick must be resident *and* outside every
@@ -584,19 +584,7 @@ impl ResidencyPass {
         cfg: &PersistConfig,
         journal_cursor: u64,
     ) -> Result<Checkpoint, PersistError> {
-        self.capture_checkpoint_internal(sim, cfg, journal_cursor, None)
-    }
-
-    /// Capture complete streamed terrain and animals using the game catalog.
-    /// The live resident set is unchanged; failed captures publish no cache state.
-    pub fn capture_checkpoint_with_catalog(
-        &mut self,
-        sim: &Simulation,
-        cfg: &PersistConfig,
-        journal_cursor: u64,
-        catalog: &spall_protocol::CreatureValidationCatalog<'_>,
-    ) -> Result<Checkpoint, PersistError> {
-        self.capture_checkpoint_internal(sim, cfg, journal_cursor, Some(catalog))
+        self.capture_checkpoint_internal(sim, cfg, journal_cursor)
     }
 
     fn capture_checkpoint_internal(
@@ -604,7 +592,6 @@ impl ResidencyPass {
         sim: &Simulation,
         cfg: &PersistConfig,
         journal_cursor: u64,
-        catalog: Option<&spall_protocol::CreatureValidationCatalog<'_>>,
     ) -> Result<Checkpoint, PersistError> {
         let world = sim.world();
         if !self.world_instance.matches_world(world) {
@@ -685,16 +672,7 @@ impl ResidencyPass {
         }
 
         let logical_total = terrain_bricks.len() as u64;
-        let checkpoint = match catalog {
-            Some(catalog) => capture_with_terrain_bricks_and_catalog(
-                sim,
-                cfg,
-                journal_cursor,
-                terrain_bricks,
-                catalog,
-            )?,
-            None => capture_with_terrain_bricks(sim, cfg, journal_cursor, terrain_bricks)?,
-        };
+        let checkpoint = capture_with_terrain_bricks(sim, cfg, journal_cursor, terrain_bricks)?;
 
         // Only commit the new cache / counters once every brick in this call
         // succeeded — a failed capture (the `EvictedBrickUnavailable` early

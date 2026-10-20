@@ -43,10 +43,6 @@ use spall_protocol::{
 };
 use spall_voxel::{Brick, BrickHash, EditPlan, Volume};
 
-#[cfg(test)]
-#[path = "lifecycle_rejection_review.rs"]
-mod lifecycle_rejection_review;
-
 /// Tunables for a [`ReplicaWorld`].
 #[derive(Debug, Clone, Copy)]
 pub struct ReplicaConfig {
@@ -384,8 +380,8 @@ pub struct ReplicaWorld {
     /// The existing replay guard binds each ID to its logical payload, excluding
     /// the recipient-specific control-stream sequence used by repair resends.
     applied_tx: BTreeMap<u64, Hash32>,
-    /// Ownership records of replicated creatures; `None` until the game installs a catalog.
-    creatures: Option<crate::replica_creatures::ReplicaCreatures>,
+    /// Creatures the server has announced.
+    creatures: crate::replica_creatures::ReplicaCreatures,
     control_gate: SequenceGate,
     /// Newest held snapshot for a body that does not exist yet: entity → (snap,
     /// server tick it was received at).
@@ -693,7 +689,7 @@ impl ReplicaWorld {
             volume_of_entity: BTreeMap::new(),
             tombstoned: BTreeSet::new(),
             applied_tx: BTreeMap::new(),
-            creatures: None,
+            creatures: crate::replica_creatures::ReplicaCreatures::new(),
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
             pending_repair_txns: BTreeMap::new(),
@@ -733,7 +729,7 @@ impl ReplicaWorld {
             volume_of_entity: BTreeMap::new(),
             tombstoned: BTreeSet::new(),
             applied_tx: BTreeMap::new(),
-            creatures: None,
+            creatures: crate::replica_creatures::ReplicaCreatures::new(),
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
             pending_repair_txns: BTreeMap::new(),
@@ -831,9 +827,7 @@ impl ReplicaWorld {
         self.volume_of_entity = staged.volume_of_entity;
         self.tombstoned = BTreeSet::new();
         self.applied_tx = BTreeMap::new();
-        if let Some(creatures) = self.creatures.as_mut() {
-            creatures.reset();
-        }
+        self.creatures.reset();
         self.control_gate = SequenceGate::new();
         self.pending_snapshots = BTreeMap::new();
         // A fresh baseline supersedes any transaction that was held pending a
@@ -1556,30 +1550,22 @@ impl ReplicaWorld {
             .fold(0.0_f64, f64::max)
     }
 
-    /// Installs the game-supplied creature catalog, enabling replay of actor
-    /// lifecycle operations. Replaces any previous store.
-    pub fn install_creature_catalog(
-        &mut self,
-        catalog: std::sync::Arc<spall_protocol::OwnedCreatureCatalog>,
-    ) {
-        self.creatures = Some(crate::replica_creatures::ReplicaCreatures::new(catalog));
-    }
-
     /// Newest observed server tick, for animation clocks.
     pub fn now_tick_estimate(&self) -> f64 {
         self.now_tick as f64
     }
 
-    /// Installs a join-time creature record. Rejected without a catalog.
-    pub fn apply_creature_sync(
+    /// Installs a creature the server announced (or, in a join list, holds).
+    pub fn apply_creature_spawn(
         &mut self,
-        sync: &spall_protocol::CreatureSync,
+        spawn: &spall_protocol::CreatureSpawn,
     ) -> Result<(), String> {
-        let creatures = self
-            .creatures
-            .as_mut()
-            .ok_or("creature sync requires an installed creature catalog")?;
-        creatures.install_sync(sync).map_err(|e| e.to_string())
+        self.creatures.spawn(spawn).map_err(|e| e.to_string())
+    }
+
+    /// Removes a creature the server despawned.
+    pub fn apply_creature_despawn(&mut self, despawn: &spall_protocol::CreatureDespawn) {
+        self.creatures.despawn(despawn.creature_id);
     }
 
     /// Applies a creature presentation frame stamped with its arrival time.
@@ -1588,21 +1574,12 @@ impl ReplicaWorld {
         frame: &spall_protocol::CreatureMotionFrame,
         now: std::time::Instant,
     ) -> usize {
-        self.creatures
-            .as_mut()
-            .map_or(0, |creatures| creatures.apply_motion(frame, now))
+        self.creatures.apply_motion(frame, now)
     }
 
-    #[cfg(test)]
-    pub(crate) fn creatures_mut_for_tests(
-        &mut self,
-    ) -> &mut crate::replica_creatures::ReplicaCreatures {
-        self.creatures.as_mut().expect("creature store installed")
-    }
-
-    /// Replicated creature ownership records, if a catalog is installed.
-    pub fn creatures(&self) -> Option<&crate::replica_creatures::ReplicaCreatures> {
-        self.creatures.as_ref()
+    /// The replicated creatures.
+    pub fn creatures(&self) -> &crate::replica_creatures::ReplicaCreatures {
+        &self.creatures
     }
 
     // --- transaction application --------------------------------------------
@@ -1619,18 +1596,6 @@ impl ReplicaWorld {
                 };
             }
         };
-        let has_lifecycle = crate::replica_creatures::ReplicaCreatures::has_lifecycle_ops(tx);
-        let actor_only = has_lifecycle
-            && tx
-                .ops
-                .iter()
-                .all(|op| matches!(op, TopologyOp::CreatureLifecycle { .. }));
-        if has_lifecycle && (!actor_only || self.creatures.is_none()) {
-            return ApplyOutcome::Rejected {
-                reason: "creature lifecycle replay requires an installed actor candidate path"
-                    .into(),
-            };
-        }
         if let Some(applied) = self.applied_tx.get(&tx.transaction_id.get()) {
             return if *applied == identity {
                 ApplyOutcome::Duplicate
@@ -1668,33 +1633,6 @@ impl ReplicaWorld {
         }
         self.now_tick = self.now_tick.max(tx.server_tick.get());
         let _ = self.control_gate.observe(tx.control_seq.0);
-
-        if actor_only {
-            // Actor-only transactions carry no geometry preconditions: apply the
-            // ordered lifecycle ops atomically, then record the replay identity.
-            let floor = self
-                .volumes
-                .keys()
-                .next_back()
-                .map_or(1, |highest| highest.saturating_add(1));
-            let creatures = self
-                .creatures
-                .as_mut()
-                .expect("actor_only implies an installed creature store");
-            return match creatures.apply_transaction(tx, floor) {
-                Ok(()) => {
-                    self.applied_tx.insert(tx.transaction_id.get(), identity);
-                    ApplyOutcome::Published {
-                        transaction: tx.transaction_id,
-                        new_bodies: Vec::new(),
-                        tombstoned: Vec::new(),
-                    }
-                }
-                Err(error) => ApplyOutcome::Rejected {
-                    reason: format!("creature lifecycle rejected: {error}"),
-                },
-            };
-        }
 
         // The distant terrain catalogue is still arriving: a transaction may
         // touch a brick whose digest is not known yet, and its result hash covers
@@ -1764,8 +1702,6 @@ impl ReplicaWorld {
                     TopologyOp::SourcePatchBaseline { .. } => "patch-baseline",
                     TopologyOp::SplitOffBulkBaseline { .. } => "split-bulk",
                     TopologyOp::SourcePatchBulkBaseline { .. } => "patch-bulk",
-                    TopologyOp::CreatureLifecycle { .. } => "creature-lifecycle",
-                    TopologyOp::CreatureLifecycleBulk { .. } => "creature-lifecycle-bulk",
                 })
                 .collect();
             let before: Vec<String> = tx
@@ -2395,7 +2331,6 @@ fn topology_op_touches_volume(op: &TopologyOp, volume: VolumeId) -> bool {
         }
         TopologyOp::SourcePatchBaseline { source, .. }
         | TopologyOp::SourcePatchBulkBaseline { source, .. } => *source == volume,
-        TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. } => false,
     }
 }
 
@@ -2517,9 +2452,6 @@ fn replay_ops(
                 flush(pending.take(), candidate, cell_size)?;
                 let bv = bulk_volume(*source)?;
                 patch_split_source(candidate, *source, bv, newer_only)?;
-            }
-            TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. } => {
-                return Err("creature lifecycle replay requires actor candidate path".into());
             }
         }
     }
