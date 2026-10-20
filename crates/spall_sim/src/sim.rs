@@ -513,6 +513,9 @@ pub const DAM_GATE_ACTOR_ID: u64 = (1 << 40) + 1;
 /// far from spherical — so covering it with clusters this size (rather than
 /// one sphere sized to the whole shape) keeps the cut close to the authored
 /// outline instead of ballooning out to the shape's own diagonal.
+/// Snow tiles (4 m each) scanned around every player: 24 tiles = 96 m, the default view
+/// distance; 30 tiles covers the 120 m maximum.
+const SNOW_DISCOVERY_RING_TILES: i32 = 30;
 const DAM_GATE_MAX_SPHERE_RADIUS_CELLS: i64 = 5;
 
 /// The fixed server timestep: 60 Hz (`docs/architecture.md`).
@@ -5011,7 +5014,7 @@ impl Simulation {
                 self.snow.enqueue_scan((x, z), 0);
                 self.snow_priority_tiles.push((x, z));
             }
-            for radius in 1i32..=24 {
+            for radius in 1i32..=SNOW_DISCOVERY_RING_TILES {
                 for &(tile_x, tile_z) in &player_tiles {
                     for dz in -radius..=radius {
                         for dx in -radius..=radius {

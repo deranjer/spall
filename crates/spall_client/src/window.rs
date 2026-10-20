@@ -5666,6 +5666,9 @@ const FOG_END_FRACTION: f32 = 0.97;
 /// frame rate with it, measured), for foliage that is a few hundred
 /// milliseconds late at most.
 /// Minimum time between ground-snow geometry rebuilds (each costs ~10 ms).
+/// Furthest ground snow is generated, whatever the view distance: beyond this the
+/// geometry rebuild no longer fits a frame budget.
+const SNOW_MAX_RADIUS_M: f32 = 96.0;
 const SNOW_REBUILD_INTERVAL: Duration = Duration::from_millis(750);
 const FOLIAGE_REBUILD_INTERVAL: Duration = Duration::from_millis(400);
 
@@ -6801,6 +6804,8 @@ impl WorldRenderer {
                 if self.ground_snow_enabled
                     && let Some((_, terrain)) = &self.vegetation_terrain
                 {
+                    self.snow_presentation
+                        .set_radius_m(view_radius_m().min(SNOW_MAX_RADIUS_M));
                     let snow_started = Instant::now();
                     let (patches, tracks) = self.snow_presentation.update(
                         &self.snow_frames,

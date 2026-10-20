@@ -201,7 +201,10 @@ fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "timing budget is only meaningful in release")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "timing budget is only meaningful in release"
+)]
 fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
     use sandbox::animal_view::AnimalView;
     use spall_client::window::CreatureView;

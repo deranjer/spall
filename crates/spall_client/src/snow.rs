@@ -13,6 +13,7 @@ use spall_voxel::{Sample, Volume};
 
 const CELL_M: f32 = 0.25;
 const CAMERA_BUCKET_M: f32 = 8.0;
+/// Default draw radius; the window sets it to the terrain view distance.
 const CAMERA_RADIUS_M: f32 = 72.0;
 const MAX_INPUT_FRAMES: usize = 4_096;
 const MIN_RENDER_DEPTH_Q16: u16 = 33; // About 0.5 mm; zero-depth cohorts stay invisible.
@@ -36,6 +37,7 @@ pub struct SnowPresentationStats {
 /// returns the same slices without rescanning terrain cells.
 #[derive(Debug, Default)]
 pub struct SnowPresentation {
+    radius_m: f32,
     cache_key: Option<u64>,
     patches: Vec<SnowSurfacePatch>,
     footprints: Vec<SnowFootprintMark>,
@@ -44,7 +46,20 @@ pub struct SnowPresentation {
 
 impl SnowPresentation {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            radius_m: CAMERA_RADIUS_M,
+            ..Self::default()
+        }
+    }
+
+    /// Sets how far from the camera snow is generated. A change invalidates the
+    /// cached geometry.
+    pub fn set_radius_m(&mut self, radius_m: f32) {
+        let radius_m = radius_m.clamp(16.0, 128.0);
+        if (radius_m - self.radius_m).abs() > f32::EPSILON {
+            self.radius_m = radius_m;
+            self.cache_key = None;
+        }
     }
 
     /// Diagnostic counters from the current cached mesh.
@@ -87,12 +102,13 @@ impl SnowPresentation {
             .map(|frame| frame.world_epoch)
             .max()
             .unwrap_or(0);
+        let radius_m = self.radius_m;
         let mut nearby: Vec<&SnowSurfaceFrame> = frames
             .iter()
             .filter(|frame| {
                 frame.schema == SNOW_SCHEMA
                     && frame.world_epoch == current_epoch
-                    && tile_distance_squared(frame, camera) <= CAMERA_RADIUS_M * CAMERA_RADIUS_M
+                    && tile_distance_squared(frame, camera) <= radius_m * radius_m
             })
             .collect();
         nearby.sort_by(|a, b| {
