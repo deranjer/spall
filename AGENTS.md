@@ -38,3 +38,7 @@ If a ticket and the repo docs disagree, resolve it explicitly and update both; d
 - Finish with changed files, exact checks run, results, remaining risks, and the next unblocked task ID. Distinguish measured results from targets.
 
 No special approval step is imposed for ordinary authorized implementation. Gate failures require evidence and an integration decision; agents should finish independent, in-scope work and report the precise blocker.
+
+## Finishing a ticket
+
+`cargo xtask check` enforces Proportionality rules 3, 7 and 9 mechanically (and warns on rule 5) via `tools/xtask/proportionality-allowlist.txt`. That allowlist may only shrink or have entries removed; adding to it needs user approval.
