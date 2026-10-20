@@ -7,30 +7,42 @@
 # domain <path> <literal>   rule 3: existing b"spall.…" hash-domain literal
 # log <path>                rule 9: tracked docs *.jsonl/*.log
 
-lines crates/spall_client/src/net.rs 3582
-lines crates/spall_client/src/replica.rs 2618
-lines crates/spall_client/src/window.rs 6383
-lines crates/spall_fluid/src/columns.rs 3197
+lines crates/spall_client/src/net.rs 3695
+lines crates/spall_fluid/src/columns.rs 3245
+lines crates/spall_protocol/src/creature_owner.rs 2062
 lines crates/spall_render/src/capture.rs 2212
-lines crates/spall_server/src/serve.rs 6717
-lines crates/spall_sim/src/world.rs 2737
-lines examples/sandbox/src/bin/sandbox-capture.rs 2993
+lines crates/spall_server/src/serve.rs 7152
+lines crates/spall_sim/src/world.rs 3291
+lines examples/sandbox/src/bin/sandbox-capture.rs 2996
 lines tools/spall_editor/src/ui.rs 2165
+const crates/spall_core/src/ids.rs CREATURE_ALLOCATOR_SCHEMA
 const crates/spall_core/src/lib.rs PROCESS_METADATA_VERSION
 const crates/spall_ecology/src/lib.rs ECOLOGY_PLAN_VERSION
 const crates/spall_ecology/src/lib.rs ECOLOGY_STATE_VERSION
 const crates/spall_ecology/src/lib.rs SPECIES_DEFINITION_VERSION
 const crates/spall_ecology/src/living.rs VERSION
+const crates/spall_physics/src/fracture.rs FRACTURE_PLAN_VERSION
 const crates/spall_protocol/src/baseline.rs BASELINE_WORLD_SCHEMA
 const crates/spall_protocol/src/column_water.rs COLUMN_WATER_VERSION
+const crates/spall_protocol/src/creature.rs CREATURE_STATE_SCHEMA
+const crates/spall_protocol/src/creature_motion.rs CREATURE_MOTION_SCHEMA
+const crates/spall_protocol/src/creature_owner.rs CREATURE_CHANGE_SCHEMA
+const crates/spall_protocol/src/creature_owner.rs CREATURE_OWNER_SCHEMA
+const crates/spall_protocol/src/creature_snapshot.rs CREATURE_SNAPSHOT_SCHEMA
+const crates/spall_protocol/src/creature_sync.rs CREATURE_SYNC_SCHEMA
 const crates/spall_protocol/src/handshake.rs PROTOCOL_VERSION
+const crates/spall_protocol/src/lifecycle_bulk.rs CREATURE_LIFECYCLE_BULK_PAYLOAD_SCHEMA
 const crates/spall_protocol/src/records.rs WIRE_SCHEMA_VERSION
+const crates/spall_protocol/src/segment.rs BASELINE_CREATURE_LIFECYCLE_WORLD_VERSION
 const crates/spall_protocol/src/segment.rs BASELINE_DEFERRED_REGIONAL_WORLD_VERSION
 const crates/spall_protocol/src/segment.rs BASELINE_REGIONAL_WORLD_VERSION
 const crates/spall_protocol/src/segment.rs BASELINE_SEGMENTED_WORLD_VERSION
 const crates/spall_protocol/src/segment.rs BASELINE_STREAMED_WORLD_VERSION
 const crates/spall_protocol/src/segment.rs REGIONAL_SEGMENT_SCHEMA
 const crates/spall_protocol/src/segment.rs SEGMENT_SCHEMA
+const crates/spall_protocol/src/snow.rs SNOW_SCHEMA
+const crates/spall_protocol/src/transaction_attachments.rs TRANSACTION_ATTACHMENT_SET_SCHEMA
+const crates/spall_protocol/src/weather.rs WEATHER_SCHEMA
 const crates/spall_server/src/baseline.rs BASELINE_CONTENT_VERSION
 const crates/spall_server/src/baseline.rs BASELINE_WORLD_VERSION
 const crates/spall_server/src/persist.rs INTEGER_BRUSH_VERSION
@@ -49,15 +61,31 @@ const examples/sandbox/src/game.rs RECIPE_CATALOG_VERSION
 const tools/spall_editor/src/lib.rs PROJECT_FORMAT_VERSION
 const tools/spall_editor/src/lib.rs SCENE_FORMAT_VERSION
 const tools/spall_editor/src/lib.rs VOXEL_FORMAT_VERSION
+domain crates/spall_asset/src/lib.rs spall.asset.v1
 domain crates/spall_mesh/src/mesh.rs spall.mesh.v1
 domain crates/spall_protocol/src/canonical.rs spall.content-with-assets.v1
 domain crates/spall_protocol/src/canonical.rs spall.manifest.v1
 domain crates/spall_protocol/src/canonical.rs spall.topology.chunk.v2
 domain crates/spall_protocol/src/canonical.rs spall.topology.v2
+domain crates/spall_protocol/src/creature.rs spall.creature-material-mapping.v1
+domain crates/spall_protocol/src/creature_owner.rs spall.creature-change.v4
+domain crates/spall_protocol/src/creature_owner.rs spall.creature-motion.v4
+domain crates/spall_protocol/src/creature_owner.rs spall.creature-owner-set.v4
+domain crates/spall_protocol/src/creature_owner.rs spall.creature-owner.v4
+domain crates/spall_protocol/src/creature_owner.rs spall.creature-source-content.v2
+domain crates/spall_protocol/src/creature_owner.rs spall.creature-topology.v4
+domain crates/spall_protocol/src/creature_snapshot.rs spall.checkpoint-topology.v1
+domain crates/spall_protocol/src/creature_snapshot.rs spall.creature-snapshot-topology.v1
+domain crates/spall_protocol/src/creature_snapshot.rs spall.creature-snapshot.v2
+domain crates/spall_protocol/src/records.rs spall.transaction-replay.v1
 domain crates/spall_protocol/src/segment.rs spall.baseline.capability.segmented.v2
 domain crates/spall_protocol/src/segment.rs spall.baseline.capability.streamed.v3
+domain crates/spall_sim/src/sim/creature_types.rs spall.creature-owner-key.v1
+domain crates/spall_sim/src/sim/creature_types.rs spall.sim-creature-catalog-fence.v1
+domain crates/spall_sim/src/world.rs spall.creature-source-ownership.v1
 domain crates/spall_voxel/src/brick.rs spall.brick.v1
 domain crates/spall_voxel/src/fixtures.rs spall.voxel.fixture.v1
+domain examples/sandbox/examples/animal_fixtures.rs spall.asset.v1
 domain examples/sandbox/src/content.rs spall.asset.v1
 domain examples/sandbox/src/content.rs spall.sandbox.content-manifest.v1
 domain tools/spall_editor/examples/terrain_trees.rs spall.fixture.terrain-palm.v1
@@ -66,256 +94,6 @@ domain tools/spall_editor/examples/terrain_trees_v2.rs spall.fixture.terrain-pal
 domain tools/spall_editor/examples/terrain_trees_v2.rs spall.fixture.weeping-willow.v2
 domain tools/spall_editor/src/lib.rs spall.editor.portable-asset-id.v1
 domain tools/spall_editor/src/spvox.rs spall.asset.v1
-log docs/reports/ENG-103-evidence/base-scale1-60hz.jsonl
-log docs/reports/ENG-103-evidence/basilisk-basin-30s.jsonl
-log docs/reports/ENG-103-evidence/basilisk-equilibrium-30s.jsonl
-log docs/reports/ENG-103-evidence/basilisk-standing-wave-l5-30s.jsonl
-log docs/reports/ENG-103-evidence/fixed-substeps-2.jsonl
-log docs/reports/ENG-103-evidence/flat-basin-stability.jsonl
-log docs/reports/ENG-103-evidence/flooded-tunnel-current.jsonl
-log docs/reports/ENG-103-evidence/flooded-tunnel.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-180ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-30s-after-antiflux-fix-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-30s-ic0-fractions.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-30s-scaling-final-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-30s-scaling-final2-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-acceptance-v2-singlephase.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-acceptance-v2-singlephase.stderr.log
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-acceptance-v2-twophase-mg.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-acceptance-v2-twophase-mg.stderr.log
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-acceptance-v2-twophase.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-acceptance-v2-twophase.stderr.log
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-physical-acceptance.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-physical-acceptance.stderr.log
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-uniform-initialization-final.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-1800ticks-uniform-initialization.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-activeproj.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-allocation-only-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-allocation-postreuse-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-baseline-corrected.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-correctness.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-final-profile.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-final-repro.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-evidence-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-evidence-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-final-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-final-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-plain-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-plain-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-plain-r2-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-plain-r2-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-plain-r3-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-plain-r3-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-release-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0-release-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0cmp-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-ic0cmp-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-initial-state-stages.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-pressure-final-diagnostics.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-pressure-final.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-pressure-optimized-tol1e-5.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-pressure-optimized-tol1e-6.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-pressure-optimized-tol1e-7.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-pressure-optimized.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-pressurebase.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-diagnosis-ic0-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-diagnosis-ic0-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-diagnosis-ic0-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-final-ic0-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-final-ic0-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-final-ic0-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-final-jacobi-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-final-jacobi-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scale-final-jacobi-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-afterfix-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-final-ic0-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-final-ic0-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-final-ic0-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-final-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-final2-ic0-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-final2-ic0-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-final2-ic0-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-final2-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-scaling-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-tol1e-5.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-tol1e-6.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-tol1e-7.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-180ticks-uniform-stages.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-3600ticks-dt120-twophase-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-360ticks-activeproj-halfdt.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-360ticks-final-profile-halfdt.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-360ticks-final-repro-halfdt.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-360ticks-halfdt-corrected.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-360ticks-halfdt3s.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-360ticks-pressure-final-halfdt.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-360ticks-pressure-optimized-halfdt.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-420ticks-uniform-stages-to-loss-v2.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-420ticks-uniform-stages-to-loss.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r1-7200ticks-120s-twophase-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r2-1800ticks-twophase-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale1-r2-180ticks-correctness.jsonl
-log docs/reports/ENG-103-evidence/grid-basin-scale2-r1-600ticks-twophase-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-120ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-1200ticks-twophase-mg.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-1200ticks-twophase-mg.stderr.log
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-evidence-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-evidence-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-final-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-final-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-plain-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-plain-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-plain-r2-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-plain-r2-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-plain-r3-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-plain-r3-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-release-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0-release-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0cmp-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-ic0cmp-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-pressure-optimized-tol1e-5.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-pressure-optimized-tol1e-6.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-pressure-optimized-tol1e-7.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-pressure-optimized-tol1e-8.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-scaling-afterfix-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-scaling-final-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-scaling-final2-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-scaling-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-serialopt.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-tol1e-5.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-tol1e-6.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale1-r1-120ticks-tol1e-7.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale2-120ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale2-r1-120ticks-perfopt.jsonl
-log docs/reports/ENG-103-evidence/grid-breach-scale2-r1-120ticks-serialopt.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-120ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-1200ticks-twophase-mg.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-1200ticks-twophase-mg.stderr.log
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-evidence-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-evidence-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-final-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-final-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-plain-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-plain-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-plain-r2-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-plain-r2-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-plain-r3-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-plain-r3-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-release-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0-release-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0cmp-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-ic0cmp-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-pressure-optimized-tol1e-5.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-pressure-optimized-tol1e-6.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-pressure-optimized-tol1e-7.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-pressure-optimized-tol1e-8.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-scaling-afterfix-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-scaling-final-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-scaling-final2-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-scaling-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-serialopt.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-tol1e-5.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-tol1e-6.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale1-r1-120ticks-tol1e-7.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale2-120ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale2-r1-120ticks-perfopt.jsonl
-log docs/reports/ENG-103-evidence/grid-canal-scale2-r1-120ticks-serialopt.jsonl
-log docs/reports/ENG-103-evidence/grid-closure-scale1-30ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-closure-scale1-r1-1200ticks-twophase-mg.jsonl
-log docs/reports/ENG-103-evidence/grid-closure-scale1-r1-1200ticks-twophase-mg.stderr.log
-log docs/reports/ENG-103-evidence/grid-equilibrium-scale1-r1-1800ticks-acceptance-v2-singlephase.jsonl
-log docs/reports/ENG-103-evidence/grid-equilibrium-scale1-r1-1800ticks-acceptance-v2-singlephase.stderr.log
-log docs/reports/ENG-103-evidence/grid-equilibrium-scale1-r1-1800ticks-acceptance-v2-twophase-mg.jsonl
-log docs/reports/ENG-103-evidence/grid-equilibrium-scale1-r1-1800ticks-acceptance-v2-twophase-mg.stderr.log
-log docs/reports/ENG-103-evidence/grid-equilibrium-scale1-r1-1800ticks-acceptance-v2-twophase.jsonl
-log docs/reports/ENG-103-evidence/grid-equilibrium-scale1-r1-1800ticks-acceptance-v2-twophase.stderr.log
-log docs/reports/ENG-103-evidence/grid-equilibrium-scale1-r2-1800ticks-twophase-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-sealed-scale1-120ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-sealed-scale1-r1-120ticks-serialopt.jsonl
-log docs/reports/ENG-103-evidence/grid-sealed-scale2-120ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-sealed-scale2-r1-120ticks-perfopt.jsonl
-log docs/reports/ENG-103-evidence/grid-sealed-scale2-r1-120ticks-serialopt.jsonl
-log docs/reports/ENG-103-evidence/grid-sensitivity-scale1-1ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-sensitivity-scale1-r1-1ticks-corrected-speed.jsonl
-log docs/reports/ENG-103-evidence/grid-standing-wave-r1-1800ticks-twophase-mg.jsonl
-log docs/reports/ENG-103-evidence/grid-standing-wave-r1-1800ticks-twophase-mg.stderr.log
-log docs/reports/ENG-103-evidence/grid-standing-wave-r2-1800ticks-twophase-mg.jsonl
-log docs/reports/ENG-103-evidence/grid-standing-wave-r2-1800ticks-twophase-mg.stderr.log
-log docs/reports/ENG-103-evidence/grid-tunnel-scale1-120ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale1-r1-1200ticks-twophase-mg.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale1-r1-1200ticks-twophase-mg.stderr.log
-log docs/reports/ENG-103-evidence/grid-tunnel-scale1-r1-120ticks-refinement2s.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale1-r2-120ticks-refinement2s.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-120ticks-wet-stencil.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-120ticks.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-activeproj.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-allocation-only-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-allocation-postreuse-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-baseline-corrected.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-final-profile-diagnostics.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-final-profile.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-final-repro-diagnostics.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-final-repro.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-fluxfix.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-evidence-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-evidence-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-final-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-final-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-plain-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-plain-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-plain-r2-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-plain-r2-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-plain-r3-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-plain-r3-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-release-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0-release-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0cmp-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-ic0cmp-jacobi.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-breakdown.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-final-diag.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-final-diagnostics.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-final.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-optimized-breakdown.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-optimized-tol1e-5.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-optimized-tol1e-6.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-optimized-tol1e-7.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressure-optimized.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressurebase.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-pressurediag.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-diagnosis-ic0-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-diagnosis-ic0-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-diagnosis-ic0-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-final-ic0-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-final-ic0-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-final-ic0-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-final-jacobi-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-final-jacobi-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scale-final-jacobi-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-afterfix-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-final-ic0-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-final-ic0-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-final-ic0-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-final-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-final2-ic0-r1.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-final2-ic0-r2.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-final2-ic0-r3.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-final2-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-scaling-trace-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-serialopt.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-tol1e-5.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-tol1e-6.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-tol1e-7.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-twophase-ic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-twophase-ic0.stderr.log
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-twophase-mg-gas.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-twophase-mg-gas.stderr.log
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-twophase-mg-rigidair.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-twophase-mg-rigidair.stderr.log
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-twophase-mic0.jsonl
-log docs/reports/ENG-103-evidence/grid-tunnel-scale2-r1-120ticks-twophase-mic0.stderr.log
-log docs/reports/ENG-103-evidence/parallel-scale1-60hz.jsonl
-log docs/reports/ENG-103-evidence/same-duration-120hz.jsonl
-log docs/reports/ENG-103-evidence/scale2-60hz.jsonl
-log docs/reports/ENG-103-evidence/summaries-2026-09-27.jsonl
 log docs/reports/ENG-117-evidence/clearing-large.jsonl
 log docs/reports/ENG-117-evidence/clearing.jsonl
 log docs/reports/ENG-117-evidence/xtask-check-final.log
