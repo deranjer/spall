@@ -34,17 +34,3 @@ name = "physics-transfer"
 path = "src/bin/physics_transfer.rs"
 required-features = ["bench"]
 
-[[bin]]
-name = "region-physics-bench"
-path = "src/bin/region_physics_bench.rs"
-required-features = ["bench"]
-
-[[bin]]
-name = "region-player-bench"
-path = "src/bin/region_player_bench.rs"
-required-features = ["bench"]
-
-[[bin]]
-name = "region-scale-bench"
-path = "src/bin/region_scale_bench.rs"
-required-features = ["bench"]

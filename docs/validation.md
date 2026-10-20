@@ -889,26 +889,8 @@ clicks to gameplay, scales with DPI, survives resize, and recovers after surface
 loss. Record before/after frame-time percentiles plus HUD CPU time and, where the
 adapter supports timestamp queries, GPU time. Compilation and CPU-side checks
 do not substitute for those hardware observations.
-`cargo run --release -p spall_sim --features bench --bin region-coordination-bench` exercises
-the stable-ID merge preflight and a live voxel-body transfer between separate
-region physics worlds. It checks transfer rollback conditions, one active body
-owner, local-to-world pose conversion, and removal of the emptied physics
-region after merge. `cargo run --release -p spall_physics --bin
-region-physics-bench` steps three rebased physics worlds together and measures
-the transfer against an uninterrupted control for position, linear/angular
-velocity, and rotation. These are physics/coordinator prototypes; they do not
-route the production `SimWorld` player, terrain, contact-damage, or topology
-paths yet.
-`cargo run --release -p spall_physics --features bench --bin region-player-bench` builds two
-small resident terrain patches 100 km apart, gives each player an independent
-region-local query window, and compares 60 grounded capsule sweeps.
-`cargo run --release -p spall_physics --features bench --bin region-scale-bench` steps a
-bounded eight-region/64-debris contact workload and reports its measured
-simulation time; it is a demonstrated fixture size, not a maximum.
-`cargo run --release -p spall_server --features bench --bin region-support-reload-bench`
-persists a remote support edit in SQLite, evicts and reopens the backing, and
-checks streamed support is unknown until the edited brick reloads, then
-resolves to unsupported geometry.
+The multi-region physics prototype and its benches (`region-coordination-bench`, `region-physics-bench`,
+`region-player-bench`, `region-scale-bench`, `region-support-reload-bench`) were removed 2026-10-20; see git history.
 `cargo run --release -p spall_mesh --features bench --bin lod-seam-bench` also hashes a seeded
 authoritative voxel brick before and after render-only seam generation and
 checks its hash and sampled solid remain unchanged.

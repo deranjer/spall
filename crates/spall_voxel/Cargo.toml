@@ -10,13 +10,6 @@ rust-version.workspace = true
 oracle = []
 # Small scene builders shared by tests, benches and gates.
 fixtures = []
-# Offline region benchmark binary.
-bench = ["fixtures"]
-
-[[bin]]
-name = "region-bench"
-path = "src/bin/region_bench.rs"
-required-features = ["bench"]
 
 [dependencies]
 blake3.workspace = true

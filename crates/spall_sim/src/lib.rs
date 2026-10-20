@@ -52,7 +52,6 @@ pub mod journal;
 pub mod player;
 pub mod playground;
 pub mod prof;
-pub mod region_coordinator;
 pub mod registry;
 pub mod replication;
 pub mod schedule;
@@ -97,9 +96,6 @@ pub use playground::{
     PLAYGROUND_SHOWCASE_COUNT, PLINKO_RESTITUTION, PlaygroundDropPools, SHOWCASE_RESTITUTION,
     pending_drop_pools, playground_drop_zones, populate as populate_playground_debris,
     spawn_push_test_box,
-};
-pub use region_coordinator::{
-    PhysicsRegionId, RegionCoordinator, RegionCoordinatorError, RegionMergePlan,
 };
 pub use registry::IdRegistry;
 pub use replication::{

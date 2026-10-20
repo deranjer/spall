@@ -31,7 +31,6 @@ pub mod merge;
 pub mod metrics;
 pub mod occupancy;
 pub mod query_cache;
-pub mod region_set;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod report;
 pub mod world;
@@ -63,7 +62,6 @@ pub use merge::{BoxSpan, greedy_boxes};
 pub use metrics::{DurationSamples, PercentileSummary};
 pub use occupancy::{ExtractError, OccupancyGrid};
 pub use query_cache::{CharacterQueryCache, REBUILD_MARGIN_M, WINDOW_RADIUS_M, WindowStats};
-pub use region_set::{PhysicsRegionSet, PhysicsRegionSetError, RegionalBodyState};
 #[cfg(any(test, feature = "fixtures"))]
 pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
 pub use world::{

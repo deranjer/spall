@@ -195,7 +195,7 @@ from the new voxel grid as well. This mode does not transfer topology/edit
 authority and is never a multiplayer protocol mode. With the flag absent, the
 normal server-authoritative path above is unchanged.
 
-For a larger world, multiple independently rebased physics regions are necessary when players are far apart. Region merge/split and body transfer must be atomic and tested. A single origin following one player is not an acceptable multiplayer large-world solution. This is a G5 gate, not hidden work in the initial sandbox.
+Multi-region physics (several rebased physics worlds with body transfer) is not implemented: the prototype was removed 2026-10-20 (see git history). Only the single-world origin shift (`PhysicsOrigin`) remains; a larger world with widely separated players needs a new design under G5.
 
 ## Renderer and visual target
 
