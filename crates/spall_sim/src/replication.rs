@@ -367,6 +367,8 @@ impl MotionPublisher {
                 linear_velocity: body.linvel_m_s.map(|v| v as f32),
                 angular_velocity: body.angvel_rad_s.map(|v| v as f32),
                 sleeping: body.sleeping,
+                endurance: 1.0,
+                exhausted: false,
             });
         }
 
@@ -391,6 +393,8 @@ impl MotionPublisher {
                 linear_velocity: player.state.velocity_m_s,
                 angular_velocity: [0.0; 3],
                 sleeping: false,
+                endurance: player.state.endurance,
+                exhausted: player.state.exhausted,
             });
         }
         out

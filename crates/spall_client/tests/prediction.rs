@@ -310,3 +310,47 @@ fn a_lost_button_release_leaves_both_sides_at_rest() {
         h.predictor.prediction_error_m()
     );
 }
+
+#[test]
+fn endurance_agrees_between_server_and_prediction_over_a_sprint_and_recovery() {
+    use spall_core::BUTTON_SPRINT;
+    let mut h = Harness::new(6);
+    // Sprint in a tight circle (it stays on the arena floor) for 16 s (past exhaustion), keep holding sprint while
+    // exhausted, then stand still and recover. Same inputs on both sides.
+    let heading = |tick: usize| {
+        let angle = tick as f32 * 0.08 - std::f32::consts::FRAC_PI_2;
+        [angle.cos(), 0.0, angle.sin()]
+    };
+    let mut saw_exhausted = false;
+    for tick in 0..16 * 60 {
+        h.step(PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: heading(tick),
+            buttons: BUTTON_SPRINT,
+        });
+        saw_exhausted |= h.server_state().exhausted;
+        assert_eq!(
+            h.predictor.predicted().endurance,
+            h.server_state().endurance,
+            "tick {tick}"
+        );
+        assert_eq!(
+            h.predictor.predicted().exhausted,
+            h.server_state().exhausted
+        );
+    }
+    assert!(saw_exhausted, "16 s of sprint never exhausted the player");
+    for _ in 0..12 * 60 {
+        h.step(idle());
+    }
+    let state = h.server_state();
+    assert_eq!(h.predictor.predicted().endurance, state.endurance);
+    assert!(!state.exhausted && state.endurance > 0.9);
+    // Endurance matches exactly above; any small position residual is from the
+    // circle's turning sweep, so the bound is loose.
+    assert!(
+        h.predictor.max_correction_m < 0.15,
+        "sprinting in a circle caused a {:.3} m correction",
+        h.predictor.max_correction_m
+    );
+}

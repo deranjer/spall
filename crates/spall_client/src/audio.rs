@@ -30,6 +30,7 @@ pub struct BiomeAudioConfig {
     /// far less than other ambience and they win a mix slot over other layers.
     pub water_tracks: Vec<bool>,
     pub footsteps: crate::footsteps::FootstepConfig,
+    pub breathing: crate::breathing::BreathingConfig,
 }
 
 /// One looping weather bed: plays at `gain` while the weather is `kind` (the

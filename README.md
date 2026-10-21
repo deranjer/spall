@@ -32,7 +32,7 @@ Press **1/2/3** for trout/crow/deer or **0** for the whole zoo; **WASD** moves,
 This is an authored animation showroom with a free camera; live creature
 behavior and physical world integration remain separate gates.
 
-In `cargo xtask play`, hold **Shift** to run (about 1.7x walk speed) and press **F8** for a third-person view of your own player body; other players are always drawn with that body.
+In `cargo xtask play`, hold **Shift** to run (about 1.45x walk speed). Running spends endurance (empty in about 13 s; a bar appears low on the screen while it recovers, and turns orange when you are exhausted and cannot run until it is back past 30%), and you breathe harder as it drops and press **F8** for a third-person view of your own player body; other players are always drawn with that body.
 
 Generated-world play loads nearby terrain at startup and streams surrounding bricks as the player
 moves. Distant terrain retains exact revision/hash records; the authoritative server still generates

@@ -246,6 +246,7 @@ impl ApplicationHandler for InteractiveApp {
                 let now = Instant::now();
                 self.update_ambience();
                 self.update_footsteps(now);
+                self.update_endurance();
                 let handler_started = now;
                 self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);
@@ -697,6 +698,7 @@ impl ApplicationHandler for InteractiveApp {
                                 .scene
                                 .set_overlay(&renderer.device, &renderer.queue, &overlay);
                         }
+                        renderer.set_endurance(self.endurance_view);
                         renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(
                             || CrosshairView {
                                 in_reach: self.hammer_target.is_some(),

@@ -894,15 +894,15 @@ fn retry_kind(reason: &str) -> Option<bool> {
 /// that should grow unbounded if a script somehow floods rejections.
 const MAX_RECORDED_ACTION_REJECT_REASONS: usize = 8;
 
-/// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
-/// discarded (players walk upright); `grounded` / `jump_held_last` are not on
-/// the wire and the next reconcile / step re-derives them.
+/// A player [`MotionSnapshot`]'s `CharacterState`; `grounded` / `jump_held_last` are re-derived.
 fn state_from_snapshot(snap: &MotionSnapshot) -> CharacterState {
     CharacterState {
         position_m: snap.pose.translation_m,
         velocity_m_s: snap.linear_velocity,
         grounded: snap.linear_velocity[1].abs() < 0.6,
         jump_held_last: false,
+        endurance: snap.endurance,
+        exhausted: snap.exhausted,
     }
 }
 

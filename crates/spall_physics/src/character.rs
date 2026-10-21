@@ -27,8 +27,8 @@ pub use spall_core::PlayerInput;
 pub mod tuning {
     /// Ground move speed, m/s.
     pub const WALK_SPEED_M_S: f32 = 4.0;
-    /// Ground move speed while the sprint button is held, m/s (1.63× walk).
-    pub const RUN_SPEED_M_S: f32 = 6.5;
+    /// Ground move speed while the sprint button is held, m/s (1.45× walk).
+    pub const RUN_SPEED_M_S: f32 = 5.8;
     /// Upward speed imparted by a jump, m/s (≈ 1.0 m apex under `GRAVITY_M_S2`).
     pub const JUMP_SPEED_M_S: f32 = 5.7;
     /// Downward acceleration applied to the capsule, m/s². Characters use a
@@ -80,6 +80,22 @@ pub mod tuning {
     pub const WADE_PUSH: f32 = 0.6;
     /// Fastest current the kernel will apply, m/s per axis.
     pub const MAX_CURRENT_M_S: f32 = 8.0;
+
+    // ---- endurance ---------------------------------------------------------
+    /// Endurance lost per second of effective sprinting (moving on the ground):
+    /// full to empty in about 13.5 s.
+    pub const ENDURANCE_DRAIN_PER_S: f32 = 0.074;
+    /// Endurance regained per second standing still: empty to full in 10 s.
+    pub const ENDURANCE_REGEN_REST_PER_S: f32 = 0.10;
+    /// Endurance regained per second while moving without sprinting.
+    pub const ENDURANCE_REGEN_WALK_PER_S: f32 = 0.05;
+    /// Endurance lost per second of swimming under way. Treading water does not
+    /// tire; steady swimming is slow work (about 50 s from full to empty).
+    pub const ENDURANCE_SWIM_DRAIN_PER_S: f32 = 0.02;
+    /// At empty endurance the player is exhausted and cannot sprint until
+    /// endurance recovers past this level; the gap stops sprint flickering on
+    /// and off at the limit.
+    pub const EXHAUSTED_RECOVER: f32 = 0.30;
 }
 
 /// Capsule dimensions for one player, metres. The capsule is upright (its axis
@@ -138,6 +154,12 @@ pub struct CharacterState {
     /// Jump-button level on the previous step, so a held button jumps once
     /// (rising edge) rather than every grounded tick.
     pub jump_held_last: bool,
+    /// Stamina, `0..=1`: drained by sprinting, regained otherwise. It advances in
+    /// the kernel step, so the server and the client predictor agree on it.
+    pub endurance: f32,
+    /// Set when endurance hit empty; sprint is unavailable (walk speed) until
+    /// endurance recovers past [`tuning::EXHAUSTED_RECOVER`].
+    pub exhausted: bool,
 }
 
 impl CharacterState {
@@ -148,6 +170,34 @@ impl CharacterState {
             velocity_m_s: [0.0; 3],
             grounded: false,
             jump_held_last: false,
+            endurance: 1.0,
+            exhausted: false,
+        }
+    }
+
+    /// Whether the sprint button would make this character run: held, and not
+    /// exhausted.
+    pub fn can_sprint(&self, input: &PlayerInput) -> bool {
+        input.wants_sprint() && !self.exhausted
+    }
+
+    /// Advances endurance by one tick. `sprinting` is effective sprinting on the
+    /// ground, `swimming` and `moving` describe the tick's input.
+    fn tick_endurance(&mut self, dt: f32, sprinting: bool, swimming: bool, moving: bool) {
+        let rate = if sprinting {
+            -tuning::ENDURANCE_DRAIN_PER_S
+        } else if swimming && moving {
+            -tuning::ENDURANCE_SWIM_DRAIN_PER_S
+        } else if moving {
+            tuning::ENDURANCE_REGEN_WALK_PER_S
+        } else {
+            tuning::ENDURANCE_REGEN_REST_PER_S
+        };
+        self.endurance = (self.endurance + rate * dt).clamp(0.0, 1.0);
+        if self.endurance <= 0.0 {
+            self.exhausted = true;
+        } else if self.exhausted && self.endurance >= tuning::EXHAUSTED_RECOVER {
+            self.exhausted = false;
         }
     }
 
@@ -165,6 +215,7 @@ impl CharacterState {
     pub fn is_finite(&self) -> bool {
         self.position_m.iter().all(|v| v.is_finite())
             && self.velocity_m_s.iter().all(|v| v.is_finite())
+            && self.endurance.is_finite()
     }
 }
 
@@ -269,7 +320,9 @@ pub fn step_character_in_water(
             }
         })
     });
+    let moving = wish_len > 0.0;
     if depth_m >= tuning::SWIM_ENTER_DEPTH_M {
+        state.tick_endurance(dt, false, true, moving);
         return swim_step(state, input, dt, depth_m, wish, flow, &mut sweep);
     }
     // Wading: deeper water slows the walk, smoothly, so crossing a shoreline
@@ -289,7 +342,9 @@ pub fn step_character_in_water(
     };
     // Sprinting only changes the ground speed; the kernel is the one place the
     // server and the client predictor both read it.
-    let ground_speed = if input.wants_sprint() {
+    let sprint = state.can_sprint(&input);
+    state.tick_endurance(dt, sprint && state.grounded && moving, false, moving);
+    let ground_speed = if sprint {
         tuning::RUN_SPEED_M_S
     } else {
         tuning::WALK_SPEED_M_S
@@ -537,6 +592,95 @@ mod tests {
         }
     }
 
+    fn grounded_state() -> CharacterState {
+        CharacterState {
+            grounded: true,
+            ..CharacterState::at([0.0; 3])
+        }
+    }
+
+    /// Steps `ticks` times on free ground, returning the state.
+    fn free_run(mut state: CharacterState, input: PlayerInput, ticks: usize) -> CharacterState {
+        for _ in 0..ticks {
+            state = step_character(state, input, DT, free_move);
+        }
+        state
+    }
+
+    #[test]
+    fn sprinting_drains_full_endurance_in_about_thirteen_seconds() {
+        let sprint = forward_input(BUTTON_SPRINT);
+        let after_12 = free_run(grounded_state(), sprint, 12 * 60);
+        assert!(after_12.endurance > 0.0 && !after_12.exhausted);
+        let after_14 = free_run(grounded_state(), sprint, 14 * 60);
+        assert!(after_14.exhausted && after_14.endurance < 0.05);
+    }
+
+    #[test]
+    fn endurance_regenerates_faster_at_rest_than_walking_and_is_full_in_ten_seconds() {
+        let low = CharacterState {
+            endurance: 0.0,
+            ..grounded_state()
+        };
+        let rested = free_run(low, PlayerInput::NEUTRAL, 10 * 60 + 1);
+        assert!((rested.endurance - 1.0).abs() < 1e-3);
+        let walked = free_run(low, forward_input(0), 10 * 60);
+        assert!(walked.endurance > 0.4 && walked.endurance < 0.6);
+    }
+
+    #[test]
+    fn exhaustion_blocks_sprint_until_endurance_passes_the_recovery_threshold() {
+        let mut state = free_run(grounded_state(), forward_input(BUTTON_SPRINT), 14 * 60);
+        assert!(state.exhausted);
+        let mut sprint_ticks_while_exhausted = 0;
+        // Keep holding sprint: it falls back to walking, which regenerates slowly.
+        while state.exhausted {
+            state = step_character(state, forward_input(BUTTON_SPRINT), DT, free_move);
+            if state.exhausted {
+                assert!(state.endurance < tuning::EXHAUSTED_RECOVER);
+                let speed = state.velocity_m_s[0].hypot(state.velocity_m_s[2]);
+                assert!((speed - tuning::WALK_SPEED_M_S).abs() < 1e-4);
+                sprint_ticks_while_exhausted += 1;
+            }
+        }
+        assert!(sprint_ticks_while_exhausted > 60);
+        assert!(state.endurance >= tuning::EXHAUSTED_RECOVER);
+        let next = step_character(state, forward_input(BUTTON_SPRINT), DT, free_move);
+        assert!((next.velocity_m_s[2].abs() - tuning::RUN_SPEED_M_S).abs() < 1e-4);
+    }
+
+    #[test]
+    fn standing_sprint_and_airborne_sprint_do_not_drain() {
+        let held = free_run(
+            grounded_state(),
+            PlayerInput {
+                buttons: BUTTON_SPRINT,
+                ..PlayerInput::NEUTRAL
+            },
+            120,
+        );
+        assert_eq!(held.endurance, 1.0);
+    }
+
+    #[test]
+    fn swimming_drains_slowly_and_treading_water_does_not() {
+        let water = Some(WaterSample::still(5.0));
+        let swim = |input| {
+            let mut state = CharacterState::at([0.0, 3.0, 0.0]);
+            for _ in 0..600 {
+                state = step_character_in_water(state, input, DT, water, |_, d| CharacterMove {
+                    translation_m: d,
+                    grounded: false,
+                });
+                state.position_m[1] = 3.0;
+            }
+            state
+        };
+        let swum = swim(forward_input(BUTTON_SPRINT));
+        assert!((swum.endurance - (1.0 - 10.0 * tuning::ENDURANCE_SWIM_DRAIN_PER_S)).abs() < 1e-3);
+        assert_eq!(swim(PlayerInput::NEUTRAL).endurance, 1.0);
+    }
+
     #[test]
     fn sprint_raises_ground_speed_to_run_speed_and_only_on_the_ground() {
         let grounded = CharacterState {
@@ -549,7 +693,7 @@ mod tests {
         assert!((speed(walk) - tuning::WALK_SPEED_M_S).abs() < 1e-4);
         assert!((speed(run) - tuning::RUN_SPEED_M_S).abs() < 1e-4);
         let ratio = tuning::RUN_SPEED_M_S / tuning::WALK_SPEED_M_S;
-        assert!((1.5..=1.7).contains(&ratio), "run/walk = {ratio}");
+        assert!((1.4..=1.5).contains(&ratio), "run/walk = {ratio}");
 
         // Airborne keeps its takeoff momentum: pressing sprint mid-air adds none.
         let airborne = CharacterState {
@@ -598,6 +742,8 @@ mod tests {
             velocity_m_s: [0.0; 3],
             grounded: true,
             jump_held_last: false,
+            endurance: 1.0,
+            exhausted: false,
         };
         let launch = PlayerInput {
             movement: [0.0, 0.0, 1.0],
@@ -632,6 +778,8 @@ mod tests {
             velocity_m_s: [0.0; 3],
             grounded: true,
             jump_held_last: false,
+            endurance: 1.0,
+            exhausted: false,
         };
         let jump = PlayerInput {
             buttons: BUTTON_JUMP,

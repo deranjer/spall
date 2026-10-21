@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use spall_client::audio::{BiomeAudioConfig, WeatherLayer};
+use spall_client::breathing::{BreathingConfig, BreathingRow, BreathingState};
 use spall_client::footsteps::{FootstepConfig, FootstepSurface};
 use spall_core::MaterialId;
 use spall_protocol::WeatherKind;
@@ -127,6 +128,37 @@ fn recordings(row: &SurfaceRow, root: &Path) -> (Option<PathBuf>, Option<PathBuf
     }
 }
 
+/// The player's breathing, one looping recording per state under `player/`, and
+/// the gain it plays at. Exhausted also plays a single heavy breath on entry. A
+/// recording that is not shipped leaves its state (or that breath) silent.
+const BREATHING: [(BreathingState, &str, f32, Option<&str>); 3] = [
+    (BreathingState::Calm, "breathing-calm.ogg", 0.12, None),
+    (BreathingState::Exerted, "breathing-exerted.ogg", 0.45, None),
+    (
+        BreathingState::Exhausted,
+        "breathing-exhausted.ogg",
+        0.5,
+        Some("breathing-accent.ogg"),
+    ),
+];
+
+/// The breathing table with each recording resolved against `root`.
+pub fn breathing(root: &Path) -> BreathingConfig {
+    let existing = |file: &str| Some(root.join("player").join(file)).filter(|path| path.is_file());
+    BreathingConfig {
+        rows: BREATHING
+            .iter()
+            .map(|&(state, file, gain, onset)| BreathingRow {
+                state,
+                path: existing(file),
+                gain,
+                looped: true,
+                onset: onset.and_then(existing),
+            })
+            .collect(),
+    }
+}
+
 /// The footstep table with each recording resolved against `root`.
 pub fn footsteps(root: &Path) -> FootstepConfig {
     let index_of = |name: &str| SURFACES.iter().position(|row| row.name == name);
@@ -242,6 +274,7 @@ pub fn config() -> BiomeAudioConfig {
             })
             .collect(),
         footsteps: footsteps(&root),
+        breathing: breathing(&root),
     }
 }
 
@@ -411,7 +444,7 @@ mod tests {
     fn every_approved_runtime_asset_decodes_without_an_audio_device() {
         let root = source_audio_root();
         let mut checked = 0;
-        for category in ["biomes", "weather", "foley"] {
+        for category in ["biomes", "weather", "foley", "player"] {
             for entry in std::fs::read_dir(root.join(category)).unwrap() {
                 let path = entry.unwrap().path();
                 assert_eq!(
@@ -423,7 +456,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 35, "all 35 user-approved recordings are packaged");
+        assert_eq!(checked, 39, "all 39 user-approved recordings are packaged");
     }
 
     #[test]

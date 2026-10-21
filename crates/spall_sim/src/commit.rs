@@ -1106,6 +1106,8 @@ fn candidate_participant_snapshots(
             linear_velocity: parent.linvel_m_s.map(|v| v as f32),
             angular_velocity: parent.angvel_rad_s.map(|v| v as f32),
             sleeping: parent.sleeping,
+            endurance: 1.0,
+            exhausted: false,
         });
     }
     for child in children {
@@ -1119,6 +1121,8 @@ fn candidate_participant_snapshots(
             linear_velocity: child.linvel_m_s.map(|v| v as f32),
             angular_velocity: child.angvel_rad_s.map(|v| v as f32),
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         });
     }
     out

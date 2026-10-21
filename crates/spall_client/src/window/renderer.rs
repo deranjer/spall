@@ -48,6 +48,8 @@ pub(crate) struct WorldRenderer {
     /// `debug_water_instances` is this clipped to the terrain window.
     /// The hammer crosshair and its label; `None` hides it (cursor not captured).
     crosshair: Option<CrosshairView>,
+    /// The endurance bar; `None` while endurance is full.
+    endurance: Option<EnduranceView>,
     debug_water_source: Vec<Instance>,
     water_window: Option<[f64; 3]>,
     /// Rectangles of the water field uploaded this frame (for the frame CSV).
@@ -235,6 +237,10 @@ impl WorldRenderer {
         finish(false, rect_count);
     }
 
+    pub(crate) fn set_endurance(&mut self, view: Option<EnduranceView>) {
+        self.endurance = view;
+    }
+
     pub(crate) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
         self.crosshair = view;
     }
@@ -408,6 +414,7 @@ impl WorldRenderer {
             vegetation_job: None,
             vegetation_seq: 0,
             crosshair: None,
+            endurance: None,
             debug_water_source: Vec::new(),
             water_window: None,
             water_rects_frame: 0,
@@ -998,6 +1005,9 @@ impl WorldRenderer {
         }
         if let Some(crosshair) = &self.crosshair {
             draw_crosshair(crosshair);
+        }
+        if let Some(bar) = self.endurance {
+            draw_endurance(bar);
         }
         self.yakui.finish();
         if let Some(preset) = selected_environment {

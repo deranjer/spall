@@ -12,6 +12,8 @@ pub(super) fn view(
             velocity_m_s,
             grounded: true,
             jump_held_last: false,
+            endurance: 1.0,
+            exhausted: false,
         },
         server_tick: 0,
         published_at,
