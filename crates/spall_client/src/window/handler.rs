@@ -397,7 +397,22 @@ impl ApplicationHandler for InteractiveApp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
+                if let Some(mut replica) =
+                    self.session.replica.get().and_then(|r| r.try_lock().ok())
+                {
+                    let focus = self
+                        .fly_eye
+                        .map(|eye| eye.to_array().map(f64::from))
+                        .or_else(|| {
+                            (*self.session.view.lock().unwrap_or_else(|e| e.into_inner()))
+                                .map(|v| v.predicted.position_m)
+                        });
+                    if let Some(position) = focus {
+                        replica.set_snow_focus(
+                            (position[0] / 4.0).floor() as i32,
+                            (position[2] / 4.0).floor() as i32,
+                        );
+                    }
                     let snow_generation = replica.snow_generation();
                     if renderer.snow_generation != Some(snow_generation) {
                         renderer.snow_frames = replica.snow_frames_shared();
@@ -956,7 +971,15 @@ impl ApplicationHandler for InteractiveApp {
                         renderer.snow_frames.clear();
                         renderer.snow_generation = None;
                         renderer.snow_upload_key = None;
+                        let resident = renderer.snow_presentation.resident_keys();
                         renderer.snow_presentation = crate::snow::SnowPresentation::new();
+                        if let Err(error) =
+                            renderer
+                                .scene
+                                .update_snow_meshes(&renderer.device, &[], &resident)
+                        {
+                            tracing::warn!(%error, "clearing snow meshes failed");
+                        }
                     }
                     if self.fly_eye.is_some() {
                         self.fly_eye = None;

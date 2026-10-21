@@ -132,8 +132,8 @@ automatic or forced weather (snow in light, medium or heavy tiers, and a blizzar
 switches the season (Spring to Winter), previews nature sounds, adjusts nature/weather
 volume and mute, and toggles visual effects/reduced lightning. Scroll the menu
 for the remaining controls. Weather and season choices are server-authorized; a
-weather profile does not change the season, a season button does. Thin ground snow and
-footprints remain planned work. See [weather plan](docs/weather.md) and
+weather profile does not change the season, a season button does. Ground snow is a layer of
+fine 6.25 cm voxels up to 0.5 m deep with carved footprints (see the weather plan). See [weather plan](docs/weather.md) and
 [combined test evidence](docs/reports/ENG-198-integrated-weather-playtest.md).
 
 - [Architecture and invariants](docs/architecture.md): subsystem ownership, voxel representation, structural destruction, physics, and renderer.

@@ -1343,7 +1343,7 @@ mod tests {
         let mut snow = SnowState::new();
         snow.reconcile(0, 0, 7, 2, mask(&[0]), 0);
         let cold = weather(WeatherKind::Snow, -800);
-        for tick in 1..=20_000 {
+        for tick in 1..=60_000 {
             snow.advance(&cold, tick).unwrap();
         }
         let candidate = crate::footprints::FootfallCandidate {
@@ -1351,26 +1351,46 @@ mod tests {
             position_m: [0.125, 2.0, 0.125],
             heading_q15: 0,
             foot: 0,
-            tick: 20_000,
+            tick: 60_000,
         };
-        assert!(snow.stamp(candidate, [0, 7, 0], 2, 20_000));
-        let before = snow.frame(0, 0, 7, 1, 0, 20_000).unwrap().footprints[0].strength_q8;
-        for tick in 20_001..=20_600 {
+        assert!(snow.stamp(candidate, [0, 7, 0], 2, 60_000));
+        let before = snow.frame(0, 0, 7, 1, 0, 60_000).unwrap().footprints[0].strength_q8;
+        for tick in 60_001..=60_600 {
             snow.advance(&cold, tick).unwrap();
         }
-        let covered = snow.frame(0, 0, 7, 1, 0, 20_600).unwrap();
+        let covered = snow.frame(0, 0, 7, 1, 0, 60_600).unwrap();
         assert_eq!(covered.surfaces[0].depth_q16, SNOW_MAX_DEPTH_Q16);
         assert!(covered.footprints[0].strength_q8 < before);
         let warm = weather(WeatherKind::Rain, 2_000);
-        for tick in 20_601..=29_000 {
+        for tick in 60_601..=100_000 {
             snow.advance(&warm, tick).unwrap();
         }
         assert!(
-            snow.frame(0, 0, 7, 1, 0, 29_000)
+            snow.frame(0, 0, 7, 1, 0, 100_000)
                 .unwrap()
                 .footprints
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn heavy_snow_builds_past_several_steps_and_stops_at_half_a_metre() {
+        let mut snow = SnowState::new();
+        snow.reconcile(0, 0, 7, 2, mask(&[0]), 0);
+        let mut heavy = weather(WeatherKind::Snow, -800);
+        heavy.precipitation_q16 = 55_705; // heavy tier, 0.85
+        for tick in 1..=10_800 {
+            snow.advance(&heavy, tick).unwrap();
+        }
+        // Three minutes of heavy snow is about 0.31 m: several 6.25 cm steps.
+        let depth = snow.frame(0, 0, 7, 1, 0, 10_800).unwrap().surfaces[0].depth_q16;
+        assert!((18_000..22_500).contains(&depth), "{depth}");
+        for tick in 10_801..=60_000 {
+            snow.advance(&heavy, tick).unwrap();
+        }
+        let capped = snow.frame(0, 0, 7, 1, 0, 60_000).unwrap().surfaces[0].depth_q16;
+        assert_eq!(capped, SNOW_MAX_DEPTH_Q16);
+        assert_eq!(f32::from(capped) / 65_536.0, 0.5);
     }
 
     #[test]

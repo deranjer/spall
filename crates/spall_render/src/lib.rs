@@ -22,6 +22,7 @@ pub(crate) mod probe;
 pub mod scene;
 pub mod sky_visibility;
 pub mod snow;
+pub mod snow_mesh;
 pub mod target;
 pub mod upload;
 pub mod vertex;
@@ -61,7 +62,9 @@ pub use scene::{Material, Scene, SceneItem, default_materials, materials_from_ma
 pub use sky_visibility::{
     SKY_MAX_RAY_CELLS, SkyVisibility, UNKNOWN_CELL, cache_origin_around, mark_world_box,
 };
-pub use snow::{SnowFootprintMark, SnowRenderError, SnowSurfacePatch};
+pub use snow_mesh::{
+    SnowBeyond, SnowFootprintMark, SnowMesh, SnowNeighbours, SnowTile, SnowTileKey, mesh_tile,
+};
 pub use target::OffscreenTarget;
 pub use upload::{GpuMesh, MeshUploader, UploadBudget};
 pub use vertex::{GpuVertex, to_gpu};

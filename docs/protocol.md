@@ -308,7 +308,7 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 16): one wire version for the handshake and every record, bumped on
+`PROTOCOL_VERSION` (currently 17): one wire version for the handshake and every record, bumped on
 any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 7, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
@@ -689,7 +689,7 @@ reports/ENG-196-weather-foundation.md and reports/ENG-199-weather-controls.md.
 Wire schema/protocol 7 originally added `SnowSurfaceFrame` (tag 25), versioned
 separately as snow schema 1. Frames replace one 4 m tile/Y layer, carrying
 disjoint exposed-face cohorts, terrain revisions, quantized depth and bounded
-transient footprints. Empty frames remove old layers. Epoch, sequence and
+transient footprints; depth is capped at 0.5 m (`SNOW_MAX_DEPTH_Q16`, protocol 17). Empty frames remove old layers. Epoch, sequence and
 effective-tick fences prevent stale snow after reset; client cache residency is
 bounded. Server-authoritative grounded travel creates tracks; clients never
 submit imprint positions. See weather.md for rates, caps and exposure rules.

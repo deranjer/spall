@@ -26,7 +26,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
-const MAX_SNOW_CACHE_FRAMES: usize = 4_096;
+/// Roughly one frame per tile column and layer within the 96 m view radius, with
+/// headroom for stacked roofs.
+const MAX_SNOW_CACHE_FRAMES: usize = 6_144;
 const MAX_SNOW_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 fn snow_frame_bytes(frame: &spall_protocol::SnowSurfaceFrame) -> usize {
@@ -216,7 +218,8 @@ pub struct ReplicaWorld {
     /// Shared so the renderer can take a snapshot without copying every frame
     /// while holding the replica lock the network and prediction threads need.
     snow: BTreeMap<(i32, i32, i32), std::sync::Arc<spall_protocol::SnowSurfaceFrame>>,
-    snow_lru: VecDeque<(i32, i32, i32)>,
+    /// Tile the cache is centred on; the farthest frames go first when it is full.
+    snow_focus: (i32, i32),
     snow_cache_bytes: usize,
     snow_epoch_floor: u64,
     snow_sequence_floor: u64,
@@ -267,7 +270,7 @@ impl ReplicaWorld {
             weather: None,
             weather_epoch_floor: 0,
             snow: BTreeMap::new(),
-            snow_lru: VecDeque::new(),
+            snow_focus: (0, 0),
             snow_cache_bytes: 0,
             snow_epoch_floor: 0,
             snow_sequence_floor: 0,
@@ -308,7 +311,7 @@ impl ReplicaWorld {
             weather: None,
             weather_epoch_floor: 0,
             snow: BTreeMap::new(),
-            snow_lru: VecDeque::new(),
+            snow_focus: (0, 0),
             snow_cache_bytes: 0,
             snow_epoch_floor: 0,
             snow_sequence_floor: 0,
@@ -415,7 +418,6 @@ impl ReplicaWorld {
         self.weather = None;
         self.snow_epoch_floor = self.snow_epoch_floor.saturating_add(1);
         self.snow.clear();
-        self.snow_lru.clear();
         self.snow_cache_bytes = 0;
         self.snow_sequence_floor = 0;
         self.snow_generation = self.snow_generation.saturating_add(1);
@@ -445,7 +447,6 @@ impl ReplicaWorld {
         if state.world_epoch > self.snow_epoch_floor {
             self.snow_epoch_floor = state.world_epoch;
             self.snow.clear();
-            self.snow_lru.clear();
             self.snow_cache_bytes = 0;
             self.snow_sequence_floor = 0;
             self.snow_generation = self.snow_generation.saturating_add(1);
@@ -469,6 +470,12 @@ impl ReplicaWorld {
         self.weather.as_ref()
     }
 
+    /// Centres the snow cache on the player's tile (4 m tiles); see
+    /// `apply_snow_frame`'s eviction.
+    pub fn set_snow_focus(&mut self, tile_x: i32, tile_z: i32) {
+        self.snow_focus = (tile_x, tile_z);
+    }
+
     /// Installs one atomic terrain snow tile/Y replacement. This stream has
     /// its own sequence per key so a delayed climate tile cannot be rejected
     /// merely because a newer motion frame advanced the replica tick.
@@ -483,7 +490,6 @@ impl ReplicaWorld {
         if frame.world_epoch > self.snow_epoch_floor {
             self.snow_epoch_floor = frame.world_epoch;
             self.snow.clear();
-            self.snow_lru.clear();
             self.snow_cache_bytes = 0;
             self.snow_sequence_floor = 0;
             self.snow_generation = self.snow_generation.saturating_add(1);
@@ -500,15 +506,20 @@ impl ReplicaWorld {
             self.snow_cache_bytes = self
                 .snow_cache_bytes
                 .saturating_add(snow_frame_bytes(&frame));
-            self.snow_lru.push_back(key);
             self.snow.insert(key, std::sync::Arc::new(frame));
+            // Evict by distance, not age: frames are resent in a slow sweep from the
+            // player outward, so the oldest ones are the nearest, and dropping those
+            // blanks the snow around the player until the sweep comes back.
             while self.snow.len() > MAX_SNOW_CACHE_FRAMES
                 || self.snow_cache_bytes > MAX_SNOW_CACHE_BYTES
             {
-                let Some(oldest) = self.snow_lru.pop_front() else {
+                let (fx, fz) = self.snow_focus;
+                let Some(farthest) = self.snow.keys().copied().max_by_key(|(x, z, _)| {
+                    i64::from(x.abs_diff(fx)).max(i64::from(z.abs_diff(fz)))
+                }) else {
                     break;
                 };
-                self.remove_snow_key(oldest);
+                self.remove_snow_key(farthest);
             }
         }
         self.snow_generation = self.snow_generation.saturating_add(1);
@@ -544,7 +555,6 @@ impl ReplicaWorld {
         if let Some(old) = self.snow.remove(&key) {
             self.snow_cache_bytes = self.snow_cache_bytes.saturating_sub(snow_frame_bytes(&old));
         }
-        self.snow_lru.retain(|candidate| *candidate != key);
     }
 
     /// Marks the baseline just installed as missing its distant terrain
@@ -2048,6 +2058,20 @@ mod tests {
         }
         assert!(replica.snow_frames().count() <= MAX_SNOW_CACHE_FRAMES);
         assert!(replica.snow_cache_bytes <= MAX_SNOW_CACHE_BYTES);
+
+        // A full cache drops the frames farthest from the player, not the oldest:
+        // tile 0 was received first and must survive when the player stands there.
+        replica.set_snow_focus(0, 0);
+        for sequence in (MAX_SNOW_CACHE_FRAMES as u64 + 2)..(MAX_SNOW_CACHE_FRAMES as u64 + 40) {
+            replica
+                .apply_snow_frame(make_frame(3, sequence, sequence as i32))
+                .unwrap();
+        }
+        assert!(
+            replica.snow_frame(0, 0, 0).is_some(),
+            "the nearest tile stays"
+        );
+        assert!(replica.snow_frames().count() <= MAX_SNOW_CACHE_FRAMES);
     }
 
     #[test]

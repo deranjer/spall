@@ -814,40 +814,44 @@ impl WorldRenderer {
             let snow_key = (
                 self.snow_generation.unwrap_or(0),
                 terrain_stamp,
-                camera.position.to_array().map(|v| (v / 8.0).floor() as i64),
+                camera.position.to_array().map(|v| (v / 2.0).floor() as i64),
                 self.ground_snow_enabled,
             );
             let snow_toggled = self.snow_upload_key.map(|k| k.3) != Some(snow_key.3);
             let snow_settled = self
                 .snow_rebuilt_at
                 .is_none_or(|at| at.elapsed() >= SNOW_REBUILD_INTERVAL);
-            if self.snow_upload_key != Some(snow_key) && (snow_toggled || snow_settled) {
+            let snow_due =
+                self.snow_upload_key != Some(snow_key) || self.snow_presentation.pending();
+            if snow_due && (snow_toggled || snow_settled) {
                 self.snow_rebuilt_at = Some(Instant::now());
                 if self.ground_snow_enabled
                     && let Some((_, terrain)) = &self.vegetation_terrain
                 {
                     self.snow_presentation
                         .set_radius_m(view_radius_m().min(SNOW_MAX_RADIUS_M));
-                    let snow_started = Instant::now();
-                    let (patches, tracks) = self.snow_presentation.update(
+                    let update = self.snow_presentation.update(
                         &self.snow_frames,
                         terrain,
                         camera.position.to_array(),
+                        SNOW_BUILD_BUDGET,
                     );
-                    let snow_ms = snow_started.elapsed().as_secs_f32() * 1000.0;
-                    if snow_ms > 8.0 {
+                    let stats = self.snow_presentation.stats();
+                    if stats.last_build_ms > 8.0 {
                         tracing::info!(
-                            snow_ms,
-                            patches = patches.len(),
-                            "ground snow rebuild exceeded one 120 Hz frame"
+                            build_ms = stats.last_build_ms,
+                            tiles = stats.last_rebuilt_tiles,
+                            "ground snow mesh slice exceeded one 120 Hz frame"
                         );
                     }
                     self.scene
-                        .set_snow_patches(&self.device, &self.queue, patches, tracks)
+                        .update_snow_meshes(&self.device, &update.upserts, &update.removed)
                         .map_err(|error| ClientError::Render(error.to_string()))?;
                 } else {
+                    let removed = self.snow_presentation.resident_keys();
+                    self.snow_presentation = crate::snow::SnowPresentation::new();
                     self.scene
-                        .set_snow_patches(&self.device, &self.queue, &[], &[])
+                        .update_snow_meshes(&self.device, &[], &removed)
                         .map_err(|error| ClientError::Render(error.to_string()))?;
                 }
                 self.snow_upload_key = Some(snow_key);
@@ -862,14 +866,20 @@ impl WorldRenderer {
                     .map(|mark| (mark.contact_cell, mark.offset_mm, mark.strength_q8))
                     .collect();
                 tracing::info!(
+                    camera = ?camera.position.to_array(),
                     frames = snow.frames_considered,
                     faces = snow.rendered_faces,
-                    patches = snow.patches,
+                    tiles = snow.tiles,
+                    fine_tiles = snow.fine_tiles,
+                    triangles = snow.triangles,
+                    pending = snow.pending_tiles,
+                    build_ms = snow.last_build_ms,
                     tracks = snow.footprints,
+                    carved_quads = snow.carved_quads,
                     max_depth_mm = snow.max_depth_mm,
-                    capped = snow.cap_limited_surfaces,
-                    stale = snow.revision_mismatches,
                     hidden = snow.hidden_or_unknown_faces,
+                    stale = snow.stale_faces,
+                    nearest_m = snow.nearest_frame_m,
                     enabled = self.ground_snow_enabled,
                     ?track_contacts,
                     "snow capture presentation"

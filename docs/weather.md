@@ -20,7 +20,7 @@ game-system handoff.
 - ENG-194 supplies biome ambience and catalogued rain/thunder recordings, but
   explicitly excludes weather playback. Preserve concurrent sound work. Rejected
   strong-wind/snowstorm candidates and SnowFall music remain excluded.
-- Existing solid worldgen snow is separate from the proposed seasonal coating.
+- Existing solid worldgen snow is separate from the seasonal snow layer.
 
 ## Player experience
 
@@ -88,12 +88,15 @@ mirrors it in client frames. Preserve existing progress through an explicit
 migration; historical winter credit cannot be inferred from insufficient old
 data, so document the deterministic conversion and that limitation.
 
-## Thin ground snow
+## Ground snow layer
 
-First snow is a shallow visual coating: no new solid voxels, collision/support,
-movement penalties or per-voxel bodies. Existing solid snow stays destructible.
-Coat eligible upward-facing static terrain, including built roofs, with slope,
-temperature and sky-exposure rules. Snow may hide grass without killing it.
+Ground snow is a layer of fine voxels resting on terrain, up to 0.5 m deep. It is
+authoritative server state but separate from terrain: it adds no solid cells,
+collision/support, movement penalties or per-voxel bodies, and walking never edits
+terrain or creates topology transactions. Existing solid snow stays destructible.
+Eligible upward-facing static terrain, including built roofs, is covered under
+slope, temperature and sky-exposure rules. Snow may hide grass without killing it.
+How it is drawn is under "Snow layer rendering" below.
 
 Prefer sparse region-tiled surface records keyed by stable volume/location and
 geometry revision, with quantized depth, accumulation/melt progress and update
@@ -110,7 +113,7 @@ Measure costs before freezing tile size, resolution, update rate and memory caps
 
 Topology commits invalidate changed surfaces and dependent exposure columns before
 cover publication. Roof removal exposes the floor for future snowfall; destroyed
-surfaces lose coating and marks. A split drops this visual coating on transferred
+surfaces lose their snow and marks. A split drops this snow on transferred
 surfaces and clears the source, preventing floating snow. Moving-body accumulation
 is deferred. Warm weather melts gradually; fresh snow fills footprints. No melt
 or rainfall mass is injected into the water solver in this phase.
@@ -135,7 +138,7 @@ history, not durable gameplay evidence. Moving-body/vehicle tracks are deferred.
 ENG-195 tracks the overall scope. ENG-196 (WX0) and ENG-197 (WX1) are integrated
 into the local test branch. ENG-198 owns the combined F10/audio/1 km playtest;
 ENG-199 supplies authorized overrides and ENG-200 supplies bounded screen effects.
-ENG-206 owns WX3 snow coating; ENG-207 owns the precipitation angle correction
+ENG-206 owns WX3 snow cover; ENG-207 owns the precipitation angle correction
 and snow presentation. WX4 follows the frozen snow surface contract. Combined checks and launch
 evidence are recorded in `docs/reports/ENG-198-integrated-weather-playtest.md`.
 
@@ -170,9 +173,9 @@ actual terrain brick revisions, stable cohort IDs and quantized depths. Clients
 derive exact +Y face geometry only where the matching committed geometry is
 known. They do not infer authority from local residency or sky exposure.
 Surviving faces retain their snow across unrelated edits; newly exposed faces
-start at zero, and removed/occluded faces lose the coating and tracks.
+start at zero, and removed/occluded faces lose their snow and tracks.
 
-Depth is Q16 metres, capped at 0.125 m, with additional Q32 fractional progress
+Depth is Q16 metres, capped at 0.5 m, with additional Q32 fractional progress
 retained by the owner and save. Cold Snow/Blizzard accumulates at 2 mm/s times
 precipitation intensity when temperature is at most 0°C. Positive temperature
 melts at 1 mm/s times `clamp(temperature / 20°C, 0, 1)`. Rates are deliberately
@@ -233,7 +236,7 @@ and compatibility. WX3 settles surface storage and distant catch-up from measure
 costs. WX4 settles visual track density/TTL. Next scoped work: **ENG-195 / WX0**
 contract and integration audit (now integrated). ENG-198 / WX2 combined validation
 is accepted with the limitations recorded in its report. The user authorized
-WX3 snow coating and then WX4 footprints on 2026-10-14, and requested a correction
+WX3 snow cover and then WX4 footprints on 2026-10-14, and requested a correction
 to rain/snow appearing too sideways. Normal precipitation will use one shared
 fall/drift velocity for particle motion and ribbon orientation; blizzard and
 wind-only cues retain stronger wind response. Surface storage and revision
@@ -272,3 +275,65 @@ vegetation `start_season` and the weather `start_season` together, keeping elaps
 so the chosen season is current at once, snow eligibility and temperature follow, and the
 season keeps advancing from it. The vegetation state is journalled and the next weather
 and vegetation keyframes (within a second) carry the change to clients.
+
+## Snow layer rendering
+
+(`spall_render/src/snow_mesh.rs` meshes, `spall_client/src/snow.rs` feeds it.) Each
+exposed +Y terrain face with snow is a 4x4 grid of 6.25 cm columns. A column's height
+is `floor(depth / 6.25 cm + u)` whole steps, where `u` in [0, 1) is a deterministic
+hash of the column's world position (a 3x3-column block hash plus a smaller
+per-column hash, so equal heights form soft lumps). The mean surface therefore
+follows the authoritative depth exactly, and depth below one step shows as a sparse
+dusting that fills in as snow arrives, with no flat translucent sheet and no jump
+when a step is crossed.
+
+- Opaque, depth-writing geometry drawn through the lit terrain pipeline with
+  procedural snow materials (`SNOW_MATERIAL_BASE`, a packed-snow variant), so it is
+  shadowed and fogged like terrain. Colour varies a few percent per column.
+- Tops are merged greedily and side faces are emitted wherever a column stands higher
+  than its neighbour or the snow meets open air; where a solid cell stands beside the
+  support plane the side is omitted. Never one cube per column.
+- Levels of detail per 4 m tile: tiles within 14 m (hysteresis to 18 m) use 6.25 cm
+  columns and footprints; farther tiles use one 0.25 m column per cell at the
+  authoritative depth. One GPU mesh per tile and layer.
+- The existing exposure logic stays authoritative: the client revalidates each face
+  against the terrain replica (solid below, air above) and never treats unknown
+  geometry as air.
+
+**No pop.** Tile meshes are replaced whole, nearest first, within a 4 ms slice per
+update, and the old mesh stays drawn until its replacement lands. Two causes of the
+reported disappearing sheet were found and fixed:
+
+- *Measured:* the client's snow-frame cache (4096 frames) was smaller than the
+  working set of a heavy-snow view (about 5,500 frames at 96 m) and evicted the
+  oldest frame first. The server resends frames in a slow sweep that starts at the
+  player, so the oldest frames were the nearest ones: every sweep, all snow within
+  about 50 m vanished until the sweep came back (a capture log showed the nearest
+  frame jumping from 0 m to 45-57 m, in step with the missing snow). The cache now
+  holds 6144 frames and, when full, drops the frames farthest from the player
+  (`ReplicaWorld::set_snow_focus`).
+- *By inspection:* the old converter dropped every face whose brick revision
+  differed from the frame's, so a terrain edit near the player hid the snow until
+  the server resent the tile. A revision change alone no longer hides snow (the
+  sampled geometry decides), and a cell whose geometry is momentarily unknown keeps
+  what it showed.
+
+## Carved footprints
+
+An authoritative footprint carves the near columns inside a sole about 38 x 16 cm
+(a tapered capsule from heel to ball, a little over life size so it reads on the
+6.25 cm grid), oriented by the heading, alternating feet. Deep snow is removed down to one packed step (the
+floor shows in a bluer packed-snow colour) and a one-step rim heaps up just outside
+the sole; in thin snow the print sits half a step down. Strength fades the dent as
+new snow refills it. TTL, per-layer and global caps, fade by snowfall and melt
+removal are unchanged and server-side; carving is presentation of those marks only.
+
+## Blizzard wind
+
+Presentation only (`spall_client/src/weather.rs`), a pure function of the weather
+seed and a client clock that survives teleports: the wind direction veers up to
++-35 degrees over tens of seconds, gusts surge every few seconds, and the blizzard
+driving speed rides them between 6 and 16 m/s. Each streak also swirls on its own
+slow circle. Snow tiers use gentler versions (veer scale 0.3, drift modulated by the
+gust). Clients share the pattern but not its time origin, so two windows agree on the
+kind of motion, not on the exact gust moment.
