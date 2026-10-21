@@ -443,7 +443,7 @@ mod tests {
         let mut rebuilds = 0usize;
         let mut max_gap = 0.0_f64;
 
-        // 300 ticks at WALK_SPEED_M_S (4.5 m/s) covers ~22.5 m — several
+        // 300 ticks at WALK_SPEED_M_S (4.0 m/s) covers ~20 m — several
         // times the window's ~5 m safe-zone diameter
         // (`2 * (WINDOW_RADIUS_M - REBUILD_MARGIN_M)`), so this genuinely
         // exercises multiple rebuilds, not just one.

@@ -43,91 +43,89 @@ fn track_range_m(name: &str) -> f32 {
     }
 }
 
-/// One footstep surface. Recordings live in `foley/`; a row whose file is not
-/// shipped yet plays the generic default (row 0), so adding a surface is the
+/// One footstep surface. Recordings live in `foley/` as `<name>-walk.ogg`,
+/// optionally `<name>-run.ogg` for run steps; a surface without a walk
+/// recording plays the generic default (row 0), so adding a surface is the
 /// recording plus, for a new surface, one row here.
 struct SurfaceRow {
     name: &'static str,
-    recording: &'static str,
+    /// Recording stem when it differs from `name`.
+    stem: Option<&'static str>,
     gain: f32,
     pitch: f32,
     materials: &'static [MaterialId],
 }
 
+const fn row(name: &'static str, gain: f32, materials: &'static [MaterialId]) -> SurfaceRow {
+    SurfaceRow {
+        name,
+        stem: None,
+        gain,
+        pitch: 1.0,
+        materials,
+    }
+}
+
+/// Quiet rustle of plants layered under grass steps.
+const GRASS_RUSTLE: &str = "tall-grass-rustle.ogg";
+const GRASS_RUSTLE_GAIN: f32 = 0.25;
+
 /// Row 0 is the quiet generic default; the rest follow the terrain materials.
 /// Snow and water are not materials: they are picked by snow depth and by
-/// standing in water (see `FootstepConfig::select_surface`).
+/// standing in water (see `FootstepConfig::select_surface`). `tile-walk.ogg`
+/// and `tile-run.ogg` are shipped for built blocks but no sandbox material is
+/// tile-like yet, so they have no row.
 const SURFACES: [SurfaceRow; 9] = [
     SurfaceRow {
-        name: "generic",
-        recording: "gravel-footsteps.ogg",
-        gain: 0.3,
+        stem: Some("gravel"),
         pitch: 0.8,
-        materials: &[],
+        ..row("generic", 0.3, &[])
     },
     SurfaceRow {
-        name: "snow",
-        recording: "snow-footsteps.ogg",
-        gain: 1.0,
-        pitch: 1.0,
-        materials: &[materials::SNOW],
+        stem: Some("snow"),
+        ..row("snow", 1.0, &[materials::SNOW])
     },
-    SurfaceRow {
-        name: "gravel",
-        recording: "gravel-footsteps.ogg",
-        gain: 1.0,
-        pitch: 1.0,
-        materials: &[materials::GRAVEL],
-    },
-    SurfaceRow {
-        name: "grass",
-        recording: "grass-footsteps.ogg",
-        gain: 0.8,
-        pitch: 1.0,
-        materials: &[MaterialId(10), materials::MOSS],
-    },
-    SurfaceRow {
-        name: "mud",
-        recording: "mud-footsteps.ogg",
-        gain: 0.9,
-        pitch: 1.0,
-        materials: &[materials::DIRT, materials::MUD, materials::CLAY],
-    },
-    SurfaceRow {
-        name: "rock",
-        recording: "rock-footsteps.ogg",
-        gain: 1.0,
-        pitch: 1.0,
-        materials: &[
+    row("gravel", 1.0, &[materials::GRAVEL]),
+    row("grass", 0.8, &[MaterialId(10), materials::MOSS]),
+    row(
+        "mud",
+        0.9,
+        &[materials::DIRT, materials::MUD, materials::CLAY],
+    ),
+    row(
+        "rock",
+        1.0,
+        &[
             materials::STONE,
             materials::BEDROCK,
             materials::DEEP_STONE,
             MaterialId(13),
             MaterialId(14),
         ],
-    },
+    ),
+    row("sand", 0.8, &[materials::SAND]),
+    row("wood", 1.0, &[materials::WOOD]),
     SurfaceRow {
-        name: "sand",
-        recording: "sand-footsteps.ogg",
-        gain: 0.8,
-        pitch: 1.0,
-        materials: &[materials::SAND],
-    },
-    SurfaceRow {
-        name: "wood",
-        recording: "wood-footsteps.ogg",
-        gain: 1.0,
-        pitch: 1.0,
-        materials: &[materials::WOOD],
-    },
-    SurfaceRow {
-        name: "water",
-        recording: "water-footsteps.ogg",
-        gain: 0.9,
-        pitch: 1.0,
-        materials: &[],
+        stem: Some("water"),
+        ..row("water", 0.9, &[])
     },
 ];
+
+/// The recordings of a surface: `<stem>-walk.ogg` and `<stem>-run.ogg`, with
+/// the two exceptions below for the older and the wading files.
+fn recordings(row: &SurfaceRow, root: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    let foley = root.join("foley");
+    let stem = row.stem.unwrap_or(row.name);
+    let existing = |name: String| Some(foley.join(name)).filter(|path| path.is_file());
+    match stem {
+        "snow" => (existing("snow-footsteps.ogg".into()), None),
+        "water" => (existing("water-wade.ogg".into()), None),
+        _ => (
+            existing(format!("{stem}-walk.ogg")),
+            existing(format!("{stem}-run.ogg")),
+        ),
+    }
+}
 
 /// The footstep table with each recording resolved against `root`.
 pub fn footsteps(root: &Path) -> FootstepConfig {
@@ -136,10 +134,16 @@ pub fn footsteps(root: &Path) -> FootstepConfig {
         surfaces: SURFACES
             .iter()
             .map(|row| {
-                let file = root.join("foley").join(row.recording);
+                let (walk, run) = recordings(row, root);
+                let grass = row.name == "grass";
                 FootstepSurface {
                     name: row.name.to_owned(),
-                    file: file.is_file().then_some(file),
+                    walk,
+                    run,
+                    layer: grass
+                        .then(|| root.join("foley").join(GRASS_RUSTLE))
+                        .filter(|path| path.is_file()),
+                    layer_gain: if grass { GRASS_RUSTLE_GAIN } else { 0.0 },
                     gain: row.gain,
                     pitch: row.pitch,
                 }
@@ -341,14 +345,20 @@ mod tests {
     }
 
     #[test]
-    fn footstep_table_resolves_shipped_recordings_and_falls_back_for_the_rest() {
+    fn footstep_table_resolves_shipped_recordings() {
         let config = footsteps(&source_audio_root());
         for surface in &config.surfaces {
-            let expected = matches!(surface.name.as_str(), "generic" | "snow" | "gravel");
-            assert_eq!(surface.file.is_some(), expected, "{}", surface.name);
-            if let Some(file) = &surface.file {
-                assert!(file.is_file());
+            let paths = [&surface.walk, &surface.run, &surface.layer];
+            for path in paths.into_iter().flatten() {
+                assert!(path.is_file());
             }
+            assert!(surface.walk.is_some(), "{} has no recording", surface.name);
+            let has_run = matches!(
+                surface.name.as_str(),
+                "generic" | "gravel" | "rock" | "sand"
+            );
+            assert_eq!(surface.run.is_some(), has_run, "{}", surface.name);
+            assert_eq!(surface.layer.is_some(), surface.name == "grass");
         }
         assert_eq!(config.surfaces[0].name, "generic");
         let surface_name = |material: Option<MaterialId>, snow: f32, water: bool| {
@@ -371,11 +381,21 @@ mod tests {
     }
 
     #[test]
-    fn snow_recording_slices_into_its_twelve_steps() {
+    fn snow_recording_slices_into_its_twelve_steps_and_every_recording_slices() {
         let config = footsteps(&source_audio_root());
         let snow = config.surfaces.iter().find(|s| s.name == "snow").unwrap();
-        let steps = spall_client::footsteps::step_count(snow.file.as_deref().unwrap()).unwrap();
+        let steps = spall_client::footsteps::step_count(snow.walk.as_deref().unwrap()).unwrap();
         assert_eq!(steps, 12);
+        for surface in &config.surfaces {
+            for path in [&surface.walk, &surface.run, &surface.layer]
+                .into_iter()
+                .flatten()
+            {
+                let steps = spall_client::footsteps::step_count(path).unwrap();
+                assert!(steps >= 2, "{} slices into {steps}", path.display());
+                println!("{} {steps}", path.display());
+            }
+        }
     }
 
     #[test]
@@ -394,7 +414,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 23, "all 23 user-approved recordings are packaged");
+        assert_eq!(checked, 35, "all 35 user-approved recordings are packaged");
     }
 
     #[test]

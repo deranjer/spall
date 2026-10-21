@@ -26,9 +26,9 @@ pub use spall_core::PlayerInput;
 /// scenario may vary — the server and client must integrate identically.
 pub mod tuning {
     /// Ground move speed, m/s.
-    pub const WALK_SPEED_M_S: f32 = 4.5;
-    /// Ground move speed while the sprint button is held, m/s (1.73× walk).
-    pub const RUN_SPEED_M_S: f32 = 7.8;
+    pub const WALK_SPEED_M_S: f32 = 4.0;
+    /// Ground move speed while the sprint button is held, m/s (1.63× walk).
+    pub const RUN_SPEED_M_S: f32 = 6.5;
     /// Upward speed imparted by a jump, m/s (≈ 1.0 m apex under `GRAVITY_M_S2`).
     pub const JUMP_SPEED_M_S: f32 = 5.7;
     /// Downward acceleration applied to the capsule, m/s². Characters use a
@@ -549,7 +549,7 @@ mod tests {
         assert!((speed(walk) - tuning::WALK_SPEED_M_S).abs() < 1e-4);
         assert!((speed(run) - tuning::RUN_SPEED_M_S).abs() < 1e-4);
         let ratio = tuning::RUN_SPEED_M_S / tuning::WALK_SPEED_M_S;
-        assert!((1.7..=1.8).contains(&ratio), "run/walk = {ratio}");
+        assert!((1.5..=1.7).contains(&ratio), "run/walk = {ratio}");
 
         // Airborne keeps its takeoff momentum: pressing sprint mid-air adds none.
         let airborne = CharacterState {
@@ -609,7 +609,7 @@ mod tests {
             grounded: false,
         });
         let takeoff = [state.velocity_m_s[0], state.velocity_m_s[2]];
-        assert!(takeoff[1] < -4.0, "launch should carry forward momentum");
+        assert!(takeoff[1] < -3.5, "launch should carry forward momentum");
 
         let reverse_and_turn = PlayerInput {
             movement: [1.0, 0.0, -1.0],

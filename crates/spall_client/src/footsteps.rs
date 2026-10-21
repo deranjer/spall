@@ -21,8 +21,14 @@ use rodio::{Decoder, OutputStreamBuilder, Source};
 #[derive(Debug, Clone, PartialEq)]
 pub struct FootstepSurface {
     pub name: String,
-    /// Recording of several steps in a row; `None` falls back to surface 0.
-    pub file: Option<PathBuf>,
+    /// Recording of several walking steps in a row; `None` falls back to
+    /// surface 0.
+    pub walk: Option<PathBuf>,
+    /// Recording of running steps; run steps use `walk` without one.
+    pub run: Option<PathBuf>,
+    /// A quiet recording layered under every step (rustling plants).
+    pub layer: Option<PathBuf>,
+    pub layer_gain: f32,
     /// Loudness of this surface relative to the others.
     pub gain: f32,
     /// Playback-rate multiplier (below 1 sounds heavier and duller).
@@ -294,10 +300,32 @@ impl FootstepAudio {
     }
 }
 
-enum Bank {
-    Unloaded,
-    Missing,
-    Ready(StepBank, usize),
+/// A loaded recording and the step last played from it.
+struct Loaded {
+    bank: StepBank,
+    last: usize,
+}
+
+/// Steps of each recording, loaded on first use. `None` marks one that could
+/// not be loaded, so it is tried (and reported) once.
+type Banks = HashMap<PathBuf, Option<Loaded>>;
+
+fn bank_for<'a>(banks: &'a mut Banks, path: &Path, name: &str) -> Option<&'a mut Loaded> {
+    banks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| match load_bank(path) {
+            Ok(bank) => {
+                if std::env::var_os("SPALL_FOOTSTEP_LOG").is_some() {
+                    eprintln!("spall-footsteps: {name} sliced into {} steps", bank.steps.len());
+                }
+                Some(Loaded { bank, last: usize::MAX })
+            }
+            Err(error) => {
+                tracing::info!(surface = %name, %error, "footstep recording unavailable; using the default");
+                None
+            }
+        })
+        .as_mut()
 }
 
 /// Small xorshift generator: step variation needs no statistical quality.
@@ -324,37 +352,38 @@ impl Variation {
     }
 }
 
-/// Loads a surface's bank on first use. A missing or unreadable recording is
-/// reported once (info) and the surface plays the default instead.
-fn bank_for<'a>(
-    banks: &'a mut [Bank],
-    surfaces: &[FootstepSurface],
-    index: usize,
-) -> Option<&'a mut Bank> {
-    if matches!(banks[index], Bank::Unloaded) {
-        let surface = &surfaces[index];
-        banks[index] = match surface.file.as_deref().map(load_bank) {
-            Some(Ok(bank)) => {
-                if std::env::var_os("SPALL_FOOTSTEP_LOG").is_some() {
-                    eprintln!(
-                        "spall-footsteps: {} sliced into {} steps",
-                        surface.name,
-                        bank.steps.len()
-                    );
-                }
-                Bank::Ready(bank, usize::MAX)
-            }
-            Some(Err(error)) => {
-                tracing::info!(surface = %surface.name, %error, "footstep recording unavailable; using the default");
-                Bank::Missing
-            }
-            None => Bank::Missing,
-        };
+/// A random step from `loaded`, never the one played last, as a stereo buffer
+/// panned and pitched, with short fades so a slice never clicks.
+fn step_buffer(
+    loaded: &mut Loaded,
+    variation: &mut Variation,
+    pitch: f32,
+    loudness: f32,
+    pan: f32,
+) -> (usize, SamplesBuffer) {
+    let bank = &loaded.bank;
+    let mut pick = (variation.next() % bank.steps.len() as u64) as usize;
+    if pick == loaded.last && bank.steps.len() > 1 {
+        pick = (pick + 1) % bank.steps.len();
     }
-    match &mut banks[index] {
-        Bank::Ready(..) => Some(&mut banks[index]),
-        _ => None,
+    loaded.last = pick;
+    let mono = &bank.steps[pick];
+    // Equal-power pan.
+    let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    let (left, right) = (angle.cos() * loudness, angle.sin() * loudness);
+    let fade_in = (bank.sample_rate as usize / 500).max(1);
+    let fade_out = (bank.sample_rate as usize / 25).max(1);
+    let mut data = Vec::with_capacity(mono.len() * 2);
+    for (i, sample) in mono.iter().enumerate() {
+        let envelope = ((i + 1) as f32 / fade_in as f32)
+            .min((mono.len() - i) as f32 / fade_out as f32)
+            .min(1.0);
+        let value = sample * envelope;
+        data.push(value * left);
+        data.push(value * right);
     }
+    let rate = (bank.sample_rate as f32 * pitch).round().max(1000.0) as u32;
+    (pick, SamplesBuffer::new(2, rate, data))
 }
 
 fn run_footsteps(
@@ -369,7 +398,7 @@ fn run_footsteps(
             return;
         }
     };
-    let mut banks: Vec<Bank> = surfaces.iter().map(|_| Bank::Unloaded).collect();
+    let mut banks = Banks::new();
     let mut variation = Variation::new();
     let log = std::env::var_os("SPALL_FOOTSTEP_LOG").is_some();
     while let Ok(event) = rx.recv() {
@@ -377,23 +406,25 @@ fn run_footsteps(
         if master <= 0.0 {
             continue;
         }
+        // The requested surface if its recording loads, else the default.
         let requested = event.surface.min(surfaces.len() - 1);
-        let index = if bank_for(&mut banks, &surfaces, requested).is_some() {
-            requested
-        } else if bank_for(&mut banks, &surfaces, 0).is_some() {
-            0
-        } else {
-            continue;
-        };
-        let Bank::Ready(bank, last) = &mut banks[index] else {
-            continue;
-        };
-        // A different step than the last one on this surface.
-        let mut pick = (variation.next() % bank.steps.len() as u64) as usize;
-        if pick == *last && bank.steps.len() > 1 {
-            pick = (pick + 1) % bank.steps.len();
+        let mut chosen = None;
+        for index in [requested, 0] {
+            let surface = &surfaces[index];
+            let path = match (&surface.run, event.running) {
+                (Some(run), true) => Some(run),
+                _ => surface.walk.as_ref(),
+            };
+            if let Some(path) = path
+                && bank_for(&mut banks, path, &surface.name).is_some()
+            {
+                chosen = Some((index, path.clone()));
+                break;
+            }
         }
-        *last = pick;
+        let Some((index, path)) = chosen else {
+            continue;
+        };
         let surface = &surfaces[index];
         let pitch = surface.pitch * (1.0 + 0.06 * variation.signed());
         let loudness = event.gain
@@ -401,31 +432,31 @@ fn run_footsteps(
             * master
             * (1.0 + 0.12 * variation.signed())
             * if event.running { 1.25 } else { 1.0 };
+        let Some(loaded) = banks.get_mut(&path).and_then(Option::as_mut) else {
+            continue;
+        };
+        let (pick, buffer) = step_buffer(loaded, &mut variation, pitch, loudness, event.pan);
         if log {
             eprintln!(
-                "spall-footsteps: {} step {pick} pitch {pitch:.2} loudness {loudness:.2} pan {:.2}",
-                surface.name, event.pan
+                "spall-footsteps: {} step {pick} of {} pitch {pitch:.2} loudness {loudness:.2} pan {:.2}",
+                surface.name,
+                path.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                event.pan,
             );
         }
-        let mono = &bank.steps[pick];
-        // Equal-power pan, with short fades so a slice never clicks.
-        let angle = (event.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-        let (left, right) = (angle.cos() * loudness, angle.sin() * loudness);
-        let fade_in = (bank.sample_rate as usize / 500).max(1);
-        let fade_out = (bank.sample_rate as usize / 25).max(1);
-        let mut data = Vec::with_capacity(mono.len() * 2);
-        for (i, sample) in mono.iter().enumerate() {
-            let envelope = ((i + 1) as f32 / fade_in as f32)
-                .min((mono.len() - i) as f32 / fade_out as f32)
-                .min(1.0);
-            let value = sample * envelope;
-            data.push(value * left);
-            data.push(value * right);
-        }
-        let rate = (bank.sample_rate as f32 * pitch).round().max(1000.0) as u32;
         stream
             .mixer()
-            .add(SamplesBuffer::new(2, rate, data).take_duration(Duration::from_secs(2)));
+            .add(buffer.take_duration(Duration::from_secs(2)));
+        if let Some(layer) = &surface.layer
+            && let Some(loaded) = bank_for(&mut banks, layer, &surface.name)
+        {
+            let loudness = surface.layer_gain * master * event.gain;
+            let (_, buffer) = step_buffer(loaded, &mut variation, 1.0, loudness, event.pan);
+            stream
+                .mixer()
+                .add(buffer.take_duration(Duration::from_secs(2)));
+        }
     }
 }
 
@@ -436,7 +467,10 @@ mod tests {
     fn config() -> FootstepConfig {
         let surface = |name: &str| FootstepSurface {
             name: name.into(),
-            file: None,
+            walk: None,
+            run: None,
+            layer: None,
+            layer_gain: 0.0,
             gain: 1.0,
             pitch: 1.0,
         };

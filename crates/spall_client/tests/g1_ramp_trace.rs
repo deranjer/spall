@@ -67,8 +67,8 @@ use spall_sim::{Simulation, SimulationConfig, TICK_DT_S};
 /// `[180, 211]`, `z` in `[100, 115]`, flat height `46` cells outside it —
 /// `46 * 0.25 m = 11.5 m`), facing `+X`.
 const RAMP_APPROACH_M: [f64; 3] = [44.5, 11.5, 26.5];
-/// Ticks to walk one direction across the ramp at `WALK_SPEED_M_S = 4.5`:
-/// `100 * 4.5 / 60 = 7.5 m`, from `x = 44.5` to `x = 52.0` — short of the
+/// Ticks to walk one direction across the ramp at `WALK_SPEED_M_S = 4.0`:
+/// `100 * 4.0 / 60 ≈ 6.7 m`, from `x = 44.5` to `x ≈ 51.2` — short of the
 /// ramp's far wall at `x = 52.75 m` (height jumps straight back up to the
 /// flat `46` the instant `x` leaves `[180, 211]` within this `z` band;
 /// walking into it is a real vertical-wall collision case this trace
