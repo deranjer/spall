@@ -6,6 +6,7 @@ pub mod catalogue;
 pub mod column_surface;
 pub mod day_night;
 pub mod ecology_demo;
+pub mod footsteps;
 pub mod interactive;
 pub mod net;
 pub mod predict;

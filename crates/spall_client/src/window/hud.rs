@@ -343,6 +343,7 @@ pub(super) fn admin_menu_view(
         weather: String::new(),
         nature_volume: 0.0,
         weather_volume: 0.0,
+        footstep_volume: 0.0,
         nature_muted: false,
         nature_selection: String::new(),
         weather_muted: false,

@@ -244,6 +244,7 @@ impl ApplicationHandler for InteractiveApp {
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
                 self.update_ambience();
+                self.update_footsteps(now);
                 let handler_started = now;
                 self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);
@@ -806,6 +807,7 @@ impl ApplicationHandler for InteractiveApp {
                                 .unwrap_or_else(|| "Weather: waiting for server".into());
                             menu.nature_volume = self.nature_volume;
                             menu.weather_volume = self.weather_volume;
+                            menu.footstep_volume = self.footstep_volume;
                             menu.nature_muted = self.nature_muted;
                             menu.nature_selection = self
                                 .nature_preview
@@ -942,6 +944,8 @@ impl ApplicationHandler for InteractiveApp {
                     (self.nature_volume + menu_actions.nature_volume_delta).clamp(0.0, 1.0);
                 self.weather_volume =
                     (self.weather_volume + menu_actions.weather_volume_delta).clamp(0.0, 1.0);
+                self.footstep_volume =
+                    (self.footstep_volume + menu_actions.footstep_volume_delta).clamp(0.0, 1.0);
                 if menu_actions.toggle_weather_effects {
                     self.weather_effects_enabled = !self.weather_effects_enabled;
                 }

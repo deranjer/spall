@@ -113,7 +113,7 @@ fn carried_cube_speed(cube_x: f32, cube_z: f32) -> (f32, f32) {
     world.sweep_character_pushing_excluding(
         crate::character::CharacterParams::DEFAULT,
         [0.0, 0.0, 0.5],
-        [0.075, 0.0, 0.0],
+        [crate::character::tuning::WALK_SPEED_M_S / 60.0, 0.0, 0.0],
         1.0 / 60.0,
         &[],
     );
@@ -128,7 +128,7 @@ fn carried_cube_speed(cube_x: f32, cube_z: f32) -> (f32, f32) {
 #[test]
 fn carry_helper_never_launches_out_of_reach_or_faster_than_the_walker() {
     const WALK: f32 = crate::character::tuning::WALK_SPEED_M_S;
-    // Capsule radius 0.3 at x = 0.075: front at 0.375. Cube x-extent 1 m.
+    // Capsule radius 0.3 at x = 0.075: front at about 0.37. Cube x-extent 1 m.
     // Well ahead (gap > margin): untouched.
     let (far, _) = carried_cube_speed(0.6, 0.0);
     assert!(far.abs() < 1e-4, "out-of-reach cube launched: {far}");

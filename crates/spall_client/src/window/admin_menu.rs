@@ -39,6 +39,7 @@ pub(crate) struct AdminMenuView {
     pub weather: String,
     pub nature_volume: f32,
     pub weather_volume: f32,
+    pub footstep_volume: f32,
     pub nature_muted: bool,
     pub nature_selection: String,
     pub weather_muted: bool,
@@ -80,6 +81,7 @@ pub(crate) struct AdminMenuActions {
     pub toggle_weather_audio: bool,
     pub nature_volume_delta: f32,
     pub weather_volume_delta: f32,
+    pub footstep_volume_delta: f32,
     pub toggle_weather_effects: bool,
     pub toggle_ground_snow: bool,
     pub toggle_weather_flashes: bool,
@@ -251,6 +253,18 @@ pub(super) fn admin_menu_panel(
                         }
                         if yakui::button("+ Weather").clicked {
                             actions.weather_volume_delta = 0.1;
+                        }
+                    });
+                    yakui::row(|| {
+                        muted(
+                            13.0,
+                            format!("Footsteps {:.0}% ", view.footstep_volume * 100.0),
+                        );
+                        if yakui::button("- Steps").clicked {
+                            actions.footstep_volume_delta = -0.1;
+                        }
+                        if yakui::button("+ Steps").clicked {
+                            actions.footstep_volume_delta = 0.1;
                         }
                     });
                     yakui::row(|| {

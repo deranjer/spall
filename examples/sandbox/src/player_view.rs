@@ -20,11 +20,11 @@ use crate::animal_visual::{
 pub const WALK_MIN_SPEED_M_S: f32 = 0.3;
 /// Ground speed above which a player runs rather than walks, m/s: midway
 /// between the walk and run speeds of the movement kernel.
-pub const RUN_MIN_SPEED_M_S: f32 = 6.0;
+pub const RUN_MIN_SPEED_M_S: f32 = 5.3;
 /// Ground covered by one walk clip cycle (two steps), metres.
-pub const WALK_STRIDE_M: f32 = 2.4;
+pub const WALK_STRIDE_M: f32 = 2.1;
 /// Ground covered by one run clip cycle, metres.
-pub const RUN_STRIDE_M: f32 = 4.2;
+pub const RUN_STRIDE_M: f32 = 3.5;
 /// The root pelvis pivot sits 13 cells of 6.25 cm above the shoe soles.
 pub const PELVIS_ABOVE_SOLE_M: f32 = 13.0 * 0.0625;
 /// Fastest the body turns toward its heading, 1/s (exponential approach).
@@ -187,15 +187,15 @@ mod tests {
     fn clip_follows_water_then_ground_speed() {
         assert_eq!(select_clip(0.0, false), "idle");
         assert_eq!(select_clip(0.1, false), "idle");
-        assert_eq!(select_clip(4.5, false), "walk");
-        assert_eq!(select_clip(7.8, false), "run");
+        assert_eq!(select_clip(4.0, false), "walk");
+        assert_eq!(select_clip(6.5, false), "run");
         // The kernel's own walk and run speeds land on walk and run.
         use spall_physics::character::tuning::{RUN_SPEED_M_S, WALK_SPEED_M_S};
         assert_eq!(select_clip(WALK_SPEED_M_S, false), "walk");
         assert_eq!(select_clip(RUN_SPEED_M_S, false), "run");
         // Water wins over speed, standing or not.
         assert_eq!(select_clip(0.0, true), "swim");
-        assert_eq!(select_clip(7.8, true), "swim");
+        assert_eq!(select_clip(6.5, true), "swim");
     }
 
     #[test]
