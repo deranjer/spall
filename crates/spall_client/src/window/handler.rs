@@ -673,6 +673,8 @@ impl ApplicationHandler for InteractiveApp {
                             submerged,
                         };
                         self.body_state.advance(&conditions, body_dt);
+                        renderer.body_reminders =
+                            crate::body_state::reminders(&self.body_state, &self.body_preview);
                         renderer
                             .scene
                             .set_screen_grade(crate::body_state::screen_grade(

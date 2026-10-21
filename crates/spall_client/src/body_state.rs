@@ -96,7 +96,8 @@ pub fn screen_grade(state: &BodyState, preview: &BodyPreview, time_s: f32) -> Sc
     ];
     // Vignettes combine: strengths as independent coverage, colour weighted
     // by strength. The injury vignette beats with the heart.
-    let beat = heartbeat(time_s, 70.0 + 70.0 * injury);
+    // A slow, resting-to-strained pulse: faster flicker read as strobing.
+    let beat = heartbeat(time_s, 48.0 + 30.0 * injury);
     let vignettes = [
         (0.35 * injury + 0.25 * injury * beat, [0.22, 0.0, 0.0]),
         (0.55 * exhaustion, [0.0; 3]),
@@ -128,11 +129,62 @@ pub fn screen_grade(state: &BodyState, preview: &BodyPreview, time_s: f32) -> Sc
     .clamped()
 }
 
-/// A lub-dub heartbeat at `bpm`: two thumps per beat, 0..=1.
+/// A body state with a HUD reminder icon, most urgent first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyCue {
+    Injury,
+    Thirst,
+    Hunger,
+    Exhaustion,
+    Cold,
+    Wet,
+}
+
+impl BodyCue {
+    pub const ALL: [Self; 6] = [
+        Self::Injury,
+        Self::Thirst,
+        Self::Hunger,
+        Self::Exhaustion,
+        Self::Cold,
+        Self::Wet,
+    ];
+}
+
+/// Level at which a state's reminder icon starts to show; it is fully shown
+/// [`REMINDER_FADE`] above that.
+pub const REMINDER_AT: f32 = 0.7;
+const REMINDER_FADE: f32 = 0.1;
+
+/// Each cue's reminder icon opacity, 0..=1, in [`BodyCue::ALL`] order. The
+/// screen grade is the main signal; the icon is a backup once a state is bad.
+pub fn reminders(state: &BodyState, preview: &BodyPreview) -> [(BodyCue, f32); 6] {
+    BodyCue::ALL.map(|cue| {
+        let level = finite_unit(match cue {
+            BodyCue::Injury => preview.injury,
+            BodyCue::Thirst => preview.thirst,
+            BodyCue::Hunger => preview.hunger,
+            BodyCue::Exhaustion => preview.exhaustion,
+            BodyCue::Cold => state.cold,
+            BodyCue::Wet => state.wet,
+        });
+        let opacity = ((level - REMINDER_AT) / REMINDER_FADE).clamp(0.0, 1.0);
+        (
+            cue,
+            if level >= REMINDER_AT {
+                opacity.max(0.05)
+            } else {
+                0.0
+            },
+        )
+    })
+}
+
+/// A soft heartbeat at `bpm`: one swell per beat with a faint echo, 0..=1.
 fn heartbeat(time_s: f32, bpm: f32) -> f32 {
     let phase = (time_s * bpm / 60.0).rem_euclid(1.0);
-    let thump = |at: f32| (-((phase - at) / 0.05).powi(2)).exp();
-    thump(0.0).max(thump(1.0)).max(0.6 * thump(0.18))
+    let thump = |at: f32| (-((phase - at) / 0.12).powi(2)).exp();
+    thump(0.0).max(thump(1.0)).max(0.3 * thump(0.3))
 }
 
 fn ease(value: f32, target: f32, dt_s: f32, tau_s: f32) -> f32 {
@@ -266,6 +318,57 @@ mod tests {
     }
 
     #[test]
+    fn reminder_icons_appear_only_from_seventy_percent() {
+        let shown = |state: BodyState, preview: BodyPreview| -> Vec<BodyCue> {
+            reminders(&state, &preview)
+                .into_iter()
+                .filter(|(_, opacity)| *opacity > 0.0)
+                .map(|(cue, _)| cue)
+                .collect()
+        };
+        assert!(shown(BodyState::default(), BodyPreview::default()).is_empty());
+        let below = BodyPreview {
+            injury: 0.69,
+            thirst: 0.5,
+            exhaustion: 0.0,
+            hunger: 0.25,
+        };
+        assert!(
+            shown(
+                BodyState {
+                    cold: 0.69,
+                    wet: 0.6
+                },
+                below
+            )
+            .is_empty()
+        );
+        let over = BodyPreview {
+            hunger: 0.75,
+            ..BodyPreview::default()
+        };
+        assert_eq!(
+            shown(
+                BodyState {
+                    cold: 0.7,
+                    wet: 1.0
+                },
+                over
+            ),
+            [BodyCue::Hunger, BodyCue::Cold, BodyCue::Wet]
+        );
+        let full = reminders(
+            &BodyState {
+                cold: 0.85,
+                wet: 0.72,
+            },
+            &over,
+        );
+        assert_eq!(full[4], (BodyCue::Cold, 1.0));
+        assert!(full[5].1 > 0.0 && full[5].1 < 1.0, "fades in: {full:?}");
+    }
+
+    #[test]
     fn the_injury_vignette_beats_faster_when_badly_hurt() {
         let beats = |injury: f32| {
             let preview = BodyPreview {
@@ -281,7 +384,7 @@ mod tests {
                 .filter(|w| w[1] > w[0] && w[1] >= w[2] && w[1] > peak * 0.9)
                 .count()
         };
-        // 10 s at ~84 vs ~140 bpm.
+        // 10 s at ~54 vs ~78 bpm.
         assert!(beats(0.2) < beats(1.0), "{} vs {}", beats(0.2), beats(1.0));
     }
 }

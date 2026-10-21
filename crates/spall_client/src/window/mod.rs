@@ -41,7 +41,7 @@ use yakui_winit::YakuiWinit;
 
 use crate::ClientError;
 use crate::audio::{AmbienceAudio, BiomeAudioConfig};
-use crate::body_state::{BodyConditions, BodyPreview, BodyState};
+use crate::body_state::{BodyConditions, BodyCue, BodyPreview, BodyState};
 use crate::day_night::environment_for_clock;
 use crate::interactive::{InteractiveSession, InteractiveView, LiveInput};
 use crate::net::{

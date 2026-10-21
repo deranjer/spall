@@ -397,6 +397,75 @@ pub(super) fn draw_crosshair(view: &CrosshairView) {
     });
 }
 
+/// The bundled reminder icons (white strokes on a dark disc, tinted per cue
+/// when drawn), uploaded once, in [`BodyCue::ALL`] order.
+pub(super) fn load_body_icons(
+    yakui: &mut yakui::Yakui,
+) -> Result<[yakui::ManagedTextureId; 6], ClientError> {
+    let mut ids = Vec::with_capacity(BodyCue::ALL.len());
+    for cue in BodyCue::ALL {
+        let png: &[u8] = match cue {
+            BodyCue::Injury => include_bytes!("../../assets/hud/injury.png"),
+            BodyCue::Thirst => include_bytes!("../../assets/hud/thirst.png"),
+            BodyCue::Hunger => include_bytes!("../../assets/hud/hunger.png"),
+            BodyCue::Exhaustion => include_bytes!("../../assets/hud/exhaustion.png"),
+            BodyCue::Cold => include_bytes!("../../assets/hud/cold.png"),
+            BodyCue::Wet => include_bytes!("../../assets/hud/wet.png"),
+        };
+        let icon = image::load_from_memory(png)
+            .map_err(|error| ClientError::Render(format!("{cue:?} HUD icon: {error}")))?
+            .into_rgba8();
+        let size = yakui::UVec2::new(icon.width(), icon.height());
+        let mut texture = yakui::paint::Texture::new(
+            yakui::paint::TextureFormat::Rgba8Srgb,
+            size,
+            icon.into_raw(),
+        );
+        texture.min_filter = yakui::paint::TextureFilter::Linear;
+        ids.push(yakui.add_texture(texture));
+    }
+    Ok(ids.try_into().expect("one icon per cue"))
+}
+
+/// Ink colour of each reminder icon.
+fn reminder_tint(cue: BodyCue) -> yakui::Color {
+    match cue {
+        BodyCue::Injury => yakui::Color::rgb(220, 70, 60),
+        BodyCue::Thirst => yakui::Color::rgb(225, 180, 95),
+        BodyCue::Hunger => yakui::Color::rgb(215, 150, 80),
+        BodyCue::Exhaustion => yakui::Color::rgb(190, 190, 200),
+        BodyCue::Cold => yakui::Color::rgb(170, 215, 255),
+        BodyCue::Wet => yakui::Color::rgb(120, 170, 220),
+    }
+}
+
+/// Reminder icons in the lower-right corner for any body state at 70% or more,
+/// most urgent rightmost-first.
+pub(super) fn draw_body_reminders(
+    icons: &[yakui::ManagedTextureId; 6],
+    reminders: &[(BodyCue, f32); 6],
+) {
+    if reminders.iter().all(|(_, opacity)| *opacity <= 0.0) {
+        return;
+    }
+    yakui::align(yakui::Alignment::BOTTOM_RIGHT, || {
+        yakui::pad(yakui::widgets::Pad::all(24.0), || {
+            yakui::row(|| {
+                for (icon, (cue, opacity)) in icons.iter().zip(reminders).rev() {
+                    if *opacity <= 0.0 {
+                        continue;
+                    }
+                    yakui::pad(yakui::widgets::Pad::horizontal(4.0), || {
+                        let mut image = yakui::widgets::Image::new(*icon, yakui::Vec2::splat(52.0));
+                        image.color = reminder_tint(*cue).with_alpha(*opacity);
+                        image.show();
+                    });
+                }
+            });
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
