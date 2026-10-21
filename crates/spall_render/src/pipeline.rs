@@ -149,6 +149,27 @@ struct GpuMaterial {
     params: [f32; 4],
 }
 
+fn gpu_materials(materials: &[Material]) -> Vec<GpuMaterial> {
+    let fallback = [Material::new([0.5, 0.5, 0.5], 0.8, 0.0)];
+    let source = if materials.is_empty() {
+        &fallback[..]
+    } else {
+        materials
+    };
+    source
+        .iter()
+        .map(|m| GpuMaterial {
+            base_color: [m.base_color[0], m.base_color[1], m.base_color[2], m.opacity],
+            params: [
+                m.roughness.clamp(0.04, 1.0),
+                m.metallic.clamp(0.0, 1.0),
+                m.emissive.max(0.0),
+                m.jitter.clamp(0.0, 0.5),
+            ],
+        })
+        .collect()
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ToneGlobals {
@@ -817,29 +838,22 @@ impl ScenePipeline {
     }
 
     pub fn material_buffer(&self, device: &wgpu::Device, materials: &[Material]) -> wgpu::Buffer {
-        let fallback = [Material::new([0.5, 0.5, 0.5], 0.8, 0.0)];
-        let source = if materials.is_empty() {
-            &fallback[..]
-        } else {
-            materials
-        };
-        let gpu: Vec<GpuMaterial> = source
-            .iter()
-            .map(|m| GpuMaterial {
-                base_color: [m.base_color[0], m.base_color[1], m.base_color[2], m.opacity],
-                params: [
-                    m.roughness.clamp(0.04, 1.0),
-                    m.metallic.clamp(0.0, 1.0),
-                    m.emissive.max(0.0),
-                    m.jitter.clamp(0.0, 0.5),
-                ],
-            })
-            .collect();
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("spall-materials"),
-            contents: bytemuck::cast_slice(&gpu),
-            usage: wgpu::BufferUsages::STORAGE,
+            contents: bytemuck::cast_slice(&gpu_materials(materials)),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         })
+    }
+
+    /// Overwrites a buffer from [`Self::material_buffer`] in place. `materials`
+    /// must have the length the buffer was created with.
+    pub fn write_materials(
+        &self,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        materials: &[Material],
+    ) {
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&gpu_materials(materials)));
     }
 
     pub fn cascade_data(camera: &Camera, sun_dir: Vec3) -> ([Mat4; CASCADE_COUNT], [f32; 4]) {

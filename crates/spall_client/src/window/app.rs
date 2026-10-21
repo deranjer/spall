@@ -7,6 +7,8 @@ pub(super) struct InteractiveApp {
     pub(super) environment: Environment,
     pub(super) day_night_cycle: bool,
     pub(super) render_materials: Vec<spall_render::Material>,
+    /// Seasonal kind of each render material (same indexing), if greenery.
+    pub(super) material_kinds: Vec<Option<crate::season_colour::Greenery>>,
     /// Material index of the debug overlay colour (one past the manifest).
     pub(super) debug_material: u32,
     pub(super) uncapped: bool,
@@ -223,6 +225,7 @@ impl InteractiveApp {
             environment,
             day_night_cycle: options.day_night_cycle.unwrap_or(true),
             render_materials,
+            material_kinds: Vec::new(),
             debug_material,
             uncapped: options.uncapped,
             ambience,

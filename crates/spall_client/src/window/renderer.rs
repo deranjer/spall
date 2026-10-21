@@ -1,7 +1,10 @@
 use super::*;
+use crate::season_colour::{Greenery, SeasonalMaterials, season_weights};
 
 pub(crate) struct WorldRenderer {
     pub(super) weather_state: Option<spall_protocol::WeatherState>,
+    seasonal: SeasonalMaterials,
+    seasonal_at: Instant,
     pub(super) weather_presentation: crate::weather::WeatherPresentation,
     weather_render_at: Instant,
     pub(super) weather_exposure: f32,
@@ -247,6 +250,7 @@ impl WorldRenderer {
         window: Arc<Window>,
         environment: Environment,
         materials: &[spall_render::Material],
+        material_kinds: &[Option<Greenery>],
         uncapped: bool,
         day_cycle_enabled: bool,
     ) -> Result<Self, ClientError> {
@@ -347,6 +351,13 @@ impl WorldRenderer {
                 0.0,
             ));
         }
+        let mut kinds = material_kinds.to_vec();
+        kinds.resize(
+            render_materials.len() - spall_ecology::living::PALETTE.len(),
+            None,
+        );
+        kinds.extend((0..spall_ecology::living::PALETTE.len()).map(Greenery::of_palette));
+        let seasonal = SeasonalMaterials::new(render_materials.clone(), kinds);
         let scene = GameRenderer::new(
             &device,
             &queue,
@@ -362,6 +373,8 @@ impl WorldRenderer {
             environment,
             day_cycle_enabled,
             weather_state: None,
+            seasonal,
+            seasonal_at: Instant::now(),
             weather_presentation: crate::weather::WeatherPresentation::new(),
             weather_render_at: Instant::now(),
             weather_exposure: 1.0,
@@ -770,6 +783,14 @@ impl WorldRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("spall-interactive-encoder"),
             });
+        let seasonal_dt = self.seasonal_at.elapsed().as_secs_f32().min(0.25);
+        self.seasonal_at = Instant::now();
+        if let Some(state) = &self.weather_state {
+            let target = season_weights(state.start_season, state.clock_ms, state.season_ms);
+            if let Some(table) = self.seasonal.update(target, seasonal_dt) {
+                self.scene.update_materials(&self.queue, &table);
+            }
+        }
         if let Some((eye, look_dir)) = cam {
             let mut camera = Camera::looking_along(
                 *eye,
