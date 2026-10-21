@@ -1,7 +1,7 @@
 //! Presentation-only weather primitives consumed by [`crate::GameRenderer`].
 
 /// Absolute renderer input cap; the client policy uses the same bound.
-pub const MAX_WEATHER_PARTICLES: usize = 1_536;
+pub const MAX_WEATHER_PARTICLES: usize = 12_288;
 
 /// One cosmetic, camera-local weather ribbon in world metres.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,7 +21,7 @@ pub struct WeatherLighting {
     pub exposure: f32,
     pub precipitation: f32,
     pub wind: f32,
-    /// 1 is clear visibility; blizzards smoothly reduce it toward 0.22.
+    /// 1 is clear visibility; a blizzard whiteout pulls it down toward 0.15.
     pub visibility: f32,
     /// Storm darkening amount for the host's sky/environment presentation.
     pub storm_dimming: f32,

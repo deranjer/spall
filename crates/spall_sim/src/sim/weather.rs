@@ -22,11 +22,15 @@ impl Simulation {
     }
 
     /// Apply or clear a persisted server-authorized weather override at the current tick.
-    pub fn set_weather_override(&mut self, kind: Option<spall_protocol::WeatherKind>) {
+    pub fn set_weather_override(
+        &mut self,
+        kind: Option<spall_protocol::WeatherKind>,
+        snow_tier: Option<spall_protocol::SnowTier>,
+    ) {
         self.weather.world_revision = self.weather.world_revision.saturating_add(1);
         self.weather.effective_tick = self.tick.get();
         if let Some(kind) = kind {
-            self.weather.force_kind(Some(kind));
+            self.weather.force_kind(Some(kind), snow_tier);
         } else {
             self.weather = spall_protocol::WeatherState::for_clock(
                 self.weather_seed,
@@ -42,6 +46,39 @@ impl Simulation {
             );
         }
         self.weather_dirty = true;
+    }
+
+    /// Re-anchors the shared vegetation and weather season clock so the current
+    /// season is `season` (0 spring .. 3 winter), keeping elapsed time. Both
+    /// anchors move together, so `validate_weather_clock_source` still holds.
+    pub fn set_season(&mut self, season: u8) -> Result<(), String> {
+        let anchor = |time_ms: u64, season_ms: u64| {
+            let elapsed = ((time_ms / season_ms.max(1)) % 4) as u8;
+            (season + 4 - elapsed) % 4
+        };
+        if season > 3 {
+            return Err("season must be 0..=3".into());
+        }
+        if let Some(v) = &mut self.vegetation {
+            let start = anchor(v.state.time_ms, v.state.season_ms);
+            v.state.start_season =
+                spall_ecology::living::Season::from_code(start).ok_or("season anchor")?;
+            v.dirty = true;
+        }
+        let weather_ms = match self.weather.clock_source {
+            spall_protocol::WeatherClockSource::Vegetation => self
+                .vegetation
+                .as_ref()
+                .map_or(self.weather.clock_ms, |v| v.state.time_ms),
+            spall_protocol::WeatherClockSource::ServerFallback => {
+                self.tick.get().saturating_mul(1000) / 60
+            }
+        };
+        self.weather.start_season = anchor(weather_ms, self.weather.season_ms);
+        self.weather.world_revision = self.weather.world_revision.saturating_add(1);
+        self.weather_dirty = true;
+        self.advance_weather();
+        Ok(())
     }
 
     /// Current authoritative weather state. Clock source is fixed per world.
@@ -121,7 +158,11 @@ impl Simulation {
         );
         let mut next = next;
         if let Some(kind) = self.weather.override_kind {
-            next.force_kind(Some(kind));
+            // A forced snow keeps its tier: it lives in the previous precipitation.
+            let tier = (kind == spall_protocol::WeatherKind::Snow).then(|| {
+                spall_protocol::SnowTier::from_precipitation(self.weather.precipitation_q16)
+            });
+            next.force_kind(Some(kind), tier);
         }
         let profile_changed = next.transition_id != self.weather.transition_id
             || next.kind != self.weather.kind

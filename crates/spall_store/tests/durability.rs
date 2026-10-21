@@ -1044,7 +1044,7 @@ fn weather_clock_checkpoint_and_journal_survive_restart_exactly() {
         season_ms: 900_000,
     };
     let mut state = WeatherState::for_clock(42, 3, 120, clock, 9);
-    state.force_kind(Some(spall_protocol::WeatherKind::Snow));
+    state.force_kind(Some(spall_protocol::WeatherKind::Snow), None);
     cp.weather = Some(state.clone());
     let mut writer = Writer::open(scratch.db()).unwrap();
     writer.publish_checkpoint(&cp).unwrap();
@@ -1060,7 +1060,7 @@ fn weather_clock_checkpoint_and_journal_survive_restart_exactly() {
         },
         9,
     );
-    clock_next.force_kind(Some(spall_protocol::WeatherKind::Snow));
+    clock_next.force_kind(Some(spall_protocol::WeatherKind::Snow), None);
     writer
         .append_journal(&[JournalRecord {
             seq: 1,

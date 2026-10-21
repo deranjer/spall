@@ -246,3 +246,29 @@ captures, live launch and remaining profiling/streaming limits are in
 reports/ENG-207-snow-playtest.md. ENG-207's precipitation correction is accepted;
 ENG-206/208 remain open for the documented combined acceptance follow-ups under
 ENG-195. No matched performance or impaired-link snow gate is claimed.
+
+## Snow tiers, blizzard and season selection
+
+Snow is one `WeatherKind` at three `precipitation_q16` tiers (`spall_protocol::SnowTier`):
+light 0.25, medium 0.5, heavy 0.85. An automatic Snow roll picks a tier from the seed;
+`AdminCommand::SetWeather { kind, intensity }` forces one (`intensity` applies to Snow only,
+default medium) and the tier survives ticks because it lives in the state's
+precipitation. Blizzard is precipitation 0.95. The F10 weather label shows the tier, and
+`--shots` accepts `weather:snow-light|snow-medium|snow-heavy` and `season:<name>`.
+
+Client particles (`spall_client/src/weather.rs`): snow uses a 24 m box of 8-12 cm flakes
+falling 1.0-1.5 m/s with a per-flake sway, on a world-anchored lattice wrapped around
+the camera. Count scales with the smoothed precipitation (about 2k / 4k / 7k) and the
+blizzard is 1.5x heavy (about 10.5k) of fast near-horizontal streaks, 8-14 m/s along the
+wind, pulsing with gusts. The cap is `spall_render::MAX_WEATHER_PARTICLES` (12,288).
+Shelter still comes from the 5x5 sky-exposure grid. Heavy snow lowers
+`WeatherLighting.visibility` to about 0.7; a blizzard pulses it between about 0.3 and
+0.15. The renderer turns visibility into a whiteout through the scene's distance fog
+(`weather_fog`: the end shrinks toward 22 m, the start toward the camera, and the colour
+goes grey-white), plus a stronger full-screen overlay (alpha cap 0.36).
+
+`AdminCommand::SetSeason { season }` (0 spring .. 3 winter, F10 buttons) re-anchors the
+vegetation `start_season` and the weather `start_season` together, keeping elapsed time,
+so the chosen season is current at once, snow eligibility and temperature follow, and the
+season keeps advancing from it. The vegetation state is journalled and the next weather
+and vegetation keyframes (within a second) carry the change to clients.

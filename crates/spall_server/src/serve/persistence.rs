@@ -190,6 +190,7 @@ pub(super) fn set_weather_admin(
     enabled: bool,
     request_id: RequestId,
     kind: Option<spall_protocol::WeatherKind>,
+    intensity: Option<spall_protocol::SnowTier>,
 ) -> spall_protocol::AdminStatus {
     if !enabled {
         return spall_protocol::AdminStatus {
@@ -198,7 +199,14 @@ pub(super) fn set_weather_admin(
             message: "admin commands are disabled on this server".into(),
         };
     }
-    sim.set_weather_override(kind);
+    if intensity.is_some() && kind != Some(spall_protocol::WeatherKind::Snow) {
+        return spall_protocol::AdminStatus {
+            request_id,
+            accepted: false,
+            message: "intensity tiers apply to snow only".into(),
+        };
+    }
+    sim.set_weather_override(kind, intensity);
     let weather = sim.weather_state();
     let mode = kind.map_or("automatic", |k| match k {
         spall_protocol::WeatherKind::Clear => "clear",
@@ -215,6 +223,64 @@ pub(super) fn set_weather_admin(
             "weather {mode} (precipitation q16 {}, gust q16 {})",
             weather.precipitation_q16, weather.gust_q16
         ),
+    }
+}
+
+/// Handles `SetWeather` and `SetSeason`.
+pub(super) fn weather_admin(
+    sim: &mut Simulation,
+    enabled: bool,
+    request_id: RequestId,
+    command: spall_protocol::AdminCommand,
+) -> spall_protocol::AdminStatus {
+    match command {
+        spall_protocol::AdminCommand::SetWeather { kind, intensity } => {
+            set_weather_admin(sim, enabled, request_id, kind, intensity)
+        }
+        spall_protocol::AdminCommand::SetSeason { season } => {
+            set_season_admin(sim, enabled, request_id, season)
+        }
+        _ => admin_refused(request_id, "not a weather command"),
+    }
+}
+
+/// A refused `AdminStatus`.
+pub(super) fn admin_refused(request_id: RequestId, message: &str) -> spall_protocol::AdminStatus {
+    spall_protocol::AdminStatus {
+        request_id,
+        accepted: false,
+        message: message.into(),
+    }
+}
+
+/// `SetSeason`: re-anchors the shared vegetation and weather clock.
+fn set_season_admin(
+    sim: &mut Simulation,
+    enabled: bool,
+    request_id: RequestId,
+    season: u8,
+) -> spall_protocol::AdminStatus {
+    let (accepted, message) = if !enabled {
+        (
+            false,
+            "admin commands are disabled on this server".to_string(),
+        )
+    } else {
+        match sim.set_season(season) {
+            Ok(()) => (
+                true,
+                format!(
+                    "season {}",
+                    ["spring", "summer", "autumn", "winter"][usize::from(season)]
+                ),
+            ),
+            Err(e) => (false, e),
+        }
+    };
+    spall_protocol::AdminStatus {
+        request_id,
+        accepted,
+        message,
     }
 }
 
@@ -303,6 +369,7 @@ mod tests {
             false,
             RequestId(1),
             Some(spall_protocol::WeatherKind::Snow),
+            None,
         );
         assert!(!disabled.accepted);
         assert_eq!(sim.weather_state(), &initial);
@@ -311,9 +378,10 @@ mod tests {
             true,
             RequestId(2),
             Some(spall_protocol::WeatherKind::Snow),
+            Some(spall_protocol::SnowTier::Heavy),
         );
         assert!(forced.accepted);
-        assert!(forced.message.contains("precipitation q16 19661"));
+        assert!(forced.message.contains("precipitation q16 55705"));
         assert_eq!(sim.weather_state().kind, spall_protocol::WeatherKind::Snow);
         assert_eq!(
             sim.weather_state().override_kind,
@@ -321,7 +389,20 @@ mod tests {
         );
         sim.tick().unwrap();
         assert_eq!(sim.weather_state().kind, spall_protocol::WeatherKind::Snow);
-        let automatic = set_weather_admin(&mut sim, true, RequestId(3), None);
+        assert_eq!(
+            sim.weather_state().precipitation_q16,
+            55_705,
+            "tier survives ticks"
+        );
+        let refused = set_weather_admin(
+            &mut sim,
+            true,
+            RequestId(9),
+            Some(spall_protocol::WeatherKind::Rain),
+            Some(spall_protocol::SnowTier::Light),
+        );
+        assert!(!refused.accepted);
+        let automatic = set_weather_admin(&mut sim, true, RequestId(3), None, None);
         assert!(automatic.accepted);
         assert_eq!(sim.weather_state().override_kind, None);
         assert_eq!(

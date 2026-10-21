@@ -67,7 +67,7 @@ pub use upload::{GpuMesh, MeshUploader, UploadBudget};
 pub use vertex::{GpuVertex, to_gpu};
 pub use viewport::{MeshChunk, ViewportFrame, ViewportRenderer};
 pub use water::{NO_WATER, WaterField};
-pub use weather::{WeatherLighting, WeatherParticle, WeatherRenderError};
+pub use weather::{MAX_WEATHER_PARTICLES, WeatherLighting, WeatherParticle, WeatherRenderError};
 
 /// Milliseconds on a process-wide clock started at the first call, for lining
 /// up the diagnostic traces (`SPALL_FRAME_TRACE`, `SPALL_SWEEP_TRACE`).

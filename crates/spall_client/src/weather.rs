@@ -9,9 +9,20 @@ use spall_render::{Camera, WeatherLighting, WeatherParticle};
 use spall_voxel::{Sample, Volume};
 
 /// Hard cap keeps effect cost independent of world size and weather intensity.
-pub const MAX_WEATHER_PARTICLES: usize = 1_536;
+pub const MAX_WEATHER_PARTICLES: usize = spall_render::MAX_WEATHER_PARTICLES;
+/// Particles per unit of precipitation (0..1). Heavy snow (0.85) is about 7k and the
+/// blizzard (0.95) 1.5x that; rain keeps its older, sparser streaks.
+const RAIN_PER_PRECIP: f32 = 1_920.0;
+const SNOW_PER_PRECIP: f32 = 8_200.0;
+const BLIZZARD_PER_PRECIP: f32 = 11_050.0;
+/// Snow falls in a tight 24 m box around the camera; rain keeps the wide one.
+const SNOW_HALF_BOX_M: f32 = 12.0;
+const RAIN_HALF_BOX_M: f32 = 20.0;
 const GRID_SIDE: usize = 5;
 const GRID_RADIUS_M: f32 = 20.0;
+/// Blizzard fog ends this far from the camera at full whiteout.
+const WHITEOUT_FOG_END_M: f32 = 22.0;
+const WHITEOUT_VISIBILITY: f32 = 0.15;
 const SKY_SCAN_M: f32 = 8.0;
 
 /// Borrowed output for this frame. `exposure` is also the shelter signal audio
@@ -30,6 +41,8 @@ pub struct WeatherPresentation {
     last_camera: Option<Vec3>,
     last_epoch: Option<u64>,
     phase_seconds: f64,
+    /// Integrated wind drift of the flake lattice, metres (x, z).
+    drift: [f64; 2],
     exposure_cache_key: Option<(i64, i64, i64, u64)>,
     exposure_grid: [bool; GRID_SIDE * GRID_SIDE],
     precipitation: f32,
@@ -46,6 +59,7 @@ impl Default for WeatherPresentation {
             last_camera: None,
             last_epoch: None,
             phase_seconds: 0.0,
+            drift: [0.0; 2],
             exposure_cache_key: None,
             exposure_grid: [false; GRID_SIDE * GRID_SIDE],
             precipitation: 0.0,
@@ -82,6 +96,7 @@ impl WeatherPresentation {
         self.last_camera = None;
         self.last_epoch = None;
         self.phase_seconds = 0.0;
+        self.drift = [0.0; 2];
         self.exposure_cache_key = None;
         self.exposure_grid = [false; GRID_SIDE * GRID_SIDE];
         self.precipitation = 0.0;
@@ -110,6 +125,7 @@ impl WeatherPresentation {
         if teleported || epoch_changed {
             self.particles.clear();
             self.phase_seconds = 0.0;
+            self.drift = [0.0; 2];
         }
         self.last_camera = Some(position);
         self.last_epoch = Some(state.world_epoch);
@@ -176,9 +192,14 @@ impl WeatherPresentation {
         let snow = matches!(state.kind, WeatherKind::Snow | WeatherKind::Blizzard);
         let blizzard = state.kind == WeatherKind::Blizzard;
         let storm = state.kind == WeatherKind::Storm;
+        let pulse = gust_pulse(self.phase_seconds);
         let desired = if self.precipitation > 0.005 {
-            let scale = if snow { 1.0 } else { 1.25 };
-            (self.precipitation * MAX_WEATHER_PARTICLES as f32 * scale).ceil() as usize
+            let per_precip = match state.kind {
+                WeatherKind::Blizzard => BLIZZARD_PER_PRECIP,
+                WeatherKind::Snow => SNOW_PER_PRECIP,
+                _ => RAIN_PER_PRECIP,
+            };
+            (self.precipitation * per_precip).ceil() as usize
         } else if state.kind == WeatherKind::HighWind && self.wind > 0.08 {
             (self.wind * 180.0).ceil() as usize
         } else {
@@ -192,62 +213,98 @@ impl WeatherPresentation {
         )
         .normalize_or_zero();
         let is_wind_cue = state.kind == WeatherKind::HighWind && self.precipitation <= 0.005;
-        let velocity = precipitation_velocity(state.kind, self.wind, wind_direction);
+        // Blizzard gusts pulse the driving speed (and the visibility below).
+        let gust = if blizzard {
+            self.wind * (0.4 + 0.6 * pulse)
+        } else {
+            self.wind
+        };
+        let velocity = precipitation_velocity(state.kind, gust, wind_direction);
+        let dt = f64::from(dt_seconds.clamp(0.0, 0.1));
+        self.drift[0] += f64::from(velocity.x) * dt;
+        self.drift[1] += f64::from(velocity.z) * dt;
         let fall_speed = -velocity.y;
+        let half = if snow {
+            SNOW_HALF_BOX_M
+        } else {
+            RAIN_HALF_BOX_M
+        };
+        let span = f64::from(half * 2.0);
+        // Vertical window of the falling column: snow stays dense around the camera.
+        let (fall_height, below) = if snow { (12.0f32, 2.5f32) } else { (24.0, 4.0) };
+        let direction = velocity.normalize_or_zero().to_array();
+        let cam = [
+            f64::from(position.x),
+            f64::from(position.y),
+            f64::from(position.z),
+        ];
         self.particles.clear();
         self.particles
             .reserve(desired.saturating_sub(self.particles.capacity()));
         for index in 0..desired {
             let h = hash(state.weather_seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let phase = unit(h) * 64.0;
-            let y = if fall_speed > 0.0 {
-                position.y + 20.0
-                    - (self.phase_seconds * f64::from(fall_speed) + f64::from(phase))
-                        .rem_euclid(24.0) as f32
+            let h2 = hash(h);
+            let h3 = hash(h2);
+            // Flakes live on a world-anchored periodic lattice wrapped around the camera,
+            // so walking through them looks like walking, not like carrying a snow globe.
+            let mut wx = f64::from(field(h, 0)) * span + self.drift[0];
+            let mut wz = f64::from(field(h, 16)) * span + self.drift[1];
+            let (speed, size) = if snow && !blizzard {
+                // 1.0-1.5 m/s fall, 8-12 cm flakes, a gentle sway.
+                let speed = 1.0 + 0.5 * field(h, 48);
+                let t = self.phase_seconds;
+                let amp = f64::from(0.15 + 0.2 * field(h2, 0));
+                let w = f64::from(0.7 + 0.9 * field(h2, 16));
+                wx += amp * (t * w + f64::from(field(h2, 32)) * std::f64::consts::TAU).sin();
+                wz += amp * (t * w * 0.8 + f64::from(field(h2, 48)) * std::f64::consts::TAU).cos();
+                (speed, 0.08 + 0.04 * field(h3, 0))
             } else {
-                position.y + (unit(hash(h ^ 0x0F0F)) * 16.0 - 8.0)
+                (fall_speed, 0.0)
             };
-            let side_x = (unit(hash(h ^ 0xA5A5)) * 40.0 - 20.0
-                + (self.phase_seconds * f64::from(velocity.x)).rem_euclid(40.0) as f32)
-                .rem_euclid(40.0)
-                - 20.0;
-            let side_z = (unit(hash(h ^ 0x5A5A)) * 40.0 - 20.0
-                + (self.phase_seconds * f64::from(velocity.z)).rem_euclid(40.0) as f32)
-                .rem_euclid(40.0)
-                - 20.0;
+            let side_x = (wx - cam[0]).rem_euclid(span) as f32 - half;
+            let side_z = (wz - cam[2]).rem_euclid(span) as f32 - half;
+            let y = if fall_speed > 0.0 {
+                let column =
+                    f64::from(field(h, 32) * fall_height) - self.phase_seconds * f64::from(speed);
+                position.y + (column - cam[1]).rem_euclid(f64::from(fall_height)) as f32 - below
+            } else {
+                position.y + (field(h, 32) * 16.0 - 8.0)
+            };
             let xz = Vec3::new(position.x + side_x, 0.0, position.z + side_z);
             if !grid_open_at(position, xz, &exposed_grid) {
                 continue;
             }
             let centre = Vec3::new(position.x + side_x, y, position.z + side_z);
+            // Flakes right at the lens would fill the screen: fade them out inside ~2 m.
+            let near = if snow {
+                let d = centre.distance(position);
+                ((d - 0.6) / 1.6).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
             let colour = if is_wind_cue {
                 [0.72, 0.78, 0.81, 0.24]
+            } else if blizzard {
+                [0.92, 0.96, 1.0, 0.7 * near]
             } else if snow {
-                [0.88, 0.94, 1.0, if blizzard { 0.78 } else { 0.64 }]
+                [0.92, 0.96, 1.0, 0.85 * near]
             } else {
                 [0.58, 0.72, 0.9, if storm { 0.64 } else { 0.48 }]
             };
+            let (length_m, width_m) = if is_wind_cue {
+                (0.8, 0.07)
+            } else if blizzard {
+                (0.2 + velocity.x.hypot(velocity.z) * 0.02, 0.04)
+            } else if snow {
+                (size, size)
+            } else {
+                (0.9 + self.wind * 0.45, 0.018)
+            };
             self.particles.push(WeatherParticle {
                 centre: centre.to_array(),
-                direction: velocity.normalize_or_zero().to_array(),
-                length_m: if is_wind_cue {
-                    0.8
-                } else if blizzard {
-                    0.18 + self.wind * 0.08
-                } else if snow {
-                    0.08
-                } else {
-                    0.9 + self.wind * 0.45
-                },
-                width_m: if is_wind_cue {
-                    0.07
-                } else if blizzard {
-                    0.035
-                } else if snow {
-                    0.07
-                } else {
-                    0.018
-                },
+                direction,
+                length_m,
+                width_m,
                 colour_rgba: colour,
             });
         }
@@ -263,11 +320,7 @@ impl WeatherPresentation {
             exposure,
             precipitation: self.precipitation,
             wind: self.wind,
-            visibility: if blizzard {
-                1.0 - self.precipitation * 0.78 * exposure
-            } else {
-                1.0
-            },
+            visibility: snow_visibility(blizzard, self.precipitation, pulse, exposure),
             storm_dimming: if storm {
                 self.precipitation * 0.22 * exposure
             } else {
@@ -283,9 +336,8 @@ impl WeatherPresentation {
 }
 
 /// World-space velocity shared by particle drift and the visible ribbon axis.
-/// Normal precipitation remains distinctly downward; blizzards carry a
-/// stronger crosswind while retaining a fall component, and wind-only cues
-/// stay horizontal.
+/// Normal precipitation remains distinctly downward; blizzards are driven
+/// nearly flat along the wind, and wind-only cues stay horizontal.
 fn precipitation_velocity(kind: WeatherKind, gust: f32, wind: Vec3) -> Vec3 {
     let gust = gust.clamp(0.0, 1.0);
     if kind == WeatherKind::HighWind {
@@ -294,11 +346,44 @@ fn precipitation_velocity(kind: WeatherKind, gust: f32, wind: Vec3) -> Vec3 {
     let (fall, drift) = match kind {
         WeatherKind::Rain => (13.0, gust * 1.8),
         WeatherKind::Storm => (13.0, gust * 2.8),
-        WeatherKind::Snow => (2.5, gust * 0.45),
-        WeatherKind::Blizzard => (2.5, gust * 2.2),
+        WeatherKind::Snow => (1.25, 0.25 + gust * 0.5),
+        // Driving snow: 8-14 m/s along the wind with only a slow fall.
+        WeatherKind::Blizzard => (1.0, 8.0 + gust * 6.0),
         WeatherKind::Clear | WeatherKind::HighWind => (0.0, 0.0),
     };
     Vec3::new(wind.x * drift, -fall, wind.z * drift)
+}
+
+/// 0..1 slow irregular pulse standing in for gusts; same value drives speed and visibility.
+fn gust_pulse(t: f64) -> f32 {
+    (0.5 + 0.5 * (t * 0.9 + 1.4 * (t * 0.37).sin()).sin()) as f32
+}
+
+/// Camera visibility: heavy snow thins the air somewhat, a blizzard pulses between about
+/// 0.30 and `WHITEOUT_VISIBILITY` with the gusts. Sheltered cameras see clear air.
+fn snow_visibility(blizzard: bool, precipitation: f32, pulse: f32, exposure: f32) -> f32 {
+    let loss = if blizzard {
+        let severity = (precipitation / 0.95).clamp(0.0, 1.0);
+        (1.0 - WHITEOUT_VISIBILITY) * severity * (0.82 + 0.18 * pulse)
+    } else {
+        // Light and medium (0.5) snow stay clear; heavy (0.85) loses 0.3.
+        0.3 * ((precipitation - 0.5) / 0.35).clamp(0.0, 1.0)
+    };
+    1.0 - loss * exposure
+}
+
+/// Distance fog for the current visibility: `(start_m, end_m, whiteout)`. Clear air keeps
+/// the normal range; thinning visibility pulls the end in geometrically toward
+/// [`WHITEOUT_FOG_END_M`], starts the fade almost at the camera and whitens the colour.
+pub fn weather_fog(visibility: f32, normal_start_m: f32, normal_end_m: f32) -> (f32, f32, f32) {
+    let t = ((1.0 - visibility) / (1.0 - WHITEOUT_VISIBILITY)).clamp(0.0, 1.0);
+    if t <= 0.0 || normal_end_m <= WHITEOUT_FOG_END_M {
+        return (normal_start_m, normal_end_m, 0.0);
+    }
+    let end = normal_end_m * (WHITEOUT_FOG_END_M / normal_end_m).powf(t);
+    let ratio = normal_start_m / normal_end_m;
+    let start = end * (ratio + (0.05 - ratio) * t);
+    (start, end, t)
 }
 
 fn sky_exposure_grid(camera: Vec3, volume: &Volume) -> [bool; GRID_SIDE * GRID_SIDE] {
@@ -356,8 +441,9 @@ fn hash(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn unit(value: u64) -> f32 {
-    (value >> 40) as f32 / ((1u32 << 24) - 1) as f32
+/// A 16-bit field of a hash as 0..1.
+fn field(value: u64, shift: u32) -> f32 {
+    ((value >> shift) & 0xFFFF) as f32 / 65_535.0
 }
 
 #[cfg(test)]
@@ -550,7 +636,7 @@ mod tests {
         let cardinal = Vec3::X;
         let diagonal = Vec3::new(1.0, 0.0, 1.0).normalize();
         let rain = precipitation_velocity(WeatherKind::Rain, 0.9, cardinal);
-        let snow = precipitation_velocity(WeatherKind::Snow, 0.9, diagonal);
+        let snow = precipitation_velocity(WeatherKind::Snow, 0.2, diagonal);
         let blizzard = precipitation_velocity(WeatherKind::Blizzard, 0.9, diagonal);
         let slope = |velocity: Vec3| velocity.x.hypot(velocity.z) / -velocity.y;
 
@@ -565,18 +651,68 @@ mod tests {
         );
         assert!(snow.y < 0.0 && snow.x > 0.0 && snow.z > 0.0);
         assert!(
-            snow.y / snow.length() < -0.98,
+            snow.y / snow.length() < -0.9,
             "normal snow stays downward: {snow:?}"
         );
-        assert!(slope(blizzard) > slope(snow));
         assert!(
-            slope(blizzard) < 0.8,
-            "blizzard still falls, not flat: {blizzard:?}"
+            slope(blizzard) > 5.0,
+            "blizzard is driven near-flat: {blizzard:?}"
         );
+        let speed = blizzard.x.hypot(blizzard.z);
+        assert!((8.0..=14.0).contains(&speed), "driving speed {speed}");
 
         let wind_only = precipitation_velocity(WeatherKind::HighWind, 0.9, diagonal);
         assert_eq!(wind_only.y, 0.0);
         assert!(wind_only.x > 0.0 && wind_only.z > 0.0);
+    }
+
+    fn count(kind: WeatherKind, precipitation: u16, wind: u16) -> usize {
+        let v = known_air();
+        let mut p = WeatherPresentation::new();
+        let mut s = state(kind, precipitation);
+        s.gust_q16 = wind;
+        // Let the smoothed precipitation settle.
+        for _ in 0..120 {
+            p.update(&s, &camera(), 1.0 / 60.0, &v);
+        }
+        p.update(&s, &camera(), 1.0 / 60.0, &v).particles.len()
+    }
+
+    #[test]
+    fn particle_count_scales_with_snow_tier_and_stays_under_the_cap() {
+        use spall_protocol::SnowTier;
+        let [light, medium, heavy] =
+            SnowTier::ALL.map(|t| count(WeatherKind::Snow, t.precipitation_q16(), 13_107));
+        assert!(light < medium && medium < heavy, "{light} {medium} {heavy}");
+        let blizzard = count(WeatherKind::Blizzard, 62_259, 55_000);
+        assert!(
+            blizzard > heavy * 13 / 10,
+            "blizzard {blizzard} vs heavy {heavy}"
+        );
+        assert!(blizzard <= MAX_WEATHER_PARTICLES);
+        let saturated = count(WeatherKind::Blizzard, u16::MAX, 55_000);
+        assert!(saturated <= MAX_WEATHER_PARTICLES);
+    }
+
+    #[test]
+    fn blizzard_whiteout_pulses_with_gusts_and_heavy_snow_only_thins_the_air() {
+        let calm = snow_visibility(true, 0.95, 0.0, 1.0);
+        let gust = snow_visibility(true, 0.95, 1.0, 1.0);
+        assert!(gust < calm && gust <= WHITEOUT_VISIBILITY + 0.01 && calm < 0.35);
+        assert_eq!(
+            snow_visibility(true, 0.95, 1.0, 0.0),
+            1.0,
+            "sheltered is clear"
+        );
+        assert_eq!(snow_visibility(false, 0.5, 0.5, 1.0), 1.0);
+        let heavy = snow_visibility(false, 0.85, 0.5, 1.0);
+        assert!((0.6..0.8).contains(&heavy), "{heavy}");
+        let (start, end, white) = weather_fog(gust, 120.0, 190.0);
+        assert!(
+            end < 30.0 && start < 3.0 && white > 0.95,
+            "{start} {end} {white}"
+        );
+        assert_eq!(weather_fog(1.0, 120.0, 190.0), (120.0, 190.0, 0.0));
     }
 
     #[test]

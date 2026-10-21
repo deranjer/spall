@@ -128,10 +128,11 @@ Nature and weather playtest: `cargo xtask play --release --worldgen natural
 to spawn that many deer and half as many crows (server-authoritative; they walk or fly
 under kinematic movement, and `--save` with animals is refused; trout are not
 spawned yet). **F10** selects
-automatic or forced weather, previews nature sounds, adjusts nature/weather
+automatic or forced weather (snow in light, medium or heavy tiers, and a blizzard whiteout),
+switches the season (Spring to Winter), previews nature sounds, adjusts nature/weather
 volume and mute, and toggles visual effects/reduced lightning. Scroll the menu
-for the remaining controls. Weather choices are server-authorized; changing a
-weather profile does not change the ecological season. Thin ground snow and
+for the remaining controls. Weather and season choices are server-authorized; a
+weather profile does not change the season, a season button does. Thin ground snow and
 footprints remain planned work. See [weather plan](docs/weather.md) and
 [combined test evidence](docs/reports/ENG-198-integrated-weather-playtest.md).
 

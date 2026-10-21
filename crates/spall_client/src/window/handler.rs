@@ -772,7 +772,7 @@ impl ApplicationHandler for InteractiveApp {
                                 .map(|state| {
                                     format!(
                                         "Weather: {} ({}) | {} | {:.1} C",
-                                        weather_label(state.kind),
+                                        weather_state_label(state),
                                         if state.override_kind.is_some() {
                                             "forced"
                                         } else {
@@ -898,10 +898,15 @@ impl ApplicationHandler for InteractiveApp {
                     self.session
                         .push_admin(spall_protocol::AdminCommand::SetDamGate { open });
                 }
-                if let Some(kind) = menu_actions.set_weather {
+                if let Some((kind, intensity)) = menu_actions.set_weather {
                     self.admin_request_pending = true;
                     self.session
-                        .push_admin(spall_protocol::AdminCommand::SetWeather { kind });
+                        .push_admin(spall_protocol::AdminCommand::SetWeather { kind, intensity });
+                }
+                if let Some(season) = menu_actions.set_season {
+                    self.admin_request_pending = true;
+                    self.session
+                        .push_admin(spall_protocol::AdminCommand::SetSeason { season });
                 }
                 if menu_actions.toggle_nature_audio {
                     self.nature_muted = !self.nature_muted;

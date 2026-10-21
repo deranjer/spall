@@ -47,7 +47,7 @@ fn profile(sim: &mut Simulation, kind: WeatherKind, season: u8) {
     let mut weather = sim.weather_state().clone();
     weather.start_season = season;
     sim.restore_weather(weather).unwrap();
-    sim.set_weather_override(Some(kind));
+    sim.set_weather_override(Some(kind), None);
 }
 
 fn journal_tick(sim: &mut Simulation, through: &mut u64) -> Vec<JournalRecord> {
@@ -190,7 +190,7 @@ fn checkpoint_and_geometry_journal_preserve_q32_snow_but_clear_temporary_tracks(
         // A final accepted preset command proves this exact durable boundary;
         // ticks without journal records are not durable suffix time by themselves.
         if tick == 600 {
-            sim.set_weather_override(Some(WeatherKind::Snow));
+            sim.set_weather_override(Some(WeatherKind::Snow), None);
         }
         sim.tick().unwrap();
         let batch = journal_tick(&mut sim, &mut through);

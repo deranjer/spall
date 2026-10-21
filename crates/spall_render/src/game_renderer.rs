@@ -566,6 +566,11 @@ impl GameRenderer {
         self.pipeline.set_fog_range(start_m, end_m);
     }
 
+    /// Whitens the distance fog (`0..=1`); see [`ScenePipeline::set_fog_whiteout`].
+    pub fn set_fog_whiteout(&self, amount: f32) {
+        self.pipeline.set_fog_whiteout(amount);
+    }
+
     pub fn set_terrain_meshes_visible(&mut self, visible: bool) {
         self.terrain_meshes_visible = visible;
     }
@@ -781,7 +786,7 @@ impl GameRenderer {
             exposure: finite_unit(lighting.exposure),
             precipitation: finite_unit(lighting.precipitation),
             wind: finite_unit(lighting.wind),
-            visibility: finite_unit(lighting.visibility).max(0.22),
+            visibility: finite_unit(lighting.visibility).max(0.1),
             storm_dimming: finite_unit(lighting.storm_dimming).min(0.22),
             lightning_flash: finite_unit(lighting.lightning_flash).min(0.08),
         };

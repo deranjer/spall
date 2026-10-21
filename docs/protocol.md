@@ -308,7 +308,7 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 15): one wire version for the handshake and every record, bumped on
+`PROTOCOL_VERSION` (currently 16): one wire version for the handshake and every record, bumped on
 any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 7, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.

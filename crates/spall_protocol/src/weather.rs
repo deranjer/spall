@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub const WEATHER_MAX_CLOCK_MS: u64 = 100_000_000_000_000;
 pub const WEATHER_TRANSITION_MS: u64 = 300_000;
 pub const WEATHER_PROFILE_MS: u64 = 1_800_000;
+/// Blizzard precipitation, 0.95 as Q0.16.
+pub const BLIZZARD_PRECIPITATION_Q16: u16 = 62_259;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -15,6 +17,39 @@ pub enum WeatherKind {
     Snow = 3,
     HighWind = 4,
     Blizzard = 5,
+}
+/// How hard it snows: light, medium and heavy are the same `Snow` kind at
+/// different `precipitation_q16`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnowTier {
+    Light,
+    Medium,
+    Heavy,
+}
+impl SnowTier {
+    pub const ALL: [SnowTier; 3] = [SnowTier::Light, SnowTier::Medium, SnowTier::Heavy];
+    /// Precipitation as Q0.16: 0.25, 0.5 and 0.85.
+    pub fn precipitation_q16(self) -> u16 {
+        match self {
+            SnowTier::Light => 16_384,
+            SnowTier::Medium => 32_768,
+            SnowTier::Heavy => 55_705,
+        }
+    }
+    /// The tier whose precipitation is nearest `q16`.
+    pub fn from_precipitation(q16: u16) -> Self {
+        Self::ALL
+            .into_iter()
+            .min_by_key(|t| t.precipitation_q16().abs_diff(q16))
+            .unwrap_or(SnowTier::Medium)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            SnowTier::Light => "light",
+            SnowTier::Medium => "medium",
+            SnowTier::Heavy => "heavy",
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -86,10 +121,13 @@ impl WeatherState {
             0..=29 => (WeatherKind::Clear, 0, 6554, 0),
             30..=59 => (WeatherKind::Rain, 26214, 9830, 1),
             60..=69 => (WeatherKind::Storm, 58982, 39321, 1),
-            70..=84 if seasonal_c <= 2 => (WeatherKind::Snow, 19661, 13107, -1),
+            70..=84 if seasonal_c <= 2 => {
+                let tier = SnowTier::ALL[(mix(seed ^ bucket.rotate_left(29)) % 3) as usize];
+                (WeatherKind::Snow, tier.precipitation_q16(), 13107, -1)
+            }
             70..=84 => (WeatherKind::Rain, 19661, 13107, 0),
             85..=92 => (WeatherKind::HighWind, 0, 42000, 0),
-            _ if seasonal_c <= 2 => (WeatherKind::Blizzard, 52429, 55000, -1),
+            _ if seasonal_c <= 2 => (WeatherKind::Blizzard, BLIZZARD_PRECIPITATION_Q16, 55000, -1),
             _ => (WeatherKind::Storm, 39321, 32768, 1),
         };
         let dirs: [(i16, i16); 8] = [
@@ -140,7 +178,8 @@ impl WeatherState {
         }
     }
     /// Apply an authoritative preset with normalized presentation values.
-    pub fn force_kind(&mut self, kind: Option<WeatherKind>) {
+    /// `snow_tier` picks the precipitation of a forced `Snow` (default medium).
+    pub fn force_kind(&mut self, kind: Option<WeatherKind>, snow_tier: Option<SnowTier>) {
         let previous_kind = self.override_kind;
         let previous_lightning_id = self.lightning_id;
         let previous_lightning_tick = self.lightning_tick;
@@ -152,9 +191,13 @@ impl WeatherState {
                 WeatherKind::Clear => (0, 6554, 0),
                 WeatherKind::Rain => (26214, 9830, 1),
                 WeatherKind::Storm => (58982, 39321, 1),
-                WeatherKind::Snow => (19661, 13107, -1),
+                WeatherKind::Snow => (
+                    snow_tier.unwrap_or(SnowTier::Medium).precipitation_q16(),
+                    13107,
+                    -1,
+                ),
                 WeatherKind::HighWind => (0, 42000, 0),
-                WeatherKind::Blizzard => (52429, 55000, -1),
+                WeatherKind::Blizzard => (BLIZZARD_PRECIPITATION_Q16, 55000, -1),
             };
             self.precipitation_q16 = precip;
             self.gust_q16 = gust;
@@ -298,6 +341,49 @@ mod tests {
     }
 
     #[test]
+    fn snow_tiers_are_ordered_forced_and_rolled() {
+        let q: Vec<u16> = SnowTier::ALL.map(SnowTier::precipitation_q16).to_vec();
+        assert_eq!(q, [16_384, 32_768, 55_705]);
+        for t in SnowTier::ALL {
+            assert_eq!(SnowTier::from_precipitation(t.precipitation_q16()), t);
+        }
+        let clock = WeatherClock {
+            time_ms: 0,
+            source: WeatherClockSource::ServerFallback,
+            start_season: 3,
+            season_ms: 900_000,
+        };
+        let mut state = WeatherState::initial(1, 1, clock);
+        for t in SnowTier::ALL {
+            state.force_kind(Some(WeatherKind::Snow), Some(t));
+            assert_eq!(state.precipitation_q16, t.precipitation_q16());
+            state.validate().unwrap();
+        }
+        // Automatic rolls in winter reach every tier, and Blizzard is stronger than heavy snow.
+        let mut seen = [false; 3];
+        for bucket in 0..2_000u64 {
+            let c = WeatherClock {
+                time_ms: bucket * WEATHER_PROFILE_MS % (3 * 900_000 * 4),
+                ..clock
+            };
+            let s = WeatherState::for_clock(bucket, 1, 0, c, 0);
+            if s.kind == WeatherKind::Snow {
+                seen[SnowTier::ALL
+                    .iter()
+                    .position(|t| *t == SnowTier::from_precipitation(s.precipitation_q16))
+                    .unwrap()] = true;
+                assert!(
+                    SnowTier::ALL
+                        .iter()
+                        .any(|t| t.precipitation_q16() == s.precipitation_q16)
+                );
+            }
+        }
+        assert_eq!(seen, [true; 3]);
+        assert!(BLIZZARD_PRECIPITATION_Q16 > SnowTier::Heavy.precipitation_q16());
+    }
+
+    #[test]
     fn forced_weather_presets_are_normalized() {
         let clock = WeatherClock {
             time_ms: 0,
@@ -309,9 +395,12 @@ mod tests {
             WeatherState::initial(seed, 1, clock).validate().unwrap();
         }
         let mut state = WeatherState::initial(33, 1, clock);
-        state.force_kind(Some(WeatherKind::Snow));
+        state.force_kind(Some(WeatherKind::Snow), None);
         assert_eq!(state.kind, WeatherKind::Snow);
-        assert_eq!(state.precipitation_q16, 19661);
+        assert_eq!(
+            state.precipitation_q16,
+            SnowTier::Medium.precipitation_q16()
+        );
         assert_eq!(state.temperature_centi_c, 2100);
         assert_eq!(state.override_kind, Some(WeatherKind::Snow));
         state.validate().unwrap();
@@ -320,11 +409,11 @@ mod tests {
             ..clock
         };
         let mut storm = WeatherState::for_clock(44, 1, 7, storm_clock, 1);
-        storm.force_kind(Some(WeatherKind::Storm));
+        storm.force_kind(Some(WeatherKind::Storm), None);
         let id = storm.lightning_id;
         let event_tick = storm.lightning_tick;
         storm.effective_tick = 8;
-        storm.force_kind(Some(WeatherKind::Storm));
+        storm.force_kind(Some(WeatherKind::Storm), None);
         assert_eq!((storm.lightning_id, storm.lightning_tick), (id, event_tick));
     }
 

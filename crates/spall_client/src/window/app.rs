@@ -583,10 +583,16 @@ impl InteractiveApp {
                     .push_admin(spall_protocol::AdminCommand::ResetWorld);
                 6.0
             }
-            ShotStep::Weather(kind) => {
+            ShotStep::Weather(kind, intensity) => {
                 self.admin_request_pending = true;
                 self.session
-                    .push_admin(spall_protocol::AdminCommand::SetWeather { kind });
+                    .push_admin(spall_protocol::AdminCommand::SetWeather { kind, intensity });
+                3.0
+            }
+            ShotStep::Season(season) => {
+                self.admin_request_pending = true;
+                self.session
+                    .push_admin(spall_protocol::AdminCommand::SetSeason { season });
                 3.0
             }
             ShotStep::Play => {

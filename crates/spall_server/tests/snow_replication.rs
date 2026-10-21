@@ -401,6 +401,7 @@ fn two_quic_clients_share_authoritative_snow_footprints_and_reset_epoch() {
                 30,
                 AdminCommand::SetWeather {
                     kind: Some(WeatherKind::Snow),
+                    intensity: None,
                 },
             ),
             (RESET_TICK, AdminCommand::ResetWorld),

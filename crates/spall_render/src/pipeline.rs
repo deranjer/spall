@@ -219,6 +219,8 @@ pub struct ScenePipeline {
     point_lights: std::sync::Mutex<Vec<PointLight>>,
     /// Distance fog start and end (metres); `[0, 0]` is off.
     fog_range: std::sync::Mutex<[f32; 2]>,
+    /// 0..=1: how far the fog colour is pulled from the sky horizon to a bright grey-white.
+    fog_whiteout: std::sync::Mutex<f32>,
     shadow_globals_buffers: Vec<wgpu::Buffer>,
     tone_globals_buffer: wgpu::Buffer,
     shadow_texture: wgpu::Texture,
@@ -252,6 +254,12 @@ impl ScenePipeline {
     /// past `end_m` does not pop in at the edge. `end_m <= start_m` turns it off.
     pub fn set_fog_range(&self, start_m: f32, end_m: f32) {
         *self.fog_range.lock().unwrap_or_else(|e| e.into_inner()) = [start_m, end_m];
+    }
+
+    /// Pulls the fog colour toward a bright, desaturated white (`0` leaves the sky's
+    /// horizon colour): the blizzard whiteout.
+    pub fn set_fog_whiteout(&self, amount: f32) {
+        *self.fog_whiteout.lock().unwrap_or_else(|e| e.into_inner()) = amount.clamp(0.0, 1.0);
     }
 
     pub fn set_point_lights(&self, lights: &[PointLight]) {
@@ -598,6 +606,7 @@ impl ScenePipeline {
             globals_buffer,
             point_lights: std::sync::Mutex::new(Vec::new()),
             fog_range: std::sync::Mutex::new([0.0, 0.0]),
+            fog_whiteout: std::sync::Mutex::new(0.0),
             shadow_globals_buffers,
             tone_globals_buffer,
             shadow_texture,
@@ -942,7 +951,14 @@ impl ScenePipeline {
             fog_color: {
                 let [r, g, b, _] = environment.background_linear().map(|v| v as f32);
                 // What the sky shader draws at the horizon.
-                [r * 0.96, g * 0.96, b * 0.96, 0.0]
+                let horizon = [r * 0.96, g * 0.96, b * 0.96];
+                let whiteout = *self.fog_whiteout.lock().unwrap_or_else(|e| e.into_inner());
+                let luma = horizon[0] * 0.2126 + horizon[1] * 0.7152 + horizon[2] * 0.0722;
+                let [r, g, b] = horizon.map(|c| {
+                    let white = (c * 0.2 + luma * 0.8) * 1.25;
+                    c + (white - c) * whiteout
+                });
+                [r, g, b, 0.0]
             },
             fog_range: {
                 let [start, end] = *self.fog_range.lock().unwrap_or_else(|e| e.into_inner());

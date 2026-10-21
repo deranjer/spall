@@ -1024,8 +1024,9 @@ pub(super) async fn serve_async(
                             }
                         }
                     }
-                    spall_protocol::AdminCommand::SetWeather { kind } => {
-                        set_weather_admin(&mut sim, admin_commands, req.request_id, kind)
+                    command @ (spall_protocol::AdminCommand::SetWeather { .. }
+                    | spall_protocol::AdminCommand::SetSeason { .. }) => {
+                        weather_admin(&mut sim, admin_commands, req.request_id, command)
                     }
                     spall_protocol::AdminCommand::TeleportSelf { feet_mm } => {
                         let feet = feet_mm.map(|mm| mm as f64 / 1000.0);
@@ -1077,11 +1078,7 @@ pub(super) async fn serve_async(
                                 },
                             }
                         } else {
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: false,
-                                message: "this scene authored no dam gate".into(),
-                            }
+                            admin_refused(req.request_id, "this scene authored no dam gate")
                         }
                     }
                 };

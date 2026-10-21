@@ -1109,7 +1109,11 @@ mod tests {
                 season_ms: 900_000,
             },
         );
-        state.force_kind(Some(kind));
+        state.force_kind(Some(kind), None);
+        if kind == WeatherKind::Snow {
+            // The 0.3 these accumulation numbers were tuned at (medium snow is 0.5).
+            state.precipitation_q16 = 19_661;
+        }
         state.temperature_centi_c = temp;
         state
     }

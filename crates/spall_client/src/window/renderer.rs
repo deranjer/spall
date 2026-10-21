@@ -690,10 +690,14 @@ impl WorldRenderer {
         if std::env::var_os("SPALL_NO_FOG").is_some() {
             self.scene.set_fog_range(0.0, 0.0);
         } else {
-            self.scene.set_fog_range(
+            // Snow weather pulls the fog in and whitens it (last frame's visibility).
+            let (start, end, whiteout) = crate::weather::weather_fog(
+                self.scene.weather_lighting().visibility,
                 fog_radius * FOG_START_FRACTION,
                 fog_radius * FOG_END_FRACTION,
             );
+            self.scene.set_fog_range(start, end);
+            self.scene.set_fog_whiteout(whiteout);
         }
         while let Ok((id, instances)) = self.vegetation_worker.rx.try_recv() {
             if self.vegetation_job == Some(id) {
