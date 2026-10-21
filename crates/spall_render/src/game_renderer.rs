@@ -1031,6 +1031,13 @@ impl GameRenderer {
         self.timer.as_ref().and_then(|timer| timer.latest)
     }
 
+    /// Replaces the colours of the material table given to [`Self::new`] (same
+    /// length), for presentation-only changes such as the season.
+    pub fn update_materials(&self, queue: &wgpu::Queue, materials: &[Material]) {
+        self.pipeline
+            .write_materials(queue, &self.materials, materials);
+    }
+
     /// Sets the point lights the following frames are shaded with (the nearest
     /// [`crate::MAX_POINT_LIGHTS`]; see [`crate::PointLight`]).
     pub fn set_point_lights(&self, lights: &[crate::PointLight]) {

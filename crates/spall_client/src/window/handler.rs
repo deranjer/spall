@@ -59,6 +59,7 @@ impl ApplicationHandler for InteractiveApp {
             window.clone(),
             self.environment,
             &self.render_materials,
+            &self.material_kinds,
             self.uncapped,
             self.day_night_cycle,
         ) {

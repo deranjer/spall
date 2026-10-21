@@ -255,6 +255,12 @@ pub fn run_interactive_window_with_options(
         // is genuinely unknown; otherwise absent means empty.
         !net_config_streams_residency,
     )?;
+    app.material_kinds = (0..app.render_materials.len())
+        .map(|id| {
+            let name = material_names.get(&u16::try_from(id).ok()?)?;
+            crate::season_colour::Greenery::of_material(name)
+        })
+        .collect();
     app.material_names = material_names;
     app.player_tint_base = player_tint_base;
 
