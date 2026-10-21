@@ -239,23 +239,16 @@ pub(super) fn draw_endurance(view: EnduranceView) {
         yakui::Color::rgb(215, 225, 235)
     };
     yakui::align(yakui::Alignment::BOTTOM_CENTER, || {
-        yakui::pad(
-            yakui::widgets::Pad {
-                bottom: 78.0,
-                ..yakui::widgets::Pad::ZERO
-            },
-            || {
-                yakui::stack(|| {
-                    yakui::colored_box(PANEL_BG.with_alpha(0.55), yakui::Vec2::new(WIDTH, HEIGHT));
-                    yakui::align(yakui::Alignment::TOP_LEFT, || {
-                        yakui::colored_box(
-                            fill.with_alpha(0.85),
-                            yakui::Vec2::new(WIDTH * view.fraction.max(0.01), HEIGHT),
-                        );
-                    });
-                });
-            },
-        );
+        yakui::pad(yakui::widgets::Pad::all(78.0), || {
+            // Two fixed-size boxes stacked at the same corner: track, then fill.
+            yakui::stack(|| {
+                yakui::colored_box(PANEL_BG.with_alpha(0.85), yakui::Vec2::new(WIDTH, HEIGHT));
+                yakui::colored_box(
+                    fill.with_alpha(0.85),
+                    yakui::Vec2::new(WIDTH * view.fraction.max(0.01), HEIGHT),
+                );
+            });
+        });
     });
 }
 

@@ -35,6 +35,13 @@ impl InteractiveApp {
             }
             self.breathing_state = breathing;
         }
+        if self.breathing_log && self.breathing_tick.elapsed() >= Duration::from_secs(1) {
+            self.breathing_tick = Instant::now();
+            eprintln!(
+                "spall-breathing: endurance {:.2} exhausted {} speed {speed:.1} m/s",
+                state.endurance, state.exhausted
+            );
+        }
         if let Some(audio) = &self.breathing {
             audio.set_state(breathing);
         }

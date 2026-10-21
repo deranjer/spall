@@ -46,6 +46,7 @@ pub(super) struct InteractiveApp {
     pub(super) breathing_state: crate::breathing::BreathingState,
     /// `SPALL_BREATHING_LOG`: print each breathing and endurance state change.
     pub(super) breathing_log: bool,
+    pub(super) breathing_tick: Instant,
     pub(super) endurance_view: Option<EnduranceView>,
     pub(super) nature_volume: f32,
     pub(super) weather_volume: f32,
@@ -266,6 +267,7 @@ impl InteractiveApp {
             footstep_log: std::env::var_os("SPALL_FOOTSTEP_LOG").is_some(),
             breathing,
             breathing_state: crate::breathing::BreathingState::Calm,
+            breathing_tick: Instant::now(),
             breathing_log: std::env::var_os("SPALL_BREATHING_LOG").is_some(),
             endurance_view: None,
             nature_volume: 0.2,
