@@ -20,13 +20,6 @@ mod trout;
 const OUT: &str = "examples/sandbox/assets/animals";
 const CHARACTERS: &str = "examples/sandbox/assets/characters";
 const CELL_SIZE_CM: u8 = 1; // SPVX code 1 = 6.25 cm.
-const PALETTE: [[u8; 3]; 5] = [
-    [76, 129, 170],
-    [205, 179, 123],
-    [35, 38, 44],
-    [120, 91, 55],
-    [224, 220, 191],
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Voxel {
@@ -54,6 +47,7 @@ struct Key {
     scale: Option<[u16; 3]>,
     visibility: Option<u8>,
 }
+#[derive(Clone)]
 struct Track {
     part: u32,
     keys: Vec<Key>,
@@ -105,12 +99,91 @@ fn cuboid(p: &mut Part, bounds: [i32; 6], m: &'static str, t: u16) {
         }
     }
 }
+/// Material and tint for one cell, chosen by its part-local position.
+type Shade<'a> = &'a dyn Fn([i32; 3]) -> (&'static str, u16);
+
+/// Sets one cell, replacing whatever an earlier shape painted there.
+fn paint(p: &mut Part, at: [i32; 3], (material, tint): (&'static str, u16)) {
+    match p.voxels.iter_mut().find(|v| [v.x, v.y, v.z] == at) {
+        Some(v) => {
+            v.material = material;
+            v.tint = tint;
+        }
+        None => voxel(p, at[0], at[1], at[2], material, tint),
+    }
+}
+/// Fills the cells whose centres lie inside an axis-aligned ellipsoid.
+fn ellipsoid(p: &mut Part, c: [f64; 3], r: [f64; 3], shade: Shade) {
+    let lo = |i: usize| (c[i] - r[i]).floor() as i32;
+    let hi = |i: usize| (c[i] + r[i]).ceil() as i32;
+    for z in lo(2)..=hi(2) {
+        for y in lo(1)..=hi(1) {
+            for x in lo(0)..=hi(0) {
+                let d = [x, y, z]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| ((f64::from(v) - c[i]) / r[i]).powi(2))
+                    .sum::<f64>();
+                if d <= 1.0 {
+                    paint(p, [x, y, z], shade([x, y, z]));
+                }
+            }
+        }
+    }
+}
+/// Fills a round limb tapering from radius `ra` at `a` to `rb` at `b`.
+fn limb(p: &mut Part, a: [f64; 3], b: [f64; 3], ra: f64, rb: f64, shade: Shade) {
+    let r = ra.max(rb);
+    let lo = |i: usize| (a[i].min(b[i]) - r).floor() as i32;
+    let hi = |i: usize| (a[i].max(b[i]) + r).ceil() as i32;
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = ab.iter().map(|v| v * v).sum::<f64>().max(1e-9);
+    for z in lo(2)..=hi(2) {
+        for y in lo(1)..=hi(1) {
+            for x in lo(0)..=hi(0) {
+                let at = [f64::from(x), f64::from(y), f64::from(z)];
+                let t =
+                    ((0..3).map(|i| (at[i] - a[i]) * ab[i]).sum::<f64>() / len2).clamp(0.0, 1.0);
+                let d2 = (0..3)
+                    .map(|i| (at[i] - (a[i] + ab[i] * t)).powi(2))
+                    .sum::<f64>();
+                let radius = ra + (rb - ra) * t;
+                if d2 <= radius * radius {
+                    paint(p, [x, y, z], shade([x, y, z]));
+                }
+            }
+        }
+    }
+}
+/// One material and tint everywhere.
+fn flat(material: &'static str, tint: u16) -> impl Fn([i32; 3]) -> (&'static str, u16) {
+    move |_| (material, tint)
+}
 fn q(axis: usize, degrees: f64) -> [i16; 4] {
     let a = degrees.to_radians() / 2.0;
     let mut q = [0i16; 4];
     q[axis] = (a.sin() * 32767.0).round() as i16;
     q[3] = (a.cos() * 32767.0).round() as i16;
     q
+}
+/// `a` then `b` applied in the parent frame: the quaternion product `b * a`.
+fn then(a: [i16; 4], b: [i16; 4]) -> [i16; 4] {
+    let f = |q: [i16; 4]| q.map(|v| f64::from(v) / 32767.0);
+    let ([ax, ay, az, aw], [bx, by, bz, bw]) = (f(a), f(b));
+    [
+        bw * ax + bx * aw + by * az - bz * ay,
+        bw * ay - bx * az + by * aw + bz * ax,
+        bw * az + bx * ay - by * ax + bz * aw,
+        bw * aw - bx * ax - by * ay - bz * az,
+    ]
+    .map(|v| (v * 32767.0).round() as i16)
+}
+/// Rotation keys given as whole quaternions.
+fn quat_track(id: u32, keys: &[(u32, [i16; 4])]) -> Track {
+    Track {
+        part: id,
+        keys: keys.iter().map(|&(t, r)| key(t, Some(r), None)).collect(),
+    }
 }
 fn key(tick: u32, rotation: Option<[i16; 4]>, translation: Option<[i32; 3]>) -> Key {
     let mut fields = 0;
@@ -143,6 +216,17 @@ fn translate_track(id: u32, vals: &[(u32, [i32; 3])]) -> Track {
     Track {
         part: id,
         keys: vals.iter().map(|&(t, v)| key(t, None, Some(v))).collect(),
+    }
+}
+/// Rotation keys `(tick, degrees, translation)` about `axis`, each also
+/// setting the part's translation (subcells; 256 = one cell).
+fn rot_trans_track(id: u32, axis: usize, keys: &[(u32, f64, [i32; 3])]) -> Track {
+    Track {
+        part: id,
+        keys: keys
+            .iter()
+            .map(|&(t, a, v)| key(t, Some(q(axis, a)), Some(v)))
+            .collect(),
     }
 }
 fn anim(name: &'static str, duration: u32, tracks: Vec<Track>) -> Clip {
@@ -370,7 +454,7 @@ fn validate(a: &Animal, bytes: &[u8]) -> Result<(), String> {
             .find(|c| c.name == *action)
             .ok_or("missing action clip")?;
         if clip.tracks.is_empty()
-            || clip.tracks.iter().any(|t| t.keys.len() < 3)
+            || clip.tracks.iter().any(|t| t.keys.len() < 2)
             || clip
                 .tracks
                 .iter()
@@ -378,9 +462,10 @@ fn validate(a: &Animal, bytes: &[u8]) -> Result<(), String> {
         {
             return Err(format!("{} {action} clip lacks cyclic end keys", a.name));
         }
-        // Every track must actually move its part: rotation or translation changes.
+        // The clip animates exactly the expected parts, and moves at least one of
+        // them; a held pose (a bedded leg) may keep its part still.
         if clip.tracks.iter().map(|t| t.part).collect::<Vec<_>>() != *expected_parts
-            || clip.tracks.iter().any(|t| {
+            || clip.tracks.iter().all(|t| {
                 t.keys.iter().all(|k| k.rotation == t.keys[0].rotation)
                     && t.keys
                         .iter()

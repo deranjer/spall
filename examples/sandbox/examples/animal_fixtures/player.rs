@@ -18,18 +18,6 @@ const HAIR: u16 = 5;
 const EYES: u16 = 6;
 const BELT: u16 = 7;
 
-/// Rotation keys `(tick, degrees, translation)` about `axis`, each also
-/// setting the part's translation (subcells; 256 = one cell).
-fn rot_trans_track(id: u32, axis: usize, keys: &[(u32, f64, [i32; 3])]) -> Track {
-    Track {
-        part: id,
-        keys: keys
-            .iter()
-            .map(|&(t, a, v)| key(t, Some(q(axis, a)), Some(v)))
-            .collect(),
-    }
-}
-
 /// A 28-cell (1.75 m) humanoid facing +X with +Y up and +Z to its left,
 /// matching the 1.8 m player capsule. The pelvis is the root; its pivot is
 /// the hip joint, 13 cells above the shoe soles. Limbs hinge about Z, where a

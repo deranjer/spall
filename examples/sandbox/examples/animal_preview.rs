@@ -43,12 +43,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
         Specimen {
             name: "crow",
-            clips: &["idle", "flap"],
+            clips: &["idle", "flap", "hop", "peck", "land", "takeoff"],
             bytes: include_bytes!("../assets/animals/crow.spvox"),
         },
         Specimen {
             name: "deer",
-            clips: &["idle", "walk"],
+            clips: &["idle", "walk", "run", "graze", "alert", "sleep"],
             bytes: include_bytes!("../assets/animals/deer.spvox"),
         },
         Specimen {
