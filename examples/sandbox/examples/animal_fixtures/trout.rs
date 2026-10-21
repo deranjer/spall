@@ -17,7 +17,7 @@ const BELLY: u16 = 4;
 const SPOT: u16 = 5;
 const FIN: u16 = 6;
 
-/// A rainbow trout about 0.65 m long, facing +X: a spindle body with a pink
+/// A rainbow trout about 0.85 m long, facing +X: a spindle body with a pink
 /// lateral band and a spotted back, and a hinged tail that yaws about Y.
 pub(super) fn trout() -> Animal {
     let skin = |[x, y, z]: [i32; 3]| {
@@ -35,7 +35,7 @@ pub(super) fn trout() -> Animal {
         ("stone", tint)
     };
     let mut body = part(1, 0, "body", [0, 0, 0]);
-    ellipsoid(&mut body, [0.5, 0.0, 0.0], [4.0, 1.8, 1.3], &skin);
+    ellipsoid(&mut body, [0.5, 0.0, 0.0], [4.6, 2.4, 1.8], &skin);
     limb(
         &mut body,
         [-2.0, 0.0, 0.0],
@@ -126,6 +126,6 @@ pub(super) fn trout() -> Animal {
         ],
         parts: vec![body, tail, dorsal, near, far],
         clips: vec![idle, swim],
-        extent: [-8, 4, -3, 3, -2, 2],
+        extent: [-8, 5, -3, 3, -2, 2],
     }
 }

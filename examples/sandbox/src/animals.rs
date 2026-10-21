@@ -45,14 +45,14 @@ struct SpeciesDef {
     capsule_m: (f32, f32),
 }
 
-const SPECIES: [SpeciesDef; 3] = [
+const SPECIES: [SpeciesDef; 5] = [
     SpeciesDef {
         key: "deer",
         habitat: AnimalHabitat::Land,
         bytes: include_bytes!("../assets/animals/deer.spvox"),
         move_clip: "walk",
         walk_speed_m_s: 1.4,
-        capsule_m: (0.28, 0.25),
+        capsule_m: (0.35, 0.35),
     },
     SpeciesDef {
         key: "crow",
@@ -69,6 +69,22 @@ const SPECIES: [SpeciesDef; 3] = [
         move_clip: "swim",
         walk_speed_m_s: 0.0,
         capsule_m: (0.0, 0.0),
+    },
+    SpeciesDef {
+        key: "bear",
+        habitat: AnimalHabitat::Land,
+        bytes: include_bytes!("../assets/animals/bear.spvox"),
+        move_clip: "walk",
+        walk_speed_m_s: 1.2,
+        capsule_m: (0.45, 0.1),
+    },
+    SpeciesDef {
+        key: "snow_leopard",
+        habitat: AnimalHabitat::Land,
+        bytes: include_bytes!("../assets/animals/leopard.spvox"),
+        move_clip: "walk",
+        walk_speed_m_s: 1.1,
+        capsule_m: (0.28, 0.1),
     },
 ];
 const CELL_M: f32 = 0.0625;
@@ -694,11 +710,15 @@ impl CreatureDirector for AnimalDirector {
     fn motion(&mut self, tick: u64, sim: &Simulation) -> Vec<CreatureAction> {
         self.last_tick = tick;
         if tick.is_multiple_of(1200) {
-            tracing::info!(
-                deer = ?self.stats[0],
-                crow = ?self.stats[1],
-                "animal moves (applied, stuck or blocked) per species"
-            );
+            for (species, stats) in self.species.iter().zip(&self.stats) {
+                if stats.0 + stats.1 > 0 {
+                    tracing::info!(
+                        species = species.key,
+                        moves = ?stats,
+                        "animal moves (applied, stuck or blocked)"
+                    );
+                }
+            }
         }
         let wrap = |angle: f64| {
             (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI

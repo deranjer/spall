@@ -2,7 +2,7 @@
 
 use spall_asset::{Asset, LoopMode, decode, sample_clip};
 
-fn animals() -> [(Asset, &'static str, &'static str); 3] {
+fn animals() -> [(Asset, &'static str, &'static str); 5] {
     [
         (
             decode(include_bytes!("../assets/animals/trout.spvox")).unwrap(),
@@ -16,6 +16,16 @@ fn animals() -> [(Asset, &'static str, &'static str); 3] {
         ),
         (
             decode(include_bytes!("../assets/animals/deer.spvox")).unwrap(),
+            "walk",
+            "foreleg_near",
+        ),
+        (
+            decode(include_bytes!("../assets/animals/bear.spvox")).unwrap(),
+            "walk",
+            "foreleg_near",
+        ),
+        (
+            decode(include_bytes!("../assets/animals/leopard.spvox")).unwrap(),
             "walk",
             "foreleg_near",
         ),

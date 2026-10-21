@@ -201,6 +201,39 @@ fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
 }
 
 #[test]
+fn bears_and_snow_leopards_spawn_and_walk_on_their_own_capsules() {
+    let mut sim = simulation();
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[0, 0, 0, 2, 2], 13)
+        .unwrap()
+        .with_radius_m(0.0, 3.0);
+    let service = CreatureService::new(Box::new(director));
+    let mut start = std::collections::BTreeMap::new();
+    for tick in 0..1500 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        if tick == 60 {
+            for alive in sim.alive_creatures() {
+                start.insert(alive.key.creature_id.get(), alive.translation_m);
+            }
+        }
+    }
+    assert_eq!(start.len(), 4, "2 bears and 2 snow leopards alive");
+    let moved: Vec<f64> = sim
+        .alive_creatures()
+        .iter()
+        .map(|alive| {
+            let from = start[&alive.key.creature_id.get()];
+            (alive.translation_m[0] - from[0]).hypot(alive.translation_m[2] - from[2])
+        })
+        .collect();
+    assert!(
+        moved.iter().filter(|d| **d > 0.5).count() >= 2,
+        "bears and leopards barely moved: {moved:?}"
+    );
+}
+
+#[test]
 #[cfg_attr(
     debug_assertions,
     ignore = "timing budget is only meaningful in release"

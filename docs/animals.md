@@ -4,6 +4,13 @@ User authorized implementation on 2026-10-14 after the SPVX/world feasibility
 audit. The first pass establishes reusable assets, CPU animation and live-habitat
 validation. It does not claim that animals spawn in the shipped game.
 
+**Current state (2026-10-21):** the sandbox director spawns deer, crows, bears
+and snow leopards with `--animals N` (trout are authored but wait on live-water
+placement, ENG-225). Each species has its own walk speed, foot capsule and
+measured placement envelope in `examples/sandbox/src/animals.rs`. The five
+assets and their clips are listed in `examples/sandbox/assets/animals/README.md`.
+The sections below are the dated foundation history.
+
 ## Ready assignments
 
 | Slice | Ticket | Scope | Prerequisite |
@@ -95,7 +102,8 @@ Dormant-ocean reads match eager water without waking or allocating regions.
 ENG-204 adds sandbox `animal_visual`, preserving per-part geometry, source
 materials/tints, joint transforms, parent visibility, pivot and 6.25 cm scale.
 Unit scale is required; expansion is capped before allocation. Its bounded
-production-renderer example writes 24 poses and three contact sheets:
+production-renderer example writes four poses per clip and one contact sheet
+per animal (all five species and the player body since ENG-221/222):
 
 ```powershell
 cargo run -p sandbox --features client --example animal-preview -- --bounded --out .local/animal-preview

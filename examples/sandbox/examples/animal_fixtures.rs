@@ -8,10 +8,14 @@ use std::{
     path::PathBuf,
 };
 
+#[path = "animal_fixtures/bear.rs"]
+mod bear;
 #[path = "animal_fixtures/crow.rs"]
 mod crow;
 #[path = "animal_fixtures/deer.rs"]
 mod deer;
+#[path = "animal_fixtures/leopard.rs"]
+mod leopard;
 #[path = "animal_fixtures/player.rs"]
 mod player;
 #[path = "animal_fixtures/trout.rs"]
@@ -584,7 +588,14 @@ fn run() -> Result<(), String> {
     let check = args.iter().any(|a| a == "--check");
     let root =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?).join("../..");
-    let animals = [trout::trout(), crow::crow(), deer::deer(), player::player()];
+    let animals = [
+        trout::trout(),
+        crow::crow(),
+        deer::deer(),
+        bear::bear(),
+        leopard::leopard(),
+        player::player(),
+    ];
     let mut uuids = BTreeSet::new();
     let manifest = sandbox::game::manifest();
     let manifest_names: BTreeSet<&str> = manifest
