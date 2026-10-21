@@ -1607,7 +1607,7 @@ pub(super) async fn serve_async(
                             bounds,
                             center,
                             snow_center_page_cursor.get(&session.raw()).copied(),
-                            16,
+                            SNOW_CENTER_PAGE_TILES,
                         );
                         if let Some(next) = next {
                             snow_center_page_cursor.insert(session.raw(), next);
@@ -1629,7 +1629,7 @@ pub(super) async fn serve_async(
                         let (frames, next) = sim.snow_snapshot_page(
                             Some(bounds),
                             snow_page_cursor.get(&session.raw()).copied().flatten(),
-                            4,
+                            SNOW_RING_PAGE_TILES,
                         );
                         snow_page_cursor.insert(session.raw(), next);
                         if !frames.is_empty() {
