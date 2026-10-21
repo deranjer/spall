@@ -336,7 +336,11 @@ fn bank_for<'a>(
         banks[index] = match surface.file.as_deref().map(load_bank) {
             Some(Ok(bank)) => {
                 if std::env::var_os("SPALL_FOOTSTEP_LOG").is_some() {
-                    tracing::info!(surface = %surface.name, steps = bank.steps.len(), "footstep recording sliced");
+                    eprintln!(
+                        "spall-footsteps: {} sliced into {} steps",
+                        surface.name,
+                        bank.steps.len()
+                    );
                 }
                 Bank::Ready(bank, usize::MAX)
             }
@@ -398,7 +402,10 @@ fn run_footsteps(
             * (1.0 + 0.12 * variation.signed())
             * if event.running { 1.25 } else { 1.0 };
         if log {
-            tracing::info!(surface = %surface.name, step = pick, pitch, loudness, pan = event.pan, running = event.running, "footstep played");
+            eprintln!(
+                "spall-footsteps: {} step {pick} pitch {pitch:.2} loudness {loudness:.2} pan {:.2}",
+                surface.name, event.pan
+            );
         }
         let mono = &bank.steps[pick];
         // Equal-power pan, with short fades so a slice never clicks.

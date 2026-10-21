@@ -143,16 +143,16 @@ impl InteractiveApp {
                 _ => (1.0, 0.0),
             };
             if self.footstep_log {
-                tracing::info!(
-                    player = walker.id,
-                    surface = config
+                println!(
+                    "spall-interactive: footfall player {} surface {} material {:?} snow {:.3} m {}",
+                    walker.id,
+                    config
                         .surfaces
                         .get(surface)
                         .map_or("?", |s| s.name.as_str()),
-                    material = ground.map(|(_, material)| material.0),
-                    snow_depth_m = snow,
-                    running = footfall.running,
-                    "footfall"
+                    ground.map(|(_, material)| material.0),
+                    snow,
+                    if footfall.running { "run" } else { "walk" },
                 );
             }
             if !audio.play(FootstepEvent {
