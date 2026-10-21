@@ -68,16 +68,19 @@ pub struct PlayArgs {
     /// `--editor-scene` file, else daylight.
     #[arg(long)]
     environment: Option<String>,
-    /// Soft frame-rate cap for the uncapped window, frames per second. Play runs
-    /// without vsync, limited to this so a loading world cannot starve the
-    /// desktop; the HUD line still reports the rate the work alone could reach.
-    #[arg(long, default_value_t = 300)]
-    fps_cap: u32,
-    /// Remove the soft cap entirely (rendering-throughput measurement only).
+    /// Run without vsync, limited to this many frames per second (throughput
+    /// measurement). Play presents with vsync by default: without it the GPU
+    /// queue can starve the whole desktop (mouse clicks, alt+tab) while a large
+    /// world loads, and a software frame cap did not prevent that (724862ad,
+    /// regressed by 014d6100 on 2026-10-20).
+    #[arg(long)]
+    fps_cap: Option<u32>,
+    /// Run without vsync and without any frame cap (throughput measurement
+    /// only; can freeze the desktop on large worlds).
     #[arg(long)]
     uncapped: bool,
-    /// Present with vsync (frame rate follows the display) instead of the soft cap.
-    #[arg(long)]
+    /// Accepted for older scripts: play uses vsync by default.
+    #[arg(long, hide = true)]
     vsync: bool,
     /// How far (metres) terrain and water are drawn, 16 to 120 (default 96).
     /// Forwarded to the client, which also widens its streamed region.
@@ -331,12 +334,13 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         eprintln!("xtask play: environment={environment}");
         client_cmd.args(["--environment", environment]);
     }
-    if !args.vsync {
+    let no_vsync_cap = match (args.uncapped, args.fps_cap) {
+        (true, _) => Some(0),
+        (false, cap) => cap,
+    };
+    if let Some(cap) = no_vsync_cap {
         client_cmd.arg("--uncapped");
-        client_cmd.env(
-            "SPALL_MAX_FPS",
-            if args.uncapped { 0 } else { args.fps_cap }.to_string(),
-        );
+        client_cmd.env("SPALL_MAX_FPS", cap.to_string());
     }
     if let Some(metres) = args.view_distance {
         client_cmd.args(["--view-distance", &metres.to_string()]);
