@@ -27,6 +27,7 @@ pub struct BiomeAudioConfig {
     /// without an entry carries [`DEFAULT_RANGE_M`].
     pub ranges_m: Vec<f32>,
     pub footsteps: crate::footsteps::FootstepConfig,
+    pub breathing: crate::breathing::BreathingConfig,
 }
 
 /// One looping weather bed: plays at `gain` while the weather is `kind` (the

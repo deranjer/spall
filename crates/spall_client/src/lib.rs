@@ -2,6 +2,7 @@
 //! and transport wiring are added by later tasks.
 
 pub mod audio;
+pub mod breathing;
 pub mod catalogue;
 pub mod column_surface;
 pub mod day_night;

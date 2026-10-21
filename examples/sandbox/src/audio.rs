@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use spall_client::audio::{BiomeAudioConfig, WeatherLayer};
+use spall_client::breathing::{BreathingConfig, BreathingRow, BreathingState};
 use spall_client::footsteps::{FootstepConfig, FootstepSurface};
 use spall_core::MaterialId;
 use spall_protocol::WeatherKind;
@@ -127,6 +128,34 @@ fn recordings(row: &SurfaceRow, root: &Path) -> (Option<PathBuf>, Option<PathBuf
     }
 }
 
+/// The player's breathing, one recording per state under `player/`, with the
+/// gain it plays at. A recording that is not shipped leaves its state silent.
+const BREATHING: [(BreathingState, &str, f32, bool); 3] = [
+    (BreathingState::Calm, "breathing-calm.ogg", 0.3, true),
+    (BreathingState::Exerted, "breathing-exerted.ogg", 0.6, true),
+    (
+        BreathingState::Exhausted,
+        "breathing-exhausted.ogg",
+        0.8,
+        true,
+    ),
+];
+
+/// The breathing table with each recording resolved against `root`.
+pub fn breathing(root: &Path) -> BreathingConfig {
+    BreathingConfig {
+        rows: BREATHING
+            .iter()
+            .map(|&(state, file, gain, looped)| BreathingRow {
+                state,
+                path: Some(root.join("player").join(file)).filter(|path| path.is_file()),
+                gain,
+                looped,
+            })
+            .collect(),
+    }
+}
+
 /// The footstep table with each recording resolved against `root`.
 pub fn footsteps(root: &Path) -> FootstepConfig {
     let index_of = |name: &str| SURFACES.iter().position(|row| row.name == name);
@@ -233,6 +262,7 @@ pub fn config() -> BiomeAudioConfig {
         thunder: Some(root.join("weather/thunder-clap.ogg")),
         ranges_m: TRACK_NAMES.iter().map(|name| track_range_m(name)).collect(),
         footsteps: footsteps(&root),
+        breathing: breathing(&root),
     }
 }
 

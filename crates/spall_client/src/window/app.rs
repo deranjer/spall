@@ -42,6 +42,11 @@ pub(super) struct InteractiveApp {
     pub(super) footstep_trackers: HashMap<u64, crate::footsteps::FootstepTracker>,
     pub(super) footstep_at: Option<Instant>,
     pub(super) footstep_log: bool,
+    pub(super) breathing: Option<crate::breathing::BreathingAudio>,
+    pub(super) breathing_state: crate::breathing::BreathingState,
+    /// `SPALL_BREATHING_LOG`: print each breathing and endurance state change.
+    pub(super) breathing_log: bool,
+    pub(super) endurance_view: Option<EnduranceView>,
     pub(super) nature_volume: f32,
     pub(super) weather_volume: f32,
     pub(super) nature_muted: bool,
@@ -225,6 +230,8 @@ impl InteractiveApp {
         let body_worker = BodyWorker::spawn(session.clone())?;
         let ambience = AmbienceAudio::start(0.2);
         let footsteps = crate::footsteps::FootstepAudio::start(&options.biome_audio.footsteps, 0.5);
+        let breathing =
+            crate::breathing::BreathingAudio::start(&options.biome_audio.breathing, 0.6);
         Ok(Self {
             session,
             window: None,
@@ -257,6 +264,10 @@ impl InteractiveApp {
             footstep_trackers: HashMap::new(),
             footstep_at: None,
             footstep_log: std::env::var_os("SPALL_FOOTSTEP_LOG").is_some(),
+            breathing,
+            breathing_state: crate::breathing::BreathingState::Calm,
+            breathing_log: std::env::var_os("SPALL_BREATHING_LOG").is_some(),
+            endurance_view: None,
             nature_volume: 0.2,
             weather_volume: 0.3,
             nature_muted: false,

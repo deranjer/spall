@@ -723,6 +723,11 @@ pub struct MotionSnapshot {
     pub linear_velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
     pub sleeping: bool,
+    /// Players only (`1.0` for bodies): sprint stamina, `0..=1`, the same value the
+    /// character kernel advances.
+    pub endurance: f32,
+    /// Players only: exhausted until endurance recovers past the kernel's threshold.
+    pub exhausted: bool,
 }
 
 impl Record for MotionSnapshot {
@@ -741,6 +746,9 @@ impl Record for MotionSnapshot {
             })?;
         finite3(&self.linear_velocity, "MotionSnapshot.linear_velocity")?;
         finite3(&self.angular_velocity, "MotionSnapshot.angular_velocity")?;
+        if !self.endurance.is_finite() {
+            return Err(RecordError::NonFinite("MotionSnapshot.endurance"));
+        }
         Ok(())
     }
 }
@@ -976,6 +984,8 @@ mod tests {
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         };
         assert!(snap.validate().is_ok());
 

@@ -344,6 +344,8 @@ mod tests {
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         }
     }
 

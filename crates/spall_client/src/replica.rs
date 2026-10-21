@@ -3013,6 +3013,8 @@ mod tests {
                 linear_velocity: [vx, 0.0, 0.0],
                 angular_velocity: [0.0; 3],
                 sleeping: false,
+                endurance: 1.0,
+                exhausted: false,
             });
         }
         (replica, body)
@@ -3207,6 +3209,8 @@ mod tests {
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         };
         assert!(!replica.ingest_snapshot(&snap), "held, not applied");
         assert!(replica.interpolated_pose(ghost, 5.0).is_none());
@@ -3343,6 +3347,8 @@ mod tests {
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         };
         replica.ingest_snapshot(&snap);
         assert_eq!(replica.terrain_generation(), initial);
@@ -3429,6 +3435,8 @@ mod tests {
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         };
         assert!(!replica.ingest_snapshot(&snap));
         assert!(replica.pending_snapshots.is_empty());

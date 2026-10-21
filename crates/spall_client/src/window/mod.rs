@@ -55,6 +55,7 @@ mod admin_menu;
 mod app;
 mod bodies;
 mod camera;
+mod endurance;
 mod footstep_update;
 mod gpu_timer;
 mod handler;

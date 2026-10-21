@@ -522,6 +522,8 @@ mod tests {
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             sleeping: true,
+            endurance: 1.0,
+            exhausted: false,
         };
         let current_tx = encode_control(&a_tx()).unwrap();
         let current_motion = encode_control(&motion).unwrap();
