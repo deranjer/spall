@@ -79,6 +79,7 @@ pub struct CustomWorld {
     pub(super) initial_bodies: Vec<InitialBody>,
     pub(super) dam_gate: Option<DamGate>,
     pub(super) vegetation: Option<spall_ecology::living::LivingState>,
+    pub(super) snow_material: Option<spall_core::MaterialId>,
 }
 
 /// A dynamic body placed in a custom world when it is created: one solid box
@@ -114,6 +115,7 @@ impl CustomWorld {
             initial_bodies: Vec::new(),
             dam_gate: None,
             vegetation: None,
+            snow_material: None,
         }
     }
 
@@ -141,6 +143,13 @@ impl CustomWorld {
 
     pub fn column_water_setup(&self) -> Option<&spall_sim::column_water::ColumnWaterSetup> {
         self.column_water.as_ref()
+    }
+
+    /// The material of the snow cells that stack up near players while it snows.
+    #[must_use]
+    pub fn with_snow_material(mut self, material: spall_core::MaterialId) -> Self {
+        self.snow_material = Some(material);
+        self
     }
 
     pub fn with_vegetation(mut self, vegetation: spall_ecology::living::LivingState) -> Self {
@@ -294,6 +303,7 @@ impl Scene {
         // A server's tick must not wait for a lake: the fluid step has its own thread.
         sim_config.column_water_worker = true;
         sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
+        sim_config.snow_layer_material = custom.and_then(|c| c.snow_material);
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if let Some(custom) = custom {
             for body in &custom.initial_bodies {

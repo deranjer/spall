@@ -272,3 +272,25 @@ vegetation `start_season` and the weather `start_season` together, keeping elaps
 so the chosen season is current at once, snow eligibility and temperature follow, and the
 season keeps advancing from it. The vegetation state is journalled and the next weather
 and vegetation keyframes (within a second) carry the change to clients.
+
+## Voxel snow layers near players
+
+Near each player (7 tiles, about 28 m) snow also stacks as real terrain: whole 0.25 m cells of
+the game's snow material (`CustomWorld::with_snow_material`, sandbox material 217) on every
+sky-exposed top surface, up to six cells per column. This supersedes "no new solid voxels" for
+that radius only; the thin coat still covers the rest of the world, and snow cells are
+ordinary terrain that collides and can be dug or destroyed.
+
+- **Accumulation** (`spall_sim/src/sim/snow_layer.rs`): snowfall at or below freezing adds
+  `0.0147 * precipitation` layers per second (heavy snow: one cell about every 85 s); warmth
+  melts at `0.00083` layers per second per degree C. The height is not saved; snow already
+  placed is terrain, and after a restart new snowfall adds on top, capped per column.
+- **Commit path:** one authored *layer edit* per 16 x 16 tile (at most 512 cell writes, two in
+  flight) goes through the normal pipeline (`EditPipeline::submit_with_layer`,
+  `stage::LayerWrite`). Each write applies only while the cell still holds the expected
+  material, so a layer never overwrites geometry changed since. It is journalled and replicated
+  as ordinary `CellRun` ops, not a brush, with no wire change. It never splits the volume, so
+  pre-existing unsupported components (a natural world has dozens) are left for the next edit
+  that may detach them. Snow edits do not destroy ground cover.
+- **Footprints:** each validated footfall removes the cell the previous foot stood in when a
+  snow cell remains below it. A column within 0.7 m of a player is skipped.

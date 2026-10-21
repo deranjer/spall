@@ -115,6 +115,8 @@ pub enum CommitError {
     Record(#[from] RecordError),
     #[error("commit cannot be encoded for replication: {0}")]
     Replication(#[from] crate::replication::ReplicationError),
+    #[error("a layer edit's cell runs do not fit one control record")]
+    LayerTooLarge,
     #[error("prepared commit state changed before publication")]
     PreparedStateChanged,
     #[error("prepared physics fence could not be captured: {0}")]
@@ -566,7 +568,11 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
         brush: staged.brush,
         material: staged.kind.write_material(),
     };
-    let mut ops = vec![brush_op.clone()];
+    let mut ops = if staged.layer {
+        crate::replication::layer_ops(vid, &staged.plan)
+    } else {
+        vec![brush_op.clone()]
+    };
     for (((entity, child_vid), _), fill) in child_ids
         .iter()
         .zip(&staged.memberships)
@@ -607,6 +613,9 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
     // remain the replica's acceptance check.
     let mut bulk_baseline = None;
     let mut bulk_transfer_id = None;
+    if staged.layer && !crate::replication::inline_wire_fits(&topology) {
+        return Err(CommitError::LayerTooLarge);
+    }
     if !crate::replication::inline_wire_fits(&topology) {
         // Inline blobs are only chosen when each fits `MAX_SPLIT_BASELINE_BLOB`,
         // but hundreds of small children (a tree crown) can still add up past

@@ -312,6 +312,8 @@ impl Simulation {
     }
 
     pub(super) fn stamp_snow_candidates(&mut self) {
+        let candidates = std::mem::take(&mut self.footfall_candidates);
+        self.dent_snow(&candidates);
         let cell_m = 0.25;
         let terrain = &self.world.terrain().volume;
         if terrain.cell_size() != spall_core::CellSizeCode::Quarter {
@@ -319,7 +321,6 @@ impl Simulation {
         }
         let water = self.column_water.as_ref().map(|w| w.frame());
         let water_sampler = water.as_ref().map(|frame| frame.sampler());
-        let candidates = std::mem::take(&mut self.footfall_candidates);
         for candidate in candidates {
             let x = (candidate.position_m[0] / cell_m).floor() as i64;
             let z = (candidate.position_m[2] / cell_m).floor() as i64;

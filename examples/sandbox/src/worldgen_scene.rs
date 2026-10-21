@@ -399,8 +399,9 @@ impl GeneratedScene {
         let column_water = self.column_water.take();
         let vegetation = self.vegetation.clone();
         let scene = Arc::new(self);
-        let mut custom =
-            CustomWorld::new(spawns, move || scene.world_setup()).with_vegetation(vegetation);
+        let mut custom = CustomWorld::new(spawns, move || scene.world_setup())
+            .with_vegetation(vegetation)
+            .with_snow_material(crate::game::materials::SNOW);
         if let Some(setup) = column_water {
             custom = custom.with_column_water(setup);
         }

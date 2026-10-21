@@ -22,6 +22,7 @@ impl Simulation {
             .map_or(0, |s| s.start_season as u8);
         let weather_season_ms = vegetation_setup.as_ref().map_or(900_000, |s| s.season_ms);
         let weather_seed = config.weather_seed;
+        let snow_layer_material = config.snow_layer_material;
         let world_span = crate::prof::Span::start("startup.world_and_collision");
         let world = SimWorld::new_with_terrain_collider_mode_and_origin(
             config.world,
@@ -59,12 +60,14 @@ impl Simulation {
             weather_dirty: true,
             weather_seed,
             snow: crate::snow::SnowState::new(),
+            snow_layer: Default::default(),
             snow_priority_tiles: Vec::new(),
             snow_priority_players: Vec::new(),
             snow_priority_refreshed_tick: 0,
             motion_footprints: crate::footprints::MotionFootprints::new(),
             footfall_candidates: Vec::new(),
         };
+        simulation.set_snow_layer_material(snow_layer_material);
         if let Some(setup) = column_water_setup {
             let _span = crate::prof::Span::start("startup.column_water");
             simulation.column_water = Some(
@@ -124,6 +127,7 @@ impl Simulation {
             weather_dirty: false,
             weather_seed: 0,
             snow: crate::snow::SnowState::new(),
+            snow_layer: Default::default(),
             snow_priority_tiles: Vec::new(),
             snow_priority_players: Vec::new(),
             snow_priority_refreshed_tick: 0,
@@ -155,6 +159,7 @@ impl Simulation {
             mut weather,
             weather_seed,
             snow,
+            snow_layer,
             ..
         } = fresh;
         let (f_entity, f_volume, f_transaction, f_journal_seq) = world.registry().counters();
@@ -185,6 +190,7 @@ impl Simulation {
         self.weather_seed = weather_seed;
         self.weather_dirty = true;
         let old_snow = std::mem::replace(&mut self.snow, snow);
+        self.snow_layer = snow_layer;
         self.motion_footprints.clear();
         self.footfall_candidates.clear();
         // The replaced world goes away off the tick thread.

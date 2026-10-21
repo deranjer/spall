@@ -101,6 +101,8 @@ impl Drop for StagingWorker {
 #[derive(Debug, Clone)]
 struct QueuedIntent {
     intent: EditIntent,
+    /// Set for an authored layer edit (see [`crate::stage::LayerWrite`]).
+    layer: Option<std::sync::Arc<[crate::stage::LayerWrite]>>,
     volume_id: VolumeId,
     region: RegionKey,
     attempts: u32,
@@ -308,6 +310,17 @@ impl EditPipeline {
         intent: EditIntent,
         world: &SimWorld,
     ) -> Result<ActionStatus, IntentError> {
+        self.submit_with_layer(intent, None, world)
+    }
+
+    /// [`Self::submit_intent`] for an authored layer edit: `layer` replaces the brush's cells, and
+    /// the brush only says where the edit is (its scheduling region and residency).
+    pub fn submit_with_layer(
+        &mut self,
+        intent: EditIntent,
+        layer: Option<std::sync::Arc<[crate::stage::LayerWrite]>>,
+        world: &SimWorld,
+    ) -> Result<ActionStatus, IntentError> {
         let request = intent.request_id;
         if let Some(status) = self.statuses.get(&request.0) {
             return Ok(status.clone());
@@ -328,6 +341,7 @@ impl EditPipeline {
         let region = RegionKey::of(volume_id, &intent.brush);
         self.pending.push_back(QueuedIntent {
             intent,
+            layer,
             volume_id,
             region,
             attempts: 0,
@@ -472,6 +486,7 @@ impl EditPipeline {
                     epoch,
                 )
                 .with_label_cache(self.label_cache.clone())
+                .with_layer(queued.layer.clone())
                 .with_warm_index(warm_index)
                 .with_warm_removal(world.warm_structure_removal(queued.volume_id, input_stamp));
                 let request = JobRequest::new(
@@ -667,6 +682,7 @@ impl EditPipeline {
                 epoch,
             )
             .with_label_cache(self.label_cache.clone())
+            .with_layer(queued.layer.clone())
             .with_warm_index(warm_index)
             .with_warm_removal(warm_removal);
             let request = JobRequest::new(

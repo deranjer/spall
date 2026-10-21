@@ -220,6 +220,38 @@ pub fn source_removal_ops(
     ops
 }
 
+/// Canonical `+X` [`TopologyOp::CellRun`]s for every write of an authored layer `plan`, in
+/// `(z, y, x)` order: replaying them in one batch reproduces the plan exactly.
+pub fn layer_ops(volume: VolumeId, plan: &spall_voxel::EditPlan) -> Vec<TopologyOp> {
+    let mut writes: Vec<_> = plan.writes.iter().collect();
+    writes.sort_by_key(|w| (w.cell.z, w.cell.y, w.cell.x));
+    let mut ops: Vec<TopologyOp> = Vec::new();
+    for write in writes {
+        if let Some(TopologyOp::CellRun {
+            start,
+            len,
+            material,
+            ..
+        }) = ops.last_mut()
+            && *material == write.material
+            && start.y == write.cell.y
+            && start.z == write.cell.z
+            && start.x + i64::from(*len) == write.cell.x
+            && i64::from(*len) < MAX_RUN_LEN
+        {
+            *len += 1;
+            continue;
+        }
+        ops.push(TopologyOp::CellRun {
+            volume,
+            start: write.cell,
+            len: 1,
+            material: write.material,
+        });
+    }
+    ops
+}
+
 /// Turns canonical X-spans into [`TopologyOp::CellRun`]s, coalescing adjacent
 /// cells that share a material and splitting a run at
 /// [`spall_protocol::limits::MAX_CELL_RUN_LEN`].

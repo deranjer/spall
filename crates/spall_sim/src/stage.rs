@@ -49,7 +49,22 @@ pub struct StageInput {
     /// Detached-cell removal still to be applied to `warm_index` (see
     /// [`crate::SimWorld::warm_structure_removal`]).
     pub warm_removal: Option<spall_voxel::EditOutcome>,
+    /// An authored multi-cell layer edit, staged in place of the brush (see [`LayerWrite`]).
+    pub layer: Option<std::sync::Arc<[LayerWrite]>>,
 }
+
+/// One cell of an authored layer edit (for example a tile of snow). It applies only while the
+/// cell still holds `expect`, so a layer staged against an older state never overwrites geometry
+/// a player built or cut in the meantime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerWrite {
+    pub cell: spall_core::GlobalCell,
+    pub material: spall_core::MaterialId,
+    pub expect: spall_core::MaterialId,
+}
+
+/// Most cells one layer edit may write, so its `CellRun` ops always fit one control record.
+pub const MAX_LAYER_WRITES: usize = 512;
 
 impl StageInput {
     /// Builds staging inputs for `intent` against `snapshot`. `evicted` is the
@@ -80,7 +95,15 @@ impl StageInput {
             label_cache: None,
             warm_index: None,
             warm_removal: None,
+            layer: None,
         }
+    }
+
+    /// Stages `layer` instead of the intent's brush.
+    #[must_use]
+    pub fn with_layer(mut self, layer: Option<std::sync::Arc<[LayerWrite]>>) -> Self {
+        self.layer = layer;
+        self
     }
 
     /// Reuses `cache` for the structural analysis of this live snapshot.
@@ -142,6 +165,9 @@ pub struct StagedEdit {
     /// edit: exactly the index of the world a commit produces when nothing detaches, and the
     /// starting point for it when something does.
     pub post_index: Option<std::sync::Arc<spall_structure::StructureIndex>>,
+    /// Whether this is an authored layer edit, journalled and replicated as cell runs rather
+    /// than as a brush.
+    pub layer: bool,
 }
 
 impl StagedEdit {
@@ -171,6 +197,8 @@ pub enum StageError {
     Structure(#[from] Interrupted),
     #[error("dry-run edit failed: {0}")]
     Edit(#[from] EditError),
+    #[error("a layer edit holds {0} writes, more than the limit")]
+    LayerTooLarge(usize),
     #[error(
         "edit needs evicted geometry that is not loaded (bricks {0:?}); \
          the caller must reload it and re-stage"
@@ -204,7 +232,10 @@ pub(crate) fn stage_edit_owned(mut input: StageInput) -> Result<StagedEdit, Stag
 
 fn stage_with(input: &StageInput, warm: Option<StructureIndex>) -> Result<StagedEdit, StageError> {
     let _total = crate::prof::Span::start("stage.total");
-    let plan = EditPlan::sphere(input.volume_id, input.brush, input.kind.write_material());
+    let plan = match &input.layer {
+        Some(layer) => layer_plan(input, layer)?,
+        None => EditPlan::sphere(input.volume_id, input.brush, input.kind.write_material()),
+    };
     if plan.writes.is_empty() {
         return Err(StageError::EmptyBrush);
     }
@@ -325,6 +356,15 @@ fn stage_with(input: &StageInput, warm: Option<StructureIndex>) -> Result<Staged
     let memberships: Vec<ComponentMembership> = match input.target {
         EditTarget::Terrain => index.split_plans(),
         EditTarget::Body(_) => detached_from_body(&index),
+    };
+
+    // A layer edit only adds or removes cells resting on the surface, so it never causes a
+    // split. The world may already hold unsupported components (a natural world has dozens);
+    // those wait for an edit that is allowed to detach them, exactly as before this one.
+    let memberships = if input.layer.is_some() {
+        Vec::new()
+    } else {
+        memberships
     };
 
     // A reused index must be indistinguishable from a rebuilt one: every debug build (and so every
@@ -456,7 +496,27 @@ fn stage_with(input: &StageInput, warm: Option<StructureIndex>) -> Result<Staged
         removed_materials,
         input_stamp: input.volume.state_stamp(),
         post_index,
+        layer: input.layer.is_some(),
     })
+}
+
+/// The writes of `layer` whose cell still holds the expected material.
+fn layer_plan(input: &StageInput, layer: &[LayerWrite]) -> Result<EditPlan, StageError> {
+    if layer.len() > MAX_LAYER_WRITES {
+        return Err(StageError::LayerTooLarge(layer.len()));
+    }
+    let mut plan = EditPlan::new(input.volume_id);
+    for write in layer {
+        let current = match input.volume.sample(write.cell) {
+            Ok(Sample::Empty { .. }) => spall_core::MaterialId::AIR,
+            Ok(Sample::Filled(material)) => material,
+            Ok(Sample::Unknown(_)) | Err(_) => continue,
+        };
+        if current == write.expect {
+            plan.set(write.cell, write.material);
+        }
+    }
+    Ok(plan)
 }
 
 /// Components of a dynamic body that detach when it is cut: all but the largest

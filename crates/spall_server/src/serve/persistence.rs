@@ -118,6 +118,7 @@ pub(super) fn setup_persistence_with_game_content(
                 )
                 .map_err(|e| e.to_string())?;
                 sim.set_column_water_worker(true);
+                sim.set_snow_layer_material(custom_world.and_then(|c| c.snow_material));
                 (sim, seq, 0, retained_transfer_ids)
             }
             // A genuinely new/empty database: seed it with the built-in scene.
