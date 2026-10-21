@@ -825,6 +825,20 @@ impl ApplicationHandler for InteractiveApp {
                             menu.reduced_weather_flashes = self.reduced_weather_flashes;
                             menu
                         });
+                        renderer.eye_submerged = render_cam.as_ref().is_some_and(|(eye, _)| {
+                            eye_below_surface(
+                                self.session
+                                    .column_surface
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .sample_at_m(
+                                        f64::from(eye.x),
+                                        f64::from(eye.y),
+                                        f64::from(eye.z),
+                                    ),
+                                f64::from(eye.y),
+                            )
+                        });
                         match renderer.finish_frame(
                             acquired,
                             render_cam.as_ref(),
@@ -845,6 +859,8 @@ impl ApplicationHandler for InteractiveApp {
                 self.hud.record_frame(&timing);
                 if let Some(renderer) = &self.renderer {
                     self.weather_exposure = renderer.weather_exposure;
+                    self.weather_submerge = renderer.weather_submerge;
+                    self.weather_wind = renderer.weather_wind;
                 }
                 if self.frame_history.len() >= FRAME_HISTORY {
                     self.frame_history.pop_front();

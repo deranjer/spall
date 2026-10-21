@@ -269,6 +269,125 @@ impl Record for WeatherSnapshot {
             .map_err(|_| RecordError::Inconsistent("weather snapshot bounds"))
     }
 }
+/// Wind at one instant: a heading and a 0..=1 strength. See [`wind_at`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wind {
+    /// Unit horizontal direction the wind blows toward, (x, z).
+    pub direction: [f32; 2],
+    /// 0 is a lull, about 0.25-0.5 a moderate breeze, 0.75 and up a strong gust.
+    pub strength: f32,
+}
+
+impl Wind {
+    /// Horizontal wind speed in m/s that `kind` shows for this strength: a
+    /// blizzard peaks near 17.5 m/s, snow tiers stay gentle, wind-only
+    /// weather never drops below a 2 m/s breeze so its streaks keep an axis.
+    pub fn speed_mps(&self, kind: WeatherKind) -> f32 {
+        let s = self.strength.clamp(0.0, 1.0);
+        match kind {
+            WeatherKind::Clear => 0.0,
+            WeatherKind::Rain => 3.5 * s.powf(1.3),
+            WeatherKind::Storm => 8.0 * s.powf(1.3),
+            WeatherKind::Snow => 3.0 * s.powf(1.8),
+            WeatherKind::HighWind => 2.0 + 10.0 * s,
+            WeatherKind::Blizzard => 17.5 * s.powf(1.3),
+        }
+    }
+}
+
+/// Length of one strength phase slot; phases are lull, moderate or strong.
+const WIND_SLOT_S: f64 = 20.0;
+/// Heading changes land once per 55 s slot, jittered by up to 35 s, so the
+/// gap between two changes is 20-90 s.
+const WIND_TURN_SLOT_S: f64 = 55.0;
+const WIND_TURN_JITTER_S: f64 = 35.0;
+
+fn unit(x: u64) -> f64 {
+    (mix(x) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+fn smoothstep(x: f64) -> f64 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+fn turn_hash(seed: u64, k: i64, salt: u64) -> u64 {
+    seed ^ (k as u64).wrapping_mul(0xA24B_AED4_963E_E407) ^ salt
+}
+
+fn turn_time_s(seed: u64, k: i64) -> f64 {
+    k as f64 * WIND_TURN_SLOT_S + WIND_TURN_JITTER_S * unit(turn_hash(seed, k, 1))
+}
+
+fn turn_heading(seed: u64, k: i64) -> f64 {
+    unit(turn_hash(seed, k, 2)) * std::f64::consts::TAU
+}
+
+/// Slot level: lull ~0-0.03, moderate 0.25-0.5, strong 0.75-0.9. A lull never
+/// directly follows another, so lulls last one slot (about 10-20 s once the
+/// 6 s blends to the neighbours are counted).
+fn slot_level(seed: u64, k: i64) -> f64 {
+    let roll = |k: i64| unit(turn_hash(seed, k, 3));
+    let r = roll(k);
+    let u = unit(turn_hash(seed, k, 4));
+    if r < 0.2 && roll(k - 1) >= 0.2 {
+        0.03 * u
+    } else if r < 0.6 {
+        0.25 + 0.25 * u
+    } else {
+        0.75 + 0.15 * u
+    }
+}
+
+/// The wind at `clock_s` seconds of the authoritative weather clock
+/// (`WeatherState::clock_ms / 1000`, plus any local extrapolation since that
+/// snapshot). A pure function of `(seed, clock_s)`, so every client and the
+/// server see the same wind at the same moment.
+///
+/// Heading: a new random heading anywhere in 360 degrees every 20-90 s, reached
+/// by turning over 5-15 s, plus a wobble of up to about 9 degrees. Strength:
+/// 20 s slots that are lulls (about 20%), moderate (40%) or strong (40%),
+/// blended over 6 s at the edges, with short surges riding on the stronger slots.
+pub fn wind_at(seed: u64, clock_s: f64) -> Wind {
+    let t = clock_s.max(0.0);
+    let tau = std::f64::consts::TAU;
+
+    let mut k = (t / WIND_TURN_SLOT_S).floor() as i64;
+    if turn_time_s(seed, k) > t {
+        k -= 1;
+    }
+    let delta = {
+        let d = (turn_heading(seed, k) - turn_heading(seed, k - 1)).rem_euclid(tau);
+        if d > std::f64::consts::PI { d - tau } else { d }
+    };
+    let turn_s = 5.0 + 10.0 * unit(turn_hash(seed, k, 5));
+    let progress = smoothstep((t - turn_time_s(seed, k)) / turn_s);
+    let phase = |salt: u64| unit(seed ^ salt) * tau;
+    let wobble =
+        0.09 * (t * tau / 9.0 + phase(0xB1)).sin() + 0.06 * (t * tau / 23.0 + phase(0xB2)).sin();
+    let heading = turn_heading(seed, k - 1) + delta * progress + wobble;
+
+    let x = (t + WIND_SLOT_S * unit(seed ^ 0xC1)) / WIND_SLOT_S;
+    let slot = x.floor() as i64;
+    let f = x - slot as f64;
+    let level = if f < 0.15 {
+        let blend = smoothstep(0.5 + f / 0.3);
+        slot_level(seed, slot - 1) * (1.0 - blend) + slot_level(seed, slot) * blend
+    } else if f > 0.85 {
+        let blend = smoothstep((f - 0.85) / 0.3);
+        slot_level(seed, slot) * (1.0 - blend) + slot_level(seed, slot + 1) * blend
+    } else {
+        slot_level(seed, slot)
+    };
+    let ripple =
+        0.5 * (t * tau / 4.1 + phase(0xB3)).sin() + 0.5 * (t * tau / 7.3 + phase(0xB4)).sin();
+    let surge = 0.12 * smoothstep((level - 0.2) / 0.5);
+    Wind {
+        direction: [heading.cos() as f32, heading.sin() as f32],
+        strength: (level + surge * ripple).clamp(0.0, 1.0) as f32,
+    }
+}
+
 fn mix(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -279,6 +398,62 @@ fn mix(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wind_is_deterministic_bounded_and_has_lulls_gusts_and_turns() {
+        let seed = 0x5EED;
+        let (mut lull, mut strong) = (false, false);
+        let mut max_speed = 0.0f32;
+        let mut headings = Vec::new();
+        let mut longest_lull = 0.0f64;
+        let mut lull_run = 0.0f64;
+        let mut previous = wind_at(seed, 0.0);
+        for step in 0..=24_000 {
+            let t = f64::from(step) * 0.05; // 20 minutes
+            let wind = wind_at(seed, t);
+            assert_eq!(wind, wind_at(seed, t));
+            assert!((0.0..=1.0).contains(&wind.strength));
+            let [x, z] = wind.direction;
+            assert!((x.hypot(z) - 1.0).abs() < 1e-4);
+            assert!((wind.strength - previous.strength).abs() < 0.05, "smooth");
+            assert!(
+                (x - previous.direction[0]).abs() < 0.1 && (z - previous.direction[1]).abs() < 0.1,
+                "heading is continuous"
+            );
+            previous = wind;
+            let speed = wind.speed_mps(WeatherKind::Blizzard);
+            max_speed = max_speed.max(speed);
+            if speed < 0.6 {
+                lull = true;
+                lull_run += 0.05;
+                longest_lull = longest_lull.max(lull_run);
+            } else {
+                lull_run = 0.0;
+            }
+            strong |= wind.strength > 0.8;
+            if step % 20 == 0 {
+                headings.push(z.atan2(x));
+            }
+        }
+        assert!(lull && strong, "lull {lull}, strong {strong}");
+        assert!(longest_lull < 25.0, "lulls are short: {longest_lull}");
+        assert!((15.0..=18.0).contains(&max_speed), "peak {max_speed} m/s");
+        // Within a 3 minute window the heading swings more than 90 degrees.
+        let swing = |a: f32, b: f32| {
+            let d = (a - b).rem_euclid(std::f32::consts::TAU);
+            d.min(std::f32::consts::TAU - d)
+        };
+        assert!(headings.windows(180).any(|w| {
+            w.iter()
+                .any(|&a| w.iter().any(|&b| swing(a, b) > std::f32::consts::FRAC_PI_2))
+        }));
+        assert_ne!(wind_at(seed, 100.0), wind_at(seed + 1, 100.0));
+        let gust = Wind {
+            direction: [1.0, 0.0],
+            strength: 0.9,
+        };
+        assert!(gust.speed_mps(WeatherKind::Snow) < 0.2 * gust.speed_mps(WeatherKind::Blizzard));
+    }
+
     #[test]
     fn seeded_policy_is_repeatable_and_bounded() {
         let c = WeatherClock {

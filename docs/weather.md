@@ -328,12 +328,40 @@ the sole; in thin snow the print sits half a step down. Strength fades the dent 
 new snow refills it. TTL, per-layer and global caps, fade by snowfall and melt
 removal are unchanged and server-side; carving is presentation of those marks only.
 
-## Blizzard wind
+## Wind
 
-Presentation only (`spall_client/src/weather.rs`), a pure function of the weather
-seed and a client clock that survives teleports: the wind direction veers up to
-+-35 degrees over tens of seconds, gusts surge every few seconds, and the blizzard
-driving speed rides them between 6 and 16 m/s. Each streak also swirls on its own
-slow circle. Snow tiers use gentler versions (veer scale 0.3, drift modulated by the
-gust). Clients share the pattern but not its time origin, so two windows agree on the
-kind of motion, not on the exact gust moment.
+One function, `spall_protocol::wind_at(weather_seed, clock_s)`, is the wind for
+everything that shows it: particle velocity and streak slant, blizzard whiteout,
+and the wind-bed audio gain. `clock_s` is the authoritative weather clock
+(`clock_ms / 1000`; clients add the local time since the last 1 Hz snapshot), so
+every client sees the same heading and strength at the same moment. The profile's
+`wind_x_q15`/`wind_z_q15`/`gust_q16` fields are no longer used for presentation.
+The server sim does not use wind.
+
+- Heading: a new random heading anywhere in 360 degrees every 20-90 s (55 s grid,
+  35 s jitter), reached by a smoothstep turn lasting 5-15 s, plus about 9 degrees of
+  wobble.
+- Strength 0..1: 20 s slots that are a lull (about 20%, never two in a row, level
+  0-0.03), moderate (40%, 0.25-0.5) or strong (40%, 0.75-0.9), blended over 6 s at
+  slot edges, with 4-7 s surges of up to +-0.12 riding on the stronger slots.
+- Speed per kind (`Wind::speed_mps`): blizzard 17.5 m/s x strength^1.3 (a lull is
+  under 1 m/s, snow falls straight down); snow tiers 3 m/s x strength^1.8; rain 3.5,
+  storm 8; wind-only weather 2 + 10 x strength.
+- Blizzard whiteout thins to about 0.6 visibility in a lull and closes to 0.15 in
+  a strong gust; the blizzard and wind-only audio beds run at 30% gain in a lull and
+  full gain in a gust.
+- Each blizzard streak still swirls on its own slow circle (local time).
+
+## Underwater
+
+When the camera eye is below the replicated water surface (`eye_below_surface`),
+weather particles, whiteout fog, storm dimming and lightning flashes fade out over
+about a second (`WeatherPresentation::set_submerged`), the underwater shader look
+takes over, and weather audio drops to 7% gain. Surfacing fades everything back.
+
+## Ambience under weather
+
+Weather ducks biome ambience per layer (`ambience_mix`): other layers by up to 65%,
+water tracks (`BiomeAudioConfig::water_tracks`: stream, ocean, beach) by at most a
+quarter of that, and water layers take mix slots before other layers. Weather beds
+play on their own `AmbienceAudio` worker, so they never evict ambience layers.

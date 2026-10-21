@@ -54,6 +54,9 @@ pub(super) struct InteractiveApp {
     pub(super) ground_snow_enabled: bool,
     pub(super) reduced_weather_flashes: bool,
     pub(super) weather_exposure: f32,
+    /// Eased 0..1 camera submersion and shared wind strength, from the renderer.
+    pub(super) weather_submerge: f32,
+    pub(super) weather_wind: f32,
     /// When the last frame was requested, for the uncapped frame limiter.
     pub(super) last_redraw: Instant,
     /// Scripted camera tour (`--shots`); empty for normal play.
@@ -269,6 +272,8 @@ impl InteractiveApp {
             ground_snow_enabled: true,
             reduced_weather_flashes: false,
             weather_exposure: 1.0,
+            weather_submerge: 0.0,
+            weather_wind: 0.0,
             last_redraw: Instant::now(),
             script: options.shots.into(),
             shots_dir: options.shots_dir,
@@ -345,26 +350,41 @@ impl InteractiveApp {
         if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
             self.latest_weather = replica.weather().cloned();
         }
+        // Weather ducks each ambience layer (water far less, see `ambience_mix`).
+        let weather_duck = if self.nature_preview.is_some() {
+            1.0
+        } else {
+            self.latest_weather.as_ref().map_or(1.0, |state| {
+                1.0 - 0.65 * f32::from(state.precipitation_q16.max(state.gust_q16))
+                    / f32::from(u16::MAX)
+            })
+        };
         if let Some(audio) = &self.ambience {
-            let weather_duck = if self.nature_preview.is_some() {
-                1.0
-            } else {
-                self.latest_weather.as_ref().map_or(1.0, |state| {
-                    1.0 - 0.65 * f32::from(state.precipitation_q16.max(state.gust_q16))
-                        / f32::from(u16::MAX)
-                })
-            };
             audio.set_gain(if self.nature_muted {
                 0.0
             } else {
-                self.nature_volume * weather_duck
+                self.nature_volume
             });
         }
+        // The wind bed swells in gusts and drops in lulls with the shared wind
+        // schedule; full strength is the old constant level.
+        let wind_gain = (0.3 + 0.7 * self.weather_wind).clamp(0.0, 1.0);
         let weather_mix = self.latest_weather.as_ref().map_or_else(Vec::new, |state| {
-            self.biome_audio.weather_mix(
-                state.kind as u8,
-                f32::from(state.precipitation_q16) / f32::from(u16::MAX),
-            )
+            let windy = matches!(
+                state.kind,
+                spall_protocol::WeatherKind::Blizzard | spall_protocol::WeatherKind::HighWind
+            );
+            self.biome_audio
+                .weather_mix(
+                    state.kind as u8,
+                    f32::from(state.precipitation_q16) / f32::from(u16::MAX),
+                )
+                .into_iter()
+                .map(|(path, gain)| {
+                    let gain = if windy { gain * wind_gain } else { gain };
+                    (path, (gain * 20.0).round() / 20.0)
+                })
+                .collect()
         });
         if let Some(audio) = &self.weather_audio {
             if self
@@ -379,7 +399,10 @@ impl InteractiveApp {
             audio.set_gain(if self.weather_muted {
                 0.0
             } else {
-                self.weather_volume * (0.25 + 0.75 * self.weather_exposure)
+                // Under water the weather is a muffled thud at most.
+                self.weather_volume
+                    * (0.25 + 0.75 * self.weather_exposure)
+                    * (1.0 - 0.93 * self.weather_submerge)
             });
             if weather_mix != self.weather_mix && audio.set_mix(weather_mix.clone()).is_ok() {
                 self.weather_mix = weather_mix;
@@ -458,6 +481,7 @@ impl InteractiveApp {
                     let field = self.ambience_field.as_ref()?;
                     let grid = self.ambience_grid.as_ref()?;
                     Some(crate::audio::ambience_mix(
+                        weather_duck,
                         field,
                         grid,
                         position,

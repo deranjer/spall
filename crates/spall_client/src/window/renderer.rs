@@ -8,6 +8,11 @@ pub(crate) struct WorldRenderer {
     pub(super) weather_presentation: crate::weather::WeatherPresentation,
     weather_render_at: Instant,
     pub(super) weather_exposure: f32,
+    /// The drawn camera eye is under water (set by the caller each frame).
+    pub(super) eye_submerged: bool,
+    /// Eased 0..1 submersion and the shared wind strength, for weather audio.
+    pub(super) weather_submerge: f32,
+    pub(super) weather_wind: f32,
     pub(super) weather_effects_enabled: bool,
     pub(super) ground_snow_enabled: bool,
     pub(super) snow_frames: Vec<std::sync::Arc<spall_protocol::SnowSurfaceFrame>>,
@@ -378,6 +383,9 @@ impl WorldRenderer {
             weather_presentation: crate::weather::WeatherPresentation::new(),
             weather_render_at: Instant::now(),
             weather_exposure: 1.0,
+            eye_submerged: false,
+            weather_submerge: 0.0,
+            weather_wind: 0.0,
             weather_effects_enabled: true,
             ground_snow_enabled: true,
             reduced_weather_flashes: false,
@@ -804,6 +812,7 @@ impl WorldRenderer {
                 .set_enabled(self.weather_effects_enabled);
             self.weather_presentation
                 .set_reduced_flashes(self.reduced_weather_flashes);
+            self.weather_presentation.set_submerged(self.eye_submerged);
             let weather_now = Instant::now();
             let weather_dt = weather_now
                 .duration_since(self.weather_render_at)
@@ -823,6 +832,8 @@ impl WorldRenderer {
                 self.scene
                     .set_weather_particles(frame.particles, frame.lighting)
                     .map_err(|error| ClientError::Render(error.to_string()))?;
+                self.weather_submerge = self.weather_presentation.submerge();
+                self.weather_wind = self.weather_presentation.wind_strength();
             } else {
                 self.scene
                     .set_weather_particles(&[], spall_render::WeatherLighting::default())

@@ -4,7 +4,7 @@
 
 use glam::Vec3;
 use spall_core::GlobalCell;
-use spall_protocol::{WeatherKind, WeatherState};
+use spall_protocol::{WeatherKind, WeatherState, Wind, wind_at};
 use spall_render::{Camera, WeatherLighting, WeatherParticle};
 use spall_voxel::{Sample, Volume};
 
@@ -41,8 +41,15 @@ pub struct WeatherPresentation {
     last_camera: Option<Vec3>,
     last_epoch: Option<u64>,
     phase_seconds: f64,
-    /// Drives the wind veer and gusts; unlike `phase_seconds` it survives a teleport.
-    wind_clock: f64,
+    /// The snapshot clock the wind schedule is anchored to, and local seconds since
+    /// that snapshot arrived. Unlike `phase_seconds` they survive a teleport.
+    clock_anchor_ms: Option<u64>,
+    clock_since_s: f64,
+    /// Latest wind strength (0..1) from the shared schedule, for audio.
+    wind_strength: f32,
+    /// Camera eye is below the water surface; `submerge` eases toward it.
+    submerged: bool,
+    submerge: f32,
     /// Integrated wind drift of the flake lattice, metres (x, z).
     drift: [f64; 2],
     exposure_cache_key: Option<(i64, i64, i64, u64)>,
@@ -61,7 +68,11 @@ impl Default for WeatherPresentation {
             last_camera: None,
             last_epoch: None,
             phase_seconds: 0.0,
-            wind_clock: 0.0,
+            clock_anchor_ms: None,
+            clock_since_s: 0.0,
+            wind_strength: 0.0,
+            submerged: false,
+            submerge: 0.0,
             drift: [0.0; 2],
             exposure_cache_key: None,
             exposure_grid: [false; GRID_SIDE * GRID_SIDE],
@@ -90,6 +101,22 @@ impl WeatherPresentation {
         }
     }
 
+    /// Whether the camera eye is under water. Weather effects fade out while it
+    /// is, and come back as it surfaces.
+    pub fn set_submerged(&mut self, submerged: bool) {
+        self.submerged = submerged;
+    }
+
+    /// 0 above water to 1 fully submerged (eased); audio muffles with it.
+    pub fn submerge(&self) -> f32 {
+        self.submerge
+    }
+
+    /// Wind strength 0..1 of the shared schedule at the last update.
+    pub fn wind_strength(&self) -> f32 {
+        self.wind_strength
+    }
+
     pub fn set_reduced_flashes(&mut self, reduced: bool) {
         self.reduced_flashes = reduced;
     }
@@ -99,7 +126,10 @@ impl WeatherPresentation {
         self.last_camera = None;
         self.last_epoch = None;
         self.phase_seconds = 0.0;
-        self.wind_clock = 0.0;
+        self.clock_anchor_ms = None;
+        self.clock_since_s = 0.0;
+        self.wind_strength = 0.0;
+        self.submerge = 0.0;
         self.drift = [0.0; 2];
         self.exposure_cache_key = None;
         self.exposure_grid = [false; GRID_SIDE * GRID_SIDE];
@@ -134,7 +164,16 @@ impl WeatherPresentation {
         self.last_camera = Some(position);
         self.last_epoch = Some(state.world_epoch);
         self.phase_seconds += f64::from(dt_seconds.clamp(0.0, 0.1));
-        self.wind_clock += f64::from(dt_seconds.clamp(0.0, 0.1));
+        if self.clock_anchor_ms != Some(state.clock_ms) {
+            self.clock_anchor_ms = Some(state.clock_ms);
+            self.clock_since_s = 0.0;
+        } else {
+            self.clock_since_s += f64::from(dt_seconds.clamp(0.0, 0.1));
+        }
+        let ease = 1.0 - (-dt_seconds.clamp(0.0, 0.1) * 4.0).exp();
+        let submerge_target = if self.submerged { 1.0 } else { 0.0 };
+        self.submerge += (submerge_target - self.submerge) * ease;
+        let fade = 1.0 - self.submerge;
         let cell_m = volume.cell_size().metres() as f32;
         let cache_key = (
             (position.x / cell_m).floor() as i64,
@@ -197,15 +236,17 @@ impl WeatherPresentation {
         let snow = matches!(state.kind, WeatherKind::Snow | WeatherKind::Blizzard);
         let blizzard = state.kind == WeatherKind::Blizzard;
         let storm = state.kind == WeatherKind::Storm;
-        // Veering and gusting are presentation only, seeded from the weather seed so
-        // every client draws the same pattern; snow tiers get gentler versions.
-        let wind_sample = wind_sample(
+        // One shared schedule of the weather seed and clock: every client (and the
+        // server) sees the same heading and strength at the same moment.
+        let wind_now = wind_at(
             state.weather_seed,
-            self.wind_clock,
-            if blizzard { 1.0 } else { 0.3 },
+            state.clock_ms as f64 / 1000.0 + self.clock_since_s,
         );
-        let pulse = wind_sample.surge;
-        let desired = if self.precipitation > 0.005 {
+        self.wind_strength = wind_now.strength;
+        let pulse = wind_now.strength;
+        let desired = if fade < 0.02 {
+            0
+        } else if self.precipitation > 0.005 {
             let per_precip = match state.kind {
                 WeatherKind::Blizzard => BLIZZARD_PER_PRECIP,
                 WeatherKind::Snow => SNOW_PER_PRECIP,
@@ -218,18 +259,9 @@ impl WeatherPresentation {
             0
         }
         .min(MAX_WEATHER_PARTICLES);
-        let mut wind_direction = Vec3::new(
-            f32::from(state.wind_x_q15) / 32767.0,
-            0.0,
-            f32::from(state.wind_z_q15) / 32767.0,
-        )
-        .normalize_or_zero();
-        if snow {
-            wind_direction = glam::Quat::from_rotation_y(wind_sample.yaw_rad) * wind_direction;
-        }
+        let wind_direction = Vec3::new(wind_now.direction[0], 0.0, wind_now.direction[1]);
         let is_wind_cue = state.kind == WeatherKind::HighWind && self.precipitation <= 0.005;
-        let gust = self.wind;
-        let velocity = precipitation_velocity(state.kind, gust, wind_direction, wind_sample);
+        let velocity = precipitation_velocity(state.kind, wind_direction, &wind_now);
         let dt = f64::from(dt_seconds.clamp(0.0, 0.1));
         self.drift[0] += f64::from(velocity.x) * dt;
         self.drift[1] += f64::from(velocity.z) * dt;
@@ -271,9 +303,9 @@ impl WeatherPresentation {
             } else {
                 if blizzard {
                     // Turbulence: each streak swirls on its own slow circle.
-                    let t = self.wind_clock;
+                    let t = self.phase_seconds;
                     let amp =
-                        f64::from(0.3 + 0.6 * field(h2, 0)) * f64::from(0.5 + wind_sample.surge);
+                        f64::from(0.3 + 0.6 * field(h2, 0)) * f64::from(0.4 + wind_now.strength);
                     let w = f64::from(0.8 + 1.6 * field(h2, 16));
                     wx += amp * (t * w + f64::from(field(h2, 32)) * std::f64::consts::TAU).sin();
                     wz += amp
@@ -303,13 +335,13 @@ impl WeatherPresentation {
                 1.0
             };
             let colour = if is_wind_cue {
-                [0.72, 0.78, 0.81, 0.24]
+                [0.72, 0.78, 0.81, 0.24 * fade]
             } else if blizzard {
-                [0.92, 0.96, 1.0, 0.7 * near]
+                [0.92, 0.96, 1.0, 0.7 * near * fade]
             } else if snow {
-                [0.92, 0.96, 1.0, 0.85 * near]
+                [0.92, 0.96, 1.0, 0.85 * near * fade]
             } else {
-                [0.58, 0.72, 0.9, if storm { 0.64 } else { 0.48 }]
+                [0.58, 0.72, 0.9, if storm { 0.64 } else { 0.48 } * fade]
             };
             let (length_m, width_m) = if is_wind_cue {
                 (0.8, 0.07)
@@ -332,17 +364,18 @@ impl WeatherPresentation {
         let lightning_age_ticks = state.effective_tick.saturating_sub(state.lightning_tick);
         const FLASH_TICKS: u64 = 11; // about 0.18 s at 60 Hz
         let flash = if storm && state.lightning_id != 0 && lightning_age_ticks < FLASH_TICKS {
-            (1.0 - lightning_age_ticks as f32 / FLASH_TICKS as f32) * 0.08 * exposure
+            (1.0 - lightning_age_ticks as f32 / FLASH_TICKS as f32) * 0.08 * exposure * fade
         } else {
             0.0
         };
         let lighting = WeatherLighting {
             exposure,
-            precipitation: self.precipitation,
-            wind: self.wind,
-            visibility: snow_visibility(blizzard, self.precipitation, pulse, exposure),
+            precipitation: self.precipitation * fade,
+            wind: self.wind * fade,
+            visibility: 1.0
+                - (1.0 - snow_visibility(blizzard, self.precipitation, pulse, exposure)) * fade,
             storm_dimming: if storm {
-                self.precipitation * 0.22 * exposure
+                self.precipitation * 0.22 * exposure * fade
             } else {
                 0.0
             },
@@ -355,63 +388,27 @@ impl WeatherPresentation {
     }
 }
 
-/// One instant of the presentation-side wind variation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct WindSample {
-    /// Veer of the wind direction about +Y, radians.
-    yaw_rad: f32,
-    /// Blizzard driving speed, 6-16 m/s.
-    speed_mps: f32,
-    /// 0..1 gust strength; also drives the whiteout pulse.
-    surge: f32,
-}
-
-const MAX_VEER_RAD: f32 = 35.0 * std::f32::consts::PI / 180.0;
-
-/// Wind veer and gusts as a smooth, bounded function of seed and time. The
-/// direction wanders up to `35 deg * veer_scale` over tens of seconds, gusts
-/// surge every few seconds, and the speed rides them between 6 and 16 m/s.
-fn wind_sample(seed: u64, t: f64, veer_scale: f32) -> WindSample {
-    let tau = std::f64::consts::TAU;
-    let phase = |salt: u64| (hash(seed ^ salt) >> 11) as f64 / (1u64 << 53) as f64 * tau;
-    let veer =
-        0.6 * (t * tau / 47.0 + phase(0xA1)).sin() + 0.4 * (t * tau / 23.0 + phase(0xA2)).sin();
-    let surge = 0.5
-        + 0.5 * (t * tau / 5.3 + phase(0xA3) + 1.1 * (t * tau / 13.7 + phase(0xA4)).sin()).sin();
-    let surge = (surge * surge) as f32;
-    WindSample {
-        yaw_rad: veer as f32 * MAX_VEER_RAD * veer_scale.clamp(0.0, 1.0),
-        speed_mps: 6.0 + 10.0 * surge,
-        surge,
-    }
-}
-
 /// World-space velocity shared by particle drift and the visible ribbon axis.
 /// Normal precipitation remains distinctly downward; blizzards are driven
-/// nearly flat along the (veering, gusting) wind, and wind-only cues stay
-/// horizontal.
-fn precipitation_velocity(kind: WeatherKind, gust: f32, wind: Vec3, sample: WindSample) -> Vec3 {
-    let gust = gust.clamp(0.0, 1.0);
-    if kind == WeatherKind::HighWind {
-        return wind * (2.0 + gust * 6.0);
-    }
-    let (fall, drift) = match kind {
-        WeatherKind::Rain => (13.0, gust * 1.8),
-        WeatherKind::Storm => (13.0, gust * 2.8),
-        WeatherKind::Snow => (1.25, (0.25 + gust * 0.5) * (0.6 + 0.8 * sample.surge)),
-        // Driving snow: 6-16 m/s along the wind with only a slow fall.
-        WeatherKind::Blizzard => (1.0, sample.speed_mps),
-        WeatherKind::Clear | WeatherKind::HighWind => (0.0, 0.0),
+/// nearly flat along the wind in gusts and fall almost straight in lulls, and
+/// wind-only cues stay horizontal.
+fn precipitation_velocity(kind: WeatherKind, direction: Vec3, wind: &Wind) -> Vec3 {
+    let drift = wind.speed_mps(kind);
+    let fall = match kind {
+        WeatherKind::Rain | WeatherKind::Storm => 13.0,
+        WeatherKind::Snow => 1.25,
+        WeatherKind::Blizzard => 1.0,
+        WeatherKind::Clear | WeatherKind::HighWind => 0.0,
     };
-    Vec3::new(wind.x * drift, -fall, wind.z * drift)
+    Vec3::new(direction.x * drift, -fall, direction.z * drift)
 }
 
-/// Camera visibility: heavy snow thins the air somewhat, a blizzard pulses between about
-/// 0.30 and `WHITEOUT_VISIBILITY` with the gusts. Sheltered cameras see clear air.
+/// Camera visibility: heavy snow thins the air somewhat, a blizzard thins in lulls (about
+/// 0.6) and closes to `WHITEOUT_VISIBILITY` in strong gusts (`pulse` is the wind strength). Sheltered cameras see clear air.
 fn snow_visibility(blizzard: bool, precipitation: f32, pulse: f32, exposure: f32) -> f32 {
     let loss = if blizzard {
         let severity = (precipitation / 0.95).clamp(0.0, 1.0);
-        (1.0 - WHITEOUT_VISIBILITY) * severity * (0.82 + 0.18 * pulse)
+        (1.0 - WHITEOUT_VISIBILITY) * severity * (0.5 + 0.5 * pulse)
     } else {
         // Light and medium (0.5) snow stay clear; heavy (0.85) loses 0.3.
         0.3 * ((precipitation - 0.5) / 0.35).clamp(0.0, 1.0)
@@ -682,40 +679,47 @@ mod tests {
     fn precipitation_velocity_matches_downward_fall_and_wind_drift() {
         let cardinal = Vec3::X;
         let diagonal = Vec3::new(1.0, 0.0, 1.0).normalize();
-        let sample = WindSample {
-            yaw_rad: 0.0,
-            speed_mps: 11.0,
-            surge: 0.5,
+        let gust = Wind {
+            direction: [1.0, 0.0],
+            strength: 0.9,
         };
-        let rain = precipitation_velocity(WeatherKind::Rain, 0.9, cardinal, sample);
-        let snow = precipitation_velocity(WeatherKind::Snow, 0.2, diagonal, sample);
-        let blizzard = precipitation_velocity(WeatherKind::Blizzard, 0.9, diagonal, sample);
+        let lull = Wind {
+            strength: 0.0,
+            ..gust
+        };
+        let rain = precipitation_velocity(WeatherKind::Rain, cardinal, &gust);
+        let snow = precipitation_velocity(WeatherKind::Snow, diagonal, &gust);
+        let blizzard = precipitation_velocity(WeatherKind::Blizzard, diagonal, &gust);
         let slope = |velocity: Vec3| velocity.x.hypot(velocity.z) / -velocity.y;
 
         assert!(rain.y < 0.0 && rain.x > 0.0 && rain.z == 0.0);
         assert!(
-            rain.y / rain.length() < -0.99,
+            rain.y / rain.length() < -0.95,
             "normal rain must read as falling: {rain:?}"
         );
-        assert!(
-            slope(rain) < 0.13,
-            "normal rain has only modest slant: {rain:?}"
-        );
         assert!(snow.y < 0.0 && snow.x > 0.0 && snow.z > 0.0);
-        assert!(
-            snow.y / snow.length() < -0.9,
-            "normal snow stays downward: {snow:?}"
-        );
+        assert!(slope(snow) < 2.5, "snow gusts stay moderate: {snow:?}");
         assert!(
             slope(blizzard) > 5.0,
-            "blizzard is driven near-flat: {blizzard:?}"
+            "a blizzard gust is driven near-flat: {blizzard:?}"
         );
         let speed = blizzard.x.hypot(blizzard.z);
-        assert!((6.0..=16.0).contains(&speed), "driving speed {speed}");
+        assert!((10.0..=18.0).contains(&speed), "driving speed {speed}");
+        assert!(
+            slope(precipitation_velocity(
+                WeatherKind::Blizzard,
+                diagonal,
+                &lull
+            )) < 0.05,
+            "a lull falls straight down"
+        );
 
-        let wind_only = precipitation_velocity(WeatherKind::HighWind, 0.9, diagonal, sample);
+        let wind_only = precipitation_velocity(WeatherKind::HighWind, diagonal, &lull);
         assert_eq!(wind_only.y, 0.0);
-        assert!(wind_only.x > 0.0 && wind_only.z > 0.0);
+        assert!(
+            wind_only.x > 0.0 && wind_only.z > 0.0,
+            "streaks keep an axis"
+        );
     }
 
     fn count(kind: WeatherKind, precipitation: u16, wind: u16) -> usize {
@@ -750,7 +754,7 @@ mod tests {
     fn blizzard_whiteout_pulses_with_gusts_and_heavy_snow_only_thins_the_air() {
         let calm = snow_visibility(true, 0.95, 0.0, 1.0);
         let gust = snow_visibility(true, 0.95, 1.0, 1.0);
-        assert!(gust < calm && gust <= WHITEOUT_VISIBILITY + 0.01 && calm < 0.35);
+        assert!(gust < calm && gust <= WHITEOUT_VISIBILITY + 0.01 && calm > 0.5);
         assert_eq!(
             snow_visibility(true, 0.95, 1.0, 0.0),
             1.0,
@@ -777,49 +781,42 @@ mod tests {
     }
 
     #[test]
-    fn wind_veers_and_gusts_within_bounds_deterministically_and_smoothly() {
-        let seed = 0x5EED;
-        let (mut min_speed, mut max_speed) = (f32::MAX, f32::MIN);
-        let (mut min_yaw, mut max_yaw) = (f32::MAX, f32::MIN);
-        let mut previous = wind_sample(seed, 0.0, 1.0);
-        for step in 1..=12_000 {
-            let t = f64::from(step) * 0.05;
-            let sample = wind_sample(seed, t, 1.0);
-            assert_eq!(sample, wind_sample(seed, t, 1.0));
-            assert!(
-                (6.0..=16.0).contains(&sample.speed_mps),
-                "{}",
-                sample.speed_mps
-            );
-            assert!(sample.yaw_rad.abs() <= MAX_VEER_RAD + 1e-6);
-            assert!((0.0..=1.0).contains(&sample.surge));
-            assert!(
-                (sample.speed_mps - previous.speed_mps).abs() < 2.5,
-                "gusts are smooth"
-            );
-            assert!(
-                (sample.yaw_rad - previous.yaw_rad).abs() < 0.03,
-                "veer is smooth"
-            );
-            previous = sample;
-            min_speed = min_speed.min(sample.speed_mps);
-            max_speed = max_speed.max(sample.speed_mps);
-            min_yaw = min_yaw.min(sample.yaw_rad);
-            max_yaw = max_yaw.max(sample.yaw_rad);
+    fn submerged_camera_drops_weather_effects_and_restores_them_on_surfacing() {
+        let v = known_air();
+        let mut p = WeatherPresentation::new();
+        let mut s = state(WeatherKind::Storm, u16::MAX);
+        s.lightning_id = 1;
+        s.lightning_tick = 1;
+        p.set_reduced_flashes(false);
+        for _ in 0..120 {
+            p.update(&s, &camera(), 1.0 / 60.0, &v);
         }
-        assert!(
-            max_speed - min_speed > 7.0,
-            "gusts surge: {min_speed}..{max_speed}"
-        );
-        assert!(
-            max_yaw - min_yaw > 0.8,
-            "direction veers: {min_yaw}..{max_yaw}"
-        );
-        assert_ne!(wind_sample(seed, 9.0, 1.0), wind_sample(seed + 1, 9.0, 1.0));
-        // Snow tiers swing less.
-        let gentle = (0..2_000)
-            .map(|i| wind_sample(seed, f64::from(i) * 0.1, 0.3).yaw_rad.abs())
-            .fold(0.0, f32::max);
-        assert!(gentle <= MAX_VEER_RAD * 0.3 + 1e-6);
+        let dry = p.update(&s, &camera(), 1.0 / 60.0, &v);
+        assert!(!dry.particles.is_empty() && dry.lighting.storm_dimming > 0.0);
+
+        p.set_submerged(true);
+        for _ in 0..120 {
+            p.update(&s, &camera(), 1.0 / 60.0, &v);
+        }
+        let wet = p.update(&s, &camera(), 1.0 / 60.0, &v);
+        assert!(wet.particles.is_empty());
+        assert!(wet.lighting.storm_dimming < 1e-3);
+        assert!(wet.lighting.lightning_flash < 1e-3);
+        assert!(p.submerge() > 0.99);
+
+        let mut b = state(WeatherKind::Blizzard, u16::MAX);
+        b.weather_seed = s.weather_seed;
+        let mut q = WeatherPresentation::new();
+        q.set_submerged(true);
+        for _ in 0..120 {
+            q.update(&b, &camera(), 1.0 / 60.0, &v);
+        }
+        assert!(q.update(&b, &camera(), 1.0 / 60.0, &v).lighting.visibility > 0.99);
+
+        p.set_submerged(false);
+        for _ in 0..120 {
+            p.update(&s, &camera(), 1.0 / 60.0, &v);
+        }
+        assert!(!p.update(&s, &camera(), 1.0 / 60.0, &v).particles.is_empty());
     }
 }

@@ -232,6 +232,15 @@ pub fn config() -> BiomeAudioConfig {
         ],
         thunder: Some(root.join("weather/thunder-clap.ogg")),
         ranges_m: TRACK_NAMES.iter().map(|name| track_range_m(name)).collect(),
+        water_tracks: TRACK_NAMES
+            .iter()
+            .map(|name| {
+                matches!(
+                    *name,
+                    "riparian-stream.ogg" | "ocean-waves.ogg" | "beach-waves.ogg"
+                )
+            })
+            .collect(),
         footsteps: footsteps(&root),
     }
 }

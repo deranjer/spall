@@ -194,6 +194,12 @@ pub(super) fn player_swims(
     )
 }
 
+/// Whether a camera eye at height `eye_y` is below the water `sample` (the water
+/// at the eye's column, as `sample_at_m` reports it).
+pub(super) fn eye_below_surface(sample: Option<spall_physics::WaterSample>, eye_y: f64) -> bool {
+    sample.is_some_and(|water| eye_y < water.surface_y)
+}
+
 pub(super) fn srgb_to_linear(channel: u8) -> f32 {
     let v = f32::from(channel) / 255.0;
     if v <= 0.04045 {
@@ -212,6 +218,19 @@ pub(super) const CAMERA_Z_FAR_M: f32 = 300.0;
 mod tests {
     use super::*;
     use crate::window::test_support::view;
+
+    #[test]
+    fn eye_below_surface_needs_water_above_the_eye() {
+        let water = |surface_y| {
+            Some(spall_physics::WaterSample {
+                surface_y,
+                flow_m_s: [0.0; 2],
+            })
+        };
+        assert!(eye_below_surface(water(10.0), 9.9));
+        assert!(!eye_below_surface(water(10.0), 10.1));
+        assert!(!eye_below_surface(None, -50.0));
+    }
 
     #[test]
     fn camera_interpolation_does_not_overshoot_and_jerk_back_at_a_stop() {

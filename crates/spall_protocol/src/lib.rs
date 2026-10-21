@@ -40,7 +40,7 @@ pub mod water;
 pub mod weather;
 pub use weather::{
     SnowTier, WEATHER_PROFILE_MS, WEATHER_TRANSITION_MS, WeatherClock, WeatherClockSource,
-    WeatherError, WeatherKind, WeatherSnapshot, WeatherState,
+    WeatherError, WeatherKind, WeatherSnapshot, WeatherState, Wind, wind_at,
 };
 
 pub use input::{frame_input, player_entity, recent_input, session_player_entity};
