@@ -194,6 +194,10 @@ ENG-210 subsequently implements the bounded per-source-part kinematic rig,
 continuous occupied-cell transition queries, same-world solver substeps and
 qualified source-contact witnesses. The coordinator integration checks and
 limits are recorded in [ENG-210 integration](reports/ENG-210-integration.md).
+Witness capture is compiled only for tests and the `spall_physics`
+`contact-witnesses` feature (2026-10-21): no game system reads it, and in the
+live 1 km world it cost 9–12 ms of every server tick with ~40 animals, holding
+the server near 35 Hz.
 The original one-step counterexamples remain retained as diagnostic evidence;
 the new substep candidate does not make the default one-step solver continuous.
 

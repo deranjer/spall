@@ -942,6 +942,7 @@ fn grid_origin_offset_m(grid: &OccupancyGrid, cell_m: f32) -> [f32; 3] {
 /// exterior axis-aligned voxel face. This deliberately leaves diagonal,
 /// shared, edge, corner, and penetrating contacts unattributed; no rounding or
 /// nearest-cell fallback is used.
+#[cfg(any(test, feature = "contact-witnesses"))]
 fn resolve_source_cell_witness(
     grid: &OccupancyGrid,
     cell_m: f32,
@@ -1293,7 +1294,12 @@ pub struct PhysicsWorld {
     /// including after their owner is retired.
     fracture_owner_keys: HashMap<u128, BodyId>,
     step_count: u64,
+    /// Source-cell attribution of articulated contacts, for tests and
+    /// evidence only: no game system reads it, and capturing it walks every
+    /// contact manifold each substep (about 10 ms a tick with 40 animals).
+    #[cfg(any(test, feature = "contact-witnesses"))]
     articulated_contact_witnesses: Vec<ArticulatedContactWitness>,
+    #[cfg(any(test, feature = "contact-witnesses"))]
     contact_witness_overflow: u64,
     /// Collider handles added/rebuilt/removed since the last [`Self::step`]
     /// or [`Self::sync_queries`] — see [`Self::sync_queries`]'s doc for why
@@ -1399,7 +1405,9 @@ impl PhysicsWorld {
             restored_velocity_based_owners: Vec::new(),
             fracture_owner_keys: HashMap::new(),
             step_count: 0,
+            #[cfg(any(test, feature = "contact-witnesses"))]
             articulated_contact_witnesses: Vec::new(),
+            #[cfg(any(test, feature = "contact-witnesses"))]
             contact_witness_overflow: 0,
             pending_modified: Vec::new(),
             pending_removed: Vec::new(),
@@ -1483,11 +1491,15 @@ impl PhysicsWorld {
             })
             .collect::<Vec<_>>();
         let mut pipeline = Duration::ZERO;
+        #[allow(unused_mut)]
         let mut contact_witness_capture = Duration::ZERO;
         let mut normal_impulse_n_s = 0.0_f32;
         let mut impulse_pair_substeps = 0;
-        self.articulated_contact_witnesses.clear();
-        self.contact_witness_overflow = 0;
+        #[cfg(any(test, feature = "contact-witnesses"))]
+        {
+            self.articulated_contact_witnesses.clear();
+            self.contact_witness_overflow = 0;
+        }
         self.params.dt = outer_dt / substeps as f32;
         for substep in 0..substeps {
             let fraction = (substep + 1) as f32 / substeps as f32;
@@ -1521,9 +1533,12 @@ impl PhysicsWorld {
                 &(),
             );
             pipeline += start.elapsed();
-            let capture_start = Instant::now();
-            self.capture_articulated_contact_witnesses(substep, substeps);
-            contact_witness_capture += capture_start.elapsed();
+            #[cfg(any(test, feature = "contact-witnesses"))]
+            {
+                let capture_start = Instant::now();
+                self.capture_articulated_contact_witnesses(substep, substeps);
+                contact_witness_capture += capture_start.elapsed();
+            }
             for pair in self.narrow_phase.contact_pairs() {
                 let impulse = pair.total_impulse_magnitude();
                 if pair.has_any_active_contact() && impulse.is_finite() && impulse > 0.0 {

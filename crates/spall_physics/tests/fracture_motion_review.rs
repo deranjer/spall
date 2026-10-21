@@ -143,6 +143,7 @@ fn translated_rotating_split_preserves_point_velocities_momenta_and_moving_sourc
 }
 
 #[test]
+#[cfg(feature = "contact-witnesses")]
 fn nonprimary_fragment_contacts_and_witnesses_retain_the_logical_owner() {
     for representation in [Representation::NativeVoxels, Representation::MergedCuboids] {
         let mut world = PhysicsWorld::new(PhysicsConfig {
