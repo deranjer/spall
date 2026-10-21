@@ -450,7 +450,11 @@ pub(super) fn draw_body_reminders(
     }
     yakui::align(yakui::Alignment::BOTTOM_RIGHT, || {
         yakui::pad(yakui::widgets::Pad::all(24.0), || {
-            yakui::row(|| {
+            // A default row fills the screen width and packs its icons at the
+            // left; shrink it to its icons so the corner alignment holds.
+            let mut row = yakui::widgets::List::row();
+            row.main_axis_size = yakui::MainAxisSize::Min;
+            row.show(|| {
                 for (icon, (cue, opacity)) in icons.iter().zip(reminders).rev() {
                     if *opacity <= 0.0 {
                         continue;
