@@ -33,6 +33,13 @@ pub(super) struct InteractiveApp {
     pub(super) ground_snow_enabled: bool,
     pub(super) reduced_weather_flashes: bool,
     pub(super) weather_exposure: f32,
+    /// Felt cold and wetness, shown as a screen grade (`body_state`).
+    pub(super) body_state: BodyState,
+    /// Admin-menu previews of looks for stats the game does not model yet.
+    pub(super) body_preview: BodyPreview,
+    pub(super) body_state_at: Option<Instant>,
+    /// Clock for the screen grade's heartbeat pulse.
+    pub(super) body_epoch: Instant,
     /// When the last frame was requested, for the uncapped frame limiter.
     pub(super) last_redraw: Instant,
     /// Scripted camera tour (`--shots`); empty for normal play.
@@ -234,6 +241,10 @@ impl InteractiveApp {
             ground_snow_enabled: true,
             reduced_weather_flashes: false,
             weather_exposure: 1.0,
+            body_state: BodyState::default(),
+            body_preview: BodyPreview::default(),
+            body_state_at: None,
+            body_epoch: Instant::now(),
             last_redraw: Instant::now(),
             script: options.shots.into(),
             shots_dir: options.shots_dir,

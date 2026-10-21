@@ -11,6 +11,7 @@ use crate::environment::Environment;
 use crate::indirect::{IndirectPipeline, IndirectResources};
 use crate::instances::{CubeInstance, CubeVertex};
 use crate::scene::Material;
+use crate::screen_grade::ScreenGrade;
 use crate::sky_visibility::{SkyPipeline, SkyVisibility};
 use crate::vertex::GpuVertex;
 use crate::water::WaterField;
@@ -154,7 +155,12 @@ struct GpuMaterial {
 struct ToneGlobals {
     exposure: f32,
     debug_passthrough: f32,
-    _pad: [f32; 2],
+    saturation: f32,
+    edge_blur: f32,
+    /// `rgb` multiplies the graded colour; `w` is the edge frost amount.
+    tint_frost: [f32; 4],
+    /// `rgb` is the colour the screen edge fades to; `w` its strength.
+    vignette: [f32; 4],
 }
 
 #[repr(C)]
@@ -1277,13 +1283,40 @@ impl ScenePipeline {
         exposure: f32,
         debug_passthrough: bool,
     ) -> wgpu::BindGroup {
+        self.tone_bind_group_graded(
+            device,
+            queue,
+            hdr,
+            exposure,
+            debug_passthrough,
+            &ScreenGrade::IDENTITY,
+        )
+    }
+
+    /// [`Self::tone_bind_group`] with a full-screen `grade` applied after tone
+    /// mapping. Debug views ignore the grade.
+    pub fn tone_bind_group_graded(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        hdr: &wgpu::TextureView,
+        exposure: f32,
+        debug_passthrough: bool,
+        grade: &ScreenGrade,
+    ) -> wgpu::BindGroup {
+        let grade = grade.clamped();
+        let [tr, tg, tb] = grade.tint;
+        let [vr, vg, vb] = grade.vignette_color;
         queue.write_buffer(
             &self.tone_globals_buffer,
             0,
             bytemuck::bytes_of(&ToneGlobals {
                 exposure,
                 debug_passthrough: u8::from(debug_passthrough) as f32,
-                _pad: [0.0; 2],
+                saturation: grade.saturation,
+                edge_blur: grade.edge_blur,
+                tint_frost: [tr, tg, tb, grade.frost],
+                vignette: [vr, vg, vb, grade.vignette],
             }),
         );
         device.create_bind_group(&wgpu::BindGroupDescriptor {

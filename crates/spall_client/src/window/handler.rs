@@ -634,6 +634,52 @@ impl ApplicationHandler for InteractiveApp {
                         if let Some(path) = self.pending_capture.take() {
                             renderer.screenshot_request = Some(path);
                         }
+                        // Body state: eased from the weather, shelter and
+                        // water the client already sees, then shown as a
+                        // full-screen grade (presentation only).
+                        let body_now = Instant::now();
+                        let body_dt = self
+                            .body_state_at
+                            .map_or(0.0, |at| body_now.duration_since(at).as_secs_f32());
+                        self.body_state_at = Some(body_now);
+                        let submerged = fresh_view.is_some_and(|v| {
+                            let [x, y, z] = v.predicted.position_m;
+                            // Waist height: wading ankle-deep does not soak you.
+                            let waist = y + 0.9;
+                            self.session
+                                .column_surface
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .surface_at_m(x, waist, z)
+                                .is_some_and(|surface| surface > waist)
+                        });
+                        let conditions = BodyConditions {
+                            air_temperature_c: self
+                                .latest_weather
+                                .as_ref()
+                                .map_or(15.0, |w| f32::from(w.temperature_centi_c) / 100.0),
+                            exposure: self.weather_exposure,
+                            precipitation: self.latest_weather.as_ref().map_or(0.0, |w| {
+                                let amount = f32::from(w.precipitation_q16) / f32::from(u16::MAX);
+                                match w.kind {
+                                    spall_protocol::WeatherKind::Rain
+                                    | spall_protocol::WeatherKind::Storm => amount,
+                                    // Snow mostly brushes off.
+                                    spall_protocol::WeatherKind::Snow
+                                    | spall_protocol::WeatherKind::Blizzard => 0.3 * amount,
+                                    _ => 0.0,
+                                }
+                            }),
+                            submerged,
+                        };
+                        self.body_state.advance(&conditions, body_dt);
+                        renderer
+                            .scene
+                            .set_screen_grade(crate::body_state::screen_grade(
+                                &self.body_state,
+                                &self.body_preview,
+                                self.body_epoch.elapsed().as_secs_f32(),
+                            ));
                         let menu_view = self.admin_menu_open.then(|| {
                             let mut menu = admin_menu_view(
                                 &self.session,
@@ -689,6 +735,8 @@ impl ApplicationHandler for InteractiveApp {
                                 snow.rendered_faces, snow.max_depth_mm, snow.footprints,
                             );
                             menu.reduced_weather_flashes = self.reduced_weather_flashes;
+                            menu.body = self.body_state;
+                            menu.body_preview = self.body_preview;
                             menu
                         });
                         match renderer.finish_frame(
@@ -811,6 +859,19 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 if menu_actions.toggle_ground_snow {
                     self.ground_snow_enabled = !self.ground_snow_enabled;
+                }
+                let preview = &mut self.body_preview;
+                let delta = menu_actions.body_preview_delta;
+                for (look, step) in [
+                    (&mut preview.injury, delta.injury),
+                    (&mut preview.thirst, delta.thirst),
+                    (&mut preview.exhaustion, delta.exhaustion),
+                    (&mut preview.hunger, delta.hunger),
+                ] {
+                    *look = (*look + step).clamp(0.0, 1.0);
+                }
+                if menu_actions.clear_body_preview {
+                    *preview = BodyPreview::default();
                 }
                 if menu_actions.toggle_weather_flashes {
                     self.reduced_weather_flashes = !self.reduced_weather_flashes;

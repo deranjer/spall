@@ -350,6 +350,8 @@ pub(super) fn admin_menu_view(
         ground_snow_enabled: true,
         snow: String::new(),
         reduced_weather_flashes: false,
+        body: BodyState::default(),
+        body_preview: BodyPreview::default(),
     }
 }
 

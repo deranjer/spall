@@ -299,6 +299,8 @@ pub struct GameRenderer {
     weather_particles: Vec<WeatherParticle>,
     weather_cpu_vertices: Vec<WeatherVertex>,
     weather_lighting: WeatherLighting,
+    /// Applied by the tone-map pass; see [`Self::set_screen_grade`].
+    screen_grade: crate::ScreenGrade,
     /// The smoothed water surface sheet, drawn alpha-blended after the opaque
     /// scene.
     water_surface: DynamicMesh,
@@ -461,6 +463,7 @@ impl GameRenderer {
             weather_particles: Vec::new(),
             weather_cpu_vertices: Vec::with_capacity(crate::weather::MAX_WEATHER_PARTICLES * 6),
             weather_lighting: WeatherLighting::default(),
+            screen_grade: crate::ScreenGrade::IDENTITY,
             water_surface: DynamicMesh::new(device),
             water_grid: false,
             sky: None,
@@ -564,6 +567,12 @@ impl GameRenderer {
     /// `end_m` metres from the camera; see [`ScenePipeline::set_fog_range`].
     pub fn set_fog_range(&self, start_m: f32, end_m: f32) {
         self.pipeline.set_fog_range(start_m, end_m);
+    }
+
+    /// The full-screen grade later frames apply after tone mapping (the
+    /// shaded view only).
+    pub fn set_screen_grade(&mut self, grade: crate::ScreenGrade) {
+        self.screen_grade = grade;
     }
 
     pub fn set_terrain_meshes_visible(&mut self, visible: bool) {
@@ -1236,12 +1245,13 @@ impl GameRenderer {
             environment,
             &self.materials,
         );
-        let tone_bind = self.pipeline.tone_bind_group(
+        let tone_bind = self.pipeline.tone_bind_group_graded(
             device,
             queue,
             self.target.hdr_view(),
             environment.exposure,
             view != DebugView::Shaded,
+            &self.screen_grade,
         );
         let skybox_bind = (view == DebugView::Shaded)
             .then(|| self.pipeline.skybox_bind_group(queue, &camera, environment));
