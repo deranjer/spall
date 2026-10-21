@@ -83,8 +83,6 @@ pub struct SimulationConfig {
     pub column_water_worker: bool,
     pub vegetation: Option<spall_ecology::living::LivingState>,
     pub weather_seed: u64,
-    /// The game's snow material: near players, snow then also stacks as real terrain cells.
-    pub snow_layer_material: Option<spall_core::MaterialId>,
 }
 
 impl SimulationConfig {
@@ -103,7 +101,6 @@ impl SimulationConfig {
             column_water_worker: false,
             vegetation: None,
             weather_seed: 0,
-            snow_layer_material: None,
         }
     }
 }
@@ -152,7 +149,6 @@ pub struct Simulation {
     pub(crate) weather_dirty: bool,
     weather_seed: u64,
     pub(crate) snow: crate::snow::SnowState,
-    pub(crate) snow_layer: snow_layer::SnowLayer,
     snow_priority_tiles: Vec<(i32, i32)>,
     snow_priority_players: Vec<(i32, i32)>,
     snow_priority_refreshed_tick: u64,
@@ -209,7 +205,6 @@ mod edit_queries;
 mod helpers;
 mod players;
 mod snow_glue;
-pub(crate) mod snow_layer;
 mod tick;
 mod water;
 mod weather;

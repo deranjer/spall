@@ -150,8 +150,6 @@ impl Simulation {
             if let Some(g) = v.pending.remove(&request.0) {
                 v.state.acknowledge(g, &self.world.terrain().volume);
                 v.dirty = true;
-            } else if self.snow_layer.owns(request.0) {
-                // Snow layers rest on the cover; they do not destroy it.
             } else {
                 // An edit by a player or the world: whatever cover it reached
                 // is destroyed (see `ClearJob`).

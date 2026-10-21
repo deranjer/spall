@@ -98,7 +98,6 @@ impl Simulation {
             .advance(&self.weather, self.tick.get())
             .map_err(TickError::Snow)?;
         self.refresh_snow_from_report(&report);
-        self.advance_snow_layer(&report);
         drop(vegetation_span);
         // Bodies float: buoyancy and drag from the column water, before the
         // physics step that integrates them.
