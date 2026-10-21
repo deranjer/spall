@@ -63,6 +63,8 @@ pub struct BreathingRow {
     /// `true` loops the recording while the state lasts; `false` plays it once per
     /// entry into the state.
     pub looped: bool,
+    /// A recording played once, at `gain`, each time the state is entered.
+    pub onset: Option<PathBuf>,
 }
 
 /// The game's breathing table: one row per state.
@@ -86,7 +88,10 @@ impl BreathingAudio {
     /// `None` when audio is off or no row has a recording to play.
     pub fn start(config: &BreathingConfig, gain: f32) -> Option<Self> {
         if std::env::var_os("SPALL_AUDIO").is_some_and(|value| value == "0")
-            || !config.rows.iter().any(|row| row.path.is_some())
+            || !config
+                .rows
+                .iter()
+                .any(|row| row.path.is_some() || row.onset.is_some())
         {
             return None;
         }
@@ -132,6 +137,8 @@ fn run_breathing(rows: Vec<BreathingRow>, state: Arc<AtomicU8>, gain: Arc<Atomic
     // A recording that failed to load is reported once and left silent.
     let mut failed = vec![false; rows.len()];
     let mut last = Instant::now();
+    let mut previous = BreathingState::Calm;
+    let mut onsets: Vec<Sink> = Vec::new();
     loop {
         thread::sleep(UPDATE);
         // The owner dropped its handles: stop.
@@ -143,6 +150,23 @@ fn run_breathing(rows: Vec<BreathingRow>, state: Arc<AtomicU8>, gain: Arc<Atomic
         let now = Instant::now();
         let dt = now.saturating_duration_since(last).as_secs_f32();
         last = now;
+        onsets.retain(|sink| !sink.empty());
+        if current != previous {
+            previous = current;
+            for row in rows.iter().filter(|row| row.state == current) {
+                let Some(path) = &row.onset else { continue };
+                match load(stream.mixer(), path, false) {
+                    Ok(sink) => {
+                        sink.set_volume(row.gain * master);
+                        sink.play();
+                        onsets.push(sink);
+                    }
+                    Err(error) => {
+                        tracing::info!(state = ?row.state, %error, "breathing onset unavailable; skipped");
+                    }
+                }
+            }
+        }
         let blend = 1.0 - (-dt / FADE.as_secs_f32()).exp();
         for (index, row) in rows.iter().enumerate() {
             let target = if row.state == current { 1.0 } else { 0.0 };
@@ -180,6 +204,9 @@ fn run_breathing(rows: Vec<BreathingRow>, state: Arc<AtomicU8>, gain: Arc<Atomic
 fn load(mixer: &rodio::mixer::Mixer, path: &std::path::Path, looped: bool) -> Result<Sink, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let sink = Sink::connect_new(mixer);
+    if std::env::var_os("SPALL_BREATHING_LOG").is_some() {
+        eprintln!("spall-breathing: loaded {}", path.display());
+    }
     sink.set_volume(0.0);
     if looped {
         sink.append(Decoder::new_looped(file).map_err(|error| error.to_string())?);

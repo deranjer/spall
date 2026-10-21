@@ -39,3 +39,7 @@ These recordings were selected from local user-approved downloads. Runtime copie
 | foley/tile-walk.ogg | Nox_Sound (0-10 s) | [Original recording](https://freesound.org/people/Nox_Sound/sounds/555868/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | foley/tile-run.ogg | Nox_Sound (10-19 s) | [Original recording](https://freesound.org/people/Nox_Sound/sounds/555868/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | foley/water-wade.ogg | Bia12 (whole preview) | [Original recording](https://freesound.org/people/Bia12/sounds/583756/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| player/breathing-calm.ogg | giddster (0-28 s as a 25 s loop) | [Original recording](https://freesound.org/people/giddster/sounds/336532/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| player/breathing-exerted.ogg | Nox_Sound (4.7 s loop) | [Original recording](https://freesound.org/people/Nox_Sound/sounds/554907/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| player/breathing-exhausted.ogg | AbuNijmeh (21 s loop) | [Original recording](https://freesound.org/people/AbuNijmeh/sounds/319103/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| player/breathing-accent.ogg | BehanSean (single 2.4 s breath) | [Original recording](https://freesound.org/people/BehanSean/sounds/422342/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
