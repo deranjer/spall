@@ -420,17 +420,25 @@ impl ApplicationHandler for InteractiveApp {
                         self.sky_dirty = false;
                     }
                 }
-                if let Some(view) = &self.creature_view
-                    && let Some(replica) =
+                if let Some(view) = &self.creature_view {
+                    // The network thread holds the replica while it applies a
+                    // batch. Drawing no animals on such a frame made the whole
+                    // herd blink out; draw the last frame's cubes instead.
+                    if let Some(replica) =
                         self.session.replica.get().and_then(|r| r.try_lock().ok())
-                    && let Some(creatures) = replica.creatures()
-                    && !creatures.is_empty()
-                {
-                    overlay.extend(view.instances(
-                        creatures,
-                        replica.now_tick_estimate(),
-                        Instant::now(),
-                    ));
+                    {
+                        self.creature_overlay.clear();
+                        if let Some(creatures) = replica.creatures()
+                            && !creatures.is_empty()
+                        {
+                            self.creature_overlay.extend(view.instances(
+                                creatures,
+                                replica.now_tick_estimate(),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                    overlay.extend_from_slice(&self.creature_overlay);
                 }
                 let outcome = match renderer.begin_frame(None, &overlay) {
                     Ok(outcome) => outcome,

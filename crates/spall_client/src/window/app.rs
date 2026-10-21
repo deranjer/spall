@@ -13,6 +13,8 @@ pub(super) struct InteractiveApp {
     ambience: Option<AmbienceAudio>,
     pub(super) biome_audio: BiomeAudioConfig,
     pub(super) creature_view: Option<std::sync::Arc<dyn CreatureView>>,
+    /// The animal cubes last drawn, redrawn on a frame whose replica lock is busy.
+    pub(super) creature_overlay: Vec<spall_render::CubeInstance>,
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
@@ -215,6 +217,7 @@ impl InteractiveApp {
             ambience,
             biome_audio: options.biome_audio,
             creature_view: options.creature_view,
+            creature_overlay: Vec::new(),
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
