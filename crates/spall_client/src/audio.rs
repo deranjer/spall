@@ -19,12 +19,26 @@ const UPDATE: Duration = Duration::from_millis(25);
 pub struct BiomeAudioConfig {
     pub tracks: Vec<Option<PathBuf>>,
     pub labels: Vec<String>,
-    /// Weather beds indexed by the stable WeatherKind code; game-owned assets.
-    pub weather_tracks: Vec<Option<PathBuf>>,
+    /// Weather beds; game-owned assets. Several layers can play at once, each
+    /// for one WeatherKind code and one band of precipitation.
+    pub weather_layers: Vec<WeatherLayer>,
     pub thunder: Option<PathBuf>,
     /// How far (metres) each biome track carries, indexed like `tracks`. A track
     /// without an entry carries [`DEFAULT_RANGE_M`].
     pub ranges_m: Vec<f32>,
+    pub footsteps: crate::footsteps::FootstepConfig,
+}
+
+/// One looping weather bed: plays at `gain` while the weather is `kind` (the
+/// stable WeatherKind code) and its precipitation, 0..=1, lies in
+/// `precipitation_min..precipitation_max`.
+#[derive(Debug, Clone)]
+pub struct WeatherLayer {
+    pub kind: u8,
+    pub precipitation_min: f32,
+    pub precipitation_max: f32,
+    pub path: PathBuf,
+    pub gain: f32,
 }
 
 /// Distance at which a biome track has faded to silence unless configured.
@@ -69,6 +83,19 @@ pub fn biome_at(
 impl BiomeAudioConfig {
     pub fn track(&self, biome: u8) -> Option<&PathBuf> {
         self.tracks.get(usize::from(biome)).and_then(Option::as_ref)
+    }
+
+    /// The weather beds to play, with their gains, for a kind and precipitation.
+    pub fn weather_mix(&self, kind: u8, precipitation: f32) -> Vec<(PathBuf, f32)> {
+        self.weather_layers
+            .iter()
+            .filter(|layer| {
+                layer.kind == kind
+                    && precipitation >= layer.precipitation_min
+                    && precipitation < layer.precipitation_max
+            })
+            .map(|layer| (layer.path.clone(), layer.gain))
+            .collect()
     }
 
     pub fn range_m(&self, biome: u8) -> f32 {
@@ -220,14 +247,6 @@ impl AmbienceAudio {
             tx,
             one_shots,
             gain,
-        })
-    }
-
-    pub fn set_track(&self, path: Option<PathBuf>) -> Result<(), TrySendError<Option<PathBuf>>> {
-        let mix = path.iter().map(|path| (path.clone(), 1.0)).collect();
-        self.tx.try_send(mix).map_err(|error| match error {
-            TrySendError::Full(_) => TrySendError::Full(path.clone()),
-            TrySendError::Disconnected(_) => TrySendError::Disconnected(path.clone()),
         })
     }
 

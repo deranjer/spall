@@ -2,7 +2,7 @@
   "schema_version": 1,
   "provenance_report": "docs/reports/ENG-194-biome-audio.md",
   "source_archive": "artifacts/audio-research/download-audit.json",
-  "approved_original_count": 19,
+  "approved_original_count": 23,
   "auditioned": false,
   "weather_auto_play": false,
   "assets": [
@@ -24,7 +24,11 @@
     {"file":"weather/rain-on-leaves.ogg","kind":"weather","original":"terrestrial/584272__samsterbirdies__rain-on-leaves.flac","creator":"SamsterBirdies","license":"CC0 1.0","source":"https://freesound.org/people/SamsterBirdies/sounds/584272/","default":false},
     {"file":"weather/distant-thunder.ogg","kind":"weather","original":"terrestrial/361401__richwise__distant-thunder.wav","creator":"richwise","license":"CC0 1.0","source":"https://freesound.org/people/richwise/sounds/361401/","default":false},
     {"file":"weather/thunder-clap.ogg","kind":"weather","original":"terrestrial/465314__fission9__thunder.wav","creator":"Fission9","license":"CC0 1.0","source":"https://freesound.org/people/Fission9/sounds/465314/","default":false},
-    {"file":"weather/thunderstorm-bed.ogg","kind":"weather","original":"water-weather/rhumphries-thunderstorm.ogg","creator":"RHumphries","license":"CC BY 3.0","source":"https://commons.wikimedia.org/wiki/File:Rhumphries_-_rbh-thunder-storm.ogg","default":false}
+    {"file":"weather/thunderstorm-bed.ogg","kind":"weather","original":"water-weather/rhumphries-thunderstorm.ogg","creator":"RHumphries","license":"CC BY 3.0","source":"https://commons.wikimedia.org/wiki/File:Rhumphries_-_rbh-thunder-storm.ogg","default":false},
+    {"file":"weather/blizzard-howling-storm.ogg","kind":"weather","original":"505999_7846219-hq.mp3","creator":"DBlover","license":"CC0 1.0","source":"https://freesound.org/people/DBlover/sounds/505999/","default":false},
+    {"file":"weather/light-snow-night.ogg","kind":"weather","original":"845502_14079354-hq.mp3","creator":"TSP-Talk","license":"CC0 1.0","source":"https://freesound.org/people/TSP-Talk/sounds/845502/","default":false},
+    {"file":"weather/arctic-wind-bed.ogg","kind":"weather","original":"117136_732072-hq.mp3","creator":"cobratronik","license":"CC0 1.0","source":"https://freesound.org/people/cobratronik/sounds/117136/","default":false},
+    {"file":"foley/snow-footsteps.ogg","kind":"foley","original":"613849_9250976-hq.mp3","creator":"Nox_Sound","license":"CC0 1.0","source":"https://freesound.org/people/Nox_Sound/sounds/613849/","default":false}
   ],
   "excluded": [
     {"name":"SnowFall.ogg","reason":"User identified it as music and rejected it; do not fetch or use."},

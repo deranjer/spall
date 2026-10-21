@@ -23,3 +23,7 @@ These recordings were selected from local user-approved downloads. Runtime copie
 | weather/distant-thunder.ogg | richwise | [Original recording](https://freesound.org/people/richwise/sounds/361401/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | weather/thunder-clap.ogg | Fission9 | [Original recording](https://freesound.org/people/Fission9/sounds/465314/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | weather/thunderstorm-bed.ogg | RHumphries | [Original recording](https://commons.wikimedia.org/wiki/File:Rhumphries_-_rbh-thunder-storm.ogg) | [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/) |
+| weather/blizzard-howling-storm.ogg | DBlover | [Original recording](https://freesound.org/people/DBlover/sounds/505999/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| weather/light-snow-night.ogg | TSP-Talk | [Original recording](https://freesound.org/people/TSP-Talk/sounds/845502/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| weather/arctic-wind-bed.ogg | cobratronik | [Original recording](https://freesound.org/people/cobratronik/sounds/117136/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| foley/snow-footsteps.ogg | Nox_Sound | [Original recording](https://freesound.org/people/Nox_Sound/sounds/613849/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |

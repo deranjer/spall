@@ -3,8 +3,17 @@
 
 use std::path::{Path, PathBuf};
 
-use spall_client::audio::BiomeAudioConfig;
+use spall_client::audio::{BiomeAudioConfig, WeatherLayer};
+use spall_client::footsteps::{FootstepConfig, FootstepSurface};
+use spall_core::MaterialId;
+use spall_protocol::WeatherKind;
 use spall_worldgen::Biome;
+
+use crate::game::materials;
+
+/// Precipitation (0..=1) from which snow counts as heavy; light and medium
+/// snow (0.25, 0.5) lie below it and heavy (0.85) above.
+const HEAVY_SNOW: f32 = 0.7;
 
 pub const TRACK_NAMES: [&str; 13] = [
     "meadow-pipit.ogg",
@@ -34,6 +43,144 @@ fn track_range_m(name: &str) -> f32 {
     }
 }
 
+/// One footstep surface. Recordings live in `foley/`; a row whose file is not
+/// shipped yet plays the generic default (row 0), so adding a surface is the
+/// recording plus, for a new surface, one row here.
+struct SurfaceRow {
+    name: &'static str,
+    recording: &'static str,
+    gain: f32,
+    pitch: f32,
+    materials: &'static [MaterialId],
+}
+
+/// Row 0 is the quiet generic default; the rest follow the terrain materials.
+/// Snow and water are not materials: they are picked by snow depth and by
+/// standing in water (see `FootstepConfig::select_surface`).
+const SURFACES: [SurfaceRow; 9] = [
+    SurfaceRow {
+        name: "generic",
+        recording: "gravel-footsteps.ogg",
+        gain: 0.3,
+        pitch: 0.8,
+        materials: &[],
+    },
+    SurfaceRow {
+        name: "snow",
+        recording: "snow-footsteps.ogg",
+        gain: 1.0,
+        pitch: 1.0,
+        materials: &[materials::SNOW],
+    },
+    SurfaceRow {
+        name: "gravel",
+        recording: "gravel-footsteps.ogg",
+        gain: 1.0,
+        pitch: 1.0,
+        materials: &[materials::GRAVEL],
+    },
+    SurfaceRow {
+        name: "grass",
+        recording: "grass-footsteps.ogg",
+        gain: 0.8,
+        pitch: 1.0,
+        materials: &[MaterialId(10), materials::MOSS],
+    },
+    SurfaceRow {
+        name: "mud",
+        recording: "mud-footsteps.ogg",
+        gain: 0.9,
+        pitch: 1.0,
+        materials: &[materials::DIRT, materials::MUD, materials::CLAY],
+    },
+    SurfaceRow {
+        name: "rock",
+        recording: "rock-footsteps.ogg",
+        gain: 1.0,
+        pitch: 1.0,
+        materials: &[
+            materials::STONE,
+            materials::BEDROCK,
+            materials::DEEP_STONE,
+            MaterialId(13),
+            MaterialId(14),
+        ],
+    },
+    SurfaceRow {
+        name: "sand",
+        recording: "sand-footsteps.ogg",
+        gain: 0.8,
+        pitch: 1.0,
+        materials: &[materials::SAND],
+    },
+    SurfaceRow {
+        name: "wood",
+        recording: "wood-footsteps.ogg",
+        gain: 1.0,
+        pitch: 1.0,
+        materials: &[materials::WOOD],
+    },
+    SurfaceRow {
+        name: "water",
+        recording: "water-footsteps.ogg",
+        gain: 0.9,
+        pitch: 1.0,
+        materials: &[],
+    },
+];
+
+/// The footstep table with each recording resolved against `root`.
+pub fn footsteps(root: &Path) -> FootstepConfig {
+    let index_of = |name: &str| SURFACES.iter().position(|row| row.name == name);
+    FootstepConfig {
+        surfaces: SURFACES
+            .iter()
+            .map(|row| {
+                let file = root.join("foley").join(row.recording);
+                FootstepSurface {
+                    name: row.name.to_owned(),
+                    file: file.is_file().then_some(file),
+                    gain: row.gain,
+                    pitch: row.pitch,
+                }
+            })
+            .collect(),
+        material_surface: SURFACES
+            .iter()
+            .enumerate()
+            .flat_map(|(index, row)| row.materials.iter().map(move |m| (m.0, index)))
+            .collect(),
+        snow_surface: index_of("snow"),
+        water_surface: index_of("water"),
+        snow_min_depth_m: 0.01,
+        walk_step_m: crate::player_view::WALK_STRIDE_M / 2.0,
+        run_step_m: crate::player_view::RUN_STRIDE_M / 2.0,
+        walk_min_speed_m_s: crate::player_view::WALK_MIN_SPEED_M_S,
+        run_min_speed_m_s: crate::player_view::RUN_MIN_SPEED_M_S,
+    }
+}
+
+/// A looping weather bed that plays whatever the precipitation.
+fn bed(kind: WeatherKind, path: PathBuf, gain: f32) -> WeatherLayer {
+    band(kind, 0.0..f32::INFINITY, path, gain)
+}
+
+/// A weather bed for one band of precipitation (0..=1) of a weather kind.
+fn band(
+    kind: WeatherKind,
+    precipitation: std::ops::Range<f32>,
+    path: PathBuf,
+    gain: f32,
+) -> WeatherLayer {
+    WeatherLayer {
+        kind: kind as u8,
+        precipitation_min: precipitation.start,
+        precipitation_max: precipitation.end,
+        path,
+        gain,
+    }
+}
+
 /// Finds assets beside the executable first (portable/editor launches), then
 /// falls back to the sandbox source tree (Cargo developer runs from any CWD).
 pub fn config() -> BiomeAudioConfig {
@@ -47,19 +194,41 @@ pub fn config() -> BiomeAudioConfig {
             .into_iter()
             .map(|biome| format!("{biome:?}"))
             .collect(),
-        weather_tracks: [
-            None,
-            Some("weather/light-rain.ogg"),
-            Some("weather/heavy-rain.ogg"),
-            None,
-            Some("biomes/pine-wind.ogg"),
-            Some("biomes/pine-wind.ogg"),
-        ]
-        .into_iter()
-        .map(|name| name.map(|name| root.join(name)))
-        .collect(),
+        weather_layers: vec![
+            bed(WeatherKind::Rain, root.join("weather/light-rain.ogg"), 1.0),
+            bed(WeatherKind::Storm, root.join("weather/heavy-rain.ogg"), 1.0),
+            // Every snow tier has the quiet night bed; heavy snow adds a little
+            // wind under it, and a blizzard howls with wind beneath.
+            bed(
+                WeatherKind::Snow,
+                root.join("weather/light-snow-night.ogg"),
+                1.0,
+            ),
+            band(
+                WeatherKind::Snow,
+                HEAVY_SNOW..f32::INFINITY,
+                root.join("weather/arctic-wind-bed.ogg"),
+                0.6,
+            ),
+            bed(
+                WeatherKind::HighWind,
+                root.join("biomes/pine-wind.ogg"),
+                1.0,
+            ),
+            bed(
+                WeatherKind::Blizzard,
+                root.join("weather/blizzard-howling-storm.ogg"),
+                1.0,
+            ),
+            bed(
+                WeatherKind::Blizzard,
+                root.join("weather/arctic-wind-bed.ogg"),
+                0.4,
+            ),
+        ],
         thunder: Some(root.join("weather/thunder-clap.ogg")),
         ranges_m: TRACK_NAMES.iter().map(|name| track_range_m(name)).collect(),
+        footsteps: footsteps(&root),
     }
 }
 
@@ -126,21 +295,87 @@ mod tests {
     #[test]
     fn weather_controls_only_select_approved_decodable_assets() {
         let config = config();
-        assert_eq!(config.weather_tracks.len(), 6);
-        assert!(config.weather_tracks[0].is_none());
-        assert!(
-            config.weather_tracks[3].is_none(),
-            "no snowfall bed was accepted"
-        );
-        for path in config
-            .weather_tracks
-            .into_iter()
-            .flatten()
-            .chain(config.thunder)
-        {
-            spall_client::audio::validate_asset(&path).unwrap();
-            assert!(!path.to_string_lossy().to_lowercase().contains("snowfall"));
+        assert!(config.weather_mix(WeatherKind::Clear as u8, 0.0).is_empty());
+        for layer in &config.weather_layers {
+            spall_client::audio::validate_asset(&layer.path).unwrap();
+            assert!(
+                !layer
+                    .path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("snowfall")
+            );
         }
+        spall_client::audio::validate_asset(&config.thunder.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snow_tiers_blizzard_and_rain_pick_their_beds() {
+        let config = config();
+        let names = |kind: WeatherKind, precipitation: f32| -> Vec<(String, f32)> {
+            config
+                .weather_mix(kind as u8, precipitation)
+                .into_iter()
+                .map(|(path, gain)| {
+                    (
+                        path.file_stem().unwrap().to_string_lossy().into_owned(),
+                        gain,
+                    )
+                })
+                .collect()
+        };
+        let night = ("light-snow-night".to_owned(), 1.0);
+        assert_eq!(names(WeatherKind::Snow, 0.25), vec![night.clone()]);
+        assert_eq!(names(WeatherKind::Snow, 0.5), vec![night.clone()]);
+        assert_eq!(
+            names(WeatherKind::Snow, 0.85),
+            [night, ("arctic-wind-bed".to_owned(), 0.6)]
+        );
+        let blizzard = names(WeatherKind::Blizzard, 0.95);
+        assert_eq!(blizzard[0].0, "blizzard-howling-storm");
+        assert!(blizzard[1].0 == "arctic-wind-bed" && blizzard[1].1 < blizzard[0].1);
+        assert_eq!(
+            names(WeatherKind::Rain, 0.5),
+            [("light-rain".to_owned(), 1.0)]
+        );
+    }
+
+    #[test]
+    fn footstep_table_resolves_shipped_recordings_and_falls_back_for_the_rest() {
+        let config = footsteps(&source_audio_root());
+        for surface in &config.surfaces {
+            let expected = matches!(surface.name.as_str(), "generic" | "snow" | "gravel");
+            assert_eq!(surface.file.is_some(), expected, "{}", surface.name);
+            if let Some(file) = &surface.file {
+                assert!(file.is_file());
+            }
+        }
+        assert_eq!(config.surfaces[0].name, "generic");
+        let surface_name = |material: Option<MaterialId>, snow: f32, water: bool| {
+            let index = config.select_surface(material.map(|m| m.0), snow, water);
+            config.surfaces[index].name.as_str()
+        };
+        assert_eq!(surface_name(Some(materials::GRAVEL), 0.0, false), "gravel");
+        assert_eq!(surface_name(Some(MaterialId(10)), 0.0, false), "grass");
+        assert_eq!(surface_name(Some(materials::MOSS), 0.0, false), "grass");
+        assert_eq!(surface_name(Some(materials::DIRT), 0.0, false), "mud");
+        assert_eq!(surface_name(Some(materials::MUD), 0.0, false), "mud");
+        assert_eq!(surface_name(Some(materials::STONE), 0.0, false), "rock");
+        assert_eq!(surface_name(Some(materials::SAND), 0.0, false), "sand");
+        assert_eq!(surface_name(Some(materials::WOOD), 0.0, false), "wood");
+        assert_eq!(surface_name(Some(materials::SNOW), 0.0, false), "snow");
+        assert_eq!(surface_name(Some(materials::STONE), 0.05, false), "snow");
+        assert_eq!(surface_name(Some(materials::SAND), 0.0, true), "water");
+        assert_eq!(surface_name(Some(MaterialId(999)), 0.0, false), "generic");
+        assert_eq!(surface_name(None, 0.0, false), "generic");
+    }
+
+    #[test]
+    fn snow_recording_slices_into_its_twelve_steps() {
+        let config = footsteps(&source_audio_root());
+        let snow = config.surfaces.iter().find(|s| s.name == "snow").unwrap();
+        let steps = spall_client::footsteps::step_count(snow.file.as_deref().unwrap()).unwrap();
+        assert_eq!(steps, 12);
     }
 
     #[test]
@@ -159,7 +394,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 19, "all 19 user-approved recordings are packaged");
+        assert_eq!(checked, 23, "all 23 user-approved recordings are packaged");
     }
 
     #[test]

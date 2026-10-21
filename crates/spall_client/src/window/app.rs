@@ -33,7 +33,13 @@ pub(super) struct InteractiveApp {
     ambience_layers: Vec<(PathBuf, u8)>,
     ambience_mix_at: Option<Instant>,
     weather_audio: Option<AmbienceAudio>,
-    weather_track: Option<PathBuf>,
+    weather_mix: Vec<(PathBuf, f32)>,
+    pub(super) footsteps: Option<crate::footsteps::FootstepAudio>,
+    pub(super) footstep_volume: f32,
+    /// One stride counter per walking player (`0` is the local player).
+    pub(super) footstep_trackers: HashMap<u64, crate::footsteps::FootstepTracker>,
+    pub(super) footstep_at: Option<Instant>,
+    pub(super) footstep_log: bool,
     pub(super) nature_volume: f32,
     pub(super) weather_volume: f32,
     pub(super) nature_muted: bool,
@@ -216,6 +222,7 @@ impl InteractiveApp {
         )?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         let ambience = AmbienceAudio::start(0.2);
+        let footsteps = crate::footsteps::FootstepAudio::start(&options.biome_audio.footsteps, 0.5);
         Ok(Self {
             session,
             window: None,
@@ -241,7 +248,12 @@ impl InteractiveApp {
             ambience_layers: Vec::new(),
             ambience_mix_at: None,
             weather_audio: AmbienceAudio::start(0.3),
-            weather_track: None,
+            weather_mix: Vec::new(),
+            footsteps,
+            footstep_volume: 0.5,
+            footstep_trackers: HashMap::new(),
+            footstep_at: None,
+            footstep_log: std::env::var_os("SPALL_FOOTSTEP_LOG").is_some(),
             nature_volume: 0.2,
             weather_volume: 0.3,
             nature_muted: false,
@@ -345,12 +357,11 @@ impl InteractiveApp {
                 self.nature_volume * weather_duck
             });
         }
-        let weather_track = self.latest_weather.as_ref().and_then(|state| {
-            self.biome_audio
-                .weather_tracks
-                .get(state.kind as usize)
-                .cloned()
-                .flatten()
+        let weather_mix = self.latest_weather.as_ref().map_or_else(Vec::new, |state| {
+            self.biome_audio.weather_mix(
+                state.kind as u8,
+                f32::from(state.precipitation_q16) / f32::from(u16::MAX),
+            )
         });
         if let Some(audio) = &self.weather_audio {
             if self
@@ -367,9 +378,8 @@ impl InteractiveApp {
             } else {
                 self.weather_volume * (0.25 + 0.75 * self.weather_exposure)
             });
-            if weather_track != self.weather_track && audio.set_track(weather_track.clone()).is_ok()
-            {
-                self.weather_track = weather_track;
+            if weather_mix != self.weather_mix && audio.set_mix(weather_mix.clone()).is_ok() {
+                self.weather_mix = weather_mix;
             }
             if let Some(state) = &self.latest_weather {
                 let event = (state.world_epoch, state.lightning_id);
