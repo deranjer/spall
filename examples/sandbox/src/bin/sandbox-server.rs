@@ -566,7 +566,7 @@ fn run_serve(args: Args) -> ExitCode {
         let anchors: Vec<[f64; 3]> = anchors.into_iter().take(1).collect();
         match sandbox::animals::AnimalDirector::new(
             anchors,
-            [args.animals, args.animals / 2, 0],
+            &[args.animals, args.animals / 2, 0],
             args.seed,
         ) {
             Ok(director) => Some(spall_server::creature_service::CreatureService::new(

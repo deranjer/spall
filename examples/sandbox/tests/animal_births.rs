@@ -21,7 +21,7 @@ fn simulation() -> Simulation {
 fn director_births_deer_and_crows_that_validate_and_replicate() {
     let mut sim = simulation();
     let anchor = [3.0, 1.0, 3.0];
-    let director = AnimalDirector::new(vec![anchor], [2, 2, 0], 7)
+    let director = AnimalDirector::new(vec![anchor], &[2, 2, 0], 7)
         .unwrap()
         .with_radius_m(0.0, 1.0);
     let service = CreatureService::new(Box::new(director));
@@ -88,7 +88,7 @@ fn a_walking_deer_is_swept_against_terrain_and_published_as_motion() {
     use spall_sim::{CreatureMoveOutcome, CreatureMoveRequest};
 
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [1, 0, 0], 3)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[1, 0, 0], 3)
         .unwrap()
         .with_radius_m(0.0, 1.0);
     let service = CreatureService::new(Box::new(director));
@@ -158,7 +158,7 @@ fn a_walking_deer_is_swept_against_terrain_and_published_as_motion() {
 #[test]
 fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [3, 2, 0], 11)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[3, 2, 0], 11)
         .unwrap()
         .with_radius_m(0.0, 1.5);
     let service = CreatureService::new(Box::new(director));
@@ -210,7 +210,7 @@ fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
     use spall_client::window::CreatureView;
 
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [4, 2, 0], 5)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[4, 2, 0], 5)
         .unwrap()
         .with_radius_m(0.0, 1.5);
     let service = CreatureService::new(Box::new(director));
@@ -256,7 +256,7 @@ fn a_player_walking_into_moving_animals_never_stalls_the_tick() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut sim = simulation();
-        let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [3, 2, 0], 21)
+        let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[3, 2, 0], 21)
             .unwrap()
             .with_radius_m(0.0, 1.0);
         let service = CreatureService::new(Box::new(director));
@@ -299,7 +299,7 @@ fn players_walk_through_creatures_instead_of_being_blocked_by_them() {
     use spall_protocol::InputSeq;
 
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [1, 0, 0], 4)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[1, 0, 0], 4)
         .unwrap()
         .with_radius_m(0.0, 0.5);
     let service = CreatureService::new(Box::new(director));
