@@ -14,7 +14,10 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
         "Hammer: break voxels where you aim (hold to repeat)",
     ),
     ("T", "Torch: place a light where you aim"),
-    ("Tab", "Pack: kneel and lay out what you carry (Tab, Esc or walk to pack up)"),
+    (
+        "Tab",
+        "Pack: kneel and lay out what you carry (Tab, Esc or walk to pack up)",
+    ),
     ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),
