@@ -190,7 +190,11 @@ against the engine maximum (the sandbox's `BEAR_SWIPE_DAMAGE` makes two bear swi
 server binds a capsule to its account on join (`bind_player_principal`), which restores the
 account's remembered health, and sends each session its own health as a `PlayerHealth` record when
 it changes. Accounts not currently bound keep their health in the simulation's roster; the checkpoint
-stores both, so health survives a restart. No HUD shows it yet.
+stores both, so health survives a restart. There is no health bar: the client feeds its latest
+health into the existing injury look (`body_state::with_health`: red pulsing vignette, colour
+drain, edge blur, and the injury reminder icon from one bear swipe down), which clears when a
+respawn restores full health. Game creatures hurt players through the director's
+`CreatureAction::HitPlayer`, which the server refuses beyond 3 m of the creature's root (ENG-240).
 
 The interactive launcher also has an explicit testing-only escape hatch:
 `--client-authoritative`. In that mode `ClientPhysics` promotes replicated body
