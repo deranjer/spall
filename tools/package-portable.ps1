@@ -28,12 +28,21 @@ foreach ($name in @("spall-editor.exe", "xtask.exe", "sandbox-server.exe", "sand
     Copy-Item -LiteralPath $source -Destination (Join-Path $OutputDirectory $name) -Force
 }
 
+$audioSource = Join-Path $repoRoot "examples\sandbox\assets\audio"
+$audioDestination = Join-Path $OutputDirectory "assets\audio"
+if (Test-Path -LiteralPath $audioSource -PathType Container) {
+    New-Item -ItemType Directory -Force -Path $audioDestination | Out-Null
+    Copy-Item -Path (Join-Path $audioSource "*") -Destination $audioDestination -Recurse -Force
+}
+
 @'
 Spall Editor portable build
 
 Run spall-editor.exe. Open File > Generate World, enter or randomize a seed,
 choose a world size and starting season, generate the preview, then choose Run
 in game. The world runs in the sandbox client with the FPS HUD enabled.
+Biome ambience is included in assets\audio; set SPALL_AUDIO=0 to mute it or
+SPALL_AUDIO_VOLUME=0..1 to change its level.
 Check Uncapped before Run in game (or scene Run) to request non-VSync game
 presentation where supported and see maximum throughput in the FPS HUD.
 Generated-world games initially load terrain within 80 m of the spawn brick
@@ -52,7 +61,7 @@ editor; wait for the current launch or close the game before launching again.
 F10 opens the in-game admin menu. Reset world rebuilds the generated world.
 The Environment section includes sun direction controls.
 
-Keep all four executables together. The folder may be moved to another Windows
+Keep the four executables and assets folder together. The folder may be moved to another Windows
 machine with a supported GPU. Each session writes diagnostics under runs\,
 including launcher.log and server.stderr.log for startup failures.
 '@ | Set-Content -LiteralPath (Join-Path $OutputDirectory "README.txt") -Encoding utf8

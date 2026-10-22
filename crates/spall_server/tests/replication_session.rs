@@ -14,6 +14,7 @@ use spall_client::{
     BaselineScene, ClientNetConfig, ScriptedAction, cut_request, run_replication_client,
 };
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
+use spall_server::{HarnessConfig, HostConfig};
 use spall_server::{Scene, ServeConfig, ServeError, serve};
 use spall_store::FaultPlan;
 
@@ -53,43 +54,48 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
     let addr_path = dir.join("server.addr");
 
     let server_cfg = ServeConfig {
-        listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        scene: Scene::BridgeCut,
-        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
-        join_token: token,
-        max_ticks: 300,
-        quiescence_ticks: 30,
-        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
-        min_clients: 1,
-        max_clients: 4,
-        startup_timeout: Duration::from_secs(20),
-        // Real-time pacing so a scripted client can interact with the tick loop.
-        paced: true,
-        log_json: dir.join("server.jsonl"),
-        summary_json: Some(dir.join("server.summary.json")),
-        fingerprint_out: Some(fp_path.clone()),
-        addr_out: Some(addr_path.clone()),
-        transport: TransportConfig::for_tests(),
-        save: None,
-        checkpoint_interval_ticks: 0,
-        seed: 0,
-        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
-        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
-        capture_workers: spall_server::serve::default_capture_workers(),
-        // Fixture scripts cut at arbitrary cells no real aim ray would produce;
-        // the ENG-47 dev-scenario path keeps this plumbing test working.
-        dev_unvalidated_actions: true,
-        admin_commands: false,
-        save_faults: None,
-        await_body_settle: false,
-        motion_interest: None,
-        residency: None,
-        residency_disk_path: None,
-        contact_damage: None,
-        dormancy: None,
-        timing_window: None,
-        credential_registry_file: None,
-        custom_world: None,
+        server: HostConfig {
+            listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            scene: Scene::BridgeCut,
+            terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
+            join_token: token,
+            max_clients: 4,
+            // Real-time pacing so a scripted client can interact with the tick loop.
+            paced: true,
+            log_json: dir.join("server.jsonl"),
+            transport: TransportConfig::for_tests(),
+            save: None,
+            checkpoint_interval_ticks: 0,
+            seed: 0,
+            catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+            max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+            capture_workers: spall_server::serve::default_capture_workers(),
+            admin_commands: false,
+            motion_interest: None,
+            residency: None,
+            residency_disk_path: None,
+            creatures: None,
+            contact_damage: None,
+            dormancy: None,
+            credential_registry_file: None,
+            custom_world: None,
+        },
+        harness: HarnessConfig {
+            max_ticks: 300,
+            quiescence_ticks: 30,
+            drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
+            min_clients: 1,
+            startup_timeout: Duration::from_secs(20),
+            summary_json: Some(dir.join("server.summary.json")),
+            fingerprint_out: Some(fp_path.clone()),
+            addr_out: Some(addr_path.clone()),
+            // Fixture scripts cut at arbitrary cells no real aim ray would produce;
+            // the ENG-47 dev-scenario path keeps this plumbing test working.
+            dev_unvalidated_actions: true,
+            save_faults: None,
+            await_body_settle: false,
+            timing_window: None,
+        },
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -176,47 +182,52 @@ fn server_persists_and_recovers_across_a_restart() {
     let save = dir.join("world.db");
 
     let base_cfg = |tag: &str| ServeConfig {
-        listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        scene: Scene::BridgeCut,
-        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
-        join_token: token,
-        max_ticks: 200,
-        quiescence_ticks: 20,
-        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
-        min_clients: 1,
-        max_clients: 2,
-        startup_timeout: Duration::from_secs(20),
-        paced: true,
-        log_json: dir.join(format!("server-{tag}.jsonl")),
-        summary_json: None,
-        fingerprint_out: Some(dir.join(format!("fp-{tag}"))),
-        addr_out: Some(dir.join(format!("addr-{tag}"))),
-        transport: TransportConfig::for_tests(),
-        save: Some(save.clone()),
-        checkpoint_interval_ticks: 0,
-        seed: 9,
-        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
-        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
-        capture_workers: spall_server::serve::default_capture_workers(),
-        // See above: arbitrary fixture cuts need the dev-scenario path.
-        dev_unvalidated_actions: true,
-        admin_commands: false,
-        save_faults: None,
-        await_body_settle: false,
-        motion_interest: None,
-        residency: None,
-        residency_disk_path: None,
-        contact_damage: None,
-        dormancy: None,
-        timing_window: None,
-        credential_registry_file: None,
-        custom_world: None,
+        server: HostConfig {
+            listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            scene: Scene::BridgeCut,
+            terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
+            join_token: token,
+            max_clients: 2,
+            paced: true,
+            log_json: dir.join(format!("server-{tag}.jsonl")),
+            transport: TransportConfig::for_tests(),
+            save: Some(save.clone()),
+            checkpoint_interval_ticks: 0,
+            seed: 9,
+            catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+            max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+            capture_workers: spall_server::serve::default_capture_workers(),
+            admin_commands: false,
+            motion_interest: None,
+            residency: None,
+            residency_disk_path: None,
+            creatures: None,
+            contact_damage: None,
+            dormancy: None,
+            credential_registry_file: None,
+            custom_world: None,
+        },
+        harness: HarnessConfig {
+            max_ticks: 200,
+            quiescence_ticks: 20,
+            drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
+            min_clients: 1,
+            startup_timeout: Duration::from_secs(20),
+            summary_json: None,
+            fingerprint_out: Some(dir.join(format!("fp-{tag}"))),
+            addr_out: Some(dir.join(format!("addr-{tag}"))),
+            // See above: arbitrary fixture cuts need the dev-scenario path.
+            dev_unvalidated_actions: true,
+            save_faults: None,
+            await_body_settle: false,
+            timing_window: None,
+        },
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
         let cfg = base_cfg(tag);
-        let fp_path = cfg.fingerprint_out.clone().unwrap();
-        let addr_path = cfg.addr_out.clone().unwrap();
+        let fp_path = cfg.harness.fingerprint_out.clone().unwrap();
+        let addr_path = cfg.harness.addr_out.clone().unwrap();
         let dir = dir.clone();
         let server_thread = std::thread::spawn(move || serve(cfg));
 
@@ -305,42 +316,47 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
     let addr_path = dir.join("addr");
 
     let cfg = ServeConfig {
-        listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        scene: Scene::BridgeCut,
-        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
-        join_token: token,
-        max_ticks: 200,
-        quiescence_ticks: 20,
-        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
-        min_clients: 1,
-        max_clients: 2,
-        startup_timeout: Duration::from_secs(20),
-        paced: true,
-        log_json: log_json.clone(),
-        summary_json: None,
-        fingerprint_out: Some(fp_path.clone()),
-        addr_out: Some(addr_path.clone()),
-        transport: TransportConfig::for_tests(),
-        save: Some(save.clone()),
-        // No periodic checkpoints: the only checkpoint after setup is the
-        // clean-shutdown one, so the one-shot fault cannot be consumed early.
-        checkpoint_interval_ticks: 0,
-        seed: 9,
-        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
-        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
-        capture_workers: spall_server::serve::default_capture_workers(),
-        dev_unvalidated_actions: false,
-        admin_commands: false,
-        save_faults: Some(FaultPlan::disk_fail_checkpoint()),
-        await_body_settle: false,
-        motion_interest: None,
-        residency: None,
-        residency_disk_path: None,
-        contact_damage: None,
-        dormancy: None,
-        timing_window: None,
-        credential_registry_file: None,
-        custom_world: None,
+        server: HostConfig {
+            listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            scene: Scene::BridgeCut,
+            terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
+            join_token: token,
+            max_clients: 2,
+            paced: true,
+            log_json: log_json.clone(),
+            transport: TransportConfig::for_tests(),
+            save: Some(save.clone()),
+            // No periodic checkpoints: the only checkpoint after setup is the
+            // clean-shutdown one, so the one-shot fault cannot be consumed early.
+            checkpoint_interval_ticks: 0,
+            seed: 9,
+            catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+            max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+            capture_workers: spall_server::serve::default_capture_workers(),
+            admin_commands: false,
+            motion_interest: None,
+            residency: None,
+            residency_disk_path: None,
+            creatures: None,
+            contact_damage: None,
+            dormancy: None,
+            credential_registry_file: None,
+            custom_world: None,
+        },
+        harness: HarnessConfig {
+            max_ticks: 200,
+            quiescence_ticks: 20,
+            drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
+            min_clients: 1,
+            startup_timeout: Duration::from_secs(20),
+            summary_json: None,
+            fingerprint_out: Some(fp_path.clone()),
+            addr_out: Some(addr_path.clone()),
+            dev_unvalidated_actions: false,
+            save_faults: Some(FaultPlan::disk_fail_checkpoint()),
+            await_body_settle: false,
+            timing_window: None,
+        },
     };
 
     let server_thread = std::thread::spawn(move || serve(cfg));

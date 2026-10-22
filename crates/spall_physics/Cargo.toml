@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 autobins = false
 
+[features]
+# Test-scene builders (also used by gates and benches).
+fixtures = ["spall_voxel/fixtures"]
+# Offline benchmark binaries.
+bench = ["fixtures"]
+
 [lints.clippy]
 # The feasibility harness has a few functions with many measured knobs.
 too_many_arguments = "allow"
@@ -16,24 +22,15 @@ spall_voxel.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-spall_voxel = { workspace = true, features = ["oracle"] }
+spall_voxel = { workspace = true, features = ["oracle", "fixtures"] }
 
 [[bin]]
 name = "collision-bench"
 path = "src/bin/collision_bench.rs"
+required-features = ["bench"]
 
 [[bin]]
 name = "physics-transfer"
 path = "src/bin/physics_transfer.rs"
+required-features = ["bench"]
 
-[[bin]]
-name = "region-physics-bench"
-path = "src/bin/region_physics_bench.rs"
-
-[[bin]]
-name = "region-player-bench"
-path = "src/bin/region_player_bench.rs"
-
-[[bin]]
-name = "region-scale-bench"
-path = "src/bin/region_scale_bench.rs"

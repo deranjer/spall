@@ -20,4 +20,4 @@ thiserror.workspace = true
 # Tests reuse the voxel dense oracle and the job-scheduler world-view double
 # rather than rebuilding either.
 spall_jobs = { workspace = true, features = ["testkit"] }
-spall_voxel = { workspace = true, features = ["oracle"] }
+spall_voxel = { workspace = true, features = ["oracle", "fixtures"] }

@@ -110,19 +110,19 @@ fn serve_config(dir: &std::path::Path, ticks: u64) -> ServeConfig {
         Scene::BridgeCut,
         JoinToken::generate().unwrap(),
     );
-    config.max_ticks = ticks;
-    config.quiescence_ticks = 0;
-    config.min_clients = 0;
-    config.max_clients = 8;
-    config.startup_timeout = Duration::from_secs(10);
-    config.paced = true;
-    config.log_json = dir.join("server.jsonl");
-    config.fingerprint_out = Some(dir.join("fingerprint.txt"));
-    config.addr_out = Some(dir.join("address.txt"));
-    config.save = Some(dir.join("world.db"));
-    config.checkpoint_interval_ticks = 60;
-    config.transport = TransportConfig::for_tests();
-    config.credential_registry_file = Some(dir.join("player-credentials.txt"));
+    config.harness.max_ticks = ticks;
+    config.harness.quiescence_ticks = 0;
+    config.harness.min_clients = 0;
+    config.server.max_clients = 8;
+    config.harness.startup_timeout = Duration::from_secs(10);
+    config.server.paced = true;
+    config.server.log_json = dir.join("server.jsonl");
+    config.harness.fingerprint_out = Some(dir.join("fingerprint.txt"));
+    config.harness.addr_out = Some(dir.join("address.txt"));
+    config.server.save = Some(dir.join("world.db"));
+    config.server.checkpoint_interval_ticks = 60;
+    config.server.transport = TransportConfig::for_tests();
+    config.server.credential_registry_file = Some(dir.join("player-credentials.txt"));
     config
 }
 
@@ -195,6 +195,21 @@ fn start_server(
             credentials,
         )
     })
+}
+
+fn join_server_bounded(
+    server: std::thread::JoinHandle<Result<spall_server::ServeSummary, spall_server::ServeError>>,
+    context: &str,
+) -> Result<spall_server::ServeSummary, spall_server::ServeError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while !server.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server did not exit within 45s ({context})"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    server.join().expect("server thread panicked")
 }
 
 fn client_config(
@@ -521,7 +536,12 @@ fn authenticated_crafting_retries_disconnects_isolates_players_and_survives_rest
         spall_client::ClientNetError::Transport(TransportError::Auth(AuthReject::BadToken))
     ));
     assert!(!format!("{revoked:?}").contains(&second.token.to_hex()));
-    assert_eq!(server.join().unwrap().unwrap().result, "passed");
+    assert_eq!(
+        join_server_bounded(server, "post-restart server")
+            .unwrap()
+            .result,
+        "passed"
+    );
 
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();

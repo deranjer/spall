@@ -102,7 +102,7 @@ fn a_brick_repair_patch_restores_exact_parity_after_a_client_divergence() {
     let terrain_vid = terrain.volume_id;
 
     let corrupt = BaselineWorld {
-        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         checkpoint_tick: world.checkpoint_tick,
         volumes: vec![BaselineVolume {
             volume_id: terrain_vid,
@@ -163,7 +163,7 @@ fn a_repair_patch_cannot_target_a_volume_the_replica_lacks() {
     let mut replica = ReplicaWorld::from_baseline_world(&world, ReplicaConfig::default()).unwrap();
 
     let bogus = BaselineWorld {
-        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         checkpoint_tick: 0,
         volumes: vec![BaselineVolume {
             volume_id: VolumeId::new(9_999).unwrap(),

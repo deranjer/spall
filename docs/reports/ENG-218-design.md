@@ -1,0 +1,452 @@
+# ENG-218 design: ordered animal lifecycle consumers
+
+## 2026-10-18 recovery contract clarification
+
+Independent applied part-body velocities are required to restore an animated
+Alive animal without changing its immediate checked-death momentum. Root twist,
+clip phase and frozen part poses cannot supply those measured values by
+themselves. The runtime physics restore prerequisite therefore requires complete
+keyed part twists, captured with owner metadata and poses on the owning thread
+while no pose frame is pending.
+
+The earlier direction below to keep the inner ownership/change layout unchanged
+does not authorize discarding this motion from a complete checkpoint or baseline.
+Before enabling those consumers, explicitly version the existing portable
+ownership/motion contract to retain and hash the complete measured part motion,
+update its reducer/callers/fixtures together, and reject superseded current
+layouts without migration. Resolve that exact DTO boundary before editing the
+serialized layout. It remains one ownership candidate and the same ordered
+transaction/journal sequence; no independent actor motion ledger or save stream.
+The runtime physics DTO does not itself implement that serialized contract.
+
+The motion-layout review must distinguish live part bodies from corpse source
+parts: after fracture, one original part can contribute cells to several moving
+components, so a single velocity on that original source part is not a complete
+corpse motion model. Existing component masks and twists remain authoritative
+for corpses. Independently sampled per-part body twists are required for Alive
+owners and must participate in full/motion hashes without changing topology-only
+fences. Preserve this distinction when versioning the existing owner contract.
+
+**Status:** coordinator-reviewed direction. Replay evidence, exact cold restore and common physics/geometry preparation prerequisites are integrated; the real combined ordered lifecycle consumer below remains pending implementation and acceptance. Production species spawning remains disabled until the complete consumer/recovery slice is accepted.
+
+## Decision: make lifecycle a real ordered topology operation
+
+Append an explicit `TopologyOp::CreatureLifecycle` operation and a distinct typed bulk marker to the existing `TopologyTransaction` operation vector. This is the best first integration boundary: it uses the transaction ID, server tick, control sequence, operation order, journal sequence, retry behavior, and client replay guard that already own voxel commits. The operation is a real actor ownership change, never a synthetic `CellRun`, body split, or empty transaction workaround. `TopologyTransaction::validate` already rejects an empty operation vector, so a lifecycle-only transaction is valid once this real variant exists; its geometry `before`, `after`, and `result_hashes` may be empty.
+
+For small lifecycle payloads, `CreatureLifecycle` carries the validated `CreatureLifecycleCommitV1` envelope inline. Its unchanged ENG-217 change's `transaction_id` must equal the enclosing transaction ID and `operation_ordinal` must equal its index in `ops`. Append the enum variant so all existing `TopologyOp` discriminants remain stable. An ordinary topology-only transaction retains its current body layout and operation bytes.
+
+ENG-217 records embed canonical source bricks and permit bounded records up to 16 MiB, while a reliable control record is limited to 64 KiB. Do not send every record inline and do not invent an asset-size admission limit. Add an actor-specific bulk marker operation for changes that exceed the conservative inline budget. It carries the transaction ID, operation ordinal, expected canonical payload hash, and transfer ID. The matching actor payload is streamed through the existing `BaselineBegin/Part/End` reliable bulk machinery using an explicit lifecycle payload/version kind and the existing bounded segment assembler. It is not a `BaselineWorld`, and it must not be stuffed into the geometry-specific `TopologyBulkSplit` blob. A replica holds the marker transaction in the existing ordered pending/retry path until the matching typed transfer validates; transactions that depend on it stay behind it.
+
+Transfer IDs must come from the unified server allocator described below; unifying the existing baseline and split/reset paths is still required implementation. Collision-check baseline, repair, world-reset, and bulk-split namespaces. Do not claim an injective deterministic u64 mapping from transaction ID and ordinal. The outer CreatureLifecycleCommitV1 hash covers the unchanged ENG-217 change plus the bounded death witness and pre-motion fence/overlay. The inner CreatureLifecycleChangeV1 schema and bytes remain unchanged. The receiver checks transfer ID, transaction ID, ordinal, payload hash, schema, size/work bounds, and catalog before creating an actor candidate. Use the present maximum record/set and baseline assembly bounds; collect raw/compressed byte and segment counts for trout, crow, and deer fixtures when implementation begins. Those are measurements for cost, not a reason to claim the largest permitted record fits a control frame.
+
+## Ordered identity, replay and atomic publication
+
+There is one authoritative transaction identity and one `JournalSeq`. Each actor operation gets its identity from `(transaction_id, operation_ordinal, canonical_change_hash)`. Reuse the existing applied-transaction ledger and stream ordering; do not add an actor sequence, applied-event set, or journal. Extend the existing ledger's receipt/fingerprint data as necessary so an exact already-applied transaction is a duplicate while reuse of its transaction ID with different operation bytes is divergent. Derive the reducer's `CreatureLifecycleReplayReceiptV1` from that ledger and the operation, not from the packet or the DTO itself.
+
+At the server tick boundary, construct one candidate for every op in transaction order. Validate the topology edit candidate, all affected creature records through the existing `reduce_creature_lifecycle_candidate`, shared registries, volume/owner uniqueness, source freshness, asset/material catalogs, physics preparation, and the combined after-state hashes before mutating anything. In particular, actor source VolumeIds must not collide with terrain, ordinary body volumes, a split child's reserved ID, another source part, or an existing actor. The existing world volume allocator remains authoritative: birth reserves the original source IDs once; death keeps those IDs owned; no lifecycle reducer allocates a shadow volume counter. A failure in any topology op, actor op, transfer preparation, material validation, counter advance, or hash check publishes neither side and appends no journal entry. Only after all preparation succeeds does the owner thread commit physics/geometry, publish actor ownership and counters, append the single journal entry, and queue the same transaction to the existing outbound transaction stream.
+
+`SimWorld::replay_transaction` and `ReplicaWorld::apply_transaction` need candidate-first handling for both operation classes. Actor-only transactions must be accepted without geometry preconditions, while mixed transactions publish the geometry and actor candidates atomically. Geometry `VolumeHash` checks keep their existing meaning. Actor ops validate actor before/after record hashes plus the actor-topology and complete-owner hashes described below. Cross-op duplicate IDs and out-of-order/malformed lifecycle ops reject before publication. Keep the current transaction duplicate/repair/bulk holding machinery as the only ordering authority.
+
+## Death evidence and delayed motion
+
+The ENG-216 checked transfer is authoritative physical evidence. Only the server-side lifecycle producer can create death evidence, using the exact `CorpseTransferOutcome` accepted by physics before ownership mutation. A client `ActionRequest` cannot supply or override a witness. Serialize a bounded, portable death witness inside the versioned `CreatureLifecycleCommitV1` envelope and include it in the outer commit hash, preserving the inner ENG-217 change bytes. It binds the creature key and source generation, before state/topology/pose epochs, root pose, resulting installed twist, and every frozen local part pose. The reducer checks it against the current source topology and the resulting corpse record. Client and recovery validate these relationships and the server transaction's authenticated authority; they do not recreate or rerun Rapier transfer physics. The witness is checked evidence of the server's physical result, not a cryptographic proof that a solver ran.
+
+A reliable death transaction must work when the client's last actor motion datagram is behind the server. ENG-217's full before-record hash includes motion, so comparing it directly with a stale client record would reject a valid death; overwriting the whole record would risk accepting stale source topology. Carry an authoritative pre-death motion/clip snapshot in the lifecycle payload, bound to the expected full before-record hash and a separate actor-topology fence. The receiver first proves its current topology/revisions/generation match the fenced topology hash, then applies the authoritative motion snapshot to a private candidate only and checks that candidate's full hash equals the expected before hash. The same ENG-217 reducer then validates the death transition with the checked transfer witness. Nothing from the pre-motion snapshot becomes visible unless the whole lifecycle transaction publishes. This accepts baseline → physics movement → death when no motion datagram arrived, while stale or tampered source topology still rejects.
+
+Ordinary live motion continues over the existing unreliable motion channel, not reliable topology operations each tick. Add a versioned creature-motion snapshot to that channel and to the existing durable pose-batch path, with monotone tick/pose-epoch checks and source-generation/topology binding. Death publication fences later-arriving snapshots so no stale alive pose can resurrect or change a corpse. The ordered death payload remains sufficient even if all recent motion datagrams are lost.
+
+## Hash contract: topology and complete ownership are distinct
+
+Keep the legacy `world_hash` and `canonical_topology_hash` bytes unchanged for actor-free terrain/body worlds. They cover canonical voxel geometry and its current volume owner identity; they do not include rigid-body motion, and animal source parts are not ordinary body volumes.
+
+Define a versioned **creature topology hash** over stable actor identity/lifecycle, source volume IDs and generations, source cell/material/revision content, hierarchy parent links and authored initial transforms, component identity/serial high-water, and exact source-cell ownership masks. It excludes root transform, current frozen/local animated poses, velocity, clip/playback state and any pose/state epoch that changes only with motion. Define an actor **motion hash** over those mutable poses, twists, clip/playback state and motion epochs. Preserve the ENG-217 record hash as the complete single-record identity (it includes motion). Define the actor ownership-set hash over ordered topology and motion state, and a versioned complete owner hash from the legacy topology hash plus actor topology and actor motion hashes. Baseline, transaction, and checkpoint each name the appropriate hash versions. A motion-only update changes motion and complete-owner hashes but cannot change either legacy topology hash or creature topology hash.
+
+The source-content hash remains narrower: exact source bytes/identity/revisions. It is not a substitute for creature topology (which also binds hierarchy and component masks) or full owner state (which binds motion).
+
+## Full baseline, segment staging and allocator restore
+
+Extend full baseline capture as one coherent tick snapshot containing the existing terrain/body volumes plus the complete creature ownership state and creature allocator snapshot. The allocator state must survive even when the actor set is empty; deriving next CreatureId from live records would reuse IDs after all actors die. Include source generations, original VolumeIds, exact brick cells/materials/revisions/edited bits, hierarchy and initial/current local poses, component masks/serial high-water, root and component motion, and the versioned hash fields. No runtime `ArticulatedBodyId`, ECS ID, physics handle, or freshness stamp is portable.
+
+Update both monolithic `BaselineWorld` and streamed/segmented baseline paths. Staged geometry and actor records stay private until the complete manifest validates; actor ownership, allocator epoch/high-water, volume ownership indexes and geometry replace the old replica atomically. A baseline replacement must clear old applied transaction and held repair/bulk state in the same swap while preserving the newly installed actor allocator/reset epoch. `BaselineSnapshot`, `encode_segmented`, `SegmentedReceiver`, `StagedBaseline`, `ReplicaWorld::install_baseline_world`, and `install_staged` are part of one path, not optional follow-up support. Regional/interest captures must include each relevant actor record whole (never a partial set of part bindings) and carry a declared scope/hash; the full-world checkpoint always captures all records.
+
+The authoritative server must own a real actor host after recovery, including an empty host with restored allocator values. Current recovery initializes `Simulation.creatures` as absent; silently leaving it absent would either lose monotone IDs or make an actor-bearing snapshot appear servable as an empty legacy world. Rebuild physical runtime handles from portable sources at restore: alive records rebuild articulated parts from exact source volumes, parent transforms and root motion; corpse records rebuild physical components from their source masks and component poses/twists. Recreate physics from the saved value data through the existing physics adapter; do not serialize handles or replay the death transfer as fake physics. Preserve source owners separately from ordinary `Body` records. If a saved record cannot rebuild exactly under the validated physics/material/asset catalog, recovery fails closed before serving.
+
+Inject the same validated creature catalog into replica and persistence validation (`ReplicaConfig` and `PersistConfig`, or their reviewed equivalent). Baseline install, catalogue merge, repair, reset, administrative topology apply, normal edit admission, replay, and body/source retirement all need an explicit actor ownership rule. Until a synchronized source-edit/fracture/removal operation exists, ordinary edit/removal/merge paths reject any attempt to mutate or retire an actor-owned source VolumeId. They must not silently drop the source or treat it as a normal body. A whole actor record, including empty part bindings and retired component serials, survives lifecycle death until a future explicit removal operation.
+
+## Journal, checkpoint and compatibility
+
+A small inline lifecycle op stays inside the existing encoded `TopologyTransaction` bytes in `JournalPayload::Topology`. New typed or multiple bulk attachments use the appended `JournalPayload::TopologyBulkTransaction` variant described below, carrying that same transaction, its existing participant snapshots and all typed attachments. It is one existing `JournalRecord` at one existing `JournalSeq`; ordinary `Topology` and `PoseBatch` tags stay explicit, while the geometry-only bulk payload path is replaced together with its callers under the new store version. Older store layouts reject; no legacy bulk decoder is required. The server's `JournalEntry` bulk association and recovery dispatch are extended alongside the replica transfer path. Creature pose batches are written through the same ordered pose journal records, not a second actor journal.
+
+Current protocol/wire is 9 with the typed inline lifecycle operation and bounded typed bulk marker/codec; bulk dispatch remains closed. Baseline schema 1, streamed-baseline world version 3 and store schema 3 remain unchanged; bump baseline/world stream versions for the actor ownership segment; bump store schema to 4 for an atomic actor ownership/allocator checkpoint sidecar and hash versions. Preserve all preexisting enum discriminants and keep legacy topology-only wire bodies intact. New peers reject old protocol/schema peers at handshake; a new baseline receiver rejects an actor-capable session's v1 geometry-only baseline rather than interpreting omitted ownership as empty.
+
+Schema-3 saves are explicitly rejected before mutation in this slice; fresh stores use schema 4. Only the current protocol record version is accepted, including in saved journals. Versions 5, 6, 7 and 8 reject without migration. Never reinterpret layouts by patching headers. The user explicitly removed legacy compatibility from scope on 2026-10-17. Keep `Checkpoint.world_hash` as the legacy topology field; add separately versioned actor topology/motion/complete-owner integrity data in the checkpoint sidecar, written and published with body/brick rows and journal cursor in the same SQLite transaction. Recovery validates all hashes before publishing the restored simulation.
+
+## File/function consumer map
+
+- `crates/spall_protocol/src/records.rs`: append typed `TopologyOp` variants; validate operation ordinal/transaction ID, witness, inline/bulk rules, and material/catalog constraints; preserve prior variants.
+- `crates/spall_protocol/src/creature_owner.rs`: extend the lifecycle payload with bounded portable death evidence and delayed-motion prestate fence; keep `reduce_creature_lifecycle_candidate` the single transition reducer; define actor topology/motion hash functions and receipt hashes.
+- `crates/spall_sim/src/commit.rs`, `journal.rs`, `sim.rs`, `world.rs`: generate validated lifecycle ops from checked ENG-216 birth/death results; stage mixed candidates; reserve shared IDs; append one journal sequence; extend `SimWorld::replay_transaction`; install a production actor host and source edit guards.
+- `crates/spall_server/src/serve.rs`: queue/send the same transaction record and correlated typed bulk bytes; pass validated catalogs; preserve existing FIFO and one applied transaction identity.
+- `crates/spall_client/src/replica.rs`, `segmented.rs`, `crates/spall_server/src/baseline.rs`: apply lifecycle ops in the existing candidate/pending order; capture full actor sets in both baseline paths; atomically install actor state/counters; accept motion snapshots without confusing topology hashes.
+- `crates/spall_store/src/dto.rs`, `db.rs`, `recover.rs`, `crates/spall_server/src/persist.rs`: append the bulk payload discriminant, publish actor sidecars atomically, reject old versions without migration, validate allocator/hash state, replay ordered lifecycle and pose records, and rebuild physics from parts before serving.
+- `docs/protocol.md`, `docs/architecture.md`, `docs/validation.md`, and the ENG-218 task entry: document new wire, baseline, store and hash contracts together; retain the closed production-spawning gate.
+
+## Acceptance tests
+
+1. Existing ordinary `TopologyTransaction` body bytes, enum discriminants, topology hash vectors, and actor-free full-world hash vectors remain unchanged. A protocol-7 peer and a baseline-v1 peer are refused explicitly by the new session.
+2. Apply an actual ENG-216 three-part birth, movement update and checked death through a `TopologyOp::CreatureLifecycle` transaction. Verify transaction/control/journal identity comes from existing allocators; no new sequence is consumed. Exact replay is duplicate; different payload under the same transaction ID, wrong operation ordinal, wrong actor receipt, or stale transaction ordering rejects.
+3. Mixed geometry + lifecycle operations reject atomically on geometry failure, actor failure, transfer-preparation failure, shared VolumeId/owner-key collision, material mismatch, and counter exhaustion. Neither candidate state nor counters nor journal cursor changes on failure.
+4. Exercise inline and bulk payloads on both sides of the control-record boundary. Bulk transfer uses existing BaselineBegin/Part/End scheduling, respects compressed/decoded/segment/work caps, holds successors until assembly, verifies transaction/ordinal/hash correlation, and journal/replays as one sequence. Record actual raw/compressed sizes for trout/crow/deer without claiming all maximum-size records are inline.
+5. Baseline and segmented staging round-trip source bricks, materials, revisions, hierarchy, masks, allocator high-water and current motion. Replacing a baseline atomically clears stale replay/repair state while retaining the supplied actor reset epoch and allocator. Verify full owner hash equality after install.
+6. Send a baseline with topology T and motion M0; advance the server physics to M1 without delivering a motion datagram; then apply death. It must succeed using the authoritative pre-motion snapshot and checked witness while a tampered source/revision/hierarchy/topology hash rejects without overwriting the replica. A forged ActionRequest witness is ignored/rejected because requests carry no witness.
+7. Change only root/local pose, velocity, clip playback and pose epoch: legacy topology and creature topology hashes remain equal while actor motion and complete-owner hashes change. Change one source material/revision or mask: topology hashes change.
+8. Checkpoint the actual actor state and allocator in monolithic and every segmented/regional baseline; replay an ordered lifecycle/pose suffix, restart cold, and verify exactly-once ownership, component serial/creature/volume high-water, source cells/revisions, hierarchy, and the declared durable-prefix hash. Use the integrated exact multi-component cold-restore primitive; the common birth/death/restore batch is integrated, while wiring exact recovery remains a prerequisite. Exercise every checkpoint publication crash cut: recovery sees either the prior complete checkpoint or the complete new actor+geometry checkpoint, never a partial pair. An invalid physics reconstruction refuses startup before listen/baseline service.
+9. Reject schema-3 saves before any mutation with a clear compatibility error; fresh schema-4 stores start with empty actor state and initialized high-water.
+10. Attempt ordinary edits, removals, admin merges and reset against actor-owned sources: they reject or use the reviewed reset transaction; no unsynchronized path changes, duplicates, retires or silently drops source IDs. Production animal registration remains disabled after ENG-218 acceptance.
+
+## Implementation boundary and limits
+
+ENG218 is one coherent consumer slice, with reviewable commits for (1) op/witness/bulk envelope and atomic server/client transaction application, (2) baseline/segmented/catalogue/allocator restore, and (3) strict store versioning/checkpoint/replay and crash tests. It is not accepted as a DTO-only or replica-only milestone; all three consumers must pass together before registration is reconsidered.
+
+This design does not add actor source editing, fracture synchronization, arbitrary terminal removal, species/habitat policy, live production spawning, or the 1024 m two-client/GPU launch claim. Those remain follow-on gates. Exact multi-component cold restoration is integrated; the common mixed physics batch is also integrated, while the real recovery consumer still requires implementation and acceptance. Do not flatten multi-part corpses into an ordinary one-volume body or invent approximate ownership.
+
+## Concrete preparation and publication boundary
+
+The current ownership split prevents `SimWorld::replay_transaction` from applying an actor record: `Simulation` owns `Option<CreatureHost>`, while `SimWorld` owns the voxel volumes, physics world, ID registry, and the private `CreatureSourceStore`. The source store tracks original source volumes and metadata. Main 1d304da promotes the source/host publication primitives and adds a crate-private inline prepare/validate/publish lifecycle path; direct fixture convenience methods named `commit_creature_*_for_test` remain test-only. This does not yet connect live tick admission, typed bulk attachments, replica or recovery consumers. Do not move the actor host into a global or clone the whole `SimWorld`/Rapier world to make replay look atomic. `CreatureHost` and the bounded portable record set may be cloned as candidates; the multi-kilometre physics world may not.
+
+The server live path should be a value-only `Simulation::prepare_live_commit(staged_edit, validated_intents, catalog, transfer_reservations) -> PreparedSimulationTransaction`. It allocates `TransactionId` and `JournalSeq` from a cloned candidate `IdRegistry`, like the existing commit path, then owns the final validated `TopologyTransaction`, cloned-after `CreatureHost` candidate, cloned-after `IdRegistry`, changed `Volume` candidates and precomputed collider plans, participants, checked actor witness, and reserved bulk attachments. It contains no copied physics world and no live published state. The replay path is separate: `Simulation::prepare_replay_transaction(tx, attachments, verified_receipts, catalog)` consumes the ordered transaction IDs and ordinals already on the wire and does not allocate new transaction/operation IDs; it only advances the candidate world counters past IDs present in the replayed suffix. `commit_prepared` performs the final freshness/token check and returns `Stale` before the first mutation, then has an infallible publish section. The authoritative edit path should extract the candidate construction already done inside `commit::commit` into this prepare/publish split, so a normal geometry edit and a lifecycle op in the same `ops` list are prepared under the same `server_tick`, `control_seq`, `transaction_id`, and operation-ordinal assignment.
+
+The integrated physics-owned preparation API for mixed lifecycle transactions is `ArticulatedBatchOperation` with exactly three variants: `AliveBirth { operation_tag, translation_m, rotation_xyzw, topology_token, parts, representation }`, `CheckedDeathTransfer { operation_tag, id, expected_topology_token, expected_pose_token }`, and `ColdRestore { operation_tag, restore, representation }`. `PhysicsWorld::prepare_articulated_batch(&self, operations, density) -> PreparedArticulatedBatch` uses private prepared state, retains the physics world instance/namespace and step count plus every affected owner/body/source snapshot, and prebuilds all colliders, masses, resultant twists, frozen poses, components, and replacement colliders. It checks all IDs/tokens/pending-pose state and collisions across the live world and all batch members before mutation. `PhysicsWorld::commit_articulated_batch(&mut self, prepared) -> Result<Vec<ArticulatedBatchOutcome>, ArticulatedError>` rechecks the captured affected state before any publish and then performs only infallible application; outputs are correlated by the local operation tag and include the exact `CorpseTransferOutcome` for each checked death. A checked death means only the alive-to-corpse transfer. It never releases or reuses the original source VolumeIds; do not add terminal death/removal or transfer-out-plus-birth reuse. Existing `add_articulated_kinematic_parts`, `transfer_articulated_to_dynamic_corpse_checked`, and `restore_dynamic_corpse` should delegate through this preparation machinery as singleton batches. They cannot be sequenced as mixed-transaction calls because a later failure would otherwise leave an earlier physics mutation published. The just-added `restore_dynamic_corpse` remains the exact source/component reconstruction primitive.
+
+The server preparation order is: validate the existing transaction replay identity and every op/ordinal; check all geometry `before` revisions and actor topology/source fences; build candidate geometry and actor states with one candidate allocator; reject actor-owned source IDs touched by ordinary edits, removals, admin merge, a second birth, or a death-transfer plus attempted reuse in the same transaction; check cross-op terrain/body/source-volume, creature-key, owner-key, and component-serial collisions; call the physics batch preparer; compute and validate every geometry and actor after hash; encode inline/bulk forms and reserve every transfer ID; reserve one existing `JournalSeq`; and ensure outbound/journal bounds are available. Any error leaves the live host, source store, volumes, physics, ID registry, journal cursor, and outbound transaction stream unchanged. The publish phase revalidates the captured world/physics generation once, performs the infallible physics batch commit, swaps prepared volume/source/host/registry candidates, appends exactly one `JournalEntry`, and emits that same transaction. The transfer witness must be taken from the prepared/committed checked outcome, never from a client request or reconstructed corpse DTO.
+
+On authoritative recovery, route lifecycle ops through `Simulation::prepare_replay_transaction`, which reduces against the current actor set using `validate_and_reduce_with_receipt` and derives the outer receipt from the existing `TopologyTransaction::replay_identity_hash` ledger and operation ordinal. The client remains a plain `ReplicaWorld` candidate and must not call `Simulation` or server physics: `ReplicaWorld::prepare_transaction_candidate` stages affected geometry maps and the actor ownership set, validates all hashes/receipts, and swaps them only after every op succeeds. Both consumers collect all transfer IDs in a transaction, hold the entire transaction until every referenced attachment is present, prepare geometry and actor candidates, and publish once. `SimWorld::replay_transaction` has no actor-host parameter and therefore must reject a transaction containing either lifecycle variant before it mutates any volume. Neither consumer may treat an unknown lifecycle op as skipped or advance `now_tick`, `control_gate`, or the applied-transaction fingerprint for a rejected/missing payload.
+
+## Exact lifecycle bulk framing and transfer IDs
+
+Append these protocol names without changing existing enum discriminants: `TopologyOp::CreatureLifecycle { commit: Box<CreatureLifecycleCommitV1> }` for a conservative inline envelope, and `TopologyOp::CreatureLifecycleBulk { operation_ordinal, payload_schema, commit_hash, transfer_id }` for an envelope that does not fit `MAX_CONTROL_RECORD`. The outer commit hash binds the full witness and pre-motion overlay. The marker is bound to the enclosing `TopologyTransaction.transaction_id`; require its ordinal to equal its op index and its schema/hash to match the assembled payload. Keep the inner ENG-217 `CreatureLifecycleChangeV1` layout unchanged. `TopologyOp::bulk_transfer_id` (or a plural successor) must surface every bulk marker, and transaction validation must reject repeated IDs or a duplicate lifecycle ordinal before publication.
+
+Reuse the existing `BaselineBegin`/`BaselinePart`/`BaselineEnd` records, bulk stream, part hash, and bounded assembler, but use a new explicit `BASELINE_CREATURE_LIFECYCLE_WORLD_VERSION = 6` dispatch value. Version 6 means one zstd-compressed, bounded postcard `CreatureLifecycleBulkPayloadV1 { schema, transaction_id, operation_ordinal, commit_hash, commit }`; it is not a `BaselineWorld` and has no regions. `BaselineBegin.total_bytes` and `part_count`, each part's hash/size, and `BaselineEnd.assembled_hash` retain their current meanings. The receiver routes world version 6 to the lifecycle payload decoder, checks the embedded transaction ID/ordinal/hash against the marker before decoding the nested record, enforces the existing compressed transfer cap plus the ENG-217 cumulative decoded-work/16 MiB record bounds, and only then releases the transaction from the pending queue. This uses the same ordered bulk transport without pretending actor data is geometry or changing `BaselineWorld` semantics.
+
+A transaction may carry more than one bulk attachment (for example, an oversized geometry split and an oversized actor record), so use a bounded `Vec<TopologyBulkAttachment>` keyed by the distinct transfer IDs in the transaction instead of assuming `find_map` returns the only payload. Replace `JournalEntry`'s geometry-only bulk association with typed attachments and use `JournalPayload::TopologyBulkTransaction { transaction, participants, attachments }` for bulk transactions. Convert current geometry split producers and consumers together when the store format advances. The user's current-only decision removes the requirement to retain a legacy split-only decoder or migration path: older stores reject before mutation. Keep explicit current DTO versions and stable tags within each supported layout; do not silently reinterpret old rows. A single journal sequence still stores the transaction and every referenced payload; recovery never reorders or independently commits attachments.
+
+Use one live-server `TransferIdAllocator` owned by the existing server runtime context for baseline, repair, reset, split, and lifecycle transfers; do not derive lifecycle IDs from `(TransactionId, ordinal)`. The concrete current starting point is `LateJoin::next_transfer_id`/`LateJoin::next_id` in `serve.rs`, but it is not yet a transaction-commit allocator: geometry bulk split currently uses `transaction_id | SPLIT_BULK_TRANSFER_ID_BIT` after commit, and world reset applies `WORLD_RESET_TRANSFER_ID_BIT` to a separately allocated ID. Replace those separate paths with one allocator and pass already-reserved `TransferId` values into `Simulation` as data in the per-tick `TransferReservations` input; do not pass a network callback or make simulation depend on server/network code. The simulation reports the bounded number of potential out-of-band attachments for a commit batch before final encoding; the server reserves that many values from the shared allocator, then reruns/prepares with those values. Unused values after an aborted/stale prepare are harmless gaps. Allocate from one monotonically increasing low sequence, keep zero as the existing baseline-request sentinel, preserve the existing split/reset namespace bits, add a distinct lifecycle namespace bit, and collision-check fully composed IDs against all active streams and IDs in retained journal attachments. Transfer IDs are server-runtime correlation values, not world state, so do not add a persisted transfer allocator counter. On server start, seed the runtime allocator beyond IDs in retained/replayable journal attachments before allowing new allocations; IDs belonging only to in-flight streams disappear with those connections. The creature allocator remains persistent independently. Migrate bulk-split ID creation to this allocator in the same integration; otherwise the claim of common uniqueness is false. If reserved values cannot be supplied before final transaction hashing/journaling, that is an explicit prerequisite/blocker, not a reason to patch markers after journaling.
+
+## Implemented cold-restore batch prerequisite
+
+The physics adapter now separates `prepare_dynamic_corpse_restore_batch` from
+`commit_dynamic_corpse_restore_batch`. Preparation owns every source shard,
+collider, mass and component value; it performs no solver insertion. Commit
+checks the creating world identity, physics step, body-slot count and every
+owner/source reservation before the first insertion. The complete batch then
+publishes without fallible preparation. Density values are captured once per
+material for all owners. The existing single-owner restore delegates through
+this same path.
+
+The cold-restore API now delegates through the integrated common
+`PreparedArticulatedBatch`, which also stages living kinematic birth and checked
+alive-to-corpse transfer. `validate_articulated_batch` produces a one-shot
+capability; `publish_validated_articulated_batch` publishes after all joint
+validation, allowing unrelated prevalidated geometry to publish first. The
+geometry adapter likewise separates preparation, freshness validation and
+publication; its no-journal publisher returns the same prepared journal entry
+for the enclosing transaction to append once. The normal commit wrapper retains
+its existing behavior and timing span.
+
+The integrated internal `PreparedSimulationTransaction` combines registry/host/source
+candidates, total geometry plus actor body-slot capacity, inline hashes and one
+journal reservation. Reserved typed bulk attachments and the live tick caller
+remain required. This internal inline producer does not implement a complete
+replica, baseline or durable actor checkpoint.
+
+## Current-only animated ownership V2 plan (2026-10-18)
+
+Implement a separate keyed CreaturePartVelocityV2 list on ownership records and
+pre-motion overlays. Alive requires exact sorted source-part coverage (including
+empty bindings), finite bounded measured linear/angular velocities; Corpse requires
+an empty list and continues using independently moving component twists. Existing
+source descriptors and frozen-pose entries retain their layout. Full/motion and
+outer commit hashes bind the new list; topology/source-content hashes omit it.
+The actual death producer samples pending-safe installed physics part motion on
+the owner thread, with no intervening mutations, and existing prepared-owner
+freshness validation fences the checked transfer. Birth zeros are valid only for
+its existing zero-motion AliveBirth installation. No other reconstruction may
+infer or default independent twists from root motion.
+
+Changed serialized owner/set/lifecycle operation/change/overlay/commit/bulk payload
+types become V2 with no V1 aliases/conversion. Owner/change/commit/bulk schemas and
+changed canonical domains advance to 2. Wire/handshake advances 9 to 10; lifecycle
+bulk kind advances 6 to 7 and superseded values refuse. Geometry baseline 1 and
+store 3 remain because their existing layouts (including opaque encoded journal
+frames) do not change here; old embedded wire frames reject. Complete actor
+checkpoint sections remain absent and guarded. A later actual checkpoint layout
+change must advance store/baseline then.
+
+Keep the existing checked installed-root-motion death witness unchanged. It
+attests the transfer result; the existing complete-before hash and outer commit
+hash bind the authoritative sampled overlay, including part velocities. Replica
+validation does not recompute physics. No duplicate input-motion ledger or witness
+vector is added. Validate this seam with a real animated physics transfer and
+freshness/refusal scenarios before claiming the producer accepted.
+
+Extend per-record, population, and attachment resource accounting for new velocity
+vectors before allocation, scan, clone or hash; retain existing ceilings. Update
+all callers and fixtures together. Required checks include independent nonrigid
+motion roundtrip, full/motion-vs-topology hash distinction, sorted/complete/finite
+coverage refusal, overlay replay without motion datagrams, checked death clearing
+the Alive list, tamper/replay rejection, bounded prefix refusal and old-format
+rejection. Complete Simulation source/allocator capture, baseline/checkpoint and
+ordered typed consumers remain subsequent ENG-218 work; spawning remains closed.
+## Complete capture and primary identity plan (2026-10-18)
+
+Whole-owner runtime corpse capture deliberately preserves the actual primary body
+first. Portable ownership V2 instead sorts component records by stable serial and
+has no explicit primary ID. A complete portable export cannot infer this identity
+from floating-point root frames (coincident components can be ambiguous). Resolve
+this missing contract by adding primary_component_serial on the existing owner:
+None selects the sole intact component; a nonzero derived serial must name exactly
+one component. Root pose/twist must match that explicitly selected component.
+Include the identity link in topology/full hashes; ordinary motion does not change
+it. Keep component arrays canonically sorted, and put the selected component first
+only while translating to the existing runtime restore DTO. No parallel primary
+sidecar or second owner record is introduced.
+
+The changed owner/set/change/operation/commit/bulk chain becomes V3/current
+schema 3 with changed canonical domains and wire 11/lifecycle kind 8; unchanged
+motion overlay V2, part velocity V2 and source/component/pose V1 DTOs keep their layouts. Superseded
+schemas reject without migration. Geometry baseline/store stay 1/3 until actual
+complete actor sections are integrated into those formats.
+
+Add a new bounded portable CreatureSnapshotV1 envelope containing its own schema,
+the existing allocator snapshot, the actual shared next-volume-ID counter, and
+the one current ownership set. It retains
+world identity/epoch and next creature ID even when no records remain. Validate
+allocator shape and exact record world/epoch plus IDs below high-water; never use
+an independent actor allocator or persist runtime handles/stamps. Source volume
+uniqueness remains the ownership-set contract; consumers must also validate the
+shared geometry volume namespace/counter at installation.
+
+Simulation capture runs read-only on the owning thread at a committed boundary.
+Before cloning/expanding grids, preflight the complete bounded population, source
+resident/dense/solid/mask work, physics reconstruction grids and owned memory.
+Verify host/source/metadata/physics maps agree exactly, preserve original sparse
+bricks with revisions/edited flags/bounds and authored hierarchy, and capture
+current applied/frozen local poses. Alive uses actual pending-safe part motion;
+Corpse uses complete runtime component masks/motion, serial high-water and primary
+identity. Preserve source generation and portable topology/pose tokens; stale or
+unsynchronized source/fracture state refuses, rather than inventing an update.
+The snapshot includes no runtime IDs and no fake body/volume ownership.
+
+Acceptance includes initialized empty allocator capture, animated Alive capture
+and codec roundtrip, complete multi-component corpse export with nonlowest primary
+and empty source bindings, exact sparse metadata retention, malformed/stale/pending
+or resource-limit refusal without mutation, and explicit allocator/identity/hash
+checks. This prerequisite does not open geometry-only checkpoints, actor baselines,
+typed runtime replay, bulk publication or spawning; those consumers remain next.
+
+### Capture adapter clarification (2026-10-18)
+
+Read-only review confirms the host logical pose_epoch and runtime authored
+pose_token are separate: initial physical token is zero; Death advances only the
+logical epoch. Keep raw physical tokens runtime-only. Capture fences actual
+physics with its raw token and binds the host logical epoch in the portable
+record in the same immutable owner-thread window. Add an explicit logical-epoch
+argument to the whole-corpse capture adapter, returning a valid cold-restore DTO
+whose epoch is the host epoch. Existing direct capture retains its token-as-epoch
+behavior for callers already using that mapping. Never serialize a second raw
+runtime counter. Tests must cover initial token zero, pending refusal and Death
+with diverged counters; the mapped restore must admit the next logical token.
+
+A second missing prerequisite is Volume.next_revision, which cannot generally be
+recovered from resident brick revisions after retirement/eviction. The current
+source format does not retain it. This capture pass must refuse such gaps with an
+explicit SourceRevision error; a subsequent current-only source DTO/high-water
+and exact restore seam is required before claiming complete general source saves.
+No derived max+1 value may silently replace the live counter. Production saves
+and spawning remain closed. Population preflight may conservatively refuse a
+potential mask/memory budget overflow; it never relaxes existing ceilings.
+
+
+### Exact source counter reconstruction plan (2026-10-18)
+
+Add required next_brick_revision to current-only CreatureSourcePartV2; positive,
+strictly above every resident brick revision, including empty source volumes.
+Include it directly in canonical source/full/topology hashes and lifecycle static
+source comparisons. Change containing owner/set/operation/change/commit/bulk to
+V4 schemas/domains4, snapshot envelope V2/schema2/domain2, wire/handshake12 and
+lifecycle bulk kind9. Unchanged motion overlay/velocity V2 and pose/component V1
+stay unchanged. No aliases, omitted-field defaults or migration. Geometry baseline
+1/store3 layouts remain guarded until complete actor sections are integrated.
+
+Add a monotonic checked Volume revision-counter resume primitive, refusing zero
+or rollback without mutation. Reconstruct a fresh bounded/unbounded Volume from
+the validated original source bricks/revisions/edited flags, then resume exactly
+at the recorded next counter (not max resident revision+1). Expose a pure source
+reconstruction adapter from the existing complete snapshot and injected catalog;
+it returns unpublished runtime volumes using saved IDs, never allocates IDs or
+installs them in a Simulation. No alternate ledger or owner format. Snapshot
+validation must bound aggregate work before reconstruction copies any cells.
+
+Capture writes each actual volume.next_revision and removes the SourceRevision
+gap refusal. Preserve source freshness/physics equality checks and all budgets.
+Tests: real higher revision edit/air-tombstone retirement with retained lower
+revision geometry, full codec->source reconstruction, next edit consumes the
+saved counter; initially empty and emptied volumes preserve gaps; zero/backward/
+occupied-brick-equal counters and missing/old fields reject; source/full/topology
+hashes change with counter alone, motion does not; u64::MAX exhaustion remains
+explicit without reuse/mutation. Existing live actor checkpoint refusal and spawn
+closure remain. Next ENG-218 is joint prepared host/source/physics/registry restore,
+then complete checkpoint/baseline and ordered consumers.
+
+
+### Joint cold actor restore plan (2026-10-18)
+
+Install complete CreatureSnapshotV2 only after geometry recovery, into a
+Simulation with no initialized host and all five creature indexes empty. Require
+an explicit expected WorldId and exact agreement with the saved shared volume
+counter; preserve every registry counter and the journal cursor. Reject source
+IDs already occupied by ordinary geometry before preparation and again at commit.
+Capture the existing geometry/physics/world/origin/journal fence and bounded
+catalog fingerprint. Refuse stale, foreign, initialized-even-empty targets.
+
+Reconstruct saved sparse source volumes and revision counters, preflight the
+complete population's existing per-owner and batch grid/solid ceilings before
+allocating occupancy grids or component cell vectors, and reuse physics
+AliveRestore/ColdRestore preparation. Preserve applied local poses, measured
+part motion, logical pose epoch, owner/source IDs, component serial gaps and the
+explicit primary component (primary-first only in the runtime restore DTO).
+Retain empty source bindings as empty physical grids. Build the complete saved
+allocator host and detached source/provenance/frozen-pose maps before publication;
+preallocate owner-handle slots, fill those slots from physics outcomes, and swap
+the complete store into the fresh target. No IDs, registry rewrites or journal
+entries are produced. Validate every participant before the first mutation and
+publish immediately on the same owning thread with no later fallible checks.
+Empty populations use the same fences but no physics batch. Test whole snapshot
+roundtrips, serial/empty/counter retention, stale/foreign/collision/catalog/budget
+refusal and no partial publication. Complete checkpoint/baseline sections and
+ordered consumers remain subsequent ENG-218 work; spawning remains closed.
+
+
+### Complete checkpoint section plan (2026-10-19)
+
+Advance current-only store schema3 to4; reject prior saves without migration.
+Every checkpoint transaction includes a required CRC-protected creature section
+row, including explicit None for an uninitialized host. A present version1 section
+contains the existing SnapshotV2 and its full canonical hash. Bound nested decode
+and exact byte frames; catalog-independent resource/identity/counter/namespace
+admission happens before encoding/publication, with full catalog validation in the
+server capture/rebuild adapter. Missing, oversized, bad-CRC or invalid actor rows
+invalidate that checkpoint through the existing fallback/corruption policy, never
+silently dropping actors. Existing transaction crash cuts include the row.
+
+Add domain-separated snapshot topology hashing (saved allocator and owner topology
+hashes, motion excluded) and compose with the unchanged geometry hash only when
+an animal host exists. Actor-free hash vectors remain unchanged. Expose the
+explicit partial geometry hash for composition; existing geometry-only callers
+remain guarded. Store the complete snapshot hash separately to bind animal motion
+and source metadata as well as topology. No new ownership ledger or journal.
+
+Add catalog-aware capture/restore entrypoints alongside existing catalog-free
+callers, which continue to reject animal-bearing state. Rebuild geometry detached,
+validate the actor section against checkpoint world/counters/namespaces and game
+catalog, jointly install the existing restore candidate, then verify complete
+recapture hash before returning the Simulation. Actor-bearing checkpoints with
+any journal suffix explicitly refuse until typed actor runtime replay is ready;
+no suffix is skipped and no checkpoint is advertised as full recovery acceptance.
+Baseline1/wire12, live spawning and serve scheduling remain closed. Tests cover
+actual Alive/Corpse and initialized-empty checkpoint/store/rebuild roundtrips,
+failed writes/crash cuts, corruption/fallback and metadata/catalog/source/hash
+refusal. GPU/1km/two-client animal gates remain separate.
+
+
+Checkpoint implementation refinements after review: persist the finite physics
+origin with the complete section; checkpoint topology composition version3 keeps
+the geometry v2 vectors for None and composes initialized snapshot topology under
+separate v1 domains. Strengthen catalog-independent bounded validation with unique
+CreatureId (not just full generational key) before host map materialization.
+Check prior required row/CRC/framing before either durable write. Serialize actor
+cursor/retained-checkpoint high-water checks and no-journal/no-host-drop guards in
+BEGIN IMMEDIATE. Structural corruption remains fallback-eligible with an explicit
+choice. Semantic catalog/physics/hash failures remain Err; AtOrBefore reloads the
+selected checkpoint's own suffix for explicit recovery, with no implicit rewind.
+Baseline1/wire12 remain unchanged; store4 rejects3 before modifying the database.
+
+Final completeness gate: catalog-aware full capture refuses world-wide retained
+evicted digests before copying geometry. The existing verified incremental
+ResidencyPass backing/cache path has no catalog participant yet and remains closed
+to initialized animal hosts; integrate that participant before streamed-world
+animal persistence. Do not publish resident-only terrain against logical hashes.
+
+
+2026-10-19 streamed checkpoint participant: reuse ResidencyPass complete logical
+terrain assembly, revision cache and verified backing reads for catalog-aware
+animal checkpoints. Bind the pass to the installed SimWorld runtime identity
+(existing commit_identity Arc, exposed only as an opaque nonserialized token);
+refuse a foreign/replaced world before reading cache or backing. Both capture
+entrypoints share that guard. Supply the assembled terrain to the existing full
+checkpoint builder with the game catalog. Reject evicted ordinary body geometry
+since the pass only reconstructs terrain. Keep full-resident capture's global
+eviction guard. Publish cache/capture counters only after all geometry, catalog,
+animal and environment capture succeeds. No store/wire layout changes or live
+serve/spawn enablement. Verify mixed/empty animals through SQLite and detached
+restore, warm/cold backing, unavailable/digest/catalog failure atomicity, foreign
+world refusal and ordinary-body eviction refusal.
+
+
+2026-10-19 typed durable attachment participant: replace the geometry-only
+JournalPayload::TopologyBulkSplit variant with TopologyAttachments carrying the
+existing bounded TransactionAttachmentSetV1 bytes. Bump current-only store schema
+to5, reject4 and earlier without migration; wire12/baseline1 stay unchanged.
+Construct/decode attachments only against the exact saved parent transaction,
+using existing count/family/ID/replay-identity and cumulative decode budgets.
+Migrate the actual terrain journal adapter/recovery/retained-ID startup path and
+real restart tests to the typed set; no alternate actor journal. Existing geometry
+producer's in-memory bulk_baseline remains its geometry output, converted to one
+Geometry attachment with the reserved marker ID. A future bulk lifecycle producer
+still needs typed in-memory publication. Store codec tests preserve validated
+lifecycle payloads and mixed families through actual SQLite, reject missing/extra/
+wrong parent/hash/family/trailing/oversized sets before nested use. Existing live
+actor journal/recovery guards remain: this transport seam must not claim runtime
+actor replay. Replay accepts geometry-only typed sets and explicitly refuses
+lifecycle attachments until the joint Simulation consumer exists. Existing
+process crash/geometry restart tests, full store/server/protocol checks and
+workspace/lint/format must retain workloads.
+
+Typed journal implementation refinements: new transport fields use borrowed
+postcard byte slices and count admission before body/copy allocation (parent64KiB,
+participants4096/per-control64KiB/total64MiB, attachments64MiB). Recovery borrows
+SQLite row buffers and rejects outer trailing bytes. Typed rows bind row tick to
+parent tick. Invalid typed batch preflight poisons before any prefix/outbox write;
+existing auxiliary preflight retries stay unchanged. Store4 rejection is checked
+explicitly alongside older versions before journal-mode changes. Actor storage
+tests retain complete three-part payloads; runtime consumers remain closed.
+
+
+2026-10-19 bounded bulk producer and in-memory journal handoff: replace
+JournalEntry.bulk_baseline with the existing typed TransactionAttachmentSetV1,
+and migrate the real geometry prepare/publication/persistence adapter/replay tests
+so there is one attachment authority. Geometry Committed.bulk_baseline remains
+network output. Prepare validates/encodes complete sets before physics publication.
+Expose the already-used lifecycle namespace bit from protocol, preserving values.
+An internal owned transfer input supplies optional reserved geometry ID and a
+bounded unique lifecycle-ID list; no allocator, callback or runtime journal is
+introduced inside Simulation. Existing no-ID inline entrypoints delegate to the
+same path and still refuse oversized work without IDs. If final inline encoding
+is too large, convert actor ops to existing V4 bulk markers/payloads using supplied
+IDs, retain ordinals and exact sampled commits, validate the final complete typed
+set (including any geometry group), and require marker transaction to fit64KiB.
+Missing/wrong namespace/duplicate IDs, codec/work/budget/exhaustion or stale fences
+fail before world/host/source/physics/registry/journal mutation. Prepared/validated
+candidates carry the exact attachments; publication appends once after both
+participants, with no fallible encoding/ID patch after publish. Tests cover actual
+three-part Birth and checked Death, mixed geometry, exact codec/journal handoff,
+reserved-ID failure/stale atomicity and existing oversized no-ID refusal. Server
+spawning/scheduling, baseline/replica and runtime actor replay remain closed.
+No wire12/store5/baseline1 layout change.
+
+Final producer audit: bound owner count before iterating supplied IDs. The mixed
+parent takes the geometry participant's attachment set rather than cloning a
+stale nested copy; it owns the complete final set. Construct the final journal
+entry before the first geometry/physics publication, rather than rewriting the
+geometry participant's returned entry afterward. No ID/payload reconstruction or
+attachment encoding follows world publication.

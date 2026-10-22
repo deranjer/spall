@@ -10,9 +10,9 @@ manifests. Cargo may select compatible patch releases only by updating
 
 | Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
 | --- | ---: | --- | --- | --- |
-| rayon | 1.12.0 (vendored path `vendor/parallel/rayon-1.12.0`, with rayon-core 1.13.0) | default features; global pool, size from `RAYON_NUM_THREADS` or core count | `MIT OR Apache-2.0` | Data-parallel loops inside one MAC step: velocity advection, PLIC plane reconstruction, and face-flux assembly. Each element writes only its own slot and ordered `collect` keeps serial order, so results are bit-identical for any thread count. Pressure CG and the multigrid smoother stay serial because thread dispatch cost more than the work at scale 2. |
+| rayon | 1.12.0 (crates.io, workspace dependency; resolves rayon-core 1.13.0) | default features; global pool, size from `RAYON_NUM_THREADS` or core count | `MIT OR Apache-2.0` | Data-parallel loops over independent work items in `spall_fluid` (`columns.rs`, the column water model) and `spall_sim`. Each item writes only its own slot and ordered `collect` keeps serial order, so results do not depend on thread count. |
 
-The vendored crates (`rayon`, `rayon-core`, `crossbeam-deque`, `crossbeam-epoch`) live in the top-level `vendor/` directory, which the workspace lists in `exclude`. Cargo makes a path dependency an implicit workspace member when it sits inside a member's directory, and it ignores `exclude` there. Under `crates/spall_fluid/vendor` they were linted as Spall code, and `--all-features` enabled rayon-core's unsupported `web_spin_lock` (and, while vendored, Salva's mutually exclusive `dim2`/`f64`). Do not move them back under a member.
+Rayon was previously vendored under `vendor/parallel` (with `rayon-core`, `crossbeam-deque`, `crossbeam-epoch`) to avoid workspace lint and `--all-features` problems while it lived under a member directory; as a registry dependency those no longer apply, and the vendor directory and workspace `exclude` were removed.
 
 The Salva 0.10.0 DFSPH particle backend was evaluated in ENG-103 and removed
 after the two-phase MAC grid was selected (roof-containment and cost gates
@@ -34,6 +34,16 @@ failed; see `docs/reports/ENG-103.md`). The vendored `salva3d` copy and its
 | wgpu | 30.0.1 | default features | `MIT OR Apache-2.0` | renderer, native surface and GPU captures |
 | naga | 30.0.1 | WGSL input, SPIR-V output | `MIT OR Apache-2.0` | direct shader validation and SPIR-V probe |
 | winit | 0.30.13 | default features | `Apache-2.0` | native window, resize, close event loop |
+
+## ENG-194 — streamed client ambience
+
+`spall_client` adds `rodio = 0.21.1` with `default-features = false` and
+`playback`, `symphonia-ogg`, and `symphonia-vorbis`. It opens the platform output device on a
+dedicated client thread and streams the sandbox's Vorbis ambience through two
+crossfading sinks. The sandbox owns the biome map and asset files; the engine
+accepts indexed paths and does not depend on the game package. `rodio` is
+`MIT OR Apache-2.0`; the Symphonia decoder is MPL-2.0 and cpal is
+`Apache-2.0 OR MIT`. No audio dependency enters headless server builds.
 
 Only the client package imports wgpu/winit. `sandbox-client` requires the
 `sandbox/client` feature, so building `sandbox-server` leaves the server

@@ -8,6 +8,8 @@ rust-version.workspace = true
 # Exposes the dense reference model so later foundation tasks (T03+) can reuse
 # it as a test oracle without copying it.
 oracle = []
+# Small scene builders shared by tests, benches and gates.
+fixtures = []
 
 [dependencies]
 blake3.workspace = true

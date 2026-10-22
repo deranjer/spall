@@ -37,6 +37,15 @@ pub enum AdminCommand {
     /// (a spectator camera that lands where it is). Millimetres, so the command
     /// stays `Eq`; the server pushes the capsule out of any solid it lands in.
     TeleportSelf { feet_mm: [i64; 3] },
+    /// Force a weather kind, or restore automatic seeded policy. `intensity`
+    /// picks the tier of a forced `Snow` and is refused for other kinds.
+    SetWeather {
+        kind: Option<crate::WeatherKind>,
+        intensity: Option<crate::SnowTier>,
+    },
+    /// Make the current season the given one (0 spring, 1 summer, 2 autumn,
+    /// 3 winter) by re-anchoring the shared vegetation and weather clock.
+    SetSeason { season: u8 },
 }
 
 /// `AdminRequest`: reliable operator command. The server decides whether this

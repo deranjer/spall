@@ -7,7 +7,7 @@
 
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{EntityId, SphereBrush};
-use spall_protocol::{RequestId, TopologyOp};
+use spall_protocol::{RequestId, SPLIT_BULK_TRANSFER_ID_BIT, TopologyOp, TransferId};
 use spall_sim::{EditIntent, EditTarget, Simulation, SimulationConfig, fixtures};
 
 fn brush_cell(x: i64, y: i64, z: i64, radius_cells: i64) -> SphereBrush {
@@ -28,6 +28,7 @@ fn sim() -> Simulation {
 fn run(ticks: u64) -> Simulation {
     let mut sim = sim();
     let actor = EntityId::new(1).unwrap();
+    let mut next_transfer_low = 401u64;
     for tick in 1..=ticks {
         if tick == 4 {
             sim.submit(EditIntent::cut(
@@ -39,7 +40,15 @@ fn run(ticks: u64) -> Simulation {
             ))
             .expect("column cut admitted");
         }
-        sim.tick().expect("tick");
+        let count = sim.transfer_reservation_bound();
+        let ids = (0..count)
+            .map(|_| {
+                let id = TransferId(SPLIT_BULK_TRANSFER_ID_BIT | next_transfer_low);
+                next_transfer_low += 1;
+                id
+            })
+            .collect();
+        sim.tick_with_transfer_ids(ids).expect("tick");
     }
     sim
 }
@@ -54,9 +63,29 @@ fn giant_split_commits_with_bulk_baseline_ops_and_replays_exactly() {
 
     let e = &entries[0];
     assert!(
-        e.bulk_baseline.is_some(),
+        e.attachments.is_some(),
         "the split's geometry travels as an out-of-band BaselineWorld"
     );
+    let marker_id = e
+        .transaction
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            TopologyOp::SplitOffBulkBaseline { transfer_id, .. } => Some(*transfer_id),
+            _ => None,
+        })
+        .expect("bulk child marker carries a transfer ID");
+    assert_eq!(marker_id, SPLIT_BULK_TRANSFER_ID_BIT | 401);
+    assert_eq!(
+        live.committed(RequestId(1))
+            .and_then(|commit| commit.bulk_transfer_id)
+            .map(|id| id.0),
+        Some(marker_id)
+    );
+    assert!(e.transaction.ops.iter().any(|op| matches!(
+        op,
+        TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } if *transfer_id == marker_id
+    )));
     let tx = &e.transaction;
     assert!(
         tx.ops
@@ -101,7 +130,7 @@ fn giant_split_commits_with_bulk_baseline_ops_and_replays_exactly() {
             .replay_transaction(
                 &entry.transaction,
                 &entry.participants,
-                entry.bulk_baseline.as_ref(),
+                entry.geometry_only_bulk(),
             )
             .expect("journalled bulk split replays from baseline");
     }

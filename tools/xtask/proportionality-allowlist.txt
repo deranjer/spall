@@ -1,0 +1,222 @@
+# Proportionality allowlist (checked by `cargo xtask check`).
+# Entries may only shrink or be removed, never added, without user approval.
+# Regenerate for review with `cargo xtask proportionality --print-allowlist`.
+#
+# lines <path> <count>      rule 7: non-test line count may not grow past <count>
+# const <path> <NAME>       rule 3: existing *_SCHEMA*/*_VERSION*: u16|u32 constant
+# domain <path> <literal>   rule 3: existing b"spall.…" hash-domain literal
+# log <path>                rule 9: tracked docs *.jsonl/*.log
+
+lines crates/spall_client/src/net.rs 3692
+lines crates/spall_fluid/src/columns.rs 3245
+lines crates/spall_render/src/capture.rs 2212
+lines crates/spall_server/src/serve/tick_loop.rs 2572
+lines crates/spall_sim/src/world.rs 2933
+lines examples/sandbox/src/bin/sandbox-capture.rs 2977
+lines tools/spall_editor/src/ui.rs 2165
+const crates/spall_core/src/lib.rs PROCESS_METADATA_VERSION
+const crates/spall_ecology/src/lib.rs SPECIES_DEFINITION_VERSION
+const crates/spall_ecology/src/living.rs VERSION
+const crates/spall_protocol/src/segment.rs BASELINE_DEFERRED_REGIONAL_WORLD_VERSION
+const crates/spall_protocol/src/segment.rs BASELINE_REGIONAL_WORLD_VERSION
+const crates/spall_protocol/src/segment.rs BASELINE_SEGMENTED_WORLD_VERSION
+const crates/spall_protocol/src/segment.rs BASELINE_STREAMED_WORLD_VERSION
+const crates/spall_protocol/src/segment.rs REGIONAL_SEGMENT_SCHEMA
+const crates/spall_protocol/src/segment.rs SEGMENT_SCHEMA
+const crates/spall_server/src/baseline.rs BASELINE_CONTENT_VERSION
+const crates/spall_server/src/baseline.rs BASELINE_WORLD_VERSION
+const crates/spall_server/src/persist.rs INTEGER_BRUSH_VERSION
+const crates/spall_server/src/persist.rs STRUCTURE_GRAPH_VERSION
+const crates/spall_server/src/persist.rs TOPOLOGY_HASH_VERSION
+const crates/spall_sim/src/commit.rs ALGORITHM_VERSION
+const crates/spall_structure/src/strength.rs STRENGTH_ALGO_VERSION
+const crates/spall_worldgen/src/spec.rs GALLERY_GEN_VERSION
+const crates/spall_worldgen/src/spec.rs GEN_VERSION
+const crates/spall_worldgen/src/spec.rs NATURAL_GEN_VERSION
+const examples/sandbox/src/content.rs CONTENT_MANIFEST_VERSION
+const examples/sandbox/src/game.rs DAMAGE_RULES_VERSION
+const examples/sandbox/src/game.rs GAME_RULES_VERSION
+const examples/sandbox/src/game.rs RECIPE_CATALOG_VERSION
+const tools/spall_editor/src/lib.rs PROJECT_FORMAT_VERSION
+const tools/spall_editor/src/lib.rs SCENE_FORMAT_VERSION
+const tools/spall_editor/src/lib.rs VOXEL_FORMAT_VERSION
+domain crates/spall_asset/src/lib.rs spall.asset.v1
+domain crates/spall_mesh/src/mesh.rs spall.mesh.v1
+domain crates/spall_protocol/src/canonical.rs spall.content-with-assets.v1
+domain crates/spall_protocol/src/canonical.rs spall.manifest.v1
+domain crates/spall_protocol/src/canonical.rs spall.topology.chunk.v2
+domain crates/spall_protocol/src/canonical.rs spall.topology.v2
+domain crates/spall_protocol/src/records.rs spall.transaction-replay.v1
+domain crates/spall_protocol/src/segment.rs spall.baseline.capability.segmented.v2
+domain crates/spall_protocol/src/segment.rs spall.baseline.capability.streamed.v3
+domain crates/spall_voxel/src/brick.rs spall.brick.v1
+domain crates/spall_voxel/src/fixtures.rs spall.voxel.fixture.v1
+domain examples/sandbox/examples/animal_fixtures.rs spall.asset.v1
+domain examples/sandbox/src/content.rs spall.asset.v1
+domain examples/sandbox/src/content.rs spall.sandbox.content-manifest.v1
+domain tools/spall_editor/examples/terrain_trees.rs spall.fixture.terrain-palm.v1
+domain tools/spall_editor/examples/terrain_trees.rs spall.fixture.weeping-willow.v1
+domain tools/spall_editor/examples/terrain_trees_v2.rs spall.fixture.terrain-palm.v2
+domain tools/spall_editor/examples/terrain_trees_v2.rs spall.fixture.weeping-willow.v2
+domain tools/spall_editor/src/lib.rs spall.editor.portable-asset-id.v1
+domain tools/spall_editor/src/spvox.rs spall.asset.v1
+log docs/reports/ENG-117-evidence/clearing-large.jsonl
+log docs/reports/ENG-117-evidence/clearing.jsonl
+log docs/reports/ENG-117-evidence/xtask-check-final.log
+log docs/reports/ENG-118-evidence/protocol-tests.log
+log docs/reports/ENG-118-evidence/storage-tests.log
+log docs/reports/ENG-118-evidence/vegetation-tests.log
+log docs/reports/ENG-118-evidence/xtask-check-release.log
+log docs/reports/ENG-118-loading-evidence/live-play-frustum.log
+log docs/reports/ENG-118-loading-evidence/live-play-render-thread.log
+log docs/reports/ENG-118-loading-evidence/live-play-worker.log
+log docs/reports/ENG-118-loading-evidence/live-play.log
+log docs/reports/ENG-118-loading-evidence/xtask-check-first-failure.log
+log docs/reports/ENG-118-loading-evidence/xtask-check.log
+log docs/reports/ENG-121-rest-state.jsonl
+log docs/reports/ENG-122-balanced-rest.jsonl
+log docs/reports/ENG-122-boundary-refresh-channel.jsonl
+log docs/reports/ENG-122-boundary-refresh-final-trench-1024.jsonl
+log docs/reports/ENG-122-boundary-refresh-final-trench-512.jsonl
+log docs/reports/ENG-122-boundary-refresh-full-wall.jsonl
+log docs/reports/ENG-122-boundary-refresh-geometry-trace-512.jsonl
+log docs/reports/ENG-122-boundary-refresh-low-dam.jsonl
+log docs/reports/ENG-122-boundary-refresh-reliable-trench-1024.jsonl
+log docs/reports/ENG-122-boundary-refresh-reliable-trench-512.jsonl
+log docs/reports/ENG-122-boundary-refresh-sgs-trench-512.jsonl
+log docs/reports/ENG-122-boundary-refresh-trench-512.jsonl
+log docs/reports/ENG-122-canal-check-initial.log
+log docs/reports/ENG-122-canal-client-tests.log
+log docs/reports/ENG-122-canal-clippy.log
+log docs/reports/ENG-122-canal-fluid-tests.log
+log docs/reports/ENG-122-canal-render-tests.log
+log docs/reports/ENG-122-canal-room-tests.log
+log docs/reports/ENG-122-cap-coupling-channel.jsonl
+log docs/reports/ENG-122-cap-coupling-full-wall.jsonl
+log docs/reports/ENG-122-cap-coupling-low-dam.jsonl
+log docs/reports/ENG-122-cap-coupling-trench-1024.jsonl
+log docs/reports/ENG-122-cap-coupling-trench-512.jsonl
+log docs/reports/ENG-122-cap-normal-scaled-channel.jsonl
+log docs/reports/ENG-122-cap-normal-scaled-failure-replay.jsonl
+log docs/reports/ENG-122-cap-normal-scaled-full-wall.jsonl
+log docs/reports/ENG-122-cap-normal-scaled-low-dam.jsonl
+log docs/reports/ENG-122-cap-normal-scaled-old-replay.jsonl
+log docs/reports/ENG-122-cap-normal-scaled-overflow-replay.jsonl
+log docs/reports/ENG-122-cap-normal-scaled-trench-1024.jsonl
+log docs/reports/ENG-122-cap-normal-scaled-trench-512.jsonl
+log docs/reports/ENG-122-cap-normal-trench-1024.jsonl
+log docs/reports/ENG-122-cap-normal-trench-512.jsonl
+log docs/reports/ENG-122-closing-cap-channel.jsonl
+log docs/reports/ENG-122-coupling-exact-cap-trial.jsonl
+log docs/reports/ENG-122-coupling-replay-capture-512.jsonl
+log docs/reports/ENG-122-coupling-replay-crop-100.jsonl
+log docs/reports/ENG-122-coupling-replay-failed-512.jsonl
+log docs/reports/ENG-122-coupling-replay-fast-faces-512.jsonl
+log docs/reports/ENG-122-coupling-replay-precursor-512.jsonl
+log docs/reports/ENG-122-coupling-replay-transition-512.jsonl
+log docs/reports/ENG-122-cut-support-shallow.jsonl
+log docs/reports/ENG-122-donor-budget-channel.jsonl
+log docs/reports/ENG-122-donor-budget-full-wall.jsonl
+log docs/reports/ENG-122-donor-budget-low-dam.jsonl
+log docs/reports/ENG-122-donor-budget-trench-1024.jsonl
+log docs/reports/ENG-122-donor-budget-trench-512.jsonl
+log docs/reports/ENG-122-dry-donor-channel.jsonl
+log docs/reports/ENG-122-dry-donor-full-wall.jsonl
+log docs/reports/ENG-122-dry-donor-low-dam.jsonl
+log docs/reports/ENG-122-dry-donor-rejected-inertia-replay.jsonl
+log docs/reports/ENG-122-dry-donor-rejected-inertia-trench-512.jsonl
+log docs/reports/ENG-122-dry-donor-trench-1024.jsonl
+log docs/reports/ENG-122-dry-donor-trench-512.jsonl
+log docs/reports/ENG-122-film-baseline.jsonl
+log docs/reports/ENG-122-film-prototype.jsonl
+log docs/reports/ENG-122-geometry.jsonl
+log docs/reports/ENG-122-incremental-flow-channel.jsonl
+log docs/reports/ENG-122-incremental-flow-full-wall.jsonl
+log docs/reports/ENG-122-incremental-flow-low-dam.jsonl
+log docs/reports/ENG-122-incremental-flow-replay-cap.jsonl
+log docs/reports/ENG-122-incremental-flow-replay-coupling.jsonl
+log docs/reports/ENG-122-incremental-flow-replay-precursor.jsonl
+log docs/reports/ENG-122-incremental-flow-trench-1024.jsonl
+log docs/reports/ENG-122-incremental-flow-trench-512.jsonl
+log docs/reports/ENG-122-interface-velocity-channel.jsonl
+log docs/reports/ENG-122-interface-velocity-full-wall.jsonl
+log docs/reports/ENG-122-interface-velocity-low-dam.jsonl
+log docs/reports/ENG-122-interface-velocity-shallow.jsonl
+log docs/reports/ENG-122-interface-velocity-trench-1024.jsonl
+log docs/reports/ENG-122-interface-velocity-trench-512.jsonl
+log docs/reports/ENG-122-interface-velocity-trench-final-1024.jsonl
+log docs/reports/ENG-122-interface-velocity-trench-final-512.jsonl
+log docs/reports/ENG-122-interface-velocity-trench-warm-1024.jsonl
+log docs/reports/ENG-122-interface-velocity-trench-warm-512.jsonl
+log docs/reports/ENG-122-local-pressure-channel.jsonl
+log docs/reports/ENG-122-local-pressure-full-wall.jsonl
+log docs/reports/ENG-122-local-pressure-low-dam.jsonl
+log docs/reports/ENG-122-local-pressure-repeat-trench-512.jsonl
+log docs/reports/ENG-122-local-pressure-source-trace.jsonl
+log docs/reports/ENG-122-local-pressure-trench-1024.jsonl
+log docs/reports/ENG-122-local-pressure-trench-512.jsonl
+log docs/reports/ENG-122-momentum-coupling-attempt1.jsonl
+log docs/reports/ENG-122-momentum-coupling-attempt2.jsonl
+log docs/reports/ENG-122-momentum-coupling.jsonl
+log docs/reports/ENG-122-momentum-dynamics.jsonl
+log docs/reports/ENG-122-momentum-generated-startup.jsonl
+log docs/reports/ENG-122-momentum-incompressible-air-attempt1.jsonl
+log docs/reports/ENG-122-momentum-incompressible-air-long.jsonl
+log docs/reports/ENG-122-momentum-incompressible-air.jsonl
+log docs/reports/ENG-122-momentum-rest.jsonl
+log docs/reports/ENG-122-operators.jsonl
+log docs/reports/ENG-122-paced-trench-1024-initial.jsonl
+log docs/reports/ENG-122-paced-trench-1024.jsonl
+log docs/reports/ENG-122-paced-trench-512-initial.jsonl
+log docs/reports/ENG-122-paced-trench-512.jsonl
+log docs/reports/ENG-122-packed-phase-memory.jsonl
+log docs/reports/ENG-122-phase-coupled-failure.jsonl
+log docs/reports/ENG-122-phase-graph-reference-regression.jsonl
+log docs/reports/ENG-122-phase-graph.jsonl
+log docs/reports/ENG-122-phase-placement.jsonl
+log docs/reports/ENG-122-phase-preconditioner-long.jsonl
+log docs/reports/ENG-122-phase-preconditioner.jsonl
+log docs/reports/ENG-122-phase-predictor.jsonl
+log docs/reports/ENG-122-phase-pressure-initial-failure.jsonl
+log docs/reports/ENG-122-phase-pressure.jsonl
+log docs/reports/ENG-122-pressure-impulse-channel.jsonl
+log docs/reports/ENG-122-pressure-impulse-full-wall.jsonl
+log docs/reports/ENG-122-pressure-impulse-low-dam.jsonl
+log docs/reports/ENG-122-pressure-impulse-trench1024.jsonl
+log docs/reports/ENG-122-pressure-impulse-trench512.jsonl
+log docs/reports/ENG-122-reference-arithmetic-failure.jsonl
+log docs/reports/ENG-122-shallow-shore-trace.jsonl
+log docs/reports/ENG-122-shallow-shore.jsonl
+log docs/reports/ENG-122-strict-transfer-attempts.jsonl
+log docs/reports/ENG-122-strict-transfer.jsonl
+log docs/reports/ENG-122-surface-reconstruction-channel.jsonl
+log docs/reports/ENG-122-surface-reconstruction-full-wall.jsonl
+log docs/reports/ENG-122-surface-reconstruction-low-dam.jsonl
+log docs/reports/ENG-122-surface-reconstruction-shallow.jsonl
+log docs/reports/ENG-122-surface-rest-fixtures.jsonl
+log docs/reports/ENG-122-surface-rest-shore.jsonl
+log docs/reports/ENG-122-transport-profile-after-1024.jsonl
+log docs/reports/ENG-122-transport-profile-after-512.jsonl
+log docs/reports/ENG-122-transport-profile-before-512.jsonl
+log docs/reports/ENG-122-transport-profile-channel.jsonl
+log docs/reports/ENG-122-transport-profile-dense-tail-512.jsonl
+log docs/reports/ENG-122-transport-profile-full-wall.jsonl
+log docs/reports/ENG-122-transport-profile-low-dam.jsonl
+log docs/reports/ENG-122-transport-profile-repeat-512.jsonl
+log docs/reports/ENG-122-viewer-fixture.jsonl
+log docs/reports/ENG-122-water-only-1024.jsonl
+log docs/reports/ENG-122-water-only-512.jsonl
+log docs/reports/ENG-122-water-only-fixtures.jsonl
+log docs/reports/ENG-122-worker-profile-512.jsonl
+log docs/reports/ENG-122-worker-profile-channel.jsonl
+log docs/reports/ENG-122-worker-profile-final-1024.jsonl
+log docs/reports/ENG-122-worker-profile-final-512.jsonl
+log docs/reports/ENG-122-worker-profile-full-wall.jsonl
+log docs/reports/ENG-122-worker-profile-gauge-1024.jsonl
+log docs/reports/ENG-122-worker-profile-gauge-512.jsonl
+log docs/reports/ENG-122-worker-profile-low-dam.jsonl
+log docs/reports/ENG-122-zero-flux-cap-channel.jsonl
+log docs/reports/ENG-122-zero-flux-cap-full-wall.jsonl
+log docs/reports/ENG-122-zero-flux-cap-low-dam.jsonl
+log docs/reports/ENG-122-zero-flux-cap-trench-1024.jsonl
+log docs/reports/ENG-122-zero-flux-cap-trench-512.jsonl

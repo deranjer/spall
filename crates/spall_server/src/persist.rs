@@ -20,7 +20,7 @@ use spall_core::{
     Revision, Tick, VolumeId,
 };
 use spall_physics::PhysicsConfig;
-use spall_protocol::{TopologyOp, content_manifest_hash};
+use spall_protocol::{TopologyOp, TransferId, content_manifest_hash};
 use spall_sim::{
     Body, BodyPose, JournalEntry, RestoredBody, SimWorld, Simulation, WorldSetup, solid_cells,
 };
@@ -36,11 +36,38 @@ use spall_voxel::{Brick, BrickBounds, BrickSnapshot, Volume};
 /// `spall_sim::commit::ALGORITHM_VERSION` and the T01/T07 versions).
 pub const INTEGER_BRUSH_VERSION: u32 = 1;
 pub const STRUCTURE_GRAPH_VERSION: u32 = 1;
-/// Version of the topology hash saved checkpoints and journals were verified with. `2` is the
-/// chunked layout (`spall.topology.v2`). A save written under `1` is refused on recovery with
-/// [`PersistError::AlgorithmVersionMismatch`]: its recorded hashes use the old layout and cannot
-/// be verified, and the engine does not carry the old algorithm to migrate them.
-pub const TOPOLOGY_HASH_VERSION: u32 = 2;
+/// Checkpoint topology composition version: unchanged geometry v2, composed
+/// with initialized animal snapshot topology under its explicit v1 domain.
+/// Actor-free canonical geometry vectors remain byte-for-byte unchanged.
+pub const TOPOLOGY_HASH_VERSION: u32 = 3;
+
+/// Transfer IDs still named by every topology transaction in the durable
+/// recovery suffix. Capture these before the suffix is replayed into a fresh
+/// in-memory journal; that journal is not a substitute for durable history.
+pub fn retained_transfer_ids(recovery: &Recovery) -> Result<Vec<TransferId>, PersistError> {
+    let mut retained = Vec::new();
+    for record in &recovery.journal {
+        let transaction = match &record.payload {
+            JournalPayload::Topology { .. } => record
+                .payload
+                .as_topology()
+                .expect("payload is Topology")
+                .map(|(transaction, _)| transaction)?,
+            JournalPayload::TopologyAttachments { .. } => record
+                .payload
+                .as_topology_with_attachments()
+                .expect("payload is TopologyAttachments")
+                .map(|(transaction, _, _)| transaction)?,
+            _ => continue,
+        };
+        for op in &transaction.ops {
+            if let Some(id) = op.bulk_transfer_id() {
+                retained.push(TransferId(id));
+            }
+        }
+    }
+    Ok(retained)
+}
 
 /// Identity a world save is stamped with. `anchor` and `physics` are redeployment
 /// config, re-supplied on restart exactly like `spall_sim::WorldSetup` treats
@@ -69,6 +96,8 @@ pub enum RecoveryChoice {
 /// Anything that can go wrong converting to/from save records.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
+    #[error("saving a world with animals is not supported")]
+    CreaturesUnsupported,
     #[error("store: {0}")]
     Store(#[from] StoreError),
     #[error("save DTO: {0}")]
@@ -99,8 +128,8 @@ pub enum PersistError {
     )]
     UnrecoverableCorruption { reports: String, fallback: String },
     #[error(
-        "save schema version mismatch: checkpoint {checkpoint}, runtime {runtime} \
-         (a schema migration is required — do not replay this database in place)"
+        "incompatible save: checkpoint schema version {checkpoint}, this build reads {runtime} \
+         (created by a different pre-release build; saves are not migrated, start a new world)"
     )]
     SchemaMismatch { checkpoint: u32, runtime: u32 },
     #[error(
@@ -173,6 +202,7 @@ pub fn capture(
     cfg: &PersistConfig,
     journal_cursor: u64,
 ) -> Result<Checkpoint, PersistError> {
+    require_checkpoint_supported(sim)?;
     let terrain_bricks = stored_bricks(&sim.world().terrain().volume)?;
     capture_with_terrain_bricks(sim, cfg, journal_cursor, terrain_bricks)
 }
@@ -189,6 +219,17 @@ pub(crate) fn capture_with_terrain_bricks(
     journal_cursor: u64,
     terrain_bricks: Vec<StoredBrick>,
 ) -> Result<Checkpoint, PersistError> {
+    require_checkpoint_supported(sim)?;
+    capture_checkpoint_internal(sim, cfg, journal_cursor, terrain_bricks)
+}
+
+fn capture_checkpoint_internal(
+    sim: &Simulation,
+    cfg: &PersistConfig,
+    journal_cursor: u64,
+    terrain_bricks: Vec<StoredBrick>,
+) -> Result<Checkpoint, PersistError> {
+    require_checkpoint_supported(sim)?;
     let world = sim.world();
     let (next_entity, next_volume, next_transaction, next_journal_seq) =
         world.registry().counters();
@@ -202,6 +243,11 @@ pub(crate) fn capture_with_terrain_bricks(
     bodies.push(stored_body(world, terrain, StoredBodyKind::Terrain));
 
     for body in world.bodies() {
+        if !world.evicted(body.volume.id()).is_empty() {
+            return Err(PersistError::BadField(
+                "checkpoint requires complete resident body geometry",
+            ));
+        }
         cell_sizes.insert(body.volume.cell_size().to_u8());
         bodies.push(stored_body(world, body, StoredBodyKind::Dynamic));
         bricks.extend(stored_bricks(&body.volume)?);
@@ -223,6 +269,7 @@ pub(crate) fn capture_with_terrain_bricks(
         topology_hash_version: TOPOLOGY_HASH_VERSION,
     };
 
+    let world_hash = world.geometry_topology_hash().0;
     Ok(Checkpoint {
         vegetation: sim
             .vegetation_state()
@@ -231,13 +278,26 @@ pub(crate) fn capture_with_terrain_bricks(
             .map_err(|_| PersistError::BadField("vegetation capture"))?
             .unwrap_or_default(),
         column_water: sim.column_water().map(|w| w.canonical_state()),
+        weather: Some(sim.weather_state().clone()),
+        snow: Some(
+            sim.snow_state_bytes()
+                .map_err(|_| PersistError::BadField("snow capture"))?,
+        ),
         tick: sim.current_tick().get(),
         journal_cursor,
-        world_hash: world.world_hash().0,
+        world_hash,
         meta,
         bodies,
         bricks,
     })
+}
+
+fn require_checkpoint_supported(sim: &Simulation) -> Result<(), PersistError> {
+    // Animals are not saved; refuse rather than silently drop them (and their id counter).
+    if sim.has_creature_host() {
+        return Err(PersistError::CreaturesUnsupported);
+    }
+    Ok(())
 }
 
 fn stored_body(world: &SimWorld, body: &Body, kind: StoredBodyKind) -> StoredBody {
@@ -348,11 +408,9 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
     entries
         .iter()
         .map(|e| {
-            let payload = match &e.bulk_baseline {
-                // T17 increment 2: a giant split's marker transaction plus its
-                // out-of-band `BaselineWorld`.
-                Some(world) => {
-                    JournalPayload::topology_bulk_split(&e.transaction, &e.participants, world)?
+            let payload = match &e.attachments {
+                Some(set) => {
+                    JournalPayload::topology_with_attachments(&e.transaction, &e.participants, set)?
                 }
                 None => JournalPayload::topology(&e.transaction, &e.participants)?,
             };
@@ -363,6 +421,27 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
             })
         })
         .collect()
+}
+
+fn geometry_replay_attachment(
+    set: spall_protocol::ValidatedTransactionAttachmentSetV1,
+) -> Result<spall_protocol::BaselineWorld, PersistError> {
+    let mut geometry = None;
+    for (_, attachment) in set.iter() {
+        match attachment {
+            spall_protocol::ValidatedTransactionAttachmentV1::Geometry(world)
+                if geometry.is_none() =>
+            {
+                geometry = Some(world.clone());
+            }
+            _ => {
+                return Err(PersistError::BadField(
+                    "multiple geometry replay groups unsupported",
+                ));
+            }
+        }
+    }
+    geometry.ok_or(PersistError::BadField("missing geometry replay attachment"))
 }
 
 /// Builds one periodic 20 Hz pose-batch [`JournalRecord`] (`docs/protocol.md`:
@@ -493,7 +572,7 @@ pub fn restore_with_terrain_collider_mode(
         &cp.bricks,
     )?;
 
-    let mut world = SimWorld::new_with_terrain_collider_mode(
+    let mut world = SimWorld::new_with_terrain_collider_mode_and_origin(
         WorldSetup {
             terrain: terrain_vol,
             terrain_collider_region: region_from(terrain_sb.collider_region),
@@ -502,6 +581,7 @@ pub fn restore_with_terrain_collider_mode(
             physics,
         },
         terrain_collider_mode,
+        spall_physics::PhysicsOrigin::ZERO,
     )?;
 
     for sb in cp
@@ -540,7 +620,7 @@ pub fn restore_with_terrain_collider_mode(
     // reproduce the canonical hash the checkpoint was published with before any
     // journal record is replayed onto it. A decodable row corruption (a flipped
     // tombstone bit, a swapped revision) is caught here.
-    let rebuilt = world.world_hash().0;
+    let rebuilt = world.geometry_topology_hash().0;
     if rebuilt != cp.world_hash {
         return Err(PersistError::CheckpointHashMismatch {
             checkpoint: hex32(&cp.world_hash),
@@ -558,6 +638,14 @@ pub fn restore_with_terrain_collider_mode(
     let mut durable_tick = cp.tick;
     let mut column_water_state = cp.column_water.clone();
     let mut vegetation_state = cp.vegetation.clone();
+    let mut weather_state = cp.weather.clone();
+    let mut snow = cp
+        .snow
+        .as_deref()
+        .map(spall_sim::snow::SnowState::from_canonical_bytes)
+        .transpose()
+        .map_err(|_| PersistError::BadField("snow checkpoint"))?
+        .unwrap_or_default();
     let mut vegetation_clock = None;
 
     for record in &recovery.journal {
@@ -572,6 +660,27 @@ pub fn restore_with_terrain_collider_mode(
             });
         }
         durable_tick = record.tick;
+        let mut replay_weather = weather_state.clone();
+        if let Some(state) = &mut replay_weather {
+            match &record.payload {
+                JournalPayload::WeatherState(next) => {
+                    if record.tick > 0 {
+                        snow.advance(state, record.tick.saturating_sub(1))
+                            .map_err(|_| PersistError::BadField("snow climate replay"))?;
+                    }
+                    next.validate()
+                        .map_err(|_| PersistError::BadField("journal weather state"))?;
+                    snow.advance(next, record.tick)
+                        .map_err(|_| PersistError::BadField("snow climate replay"))?;
+                    replay_weather = Some(next.clone());
+                }
+                _ => {
+                    snow.advance(state, record.tick)
+                        .map_err(|_| PersistError::BadField("snow climate replay"))?;
+                }
+            }
+        }
+        weather_state = replay_weather;
         // A giant-split record (T17 increment 2) carries the same marker
         // transaction plus an out-of-band `BaselineWorld`; ordinary topology
         // records replay with `None`.
@@ -584,6 +693,29 @@ pub fn restore_with_terrain_collider_mode(
             JournalPayload::VegetationState(state) => {
                 vegetation_clock = None;
                 vegetation_state = state.clone();
+                last_seq = record.seq;
+                continue;
+            }
+            JournalPayload::WeatherState(state) => {
+                state
+                    .validate()
+                    .map_err(|_| PersistError::BadField("journal weather state"))?;
+                last_seq = record.seq;
+                continue;
+            }
+            JournalPayload::SnowTileState {
+                world_epoch,
+                tile,
+                state,
+            } => {
+                if weather_state
+                    .as_ref()
+                    .is_some_and(|weather| weather.world_epoch != *world_epoch)
+                {
+                    return Err(PersistError::BadField("snow tile world epoch"));
+                }
+                snow.restore_tile_canonical_bytes((tile[0], tile[1], tile[2]), state)
+                    .map_err(|_| PersistError::BadField("journal snow tile"))?;
                 last_seq = record.seq;
                 continue;
             }
@@ -601,11 +733,11 @@ pub fn restore_with_terrain_collider_mode(
                 .as_topology()
                 .expect("payload is Topology")
                 .map(|(tx, p)| (tx, p, None))?,
-            JournalPayload::TopologyBulkSplit { .. } => record
+            JournalPayload::TopologyAttachments { .. } => record
                 .payload
-                .as_topology_bulk_split()
-                .expect("payload is TopologyBulkSplit")
-                .map(|(tx, p, w)| (tx, p, Some(w)))?,
+                .as_topology_with_attachments()
+                .expect("payload is TopologyAttachments")
+                .map(|(tx, p, set)| (tx, p, Some(set)))?,
             JournalPayload::PoseBatch { .. } => {
                 let snaps = record
                     .payload
@@ -616,7 +748,8 @@ pub fn restore_with_terrain_collider_mode(
                 continue;
             }
         };
-        let (tx, participants, bulk) = topology;
+        let (tx, participants, attachments) = topology;
+        let bulk = attachments.map(geometry_replay_attachment).transpose()?;
         if tx.algorithm_version != INTEGER_BRUSH_VERSION {
             return Err(PersistError::AlgorithmVersionMismatch {
                 field: "journal transaction.algorithm_version",
@@ -669,8 +802,21 @@ pub fn restore_with_terrain_collider_mode(
             .encode()
             .map_err(|_| PersistError::BadField("vegetation clock encode"))?;
     }
+    // Every checkpoint this build writes carries weather; an older save is refused by the schema
+    // version before recovery gets here.
+    let state = weather_state.ok_or(PersistError::BadField("checkpoint without weather state"))?;
+    sim.restore_weather(state)
+        .map_err(|_| PersistError::BadField("weather recovery"))?;
+    sim.restore_snow_state(
+        &snow
+            .to_canonical_bytes()
+            .map_err(|_| PersistError::BadField("snow recovery encode"))?,
+    )
+    .map_err(|_| PersistError::BadField("snow recovery"))?;
     sim.restore_vegetation(&vegetation_state)
         .map_err(|_| PersistError::BadField("vegetation recovery"))?;
+    sim.validate_weather_clock_source()
+        .map_err(|_| PersistError::BadField("weather clock source"))?;
     if let Some(state) = &column_water_state {
         sim.restore_column_water(
             state,
@@ -740,7 +886,7 @@ fn replay_recovery(
         .filter(|r| {
             matches!(
                 r.payload,
-                JournalPayload::Topology { .. } | JournalPayload::TopologyBulkSplit { .. }
+                JournalPayload::Topology { .. } | JournalPayload::TopologyAttachments { .. }
             )
         })
         .count() as u64;
@@ -1508,5 +1654,33 @@ fn check(name: &str, passed: bool, detail: String) -> ScenarioResult {
         name: name.to_string(),
         passed,
         detail,
+    }
+}
+
+#[cfg(test)]
+mod creature_checkpoint_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn full_and_incremental_capture_refuse_a_world_with_animals() {
+        let cfg = PersistConfig {
+            world_id: 901,
+            seed: 0,
+            generator_version: 1,
+        };
+        let mut sim = Simulation::new(spall_sim::SimulationConfig::new(
+            spall_sim::fixtures::flat_terrain_setup(),
+        ))
+        .unwrap();
+        sim.initialize_creature_host().unwrap();
+        let terrain = stored_bricks(&sim.world().terrain().volume).unwrap();
+        assert!(matches!(
+            capture(&sim, &cfg, 0),
+            Err(PersistError::CreaturesUnsupported)
+        ));
+        assert!(matches!(
+            capture_with_terrain_bricks(&sim, &cfg, 0, terrain),
+            Err(PersistError::CreaturesUnsupported)
+        ));
     }
 }

@@ -3,6 +3,9 @@
 //! The cache is deliberately a derived render resource. It is not a world
 //! format and it never feeds collision, support, or authoritative geometry.
 
+// The trace/denoise/temporal dispatch is driven only by the `capture` harness.
+#![cfg_attr(not(feature = "capture"), allow(dead_code))]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 

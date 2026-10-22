@@ -10,7 +10,7 @@ ctrlc = "3.5.2"
 serde.workspace = true
 serde_json.workspace = true
 spall_core = { path = "../../crates/spall_core" }
-spall_net = { path = "../../crates/spall_net" }
+spall_net = { path = "../../crates/spall_net", features = ["test-util"] }
 spall_voxel = { path = "../../crates/spall_voxel" }
 spall_store = { path = "../../crates/spall_store" }
 thiserror.workspace = true

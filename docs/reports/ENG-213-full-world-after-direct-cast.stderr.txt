@@ -1,0 +1,20 @@
+   Compiling spall_physics v0.1.0 (C:\Users\deran\.codex\worktrees\animal-world-locality\voxel_engine\crates\spall_physics)
+   Compiling spall_sim v0.1.0 (C:\Users\deran\.codex\worktrees\animal-world-locality\voxel_engine\crates\spall_sim)
+   Compiling spall_server v0.1.0 (C:\Users\deran\.codex\worktrees\animal-world-locality\voxel_engine\crates\spall_server)
+   Compiling sandbox v0.1.0 (C:\Users\deran\.codex\worktrees\animal-world-locality\voxel_engine\examples\sandbox)
+    Finished `release` profile [optimized + debuginfo] target(s) in 18.13s
+     Running `target\release\examples\animal-collision-probe.exe --generated-1km`
+generated 4096-cell natural seed-1 world in 11293 ms
+built authoritative per-brick terrain physics in 3726 ms
+authoritative SimWorld reports 123892 terrain brick colliders
+generated water plan has 2024056 wet columns
+indexed generated initial water plan in 110 ms
+validated trout habitat at Vec3(258.875, 26.375, 16.375)
+measured trout NativeVoxels: 10 phases
+measured trout MergedCuboids: 10 phases
+validated crow habitat at Vec3(461.125, 55.25, 537.125)
+measured crow NativeVoxels: 10 phases
+measured crow MergedCuboids: 10 phases
+validated deer habitat at Vec3(456.125, 52.0, 537.125)
+measured deer NativeVoxels: 10 phases
+measured deer MergedCuboids: 10 phases

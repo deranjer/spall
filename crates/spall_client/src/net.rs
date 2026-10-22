@@ -147,6 +147,18 @@ impl MoverProfile {
     }
 }
 
+/// A mover section this slow delays input delivery and shows up as a prediction
+/// pop; say so, with the section, so the cause is in the log.
+fn note_mover_stall(section: &'static str, spent: Duration) {
+    if spent >= Duration::from_millis(30) {
+        tracing::warn!(
+            section,
+            ms = spent.as_secs_f64() * 1e3,
+            "mover loop section stalled (input delivery delayed)"
+        );
+    }
+}
+
 /// Advances the replica's observed server tick and, when transactions are held
 /// for repairs, retries them: the steady water stream then lets a repair
 /// request the server dropped be sent again once its cooldown has elapsed,
@@ -551,8 +563,20 @@ pub struct ClientSummary {
     pub water_frame_seq: u64,
     /// Water keyframes that failed to assemble or decode.
     pub water_keyframe_errors: u64,
+    /// Validated authoritative weather snapshots received, including late-join/reset refreshes.
+    #[serde(default)]
+    pub weather_snapshots_received: u64,
     /// Admin world-reset baselines installed as a replacement world.
     pub world_resets_installed: u64,
+    /// Creatures held by the replica at the end of the run.
+    #[serde(default)]
+    pub creatures_replicated: usize,
+    /// Creature motion entries applied over the run.
+    #[serde(default)]
+    pub creature_motion_entries: u64,
+    /// Largest horizontal distance a creature was presented from where it spawned.
+    #[serde(default)]
+    pub creature_max_displacement_m: f64,
     /// Server answers to `admin_script` commands, in arrival order.
     pub admin_statuses: Vec<spall_protocol::AdminStatus>,
     /// Farthest a replicated body moved from its first observed pose, metres.
@@ -773,6 +797,7 @@ struct Counters {
     water_regions: AtomicU64,
     water_frame_seq: AtomicU64,
     water_errors: AtomicU64,
+    weather_snapshots: AtomicU64,
     world_resets: AtomicU64,
     /// Logical bricks in the installed late-join baseline (T17).
     baseline_bricks: AtomicU64,
@@ -869,15 +894,15 @@ fn retry_kind(reason: &str) -> Option<bool> {
 /// that should grow unbounded if a script somehow floods rejections.
 const MAX_RECORDED_ACTION_REJECT_REASONS: usize = 8;
 
-/// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
-/// discarded (players walk upright); `grounded` / `jump_held_last` are not on
-/// the wire and the next reconcile / step re-derives them.
+/// A player [`MotionSnapshot`]'s `CharacterState`; `grounded` / `jump_held_last` are re-derived.
 fn state_from_snapshot(snap: &MotionSnapshot) -> CharacterState {
     CharacterState {
         position_m: snap.pose.translation_m,
         velocity_m_s: snap.linear_velocity,
         grounded: snap.linear_velocity[1].abs() < 0.6,
         jump_held_last: false,
+        endurance: snap.endurance,
+        exhausted: snap.exhausted,
     }
 }
 
@@ -1853,6 +1878,7 @@ async fn run_async(
             // reset baseline installs; it belongs to the old world and its
             // deltas have no base in the new one.
             let mut column_water_floor = 0_u64;
+            let mut weather_floor = 0_u64;
             let mut vegetation = spall_protocol::vegetation::VegetationAssembler::default();
             // The climate raster rides along with only some keyframes (it never changes
             // within a world); the last one received stands in for the rest.
@@ -1867,6 +1893,8 @@ async fn run_async(
                 profile.begin_record(match &received {
                     Ok(Some(WireRecord::VegetationSnapshot(_))) => "vegetation",
                     Ok(Some(WireRecord::ColumnWaterUpdate(_))) => "column-water",
+                    Ok(Some(WireRecord::WeatherSnapshot(_))) => "weather",
+                    Ok(Some(WireRecord::SnowSurfaceFrame(_))) => "snow",
                     Ok(Some(WireRecord::TopologyTransaction(_))) => "transaction",
                     Ok(Some(WireRecord::BaselineBegin(_))) => "baseline-begin",
                     Ok(Some(WireRecord::BaselineEnd(_))) => "baseline-end",
@@ -1906,6 +1934,53 @@ async fn run_async(
                             Err(error) => {
                                 eprintln!("spall-client: rejected vegetation frame: {error}")
                             }
+                        }
+                    }
+                    Ok(Some(WireRecord::WeatherSnapshot(snapshot))) => {
+                        if snapshot.state.effective_tick < weather_floor {
+                            continue;
+                        }
+                        if let Err(error) = replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_weather(snapshot.state)
+                        {
+                            eprintln!("spall-client: rejected weather state: {error}");
+                        } else {
+                            counters.weather_snapshots.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(Some(WireRecord::CreatureMotionFrame(frame))) => {
+                        replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_creature_motion(&frame, std::time::Instant::now());
+                    }
+                    Ok(Some(WireRecord::CreatureSpawn(spawn))) => {
+                        if let Err(error) = replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_creature_spawn(&spawn)
+                        {
+                            eprintln!("spall-client: rejected creature spawn: {error}");
+                        }
+                    }
+                    Ok(Some(WireRecord::CreatureDespawn(despawn))) => {
+                        replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_creature_despawn(&despawn);
+                    }
+                    Ok(Some(WireRecord::SnowSurfaceFrame(frame))) => {
+                        if frame.effective_tick < weather_floor {
+                            continue;
+                        }
+                        if let Err(error) = replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_snow_frame(frame)
+                        {
+                            eprintln!("spall-client: rejected snow frame: {error}");
                         }
                     }
                     Ok(Some(WireRecord::ColumnWaterUpdate(update))) => {
@@ -2024,6 +2099,7 @@ async fn run_async(
                             Ok(world) => {
                                 vegetation_floor = begin.checkpoint_tick.get();
                                 column_water_floor = begin.checkpoint_tick.get();
+                                weather_floor = begin.checkpoint_tick.get().saturating_add(1);
                                 vegetation =
                                     spall_protocol::vegetation::VegetationAssembler::default();
                                 cover_field = spall_ecology::cover::CoverField::default();
@@ -2785,11 +2861,23 @@ async fn run_async(
             // Diagnostic: where one mover iteration's wall time goes. Logged,
             // never replicated or persisted.
             let mut profile = MoverProfile::default();
+            let mut last_iteration: Option<std::time::Instant> = None;
             loop {
                 if *stop_rx.borrow() {
                     return;
                 }
                 let now = std::time::Instant::now();
+                // The loop should come round every few milliseconds. A long gap is an
+                // input-delivery hole (the server's ack catches up, prediction history
+                // empties, and the reconcile pops the player), whatever caused it.
+                if let Some(previous) = last_iteration.replace(now)
+                    && now.duration_since(previous) >= Duration::from_millis(60)
+                {
+                    tracing::warn!(
+                        gap_ms = now.duration_since(previous).as_secs_f64() * 1e3,
+                        "mover loop did not run for a while (input delivery delayed)"
+                    );
+                }
                 // The timeline rate comes from the lead controller (1.0 until
                 // a reconcile has reported a lead); read under a brief lock.
                 let timeline_rate = pred.lock().unwrap_or_else(|e| e.into_inner()).lead.rate();
@@ -2806,7 +2894,11 @@ async fn run_async(
                 // fresh `&Volume` each tick for its own window cache.
                 let section = std::time::Instant::now();
                 let terrain = cached_terrain_snapshot(&replica, &terrain_cache);
-                profile.snapshot.add(section.elapsed());
+                {
+                    let spent = section.elapsed();
+                    note_mover_stall("snapshot", spent);
+                    profile.snapshot.add(spent);
+                }
                 let terrain_volume = terrain.as_ref().map(|t| t.volume.clone());
                 let section = std::time::Instant::now();
                 let (body_collisions, traced_samplers) = {
@@ -2862,7 +2954,11 @@ async fn run_async(
                     body_collision_versions.retain(|entity, _| live.contains(entity));
                     (bodies, traced_samplers)
                 };
-                profile.bodies.add(section.elapsed());
+                {
+                    let spent = section.elapsed();
+                    note_mover_stall("bodies", spent);
+                    profile.bodies.add(spent);
+                }
                 let section = std::time::Instant::now();
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
@@ -3124,7 +3220,11 @@ async fn run_async(
                         window_stats,
                     )
                 };
-                profile.predictor.add(section.elapsed());
+                {
+                    let spent = section.elapsed();
+                    note_mover_stall("predictor", spent);
+                    profile.predictor.add(spent);
+                }
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
                 }
@@ -3166,7 +3266,11 @@ async fn run_async(
                         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                         pass.step(&mut guard, feet)
                     };
-                    profile.residency.add(section.elapsed());
+                    {
+                    let spent = section.elapsed();
+                    note_mover_stall("residency", spent);
+                    profile.residency.add(spent);
+                }
                     counters
                         .residency_evictions
                         .store(pass.evictions_total(), Ordering::Relaxed);
@@ -3508,7 +3612,13 @@ async fn run_async(
         water_regions_received: counters.water_regions.load(Ordering::Relaxed),
         water_frame_seq: counters.water_frame_seq.load(Ordering::Relaxed),
         water_keyframe_errors: counters.water_errors.load(Ordering::Relaxed),
+        weather_snapshots_received: counters.weather_snapshots.load(Ordering::Relaxed),
         world_resets_installed: counters.world_resets.load(Ordering::Relaxed),
+        creatures_replicated: guard.creatures().len(),
+        creature_motion_entries: guard.creatures().motion_entries_applied(),
+        creature_max_displacement_m: guard
+            .creatures()
+            .max_displacement_m(std::time::Instant::now()),
         admin_statuses: admin_statuses
             .lock()
             .unwrap_or_else(|e| e.into_inner())

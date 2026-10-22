@@ -106,6 +106,8 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         meta: m,
         bodies: vec![],
         column_water: None,
+        weather: None,
+        snow: None,
         bricks: vec![StoredBrick {
             volume_id: 1,
             coord: [0, 0, 0],
@@ -246,14 +248,15 @@ fn spawn_child(boundary: &str, db: &Path, marker: &Path, log: &Path) -> OwnedChi
     OwnedChild(child)
 }
 
-fn wait_for_marker(marker: &Path, child: &mut OwnedChild) {
+fn wait_for_marker(marker: &Path, child: &mut OwnedChild, log: &Path) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if marker.exists() {
             return;
         }
         if let Some(status) = child.0.try_wait().unwrap() {
-            panic!("crash child exited before reaching the boundary: {status}");
+            let output = std::fs::read_to_string(log).unwrap_or_default();
+            panic!("crash child exited before reaching the boundary: {status}\n{output}");
         }
         assert!(
             Instant::now() < deadline,
@@ -318,7 +321,7 @@ fn abrupt_process_death_recovers_the_durable_prefix() {
         let log = s.dir.join("child.log");
 
         let mut child = spawn_child(boundary, &s.db(), &marker, &log);
-        wait_for_marker(&marker, &mut child);
+        wait_for_marker(&marker, &mut child, &log);
 
         // Unconditional external kill: no unwinding, no `Drop`, no WAL
         // checkpoint — a genuine abrupt process death.

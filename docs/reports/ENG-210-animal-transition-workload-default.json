@@ -1,0 +1,303 @@
+{
+  "hardware": {
+    "arch": "x86_64",
+    "available_parallelism": 16,
+    "cpu_model": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "os": "windows",
+    "profile": "release"
+  },
+  "physics": "same spall_physics PhysicsWorld Rapier adapter",
+  "results": [
+    {
+      "animal": "trout",
+      "body_count": 1,
+      "clips": 2,
+      "collider_count": 5,
+      "collider_primitives": 5,
+      "initial_attachment": {
+        "p50_us": 20.0,
+        "p95_us": 21.5,
+        "p99_us": 45.300000000000004
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 5,
+      "pose_refresh_ray_step": {
+        "p50_us": 6.3,
+        "p95_us": 6.8,
+        "p99_us": 8.600000000000001
+      },
+      "ray_checks": 4110,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "native_voxels",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "swim@0",
+        "swim@15",
+        "swim@30",
+        "swim@45",
+        "swim@60"
+      ],
+      "sampled_phases": 10,
+      "source_cell_rebuild": {
+        "p50_us": 3.0,
+        "p95_us": 8.0,
+        "p99_us": 8.2
+      },
+      "source_cells": 136,
+      "source_parts": 5,
+      "terrain_transition_sweeps": null,
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 5,
+      "warmup": 10
+    },
+    {
+      "animal": "trout",
+      "body_count": 1,
+      "clips": 2,
+      "collider_count": 5,
+      "collider_primitives": 17,
+      "initial_attachment": {
+        "p50_us": 6.6000000000000005,
+        "p95_us": 6.8,
+        "p99_us": 8.9
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 5,
+      "pose_refresh_ray_step": {
+        "p50_us": 5.800000000000001,
+        "p95_us": 6.1,
+        "p99_us": 10.4
+      },
+      "ray_checks": 4110,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "merged_cuboids",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "swim@0",
+        "swim@15",
+        "swim@30",
+        "swim@45",
+        "swim@60"
+      ],
+      "sampled_phases": 10,
+      "source_cell_rebuild": {
+        "p50_us": 1.3,
+        "p95_us": 2.3,
+        "p99_us": 2.5
+      },
+      "source_cells": 136,
+      "source_parts": 5,
+      "terrain_transition_sweeps": null,
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 5,
+      "warmup": 10
+    },
+    {
+      "animal": "crow",
+      "body_count": 1,
+      "clips": 2,
+      "collider_count": 6,
+      "collider_primitives": 6,
+      "initial_attachment": {
+        "p50_us": 23.200000000000003,
+        "p95_us": 23.7,
+        "p99_us": 28.3
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 6,
+      "pose_refresh_ray_step": {
+        "p50_us": 7.5,
+        "p95_us": 7.9,
+        "p99_us": 10.5
+      },
+      "ray_checks": 6546,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "native_voxels",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "flap@0",
+        "flap@12",
+        "flap@24",
+        "flap@36",
+        "flap@48"
+      ],
+      "sampled_phases": 10,
+      "source_cell_rebuild": {
+        "p50_us": 3.8,
+        "p95_us": 4.8999999999999995,
+        "p99_us": 5.0
+      },
+      "source_cells": 217,
+      "source_parts": 6,
+      "terrain_transition_sweeps": null,
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 6,
+      "warmup": 10
+    },
+    {
+      "animal": "crow",
+      "body_count": 1,
+      "clips": 2,
+      "collider_count": 6,
+      "collider_primitives": 14,
+      "initial_attachment": {
+        "p50_us": 6.2,
+        "p95_us": 6.3999999999999995,
+        "p99_us": 10.0
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 6,
+      "pose_refresh_ray_step": {
+        "p50_us": 6.7,
+        "p95_us": 7.0,
+        "p99_us": 7.4
+      },
+      "ray_checks": 6546,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "merged_cuboids",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "flap@0",
+        "flap@12",
+        "flap@24",
+        "flap@36",
+        "flap@48"
+      ],
+      "sampled_phases": 10,
+      "source_cell_rebuild": {
+        "p50_us": 1.2,
+        "p95_us": 1.4,
+        "p99_us": 1.5
+      },
+      "source_cells": 217,
+      "source_parts": 6,
+      "terrain_transition_sweeps": null,
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 6,
+      "warmup": 10
+    },
+    {
+      "animal": "deer",
+      "body_count": 1,
+      "clips": 2,
+      "collider_count": 9,
+      "collider_primitives": 9,
+      "initial_attachment": {
+        "p50_us": 33.9,
+        "p95_us": 35.1,
+        "p99_us": 41.8
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 9,
+      "pose_refresh_ray_step": {
+        "p50_us": 11.7,
+        "p95_us": 12.4,
+        "p99_us": 12.6
+      },
+      "ray_checks": 8604,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "native_voxels",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "walk@0",
+        "walk@12",
+        "walk@24",
+        "walk@36",
+        "walk@48"
+      ],
+      "sampled_phases": 10,
+      "source_cell_rebuild": {
+        "p50_us": 3.1,
+        "p95_us": 9.5,
+        "p99_us": 9.6
+      },
+      "source_cells": 285,
+      "source_parts": 9,
+      "terrain_transition_sweeps": null,
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 9,
+      "warmup": 10
+    },
+    {
+      "animal": "deer",
+      "body_count": 1,
+      "clips": 2,
+      "collider_count": 9,
+      "collider_primitives": 21,
+      "initial_attachment": {
+        "p50_us": 9.6,
+        "p95_us": 11.9,
+        "p99_us": 15.9
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 9,
+      "pose_refresh_ray_step": {
+        "p50_us": 10.6,
+        "p95_us": 11.1,
+        "p99_us": 13.299999999999999
+      },
+      "ray_checks": 8604,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "merged_cuboids",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "walk@0",
+        "walk@12",
+        "walk@24",
+        "walk@36",
+        "walk@48"
+      ],
+      "sampled_phases": 10,
+      "source_cell_rebuild": {
+        "p50_us": 1.1,
+        "p95_us": 2.0,
+        "p99_us": 2.2
+      },
+      "source_cells": 285,
+      "source_parts": 9,
+      "terrain_transition_sweeps": null,
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 9,
+      "warmup": 10
+    }
+  ],
+  "rig": "single_position_kinematic_root_with_part_colliders",
+  "scenario": "eng209_actual_animal_collision_bounded",
+  "source": "authored SPVX trout/crow/deer, exact 6.25 cm cells, all clips/phases"
+}

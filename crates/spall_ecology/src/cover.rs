@@ -34,31 +34,30 @@ pub const CARPET_FORMS: [u8; 8] = [6, 9, 11, 12, 18, 19, 20, 21];
 pub const MAX_COVER_SPECIES: usize = 64;
 /// Most destroyed-cover records a world keeps at once.
 pub const MAX_CLEARED: usize = 65_536;
-/// Cover destroyed this long ago (seconds of ecological time) is a small
-/// sprout, then medium, then full grown (and forgotten).
+/// Active growing time after destruction before cover has sprouted, grown, and
+/// returned to full size. Winter does not count toward these intervals.
 pub const SMALL_AFTER_S: u32 = 20;
 pub const MEDIUM_AFTER_S: u32 = 90;
 pub const FULL_AFTER_S: u32 = 180;
 
-/// A column whose cover was destroyed, and when (whole seconds of the world's
-/// ecological clock). The one thing about cover the server remembers: cover
-/// itself is stateless, but where it was torn up and how long ago is not
-/// something a formula can know.
+/// A column whose cover was destroyed and its accumulated active growth time
+/// in milliseconds. The one thing about cover the server remembers: cover
+/// itself is stateless, but where it was torn up and its regrowth are not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cleared {
     pub x: u16,
     pub z: u16,
-    pub at_s: u32,
+    pub growth_ms: u32,
 }
 
-/// How grown cover is `age_s` seconds after it was destroyed: `None` while
+/// How grown cover is `age_ms` active milliseconds after it was destroyed: `None` while
 /// nothing has sprouted yet, then small, medium and, once [`FULL_AFTER_S`] has
 /// passed, full size (`1.0`: the record can be dropped).
-pub fn regrowth(age_s: u32) -> Option<f32> {
-    match age_s {
-        a if a < SMALL_AFTER_S => None,
-        a if a < MEDIUM_AFTER_S => Some(0.3),
-        a if a < FULL_AFTER_S => Some(0.65),
+pub fn regrowth(age_ms: u32) -> Option<f32> {
+    match age_ms {
+        a if a < SMALL_AFTER_S * 1000 => None,
+        a if a < MEDIUM_AFTER_S * 1000 => Some(0.3),
+        a if a < FULL_AFTER_S * 1000 => Some(0.65),
         _ => Some(1.0),
     }
 }
@@ -67,17 +66,15 @@ pub fn regrowth(age_s: u32) -> Option<f32> {
 #[derive(Debug, Clone, Default)]
 pub struct CoverMemory {
     cleared: std::collections::HashMap<(i64, i64), u32>,
-    now_s: u32,
 }
 
 impl CoverMemory {
-    pub fn new(cleared: &[Cleared], now_s: u32) -> Self {
+    pub fn new(cleared: &[Cleared]) -> Self {
         Self {
             cleared: cleared
                 .iter()
-                .map(|c| ((i64::from(c.x), i64::from(c.z)), c.at_s))
+                .map(|c| ((i64::from(c.x), i64::from(c.z)), c.growth_ms))
                 .collect(),
-            now_s,
         }
     }
 
@@ -92,7 +89,7 @@ impl CoverMemory {
     pub fn growth_at(&self, x: i64, z: i64) -> Option<f32> {
         match self.cleared.get(&(x, z)) {
             None => Some(1.0),
-            Some(at) => regrowth(self.now_s.saturating_sub(*at)),
+            Some(age) => regrowth(*age),
         }
     }
 }
@@ -1305,28 +1302,29 @@ mod tests {
     #[test]
     fn destroyed_cover_sprouts_then_grows_through_small_medium_and_full() {
         assert_eq!(regrowth(0), None);
-        assert_eq!(regrowth(SMALL_AFTER_S - 1), None);
-        assert_eq!(regrowth(SMALL_AFTER_S), Some(0.3));
-        assert_eq!(regrowth(MEDIUM_AFTER_S - 1), Some(0.3));
-        assert_eq!(regrowth(MEDIUM_AFTER_S), Some(0.65));
-        assert_eq!(regrowth(FULL_AFTER_S - 1), Some(0.65));
-        assert_eq!(regrowth(FULL_AFTER_S), Some(1.0));
-        let cleared = [Cleared {
-            x: 5,
-            z: 6,
-            at_s: 100,
-        }];
-        let at = |now| CoverMemory::new(&cleared, now);
-        assert_eq!(at(110).growth_at(5, 6), None);
-        assert_eq!(at(125).growth_at(5, 6), Some(0.3));
-        assert_eq!(at(200).growth_at(5, 6), Some(0.65));
-        assert_eq!(at(300).growth_at(5, 6), Some(1.0));
+        assert_eq!(regrowth(SMALL_AFTER_S * 1000 - 1), None);
+        assert_eq!(regrowth(SMALL_AFTER_S * 1000), Some(0.3));
+        assert_eq!(regrowth(MEDIUM_AFTER_S * 1000 - 1), Some(0.3));
+        assert_eq!(regrowth(MEDIUM_AFTER_S * 1000), Some(0.65));
+        assert_eq!(regrowth(FULL_AFTER_S * 1000 - 1), Some(0.65));
+        assert_eq!(regrowth(FULL_AFTER_S * 1000), Some(1.0));
+        let at = |age| {
+            CoverMemory::new(&[Cleared {
+                x: 5,
+                z: 6,
+                growth_ms: age,
+            }])
+        };
+        assert_eq!(at(10_000).growth_at(5, 6), None);
+        assert_eq!(at(25_000).growth_at(5, 6), Some(0.3));
+        assert_eq!(at(100_000).growth_at(5, 6), Some(0.65));
+        assert_eq!(at(180_000).growth_at(5, 6), Some(1.0));
         assert_eq!(
-            at(110).growth_at(5, 7),
+            at(10_000).growth_at(5, 7),
             Some(1.0),
             "other columns are untouched"
         );
-        assert!(at(110).is_recorded(5, 6) && !at(110).is_recorded(6, 5));
+        assert!(at(10_000).is_recorded(5, 6) && !at(10_000).is_recorded(6, 5));
     }
 
     #[test]
@@ -1342,7 +1340,7 @@ mod tests {
                 (ez - 24..=ez + 24).map(move |z| Cleared {
                     x: x as u16,
                     z: z as u16,
-                    at_s: 1000,
+                    growth_ms: 0,
                 })
             })
             .collect();
@@ -1361,7 +1359,11 @@ mod tests {
                 .map(|p| p.size[1])
                 .fold(0.0f32, f32::max)
         };
-        let mut run = |now| {
+        let mut run = |age| {
+            let mut records = cleared.clone();
+            for record in &mut records {
+                record.growth_ms = age;
+            }
             cover_parts(
                 &g,
                 &s,
@@ -1370,11 +1372,11 @@ mod tests {
                 eye,
                 40.0,
                 &mut flat,
-                &CoverMemory::new(&cleared, now),
+                &CoverMemory::new(&records),
                 INSTANCE_BUDGET,
             )
         };
-        let fresh = run(1005);
+        let fresh = run(5_000);
         assert_eq!(
             fresh.iter().filter(|p| inside(p)).count(),
             0,
@@ -1385,9 +1387,9 @@ mod tests {
             "the rest of the carpet is untouched"
         );
         let (small, medium, full) = (
-            run(1000 + SMALL_AFTER_S),
-            run(1000 + MEDIUM_AFTER_S),
-            run(1000 + FULL_AFTER_S),
+            run(SMALL_AFTER_S * 1000),
+            run(MEDIUM_AFTER_S * 1000),
+            run(FULL_AFTER_S * 1000),
         );
         assert!(small.iter().any(inside) && top(&small) > 0.0);
         assert!(

@@ -41,18 +41,22 @@ pub mod collider;
 pub mod column_water;
 pub mod commit;
 pub mod contact_damage;
+pub mod creatures;
 pub mod dormancy;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
+pub mod footprints;
 pub mod intent;
 pub mod journal;
 pub mod player;
 pub mod playground;
 pub mod prof;
-pub mod region_coordinator;
 pub mod registry;
 pub mod replication;
 pub mod schedule;
 pub mod sim;
+pub mod snow;
+pub mod snow_query;
 pub mod stage;
 pub mod transfer;
 pub mod world;
@@ -70,6 +74,7 @@ pub use contact_damage::{
     ContactDamageConfig, ContactDamageMaterialProfile, ContactDamagePlan, ContactDamagePolicy,
     ContactEvent, PlannedDamage,
 };
+pub use creatures::{CreatureHostInitError, CreatureSpawnError};
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};
@@ -82,9 +87,6 @@ pub use playground::{
     pending_drop_pools, playground_drop_zones, populate as populate_playground_debris,
     spawn_push_test_box,
 };
-pub use region_coordinator::{
-    PhysicsRegionId, RegionCoordinator, RegionCoordinatorError, RegionMergePlan,
-};
 pub use registry::IdRegistry;
 pub use replication::{
     MotionPublisher, REST_RESYNC_TICKS, ReplicationError, action_statuses, committed_transactions,
@@ -93,12 +95,13 @@ pub use replication::{
 pub use schedule::EditTiming;
 pub use schedule::{EditPipeline, RegionKey, TickReport};
 pub use sim::{
-    CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, SERVER_REQUEST_ID_BAND, Simulation,
+    CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, CreatureMoveOutcome, CreatureMoveRequest,
+    CreaturePose, CreatureWalkOutcome, CreatureWalkRequest, SERVER_REQUEST_ID_BAND, Simulation,
     SimulationConfig, TICK_DT_S, TickError,
 };
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit, warm_index_reuses};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
-pub use world::{RestoredBody, SimWorld, WorldError};
+pub use world::{RestoredBody, SimWorld, WorldError, WorldInstanceToken};
 pub use world::{
     WorldSetup, canonical_logical_volume_for, canonical_volume_for, solid_cells,
     volume_topology_hash_for,

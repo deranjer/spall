@@ -7,9 +7,11 @@
 //! camera-local occupancy/material cache and one-bounce compute prototype.
 
 pub mod camera;
+#[cfg(feature = "capture")]
 pub mod capture;
 pub mod context;
 pub mod environment;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod game_renderer;
 pub mod indirect;
@@ -19,13 +21,17 @@ pub mod pipeline;
 pub(crate) mod probe;
 pub mod scene;
 pub mod sky_visibility;
+pub mod snow;
+pub mod snow_mesh;
 pub mod target;
 pub mod upload;
 pub mod vertex;
 pub mod viewport;
 pub mod water;
+pub mod weather;
 
 pub use camera::{Aabb, Camera, Frustum};
+#[cfg(feature = "capture")]
 pub use capture::{
     BandTrace, CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, CollapseFrame,
     CollapseSequenceOptions, CollapseSequenceReport, FrameLoopOptions, FrameLoopReport,
@@ -37,6 +43,7 @@ pub use capture::{
 };
 pub use context::{RenderContext, RenderError};
 pub use environment::{Environment, EnvironmentPreset};
+#[cfg(any(test, feature = "fixtures"))]
 pub use fixtures::{
     DaylightTerrainScene, EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics,
     MovingBodyOverlap, OCCLUDER_MAX_M, OCCLUDER_MIN_M, PanningCamera, RECEIVER_MAX_M,
@@ -55,11 +62,15 @@ pub use scene::{Material, Scene, SceneItem, default_materials, materials_from_ma
 pub use sky_visibility::{
     SKY_MAX_RAY_CELLS, SkyVisibility, UNKNOWN_CELL, cache_origin_around, mark_world_box,
 };
+pub use snow_mesh::{
+    SnowBeyond, SnowFootprintMark, SnowMesh, SnowNeighbours, SnowTile, SnowTileKey, mesh_tile,
+};
 pub use target::OffscreenTarget;
 pub use upload::{GpuMesh, MeshUploader, UploadBudget};
 pub use vertex::{GpuVertex, to_gpu};
 pub use viewport::{MeshChunk, ViewportFrame, ViewportRenderer};
 pub use water::{NO_WATER, WaterField};
+pub use weather::{MAX_WEATHER_PARTICLES, WeatherLighting, WeatherParticle, WeatherRenderError};
 
 /// Milliseconds on a process-wide clock started at the first call, for lining
 /// up the diagnostic traces (`SPALL_FRAME_TRACE`, `SPALL_SWEEP_TRACE`).

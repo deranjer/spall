@@ -300,12 +300,28 @@ fn giant_collapse_attempt() {
     let status = submit.expect("submit is only rejected for malformed input");
 
     let t1 = std::time::Instant::now();
-    let outcome = sim.run_until_idle(120);
+    let mut reports = Vec::new();
+    let mut next_transfer_low = 1u64;
+    for _ in 0..120 {
+        let count = sim.transfer_reservation_bound();
+        let ids = (0..count)
+            .map(|_| {
+                let id = spall_protocol::TransferId(
+                    spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT | next_transfer_low,
+                );
+                next_transfer_low += 1;
+                id
+            })
+            .collect();
+        let report = sim.tick_with_transfer_ids(ids).unwrap();
+        let done = sim.is_idle();
+        reports.push(report);
+        if done {
+            break;
+        }
+    }
     let elapsed = t1.elapsed();
 
-    let reports = outcome.unwrap_or_else(|e| {
-        panic!("giant_collapse_attempt: run_until_idle failed after {elapsed:?}: {e:?}")
-    });
     let committed: u64 = reports.iter().map(|r| r.committed.len() as u64).sum();
     let rejected: Vec<String> = reports
         .iter()

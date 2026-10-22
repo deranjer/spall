@@ -59,17 +59,28 @@ pub struct PlayArgs {
     /// (use with `--spawn-at-lake` to start on the shore beside them).
     #[arg(long, requires = "worldgen")]
     spawn_raft: bool,
+    /// Spawn this many deer (and half as many crows) around the spawn points.
+    /// Animals are ephemeral for now: the world cannot be saved while they exist.
+    #[arg(long, default_value_t = 0)]
+    animals: u32,
     /// Lighting environment for the window: studio, daylight, overcast,
     /// sunset or night. Defaults to the environment saved in the
     /// `--editor-scene` file, else daylight.
     #[arg(long)]
     environment: Option<String>,
-    /// Accepted for older scripts: play is uncapped (vsync off) by default now.
-    #[arg(long, hide = true)]
-    uncapped: bool,
-    /// Cap the frame rate to the display (vsync on). Play runs uncapped by
-    /// default so the frame rate shows what the game actually costs.
+    /// Run without vsync, limited to this many frames per second (throughput
+    /// measurement). Play presents with vsync by default: without it the GPU
+    /// queue can starve the whole desktop (mouse clicks, alt+tab) while a large
+    /// world loads, and a software frame cap did not prevent that (724862ad,
+    /// regressed by 014d6100 on 2026-10-20).
     #[arg(long)]
+    fps_cap: Option<u32>,
+    /// Run without vsync and without any frame cap (throughput measurement
+    /// only; can freeze the desktop on large worlds).
+    #[arg(long)]
+    uncapped: bool,
+    /// Accepted for older scripts: play uses vsync by default.
+    #[arg(long, hide = true)]
     vsync: bool,
     /// How far (metres) terrain and water are drawn, 16 to 120 (default 96).
     /// Forwarded to the client, which also widens its streamed region.
@@ -234,6 +245,9 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             if args.spawn_at_lake {
                 server_cmd.arg("--spawn-at-lake");
             }
+            if args.animals > 0 {
+                server_cmd.args(["--animals", &args.animals.to_string()]);
+            }
             if args.spawn_raft {
                 server_cmd.arg("--spawn-raft");
             }
@@ -320,8 +334,13 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         eprintln!("xtask play: environment={environment}");
         client_cmd.args(["--environment", environment]);
     }
-    if args.uncapped || !args.vsync {
+    let no_vsync_cap = match (args.uncapped, args.fps_cap) {
+        (true, _) => Some(0),
+        (false, cap) => cap,
+    };
+    if let Some(cap) = no_vsync_cap {
         client_cmd.arg("--uncapped");
+        client_cmd.env("SPALL_MAX_FPS", cap.to_string());
     }
     if let Some(metres) = args.view_distance {
         client_cmd.args(["--view-distance", &metres.to_string()]);

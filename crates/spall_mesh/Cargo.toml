@@ -9,6 +9,15 @@ rust-version.workspace = true
 # digest helper so downstream crates and gates can cross-check greedy output.
 # Always compiled for this crate's own tests.
 reference = []
+# Acceptance-shape and meshing scene builders for tests, benches and gates.
+fixtures = []
+# Offline LOD seam benchmark binary.
+bench = []
+
+[[bin]]
+name = "lod-seam-bench"
+path = "src/bin/lod_seam_bench.rs"
+required-features = ["bench"]
 
 [dependencies]
 spall_core.workspace = true

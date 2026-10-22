@@ -438,6 +438,9 @@ persisted content manifests; (6) build survival inventory, gathering,
 crafting, and progression scenarios. Keep these as separate content work; do
 not fold UI/editor work into T25.
 
+**ENG-194 follow-up - biome ambience:** The sandbox owns a provenance-tracked audio catalogue and maps accepted nature recordings to the thirteen worldgen biomes. The client streams the selected replicated biome ambience with a bounded crossfade; weather remains catalogued for later work, and Snow/Scree are silent. See docs/reports/ENG-194-biome-audio.md.
+
+
 **Increment 2 (versioned server action catalog):** `spall_server::ToolCatalog`
 stores validated unique tool IDs, an explicit catalog version, allowed edit
 kind/material, maximum brush radius, and aim reach. The ordinary `serve`
@@ -1802,3 +1805,423 @@ Natural worlds (landform, erosion, hydrology, climate, thirteen biomes), live ri
 | W6 editor preview layers, tuning and docs | ENG-191 | in review |
 
 Statuses are the coordinator's; nothing is marked done before review and integration.
+
+### ENG-195 - Weather, snow cover, footprints and winter dormancy (plan only)
+
+Status: backlog. User requested planning only on 2026-10-14. Canonical scope,
+ownership, dependencies and future acceptance: [weather plan](weather.md).
+Rain/storms, snowfall, high wind and blizzards start with client presentation of
+server-owned weather; thin terrain snow and shared temporary footprints follow.
+Living vegetation already blocks winter biomass/wood/seeding, but chronological
+age/seed credit and cleared-cover elapsed-time regrowth need dormancy fixes.
+Preserve ongoing ENG-194 audio work and integrated ENG-189/190 interfaces.
+
+Future slices: WX0 state/clock/compatibility; WX1 winter dormancy after WX0;
+WX2 screen effects/audio hooks after WX0; WX3 snow surfaces after WX0/WX2;
+WX4 validated footprints/integration after WX3. Split implementation tickets when
+requested. No runtime change or weather gate is claimed. Next scoped work:
+ENG-195 / WX0 contract and integration audit.
+
+ENG-195 implementation authorized (2026-10-14): parent now in progress.
+ENG-196 / WX0 weather foundation and ENG-197 / WX1 winter dormancy are in progress
+with Luna Medium workers in separate managed worktrees. The frozen clock contract
+in weather.md resolves WX1's WX0 clock prerequisite before parallel work: existing
+chronological ecology fields and VegetationClock journal semantics stay unchanged;
+weather consumes read-only time, and winter owns private active-growth accounting.
+Workers own separate code areas; coordinator owns shared docs and integration.
+WX2-WX4 remain unassigned. No implementation gate is accepted at dispatch.
+
+### ENG-198 / ENG-199 / ENG-200 - F10 weather/audio and combined 1 km playtest
+
+User requested integration and live testing, 2026-10-14. ENG-198 coordinates
+ENG-194 nature audio, integrated ENG-196 weather and ENG-197 winter dormancy,
+ENG-199 authorized weather overrides/compatibility and ENG-200 visual effects.
+All stay in progress until integration review and required evidence are recorded.
+Coordinator owns F10/audio/window/common docs/build/launch. Luna Medium workers
+implemented separate server/protocol and client/render slices in isolated worktrees.
+Canonical plan: weather.md; exact combined checks and launch evidence:
+reports/ENG-198-integrated-weather-playtest.md. WX3/WX4 remain unassigned.
+
+### ENG-201..ENG-205 - Animated animal foundations and world integration
+
+User authorized Luna 6 Medium implementation workers on 2026-10-14.
+Independent assignments: ENG-201 / A0 CPU SPVX assembly decoder and transform
+sampling; ENG-202 / A1 articulated trout, crow and deer fixtures; ENG-203 / A2
+live terrain/water habitat candidate validation. ENG-201/202/203 are reviewed
+and done, including cross-fixture decoding and live generated-world checks.
+Frozen scope, dependencies and acceptance: docs/animals.md.
+A1 uses the existing binary format; A2 uses current world snapshots. No live
+animal spawning, navigation, multiplayer animation or persistence gate is claimed.
+ENG-204 / A3 implements CPU articulated render extraction and the bounded GPU
+animal preview. The coordinator recovered the preview worker's files after its
+usage limit, fixed camera/framing and refined the source assets after visual
+review. ENG-204 is done for its bounded source preview scope; the report records
+the exact checks and concurrent-build caveat.
+Next unblocked: ENG-205 / A4, the missing authoritative creature tick/lifecycle,
+collision/damage/ownership, wire and durable-recovery contracts before live
+population. Exact preview commands and limitations: docs/animals.md and
+reports/ENG-204-animal-preview.md.
+
+ENG-205 contract review continued on 2026-10-15: separate part-local source
+volumes under one assembly owner replace the proposed overlapping single grid.
+Exact articulated collision and source-cell query feasibility is ENG-209 / A4-P,
+now in progress in an isolated Luna 6 Medium worktree at 7208ffc. It measures
+one existing-Rapier-world kinematic root with exact per-part colliders; it does
+not implement live actors or accept population capacity. Corpse aggregate
+ownership/physics is a separate prerequisite. Canonical status: docs/animals.md;
+ENG-205 remains under review until corrections are integrated.
+
+ENG-205 audit accepted and integrated on 2026-10-15 as 33d73df + bf56e76.
+The reviewed lifecycle proposal and reports/ENG-205-contract-audit.md define
+ownership, clock, identity, recovery and prerequisite decisions. This closes
+the audit only; runtime interfaces remain proposed pending physical gates.
+Next unblocked: ENG-209 exact articulated collision/source-cell query prototype.
+Focused asset/sandbox regression checks passed (13 + 23 + 3 tests). Corpse
+aggregate physics, live population, multiplayer and recovery remain unproven.
+
+### ENG-206 / ENG-207 / ENG-208 - Ground snow, precipitation and footprints
+
+User authorized implementation on 2026-10-14 and continuation on 2026-10-15.
+ENG-206 owns authoritative thin terrain snow, exposure, bounded discovery and
+recovery. ENG-207 owns downward precipitation and snow presentation. ENG-208
+owns validated grounded footsteps, shared replication and F10 controls.
+The coordinator integrates two isolated Luna Medium assignments and owns
+storage, protocol compatibility, window wiring and combined verification.
+Contracts: weather.md. Evidence: reports/ENG-206-ground-snow.md and
+reports/ENG-208-footprints.md. Tickets remain in progress until generated-world
+graphics and final integration gates pass. Snow adds no collision or voxel mass;
+moving-body accumulation is outside this phase.
+
+ENG-206/207/208 integration reviewed on 2026-10-15: ground coating, shared
+footprints, nearest-first publication, exact restart and F10 controls are
+implemented. ENG-207 precipitation/presentation correction is accepted. Actual
+1024 m coating and a second live client's boot marks were visually inspected.
+ENG-206/208 remain in progress for documented topology-history, impaired-link,
+destruction and matched performance follow-ups under ENG-195; no provisional
+performance target is accepted. Final evidence and live-world path:
+reports/ENG-207-snow-playtest.md. Next unblocked weather work: ENG-195 combined
+acceptance (T25 integration), independently of the animal prototype work.
+
+ENG-209 / A4-P accepted on 2026-10-15 for the exact articulated geometry/query
+prototype, integrated as c46b7c6. All six actual-animal/collider cases pass:
+38,520 oracle ray checks and 66 guaranteed misses, zero mismatches. Integrated
+focused checks pass 118 tests (one manual timing diagnostic ignored), strict
+physics/probe Clippy and formatting. Reports: ENG-209-articulated-collision.md
+and ENG-209-animal-workload.md, with committed JSON measurements.
+Next unblocked: ENG-210 / A4-R, backlog movement/collision-response rig gate.
+ENG-209 does not accept limb surface-velocity response or fixed-terrain solver
+blocking; editable corpse aggregates and runtime/network/recovery remain gated.
+
+## ENG-211: interactive animal zoo (2026-10-15, accepted)
+
+User-requested visual showroom, independent of the authoritative creature runtime.
+The animal-zoo client example shows all current source species (trout/crow/deer)
+in aquarium/aviary/paddock exhibits with free camera, focus shortcuts, pause and
+idle/action controls. Production renderer and original SPVX cells/clips are used.
+Measured: 2 scenario tests pass; strict example Clippy, formatting and diff checks
+pass; 12 GPU captures on RTX 4080 SUPER/DX12; native smoke presents 90 frames and
+resizes successfully. See docs/reports/ENG-211-animal-zoo.md for exact checks.
+No actor authority, navigation, physics response, population or persistence is
+accepted here. Next unblocked animal task remains ENG-210.
+## ENG-210 / A4-R: articulated movement/response feasibility (2026-10-15)
+
+Assigned to an isolated Luna 6 Medium worker; coordinator owns review/integration.
+Prerequisite ENG-209 is accepted. This CPU-only pass selects and measures a
+concrete rig before production actor interfaces. Preserve original root/local
+0.6 m over 60 steps, fast 0.5 m one-step and fixed-wall counterexamples. Require
+bounded animated-part contact response, explicit exact/conservative terrain
+movement blocking, support removal/fall, stale-update isolation and justified
+source-cell damage attribution (never guess a manifold cell). Validate real
+trout/crow/deer geometry and all clips, retain exact per-part VolumeIds/cells,
+report complete update/query/step costs and body/collider/primitive counts.
+No per-voxel bodies, second solver, hidden anchors, approximate geometry claimed
+as exact, runtime actor/network/storage/UI or corpse gate acceptance. A bounded
+per-source-part body candidate is permitted under one conceptual assembly owner.
+Ticket remains in progress until coordinator review and required checks pass.
+## ENG-212: editable multi-volume corpse aggregate feasibility
+
+Next prerequisite for the requested 1 km weather + fully simulated animal run,
+after reviewed ENG-210 integration. CPU-only candidate must atomically retain
+all source-part VolumeIds/cells/materials/revisions/death poses in an editable
+physical aggregate without revoxelization, per-part auto-explosion, implicit
+PART joints, per-voxel bodies, hidden anchors or a second solver. Measure exact
+query provenance, dynamic fall/contact, mass/inertia/COM, surviving-cell pose
+and momentum through edits/removal, stale rebuild isolation and ownership
+conservation using actual trout/crow/deer and both exact representations.
+Cross-part fracture rules must be explicit, never inferred from hierarchy.
+No host/network/storage/UI implementation or population acceptance in this
+slice. Coordinator owns review, integration and Loopira; worker owns an isolated
+worktree and reviewable evidence/commits. Runtime actors remain dependent on
+reviewed movement, corpse and provenance contracts in animal-lifecycle.md.
+ENG-210 coordinator acceptance (2026-10-16): bounded CPU movement/response and
+source-contact witness feasibility integrated through aabc2d3, including the
+independently reviewed pending-pose/topology race fix. Combined integrated
+checks pass 233 tests, 7 ignored; workspace all-target/all-feature compilation,
+strict physics/probe lint, formatting and diff checks pass. Candidate32 and
+unchanged default release probes each pass 38,520 rays plus 66 misses with
+zero mismatches; candidate accepts 48 transitions with representation parity.
+Default solver remains one step. No production damage, population, corpse or
+live-world/network/recovery acceptance is implied. Evidence and exact commands:
+docs/reports/ENG-210-integration.md. Next unblocked: ENG-212; the user-requested
+1 km weather/fully simulated animal instance remains held for dependent gates.
+## ENG-213: full-world animal transition locality and 1 km physics feasibility
+
+Independent of ENG-212 corpse implementation; requires accepted ENG-210.
+The full authoritative 1024 m terrain has per-brick fixed colliders. Current
+source-cell transition work counts all fixed colliders before the one-million
+cast budget; deer exceeds it above 3508 colliders. Measure the actual count.
+Implement conservative current-world broadphase filtering over the full
+linear-origin/shortest-arc rotation path, with exhaustive small-world oracle,
+mid-arc thin obstacles, edits/removal, negative/off-center geometry and budgets.
+Do not increase the cap, shrink the world or use endpoint-only clearance.
+Measure actual seed-1/4096-cell world, all clips and global solver-substep costs,
+full fixed/dynamic/body/collider counts; no population target is accepted here.
+No runtime actor/network/storage/UI changes. Coordinator owns review/integration
+and tracking; Luna Medium worker uses its dedicated worktree.
+ENG-212/213 coordinator acceptance (2026-10-16): integrated through 30e859b for
+bounded CPU aggregate/locality feasibility. Checks pass 242 tests, 7 ignored,
+workspace all-target/all-feature compile, strict lint, format and diff checks.
+Eighteen corpse cases and candidate/default 38,520 rays + 66 misses pass.
+Actual 1024 m run retains 123892 fixed colliders and 60 accepted animal phases.
+No shipping fracture/runtime/network/recovery/weather population acceptance.
+Evidence: reports/ENG-212-213-integration.md. Next unblocked: ENG-214.
+
+## ENG-214: corpse connectivity, fracture and source split ownership
+
+After reviewed ENG-212, define exact material connectivity or authored source
+bonds without inferring anatomy from PART, approximate topology or anchors.
+Preserve source VolumeIds/cell coordinates/materials/revisions across atomic
+one-to-many component ownership; no revoxelization or per-part auto-explosion.
+Prove prepared/stale isolation, conservation, mass/motion/query identity and
+actual asset connectivity with independent CPU cases. Ambiguous geometry fails
+closed. Host/protocol/store/runtime interfaces depend on reviewed provenance.
+ENG-214 planner-only progress (2026-10-16): integrated 0b522a9/39cf525.
+Independent checks pass 120 physics/review tests, one existing manual timing
+test ignored. Seven review tests include 81 exact half-turn cell configurations.
+Strict physics lint, format/diff checks and sandbox probe compile pass.
+Nine actual-asset poses: trout 3 prepared, crow idle 1 prepared with seven
+components; crow flap 2 and deer 3 reject ambiguous connectivity. Physical
+split, continued fragment edits and actual asset pose acceptance remain open.
+Evidence: reports/ENG-214-planner-review.md and planner-survey JSON.
+Next unblocked remains ENG-214; no combined 1 km animal launch acceptance.
+
+ENG-214 physical split/edit progress (2026-10-16): integrated through f4ea2ed.
+One logical owner now supports atomic disjoint-source component bodies, stable
+lifetime IDs, immutable material density, keyed removals and re-splits after
+independent motion. Integrated checks pass 261 tests,7 ignored, workspace
+compile, scoped strict lint/format and release regressions. Crow idle retains
+217 source cells,7 bodies,11 colliders and217 nearest-hit baseline ray results.
+Five crow flap/deer poses still reject ambiguous contact; no assets changed.
+Evidence: reports/ENG-214-physical-review.md and physical-survey JSON.
+Next unblocked remains ENG-214 certified rotated geometry. No runtime animal
+lifecycle/network/recovery or combined1km launch acceptance is implied.
+
+ENG-214 coordinator closeout (2026-10-16): accepted bounded CPU connectivity
+and physical split/edit feasibility through8e620d1. All9 unchanged actual
+animal poses now prepare exact partitions. Certified positive-area shared
+faces resolve deer walk tangency without tolerances; conservative cachedAABBs
+reduce worst observed planning to0.96ms.268 integrated tests pass,7ignored,
+workspace compile/lint/format and release regressions pass. Exact rational
+oracle covers6372 volume/shared-face cases,32 safely ambiguous,0wrong results.
+Four physicalsplit cases preserve936 source records and nearest-hit baselines,
+and120 seeded steps retain finite states/exact provenance. No asset edits.
+Evidence: reports/ENG-214-integration.md and final-survey JSON. Earlier
+rejections/slow interval prototype are preserved as historical evidence.
+Next unblocked: ENG-215 authoritative host identities/state DTOs/scheduling.
+Runtime lifecycle/network/recovery and combined1km launch remain pending.
+
+## ENG-215: authoritative animal host identities and scheduling seam
+
+After accepted ENG-210/212/213/214, implement animal-lifecycle.md slice3.
+Engine-owned stable CreatureId/world-epoch/generation and checked allocator,
+versioned bounded actor/species/asset/material/clip/source bindings, validated
+owner-thread registry and statically linked game behavior scheduling seam.
+Review shared-interface design first. Preserve engine/game boundary and exact
+logical source ownership. No runtime birth/death transaction, actor network
+channel or durable schema changes until following slices; DTO roundtrip and
+counter snapshots alone are not launch acceptance. Required rejection,
+allocator/restore/reset, bounded scheduling and stale-intent invariant tests
+are recorded on ENG-215. Dedicated worktree; coordinator owns integration/log.
+
+ENG-215 coordinator acceptance (2026-10-16): integrated through32cf744.
+Stable checked creature identities/counters, bounded standalone state DTOs and
+owner-thread immutable scheduling proposals pass334 tests,9existing ignored.
+Workspace all-target/all-feature compile, scoped strict lint,format/diff pass.
+Independent review fixed species/asset binding, pre-allocation source limits,
+invalid epochs, frozen corpse scheduling, reset identity loss and ID reuse.
+Production registration is unavailable pending atomic source ownership.
+Evidence: reports/ENG-215-integration.md. Next dependency-ready work: atomic
+actor lifecycle/source ownership. Network/durable/species integration and the
+fully simulated1024m weather launch remain pending.
+## ENG-216: atomic animal lifecycle and source-volume ownership
+
+Depends on accepted ENG-215. Dedicated animal-ownership worktree starts9733695.
+Design-first review covers separate creature source ownership, canonical hashes,
+existing transaction/journal ordering, physics prepare/commit and retirement.
+Preserve original VolumeIds/cell/material/revisions and checked stable counters;
+no ordinary one-volume BodyRecord workaround or alternate journal. Reject stale,
+duplicate/foreign and failed preparations atomically. Production registration
+stays gated if actor wire/store support is absent. Exact scope and required
+invariants are in Loopira ENG-216; coordinator review precedes shared edits.
+Next launch requirements remain species/habitat, replication and durable recovery.
+ENG-216 design review (2026-10-16): scope narrowed explicitly to typed SimWorld
+source ownership plus atomic in-memory birth/death test seam. Mutation remains
+unreachable from shipped production paths. No journal/control sequence consumed,
+no TopologyTransaction/checkpoint extension or competing journal in this slice.
+Existing ordered transaction, replica and recovery integration is a following
+prerequisite. Separate versioned actor hash domain preserves legacy owner bytes;
+actor state must never be published as a complete legacy checkpoint/world hash.
+Birth reserves original VolumeIds and CreatureKey from cloned authoritative
+allocators; physics preparation must fail atomically before ownership publication.
+Lifetime part bindings remain even for empty sources; partial edits/removal follow.
+Luna worker received reviewed boundary and is proceeding in animal-ownership.
+ENG-216 coordinator acceptance (2026-10-16 local): integrated through cd0b6e3.
+Bounded unit-test-only source ownership and atomic birth/death pass 364 tests,
+10 existing ignored, workspace compile/scoped strict lint/format/diff checks.
+All18 release trout/crow/deer corpse cases pass. Nine independent review cases
+cover lifecycle/material/motion rejection, both allocators, reset and refusal
+before transfer. Nested3part mixed-material rotated-root queries/mass pass.
+Same-max canonical source replacement rejects; ordinary apply_edit already
+advances the volume-wide revision high-water mark. Full source freshness and
+retained hierarchy protect transfer; exact resultant motion validates before
+physics mutation. Source-only hash excludes actor/pose state. No production
+registration, transaction/wire/checkpoint schema or journal changed.
+Evidence: reports/ENG-216-integration.md. Next unblocked: ENG-217 versioned
+actor/source records and ordered lifecycle replay, design review before edits.
+Replica/baseline and durable recovery must support actors before live spawning.
+
+## ENG-217: versioned animal source ownership and ordered lifecycle replay
+
+Depends on accepted ENG-216. Review portable actor/source/hierarchy/component
+DTOs, canonical hash domain/version and existing ordered transaction/replay
+extension before shared edits. Runtime stamps/handles never serialize. Preserve
+legacy ordinary bytes and no-actor hashes. Candidate-first all-or-nothing
+application and idempotent/divergent replay tests must prove exact source
+identity, revision/material checks and allocator safety. Agree fragment masks
+and source-edit synchronization boundaries explicitly; unsupported paths remain
+closed. No separate journal or unjournaled sequence consumption. Production
+registration stays disabled until baseline/replica and checkpoint/recovery
+consumers are implemented. Exact scoped acceptance is on Loopira ENG-217.
+ENG-217 design review: exact wire schema7 and store schema3 embed framed topology
+bytes, so adding lifecycle operations safely requires coordinated consumers.
+Approved current slice: canonical portable actor/source records plus one reusable
+pure candidate reducer. No independent actor sequence/ledger/journal, no current
+TopologyTransaction/wire/baseline/store version mutation. Later consumers wrap
+these same records/reducer in existing order with explicit compatibility gates.
+Runtime source stamps never serialize; portable generation/content/revisions do.
+Exact component masks may encode, but unsupported split/edit/removal reduction
+rejects explicitly. Death preserves all source bytes and freezes exact hierarchy
+and resultant motion. Bridge ENG-216 fixtures into records; bound nested decode,
+mask/dense/occupied work and checked arithmetic. Production registration stays
+closed. Luna worker proceeds in dedicated animal-replay checkout at a313196.
+ENG-217 coordinator acceptance (2026-10-17): portable source ownership,
+canonical separate hash domains, cumulative bounded decode and one affected
+record lifecycle reducer are integrated. Actual nested3part simulation bridge
+preserves sources/hierarchy/frozenposes/resultant motion. Protocol+sim tests:
+331passed0failed9existingignored; workspace all-target/all-feature compile,
+scoped strict lint and format/diff pass. No production registration, wire7,
+baseline1, store3 or journal changes. Evidence: reports/ENG-217-integration.md.
+Next unblocked work: coordinated ordered transaction, replica/baseline and
+durable checkpoint/replay consumers using these same records/reducer, with
+explicit compatibility and topology-versus-motion hash separation. Source
+edit/fracture synchronization, species/habitat and combined1024m proof follow.
+## ENG-218: ordered animal lifecycle consumers and durable recovery
+
+Depends on accepted ENG-217(main84880c2). Design-first coordinated integration
+of the SAME portable ownership records/reducer with actual ordered world
+transactions, client baseline/replica and checkpoint/journal recovery. Evaluate
+one legitimate typed lifecycle TopologyOp within existing transaction order;
+never fake geometry or a separate actor stream/ledger/journal. Explicit wire,
+baseline and store version handling, allocator highwater even for empty sets,
+portable checked death evidence and source owner uniqueness are required.
+Define actor topology hashing separately from motion-bearing fullowner hashing.
+Mixedop atomicity, duplicate/divergent replay, baseline/restart/suffix recovery,
+oldformat rejection without mutation, checkpoint crash cuts and exact source/
+hierarchy/motion/counter checks precede acceptance. Physical restore must be
+specified; no ghost actors or fake Body ownership. Production species spawning
+stays closed; sourceedit/fracture sync and integrated1024m proof still follow.
+Exact contract: Loopira ENG-218. Coordinator reviews design before shared edits;
+Luna6Medium worker uses dedicated animal-consumers checkout from84880c2.
+ENG-218 checkpoint (2026-10-17): integrated replay guard, source-fenced lifecycle
+commit evidence, exact corpse reconstruction and owned atomic cold-restore batch.
+Main 963d1b7: 646 tests passed, 12 existing ignored; workspace all-target/features
+check, four-package strict all-targets Clippy, fmt/diff and 18 release animal
+corpse cases passed. See docs/reports/ENG-218-progress.md for commands and limits.
+Next unblocked task remains ENG-218: common prepared birth/death/restore batch,
+then real ordered operations, complete baseline and durable recovery consumers.
+No production population or combined weather/1024m acceptance is claimed.
+
+ENG-218 checkpoint (2026-10-17, main96ba47d): common articulated birth/death/
+restore preparation, selected-body freshness fence, owned geometry preparation
+and no-journal publication seam integrated. Actual joint geometry-first/animal
+publish fixture passes; it is not a serialized lifecycle transaction. Measured:
+667 tests passed, 12 existing ignored across68suites; workspace all-target/
+feature check, scoped strict all-target lint, fmt/diff and18releasecorpsecases
+passed. See reports/ENG-218-progress.md. Next remainsENG-218 actual ordered
+lifecycle transaction/client consumers, typedbulk, completebaseline and durable
+checkpoint/replay. Combinedcapacity/registry/journal admission must precede any
+mixedpublish. No productionanimals or combinedweather/1024m acceptance claimed.
+
+ENG-218 current-only progress (2026-10-17): main ca33d8f includes ordered inline creature lifecycle framing at protocol/wire 8, prepared physics evidence/capacity, and atomic rejection by geometry-only consumers. User explicitly requires removal of legacy compatibility: saved-wire rewriting, old weather/vegetation DTO upgrades, and store schema backfills are removed; unsupported old formats and incomplete current schemas reject. Current store schema 3 and baseline schema 1 remain until their actor-aware replacements pass. Coordinator server/sim/store retry: 479 passed, 12 ignored; workspace all-target/all-feature check, seven-package strict all-target Clippy retry, formatting and diff checks passed. Initial snow migration expectation and redundant test clone failed before correction; report records both. Full validated three-part sparse-source fixture is 99,068 bytes versus 65,536-byte control cap, requiring typed bulk. Producer and bulk consumer work remains unaccepted in isolated checkout; production spawning remains disabled. Next unblocked task: ENG-218 authoritative/replica lifecycle consumers, bounded typed bulk, complete baseline and durable recovery. See docs/reports/ENG-218-progress.md.
+
+ENG-218 bulk framing progress (2026-10-17): main bf6ba9a advances current-only protocol/wire to 9 and adds bounded typed lifecycle bulk marker/codec. Prior wire 8 also rejects; no compatibility upgrades. Geometry split groups retain shared transfer IDs; lifecycle collisions reject. New tag 6 dispatch remains closed pending atomic typed consumers/common allocator. Three-part fixture: 99,093 raw bulk-envelope bytes, 397 compressed; shipped animal assets not measured. Main protocol review tests 11 and inline/bulk client/recovery refusal tests 2 passed; workspace all-target/all-feature check, strict seven-package all-target Clippy, formatting and diff checks passed after correcting missing test diagnostic/applier match arms. Producer draft remains isolated pending final death-source/work/twist and mixed transaction scenarios. Next task remains ENG-218; production spawning/1km launch remain gated. See docs/reports/ENG-218-progress.md.
+
+ENG-218 inline producer (2026-10-17): main 1d304da integrates crate-private authoritative lifecycle prepare/validate/publish with shared geometry/actor candidate IDs and one journal append. Ordered Birth/pose/Death, final source/catalog fences, late mixed failure, installed twist and cumulative work checks are covered. Main full spall_sim: 252 passed, 9 ignored across 30 targets; workspace all-target/all-feature check and strict seven-package all-target Clippy passed. Additional dormant mixed admission guard regression passed (1); strict Sim lint passed. Closed inline producer rejects dormant mixed targets until staged reactivation exists and still rejects oversized three-part records; no live scheduling, bulk, replica or recovery acceptance. Next ENG-218: one checked shared runtime transfer allocator and bounded typed attachment sets, then reservation handoff/journal, dormant publication, replica/baseline/store consumers. No legacy migration paths; production spawning/1km launch still gated. See reports/ENG-218-progress.md.
+
+ENG-218 allocator/attachment prerequisites (2026-10-17): main f4779af+a272e48 adds one checked runtime transfer sequence and pre-world-reset session-group reservations; main a8d790e+7ac6bc1 adds bounded typed attachment sets, exact parent replay identity and cumulative lifecycle work limits. Current wire9/baseline1/store3 unchanged; runtime split/lifecycle handoff and retained-marker startup seeding still pending. Main allocator server suite196 passed/2ignored/23targets; after reset/protocol integration protocol124, resetpreflight1, real latejoin+snowreset2 passed. Workspace all-target/all-feature check, strict seven-package lint, format/diff passed. Next ENG-218 is owned bounded geometry reservation data through existing tick/rebase, then lifecyclebulk/typedjournal and real replica/baseline/recovery consumers. No production spawning or 1km acceptance. See reports/ENG-218-progress.md.
+
+ENG-218 geometry transfer handoff accepted (2026-10-18): main 65e0911 + d3fa65f uses owned shared-allocator Split reservations through existing tick/rebase and preserves one ID across bulk markers, QUIC and durable records. Startup validates all durable suffix transfer IDs before restore/checkpoint writes and seeds the live allocator above them. New full-size QUIC/SQLite split test covers actual replica install, failed final checkpoint, exact recovered hash and restart high-water; simulation boundary tests cover invalid/duplicate IDs and idle zero demand. Integrated main retry: 578 passed, 0 failed, 11 ignored across 64 targets. Initial sandbox local-server startup timeout is recorded; network-enabled retry passed. Workspace all-target/all-feature check, seven-package strict all-target Clippy, fmt/diff passed. Wire9/baseline1/store3 unchanged, no legacy path. Next ENG-218 prerequisite is complete actor checkpoint/baseline restore including source ownership and empty-host allocator, then typed attachment transport/ordered replay and one journal record before enabling lifecycle production. Production spawning and combined 1024m animal/weather/GPU/population/recovery/destruction acceptance remain gated. See reports/ENG-218-progress.md.
+ENG-218 animated physics reconstruction prerequisite (2026-10-18): main decfd1a + f313fb2 adds prepared AliveRestore with exact keyed measured part twists, applied hierarchy, root motion and stable owner/source/tokens, under existing batch budgets/fences. Independent review prevented rigid-only animation loss and caught first-step free limb drift; corrected one-step mode reset handles no-input hold, authored resume and immediate death without re-kinematicizing corpse. Main cf0e3bd refuses full/incremental geometry-only checkpoints for any initialized actor host, even empty allocator high-water, until complete format exists. Focused alive tests 6 passed and checkpoint boundary 1 passed. Full main physics/sim/server corrected-harness retry: 613 passed, 0 failed, 12 ignored across 71 targets; first attempt hit 3 QUIC certificate failures from PID-reused temp folders created Oct15, now fixed with nonce/exclusive creation and old logs retained. Workspace all-target/all-feature check, seven-package strict all-target Clippy, fmt/diff passed. Current wire9/baseline1/store3 unchanged. Next ENG-218: bounded full-owner corpse/source capture and explicitly versioned complete part-motion/allocator serialization, then atomic Simulation checkpoint/baseline and ordered typed journal/replica consumers. Runtime reconstruction is not complete animal saving. Production spawning, combined 1024m weather/animals, GPU/population and multiplayer animal restart/destruction remain gated. See reports/ENG-218-progress.md and design clarification.
+ENG-218 2026-10-18 whole-owner corpse physics capture: main c3fb333 adds a bounded
+read-only export using canonical source bindings plus actual component masks,
+poses/twists, portable fences, primary identity and serial high-water. Public real
+fracture/roundtrip and negative-coordinate air-padding cases pass (2); full
+physics/sim 420 passed, 0 failed, 10 ignored across 48 targets. Cold-restore storage
+matches the existing 4M dense-cell articulated ceiling; fracture planner stays 1M.
+Not complete serialized actor capture. Next ENG-218: full Simulation source/owner
+and allocator snapshot, versioned independent Alive motion, atomic checkpoint/
+baseline and typed ordered consumers. Production spawning and combined 1024 m
+weather/animal gates stay closed. See ENG-218-progress.md for exact checks/limits.
+ENG-218 2026-10-18 bounded ownership-set reader: main a5ca1da adds seeded V1
+Deserialize preserving per-record and cumulative set budgets before allocation,
+plus frame-capped catalog-validating decode. Coordinator closes bounded names,
+strict nested maps (including duplicate mask-cell Wire reader) and excess binding
+payload reads. Public corrected retry22pass; protocol/sim393pass0fail9ignored
+across40targets. No wire9/baseline1/store3 change or runtime consumer activation.
+Next ENG-218: explicitly versioned independent Alive part motion/overlay and death
+evidence, canonical Simulation source/owner+allocator snapshot, atomic complete
+checkpoint/baseline and typed ordered journal/replica. Combined1024m animal/weather,
+population/GPU/multiplayer recovery gates and spawning remain closed. Exact checks,
+failed initial map test and limits in reports/ENG-218-progress.md.
+ENG-218 2026-10-18 animated ownership V2: changed owner/set/change/overlay/commit/
+bulk types now retain exact keyed measured Alive part velocities, empty for Corpse.
+Full/motion hashes bind them; topology/source hashes exclude them. Current-only
+schemas2, wire10 and lifecyclekind7 replace changed V1/wire9/kind6 without migration;
+geometrybaseline1/store3 remain unchanged opaque-container layouts. Actual checked
+three-part animated capture/codec bridge passes; ordered one-part producer retains
+actual sampled motion; two-part inline birth refuses atomically at existing64KiB
+until typedbulk producer exists. Final protocol/sim/store/server640pass0fail12ignored
+68targets; clientrefusal2pass; workspace alltargets/allfeatures, seven-package strict
+lint, format/diff pass. Initial crash marker rename denied; same permitted workload
+passes; child diagnostics now retained. See ENG-218-progress for exact attempts.
+Next ENG-218: complete canonical Simulation source/owner+allocator capture and
+atomic actor checkpoint/baseline, typed ordered journal/replica/attachment consumers,
+then bulk scheduling and sourceedit/fracture sync. Spawn/combined1024m animalweather,
+GPU/population/multiplayer animalrestart/destruction remain gated.
+ENG-218 2026-10-18 primary identity V3/snapshot prerequisite: portable owner explicitly retains primary component serial independently of canonical sorted component order; root pose/twist must match it. Empty source parts retain identity/hierarchy with nonempty aggregate masks. Current-only owner/set/change/commit/bulk schemas3, wire11/lifecyclekind8; unchanged overlayV2/partvelocityV2 retained, no migration. New bounded CreatureSnapshotV1 retains existing allocator epoch/high-water evenempty plus actual shared nextvolume counter and one bounded ownerset. Full integrated protocol/sim/store/server644pass0fail12ignored68targets; workspace alltarget/allfeature check passes. This is a portable DTO prerequisite, not Simulation capture/checkpoint installation or spawning. Next ENG-218 canonical bounded complete Simulation capture, joint prepared restore, complete checkpoint/baseline and ordered replay/replica, then bulk and sourcesync. Combined1024m/GPU/population/animalrestart/destruction remain gated. Exact checks/attempts in reports/ENG-218-progress.md.
+
+ENG-218 2026-10-18 guarded Simulation owner capture: complete source-map bijection, two-pass bounded source/grid/mask/native capacity admission, exact Alive physics/source equality and full corpse masks/primary/high-water. Raw physical animation tokens remain runtime fences; explicit adapter maps to authoritative host logical epoch, including initialtoken0 and checkedDeath. Current source DTO lacks Volume.next_revision gaps; capture explicitly refuses SourceRevision until next sourcehighwater format/exactrestore prerequisite. Full voxel/physics/protocol/sim661pass0fail11existingignored60targets; focusedanimal32pass. Wire11/baseline1/store3 unchanged; no checkpoint/spawn activation. Next unblocked ENG-218 sourcecounter highwater + exactrestore, joint Simulation restore, checkpoint/baseline/ordered replay/replica, bulk and sourcesync. Combined1024m/GPU/population/restart/destruction remain gated. Exact evidence in reports/ENG-218-progress.md.
+
+ENG-218 2026-10-18 exact source counters: current-only SourcePartV2.next_brick_revision, owner/set/change/commit/bulkV4 schemas/domains4, SnapshotV2/schema2, wire12/kind9. Source/full/topology hashes bind actual counter; Death preserves it. Capture removes SourceRevision gap refusal; pure validated source reconstruction resumes exact counters after original bricks, including empty/retired gaps and MAX exhaustion. Volume resume rejects zero/rollback without mutation. Full voxel/physics/protocol/sim/store/server909pass0fail14existingignored89targets. No complete Simulation installer/checkpoint/baseline or spawn activation; baseline1/store3 unchanged guarded layouts. Next unblocked ENG-218 joint atomic host/source/physics/registry restore, complete actor checkpoint/baseline/ordered replay/replica, then bulk and sourcesync. Combined1024m/GPU/population/animalrestart/destruction remain gated; see ENG-218-progress.md for exact evidence.
+
+ENG-218 2026-10-18 joint cold Simulation restore: opaque prepare/commit installs complete current SnapshotV2 after geometry recovery into uninitialized host/all five source indexes empty. Exact expected WorldId/shared volume counter, disjoint source namespace, bounded physical population and catalog, saved IDs/allocator/revision counters/Alive measured motion/Corpse masks/primary/serial gaps retained. Stage complete source+host maps and owner slots before physics; revalidate geometry/world/origin/registry/journal/catalog and physics before atomic publication, with no new IDs/counter rewrites/journal entries. Empty snapshots retain allocator; initialized-empty replacement and lossy frame conversion refuse. Full voxel/physics/protocol/sim/store/server916pass0fail14existingignored89targets; final strengthened simulation273pass0fail9ignored31targets; focusedanimals48pass. Workspace alltargets/allfeatures and strict seven-package lint pass. Wire12/baseline1/store3 unchanged guarded layouts. Next unblocked ENG-218: complete actor checkpoint/baseline and typed ordered journal/replica/attachment consumers, bulk and source-edit/fracture/terminal sync. Spawn/combined1024m/GPU/population/multiplayer animal restart/destruction remain gated; exact checks/attempts in reports/ENG-218-progress.md.
+
+ENG-218 2026-10-19 complete checkpoint section: store4 required CRC/host-flag animal row holds existing SnapshotV2/full hash/exact physics origin, published with geometry/environment/cursor in one transaction; store3 rejects without migration. Catalog-aware capture/restore rebuilds detached geometry then joint actor candidate and exact full recapture; catalog-free callers refuse animal state. Checkpoint topology composition3 separates sampled motion and preserves actor-free geometry2 vectors. Bounded source/world/counter/cell-size/namespace admission, unique CreatureId across generations, mandatory row/CRC checks and retained-pruned cursor guards validated. Writer refuses initialized-host omission and unsupported animal suffix/appends until typed replay. Explicit AtOrBefore choice reloads its own suffix; no automatic semantic rewind. Focused12pass; corrected full voxel/physics/protocol/sim/store/server929pass0fail14existingignored90targets; workspace alltargets/allfeatures and strict seven-package lint/clientrefusal2 pass. Initial full hash-version fixture assertion2 corrected to3 with stronger old1/2 refusal; no migration/gate/workload relaxation. Next unblocked ENG-218 typed ordered journal/attachment and baseline/replica consumers, live catalog handoff, bulk and source-edit/fracture/terminal sync. Production spawning/combined1024m/GPU/population/real-process animal restart/destruction remain gated; exact files/checks/attempts in reports/ENG-218-progress.md.
+ENG-218 final checkpoint completeness guard: catalog-aware full capture refuses any retained evicted geometry before copying, with actual eviction/logical-hash retention and unchanged-animal regression. Existing incremental ResidencyPass capture still needs actor/catalog/backing participation; live streamed1km saves remain gated. Full server and workspace/lint rechecks follow the six-package929-pass run; see progress report for final exact evidence.
+ENG-218 final checkpoint guard validation: full server212pass0fail2ignored25targets includes13 animal checkpoint cases; refreshed workspace/allfeatures/alltargets, strict seven-package lint and fmt/diff pass. No workload or gate reduced; live catalog/residency and typed runtime consumers remain next.
+
+ENG-218 2026-10-19 streamed checkpoint participant: ResidencyPass::capture_checkpoint_with_catalog reuses complete logical terrain cache/backing assembly and validated animal/environment checkpoint capture. Runtime-only installed-world identity guards both entrypoints before cache/backing access; evicted ordinary bodies refuse; complete success precedes cache/counter publication. Mixed/empty animal SQLite recovery, warm/cold backing, missing/revision/content/catalog failure atomicity, foreign same-ID world and body eviction tests pass. Focused19pass; full simulation/server491pass0fail11existingignored56targets; workspace alltargets/allfeatures, strict seven-package Clippy, fmt/diff pass. No store4/wire12/baseline1 change. Next unblocked ENG-218 live catalog handoff, typed ordered journal/attachment/baseline/replica consumers, bulk producer and source-edit/fracture/terminal synchronization. Spawning/combined1024m/GPU/shippedpopulation/two-client/real-process animal crash-restart remain gated. Exact files/checks/attempts in reports/ENG-218-progress.md.
+
+ENG-218 2026-10-19 typed durable attachment participant: store5 replaces4 without migration and removes geometry-only bulk journal variant/legacy compatibility test. TopologyAttachments uses existing bounded TransactionAttachmentSetV1 for complete correlated terrain/lifecycle families; actual terrain journal/recovery/startup retained-ID path migrated. Typed controls/participant/attachment decode bounds precede copy, recovery borrows SQLite BLOBs and rejects trailing bytes, row tick matches parent. Invalid typed batch poisons before valid prefix/outbox publication, existing auxiliary retries preserved. Full corrected store/server267pass0fail3existingignored29targets; final focused store15pass, animal23pass; workspace alltargets/allfeatures, strict seven-package lint and fmt/diff pass. Initial snow retry regression corrected by scoping new poisoning to typed records, no gate/workload reduced. Codec retains real oversized three-part animal sources/motion through SQLite; runtime lifecycle/mixed replay explicitly refuses until joint consumer exists. Next unblocked ENG-218 typed in-memory bulk producer/reservation handoff, joint actor replay, baseline/replica/live catalog and source-edit/fracture/terminal sync. Spawning/combined1024m/GPU/shippedpopulation/real-process/two-client animal restart/destruction remain gated. Exact evidence in ENG-218-progress.md.
+
+ENG-218 2026-10-19 bulk producer + prepared journal handoff: internal bounded transfer input takes caller-reserved exact-namespace nonzero unique lifecycle IDs and optional geometry ID; protocol shares existing bit61 constant. Oversized complete actor transactions convert exact sampled V4 commits to bulk markers preserving ordinals/hash/witness; full typed mixed set actual encoding/work validation precedes publication. JournalEntry.attachments replaces geometry-only field; geometry prepares typed set, server journal adapter consumes it directly. Mixed parent takes geometry set and builds final entry before any world publication; one append, no later payload patch. Four actual3part Birth/animated checkedDeath/full-size geometry mix/reservation and stale atomicity tests pass; no-ID refusal retained. Full protocol/sim/store/server688pass0fail12existingignored69targets before final publication refinement; final simlib162pass0fail6ignored, checkpoint23pass, client bulk3pass. Workspace alltargets/allfeatures, strict seven-package lint and fmt/diff pass. Test scratch collision corrected with unique exclusive names; remaining client caller migrated without changing workload; exact attempts/files/logs in ENG-218-progress.md. Wire12/store5/baseline1 unchanged. Next unblocked ENG-218 live server intent/reservation/delivery handoff, joint actor replay, baseline/replica/live catalog and source-edit/fracture/terminal sync. Spawning/combined1024m/GPU/shippedpopulation/real-process/two-client animal restart/destruction remain gated.

@@ -88,6 +88,25 @@ fn a_still_sea_is_held_as_records_and_reports_the_same_water() {
 }
 
 #[test]
+fn bounded_column_query_matches_lazy_ocean_without_reviving_it() {
+    let (lazy, eager) = (world(true), world(false));
+    let (x, z) = (5, 7); // Interior of dormant region (0, 0).
+    let query = |world: &ColumnWorld, max_spans| {
+        let mut spans = Vec::new();
+        let within_budget = world.visit_spans_in_column(x, z, max_spans, |span| {
+            spans.push((span.floor_y, span.depth));
+        });
+        (within_budget, spans)
+    };
+
+    assert_eq!(query(&lazy, 1), query(&eager, 1));
+    assert_eq!(query(&lazy, 1), (true, vec![(1, 4.0)]));
+    let dormant_before = lazy.dormant_region_count();
+    assert_eq!(query(&lazy, 0), (false, Vec::new()));
+    assert_eq!(lazy.dormant_region_count(), dormant_before);
+}
+
+#[test]
 fn a_resting_sea_stays_dormant_while_it_is_stepped() {
     let mut lazy = world(true);
     let before = lazy.dormant_region_count();

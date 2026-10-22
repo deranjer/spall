@@ -218,6 +218,14 @@ impl Writer {
                     got: u64::MAX,
                 })?;
         for (offset, r) in records.iter().enumerate() {
+            if let Err(error) = r.validate() {
+                // Typed transport failure closes this writer before a batch prefix
+                // can publish. Preserve existing auxiliary preflight retry behavior.
+                if matches!(r.payload, dto::JournalPayload::TopologyAttachments { .. }) {
+                    self.poison("invalid typed journal record");
+                }
+                return Err(error.into());
+            }
             let expect = start
                 .checked_add(offset as u64)
                 .ok_or(StoreError::JournalGap {
@@ -237,7 +245,7 @@ impl Writer {
                     && matches!(
                         r.payload,
                         dto::JournalPayload::Topology { .. }
-                            | dto::JournalPayload::TopologyBulkSplit { .. }
+                            | dto::JournalPayload::TopologyAttachments { .. }
                     )
             }) {
                 return Err(StoreError::OutboxJournalMismatch(event.journal_seq));
@@ -257,7 +265,7 @@ impl Writer {
         let metrics = &mut self.metrics;
         let outcome = (|| -> Result<u64, StoreError> {
             let mut payload_bytes = 0u64;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             {
                 let mut stmt = tx.prepare_cached(
                     "INSERT INTO journal (seq, tick, payload, crc) VALUES (?, ?, ?, ?)",
@@ -390,6 +398,22 @@ impl Writer {
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         }
         let column_blob = dto::encode(&checkpoint.column_water)?;
+        if let Some(state) = &checkpoint.weather {
+            state
+                .validate()
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        }
+        let weather_blob = dto::encode(&checkpoint.weather)?;
+        if checkpoint
+            .snow
+            .as_ref()
+            .is_some_and(|state| state.len() > 64 * 1024 * 1024)
+        {
+            return Err(StoreError::Corrupt(
+                "snow checkpoint exceeds byte limit".into(),
+            ));
+        }
+        let snow_blob = dto::encode(&checkpoint.snow)?;
         if column_blob.len() > dto::MAX_STORED_COLUMN_WATER_BYTES {
             return Err(StoreError::Corrupt(
                 "column water checkpoint exceeds byte limit".into(),
@@ -406,7 +430,7 @@ impl Writer {
         let metrics = &mut self.metrics;
         let outcome = (|| -> Result<(), StoreError> {
             let mut payload_bytes = 0u64;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT OR REPLACE INTO checkpoints \
                  (tick, journal_cursor, world_hash, meta, complete, created_unix_ms) \
@@ -419,6 +443,32 @@ impl Writer {
                     now_ms,
                 ],
             )?;
+            tx.execute(
+                "DELETE FROM checkpoint_weather WHERE tick = ?",
+                [checkpoint.tick as i64],
+            )?;
+            tx.execute(
+                "INSERT INTO checkpoint_weather (tick,state,crc) VALUES (?,?,?)",
+                params![
+                    checkpoint.tick as i64,
+                    &weather_blob,
+                    crc16(&weather_blob).as_slice()
+                ],
+            )?;
+            payload_bytes += weather_blob.len() as u64;
+            tx.execute(
+                "DELETE FROM checkpoint_snow WHERE tick = ?",
+                [checkpoint.tick as i64],
+            )?;
+            tx.execute(
+                "INSERT INTO checkpoint_snow (tick,state,crc) VALUES (?,?,?)",
+                params![
+                    checkpoint.tick as i64,
+                    &snow_blob,
+                    crc16(&snow_blob).as_slice()
+                ],
+            )?;
+            payload_bytes += snow_blob.len() as u64;
             // A re-published tick starts clean.
             tx.execute(
                 "DELETE FROM checkpoint_column_water WHERE tick = ?",

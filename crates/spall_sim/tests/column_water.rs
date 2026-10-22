@@ -320,10 +320,7 @@ fn a_discharge_spring_adds_exactly_its_rate_and_survives_a_save() {
 
     // The spring is part of the saved state and comes back with the same rate.
     let state = water.canonical_state();
-    assert_eq!(
-        state.version,
-        spall_protocol::column_water::COLUMN_WATER_VERSION
-    );
+    assert_eq!(state.version, spall_protocol::WIRE_SCHEMA_VERSION);
     assert_eq!(state.discharges.len(), 1);
     let restored = AuthoritativeColumnWater::restore(
         &sim.world().terrain().volume,

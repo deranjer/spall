@@ -12,9 +12,10 @@ use spall_voxel::{Sample, Volume};
 use spall_worldgen::{Biome, ColumnMap};
 use thiserror::Error;
 
-pub const ECOLOGY_STATE_VERSION: u16 = 1;
-pub const ECOLOGY_PLAN_VERSION: u16 = 2;
+/// Format of authored species definitions (game content, not saved state), so it is not folded
+/// into the save version.
 pub const SPECIES_DEFINITION_VERSION: u16 = 1;
+
 pub const MAX_PATCHES: usize = 65_536;
 pub const MAX_PLANTS: usize = 16_384;
 pub const MAX_SEEDS: usize = 65_536;
@@ -122,7 +123,7 @@ pub struct EcologyState {
 impl Default for EcologyState {
     fn default() -> Self {
         Self {
-            version: ECOLOGY_STATE_VERSION,
+            version: spall_core::STORE_SCHEMA_VERSION_U16,
             ecological_time_ms: 0,
             time_credit_ms: 0,
             rng_progress: 0,
@@ -684,7 +685,7 @@ pub fn update(
                 proposals.push(WoodProposal {
                     id: proposal_id(id, plant.committed_cells, target),
                     plant_id: id,
-                    plan_version: ECOLOGY_PLAN_VERSION,
+                    plan_version: spall_core::STORE_SCHEMA_VERSION_U16,
                     input_revision: inputs.revision,
                     cells,
                     dependencies: deps
@@ -1041,7 +1042,7 @@ pub fn decode_state(bytes: &[u8]) -> Result<EcologyState, EcologyError> {
         return Err(EcologyError::Encoding);
     }
     let version = r.u16()?;
-    if version != ECOLOGY_STATE_VERSION {
+    if version != spall_core::STORE_SCHEMA_VERSION_U16 {
         return Err(EcologyError::Version(version));
     }
     let mut s = EcologyState {
@@ -1154,7 +1155,7 @@ pub fn decode_state(bytes: &[u8]) -> Result<EcologyState, EcologyError> {
 
 fn validate_limits(s: &EcologyState) -> Result<(), EcologyError> {
     let skeleton_cells: usize = s.plants.values().map(|p| p.skeleton.len()).sum();
-    if s.version != ECOLOGY_STATE_VERSION {
+    if s.version != spall_core::STORE_SCHEMA_VERSION_U16 {
         return Err(EcologyError::Version(s.version));
     }
     if s.grass.len() > MAX_PATCHES

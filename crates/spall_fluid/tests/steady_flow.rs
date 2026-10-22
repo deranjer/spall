@@ -182,7 +182,7 @@ fn a_steady_river_stops_costing_time_conserves_mass_and_matches_always_active() 
         reference.drift()
     );
 
-    // How much it saves is measured on real worlds (river_idle_probe); this
+    // How much it saves is measured on real worlds (the since-deleted river_idle_probe, ENG-190); this
     // synthetic channel's end regions never sleep and its one interior region
     // sloshes, so here it is enough that regions did freeze.
     assert!(steady.steadied > 0, "no region ever froze as steady");

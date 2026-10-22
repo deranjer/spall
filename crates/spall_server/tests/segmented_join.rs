@@ -14,12 +14,12 @@ fn run_case(budget: u64, admitted: bool) {
     let fp = dir.join("fingerprint");
     let addr = dir.join("addr");
     let mut server = ServeConfig::headless("127.0.0.1:0".parse().unwrap(), Scene::BridgeCut, token);
-    server.max_ticks = 240;
-    server.quiescence_ticks = 90;
-    server.paced = true;
-    server.log_json = dir.join("server.jsonl");
-    server.fingerprint_out = Some(fp.clone());
-    server.addr_out = Some(addr.clone());
+    server.harness.max_ticks = 240;
+    server.harness.quiescence_ticks = 90;
+    server.server.paced = true;
+    server.server.log_json = dir.join("server.jsonl");
+    server.harness.fingerprint_out = Some(fp.clone());
+    server.harness.addr_out = Some(addr.clone());
     let thread = std::thread::spawn(move || serve(server));
     let started = Instant::now();
     while !(fp.exists() && addr.exists()) {
@@ -104,21 +104,21 @@ fn shutdown_drains_an_accepted_baseline_over_a_delayed_link() {
             )
             .unwrap();
     }
-    config.scene = Scene::Custom;
-    config.custom_world = Some(spall_server::CustomWorld::new(
+    config.server.scene = Scene::Custom;
+    config.server.custom_world = Some(spall_server::CustomWorld::new(
         vec![[0.125, 8.0, 0.125]],
         move || spall_sim::WorldSetup {
             terrain: terrain.clone(),
             ..spall_sim::fixtures::flat_terrain_setup()
         },
     ));
-    config.max_ticks = 20;
-    config.quiescence_ticks = 0;
-    config.paced = true;
-    config.transport = TransportConfig::for_tests();
-    config.log_json = dir.join("server.jsonl");
-    config.fingerprint_out = Some(fp.clone());
-    config.addr_out = Some(addr.clone());
+    config.harness.max_ticks = 20;
+    config.harness.quiescence_ticks = 0;
+    config.server.paced = true;
+    config.server.transport = TransportConfig::for_tests();
+    config.server.log_json = dir.join("server.jsonl");
+    config.harness.fingerprint_out = Some(fp.clone());
+    config.harness.addr_out = Some(addr.clone());
     let server = std::thread::spawn(move || serve(config));
     let started = Instant::now();
     while !(fp.exists() && addr.exists()) {

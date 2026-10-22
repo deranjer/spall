@@ -38,7 +38,7 @@ pub(crate) struct AuthoritativeVegetation {
     columns: ColumnMap,
     pending: BTreeMap<u64, Growth>,
     jobs: VecDeque<ClearJob>,
-    dirty: bool,
+    pub(crate) dirty: bool,
     /// The tick of the last growth edit submitted.
     last_growth_tick: Option<u64>,
 }
@@ -83,6 +83,12 @@ impl Simulation {
         let columns = ColumnMap::compute(&spec).map_err(|e| e.to_string())?;
         let mut state = state;
         state.ensure_field(&columns);
+        if self.current_tick().get() == 0 && self.weather.clock_ms == 0 {
+            self.weather.clock_source = spall_protocol::WeatherClockSource::Vegetation;
+            self.weather.start_season = state.start_season as u8;
+            self.weather.season_ms = state.season_ms;
+            self.weather_dirty = true;
+        }
         self.vegetation = Some(AuthoritativeVegetation {
             state,
             columns,

@@ -1,13 +1,22 @@
 //! Game-owned configuration belongs here.
 
+pub mod animal_habitat;
+#[cfg(feature = "client")]
+pub mod animal_view;
+pub mod animal_visual;
+pub mod animals;
 pub mod appearance;
 pub mod appearance_extensions;
 pub mod appearance_v3;
+#[cfg(feature = "client")]
+pub mod audio;
 pub mod content;
 pub mod editor_scene;
 /// Minimal game content (material catalog, player tools) that turns tool use
 /// into engine [`spall_sim::EditIntent`]s. The engine never imports this.
 pub mod game;
+#[cfg(feature = "client")]
+pub mod player_view;
 pub mod progression_store;
 pub mod worldgen_scene;
 

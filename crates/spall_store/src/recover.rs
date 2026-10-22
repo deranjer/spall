@@ -18,7 +18,17 @@ use crate::dto::{
     self, BrickPayload, Checkpoint, JournalPayload, JournalRecord, STORE_SCHEMA_VERSION,
     StoredBody, StoredBrick, StoredWorldMeta,
 };
-use crate::schema::read_user_version;
+use crate::schema::{read_user_version, validate_schema_layout};
+
+fn decode_journal_payload(bytes: &[u8]) -> Result<JournalPayload, dto::DtoError> {
+    let (payload, rest) = postcard::take_from_bytes(bytes)?;
+    if !rest.is_empty() {
+        return Err(dto::DtoError::Postcard(
+            postcard::Error::DeserializeBadEncoding,
+        ));
+    }
+    Ok(payload)
+}
 
 /// One non-fatal problem found during recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +81,8 @@ pub enum RecoverBase {
     /// Used to verify that the committed topology-event stream, replayed from
     /// the original baseline, reproduces the live world (T11 exact replay).
     Oldest,
+    /// Explicit recovery choice; reloads the journal from this candidate's cursor.
+    AtOrBefore(u64),
 }
 
 /// Opens `path` read/write (it must exist) and recovers the durable state from
@@ -119,16 +131,21 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
             supported: STORE_SCHEMA_VERSION,
         });
     }
+    validate_schema_layout(conn)?;
 
     let complete_ticks: Vec<i64> = {
         let order = match base {
-            RecoverBase::Latest => "DESC",
+            RecoverBase::Latest | RecoverBase::AtOrBefore(_) => "DESC",
             RecoverBase::Oldest => "ASC",
         };
+        let ceiling = match base {
+            RecoverBase::AtOrBefore(tick) => Some(tick.min(i64::MAX as u64) as i64),
+            _ => None,
+        };
         let mut stmt = conn.prepare(&format!(
-            "SELECT tick FROM checkpoints WHERE complete = 1 ORDER BY tick {order}"
+            "SELECT tick FROM checkpoints WHERE complete = 1 AND (?1 IS NULL OR tick <= ?1) ORDER BY tick {order}"
         ))?;
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let rows = stmt.query_map([ceiling], |r| r.get::<_, i64>(0))?;
         rows.collect::<Result<_, _>>()?
     };
 
@@ -175,8 +192,16 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
         while let Some(row) = rows.next()? {
             let seq = row.get::<_, i64>(0)? as u64;
             let tick = row.get::<_, i64>(1)? as u64;
-            let payload: Vec<u8> = row.get(2)?;
-            let crc: Vec<u8> = row.get(3)?;
+            // SQLite already owns this row buffer. Decode borrowed fields before
+            // copying; typed attachment bytes enforce their cap before allocation.
+            let payload = row
+                .get_ref(2)?
+                .as_blob()
+                .map_err(|e| StoreError::Corrupt(format!("journal payload SQL type: {e}")))?;
+            let crc = row
+                .get_ref(3)?
+                .as_blob()
+                .map_err(|e| StoreError::Corrupt(format!("journal CRC SQL type: {e}")))?;
 
             if seq != expected {
                 corruption.push(CorruptionReport::new(format!(
@@ -184,13 +209,13 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
                 )));
                 break;
             }
-            if crc16(&payload) != crc {
+            if crc16(payload) != crc {
                 corruption.push(CorruptionReport::new(format!(
                     "journal seq {seq} failed CRC; durable prefix ends at {durable_through}"
                 )));
                 break;
             }
-            let decoded: JournalPayload = match dto::decode(&payload) {
+            let decoded: JournalPayload = match decode_journal_payload(payload) {
                 Ok(p) => p,
                 Err(e) => {
                     corruption.push(CorruptionReport::new(format!(
@@ -199,11 +224,18 @@ pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recover
                     break;
                 }
             };
-            journal.push(JournalRecord {
+            let record = JournalRecord {
                 seq,
                 tick,
                 payload: decoded,
-            });
+            };
+            if let Err(error) = record.validate() {
+                corruption.push(CorruptionReport::new(format!(
+                    "journal seq {seq} has invalid auxiliary state: {error}"
+                )));
+                break;
+            }
+            journal.push(record);
             durable_through = seq;
             expected += 1;
         }
@@ -280,6 +312,8 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
     Ok(Checkpoint {
         vegetation: load_vegetation(conn, tick)?,
         column_water: load_column_water(conn, tick)?,
+        weather: load_weather(conn, tick)?,
+        snow: load_snow(conn, tick)?,
         tick: tick as u64,
         journal_cursor: journal_cursor as u64,
         world_hash,
@@ -353,4 +387,87 @@ fn load_vegetation(conn: &Connection, tick: i64) -> Result<Vec<u8>, StoreError> 
         ));
     }
     Ok(bytes)
+}
+
+fn load_snow(conn: &Connection, tick: i64) -> Result<Option<Vec<u8>>, StoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_snow')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Err(StoreError::Corrupt(
+            "current schema is missing required table checkpoint_snow".into(),
+        ));
+    }
+    // Check the SQLite length before copying a potentially corrupt large BLOB.
+    let len: Option<i64> = conn
+        .query_row(
+            "SELECT length(state) FROM checkpoint_snow WHERE tick=?",
+            [tick],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(len) = len else {
+        return Err(StoreError::Corrupt("snow checkpoint row missing".into()));
+    };
+    if !(0..=64 * 1024 * 1024 + 16).contains(&len) {
+        return Err(StoreError::Corrupt("snow checkpoint byte limit".into()));
+    }
+    let (blob, crc): (Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT state,crc FROM checkpoint_snow WHERE tick=?",
+        [tick],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if crc.as_slice() != crc16(&blob).as_slice() {
+        return Err(StoreError::Corrupt(
+            "snow checkpoint checksum mismatch".into(),
+        ));
+    }
+    let state: Option<Vec<u8>> = dto::decode(&blob)?;
+    if state
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > 64 * 1024 * 1024)
+    {
+        return Err(StoreError::Corrupt("snow checkpoint byte limit".into()));
+    }
+    Ok(state)
+}
+
+fn load_weather(
+    conn: &Connection,
+    tick: i64,
+) -> Result<Option<spall_protocol::WeatherState>, StoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_weather')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Err(StoreError::Corrupt(
+            "current schema is missing required table checkpoint_weather".into(),
+        ));
+    }
+    let row: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT state,crc FROM checkpoint_weather WHERE tick=?",
+            [tick],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((blob, crc)) = row else {
+        return Err(StoreError::Corrupt("weather checkpoint row missing".into()));
+    };
+    if crc.as_slice() != crc16(&blob).as_slice() {
+        return Err(StoreError::Corrupt(
+            "weather checkpoint checksum mismatch".into(),
+        ));
+    }
+    let state: Option<spall_protocol::WeatherState> = dto::decode(&blob)?;
+    if let Some(state) = &state {
+        state
+            .validate()
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    }
+    Ok(state)
 }

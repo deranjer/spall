@@ -3,9 +3,7 @@
 //! `PRAGMA user_version` is the authoritative on-disk schema version. A fresh
 //! database (`user_version == 0`) is stamped and populated; a database at the
 //! current version opens as-is; a **newer** version is rejected without any
-//! modification, and an older non-zero version is rejected pending a migration
-//! path (`docs/protocol.md`: "Use versioned DTO migrations with fixture worlds
-//! before changing save formats").
+//! modification, and an older non-zero version is rejected without modification.
 
 use rusqlite::Connection;
 
@@ -24,6 +22,16 @@ use crate::dto::STORE_SCHEMA_VERSION;
 ///   `payload` for interior-corruption detection.
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS checkpoint_vegetation (
+    tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
+    state BLOB NOT NULL,
+    crc BLOB NOT NULL
+);
+CREATE TABLE checkpoint_weather (
+    tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
+    state BLOB NOT NULL,
+    crc BLOB NOT NULL
+);
+CREATE TABLE checkpoint_snow (
     tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
     state BLOB NOT NULL,
     crc BLOB NOT NULL
@@ -92,30 +100,23 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
     let found = read_user_version(conn)?;
     match found {
         0 => {
+            let user_objects: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND substr(name,1,7) <> 'sqlite_'",
+                [],
+                |row| row.get(0),
+            )?;
+            if user_objects != 0 {
+                return Err(StoreError::SchemaTooOld {
+                    found: 0,
+                    supported: STORE_SCHEMA_VERSION,
+                });
+            }
             conn.execute_batch(&format!(
                 "BEGIN;\n{SCHEMA_SQL}\nPRAGMA user_version = {STORE_SCHEMA_VERSION};\nCOMMIT;"
             ))?;
             Ok(())
         }
-        v if v == STORE_SCHEMA_VERSION => {
-            let has_vegetation: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_vegetation')",
-                [],
-                |r| r.get(0),
-            )?;
-            if !has_vegetation {
-                // Creation and backfill must survive a crash together: an
-                // existing table with missing rows is deliberately corruption.
-                let tx = conn.unchecked_transaction()?;
-                tx.execute_batch("CREATE TABLE checkpoint_vegetation (tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE, state BLOB NOT NULL, crc BLOB NOT NULL);")?;
-                let empty: Vec<u8> = Vec::new();
-                tx.execute("INSERT INTO checkpoint_vegetation (tick,state,crc) SELECT tick,?,? FROM checkpoints",rusqlite::params![&empty,crate::db::crc16(&empty).as_slice()])?;
-                tx.commit()?;
-            }
-            // Additive auxiliary table: does not alter any versioned world DTO.
-            conn.execute_batch("CREATE TABLE IF NOT EXISTS game_outbox (event_id BLOB PRIMARY KEY CHECK (length(event_id) = 32), journal_seq INTEGER NOT NULL, payload BLOB NOT NULL) WITHOUT ROWID;")?;
-            Ok(())
-        }
+        v if v == STORE_SCHEMA_VERSION => validate_schema_layout(conn),
         v if v > STORE_SCHEMA_VERSION => Err(StoreError::SchemaTooNew {
             found: v,
             supported: STORE_SCHEMA_VERSION,
@@ -125,4 +126,60 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
             supported: STORE_SCHEMA_VERSION,
         }),
     }
+}
+
+/// Refuses incomplete schemas without attempting an implicit migration.
+pub(crate) fn validate_schema_layout(conn: &Connection) -> Result<(), StoreError> {
+    const REQUIRED: &[(&str, &[&str])] = &[
+        ("checkpoint_vegetation", &["tick", "state", "crc"]),
+        ("checkpoint_weather", &["tick", "state", "crc"]),
+        ("checkpoint_snow", &["tick", "state", "crc"]),
+        ("checkpoint_column_water", &["tick", "state", "crc"]),
+        ("world", &["id", "meta"]),
+        (
+            "checkpoints",
+            &[
+                "tick",
+                "journal_cursor",
+                "world_hash",
+                "meta",
+                "complete",
+                "created_unix_ms",
+            ],
+        ),
+        ("checkpoint_bodies", &["tick", "entity_id", "body"]),
+        (
+            "checkpoint_bricks",
+            &[
+                "tick",
+                "volume_id",
+                "bx",
+                "by",
+                "bz",
+                "revision",
+                "edited",
+                "payload",
+            ],
+        ),
+        ("journal", &["seq", "tick", "payload", "crc"]),
+        ("game_outbox", &["event_id", "journal_seq", "payload"]),
+    ];
+    for (name, expected_columns) in REQUIRED {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({name})"))?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<_, _>>()?;
+        if columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+            != *expected_columns
+        {
+            return Err(StoreError::Corrupt(format!(
+                "current schema has missing or unexpected layout for table {name}"
+            )));
+        }
+    }
+    Ok(())
 }

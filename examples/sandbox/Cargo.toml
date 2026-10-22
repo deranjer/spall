@@ -19,6 +19,11 @@ path = "src/bin/sandbox-capture.rs"
 required-features = ["client"]
 
 [[example]]
+name = "animal-preview"
+path = "examples/animal_preview.rs"
+required-features = ["client"]
+
+[[example]]
 name = "ecology-clearing"
 path = "examples/ecology_clearing.rs"
 
@@ -30,9 +35,14 @@ client = [
     "dep:spall_jobs",
     "dep:spall_render",
     "dep:serde_json",
+    # sandbox-capture drives the acceptance fixtures and the offscreen capture harness.
+    "spall_mesh/fixtures",
+    "spall_render/capture",
+    "spall_render/fixtures",
 ]
 
 [dependencies]
+spall_asset.workspace = true
 blake3.workspace = true
 clap.workspace = true
 ron.workspace = true
@@ -52,7 +62,7 @@ spall_protocol = { path = "../../crates/spall_protocol" }
 spall_render = { workspace = true, optional = true }
 spall_server = { path = "../../crates/spall_server" }
 spall_store = { path = "../../crates/spall_store" }
-spall_sim = { path = "../../crates/spall_sim" }
+spall_sim = { path = "../../crates/spall_sim", features = ["fixtures"] }
 spall_physics = { workspace = true }
 spall_structure = { workspace = true }
 glam.workspace = true
@@ -67,6 +77,12 @@ image.workspace = true
 serde_json.workspace = true
 spall_jobs.workspace = true
 wgpu.workspace = true
+winit.workspace = true
+
+[[example]]
+name = "animal-zoo"
+path = "examples/animal_zoo.rs"
+required-features = ["client"]
 
 [[example]]
 name = "vegetation-gallery"

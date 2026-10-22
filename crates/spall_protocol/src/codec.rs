@@ -75,6 +75,16 @@ fn encode<R: Record>(
     channel: &'static str,
 ) -> Result<Vec<u8>, CodecError> {
     record.validate()?;
+    let body_size = postcard::experimental::serialized_size(record)
+        .map_err(|e| CodecError::Body(e.to_string()))?;
+    let total_size = HEADER_LEN
+        .checked_add(body_size)
+        .ok_or_else(|| CodecError::Size(SizeLimitError::bytes(channel, usize::MAX, limit)))?;
+    if total_size > limit {
+        return Err(CodecError::Size(SizeLimitError::bytes(
+            channel, total_size, limit,
+        )));
+    }
     let body = postcard::to_stdvec(record).map_err(|e| CodecError::Body(e.to_string()))?;
     let total = HEADER_LEN + body.len();
     if total > limit {
@@ -153,7 +163,7 @@ mod tests {
     use super::*;
     use crate::records::{
         ActionOutcome, ActionStatus, DurableThrough, InputSeq, MotionSnapshot, RequestId,
-        SnapshotSeq,
+        SnapshotSeq, WIRE_SCHEMA_VERSION,
     };
     use spall_core::{EntityId, JournalSeq, Pose, QuantizedQuat, Revision, Tick};
 
@@ -206,9 +216,11 @@ mod tests {
             journal_seq: JournalSeq(300),
         };
         let bytes = encode_control(&record).unwrap();
-        // header: schema=4 (bumped for the chunked v2 topology hash),
-        // tag=11 (DurableThrough); body: postcard varint of 300 = 0xAC 0x02
-        assert_eq!(bytes, [0x04, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
+        // header: schema=wire version, tag=11 (DurableThrough); body: postcard varint of 300 =
+        // 0xAC 0x02
+        let mut expected = WIRE_SCHEMA_VERSION.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[0x0B, 0x00, 0xAC, 0x02]);
+        assert_eq!(bytes, expected);
         let back: DurableThrough = decode_control(&bytes).unwrap();
         assert_eq!(back, record);
     }
@@ -232,7 +244,7 @@ mod tests {
             Err(CodecError::TagMismatch { .. })
         ));
         // Corrupt the schema version.
-        bytes[0] = 0x09;
+        bytes[0] = 0x08;
         assert!(matches!(
             decode_control::<DurableThrough>(&bytes),
             Err(CodecError::SchemaVersion { .. })
@@ -266,6 +278,8 @@ mod tests {
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         }
     }
 

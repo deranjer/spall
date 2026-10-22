@@ -4,18 +4,35 @@ Planning baseline: 2026-09-06. T00 implements the Rust workspace, headless serve
 
 Run `cargo xtask check` for formatting, lint, and tests; `cargo xtask smoke` for a bounded server lifecycle; or `cargo xtask smoke --graphical` to include real window presentation and resize. Run the window directly with `cargo run -p sandbox --features client --bin sandbox-client -- --offline`.
 
-Generated-world water defaults to the performance choice: adaptive coarse MAC
-water with freely displaced air, original velocity sampling, multigrid pressure
-and bounded conservative water transport, with the current smoothed water look.
-Air applies atmospheric pressure at the water surface, including enclosed
-pockets; it has no simulated mass, compression or back-pressure. The initial
-cell budget is 50,000 (seed-1 showcase: 0.75 m at 512, 1 m at 1024), on a 20 Hz worker.
-This accepts thin-wall leaks and diffuse narrow-trench flow; exact fine-phase
-and conservative-momentum experiments remain opt-in. See the
-[default decision](docs/reports/ENG-122.md#water-only-default-2026-10-03)
-for measured costs and limits.
+Water is the stacked-column virtual-pipe model in `spall_fluid::columns`
+(ENG-164..169): one column per terrain cell, each split into vertical open
+spans holding a conserved water volume, joined to neighbouring spans by
+persistent pipe flows that accelerate with head difference. Columns are stored
+sparsely in 32 x 32 regions that sleep when quiet and are throttled by distance
+from the players; non-resident regions are closed, frozen boundaries. The
+server publishes column-region state to clients. The earlier grid MAC/multigrid
+solver was removed in ENG-169; its history lives in
+[docs/reports/ENG-169.md](docs/reports/ENG-169.md) and
+[docs/reports/history-architecture.md](docs/reports/history-architecture.md).
+See [water handoff](docs/water-agent-handoff.md) for the design.
 
 The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It creates versioned RON project/scene documents and canonical `.spvox` voxel assets, and never adds egui to the game runtime dependency graph. On Windows, `tools/package-portable.ps1` builds a portable editor + sandbox folder; use File > Generate World to choose a seed, world size, and starting season, preview the map, then launch it in the FPS-HUD-enabled sandbox.
+
+Animated animal source fixtures (trout, crow and deer) have a bounded renderer
+preview: `cargo run -p sandbox --features client --example animal-preview -- --bounded`.
+It writes pose captures under `.local/animal-preview`. Live deer and crows can be
+spawned in a worldgen sandbox with `--animals N` (below); trout, hunting and
+saving a world with animals remain open in [the animal plan](docs/animals.md).
+
+Visit the small animated zoo with
+`cargo run -p sandbox --features client --example animal-zoo`.
+Press **1/2/3** for trout/crow/deer or **0** for the whole zoo; **WASD** moves,
+**Q/E** moves vertically, and clicking enables mouse look. **Space** pauses,
+**Tab** switches idle/action, and **Esc** releases the mouse or closes the window.
+This is an authored animation showroom with a free camera; live creature
+behavior and physical world integration remain separate gates.
+
+In `cargo xtask play`, hold **Shift** to run (about 1.45x walk speed). Running spends endurance (empty in about 13 s; a bar appears low on the screen while it recovers, and turns orange when you are exhausted and cannot run until it is back past 30%), and you breathe harder as it drops and press **F8** for a third-person view of your own player body; other players are always drawn with that body.
 
 Generated-world play loads nearby terrain at startup and streams surrounding bricks as the player
 moves. Distant terrain retains exact revision/hash records; the authoritative server still generates
@@ -44,14 +61,14 @@ Earlier `ve_*` design names are now `spall_*`; the former `ve_game` role belongs
 | Window/input | winit | Native render window and input only; no UI toolkit. |
 | Math | glam | Engine-facing vectors/transforms; conversions to physics types stay inside the physics adapter. |
 | Physics | rapier3d behind a narrow adapter | Use an existing rigid-body solver, character queries, and collision system. Prototype editable voxel colliders and compound cuboids before choosing the production representation. |
-| Entity storage | hecs | Players, bodies, tools, and future creatures. Individual voxels are array entries, never entities. Explicit system order; no custom ECS. |
+| Entity storage | Planned: hecs (not yet a dependency) | Players, bodies, tools, and future creatures. Individual voxels are array entries, never entities. Explicit system order; no custom ECS. Today the sim uses its own stable-ID tables. |
 | Transport | Quinn/QUIC with rustls; Tokio in transport/I/O only | Reliable streams for topology and baseline data; unreliable datagrams for inputs and motion. Local single-player uses the same server rules. |
 | Jobs | Rayon pool plus bounded queues | CPU meshing, topology analysis, collision builds, generation, and compression. Workers produce versioned results; they do not mutate the live world. |
-| Data | Serde + TOML for authored definitions; explicit versioned binary DTOs with postcard | Human-editable materials/scenarios, compact wire records. Serialization derives do not replace a protocol specification. |
+| Data | Serde + RON for authored editor documents (TOML planned, not yet used); explicit versioned binary DTOs with postcard | Human-editable materials/scenarios, compact wire records. Serialization derives do not replace a protocol specification. |
 | Persistence | SQLite via rusqlite, compressed brick blobs via zstd | Transactional checkpoints and event journal without inventing a crash-safe region filesystem first. One writer; measure throughput in the persistence gate. |
 | Integrity | BLAKE3 | Canonical topology, content manifest, and checkpoint hashes. Not a substitute for authentication. |
 | Tools | clap, tracing, serde_json, image | CLI, structured logs/metrics, JSON scenarios, PNG captures. |
-| Verification | cargo test, proptest, Criterion; GPU validation and captures | Exact CPU invariants, protocol failure tests, realistic performance scenarios, visual inspection. |
+| Verification | cargo test (proptest and Criterion planned, not yet dependencies); GPU validation and captures | Exact CPU invariants, protocol failure tests, realistic performance scenarios, visual inspection. |
 
 These are library choices, not a pre-existing game engine. We own voxel storage, destruction, structural rules, streaming, replication, rendering, persistence schemas, and game logic. We reuse platform plumbing and a physics solver.
 
@@ -105,6 +122,19 @@ Connectivity is the first collapse rule. It allows unrealistic long cantilevers 
 The first useful deliverable is a networked destruction sandbox. It must already exercise real terrain, moving voxel bodies, and the actual protocol.
 
 ## Read and assign work
+
+Nature and weather playtest: `cargo xtask play --release --worldgen natural
+--worldgen-size 4096 --season winter` launches a 1024 m world. Add `--animals 24`
+to spawn that many deer and half as many crows (server-authoritative; they walk or fly
+under kinematic movement, and `--save` with animals is refused; trout are not
+spawned yet). **F10** selects
+automatic or forced weather (snow in light, medium or heavy tiers, and a blizzard whiteout),
+switches the season (Spring to Winter), previews nature sounds, adjusts nature/weather
+volume and mute, and toggles visual effects/reduced lightning. Scroll the menu
+for the remaining controls. Weather and season choices are server-authorized; a
+weather profile does not change the season, a season button does. Ground snow is a layer of
+fine 6.25 cm voxels up to 0.5 m deep with carved footprints (see the weather plan). See [weather plan](docs/weather.md) and
+[combined test evidence](docs/reports/ENG-198-integrated-weather-playtest.md).
 
 - [Architecture and invariants](docs/architecture.md): subsystem ownership, voxel representation, structural destruction, physics, and renderer.
 - [Protocol and persistence](docs/protocol.md): exact replication and recovery contracts.

@@ -109,17 +109,17 @@ fn client_receives_column_water_late_joiner_converges_and_reset_reseeds() {
         Scene::Custom,
         token,
     );
-    server_cfg.max_ticks = 420;
-    server_cfg.quiescence_ticks = 0;
-    server_cfg.paced = true;
-    server_cfg.startup_timeout = Duration::from_secs(20);
-    server_cfg.log_json = dir.join("server.jsonl");
-    server_cfg.summary_json = Some(dir.join("server.summary.json"));
-    server_cfg.fingerprint_out = Some(fp_path.clone());
-    server_cfg.addr_out = Some(addr_path.clone());
-    server_cfg.dev_unvalidated_actions = true;
-    server_cfg.admin_commands = true;
-    server_cfg.custom_world = Some(world);
+    server_cfg.harness.max_ticks = 420;
+    server_cfg.harness.quiescence_ticks = 0;
+    server_cfg.server.paced = true;
+    server_cfg.harness.startup_timeout = Duration::from_secs(20);
+    server_cfg.server.log_json = dir.join("server.jsonl");
+    server_cfg.harness.summary_json = Some(dir.join("server.summary.json"));
+    server_cfg.harness.fingerprint_out = Some(fp_path.clone());
+    server_cfg.harness.addr_out = Some(addr_path.clone());
+    server_cfg.harness.dev_unvalidated_actions = true;
+    server_cfg.server.admin_commands = true;
+    server_cfg.server.custom_world = Some(world);
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 
     let fingerprint =
@@ -213,6 +213,14 @@ fn client_receives_column_water_late_joiner_converges_and_reset_reseeds() {
     assert!(client.admin_statuses[0].accepted);
     assert_eq!(server.world_resets, 1);
     assert_eq!(client.world_resets_installed, 1);
+    assert!(
+        client.weather_snapshots_received >= 2,
+        "weather keyframes should refresh across reset"
+    );
+    assert!(
+        late.weather_snapshots_received >= 1,
+        "late joiner should receive the current weather state"
+    );
     assert_eq!(server.total_solid_cells, pristine_solid_cells);
     assert_eq!(client.final_world_hash, server.final_world_hash);
 }

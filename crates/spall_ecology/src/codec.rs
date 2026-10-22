@@ -1,4 +1,4 @@
-//! Saved form of the organisms (living state version 3).
+//! Saved form of the organisms (living state version 4).
 //!
 //! A tree's skeleton (`wood`, `parents`) is a pure function of its root, its
 //! species and its id, so it is not saved: only which cells were removed is.
@@ -6,8 +6,7 @@
 //! thousands of skeleton cells at every checkpoint.
 //!
 //! `skeleton()` is therefore part of the format. Changing the shape a species
-//! grows requires a new state version and an upgrade that keeps the old shape
-//! for the trees already saved.
+//! grows requires a new state version.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::living::Organism;
@@ -25,6 +24,8 @@ struct Wire {
     /// Indices of removed skeleton cells.
     removed: Vec<u16>,
     committed: u16,
+    growth_ms: Option<u64>,
+    seed_growth_ms: Option<u64>,
 }
 
 // `serde(with)` hands the field over as `&Vec<_>`.
@@ -51,6 +52,8 @@ pub(crate) fn serialize<S: Serializer>(
                 .map(|(i, _)| i as u16)
                 .collect(),
             committed: p.committed,
+            growth_ms: Some(p.growth_ms),
+            seed_growth_ms: Some(p.seed_growth_ms),
         }
     }))
 }
@@ -62,9 +65,15 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<Organism>, D::Error> {
     let wire = Vec::<Wire>::deserialize(deserializer)?;
-    Ok(wire
-        .into_iter()
+    wire.into_iter()
         .map(|w| {
+            use serde::de::Error as _;
+            let growth_ms = w
+                .growth_ms
+                .ok_or_else(|| D::Error::custom("current organism is missing growth_ms"))?;
+            let seed_growth_ms = w
+                .seed_growth_ms
+                .ok_or_else(|| D::Error::custom("current organism is missing seed_growth_ms"))?;
             let mut removed = Vec::new();
             for i in w.removed {
                 let i = usize::from(i);
@@ -73,11 +82,13 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
                 }
                 removed[i] = true;
             }
-            Organism {
+            Ok(Organism {
                 id: w.id,
                 species: w.species,
                 root: w.root,
                 age_ms: w.age_ms,
+                growth_ms,
+                seed_growth_ms,
                 last_update_ms: w.last_update_ms,
                 last_seed_ms: w.last_seed_ms,
                 alive: w.alive,
@@ -86,7 +97,7 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
                 parents: Vec::new().into(),
                 removed: std::sync::Arc::new(removed),
                 committed: w.committed,
-            }
+            })
         })
-        .collect())
+        .collect()
 }

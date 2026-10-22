@@ -14,15 +14,11 @@
 //! [`MotionSnapshot`](crate::MotionSnapshot) keyframe per body, exactly as
 //! `docs/protocol.md` step 4 of "Late join" describes.
 
+use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use spall_core::{CELLS_PER_BRICK, EntityId, MaterialId, VolumeId};
 
 use crate::limits::{MAX_SPLIT_BASELINE_BLOB, MAX_SPLIT_BASELINE_DECOMPRESSED};
-
-/// Schema version of the [`BaselineWorld`] payload. Independent of the wire
-/// record schema and the save schema (`docs/protocol.md`: "Version the wire
-/// schema independently of the world save schema").
-pub const BASELINE_WORLD_SCHEMA: u16 = 1;
 
 /// Who owns a baseline volume's cells: a serializable twin of
 /// [`crate::CanonicalOwner`] (which is a pure hashing type and intentionally not
@@ -121,7 +117,7 @@ impl BaselineWorld {
     /// brick minimum per volume, and the volume sort order the canonical hash
     /// assumes.
     pub fn validate(&self) -> Result<(), BaselineDecodeError> {
-        if self.schema != BASELINE_WORLD_SCHEMA {
+        if self.schema != WIRE_SCHEMA_VERSION {
             return Err(BaselineDecodeError::Schema(self.schema));
         }
         let mut last_id = 0u64;
@@ -142,7 +138,7 @@ impl BaselineWorld {
     }
 
     /// zstd-compressed postcard bytes — the form a giant bulk split's geometry
-    /// is stored in a `spall_store` `TopologyBulkSplit` journal payload (T17
+    /// is stored in a `spall_store` `TopologyAttachments` journal payload (T17
     /// increment 2). Panics only on an internal encoder error.
     pub fn encode_compressed(&self) -> Vec<u8> {
         zstd::stream::encode_all(self.encode().as_slice(), 0).expect("zstd encodes")
@@ -256,7 +252,7 @@ mod tests {
 
     fn a_world() -> BaselineWorld {
         BaselineWorld {
-            schema: BASELINE_WORLD_SCHEMA,
+            schema: WIRE_SCHEMA_VERSION,
             checkpoint_tick: 42,
             volumes: vec![
                 BaselineVolume {

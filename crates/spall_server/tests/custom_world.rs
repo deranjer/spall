@@ -10,7 +10,7 @@ fn config(dir: &std::path::Path, scene: Scene) -> ServeConfig {
         scene,
         JoinToken::generate().unwrap(),
     );
-    cfg.log_json = dir.join("server.jsonl");
+    cfg.server.log_json = dir.join("server.jsonl");
     cfg
 }
 
@@ -23,7 +23,7 @@ fn custom_scene_without_a_world_is_a_configuration_error() {
 
     // A world with no spawn point is equally unusable: every client needs one.
     let mut cfg = config(&dir, Scene::Custom);
-    cfg.custom_world = Some(CustomWorld::new(Vec::new(), || {
+    cfg.server.custom_world = Some(CustomWorld::new(Vec::new(), || {
         spall_sim::fixtures::walk_arena_setup()
     }));
     let error = serve(cfg).unwrap_err();

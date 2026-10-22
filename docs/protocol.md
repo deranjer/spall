@@ -28,7 +28,7 @@ Handshake includes protocol version, exact content manifest hash, world ID, gene
 | ProgressionRequest | nonzero request ID, recipe catalog version, expected inventory revision, and inspect/craft operation; authenticated control stream only |
 | ProgressionResponse | request ID, current catalog/inventory revisions, outcome/rejection code, and complete sorted inventory snapshot |
 
-Never serialize Rapier handles, ECS entities, pointers, platform-sized integers, or raw Rust structs. DTOs use explicit numeric sizes, tags, units, and bounds. Version the wire schema independently of the world save schema. Protocol mismatch is initially a clear rejection, not speculative compatibility code.
+Never serialize Rapier handles, ECS entities, pointers, platform-sized integers, or raw Rust structs. DTOs use explicit numeric sizes, tags, units, and bounds. Pre-release there are exactly two version numbers: `PROTOCOL_VERSION` (wire; every record header carries it as `WIRE_SCHEMA_VERSION`, which is the same value) and `STORE_SCHEMA_VERSION` (save). Client and server ship together, so a mismatch is a clear rejection, not speculative compatibility code. Per-record and per-family schema numbers return at the first public release, when real saves and third-party clients need protecting.
 
 Progression requests are game-facing control records, not world edits. In
 per-player credential mode, the server passes the authenticated `PlayerId` to
@@ -76,7 +76,7 @@ The assembler validates before staging and reads at most the declared cell
 count plus one byte. Bad headers, corrupt streams and overlong output clear
 staging without publishing a partial frame.
 
-`WaterDelta` uses independent record schema 1, tag 18. It names the domain
+`WaterDelta` (tag 18) names the domain
 origin, installed base sequence, new sequence/tick, ordinal/count, relative
 fluid brick coordinate and zstd quantized fractions. Fluid bricks are 16 cells
 per axis with edge clipping; at most 4096 changed bricks, 4160 compressed bytes
@@ -115,17 +115,7 @@ geometry, conserving displaced mass. Velocity, pressure, solver cache and sleep
 reset to rest/awake; restarting is not a continuation of the pre-crash flow
 trajectory. Presentation bytes never serve as canonical saves.
 
-Older saves require an explicit copy migration:
-
-```powershell
-cargo xtask migrate-water-save --source old/world.db --output migrated/world.db
-```
-
-The source stays intact. The destination must be absent; migration copies
-schema-1 geometry/history, inserts empty water groups, rewrites metadata to
-schema 2 and verifies recovery. Schema-1 saves did not persist water, so water
-cannot be reconstructed from their historical presentation. Older binaries
-reject the schema-2 version instead of silently dropping water.
+Old save formats are rejected. No save-copy migration command or compatibility decoder is retained.
 
 ## Column water presentation and recovery (ENG-167)
 
@@ -133,11 +123,10 @@ The stacked-column water (`docs/water-agent-handoff.md`) is the production
 model. The dense MAC `WaterState` above is gone: `grid_mac` was removed in
 ENG-169 and its wire and storage types with it (`WaterSnapshot` and `WaterDelta`
 records, tags 15 and 18 now reserved; the checkpoint `water` row; the
-`WaterState` journal payload; the schema-1 migration). Protocol version 5, store
-schema 3; older saves are rejected. The column-water checkpoint row is always
+`WaterState` journal payload; the schema-1 migration). Older saves are rejected. The column-water checkpoint row is always
 written (`None` for a dry world), so a missing row is corruption, never a
 silently dry restore. Each replicated span also carries the quantized
-horizontal water velocity (`ColumnWaterUpdate` schema 2: `flow_x`, `flow_z` as
+horizontal water velocity (`ColumnWaterUpdate`: `flow_x`, `flow_z` as
 `i8` in 1/16 m/s) so clients predict swimming against the same current as the
 server. It adds three contracts and no change to the save schema version.
 
@@ -183,7 +172,7 @@ T10 implements this for the all-resident G1 case: a committed `TopologyTransacti
 
 T17 increment 1 (ENG-64) adds the **baseline-blob split**: when the inline `CellRun` list would overflow one reliable control record (`MAX_CONTROL_RECORD`, not just the `MAX_TRANSACTION_OPS` count — ~1300 fragmented runs already blow the 64 KiB frame), the commit re-encodes the ops as `[IntegerBrush, SplitOffBaseline { source, child, child_entity, blob }*, SourcePatchBaseline { source, blob }]`. Each `blob` is a zstd-compressed postcard `spall_protocol::baseline::BaselineVolume` (the same per-brick `{coord, revision, edited, cells}` payload late-join uses) — one carries the whole child volume, one the source's post-cut affected bricks — bounded by `MAX_SPLIT_BASELINE_BLOB` (28 KiB compressed) so the record still fits the wire. `before` / `after` / `result_hashes` are unchanged and remain the replica's acceptance check; the blob rides inside `tx.ops`, so the durable journal and exact-replay reconstruct the split with no schema change.
 
-T17 increment 2 (ENG-64) handles the split whose compressed geometry is *still* over `MAX_SPLIT_BASELINE_BLOB` — the G1 64-brick collapse. The commit emits marker-only ops `[IntegerBrush, SplitOffBulkBaseline { source, child, child_entity, transfer_id }*, SourcePatchBulkBaseline { source, transfer_id }]` plus **one out-of-band `BaselineWorld`** (every child volume + the source's post-cut affected bricks). `transfer_id` is the split's `TransactionId` with a reserved high bit set so it can never collide with a late-join / repair transfer id. That world travels to replicas as a `BaselineTransfer` on a bulk stream (`BaselineBegin` control + `BaselinePart` bulk + `BaselineEnd` control, keyed by `transfer_id`), broadcast to every live client right after the marker transaction; a joining client gets both queued. The control stream is FIFO and single-reader, so a replica always processes the marker `TopologyTransaction` first, **holds** it (`ApplyOutcome::AwaitingBulkSplit`), then assembles the blob from the bulk stream and retries. To disk the pair is a new `spall_store` `JournalPayload::TopologyBulkSplit` variant (an appended postcard variant — old rows stay decodable, `STORE_SCHEMA_VERSION` unchanged); exact-replay and durable recovery feed the sibling `BaselineWorld` into `replay_transaction`. A split whose assembled `BaselineWorld` exceeds `MAX_ASSEMBLED_TRANSFER` (64 MiB) or `MAX_BASELINE_PARTS` is still refused (per-region splitting remains T18).
+T17 increment 2 (ENG-64) handles the split whose compressed geometry is *still* over `MAX_SPLIT_BASELINE_BLOB` — the G1 64-brick collapse. The commit emits marker-only ops `[IntegerBrush, SplitOffBulkBaseline { source, child, child_entity, transfer_id }*, SourcePatchBulkBaseline { source, transfer_id }]` plus **one out-of-band `BaselineWorld`** (every child volume + the source's post-cut affected bricks). `transfer_id` is reserved from the common runtime transfer allocator before final transaction hashing/journaling, using the split namespace; it is preserved across wire and durable attachments. That world travels to replicas as a `BaselineTransfer` on a bulk stream (`BaselineBegin` control + `BaselinePart` bulk + `BaselineEnd` control, keyed by `transfer_id`), broadcast to every live client right after the marker transaction; a joining client gets both queued. The control stream is FIFO and single-reader, so a replica always processes the marker `TopologyTransaction` first, **holds** it (`ApplyOutcome::AwaitingBulkSplit`), then assembles the blob from the bulk stream and retries. To disk the pair uses current store5 `JournalPayload::TopologyAttachments`, with one Geometry entry in the existing bounded `TransactionAttachmentSetV1`. Exact replay and durable recovery validate the complete typed set against its parent before feeding the geometry into `replay_transaction`; older saves reject without migration. A split whose assembled `BaselineWorld` exceeds `MAX_ASSEMBLED_TRANSFER` (64 MiB) or `MAX_BASELINE_PARTS` is still refused (per-region splitting remains T18).
 
 Physics is not lockstep. Do not promise identical trajectories from running the same inputs on every machine. Rapier's determinism guarantees have conditions, and whole-engine determinism requires more than selecting a physics feature. [Rapier determinism documentation](https://rapier.rs/docs/user_guides/rust/determinism/).
 
@@ -260,7 +249,7 @@ no crash-recovery promise.
 
 Retire journal records only after a newer durable checkpoint covers them and no snapshot transfer needs them. Cap retention; lagging joins get a fresh baseline. Persist modified-air bricks explicitly so procedural regeneration cannot restore mined blocks. Initial baselines transfer authoritative terrain rather than trusting client-side generation to be bit-identical.
 
-Use versioned DTO migrations with fixture worlds before changing save formats. Unknown newer schemas are rejected without modifying the database. Back up/migrate into a separate database and validate before replacement.
+Use explicit versioned DTOs and fixture worlds when changing save formats. Unsupported schemas are rejected without modifying the database; no save-format migration paths are retained. An older save fails to open with an "incompatible save, created by an older pre-release build" error (`StoreError::SchemaTooOld`, `PersistError::SchemaMismatch`); there is no migration before the first public release.
 
 ## Network budget and overload behavior
 
@@ -318,9 +307,11 @@ baselines for an interest-crossing split.
 
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
-`spall_protocol` record headers use `WIRE_SCHEMA_VERSION = 1`. The connection
-protocol is `PROTOCOL_VERSION = 2` after adding server-authenticated player
-principals to the pre-stream authentication exchange.
+`spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
+`PROTOCOL_VERSION` (currently 17): one wire version for the handshake and every record, bumped on
+any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 7, defined in
+`spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
+exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
 
 **Endianness.** Every canonical hash pre-image and every frame header field is
 little-endian, fixed width. Canonical sequences carry a `u32` LE length prefix;
@@ -370,8 +361,8 @@ digest by the stamps of the storage chunks it was computed from (`spall_voxel`'s
 and shared by clones; a different cache is equally conformant as long as the digests are equal.
 
 *Versioning.* v1 hashed every brick in one stream under the tag `spall.topology.v1`. v2 changes
-every hash value, so it is not interchangeable: the wire schema moved to 4
-(`WIRE_SCHEMA_VERSION`, stamped in every record header, so a v1 peer cannot decode a single
+every hash value, so it is not interchangeable: the wire version was bumped
+(`WIRE_SCHEMA_VERSION`, stamped in every record header, so a peer on the old version cannot decode a single
 record) and saved worlds record `topology_hash_version = 2`. **A save written under v1 is
 refused on recovery** with an algorithm-version mismatch; its recorded checkpoint and journal
 hashes cannot be verified under v2 and the engine does not carry the v1 algorithm to migrate
@@ -477,9 +468,12 @@ then send `BaselineBegin.world_version = 3`, reusing segment schema 2: a
 manifest followed by individually hashed/compressed frames. The cumulative
 compressed ceiling is 256 MiB; each bulk part remains <=1 MiB, each decoded
 segment <=4 MiB by default, and the manifest's decoded total <=16 GiB.
-Version 1 and version 2 retain their 64 MiB compressed ceilings; the legacy
+Emitted world versions today: 1 (single blob: repairs and split blobs), 3 (streamed), 4 (regional) and 5
+(deferred regional). Version 2 (non-streamed segmented) is no longer produced by the server
+(its constant is still referenced by `serve.rs` and the client accepts it).
+Version 1 and version 2 retain their 64 MiB compressed ceilings; the
 single-blob decompression bound remains 256 MiB. Unsupported clients receive
-the legacy format, never an unnegotiated larger transfer. Repairs and bulk
+the single-blob format, never an unnegotiated larger transfer. Repairs and bulk
 split blobs keep the existing format.
 
 The server expands immutable brick snapshots one segment at a time. The client
@@ -526,9 +520,8 @@ baseline validation are unchanged. The distinct BBR impaired fixture must not
 be reported as proof that the default CUBIC impaired workload passes, or as a
 G3/G4 fairness/congestion acceptance result.
 
-The legacy baseline transfer body is `spall_protocol::baseline::BaselineWorld`
-(`BASELINE_WORLD_SCHEMA = 1`, versioned independently of the wire and save
-schemas): per volume the `VolumeId`, cell-size code, owner (terrain / body
+The single-blob baseline transfer body (world version 1: repairs and split blobs) is
+`spall_protocol::baseline::BaselineWorld` (its `schema` is `WIRE_SCHEMA_VERSION`): per volume the `VolumeId`, cell-size code, owner (terrain / body
 entity), optional brick bounds, and every resident brick as
 `{coord, revision, edited, cells}` where `cells` is `Uniform(u16)` or a
 `Dense` vector of exactly `CELLS_PER_BRICK` raw material ids. It carries
@@ -675,3 +668,65 @@ Additive wire records under envelope schema 3; matched client and server builds 
 Single-brick repair requests no longer fill `current_hash`/`expected_hash` (the server never read
 them), and a transaction whose result hash covers a volume with an earlier transaction still held
 for a repair or bulk blob waits behind it.
+
+### ENG-196/199 - Weather state and authorized overrides
+
+Wire schema/protocol 6 adds WeatherSnapshot tag 24 and appended
+AdminCommand::SetWeather { kind: Option<WeatherKind> }; None restores automatic.
+WeatherState schema 2 carries the canonical override along with explicit clock,
+epoch/revision, quantized precipitation/wind and stable lightning event fields.
+Matching client/server versions are required. Old weather checkpoint/journal
+layouts are rejected; no runtime enum bytes are persisted.
+Existing ecology chronological clock and VegetationClock journal semantics stay
+unchanged. A persisted fallback tick clock serves worlds without vegetation.
+Weather overrides require the existing admin authorization and persist through
+checkpoint/restart; world reset clears them. Per-weather stream fences allow
+weather older than motion while refusing stale weather/reset records. See
+reports/ENG-196-weather-foundation.md and reports/ENG-199-weather-controls.md.
+
+### ENG-206/208 - Ground snow and footprints
+
+Wire schema/protocol 7 originally added `SnowSurfaceFrame` (tag 25), versioned
+separately as snow schema 1. Frames replace one 4 m tile/Y layer, carrying
+disjoint exposed-face cohorts, terrain revisions, quantized depth and bounded
+transient footprints; depth is capped at 0.5 m (`SNOW_MAX_DEPTH_Q16`, protocol 17). Empty frames remove old layers. Epoch, sequence and
+effective-tick fences prevent stale snow after reset; client cache residency is
+bounded. Server-authoritative grounded travel creates tracks; clients never
+submit imprint positions. See weather.md for rates, caps and exposure rules.
+
+Canonical checkpoints retain exact fractional snow depth and climate cursors;
+geometry journal entries preserve exact cohort changes. Footprints clear on
+restart. Live and saved topology/motion records now require protocol/wire 12. Saved
+wire headers 5, 6, 7, 8 and 9 are rejected without migration or header rewriting.
+
+### Creatures
+
+Creatures are server-authoritative entities, not world voxels. The wire carries
+three records, all on the reliable ordered stream the server already uses for
+water and vegetation (`Outbound::Water`), so a client sees them in the order the
+server produced them:
+
+* `CreatureSpawn` (tag 26): `{ schema, CreatureRecord }`, where `CreatureRecord`
+  is `creature_id`, `species` (a game key of at most 63 bytes), root
+  `translation_m`/`rotation_xyzw`, `locomotion_tag` and `clip_phase_tick`. It is
+  sent when the game's director spawns a creature, and once per held creature in
+  the late-join list. Installing it is idempotent.
+* `CreatureDespawn` (tag 28): `{ schema, creature_id }`.
+* `CreatureMotionFrame` (tag 27): up to 256 entries sorted by id, sent at 20 Hz to
+  live sessions for creatures near that session's player. A frame never creates or
+  retires a creature; a client ignores entries for ids it does not hold and
+  entries no newer than the one it applied.
+
+A joining client's queue starts with the creature list taken at the instant its
+baseline capture starts; spawns and despawns committed after that are appended to
+the same queue and delivered with it, so the list and the stream never overlap or
+leave a gap. Creature ids are never reused within a server run, not even across a
+world reset; a reset baseline makes every replica drop its creatures and the
+director spawns new ones with fresh ids. The server owns species and clips: the
+record names only the species, and the client picks the clip from the species and
+`locomotion_tag`.
+
+Worlds with animals cannot be saved. Startup refuses a save path together with a
+creature director, and checkpoint capture refuses a simulation that has a creature
+host. The store has no creature section. Typed durable transaction attachments
+(`JournalPayload::TopologyAttachments`) carry bulk-split geometry only.

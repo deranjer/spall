@@ -25,7 +25,7 @@ Reference host: AMD Ryzen 7 9700X (8C/16T), 63.6 GiB RAM, Windows 11,
 `rustc 1.96.1` `x86_64-pc-windows-msvc`. Release build. Reproduce with:
 
 ```
-cargo run --release -p spall_physics --bin collision-bench -- --out .local/runs/t06-collision
+cargo run --release -p spall_physics --features bench --bin collision-bench -- --out .local/runs/t06-collision
 ```
 
 Raw JSON: `.local/runs/t06-collision/collision-feasibility.json` (ignored path).

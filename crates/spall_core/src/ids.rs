@@ -101,6 +101,46 @@ server_id!(
     /// Identity of one committed topology transaction.
     TransactionId
 );
+server_id!(
+    /// Identity of one creature. Never reused within a server run, not even across a world reset.
+    CreatureId
+);
+
+/// Monotonic creature id counter. Ids are never reused within a server run, not even across a
+/// world reset, so a late motion frame can never address a different creature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatureAllocator {
+    ids: IdAllocator,
+}
+
+impl Default for CreatureAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CreatureAllocator {
+    pub const fn new() -> Self {
+        Self {
+            ids: IdAllocator::new(),
+        }
+    }
+
+    /// The first id a caller may still name; ids below it were already handed out.
+    pub const fn next_creature_id(&self) -> u64 {
+        self.ids.peek()
+    }
+
+    /// Takes `id`, which the caller planned from [`Self::next_creature_id`]. Anything below the
+    /// counter was already taken.
+    pub fn claim(&mut self, id: CreatureId) -> Result<(), IdError> {
+        if id.get() < self.ids.peek() {
+            return Err(IdError::Reserved);
+        }
+        self.ids = IdAllocator::resume_at(id.get().checked_add(1).ok_or(IdError::Exhausted)?)?;
+        Ok(())
+    }
+}
 
 /// Monotonic allocator for one server id family. Persist [`IdAllocator::peek`]
 /// as the next-id counter; never reuse a value it has handed out.
@@ -222,6 +262,7 @@ mod tests {
         assert_eq!(EntityId::new(0), Err(IdError::Reserved));
         assert_eq!(VolumeId::new(0), Err(IdError::Reserved));
         assert_eq!(TransactionId::new(0), Err(IdError::Reserved));
+        assert_eq!(CreatureId::new(0), Err(IdError::Reserved));
         assert_eq!(EntityId::new(1).unwrap().get(), 1);
     }
 
@@ -263,5 +304,22 @@ mod tests {
         assert_eq!(WorldId::from_le_bytes(id.to_le_bytes()), id);
         assert_eq!(id.to_le_bytes()[0], 0x10);
         assert!(WorldId::NIL.is_nil());
+    }
+
+    #[test]
+    fn creature_allocator_claims_only_fresh_ids_and_never_wraps() {
+        let mut allocator = CreatureAllocator::new();
+        assert_eq!(allocator.next_creature_id(), 1);
+        allocator.claim(CreatureId::new(3).unwrap()).unwrap();
+        assert_eq!(allocator.next_creature_id(), 4);
+        assert_eq!(
+            allocator.claim(CreatureId::new(3).unwrap()),
+            Err(IdError::Reserved)
+        );
+        assert_eq!(
+            allocator.claim(CreatureId::new(u64::MAX).unwrap()),
+            Err(IdError::Exhausted)
+        );
+        assert_eq!(allocator.next_creature_id(), 4);
     }
 }

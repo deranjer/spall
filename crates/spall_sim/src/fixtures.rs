@@ -125,18 +125,9 @@ pub const PLAYGROUND_BRICK: MaterialId = MaterialId(12);
 pub const PLAYGROUND_SANDSTONE: MaterialId = MaterialId(13);
 /// Playground slate (jump-course platforms), id 14.
 pub const PLAYGROUND_SLATE: MaterialId = MaterialId(14);
-/// Debris red, id 15.
-pub const DEBRIS_RED: MaterialId = MaterialId(15);
-/// Debris orange, id 16.
-pub const DEBRIS_ORANGE: MaterialId = MaterialId(16);
-/// Debris yellow, id 17.
-pub const DEBRIS_YELLOW: MaterialId = MaterialId(17);
-/// Debris green, id 18.
-pub const DEBRIS_GREEN: MaterialId = MaterialId(18);
-/// Debris blue, id 19.
-pub const DEBRIS_BLUE: MaterialId = MaterialId(19);
-/// Debris purple, id 20.
-pub const DEBRIS_PURPLE: MaterialId = MaterialId(20);
+pub use crate::playground::{
+    DEBRIS_BLUE, DEBRIS_GREEN, DEBRIS_ORANGE, DEBRIS_PURPLE, DEBRIS_RED, DEBRIS_YELLOW,
+};
 
 /// Every non-debris, non-air material [`crate::fixtures::playground_scene`]
 /// paints the terrain with, plus a bright palette [`crate::playground`]'s
@@ -1518,4 +1509,21 @@ pub fn spawn_review_lever(
         )
         .expect("review lever spawns");
     (base, lever)
+}
+
+/// Source volume whose single brick alternates solid and air along every row,
+/// so run-length ownership encoding cannot shrink it: the only fixture shape
+/// that still exceeds the inline control-record ceiling after compaction.
+pub fn noisy_source_volume(id: VolumeId, material: MaterialId) -> Volume {
+    let mut volume = Volume::new(id, CellSizeCode::Quarter);
+    let mut plan = EditPlan::new(id);
+    for z in 0..32 {
+        for y in 0..32 {
+            for x in (0..32).step_by(2) {
+                plan.set(GlobalCell::new(x, y, z), material);
+            }
+        }
+    }
+    volume.apply_edit(&plan).unwrap();
+    volume
 }

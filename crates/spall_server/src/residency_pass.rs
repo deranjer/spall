@@ -244,6 +244,8 @@ pub struct ResidencyPass {
     pinned_max: usize,
     admission_deferred_total: u64,
     required_over_budget_ticks: u64,
+    /// Runtime identity of the world whose records this pass caches.
+    world_instance: spall_sim::WorldInstanceToken,
     /// T23 / G3 row 7 increment 15: the last successful `capture_checkpoint`
     /// call's per-brick records (terrain only), keyed by coordinate, so an
     /// unchanged brick's record is reused rather than re-snapshotted /
@@ -312,6 +314,7 @@ impl ResidencyPass {
             reload_grace: BTreeMap::new(),
             prev_player_feet: BTreeMap::new(),
             prev_body_spheres: BTreeMap::new(),
+            world_instance: world.instance_token(),
             checkpoint_cache,
             evictions_total: 0,
             reloads_total: 0,
@@ -581,7 +584,21 @@ impl ResidencyPass {
         cfg: &PersistConfig,
         journal_cursor: u64,
     ) -> Result<Checkpoint, PersistError> {
+        self.capture_checkpoint_internal(sim, cfg, journal_cursor)
+    }
+
+    fn capture_checkpoint_internal(
+        &mut self,
+        sim: &Simulation,
+        cfg: &PersistConfig,
+        journal_cursor: u64,
+    ) -> Result<Checkpoint, PersistError> {
         let world = sim.world();
+        if !self.world_instance.matches_world(world) {
+            return Err(PersistError::BadField(
+                "checkpoint residency world instance mismatch",
+            ));
+        }
         let mut new_cache = BTreeMap::new();
         let mut terrain_bricks = Vec::new();
         let mut captured = 0u64;

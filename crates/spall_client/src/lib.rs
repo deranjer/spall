@@ -1,18 +1,25 @@
 //! Native render-window host and the client-side replica. GPU voxel extraction
 //! and transport wiring are added by later tasks.
 
+pub mod audio;
+pub mod breathing;
 pub mod catalogue;
 pub mod column_surface;
 pub mod day_night;
 pub mod ecology_demo;
+pub mod footsteps;
 pub mod interactive;
 pub mod net;
 pub mod predict;
 pub mod replica;
+pub mod replica_creatures;
 pub mod residency;
+pub mod season_colour;
 pub mod segmented;
 pub mod sky;
+pub mod snow;
 pub mod tick_accumulator;
+pub mod weather;
 pub mod window;
 
 pub use catalogue::CatalogueReceiver;

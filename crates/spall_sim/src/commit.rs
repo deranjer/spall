@@ -42,6 +42,7 @@ use spall_voxel::{EditError, EditPlan, Volume};
 use crate::body::{Body, BodyKind, BodyPose};
 use crate::collider::plan_collider;
 use crate::journal::{JournalEntry, JournalSink};
+use crate::registry::IdRegistry;
 use crate::stage::StagedEdit;
 use crate::transfer::{self, ChildBody, ParentState};
 use crate::world::{SimWorld, volume_topology_hash_for};
@@ -65,7 +66,9 @@ pub struct Committed {
     /// `BaselineWorld` (every child volume + the source's post-cut affected
     /// bricks) the host must deliver on a bulk stream and journal alongside the
     /// transaction. `None` for every ordinary commit.
-    pub bulk_baseline: Option<spall_protocol::baseline::BaselineWorld>,
+    pub bulk_baseline: Option<Box<spall_protocol::baseline::BaselineWorld>>,
+    /// Allocator-reserved identity for the out-of-band baseline.
+    pub bulk_transfer_id: Option<TransferId>,
     /// Exact pre-edit material counts removed by this committed cut. This is
     /// game-facing outcome metadata; it does not grant items by itself.
     pub removed_materials: std::collections::BTreeMap<MaterialId, u64>,
@@ -112,6 +115,16 @@ pub enum CommitError {
     Record(#[from] RecordError),
     #[error("commit cannot be encoded for replication: {0}")]
     Replication(#[from] crate::replication::ReplicationError),
+    #[error("prepared commit state changed before publication")]
+    PreparedStateChanged,
+    #[error("prepared physics fence could not be captured: {0}")]
+    PhysicsFence(String),
+    #[error("bulk split requires a server-reserved transfer ID")]
+    MissingBulkTransferId,
+    #[error("typed transaction attachments: {0}")]
+    Attachments(#[from] spall_protocol::TransactionAttachmentError),
+    #[error("tick transfer IDs must be unique, nonzero split-namespace IDs")]
+    InvalidBulkTransferIds,
     #[error(
         "commit needs evicted geometry that is not loaded (volume {volume}, bricks {bricks:?}); \
          the caller must reload it and re-stage"
@@ -120,6 +133,50 @@ pub enum CommitError {
         volume: VolumeId,
         bricks: Vec<spall_core::BrickCoord>,
     },
+}
+
+/// An owned geometry candidate. It contains no whole-world or physics clone;
+/// the captured fence describes exactly the live state it read.
+pub(crate) struct PreparedGeometryCommit {
+    pub(crate) fence: crate::world::GeometryCommitFence,
+    pub(crate) token: spall_jobs::JobToken,
+    pub(crate) registry: IdRegistry,
+    volume: spall_core::VolumeId,
+    parent_phys: spall_physics::BodyId,
+    parent_candidate: Volume,
+    parent_rebuild: Option<(
+        crate::collider::ColliderPlan,
+        Option<spall_physics::BodyMassProperties>,
+    )>,
+    terrain_brick_rebuild: Option<Vec<crate::world::PreparedTerrainBrickPublication>>,
+    children: Vec<PreparedChildPublication>,
+    remove_outcome: Option<spall_voxel::EditOutcome>,
+    pub(crate) transaction_id: spall_core::TransactionId,
+    pub(crate) journal_seq: spall_core::JournalSeq,
+    pub(crate) topology: TopologyTransaction,
+    pub(crate) participants: Vec<MotionSnapshot>,
+    pub(crate) bulk_baseline: Option<spall_protocol::baseline::BaselineWorld>,
+    pub(crate) attachments: Option<spall_protocol::TransactionAttachmentSetV1>,
+    bulk_transfer_id: Option<TransferId>,
+    pub(crate) bumped_epoch: bool,
+    stamp_before_commit: u64,
+    input_stamp: u64,
+    post_index: Option<std::sync::Arc<spall_structure::StructureIndex>>,
+    removed_materials: std::collections::BTreeMap<MaterialId, u64>,
+}
+
+struct PreparedChildPublication {
+    child: ChildBody,
+    cell_m: f32,
+    rotation_xyzw: [f32; 4],
+    translation_m: [f32; 3],
+    linvel_m_s: [f32; 3],
+    angvel_rad_s: [f32; 3],
+}
+
+pub(crate) enum PrepareGeometryOutcome {
+    Stale(Staleness),
+    Ready(Box<PreparedGeometryCommit>),
 }
 
 impl From<crate::transfer::PlanChildError> for CommitError {
@@ -139,12 +196,78 @@ pub fn commit(
     server_tick: Tick,
     control_seq: ControlSeq,
 ) -> Result<CommitOutcome, CommitError> {
+    commit_with_bulk_transfer_ids(
+        world,
+        journal,
+        staged,
+        server_tick,
+        control_seq,
+        &mut std::collections::VecDeque::new(),
+    )
+}
+
+pub(crate) fn commit_with_bulk_transfer_ids(
+    world: &mut SimWorld,
+    journal: &mut JournalSink,
+    staged: &StagedEdit,
+    server_tick: Tick,
+    control_seq: ControlSeq,
+    bulk_transfer_ids: &mut std::collections::VecDeque<TransferId>,
+) -> Result<CommitOutcome, CommitError> {
     let _total = crate::prof::Span::start("commit.total");
+    match prepare_geometry_with_transfer_ids(
+        world,
+        journal,
+        staged,
+        server_tick,
+        control_seq,
+        bulk_transfer_ids,
+    )? {
+        PrepareGeometryOutcome::Stale(reason) => Ok(CommitOutcome::Stale(reason)),
+        PrepareGeometryOutcome::Ready(prepared) => {
+            let validated = validate_prepared_geometry(world, journal, *prepared)?;
+            let (committed, entry) = publish_validated_geometry_without_journal(world, validated);
+            journal.append(entry);
+            Ok(CommitOutcome::Committed(committed))
+        }
+    }
+}
+
+/// Builds an owned candidate without mutating `world` or `journal`. The
+/// candidate can be combined with other transaction participants before its
+/// final fence validation and publication.
+#[cfg(test)]
+pub(crate) fn prepare_geometry(
+    world: &SimWorld,
+    journal: &JournalSink,
+    staged: &StagedEdit,
+    server_tick: Tick,
+    control_seq: ControlSeq,
+) -> Result<PrepareGeometryOutcome, CommitError> {
+    prepare_geometry_with_transfer_ids(
+        world,
+        journal,
+        staged,
+        server_tick,
+        control_seq,
+        &mut std::collections::VecDeque::new(),
+    )
+}
+
+pub(crate) fn prepare_geometry_with_transfer_ids(
+    world: &SimWorld,
+    journal: &JournalSink,
+    staged: &StagedEdit,
+    server_tick: Tick,
+    control_seq: ControlSeq,
+    bulk_transfer_ids: &mut std::collections::VecDeque<TransferId>,
+) -> Result<PrepareGeometryOutcome, CommitError> {
+    let _prepare = crate::prof::Span::start("commit.prepare");
     let validate = crate::prof::Span::start("commit.validate");
     // 1. Re-validate against the live world.
     match staged.token.check(world) {
         Staleness::Fresh => {}
-        other => return Ok(CommitOutcome::Stale(other)),
+        other => return Ok(PrepareGeometryOutcome::Stale(other)),
     }
     drop(validate);
 
@@ -483,6 +606,7 @@ pub fn commit(
     // (increment 2). `before` / `after` / `result_hashes` are unchanged and
     // remain the replica's acceptance check.
     let mut bulk_baseline = None;
+    let mut bulk_transfer_id = None;
     if !crate::replication::inline_wire_fits(&topology) {
         // Inline blobs are only chosen when each fits `MAX_SPLIT_BASELINE_BLOB`,
         // but hundreds of small children (a tree crown) can still add up past
@@ -499,9 +623,9 @@ pub fn commit(
                 &child_ids,
                 &children,
                 staged.splits(),
-                transaction_id,
                 server_tick,
                 force_bulk,
+                bulk_transfer_ids,
             )? {
                 SplitEncoding::Inline(ops) => {
                     topology.ops = ops;
@@ -510,9 +634,14 @@ pub fn commit(
                     }
                     force_bulk = true;
                 }
-                SplitEncoding::Bulk { ops, baseline } => {
+                SplitEncoding::Bulk {
+                    ops,
+                    baseline,
+                    transfer_id,
+                } => {
                     topology.ops = ops;
                     bulk_baseline = Some(baseline);
+                    bulk_transfer_id = Some(transfer_id);
                     break;
                 }
             }
@@ -532,6 +661,22 @@ pub fn commit(
     }
     topology.validate()?;
     drop(encoding);
+    let attachments =
+        bulk_baseline
+            .as_ref()
+            .map(|world| spall_protocol::TransactionAttachmentSetV1 {
+                schema: spall_protocol::WIRE_SCHEMA_VERSION,
+                transaction_id,
+                attachments: vec![spall_protocol::TransactionAttachmentV1::Geometry {
+                    transfer_id: bulk_transfer_id
+                        .expect("bulk geometry owns a reserved ID")
+                        .0,
+                    world: world.clone(),
+                }],
+            });
+    if let Some(set) = &attachments {
+        set.encode_for_transaction(&topology)?;
+    }
 
     let bumped_epoch = staged.splits();
     let participants = candidate_participant_snapshots(
@@ -545,36 +690,156 @@ pub fn commit(
         journal_seq,
     );
 
-    // Validate every narrowed/localized coordinate before any authoritative
-    // state or collider is published. The publication section below is then
-    // infallible with respect to physics-frame conversion.
-    for child in &children {
-        world.physics_translation(child.pose.translation_m)?;
-    }
-    if let Some(plans) = &terrain_brick_rebuild {
-        let cell_m = world.terrain().cell_size().metres();
-        for (_, plan) in plans {
-            if let Some(plan) = plan {
-                world
-                    .physics_origin()
-                    .localize_terrain_grid(plan.grid.clone(), cell_m)
-                    .ok_or(crate::world::WorldError::PhysicsFrameOutOfRange)?;
-            }
+    // Finish every fallible frame conversion and terrain localization while
+    // this is still only a candidate.
+    let mut prepared_children = Vec::with_capacity(children.len());
+    for child in children {
+        let cell_m = child.volume.cell_size().metres() as f32;
+        let rotation_xyzw = [
+            child.pose.rotation.x as f32,
+            child.pose.rotation.y as f32,
+            child.pose.rotation.z as f32,
+            child.pose.rotation.w as f32,
+        ];
+        let translation_m = world.physics_translation(child.pose.translation_m)?;
+        let linvel_m_s = child.linvel_m_s.map(|v| v as f32);
+        let angvel_rad_s = child.angvel_rad_s.map(|v| v as f32);
+        if !cell_m.is_finite()
+            || rotation_xyzw.iter().any(|v| !v.is_finite())
+            || linvel_m_s.iter().any(|v| !v.is_finite())
+            || angvel_rad_s.iter().any(|v| !v.is_finite())
+        {
+            return Err(CommitError::World(
+                crate::world::WorldError::PhysicsFrameOutOfRange,
+            ));
         }
+        prepared_children.push(PreparedChildPublication {
+            child,
+            cell_m,
+            rotation_xyzw,
+            translation_m,
+            linvel_m_s,
+            angvel_rad_s,
+        });
     }
+    let terrain_brick_coords = terrain_brick_rebuild
+        .as_ref()
+        .map(|plans| plans.iter().map(|(coord, _)| *coord).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let prepared_terrain_bricks = terrain_brick_rebuild
+        .map(|plans| {
+            plans
+                .into_iter()
+                .map(|(coord, plan)| {
+                    let revision = parent_candidate
+                        .brick_revision(coord)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(Revision::ZERO);
+                    world
+                        .prepare_terrain_brick_publication(coord, revision, plan.as_ref())
+                        .map_err(CommitError::World)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let fence = world
+        .capture_geometry_commit_fence(vid, &terrain_brick_coords, journal.cursor())
+        .map_err(CommitError::PhysicsFence)?;
 
-    // ---- Publish. Every step below is infallible: the candidate is committed
-    // ---- to the live world in one shot at the tick boundary.
+    Ok(PrepareGeometryOutcome::Ready(Box::new(
+        PreparedGeometryCommit {
+            fence,
+            token: staged.token.clone(),
+            registry: reg,
+            volume: vid,
+            parent_phys,
+            parent_candidate,
+            parent_rebuild,
+            terrain_brick_rebuild: prepared_terrain_bricks,
+            children: prepared_children,
+            remove_outcome,
+            transaction_id,
+            journal_seq,
+            topology,
+            participants,
+            bulk_transfer_id,
+            bulk_baseline,
+            attachments,
+            bumped_epoch,
+            stamp_before_commit,
+            input_stamp: staged.input_stamp,
+            post_index: staged.post_index.clone(),
+            removed_materials: staged.removed_materials.clone(),
+        },
+    )))
+}
+
+/// Converts a prepared candidate into a one-shot publication capability.
+/// Combined transactions validate every participant before publishing any.
+pub(crate) fn validate_prepared_geometry(
+    world: &SimWorld,
+    journal: &JournalSink,
+    prepared: PreparedGeometryCommit,
+) -> Result<ValidatedGeometryCommit, CommitError> {
+    if prepared.token.check(world) != Staleness::Fresh
+        || !world.validates_geometry_commit_fence(&prepared.fence, journal.cursor())
+        || prepared.journal_seq.0 <= journal.cursor()
+    {
+        return Err(CommitError::PreparedStateChanged);
+    }
+    Ok(ValidatedGeometryCommit { prepared })
+}
+
+/// A private one-shot permit. Call only after all shared geometry/physics
+/// fences have been checked; publication below has no fallible work.
+pub(crate) struct ValidatedGeometryCommit {
+    prepared: PreparedGeometryCommit,
+}
+
+/// Publishes prepared geometry and returns the entry for the caller to append.
+/// The caller must have validated every participant before calling this
+/// infallible publication function. Keeping journal append separate lets a
+/// future mixed transaction publish all prepared participants before adding
+/// its single combined journal entry.
+pub(crate) fn publish_validated_geometry_without_journal(
+    world: &mut SimWorld,
+    validated: ValidatedGeometryCommit,
+) -> (Committed, JournalEntry) {
     let _publish = crate::prof::Span::start("commit.publish");
-    *world.registry_mut() = reg;
+    let PreparedGeometryCommit {
+        registry,
+        volume,
+        parent_phys,
+        parent_candidate,
+        parent_rebuild,
+        terrain_brick_rebuild,
+        children,
+        remove_outcome,
+        transaction_id,
+        journal_seq,
+        topology,
+        participants,
+        bulk_baseline,
+        attachments,
+        bulk_transfer_id,
+        bumped_epoch,
+        stamp_before_commit,
+        input_stamp,
+        post_index,
+        removed_materials,
+        fence: _,
+        token: _,
+    } = validated.prepared;
 
-    if let Some(parent) = world.volume_body_mut(vid) {
+    *world.registry_mut() = registry;
+    if let Some(parent) = world.volume_body_mut(volume) {
         parent.volume = parent_candidate;
     }
 
     if let Some(plans) = terrain_brick_rebuild {
-        for (coord, plan) in plans {
-            world.publish_terrain_brick(coord, plan.as_ref())?;
+        for plan in plans {
+            world.publish_prepared_terrain_brick(plan);
         }
     } else {
         match parent_rebuild {
@@ -587,50 +852,41 @@ pub fn commit(
                         .physics_mut()
                         .set_mass_properties(parent_phys, mass_properties);
                 }
-                if let Some(parent) = world.volume_body_mut(vid) {
+                if let Some(parent) = world.volume_body_mut(volume) {
                     parent.collider_revision += 1;
                     parent.coarsen_k = plan.coarsen_k;
                 }
             }
-            None => {
-                // The cut cleared the parent's last solid cell. Retire its
-                // ownership atomically with the edit (`ENG-56`): a detached body
-                // and its physics handle are removed; terrain loses its collider.
-                // Nothing keeps colliding with the obsolete solid shape, and the
-                // transaction's cell-removal ops already carry the emptying for
-                // replicas and for journal replay.
-                world.retire_empty_volume(vid);
-            }
+            None => world.retire_empty_volume(volume),
         }
     }
 
-    // 8. Install every child body and its collider. Mass / COM / inertia come
-    //    from the child's fine material grid (`child.mass_properties`), installed
-    //    into the body independently of the collision shape, so coarse collider
-    //    inflation cannot change the physical mass.
-    let mut child_entities = Vec::new();
-    for child in children {
-        let child_cell_m = child.volume.cell_size().metres() as f32;
-        let rot = child.pose.rotation;
-        let rot_xyzw = [rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32];
-        let trans = world
-            .physics_translation(child.pose.translation_m)
-            .expect("child physics translation was validated before publication");
-        let linvel = child.linvel_m_s.map(|v| v as f32);
-        let angvel = child.angvel_rad_s.map(|v| v as f32);
-
+    let mut child_entities = Vec::with_capacity(children.len());
+    for prepared_child in children {
+        let PreparedChildPublication {
+            child,
+            cell_m,
+            rotation_xyzw,
+            translation_m,
+            linvel_m_s,
+            angvel_rad_s,
+        } = prepared_child;
         let phys = world.physics_mut().add_body(BodySpec {
             kind: PhysBodyKind::Dynamic { ccd: false },
             representation: child.collider_plan.representation,
             grid: child.collider_plan.grid.clone(),
-            cell_m: child_cell_m,
+            cell_m,
             density_kg_m3: 1.0,
             mass_properties: Some(child.mass_properties),
-            translation_m: trans,
-            linvel_m_s: linvel,
+            translation_m,
+            linvel_m_s,
         });
-        world.physics_mut().set_body_pose(phys, trans, rot_xyzw);
-        world.physics_mut().set_body_velocity(phys, linvel, angvel);
+        world
+            .physics_mut()
+            .set_body_pose(phys, translation_m, rotation_xyzw);
+        world
+            .physics_mut()
+            .set_body_velocity(phys, linvel_m_s, angvel_rad_s);
 
         let body = Body {
             entity: Some(child.entity),
@@ -654,38 +910,33 @@ pub fn commit(
     if bumped_epoch {
         world.bump_topology_epoch();
     }
-
-    journal.append(JournalEntry {
+    let entry = JournalEntry {
         seq: journal_seq,
         transaction: topology.clone(),
         participants,
-        bulk_baseline: bulk_baseline.clone(),
-    });
+        attachments,
+    };
 
-    // Keep the terrain's structure index warm for the next edit. Only if the live volume was the
-    // very state the edit was staged against: otherwise something else changed it in between.
-    //
-    // Without a split the commit leaves the world exactly as the staging pass predicted, so the
-    // index that pass produced describes it. With a split that index still holds the detached
-    // cells; the removal is stored beside it and the next staging applies it on its own thread
-    // (adopting the epoch the split moved the world to), so this commit does not pay for it.
-    if let Some(index) = &staged.post_index
-        && stamp_before_commit == staged.input_stamp
-        && let Some(live) = world.volume_ref(vid)
+    if let Some(index) = post_index
+        && stamp_before_commit == input_stamp
+        && let Some(live) = world.volume_ref(volume)
     {
-        let stamp = live.state_stamp();
-        world.set_warm_structure(vid, stamp, index.clone(), remove_outcome.clone());
+        world.set_warm_structure(volume, live.state_stamp(), index, remove_outcome.clone());
     }
 
-    Ok(CommitOutcome::Committed(Committed {
-        transaction: transaction_id,
-        journal_seq,
-        topology,
-        children: child_entities,
-        bumped_epoch,
-        bulk_baseline,
-        removed_materials: staged.removed_materials.clone(),
-    }))
+    (
+        Committed {
+            transaction: transaction_id,
+            journal_seq,
+            topology,
+            children: child_entities,
+            bumped_epoch,
+            bulk_baseline: bulk_baseline.map(Box::new),
+            bulk_transfer_id,
+            removed_materials,
+        },
+        entry,
+    )
 }
 
 /// How an oversized split's geometry is carried once the inline `CellRun` list
@@ -701,6 +952,7 @@ enum SplitEncoding {
     Bulk {
         ops: Vec<TopologyOp>,
         baseline: spall_protocol::baseline::BaselineWorld,
+        transfer_id: TransferId,
     },
 }
 
@@ -721,9 +973,9 @@ fn build_split_baseline_ops(
     child_ids: &[(spall_core::EntityId, VolumeId)],
     children: &[ChildBody],
     splits: bool,
-    transaction_id: spall_core::TransactionId,
     server_tick: Tick,
     force_bulk: bool,
+    transfer_ids: &mut std::collections::VecDeque<TransferId>,
 ) -> Result<SplitEncoding, CommitError> {
     use spall_protocol::baseline::{BaselineOwner, BaselineWorld};
     use spall_protocol::limits::{MAX_ASSEMBLED_TRANSFER, MAX_BULK_PART, MAX_SPLIT_BASELINE_BLOB};
@@ -774,29 +1026,31 @@ fn build_split_baseline_ops(
         return Ok(SplitEncoding::Inline(ops));
     }
 
-    // Bulk path: marker ops + one out-of-band `BaselineWorld` keyed by
-    // `transfer_id` (the split's `TransactionId` with the reserved high bit set).
-    let transfer_id = transaction_id.get() | spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT;
+    // Bulk path: marker ops + one out-of-band `BaselineWorld` keyed by an ID
+    // reserved by the authoritative server before this tick.
+    let transfer_id = transfer_ids
+        .pop_front()
+        .ok_or(CommitError::MissingBulkTransferId)?;
     let mut ops = vec![brush_op];
     for ((entity, child_vid), _child) in child_ids.iter().zip(children) {
         ops.push(TopologyOp::SplitOffBulkBaseline {
             source,
             child: *child_vid,
             child_entity: *entity,
-            transfer_id,
+            transfer_id: transfer_id.0,
         });
     }
     if splits {
         ops.push(TopologyOp::SourcePatchBulkBaseline {
             source,
-            transfer_id,
+            transfer_id: transfer_id.0,
         });
     }
 
     let mut world_volumes: Vec<_> = volumes.into_iter().map(|(bv, _)| bv).collect();
     world_volumes.sort_by_key(|v| v.volume_id.get());
     let baseline = BaselineWorld {
-        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        schema: spall_protocol::WIRE_SCHEMA_VERSION,
         checkpoint_tick: server_tick.get(),
         volumes: world_volumes,
     };
@@ -812,7 +1066,11 @@ fn build_split_baseline_ops(
             },
         ));
     }
-    Ok(SplitEncoding::Bulk { ops, baseline })
+    Ok(SplitEncoding::Bulk {
+        ops,
+        baseline,
+        transfer_id,
+    })
 }
 
 /// A `MotionSnapshot` for every dynamic body that took part in the transaction:
@@ -848,6 +1106,8 @@ fn candidate_participant_snapshots(
             linear_velocity: parent.linvel_m_s.map(|v| v as f32),
             angular_velocity: parent.angvel_rad_s.map(|v| v as f32),
             sleeping: parent.sleeping,
+            endurance: 1.0,
+            exhausted: false,
         });
     }
     for child in children {
@@ -861,6 +1121,8 @@ fn candidate_participant_snapshots(
             linear_velocity: child.linvel_m_s.map(|v| v as f32),
             angular_velocity: child.angvel_rad_s.map(|v| v as f32),
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         });
     }
     out
@@ -881,3 +1143,7 @@ pub fn queued_status(request_id: spall_protocol::RequestId) -> ActionStatus {
 /// Unused transfer id sentinel kept for the journal/DTO surface; real transfers
 /// are T17.
 pub const NO_TRANSFER: TransferId = TransferId(0);
+
+#[cfg(test)]
+#[path = "commit_review.rs"]
+mod commit_review;

@@ -46,6 +46,11 @@ pub enum WireRecord {
     CatalogueAck(spall_protocol::CatalogueAck),
     ControlProbe(spall_protocol::ControlProbe),
     ColumnWaterUpdate(spall_protocol::ColumnWaterUpdate),
+    WeatherSnapshot(spall_protocol::WeatherSnapshot),
+    SnowSurfaceFrame(spall_protocol::SnowSurfaceFrame),
+    CreatureSpawn(spall_protocol::CreatureSpawn),
+    CreatureMotionFrame(spall_protocol::CreatureMotionFrame),
+    CreatureDespawn(spall_protocol::CreatureDespawn),
 }
 
 impl WireRecord {
@@ -71,6 +76,11 @@ impl WireRecord {
             Self::CatalogueAck(_) => WireTag::CatalogueAck,
             Self::ControlProbe(_) => WireTag::ControlProbe,
             Self::ColumnWaterUpdate(_) => WireTag::ColumnWaterUpdate,
+            Self::WeatherSnapshot(_) => WireTag::WeatherSnapshot,
+            Self::SnowSurfaceFrame(_) => WireTag::SnowSurfaceFrame,
+            Self::CreatureSpawn(_) => WireTag::CreatureSpawn,
+            Self::CreatureMotionFrame(_) => WireTag::CreatureMotionFrame,
+            Self::CreatureDespawn(_) => WireTag::CreatureDespawn,
         }
     }
 
@@ -97,6 +107,11 @@ impl WireRecord {
             Self::CatalogueAck(r) => encode_control(r),
             Self::ControlProbe(r) => encode_control(r),
             Self::ColumnWaterUpdate(r) => encode_control(r),
+            Self::WeatherSnapshot(r) => encode_control(r),
+            Self::SnowSurfaceFrame(r) => encode_control(r),
+            Self::CreatureSpawn(r) => encode_control(r),
+            Self::CreatureMotionFrame(r) => encode_control(r),
+            Self::CreatureDespawn(r) => encode_control(r),
         }
     }
 
@@ -132,6 +147,11 @@ impl WireRecord {
             WireTag::CatalogueAck => Self::CatalogueAck(decode_control(bytes)?),
             WireTag::ControlProbe => Self::ControlProbe(decode_control(bytes)?),
             WireTag::ColumnWaterUpdate => Self::ColumnWaterUpdate(decode_control(bytes)?),
+            WireTag::WeatherSnapshot => Self::WeatherSnapshot(decode_control(bytes)?),
+            WireTag::SnowSurfaceFrame => Self::SnowSurfaceFrame(decode_control(bytes)?),
+            WireTag::CreatureSpawn => Self::CreatureSpawn(decode_control(bytes)?),
+            WireTag::CreatureMotionFrame => Self::CreatureMotionFrame(decode_control(bytes)?),
+            WireTag::CreatureDespawn => Self::CreatureDespawn(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,

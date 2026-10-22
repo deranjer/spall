@@ -332,6 +332,7 @@ fn dummy_checkpoint(tick: u64, cursor: u64) -> Checkpoint {
     use spall_store::{STORE_SCHEMA_VERSION, StoredWorldMeta};
     Checkpoint {
         vegetation: Vec::new(),
+        snow: None,
         tick,
         journal_cursor: cursor,
         world_hash: [0; 32],
@@ -352,6 +353,7 @@ fn dummy_checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         },
         bodies: vec![],
         column_water: None,
+        weather: None,
         bricks: vec![],
     }
 }

@@ -20,11 +20,11 @@ use crate::limits::{
     SizeLimitError,
 };
 
-/// Schema version stamped into every encoded record header. A peer on another version cannot
-/// decode a single record, so mismatched builds refuse each other at the first message. Bumped to
-/// 4 with the chunked topology hash (`spall.topology.v2`): every `result_hashes` and world hash
-/// value changed, so a mixed pair could otherwise connect and then reject every transaction.
-pub const WIRE_SCHEMA_VERSION: u16 = 4;
+/// Schema version stamped into every encoded record header: the wire version itself
+/// ([`crate::PROTOCOL_VERSION`]). A peer on another version cannot decode a single record, so
+/// mismatched builds refuse each other at the first message. Saved journals and live peers both
+/// reject other versions without migration.
+pub const WIRE_SCHEMA_VERSION: u16 = crate::handshake::PROTOCOL_VERSION;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -52,6 +52,11 @@ pub enum WireTag {
     CatalogueAck = 21,
     ControlProbe = 22,
     ColumnWaterUpdate = 23,
+    WeatherSnapshot = 24,
+    SnowSurfaceFrame = 25,
+    CreatureSpawn = 26,
+    CreatureMotionFrame = 27,
+    CreatureDespawn = 28,
 }
 
 impl WireTag {
@@ -78,6 +83,11 @@ impl WireTag {
             21 => Self::CatalogueAck,
             22 => Self::ControlProbe,
             23 => Self::ColumnWaterUpdate,
+            24 => Self::WeatherSnapshot,
+            25 => Self::SnowSurfaceFrame,
+            26 => Self::CreatureSpawn,
+            27 => Self::CreatureMotionFrame,
+            28 => Self::CreatureDespawn,
             _ => return None,
         })
     }
@@ -481,7 +491,7 @@ pub enum TopologyOp {
     /// A split whose geometry is too large even for a compressed inline blob
     /// (T17 increment 2 / ENG-64): a *marker only*. The child volume travels
     /// out of band — as a [`crate::baseline::BaselineWorld`] on a bulk stream to
-    /// replicas, and as a journal `TopologyBulkSplit` payload to disk — keyed by
+    /// replicas, and as a journal `TopologyAttachments` payload to disk — keyed by
     /// `transfer_id` (the [`crate::BaselineBegin::transfer_id`] of that
     /// transfer). The replica **holds** this transaction until the matching
     /// blob assembles.
@@ -591,11 +601,77 @@ impl Record for TopologyTransaction {
                 });
             }
         }
+        let mut transfer_uses = std::collections::BTreeMap::<u64, [u8; 2]>::new();
+        for op in &self.ops {
+            let transfer_use = match op {
+                TopologyOp::SplitOffBulkBaseline { transfer_id, .. } => Some((*transfer_id, 0)),
+                TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => Some((*transfer_id, 1)),
+                _ => None,
+            };
+            if let Some((id, kind)) = transfer_use {
+                let counts = transfer_uses.entry(id).or_default();
+                counts[kind] = counts[kind].saturating_add(1);
+            }
+        }
+        if transfer_uses.values().any(|counts| {
+            let total = counts
+                .iter()
+                .map(|count| usize::from(*count))
+                .sum::<usize>();
+            total > 1 && !(counts[0] > 0 && counts[1] <= 1)
+        }) {
+            return Err(RecordError::Inconsistent(
+                "bulk transfer id is reused outside one geometry split group",
+            ));
+        }
         Ok(())
     }
 }
 
 impl TopologyTransaction {
+    /// Sorted distinct transfer ids referenced by this transaction. Geometry split
+    /// source/child markers intentionally collapse to one attachment id.
+    pub fn bulk_transfer_ids(&self) -> Vec<u64> {
+        self.ops
+            .iter()
+            .filter_map(TopologyOp::bulk_transfer_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Identity of the ordered transaction payload, independent of the
+    /// recipient's control-stream sequence. Repairs may resend the same
+    /// transaction on a new sequence; changing any logical field is divergent.
+    /// Bound serialized work before allocating or cloning payload bytes.
+    pub fn replay_identity_hash(&self) -> Result<Hash32, crate::CodecError> {
+        self.validate()?;
+        let size = postcard::experimental::serialized_size(self)
+            .map_err(|e| crate::CodecError::Body(e.to_string()))?;
+        let limit = crate::limits::MAX_CONTROL_RECORD;
+        if size > limit - crate::codec::HEADER_LEN {
+            return Err(crate::CodecError::FrameTooLarge {
+                actual: size.saturating_add(crate::codec::HEADER_LEN),
+                limit,
+            });
+        }
+        let identity = (
+            &self.transaction_id,
+            &self.server_tick,
+            &self.algorithm_version,
+            &self.dependencies,
+            &self.before,
+            &self.after,
+            &self.ops,
+            &self.result_hashes,
+        );
+        let bytes =
+            postcard::to_stdvec(&identity).map_err(|e| crate::CodecError::Body(e.to_string()))?;
+        let mut writer = crate::CanonicalWriter::with_domain(b"spall.transaction-replay.v1");
+        writer.blob(&bytes);
+        Ok(writer.hash())
+    }
+
     /// Extra validation that needs the world manifest: every material id
     /// referenced by an op must be defined (or be air).
     pub fn validate_against(&self, manifest: &MaterialManifest) -> Result<(), RecordError> {
@@ -647,6 +723,11 @@ pub struct MotionSnapshot {
     pub linear_velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
     pub sleeping: bool,
+    /// Players only (`1.0` for bodies): sprint stamina, `0..=1`, the same value the
+    /// character kernel advances.
+    pub endurance: f32,
+    /// Players only: exhausted until endurance recovers past the kernel's threshold.
+    pub exhausted: bool,
 }
 
 impl Record for MotionSnapshot {
@@ -665,6 +746,9 @@ impl Record for MotionSnapshot {
             })?;
         finite3(&self.linear_velocity, "MotionSnapshot.linear_velocity")?;
         finite3(&self.angular_velocity, "MotionSnapshot.angular_velocity")?;
+        if !self.endurance.is_finite() {
+            return Err(RecordError::NonFinite("MotionSnapshot.endurance"));
+        }
         Ok(())
     }
 }
@@ -900,6 +984,8 @@ mod tests {
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             sleeping: false,
+            endurance: 1.0,
+            exhausted: false,
         };
         assert!(snap.validate().is_ok());
 

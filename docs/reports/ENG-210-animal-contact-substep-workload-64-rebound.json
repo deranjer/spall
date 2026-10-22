@@ -1,0 +1,954 @@
+{
+  "hardware": {
+    "arch": "x86_64",
+    "available_parallelism": 16,
+    "cpu_model": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "os": "windows",
+    "profile": "release"
+  },
+  "physics": "same spall_physics PhysicsWorld Rapier adapter",
+  "results": [
+    {
+      "animal": "trout",
+      "body_count": 6,
+      "clips": 2,
+      "collider_count": 5,
+      "collider_primitives": 5,
+      "initial_attachment": {
+        "p50_us": 24.4,
+        "p95_us": 26.0,
+        "p99_us": 47.2
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 5,
+      "pose_refresh_ray_step": {
+        "p50_us": 102.39999999999999,
+        "p95_us": 110.19999999999999,
+        "p99_us": 147.70000000000002
+      },
+      "ray_checks": 4110,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "native_voxels",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "swim@0",
+        "swim@15",
+        "swim@30",
+        "swim@45",
+        "swim@60"
+      ],
+      "sampled_phases": 10,
+      "solver_substeps": 64,
+      "source_cell_rebuild": {
+        "p50_us": 3.1999999999999997,
+        "p95_us": 10.8,
+        "p99_us": 10.9
+      },
+      "source_cells": 136,
+      "source_parts": 5,
+      "terrain_transition_sweeps": {
+        "accepted": 8,
+        "blocked": 0,
+        "cases": [
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2369.3999999999996,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 30.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 3758.1,
+            "from_tick": 30.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 60.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 3803.8,
+            "from_tick": 60.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 90.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 3851.3,
+            "from_tick": 90.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 120.0
+          },
+          {
+            "blocked": false,
+            "clip": "swim",
+            "complete_update_query_step_us": 2757.5,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 15.0
+          },
+          {
+            "blocked": false,
+            "clip": "swim",
+            "complete_update_query_step_us": 2458.5,
+            "from_tick": 15.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 30.0
+          },
+          {
+            "blocked": false,
+            "clip": "swim",
+            "complete_update_query_step_us": 2349.2000000000003,
+            "from_tick": 30.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 45.0
+          },
+          {
+            "blocked": false,
+            "clip": "swim",
+            "complete_update_query_step_us": 2412.6,
+            "from_tick": 45.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 60.0
+          }
+        ],
+        "complete_transition_query_step": {
+          "p50_us": 2757.5,
+          "p95_us": 3851.3,
+          "p99_us": 3851.3
+        },
+        "same_clip_transitions": 8
+      },
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 5,
+      "warmup": 10
+    },
+    {
+      "animal": "trout",
+      "body_count": 6,
+      "clips": 2,
+      "collider_count": 5,
+      "collider_primitives": 17,
+      "initial_attachment": {
+        "p50_us": 10.6,
+        "p95_us": 10.7,
+        "p99_us": 14.5
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 5,
+      "pose_refresh_ray_step": {
+        "p50_us": 103.9,
+        "p95_us": 116.39999999999999,
+        "p99_us": 155.9
+      },
+      "ray_checks": 4110,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "merged_cuboids",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "swim@0",
+        "swim@15",
+        "swim@30",
+        "swim@45",
+        "swim@60"
+      ],
+      "sampled_phases": 10,
+      "solver_substeps": 64,
+      "source_cell_rebuild": {
+        "p50_us": 1.4,
+        "p95_us": 5.2,
+        "p99_us": 5.6
+      },
+      "source_cells": 136,
+      "source_parts": 5,
+      "terrain_transition_sweeps": {
+        "accepted": 8,
+        "blocked": 0,
+        "cases": [
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 1765.4,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 30.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 1387.4,
+            "from_tick": 30.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 60.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 1669.5,
+            "from_tick": 60.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 90.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 1393.0,
+            "from_tick": 90.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 120.0
+          },
+          {
+            "blocked": false,
+            "clip": "swim",
+            "complete_update_query_step_us": 1656.9,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 15.0
+          },
+          {
+            "blocked": false,
+            "clip": "swim",
+            "complete_update_query_step_us": 1624.5,
+            "from_tick": 15.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 30.0
+          },
+          {
+            "blocked": false,
+            "clip": "swim",
+            "complete_update_query_step_us": 1719.8999999999999,
+            "from_tick": 30.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 45.0
+          },
+          {
+            "blocked": false,
+            "clip": "swim",
+            "complete_update_query_step_us": 1815.7,
+            "from_tick": 45.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 5,
+            "terrain_collider_count": 2,
+            "to_tick": 60.0
+          }
+        ],
+        "complete_transition_query_step": {
+          "p50_us": 1669.5,
+          "p95_us": 1815.7,
+          "p99_us": 1815.7
+        },
+        "same_clip_transitions": 8
+      },
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 5,
+      "warmup": 10
+    },
+    {
+      "animal": "crow",
+      "body_count": 7,
+      "clips": 2,
+      "collider_count": 6,
+      "collider_primitives": 6,
+      "initial_attachment": {
+        "p50_us": 29.7,
+        "p95_us": 35.1,
+        "p99_us": 61.199999999999996
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 6,
+      "pose_refresh_ray_step": {
+        "p50_us": 114.7,
+        "p95_us": 121.80000000000001,
+        "p99_us": 195.79999999999998
+      },
+      "ray_checks": 6546,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "native_voxels",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "flap@0",
+        "flap@12",
+        "flap@24",
+        "flap@36",
+        "flap@48"
+      ],
+      "sampled_phases": 10,
+      "solver_substeps": 64,
+      "source_cell_rebuild": {
+        "p50_us": 4.8,
+        "p95_us": 7.0,
+        "p99_us": 11.8
+      },
+      "source_cells": 217,
+      "source_parts": 6,
+      "terrain_transition_sweeps": {
+        "accepted": 8,
+        "blocked": 0,
+        "cases": [
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2472.5,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 30.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2187.4,
+            "from_tick": 30.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 60.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2750.5,
+            "from_tick": 60.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 90.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2257.2,
+            "from_tick": 90.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 120.0
+          },
+          {
+            "blocked": false,
+            "clip": "flap",
+            "complete_update_query_step_us": 2521.1,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 12.0
+          },
+          {
+            "blocked": false,
+            "clip": "flap",
+            "complete_update_query_step_us": 2769.5,
+            "from_tick": 12.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 24.0
+          },
+          {
+            "blocked": false,
+            "clip": "flap",
+            "complete_update_query_step_us": 2519.2999999999997,
+            "from_tick": 24.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 36.0
+          },
+          {
+            "blocked": false,
+            "clip": "flap",
+            "complete_update_query_step_us": 2805.1,
+            "from_tick": 36.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 48.0
+          }
+        ],
+        "complete_transition_query_step": {
+          "p50_us": 2521.1,
+          "p95_us": 2805.1,
+          "p99_us": 2805.1
+        },
+        "same_clip_transitions": 8
+      },
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 6,
+      "warmup": 10
+    },
+    {
+      "animal": "crow",
+      "body_count": 7,
+      "clips": 2,
+      "collider_count": 6,
+      "collider_primitives": 14,
+      "initial_attachment": {
+        "p50_us": 12.700000000000001,
+        "p95_us": 12.799999999999999,
+        "p99_us": 15.2
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 6,
+      "pose_refresh_ray_step": {
+        "p50_us": 115.8,
+        "p95_us": 125.4,
+        "p99_us": 156.79999999999998
+      },
+      "ray_checks": 6546,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "merged_cuboids",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "flap@0",
+        "flap@12",
+        "flap@24",
+        "flap@36",
+        "flap@48"
+      ],
+      "sampled_phases": 10,
+      "solver_substeps": 64,
+      "source_cell_rebuild": {
+        "p50_us": 2.3,
+        "p95_us": 3.1999999999999997,
+        "p99_us": 4.6
+      },
+      "source_cells": 217,
+      "source_parts": 6,
+      "terrain_transition_sweeps": {
+        "accepted": 8,
+        "blocked": 0,
+        "cases": [
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2854.2,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 30.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2510.8,
+            "from_tick": 30.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 60.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2894.1000000000004,
+            "from_tick": 60.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 90.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 2496.8999999999996,
+            "from_tick": 90.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 120.0
+          },
+          {
+            "blocked": false,
+            "clip": "flap",
+            "complete_update_query_step_us": 2792.6,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 12.0
+          },
+          {
+            "blocked": false,
+            "clip": "flap",
+            "complete_update_query_step_us": 2654.3,
+            "from_tick": 12.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 24.0
+          },
+          {
+            "blocked": false,
+            "clip": "flap",
+            "complete_update_query_step_us": 2774.5,
+            "from_tick": 24.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 36.0
+          },
+          {
+            "blocked": false,
+            "clip": "flap",
+            "complete_update_query_step_us": 2725.1,
+            "from_tick": 36.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 6,
+            "terrain_collider_count": 2,
+            "to_tick": 48.0
+          }
+        ],
+        "complete_transition_query_step": {
+          "p50_us": 2774.5,
+          "p95_us": 2894.1000000000004,
+          "p99_us": 2894.1000000000004
+        },
+        "same_clip_transitions": 8
+      },
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 6,
+      "warmup": 10
+    },
+    {
+      "animal": "deer",
+      "body_count": 10,
+      "clips": 2,
+      "collider_count": 9,
+      "collider_primitives": 9,
+      "initial_attachment": {
+        "p50_us": 42.0,
+        "p95_us": 47.5,
+        "p99_us": 63.0
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 9,
+      "pose_refresh_ray_step": {
+        "p50_us": 137.3,
+        "p95_us": 150.4,
+        "p99_us": 170.29999999999998
+      },
+      "ray_checks": 8604,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "native_voxels",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "walk@0",
+        "walk@12",
+        "walk@24",
+        "walk@36",
+        "walk@48"
+      ],
+      "sampled_phases": 10,
+      "solver_substeps": 64,
+      "source_cell_rebuild": {
+        "p50_us": 3.7,
+        "p95_us": 13.5,
+        "p99_us": 13.8
+      },
+      "source_cells": 285,
+      "source_parts": 9,
+      "terrain_transition_sweeps": {
+        "accepted": 8,
+        "blocked": 0,
+        "cases": [
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 4520.4,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 30.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 4230.4,
+            "from_tick": 30.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 60.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 4345.2,
+            "from_tick": 60.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 90.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 4289.0,
+            "from_tick": 90.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 120.0
+          },
+          {
+            "blocked": false,
+            "clip": "walk",
+            "complete_update_query_step_us": 4058.4,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 12.0
+          },
+          {
+            "blocked": false,
+            "clip": "walk",
+            "complete_update_query_step_us": 4648.700000000001,
+            "from_tick": 12.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 24.0
+          },
+          {
+            "blocked": false,
+            "clip": "walk",
+            "complete_update_query_step_us": 4404.7,
+            "from_tick": 24.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 36.0
+          },
+          {
+            "blocked": false,
+            "clip": "walk",
+            "complete_update_query_step_us": 4632.4,
+            "from_tick": 36.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 48.0
+          }
+        ],
+        "complete_transition_query_step": {
+          "p50_us": 4404.7,
+          "p95_us": 4648.700000000001,
+          "p99_us": 4648.700000000001
+        },
+        "same_clip_transitions": 8
+      },
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 9,
+      "warmup": 10
+    },
+    {
+      "animal": "deer",
+      "body_count": 10,
+      "clips": 2,
+      "collider_count": 9,
+      "collider_primitives": 21,
+      "initial_attachment": {
+        "p50_us": 17.8,
+        "p95_us": 18.2,
+        "p99_us": 21.3
+      },
+      "miss_checks": 11,
+      "negative_origin_parts": 9,
+      "pose_refresh_ray_step": {
+        "p50_us": 136.7,
+        "p95_us": 153.39999999999998,
+        "p99_us": 166.0
+      },
+      "ray_checks": 8604,
+      "ray_mismatches": 0,
+      "repeats": 100,
+      "representation": "merged_cuboids",
+      "sampled_clip_phases": [
+        "idle@0",
+        "idle@30",
+        "idle@60",
+        "idle@90",
+        "idle@120",
+        "walk@0",
+        "walk@12",
+        "walk@24",
+        "walk@36",
+        "walk@48"
+      ],
+      "sampled_phases": 10,
+      "solver_substeps": 64,
+      "source_cell_rebuild": {
+        "p50_us": 1.5,
+        "p95_us": 6.1,
+        "p99_us": 6.6000000000000005
+      },
+      "source_cells": 285,
+      "source_parts": 9,
+      "terrain_transition_sweeps": {
+        "accepted": 8,
+        "blocked": 0,
+        "cases": [
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 4948.1,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 30.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 5168.4,
+            "from_tick": 30.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 60.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 4887.9,
+            "from_tick": 60.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 90.0
+          },
+          {
+            "blocked": false,
+            "clip": "idle",
+            "complete_update_query_step_us": 5479.5,
+            "from_tick": 90.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 120.0
+          },
+          {
+            "blocked": false,
+            "clip": "walk",
+            "complete_update_query_step_us": 4799.5,
+            "from_tick": 0.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 12.0
+          },
+          {
+            "blocked": false,
+            "clip": "walk",
+            "complete_update_query_step_us": 5263.4,
+            "from_tick": 12.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 24.0
+          },
+          {
+            "blocked": false,
+            "clip": "walk",
+            "complete_update_query_step_us": 4803.400000000001,
+            "from_tick": 24.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 36.0
+          },
+          {
+            "blocked": false,
+            "clip": "walk",
+            "complete_update_query_step_us": 5290.099999999999,
+            "from_tick": 36.0,
+            "hit_part_id": null,
+            "hit_time_of_impact": null,
+            "independent_clearance_proven": true,
+            "source_part_count": 9,
+            "terrain_collider_count": 2,
+            "to_tick": 48.0
+          }
+        ],
+        "complete_transition_query_step": {
+          "p50_us": 5168.4,
+          "p95_us": 5479.5,
+          "p99_us": 5479.5
+        },
+        "same_clip_transitions": 8
+      },
+      "timed_ray_miss_count": 0,
+      "timed_ray_misses": [],
+      "timed_ray_queries_per_pose": 9,
+      "warmup": 10
+    }
+  ],
+  "rig": "one_position_kinematic_body_per_source_part",
+  "scenario": "eng210_actual_animal_kinematic_parts_bounded",
+  "solver_substeps": 64,
+  "source": "authored SPVX trout/crow/deer, exact 6.25 cm cells, all clips/phases",
+  "terrain_transition_contract": "continuous casts of every occupied source-cell Cuboid; linear part-body origin and shortest-arc rotation; 10 degree root yaw; bounded by one million cell-terrain casts",
+  "transition_representation_disagreements": 0
+}
