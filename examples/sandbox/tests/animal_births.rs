@@ -282,7 +282,7 @@ fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
     let mut cubes = 0;
     for _ in 0..200 {
         cubes = view
-            .instances(creatures, 0.0, std::time::Instant::now())
+            .instances(creatures, 0.0, std::time::Instant::now(), None)
             .len();
     }
     let per_call = started.elapsed() / 200;
@@ -292,6 +292,101 @@ fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
         per_call * 6 < std::time::Duration::from_millis(2),
         "{per_call:?} per 6 animals"
     );
+}
+
+/// The 1 km world's herd (24 deer, 12 crows, 3 bears, 3 snow leopards,
+/// 6 trout) scattered over a 60 m square around the origin, half of them
+/// moving, at varied headings and clip phases.
+fn one_km_herd() -> spall_client::replica_creatures::ReplicaCreatures {
+    let mut creatures = spall_client::replica_creatures::ReplicaCreatures::new();
+    let roster = [
+        ("deer", 24),
+        ("crow", 12),
+        ("bear", 3),
+        ("snow_leopard", 3),
+        ("trout", 6),
+    ];
+    let mut id = 1_u64;
+    for (species, count) in roster {
+        for i in 0..count {
+            let a = id as f64 * 2.399;
+            let r = 30.0 * ((id as f64 * 0.618).fract());
+            let yaw = (id as f32 * 1.7).rem_euclid(std::f32::consts::TAU);
+            let (s, c) = (yaw * 0.5).sin_cos();
+            creatures
+                .spawn(&spall_protocol::CreatureSpawn {
+                    schema: spall_protocol::WIRE_SCHEMA_VERSION,
+                    creature: spall_protocol::CreatureRecord {
+                        creature_id: id,
+                        species: species.to_owned(),
+                        translation_m: [r * a.cos(), 1.0, r * a.sin()],
+                        rotation_xyzw: [0.0, s, 0.0, c],
+                        locomotion_tag: (i % 2) as u8,
+                        clip_phase_tick: id * 7,
+                    },
+                })
+                .unwrap();
+            id += 1;
+        }
+    }
+    creatures
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "timing budget is only meaningful in release"
+)]
+fn drawing_the_one_km_herd_each_frame() {
+    use sandbox::animal_view::AnimalView;
+    use spall_client::window::CreatureView;
+
+    use spall_client::window::{CreatureCull, DEFAULT_VIEW_DISTANCE_M};
+
+    let creatures = one_km_herd();
+    let view = AnimalView::new().unwrap();
+    // The game camera's cone (75 degree vertical FOV at 16:9) from `eye`.
+    let camera = |eye: [f64; 3], forward: [f32; 3]| CreatureCull {
+        apex_m: [eye[0] - 3.0 * f64::from(forward[0]), eye[1], eye[2]],
+        forward,
+        half_angle_rad: ((37.5_f32).to_radians().tan()
+            * (1.0_f32 + (16.0 / 9.0_f32).powi(2)).sqrt())
+        .atan(),
+        eye_m: eye,
+        max_distance_m: DEFAULT_VIEW_DISTANCE_M + 3.0,
+    };
+    let cases = [
+        ("no cull", None),
+        (
+            "inside the herd",
+            Some(camera([0.0, 2.0, 0.0], [1.0, 0.0, 0.0])),
+        ),
+        (
+            "herd edge, looking away",
+            Some(camera([35.0, 2.0, 0.0], [1.0, 0.0, 0.0])),
+        ),
+        (
+            "200 m away, looking at it",
+            Some(camera([200.0, 2.0, 0.0], [-1.0, 0.0, 0.0])),
+        ),
+    ];
+    let frames = 120;
+    let mut drawn = Vec::new();
+    for (name, cull) in cases {
+        let started = std::time::Instant::now();
+        let mut cubes = 0;
+        for _ in 0..frames {
+            cubes = view
+                .instances(&creatures, 0.0, std::time::Instant::now(), cull.as_ref())
+                .len();
+        }
+        let per_call = started.elapsed() / frames;
+        eprintln!("1 km herd, {name}: {cubes} cubes, {per_call:?} per frame");
+        drawn.push(cubes);
+    }
+    assert!(drawn[1] > 0 && drawn[1] < drawn[0], "{drawn:?}");
+    assert_eq!(drawn[2], 0, "{drawn:?}");
+    assert_eq!(drawn[3], 0, "{drawn:?}");
 }
 
 #[test]
