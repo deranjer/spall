@@ -37,6 +37,9 @@ pub enum CreatureAction {
     Fly(spall_sim::CreatureMoveRequest),
     /// A walking creature's step.
     Walk(spall_sim::CreatureWalkRequest),
+    /// A creature eats the ground cover in one terrain column (cells), through
+    /// the same destroyed-cover record a surface edit makes.
+    Graze { creature_id: u64, column: [i64; 2] },
 }
 
 impl CreatureAction {
@@ -44,6 +47,7 @@ impl CreatureAction {
         match self {
             Self::Fly(request) => request.creature_id,
             Self::Walk(request) => request.creature_id,
+            Self::Graze { creature_id, .. } => *creature_id,
         }
     }
 }
@@ -52,6 +56,8 @@ impl CreatureAction {
 pub enum CreatureActionOutcome {
     Fly(spall_sim::CreatureMoveOutcome),
     Walked(spall_sim::CreatureWalkOutcome),
+    /// Whether there was cover to eat.
+    Grazed(bool),
 }
 
 pub trait CreatureDirector: Send {
@@ -196,6 +202,9 @@ impl CreatureService {
                 CreatureAction::Walk(request) => sim
                     .walk_creature(request)
                     .map(CreatureActionOutcome::Walked),
+                CreatureAction::Graze { column, .. } => Ok(CreatureActionOutcome::Grazed(
+                    sim.graze_cover(column[0], column[1]),
+                )),
             };
             match result {
                 Ok(outcome) => outcomes.push((creature_id, outcome)),
