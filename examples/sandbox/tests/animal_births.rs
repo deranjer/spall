@@ -564,3 +564,140 @@ fn a_grazing_deer_eats_the_grass_under_its_muzzle() {
     });
     assert!(ran, "a player beside a grazing deer did not make it flee");
 }
+
+/// A stone world `width` x `depth` cells: a 2-cell floor, raised to
+/// `plateau_top` (inclusive cell) from `plateau_x` on in x, with resident air
+/// above both up to `height` so downward ground queries find the surface.
+fn terrain_simulation(
+    width: i64,
+    depth: i64,
+    height: i64,
+    plateau_x: i64,
+    plateau_top: i64,
+) -> Simulation {
+    use spall_core::{GlobalCell, MaterialId};
+    use spall_voxel::EditPlan;
+
+    let mut setup = fixtures::flat_terrain_setup();
+    let id = setup.terrain.id();
+    let mut volume = spall_voxel::Volume::new(id, spall_core::CellSizeCode::Quarter);
+    let mut fill = |a: [i64; 3], b: [i64; 3], material: MaterialId| {
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(a[0], a[1], a[2]),
+                GlobalCell::new(b[0], b[1], b[2]),
+                material,
+            ))
+            .unwrap();
+    };
+    fill([0, 0, 0], [width - 1, 1, depth - 1], fixtures::STONE);
+    if plateau_x < width {
+        fill(
+            [plateau_x, 0, 0],
+            [width - 1, plateau_top, depth - 1],
+            fixtures::STONE,
+        );
+        fill(
+            [plateau_x, plateau_top + 1, 0],
+            [width - 1, height - 1, depth - 1],
+            MaterialId::AIR,
+        );
+    }
+    fill(
+        [0, 2, 0],
+        [plateau_x.min(width) - 1, height - 1, depth - 1],
+        MaterialId::AIR,
+    );
+    setup.terrain = volume;
+    setup.terrain_collider_region = (
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(width - 1, height - 1, depth - 1),
+    );
+    setup.materials = sandbox::game::manifest();
+    let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
+    sim.initialize_creature_host().unwrap();
+    sim
+}
+
+fn step(sim: &mut Simulation, service: &CreatureService) {
+    sim.tick().unwrap();
+    service.run_tick(sim).unwrap();
+    service.run_motion(sim).unwrap();
+}
+
+/// Circling crows over a wide flat field now and then come down, hop and peck
+/// on the ground, and climb back to their circle; a player walking up to a
+/// grounded crow sends it up early.
+#[test]
+fn crows_land_hop_and_peck_then_take_off_and_flee_a_near_player() {
+    use sandbox::animals::{
+        LOCOMOTION_HOP, LOCOMOTION_LAND, LOCOMOTION_MOVE, LOCOMOTION_PECK, LOCOMOTION_TAKEOFF,
+    };
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE};
+
+    // 48 m square, 16 m of air over a floor whose top face is at 0.5 m.
+    let mut sim = terrain_simulation(192, 192, 64, 192, 0);
+    let director = AnimalDirector::new(vec![[24.0, 0.5, 24.0]], &[0, 3], 23)
+        .unwrap()
+        .with_radius_m(0.0, 2.0);
+    let service = CreatureService::new(Box::new(director));
+    let grounded = |y: f64| y < 0.5 + 0.6;
+    // Per crow: the stages seen in order (landing, on the ground, taking off,
+    // circling high again).
+    let mut stage: std::collections::BTreeMap<u64, u8> = Default::default();
+    let mut full_cycle = None;
+    for _ in 0..30_000 {
+        step(&mut sim, &service);
+        for crow in sim.creature_records() {
+            let s = stage.entry(crow.creature_id).or_default();
+            let y = crow.translation_m[1];
+            *s = match (*s, crow.locomotion_tag) {
+                (0, LOCOMOTION_LAND) => 1,
+                (1, LOCOMOTION_HOP | LOCOMOTION_PECK) if grounded(y) => 2,
+                (2, LOCOMOTION_TAKEOFF) => 3,
+                (3, LOCOMOTION_MOVE) if y > 2.5 => 4,
+                (s, _) => s,
+            };
+            if *s == 4 {
+                full_cycle = Some(crow.creature_id);
+            }
+        }
+        if full_cycle.is_some() {
+            break;
+        }
+    }
+    assert!(
+        full_cycle.is_some(),
+        "no crow landed, pecked and flew again: stages {stage:?}"
+    );
+
+    // Wait until a crow is on the ground, then put a player 4 m from it.
+    let crow = (0..30_000)
+        .find_map(|_| {
+            step(&mut sim, &service);
+            sim.creature_records().into_iter().find(|c| {
+                matches!(c.locomotion_tag, LOCOMOTION_HOP | LOCOMOTION_PECK)
+                    && grounded(c.translation_m[1])
+            })
+        })
+        .expect("a crow lands again");
+    let at = crow.translation_m;
+    sim.add_player(
+        EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap(),
+        [at[0] + 4.0, 0.6, at[2]],
+    );
+    for _ in 0..60 {
+        step(&mut sim, &service);
+    }
+    let now = sim
+        .creature_records()
+        .into_iter()
+        .find(|c| c.creature_id == crow.creature_id)
+        .unwrap();
+    assert_eq!(now.locomotion_tag, LOCOMOTION_TAKEOFF, "{now:?}");
+    assert!(
+        now.translation_m[1] > at[1] + 1.0,
+        "the spooked crow did not climb: {now:?}"
+    );
+}

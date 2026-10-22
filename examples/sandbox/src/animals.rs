@@ -35,6 +35,9 @@ struct SpeciesDef {
     flee_speed_m_s: Option<f64>,
     /// Crops the grass under its mouth (`graze` clip) now and then while resting.
     grazes: bool,
+    /// A flyer that sometimes lands, hops and pecks on the ground, walking on
+    /// its `capsule_m` there.
+    perches: bool,
 }
 
 const SPECIES: [SpeciesDef; 5] = [
@@ -48,16 +51,20 @@ const SPECIES: [SpeciesDef; 5] = [
         // Faster than a sprinting player (5.8 m/s), so a chase is lost.
         flee_speed_m_s: Some(7.5),
         grazes: true,
+        perches: false,
     },
     SpeciesDef {
         key: "crow",
         habitat: AnimalHabitat::Flying,
         bytes: include_bytes!("../assets/animals/crow.spvox"),
         move_clip: "flap",
-        walk_speed_m_s: 0.0,
-        capsule_m: (0.0, 0.0),
+        // Hopping pace on the ground.
+        walk_speed_m_s: 0.8,
+        // Feet and folded body, for hopping on the ground.
+        capsule_m: (0.08, 0.04),
         flee_speed_m_s: None,
         grazes: false,
+        perches: true,
     },
     SpeciesDef {
         key: "trout",
@@ -68,6 +75,7 @@ const SPECIES: [SpeciesDef; 5] = [
         capsule_m: (0.0, 0.0),
         flee_speed_m_s: None,
         grazes: false,
+        perches: false,
     },
     SpeciesDef {
         key: "bear",
@@ -78,6 +86,7 @@ const SPECIES: [SpeciesDef; 5] = [
         capsule_m: (0.45, 0.1),
         flee_speed_m_s: None,
         grazes: false,
+        perches: false,
     },
     SpeciesDef {
         key: "snow_leopard",
@@ -88,6 +97,7 @@ const SPECIES: [SpeciesDef; 5] = [
         capsule_m: (0.28, 0.1),
         flee_speed_m_s: None,
         grazes: false,
+        perches: false,
     },
 ];
 /// Gap kept between an animal's lowest cell and the terrain it stands on.
@@ -107,6 +117,27 @@ const GRASS: spall_core::MaterialId = spall_core::MaterialId(10);
 const GRAZE_CHANCE: f64 = 0.5;
 /// Ticks between bites while grazing (1.5 s).
 const BITE_TICKS: u64 = 90;
+/// A perching flyer descending to the ground (`land` clip).
+pub const LOCOMOTION_LAND: u8 = 5;
+/// Hopping along the ground (`hop` clip).
+pub const LOCOMOTION_HOP: u8 = 6;
+/// Pecking at the ground where it stands (`peck` clip).
+pub const LOCOMOTION_PECK: u8 = 7;
+/// Climbing from the ground back to its circle (`takeoff` clip).
+pub const LOCOMOTION_TAKEOFF: u8 = 8;
+/// Chance per update (7.5 Hz) that a circling perching flyer goes down: about
+/// once every 30 s of circling.
+const LAND_CHANCE: f64 = 1.0 / 225.0;
+/// Highest drop a flyer descends to land, metres.
+const MAX_LANDING_DROP_M: f64 = 25.0;
+const DESCEND_M_S: f64 = 3.0;
+const CLIMB_M_S: f64 = 4.0;
+/// A player this close to a landing or grounded flyer, or a sprinting one
+/// within twice this, sends it back up.
+const SPOOK_M: f64 = 10.0;
+/// How far a circling bird may climb over its first height to get round
+/// whatever blocks its circle; past that it turns round instead (ENG-230).
+const MAX_ORBIT_CLIMB_M: f64 = 12.0;
 /// A player this close is noticed by a fleeing species, which stops to watch.
 const NOTICE_M: f64 = 28.0;
 /// A player this close, or a sprinting one inside the notice distance, makes
@@ -134,6 +165,10 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
         LOCOMOTION_ALERT if def.flee_speed_m_s.is_some() => Some("alert"),
         LOCOMOTION_RUN if def.flee_speed_m_s.is_some() => Some("run"),
         LOCOMOTION_GRAZE if def.grazes => Some("graze"),
+        LOCOMOTION_LAND if def.perches => Some("land"),
+        LOCOMOTION_HOP if def.perches => Some("hop"),
+        LOCOMOTION_PECK if def.perches => Some("peck"),
+        LOCOMOTION_TAKEOFF if def.perches => Some("takeoff"),
         _ => None,
     }
 }
@@ -156,6 +191,7 @@ pub struct AnimalSpecies {
     /// Pace when fleeing players; `None` for species that ignore them.
     pub flee_speed_m_s: Option<f64>,
     pub grazes: bool,
+    pub perches: bool,
 }
 
 /// Decodes every authored species.
@@ -173,6 +209,7 @@ pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
                 capsule_m: def.capsule_m,
                 flee_speed_m_s: def.flee_speed_m_s,
                 grazes: def.grazes,
+                perches: def.perches,
             })
         })
         .collect()
@@ -234,6 +271,19 @@ enum Gait {
     /// Stand cropping the grass under the mouth, a bite every [`BITE_TICKS`],
     /// until `until` or the grass in reach is gone.
     Graze { until: u64, next_bite: u64 },
+    /// A circling bird descending to `target` on the ground. `orbit` is the
+    /// circle it left, `[theta, omega, radius]`, to return to.
+    Land { target: [f64; 3], orbit: [f64; 3] },
+    /// On the ground until `until`: hopping to `hop` (x, z) if set, else
+    /// pecking where it stands, until `act_until`.
+    Perch {
+        until: u64,
+        act_until: u64,
+        hop: Option<[f64; 2]>,
+        orbit: [f64; 3],
+    },
+    /// Climbing back to its circle.
+    TakeOff { orbit: [f64; 3] },
 }
 
 /// The nearest player to an animal, horizontally.
@@ -265,6 +315,20 @@ fn nearest_threat(players: &[([f64; 3], bool)], here: [f64; 3]) -> Option<Threat
         .min_by(|a, b| a.distance_m.total_cmp(&b.distance_m))
 }
 
+/// What a perching bird does this update.
+struct BirdStep {
+    tag: u8,
+    yaw: f64,
+    desired: [f64; 2],
+    fly_target: [f64; 3],
+    /// See `fly` in the motion loop: `None` walks.
+    fly: Option<bool>,
+}
+
+fn wrap_angle(angle: f64) -> f64 {
+    (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Walker {
     species: usize,
@@ -283,6 +347,8 @@ struct Walker {
     stuck: u32,
     /// Detours tried since the animal last made progress.
     detours: u32,
+    /// Highest a circling bird's `home` may climb (ENG-230).
+    max_home_y: f64,
 }
 
 struct Placement {
@@ -301,6 +367,9 @@ pub struct AnimalDirector {
     envelope_m: Vec<DVec3>,
     /// How far ahead of the root the mouth reaches the ground while grazing.
     mouth_m: Vec<f64>,
+    /// Root-to-lowest-foot offset over the ground clips (idle, hop, peck) of a
+    /// perching flyer, whose wingbeats reach lower than its feet.
+    perch_feet: Vec<f32>,
     /// Terrain materials that count as grass.
     grass: Vec<spall_core::MaterialId>,
     anchors: Vec<[f64; 3]>,
@@ -354,6 +423,18 @@ impl AnimalDirector {
             .iter()
             .map(|visual| f64::from(clip_bounds(visual, &["graze"]).1.x.max(0.0)))
             .collect();
+        let perch_feet = species
+            .iter()
+            .zip(&visuals)
+            .zip(&walk_feet)
+            .map(|((species, visual), &feet)| {
+                if species.perches {
+                    clip_bounds(visual, &["idle", "hop", "peck"]).0.y
+                } else {
+                    feet
+                }
+            })
+            .collect();
         let grass = std::iter::once(GRASS)
             .chain(
                 crate::appearance::variants()
@@ -368,6 +449,7 @@ impl AnimalDirector {
             walk_feet,
             envelope_m,
             mouth_m,
+            perch_feet,
             grass,
             anchors,
             targets: (0..count)
@@ -552,8 +634,181 @@ impl AnimalDirector {
                 }
                 _ => {}
             },
-            Gait::Orbit { .. } => {}
+            Gait::Orbit { .. } | Gait::Land { .. } | Gait::Perch { .. } | Gait::TakeOff { .. } => {}
         }
+    }
+
+    /// Sends a landing or grounded bird back up when a player comes close.
+    fn spook(walker: &mut Walker, threat: Option<Threat>) {
+        let near = threat.is_some_and(|t| {
+            t.distance_m < SPOOK_M || (t.sprinting && t.distance_m < 2.0 * SPOOK_M)
+        });
+        if let (true, Gait::Land { orbit, .. } | Gait::Perch { orbit, .. }) = (near, walker.gait) {
+            walker.stuck = 0;
+            walker.gait = Gait::TakeOff { orbit };
+        }
+    }
+
+    /// One update of a perching bird's landing, time on the ground, or climb
+    /// back to its circle.
+    fn bird_step(&mut self, walker: &mut Walker, here: [f64; 3], tick: u64) -> BirdStep {
+        let mut step = BirdStep {
+            tag: LOCOMOTION_PECK,
+            yaw: walker.yaw,
+            desired: [0.0; 2],
+            fly_target: here,
+            fly: None,
+        };
+        let toward = |from: [f64; 3], to: [f64; 3], max: f64| -> ([f64; 3], bool) {
+            let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+            let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if length <= max {
+                (to, true)
+            } else {
+                let k = max / length;
+                (
+                    [from[0] + d[0] * k, from[1] + d[1] * k, from[2] + d[2] * k],
+                    false,
+                )
+            }
+        };
+        match walker.gait {
+            Gait::Land { target, orbit } => {
+                let (next, arrived) = toward(here, target, DESCEND_M_S * MOVE_DT_S);
+                if arrived {
+                    walker.gait = Gait::Perch {
+                        until: tick + 600 + self.next() % 600,
+                        act_until: tick + 60,
+                        hop: None,
+                        orbit,
+                    };
+                }
+                step.tag = LOCOMOTION_LAND;
+                step.fly_target = next;
+                step.fly = Some(true);
+            }
+            Gait::Perch {
+                until,
+                act_until,
+                hop,
+                orbit,
+            } => {
+                if tick >= until {
+                    walker.stuck = 0;
+                    walker.gait = Gait::TakeOff { orbit };
+                    step.tag = LOCOMOTION_TAKEOFF;
+                } else if let Some(goal) = hop {
+                    let (dx, dz) = (goal[0] - here[0], goal[1] - here[2]);
+                    let distance = dx.hypot(dz);
+                    if distance < 0.1 || walker.stuck >= 2 || tick >= act_until {
+                        // Arrived (or cannot get there): peck for a while.
+                        walker.gait = Gait::Perch {
+                            until,
+                            act_until: tick + 60 + self.next() % 90,
+                            hop: None,
+                            orbit,
+                        };
+                    } else {
+                        let want = f64::atan2(-dz, dx);
+                        step.yaw = walker.yaw + wrap_angle(want - walker.yaw).clamp(-0.8, 0.8);
+                        let pace = self.species[walker.species].walk_speed_m_s * MOVE_DT_S;
+                        let reach = pace.min(distance);
+                        step.desired = [dx / distance * reach, dz / distance * reach];
+                        step.tag = LOCOMOTION_HOP;
+                    }
+                } else if tick >= act_until {
+                    // Pecked enough here: hop a short way, or keep pecking.
+                    let hop = if self.unit() < 0.55 {
+                        let angle = self.unit() * std::f64::consts::TAU;
+                        let distance = 0.3 + self.unit() * 0.7;
+                        walker.stuck = 0;
+                        Some([
+                            here[0] + distance * angle.cos(),
+                            here[2] - distance * angle.sin(),
+                        ])
+                    } else {
+                        None
+                    };
+                    walker.gait = Gait::Perch {
+                        until,
+                        act_until: tick
+                            + if hop.is_some() {
+                                180
+                            } else {
+                                60 + self.next() % 90
+                            },
+                        hop,
+                        orbit,
+                    };
+                }
+            }
+            Gait::TakeOff {
+                orbit: [theta, omega, radius],
+            } => {
+                let circle = [
+                    walker.home[0] + radius * theta.cos(),
+                    walker.home[1],
+                    walker.home[2] + radius * theta.sin(),
+                ];
+                let climb = CLIMB_M_S * MOVE_DT_S;
+                step.tag = LOCOMOTION_TAKEOFF;
+                step.fly = Some(true);
+                if walker.stuck > 8 {
+                    // Boxed in: stay on the ground a while longer.
+                    walker.stuck = 0;
+                    walker.gait = Gait::Perch {
+                        until: tick + 300,
+                        act_until: tick + 60,
+                        hop: None,
+                        orbit: [theta, omega, radius],
+                    };
+                    step.fly = None;
+                    step.tag = LOCOMOTION_PECK;
+                } else if walker.stuck > 0 {
+                    // Blocked on the way: go straight up first.
+                    step.fly_target = [here[0], here[1] + climb, here[2]];
+                } else {
+                    let (next, arrived) = toward(here, circle, climb);
+                    step.fly_target = next;
+                    let (dx, dz) = (circle[0] - here[0], circle[2] - here[2]);
+                    if dx.hypot(dz) > 0.5 {
+                        step.yaw = f64::atan2(-dz, dx);
+                    }
+                    if arrived {
+                        walker.gait = Gait::Orbit {
+                            theta,
+                            omega,
+                            radius,
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+        step
+    }
+
+    /// Where a circling bird at `here` would land: the ground straight below,
+    /// if it is near enough and dry.
+    fn landing_spot(&self, sim: &Simulation, species: usize, here: [f64; 3]) -> Option<[f64; 3]> {
+        let (x, z) = (
+            (here[0] / 0.25).floor() as i64,
+            (here[2] / 0.25).floor() as i64,
+        );
+        let ground = Self::ground_y_m(sim, x, z)?;
+        if here[1] - ground > MAX_LANDING_DROP_M {
+            return None;
+        }
+        let wet = sim.column_water().is_some_and(|water| {
+            water
+                .water_sample_at_m(here[0], ground + 0.1, here[2])
+                .is_some_and(|w| w.surface_y > ground + 0.05)
+        });
+        if wet {
+            return None;
+        }
+        let root_y = ground - f64::from(self.perch_feet[species]) + GROUND_CLEARANCE_M;
+        Some([here[0], root_y, here[2]])
     }
 
     fn birth(&self, placement: &Placement, ids: &mut CreatureIdPlan) -> CreatureRecord {
@@ -643,6 +898,7 @@ impl CreatureDirector for AnimalDirector {
                             detours: 0,
                             yaw: placement.yaw_rad,
                             at: placement.root_m.to_array(),
+                            max_home_y: home[1] + MAX_ORBIT_CLIMB_M,
                         },
                     );
                 }
@@ -673,13 +929,38 @@ impl CreatureDirector for AnimalDirector {
         match outcome {
             CreatureActionOutcome::Fly(CreatureMoveOutcome::Blocked) => {
                 self.stats[walker.species].1 += 1;
-                // A bird whose circle hits something solid (a tree) flies higher.
-                if matches!(walker.gait, Gait::Orbit { .. }) {
-                    walker.home[1] += 1.5;
+                match walker.gait {
+                    // A bird whose circle hits something solid (a tree) flies
+                    // higher, up to a limit; past it, it circles the other way.
+                    Gait::Orbit {
+                        theta,
+                        omega,
+                        radius,
+                    } => {
+                        if walker.home[1] + 1.5 <= walker.max_home_y {
+                            walker.home[1] += 1.5;
+                        } else {
+                            walker.gait = Gait::Orbit {
+                                theta,
+                                omega: -omega,
+                                radius,
+                            };
+                        }
+                    }
+                    // Something in the way down: give up and go back up.
+                    Gait::Land { orbit, .. } => {
+                        walker.stuck = 0;
+                        walker.gait = Gait::TakeOff { orbit };
+                    }
+                    Gait::TakeOff { .. } => walker.stuck += 1,
+                    _ => {}
                 }
             }
             CreatureActionOutcome::Fly(CreatureMoveOutcome::Moved) => {
                 self.stats[walker.species].0 += 1;
+                if matches!(walker.gait, Gait::TakeOff { .. }) {
+                    walker.stuck = 0;
+                }
             }
             CreatureActionOutcome::Walked(walked) => {
                 self.stats[walker.species].0 += 1;
@@ -716,9 +997,7 @@ impl CreatureDirector for AnimalDirector {
                 }
             }
         }
-        let wrap = |angle: f64| {
-            (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
-        };
+        let wrap = wrap_angle;
         let players: Vec<([f64; 3], bool)> = sim
             .world()
             .players()
@@ -738,17 +1017,24 @@ impl CreatureDirector for AnimalDirector {
             };
             let here = alive.translation_m;
             walker.at = here;
-            let flying = matches!(walker.gait, Gait::Orbit { .. });
             // `desired` is the horizontal step for a walker; `target` the root target
-            // for a flyer. Neither is set while resting.
+            // for a flyer. Neither is set while resting. `fly` is set for a flying
+            // step: `Some(true)` near the ground, on the small ground capsule.
             let mut desired = [0.0_f64; 2];
             let mut fly_target = here;
+            let mut fly: Option<bool> = None;
             let mut yaw = walker.yaw;
             let mut tag = LOCOMOTION_IDLE;
             let flee_speed = self.species[walker.species].flee_speed_m_s;
-            let threat = flee_speed.and_then(|_| nearest_threat(&players, here));
+            let perches = self.species[walker.species].perches;
+            let threat = (flee_speed.is_some() || perches)
+                .then(|| nearest_threat(&players, here))
+                .flatten();
             if flee_speed.is_some() {
                 self.react_to_players(&mut walker, threat, tick);
+            }
+            if perches {
+                Self::spook(&mut walker, threat);
             }
             match walker.gait {
                 Gait::Rest { until } => {
@@ -831,6 +1117,24 @@ impl CreatureDirector for AnimalDirector {
                     // Tangent of the circle, nose along the direction of travel.
                     yaw = f64::atan2(-theta.cos() * omega.signum(), -theta.sin() * omega.signum());
                     tag = LOCOMOTION_MOVE;
+                    fly = Some(false);
+                    // Now and then a perching bird goes down, unless a player is near.
+                    let calm = threat.is_none_or(|t| t.distance_m > 2.0 * SPOOK_M);
+                    if perches
+                        && calm
+                        && self.unit() < LAND_CHANCE
+                        && let Some(target) = self.landing_spot(sim, walker.species, here)
+                    {
+                        walker.gait = Gait::Land {
+                            target,
+                            orbit: [theta, omega, radius],
+                        };
+                    }
+                }
+                Gait::Land { .. } | Gait::Perch { .. } | Gait::TakeOff { .. } => {
+                    let step = self.bird_step(&mut walker, here, tick);
+                    (tag, yaw, desired, fly_target, fly) =
+                        (step.tag, step.yaw, step.desired, step.fly_target, step.fly);
                 }
                 Gait::Alert { .. } => {
                     // Turn to watch the player, a bounded angle per step.
@@ -913,8 +1217,12 @@ impl CreatureDirector for AnimalDirector {
             };
             let (sin, cos) = ((yaw * 0.5).sin(), (yaw * 0.5).cos());
             let rotation = [0.0, sin as f32, 0.0, cos as f32];
-            if flying {
-                actions.push(CreatureAction::Fly(CreatureMoveRequest {
+            let (radius_m, half_height_m) = self.species[walker.species].capsule_m;
+            // Near the ground a perching bird folds its wings: its feet and
+            // capsule are the ground ones.
+            let ground_feet = self.perch_feet[walker.species];
+            actions.push(match fly {
+                Some(false) => CreatureAction::Fly(CreatureMoveRequest {
                     creature_id: id,
                     target_translation_m: fly_target,
                     target_rotation_xyzw: rotation,
@@ -923,19 +1231,28 @@ impl CreatureDirector for AnimalDirector {
                     feet_offset_m: self.walk_feet[walker.species],
                     capsule_radius_m: FLY_CAPSULE_RADIUS_M,
                     capsule_half_height_m: FLY_CAPSULE_HALF_HEIGHT_M,
-                }));
-            } else {
-                actions.push(CreatureAction::Walk(CreatureWalkRequest {
+                }),
+                Some(true) => CreatureAction::Fly(CreatureMoveRequest {
+                    creature_id: id,
+                    target_translation_m: fly_target,
+                    target_rotation_xyzw: rotation,
+                    locomotion_tag: tag,
+                    clip_phase_tick: phase,
+                    feet_offset_m: ground_feet,
+                    capsule_radius_m: radius_m,
+                    capsule_half_height_m: half_height_m,
+                }),
+                None => CreatureAction::Walk(CreatureWalkRequest {
                     creature_id: id,
                     desired_step_m: [desired[0] as f32, desired[1] as f32],
                     target_rotation_xyzw: rotation,
                     locomotion_tag: tag,
                     clip_phase_tick: phase,
-                    feet_offset_m: self.walk_feet[walker.species],
-                    capsule_radius_m: self.species[walker.species].capsule_m.0,
-                    capsule_half_height_m: self.species[walker.species].capsule_m.1,
-                }));
-            }
+                    feet_offset_m: ground_feet,
+                    capsule_radius_m: radius_m,
+                    capsule_half_height_m: half_height_m,
+                }),
+            });
         }
         actions
     }
@@ -967,6 +1284,14 @@ mod tests {
             if species.grazes {
                 sends.push(LOCOMOTION_GRAZE);
             }
+            if species.perches {
+                sends.extend([
+                    LOCOMOTION_LAND,
+                    LOCOMOTION_HOP,
+                    LOCOMOTION_PECK,
+                    LOCOMOTION_TAKEOFF,
+                ]);
+            }
             for tag in sends {
                 assert!(
                     locomotion_clip(species.key, tag).is_some(),
@@ -984,7 +1309,7 @@ mod tests {
     fn walking_capsules_fit_their_bodies() {
         let materials = crate::animal_visual::material_mapping(&crate::game::manifest());
         for species in species().unwrap() {
-            if species.habitat != AnimalHabitat::Land {
+            if species.habitat != AnimalHabitat::Land && !species.perches {
                 continue;
             }
             let visual = crate::animal_visual::AnimalVisual::new(
@@ -993,7 +1318,12 @@ mod tests {
                 crate::animal_visual::MAX_ANIMAL_VISUAL_CELLS,
             )
             .unwrap();
-            let (lo, hi) = pose_bounds(&visual, species.key);
+            // A perching bird walks with its wings folded.
+            let (lo, hi) = if species.perches {
+                clip_bounds(&visual, &["idle", "hop", "peck"])
+            } else {
+                pose_bounds(&visual, species.key)
+            };
             let (radius, half_height) = species.capsule_m;
             let reach = (hi.x - lo.x).max(hi.z - lo.z);
             assert!(radius > 0.0 && half_height > 0.0, "{} capsule", species.key);
