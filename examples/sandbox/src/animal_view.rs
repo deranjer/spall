@@ -14,9 +14,9 @@ use crate::animals::{AnimalError, LOCOMOTION_IDLE, locomotion_clip, species};
 
 #[derive(Debug)]
 pub struct AnimalView {
-    /// Species key, visual, and whether it is drawn in its palette colours.
-    visuals: Vec<(&'static str, AnimalVisual, bool)>,
-    /// Distinct `(material, tint)` pairs the tinted species paint with.
+    visuals: Vec<(&'static str, AnimalVisual)>,
+    /// Distinct `(material, tint)` pairs the species paint with: animals are
+    /// drawn in their palette colours, not their materials' own.
     tints: Vec<(MaterialId, [u8; 3])>,
     started: Instant,
 }
@@ -28,22 +28,20 @@ impl AnimalView {
         let mut visuals = Vec::new();
         for s in species()? {
             let key = s.key;
-            if s.tinted {
-                for run in s.asset.runs.iter().filter(|run| run.tint_slot != 0) {
-                    let Some(&material) =
-                        mapping.get(&s.asset.material_keys[usize::from(run.material_slot) - 1])
-                    else {
-                        return Err(AnimalError::Asset(key, "unmapped material".into()));
-                    };
-                    let pair = (material, s.asset.tints_srgb[usize::from(run.tint_slot) - 1]);
-                    if !tints.contains(&pair) {
-                        tints.push(pair);
-                    }
+            for run in s.asset.runs.iter().filter(|run| run.tint_slot != 0) {
+                let Some(&material) =
+                    mapping.get(&s.asset.material_keys[usize::from(run.material_slot) - 1])
+                else {
+                    return Err(AnimalError::Asset(key, "unmapped material".into()));
+                };
+                let pair = (material, s.asset.tints_srgb[usize::from(run.tint_slot) - 1]);
+                if !tints.contains(&pair) {
+                    tints.push(pair);
                 }
             }
             let visual = AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
                 .map_err(|e| AnimalError::Asset(key, e.to_string()))?;
-            visuals.push((key, visual, s.tinted));
+            visuals.push((key, visual));
         }
         Ok(Self {
             visuals,
@@ -67,8 +65,8 @@ impl CreatureView for AnimalView {
     ) -> Vec<CubeInstance> {
         let mut out = Vec::new();
         for record in creatures.records() {
-            let Some((species_key, visual, tinted)) =
-                self.visuals.iter().find(|(key, ..)| *key == record.species)
+            let Some((species_key, visual)) =
+                self.visuals.iter().find(|(key, _)| *key == record.species)
             else {
                 continue;
             };
@@ -96,7 +94,6 @@ impl CreatureView for AnimalView {
             out.extend(cells.iter().map(|cell| {
                 let material = cell
                     .tint_srgb
-                    .filter(|_| *tinted)
                     .and_then(|tint| self.tints.iter().position(|t| *t == (cell.material, tint)))
                     .map_or(u32::from(cell.material.0), |i| tint_base + i as u32);
                 CubeInstance::new(
@@ -115,23 +112,19 @@ impl CreatureView for AnimalView {
 mod tests {
     use super::*;
 
-    /// Only species marked `tinted` (wolves) are drawn in palette colours;
-    /// the rest keep their materials' own colours.
+    /// Every palette colour of every species has a material, so no animal
+    /// falls back to its material's own colour (fur is wood, which is brown).
     #[test]
-    fn only_tinted_species_get_palette_materials() {
+    fn every_palette_colour_has_a_material() {
         let view = AnimalView::new().unwrap();
-        let wolf = species()
-            .unwrap()
-            .into_iter()
-            .find(|s| s.key == "wolf")
-            .unwrap();
-        assert!(wolf.tinted);
-        assert!(!view.tints.is_empty());
-        for (_, tint) in &view.tints {
-            assert!(
-                wolf.asset.tints_srgb.contains(tint),
-                "{tint:?} is not a wolf colour"
-            );
+        for s in species().unwrap() {
+            for tint in &s.asset.tints_srgb {
+                assert!(
+                    view.tints.iter().any(|(_, t)| t == tint),
+                    "{} colour {tint:?} has no material",
+                    s.key
+                );
+            }
         }
     }
 }
