@@ -162,6 +162,8 @@ pub struct Simulation {
     retiring: Retiring,
     /// Empty unless the owning application explicitly installs a creature host.
     creatures: Option<crate::creatures::CreatureHost>,
+    /// Carcasses still being placed, one supported layer at a time.
+    carcasses: Vec<creature_death::PendingCarcass>,
 }
 
 /// Frees a large value on a background thread. Dropping a full-size world (hundreds of thousands
