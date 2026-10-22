@@ -295,6 +295,7 @@ enum Gait {
     },
     Deer(deer::DeerGait),
     Bird(birds::BirdGait),
+    Fish(fish::FishGait),
 }
 
 fn wrap_angle(angle: f64) -> f64 {
