@@ -79,6 +79,7 @@ fn current_schema_missing_auxiliary_tables_reject_without_mutation() {
         "checkpoint_snow",
         "checkpoint_vegetation",
         "checkpoint_weather",
+        "checkpoint_players",
         "game_outbox",
     ] {
         let scratch = Scratch::new(&format!("missing-{missing}"));
@@ -178,6 +179,10 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         bodies: vec![],
         column_water: None,
         weather: None,
+        players: vec![spall_store::StoredPlayerHealth {
+            player_id: [3; 16],
+            health: 42,
+        }],
         snow: None,
         bricks: vec![
             StoredBrick {

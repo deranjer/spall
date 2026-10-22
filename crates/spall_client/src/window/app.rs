@@ -60,6 +60,16 @@ pub(super) struct InteractiveApp {
     pub(super) ground_snow_enabled: bool,
     pub(super) reduced_weather_flashes: bool,
     pub(super) weather_exposure: f32,
+    /// Felt cold and wetness, shown as a screen grade (`body_state`).
+    pub(super) body_state: BodyState,
+    /// Admin-menu previews of looks for stats the game does not model yet.
+    pub(super) body_preview: BodyPreview,
+    /// This client's authoritative health, last read from the replica; shown
+    /// as the injury look.
+    pub(super) player_health: Option<spall_protocol::PlayerHealth>,
+    pub(super) body_state_at: Option<Instant>,
+    /// Clock for the screen grade's heartbeat pulse.
+    pub(super) body_epoch: Instant,
     /// Eased 0..1 camera submersion and shared wind strength, from the renderer.
     pub(super) weather_submerge: f32,
     pub(super) weather_wind: f32,
@@ -285,6 +295,11 @@ impl InteractiveApp {
             ground_snow_enabled: true,
             reduced_weather_flashes: false,
             weather_exposure: 1.0,
+            body_state: BodyState::default(),
+            body_preview: BodyPreview::default(),
+            player_health: None,
+            body_state_at: None,
+            body_epoch: Instant::now(),
             weather_submerge: 0.0,
             weather_wind: 0.0,
             last_redraw: Instant::now(),

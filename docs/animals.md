@@ -75,12 +75,88 @@ root pose and a clip. They are drawn from the species' SPVX asset and own no
 world voxels, so they cannot be cut apart voxel by voxel and are not saved with
 the world. The server moves deer and crows with a capsule swept against terrain;
 clients receive spawn, despawn and motion records. Players and bodies pass
-through them. `--animals N` spawns deer and crows in a worldgen sandbox; trout
-need live column-water placement and are not spawned yet. The model, what it
-replaced, and the planned hunting design are in
+through them. `--animals N` spawns N deer, N/2 crows and N/8 (rounded up) each
+of grizzly bears and snow leopards, and N/4 trout, in a worldgen sandbox. Each walking species has its
+own pace and foot capsule, sized to fit inside its body; placement envelopes and
+foot height are measured from the asset's idle and walk poses.
+
+Deer notice players: one within 28 m makes a deer stop and watch it (`alert`
+clip); one within 14 m, or sprinting inside 28 m, makes it bolt at 7.5 m/s
+(`run` clip), faster than a sprinting player. A deer that watched for a few
+seconds with the player still near leaves anyway, and a fleeing deer calms
+down once every player is 45 m away.
+
+Deer resting on grass sometimes graze (`graze` clip) and really eat it: each
+bite clears the ground cover under the muzzle through the server's
+destroyed-cover record, so the patch replicates and regrows like a dug one.
+Circling crows now and then land, hop and peck on the ground, then take off
+back to their circle; a player within 10 m (20 m sprinting) sends them up. A
+circling bird blocked by terrain climbs at most 12 m before reversing its
+circle. Snow leopards spawn only on ground 8 m above their spawn anchor or on
+steep ground, and wander no more than 6 m below where they were born; a world
+with no high ground near the anchors has none.
+
+Trout are born only where the live column water is deep enough for the whole
+body (with 0.25 m below it), within six times the land spawn ring, and wander
+inside the water at 0.6 m/s (`swim` clip); every step is checked to stay
+underwater. A trout whose water drains sinks straight to the bed and lies still
+until the water returns. A world with no deep water near the anchor has no
+trout, and the other species keep their placement attempts.
+
+At night (sun below the horizon) a resting or wandering deer lies down with its
+`sleep` clip and stays put until morning; each deer's bedtime and waking trail
+sunset and sunrise by up to one in-game hour. While asleep it ignores players
+beyond 10 m (20 m sprinting); closer, it wakes and flees as usual.
+
+Crows nest. Each picks the highest tree top within reach of its circle and
+builds a 9-cell wood cup on it over several trips, one single-cell server edit
+at a time and ground up, so nothing splits off. Nests are ordinary terrain: they
+replicate, can be cut, and are saved like any edit. At night a crow roosts in
+its finished nest until morning (a player within 10 m, or 20 m sprinting, still
+spooks it). It rebuilds missing cells, and picks a new site if the tree top is
+gone.
+
+Bears hunt. A hungry bear stalks a deer it notices within 40 m (0.7 m/s, unseen
+by deer), charges from 14 m at 10 m/s for up to 5 s, and kills on contact; the
+despawn reaches every client like a hammer kill. It then eats the carcass top
+down, one terrain cell every 0.5 s through single-cell server edits
+(`CreatureAction::EditCell`), until it is gone or after 48 bites, and is hungry
+again 4 minutes later. Deer flee a bear that is not stalking; a charging bear
+counts as sprinting.
+
+Bears do not like being run at. A player within 10 m, or one sprinting inside
+22 m, makes a bear rear up (`stand` clip) and watch; if the player is still
+within 7 m (or sprinting inside 10 m) it bluff-charges, swipes (`swipe`) and
+backs off at a walk for 6 s, after which only a player inside 4 m bothers it
+for 15 s. Most charges are bluffs that stop 3.5 m short and cuff the air. A
+player still inside 4 m when the bear finishes rearing, or one bluffed player
+in about seven by a seeded roll (15 %), gets a real charge that closes to
+1.8 m (ENG-240). Either way, the paw lands 0.3 s into the swipe on a player
+within 2.5 m of the bear's root, so stepping into a bluff gets you hit too. A
+hit removes `BEAR_SWIPE_DAMAGE` (60 of 100) through `Simulation::damage_player`;
+two kill, and the player respawns at their spawn with full health. The server
+refuses a creature hit on a player more than 3 m from the creature's root. A
+bear chased off a carcass goes back to it. Bears are about 2.75 m long and
+1.3 m at the hump.
+
+A hungry bear with no deer in notice fishes: it walks into water at most 0.8 m
+deep (or stops on the bank) beside a trout within 40 m, waits, and swipes
+(`swipe` clip) at a trout within 1.5 m of its paw, catching it half the time. A
+caught trout simply despawns on every client, with no carcass; the bear eats it
+for 5 s (`eat`) and is hungry again 90 s later. Hovering trout swim away from a
+bear standing in the water within 2 m.
+
+An animal can die. A hammer (cutting tool) strike that meets an animal's posed
+voxels before any terrain kills it with one blow: the server despawns it, and
+its voxels, at 0.25 m terrain cells dropped onto the ground below, are written
+into the terrain as ordinary committed edits. The carcass replicates and can be
+cut away like any terrain; it is not saved, since worlds with animals are not.
+
+The model, what it replaced, and the planned hunting design are in
 [animal lifecycle](animal-lifecycle.md). Habitat, species and spawn rules are
 game content in `examples/sandbox`.
 
-Planned, not built: hunting (death despawns the animal and the game emits
-drops), swimming and flight physics beyond the capsule, saving animals, and the
+Planned, not built: health and damage, drops,
+finer-than-terrain carcasses,
+swimming and flight physics beyond the capsule, saving animals, and the
 population/performance measurements a populated world needs.

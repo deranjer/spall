@@ -117,3 +117,40 @@ fn motion_frames_interpolate_hold_and_ignore_stale_entries() {
         held.translation_m
     );
 }
+
+#[test]
+fn steady_motion_presents_without_hold_and_jump() {
+    let mut creatures = ReplicaCreatures::new();
+    creatures.spawn(&spawn(7, 0.0)).unwrap();
+    let id = 7;
+    let record = creatures.get(id).unwrap().clone();
+
+    // The server moves a walker 0.2 m every 8 ticks (133 ms); frames are drawn
+    // every 16 ms and each draw first takes whatever poses have arrived.
+    let t0 = Instant::now();
+    let move_every = Duration::from_millis(133);
+    let mut sent = 0_u32;
+    let mut presented = Vec::new();
+    for frame in 0..150_u32 {
+        let now = t0 + Duration::from_millis(16) * frame;
+        while t0 + move_every * sent <= now {
+            let tick = 10 + u64::from(sent) * 8;
+            creatures.apply_motion(
+                &motion_frame(tick, id, 0.2 * f64::from(sent)),
+                t0 + move_every * sent,
+            );
+            sent += 1;
+        }
+        presented.push(creatures.presentation(&record, now).translation_m[0]);
+    }
+    // Once the render delay has passed, every frame advances by about the
+    // steady per-frame distance: no frame holds still and none jumps.
+    let per_frame = 0.2 * 16.0 / 133.0;
+    for pair in presented[20..].windows(2) {
+        let step = pair[1] - pair[0];
+        assert!(
+            step > per_frame * 0.5 && step < per_frame * 1.5,
+            "uneven step {step} (expected about {per_frame}); presented {presented:?}"
+        );
+    }
+}

@@ -66,12 +66,21 @@ pub(crate) struct WorldRenderer {
     /// ratio needed to finish the projection).
     aspect: f32,
     yakui: yakui::Yakui,
+    /// Body-state reminder icons, in [`BodyCue::ALL`] order.
+    body_icons: [yakui::ManagedTextureId; 6],
+    /// Each reminder icon's opacity this frame (`body_state::reminders`).
+    pub(super) body_reminders: [(BodyCue, f32); 6],
     yakui_winit: YakuiWinit,
     yakui_wgpu: YakuiWgpu,
     yakui_buffers: yakui_wgpu::Buffers,
     hud_gpu_timer: Option<HudGpuTimer>,
     /// Set to capture the next finished frame to this PNG path.
     pub(crate) screenshot_request: Option<PathBuf>,
+    /// Without vsync nothing else throttles submission: each frame waits for
+    /// the previous frame's GPU work, so the queue never runs ahead of the GPU
+    /// and starves the desktop compositor.
+    gpu_paced: bool,
+    previous_submission: Option<wgpu::SubmissionIndex>,
 }
 
 /// One render frame's timing breakdown — see [`WorldRenderer::begin_frame`]/
@@ -343,7 +352,8 @@ impl WorldRenderer {
         };
         surface.configure(&device, &surface_config);
         let aspect = surface_config.width as f32 / surface_config.height.max(1) as f32;
-        let yakui = yakui::Yakui::new();
+        let mut yakui = yakui::Yakui::new();
+        let body_icons = load_body_icons(&mut yakui)?;
         let yakui_winit = YakuiWinit::new(&window);
         let yakui_wgpu = YakuiWgpu::new(device.clone(), queue.clone());
         let yakui_buffers = yakui_wgpu.buffers();
@@ -426,9 +436,13 @@ impl WorldRenderer {
             yakui,
             yakui_winit,
             yakui_wgpu,
+            body_icons,
+            body_reminders: BodyCue::ALL.map(|cue| (cue, 0.0)),
             yakui_buffers,
             hud_gpu_timer,
             screenshot_request: None,
+            gpu_paced: present_mode != wgpu::PresentMode::Fifo,
+            previous_submission: None,
         })
     }
 
@@ -1006,6 +1020,7 @@ impl WorldRenderer {
         if let Some(crosshair) = &self.crosshair {
             draw_crosshair(crosshair);
         }
+        draw_body_reminders(&self.body_icons, &self.body_reminders);
         if let Some(bar) = self.endurance {
             draw_endurance(bar);
         }
@@ -1035,7 +1050,19 @@ impl WorldRenderer {
             self.queue_screenshot_copy(&mut encoder, &surface_texture.texture, path)
         });
         let submit_start = Instant::now();
-        self.queue.submit([encoder.finish()]);
+        let submission = self.queue.submit([encoder.finish()]);
+        if let Some(previous) = self.previous_submission.replace(submission)
+            && self.gpu_paced
+        {
+            // One frame in flight: the GPU works on this frame while the CPU
+            // waits for the last one, and never builds a backlog.
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(previous),
+                    timeout: None,
+                })
+                .map_err(|error| ClientError::Render(error.to_string()))?;
+        }
         if let Some(pending) = screenshot {
             self.finish_screenshot(pending)?;
         }
@@ -1045,16 +1072,12 @@ impl WorldRenderer {
         {
             timer.map_after_submit(slot);
         }
-        // A minimal isolated reproduction (ENG-69; the since-deleted `examples/poc_local`)
-        // found that on this app's Vulkan backend, `desired_maximum_frame_latency: 1`
-        // above did not actually stop the CPU from racing ~2 frames ahead of
-        // the display — a measured, sustained 0.2ms/16ms/33ms three-frame
-        // burst cycle even at complete idle, which reads as edge
-        // ghosting/jitter under any camera motion regardless of what drives
-        // it (confirmed independent of physics/input/networking). Blocking
-        // here until the GPU has actually finished this frame's work caps
-        // one submission in flight at a time and restored a rock-steady
-        // ~16.6ms cadence in that reproduction.
+        // Runs finished-work callbacks (timers, screenshots) without
+        // blocking. `PollType::Poll` never waits for the GPU: with vsync the
+        // present blocks instead, and without it the wait above paces frames.
+        // (An earlier comment here claimed this blocked until the GPU
+        // finished; it did not, which let no-vsync play queue frames without
+        // bound and freeze the desktop.)
         self.device
             .poll(wgpu::PollType::Poll)
             .map_err(|error| ClientError::Render(error.to_string()))?;

@@ -231,6 +231,33 @@ pub(super) fn resolve_intent_with_catalog(
     })
 }
 
+/// The creature a cutting tool's aim meets before any terrain or body, if any
+/// (ENG-237). Only the tool's own reach and radius cap apply; the client's
+/// claimed target is ignored, as the creature is not geometry.
+pub(super) fn creature_strike(
+    sim: &Simulation,
+    req: &ActionRequest,
+    catalog: &ToolCatalog,
+) -> Option<u64> {
+    let spec = catalog.get(req.tool)?;
+    if req.action != ActionKind::Cut
+        || spec.kind != EditKind::Cut
+        || req.claimed_brush.radius_units() > spec.max_radius_cells.saturating_mul(BRUSH_UNIT)
+    {
+        return None;
+    }
+    let origin = DVec3::from_array(req.aim_origin_m);
+    let dir = DVec3::from_array(req.aim_dir.map(f64::from));
+    if !origin.is_finite() || !dir.is_finite() || dir.length_squared() < 1e-24 {
+        return None;
+    }
+    let dir = dir.normalize();
+    let (creature_id, t) = sim.creature_struck(req.aim_origin_m, dir.to_array(), spec.reach_m)?;
+    let blocked = nearest_hit(sim.world(), Ray::new(origin, dir), spec.reach_m)
+        .is_some_and(|hit| hit.t_m < t);
+    (!blocked).then_some(creature_id)
+}
+
 /// Per-tick admission counter, shared by the action and repair intake. Returns
 /// `true` while `session` is still under `cap` for this tick and bumps its
 /// count; `false` once the quota is spent. Each session's count is independent,

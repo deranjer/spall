@@ -51,6 +51,7 @@ pub enum WireRecord {
     CreatureSpawn(spall_protocol::CreatureSpawn),
     CreatureMotionFrame(spall_protocol::CreatureMotionFrame),
     CreatureDespawn(spall_protocol::CreatureDespawn),
+    PlayerHealth(spall_protocol::PlayerHealth),
 }
 
 impl WireRecord {
@@ -81,6 +82,7 @@ impl WireRecord {
             Self::CreatureSpawn(_) => WireTag::CreatureSpawn,
             Self::CreatureMotionFrame(_) => WireTag::CreatureMotionFrame,
             Self::CreatureDespawn(_) => WireTag::CreatureDespawn,
+            Self::PlayerHealth(_) => WireTag::PlayerHealth,
         }
     }
 
@@ -112,6 +114,7 @@ impl WireRecord {
             Self::CreatureSpawn(r) => encode_control(r),
             Self::CreatureMotionFrame(r) => encode_control(r),
             Self::CreatureDespawn(r) => encode_control(r),
+            Self::PlayerHealth(r) => encode_control(r),
         }
     }
 
@@ -152,6 +155,7 @@ impl WireRecord {
             WireTag::CreatureSpawn => Self::CreatureSpawn(decode_control(bytes)?),
             WireTag::CreatureMotionFrame => Self::CreatureMotionFrame(decode_control(bytes)?),
             WireTag::CreatureDespawn => Self::CreatureDespawn(decode_control(bytes)?),
+            WireTag::PlayerHealth => Self::PlayerHealth(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,
@@ -413,6 +417,26 @@ mod tests {
             NetMessage::decode(&bytes, limits::MAX_CONTROL_RECORD).unwrap(),
             msg
         );
+    }
+
+    #[test]
+    fn player_health_round_trips_and_an_impossible_health_is_refused() {
+        let health = spall_protocol::PlayerHealth {
+            health: 40,
+            max_health: 100,
+        };
+        let bytes = WireRecord::PlayerHealth(health).encode_framed().unwrap();
+        assert_eq!(
+            WireRecord::decode_framed(&bytes).unwrap(),
+            WireRecord::PlayerHealth(health)
+        );
+        for bad in [(0, 100), (101, 100)] {
+            let record = WireRecord::PlayerHealth(spall_protocol::PlayerHealth {
+                health: bad.0,
+                max_health: bad.1,
+            });
+            assert!(record.encode_framed().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

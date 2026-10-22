@@ -278,11 +278,13 @@ impl SnowState {
         self.dirty = true;
     }
 
+    /// Every stored layer of one column tile. A range over the `(x, z, y)` key
+    /// order: filtering every key cost ~20 ms a tick while discovery filled a
+    /// 1 km winter world.
     pub fn tile_layers(&self, tile_x: i32, tile_z: i32) -> Vec<(i32, i32, i32)> {
         self.tiles
-            .keys()
-            .filter(|(x, z, _)| *x == tile_x && *z == tile_z)
-            .copied()
+            .range((tile_x, tile_z, i32::MIN)..=(tile_x, tile_z, i32::MAX))
+            .map(|(key, _)| *key)
             .collect()
     }
 
@@ -1124,6 +1126,26 @@ mod tests {
             mask[*bit / 64] |= 1u64 << (*bit % 64);
         }
         mask
+    }
+
+    #[test]
+    fn tile_layers_returns_only_that_columns_layers() {
+        let mut snow = SnowState::new();
+        for (x, z, y) in [
+            (0, 0, 5),
+            (0, 0, -3),
+            (0, 1, 5),
+            (-1, 0, 5),
+            (1, 0, 9),
+            (0, -1, 2),
+            (-1, -1, 4),
+        ] {
+            snow.discover_initial(x, z, y, 1, mask(&[0]));
+        }
+        assert_eq!(snow.tile_layers(0, 0), vec![(0, 0, -3), (0, 0, 5)]);
+        assert_eq!(snow.tile_layers(-1, -1), vec![(-1, -1, 4)]);
+        assert_eq!(snow.tile_layers(0, -1), vec![(0, -1, 2)]);
+        assert!(snow.tile_layers(2, 2).is_empty());
     }
 
     #[test]

@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 use spall_protocol::{CreatureDespawn, CreatureRecord, CreatureSpawn, WIRE_SCHEMA_VERSION};
 use spall_sim::Simulation;
 
+/// Farthest a player's feet may be from a creature's root for that creature's
+/// hit to land (ENG-240). The server refuses a director's hit beyond it.
+const HIT_PLAYER_REACH_M: f64 = 3.0;
+
 /// Sequential id source for one batch of spawns.
 #[derive(Debug, Clone, Copy)]
 pub struct CreatureIdPlan {
@@ -37,6 +41,27 @@ pub enum CreatureAction {
     Fly(spall_sim::CreatureMoveRequest),
     /// A walking creature's step.
     Walk(spall_sim::CreatureWalkRequest),
+    /// A creature eats the ground cover in one terrain column (cells), through
+    /// the same destroyed-cover record a surface edit makes.
+    Graze { creature_id: u64, column: [i64; 2] },
+    /// The creature kills `prey`, which dies as from a strike: despawned,
+    /// announced to every client, and left as a terrain carcass.
+    Kill { creature_id: u64, prey: u64 },
+    /// The creature changes one terrain cell through the committed edit path:
+    /// `place` fills it if empty, `None` clears it if solid.
+    EditCell {
+        creature_id: u64,
+        cell: spall_core::GlobalCell,
+        place: Option<spall_core::MaterialId>,
+    },
+    /// The creature hits `player` for `damage` health through
+    /// [`Simulation::damage_player`]; refused when the player's feet are more
+    /// than 3 m from the creature's root.
+    HitPlayer {
+        creature_id: u64,
+        player: spall_core::EntityId,
+        damage: u16,
+    },
 }
 
 impl CreatureAction {
@@ -44,14 +69,26 @@ impl CreatureAction {
         match self {
             Self::Fly(request) => request.creature_id,
             Self::Walk(request) => request.creature_id,
+            Self::Graze { creature_id, .. }
+            | Self::Kill { creature_id, .. }
+            | Self::EditCell { creature_id, .. }
+            | Self::HitPlayer { creature_id, .. } => *creature_id,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CreatureActionOutcome {
     Fly(spall_sim::CreatureMoveOutcome),
     Walked(spall_sim::CreatureWalkOutcome),
+    /// Whether there was cover to eat.
+    Grazed(bool),
+    /// The prey died; its carcass cells are queued.
+    Killed(spall_sim::CreatureKill),
+    /// Whether the cell edit was queued (`false`: the cell already was so).
+    CellEdited(bool),
+    /// The player was hurt, or killed and respawned.
+    HitPlayer(spall_sim::PlayerDamage),
 }
 
 pub trait CreatureDirector: Send {
@@ -112,6 +149,39 @@ impl CreatureRoster {
     }
 }
 
+/// A creature's hit on a player, at the tick boundary. Refused for an unknown
+/// creature or player, or one out of [`HIT_PLAYER_REACH_M`].
+fn hit_player(
+    sim: &mut Simulation,
+    creature_id: u64,
+    player: spall_core::EntityId,
+    damage: u16,
+) -> Result<spall_sim::PlayerDamage, String> {
+    let root = sim
+        .creature_poses()
+        .into_iter()
+        .find(|pose| pose.creature_id == creature_id)
+        .ok_or("unknown creature")?
+        .translation_m;
+    let feet = sim.player_state(player).ok_or("unknown player")?.position_m;
+    let distance = (0..3)
+        .map(|i| (feet[i] - root[i]).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if distance > HIT_PLAYER_REACH_M {
+        return Err(format!("player out of reach ({distance:.1} m)"));
+    }
+    let outcome = sim.damage_player(player, damage).ok_or("unknown player")?;
+    tracing::info!(
+        creature = creature_id,
+        player = player.get(),
+        damage,
+        ?outcome,
+        "creature hit a player"
+    );
+    Ok(outcome)
+}
+
 /// Cloneable handle so `ServeConfig` keeps its derives.
 #[derive(Clone)]
 pub struct CreatureService {
@@ -158,7 +228,8 @@ impl CreatureService {
 
     /// Collects the director's movement for this tick and applies it. A request
     /// the engine rejects is logged and skipped; it never stops the server.
-    pub fn run_motion(&self, sim: &mut Simulation) -> Result<(), String> {
+    /// Returns the creatures its kills removed, for the caller to announce.
+    pub fn run_motion(&self, sim: &mut Simulation) -> Result<CreatureRoster, String> {
         let started = std::time::Instant::now();
         let result = self.run_motion_inner(sim);
         let elapsed = started.elapsed();
@@ -179,7 +250,7 @@ impl CreatureService {
         result
     }
 
-    fn run_motion_inner(&self, sim: &mut Simulation) -> Result<(), String> {
+    fn run_motion_inner(&self, sim: &mut Simulation) -> Result<CreatureRoster, String> {
         let tick = sim.current_tick().get();
         let actions = self
             .director
@@ -187,8 +258,13 @@ impl CreatureService {
             .map_err(|_| "creature director panicked earlier".to_string())?
             .motion(tick, sim);
         let mut outcomes = Vec::with_capacity(actions.len());
+        let mut roster = CreatureRoster::default();
         for action in actions {
             let creature_id = action.creature_id();
+            // A creature killed earlier in this batch does nothing more.
+            if roster.despawned.contains(&creature_id) {
+                continue;
+            }
             let result = match action {
                 CreatureAction::Fly(request) => {
                     sim.move_creature(request).map(CreatureActionOutcome::Fly)
@@ -196,11 +272,35 @@ impl CreatureService {
                 CreatureAction::Walk(request) => sim
                     .walk_creature(request)
                     .map(CreatureActionOutcome::Walked),
+                CreatureAction::Graze { column, .. } => Ok(CreatureActionOutcome::Grazed(
+                    sim.graze_cover(column[0], column[1]),
+                )),
+                CreatureAction::Kill { prey, .. } => sim
+                    .kill_creature_by(creature_id, prey)
+                    .map(|kill| {
+                        tracing::info!(
+                            creature = creature_id,
+                            prey,
+                            species = %kill.record.species,
+                            carcass_cells = kill.carcass.len(),
+                            "creature killed by a creature"
+                        );
+                        roster.despawned.push(prey);
+                        CreatureActionOutcome::Killed(kill)
+                    })
+                    .map_err(|error| error.to_string()),
+                CreatureAction::EditCell { cell, place, .. } => sim
+                    .creature_edit_cell(creature_id, cell, place)
+                    .map(CreatureActionOutcome::CellEdited),
+                CreatureAction::HitPlayer { player, damage, .. } => {
+                    hit_player(sim, creature_id, player, damage)
+                        .map(CreatureActionOutcome::HitPlayer)
+                }
             };
             match result {
                 Ok(outcome) => outcomes.push((creature_id, outcome)),
                 Err(error) => {
-                    tracing::warn!(creature = creature_id, %error, "creature move rejected");
+                    tracing::warn!(creature = creature_id, %error, "creature action rejected");
                 }
             }
         }
@@ -211,7 +311,7 @@ impl CreatureService {
         for (creature_id, outcome) in outcomes {
             director.on_action_outcome(creature_id, outcome);
         }
-        Ok(())
+        Ok(roster)
     }
 
     /// Tells the director the world was replaced.
@@ -249,5 +349,73 @@ impl CreatureService {
             roster.spawned = spawned;
         }
         Ok(roster)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spall_core::player_entity_for;
+    use spall_sim::{PLAYER_MAX_HEALTH, SimulationConfig, fixtures};
+
+    /// Spawns one creature, then hits both players for 30 on every motion call.
+    struct Hitter;
+
+    impl CreatureDirector for Hitter {
+        fn plan(
+            &mut self,
+            tick: u64,
+            _: &Simulation,
+            ids: &mut CreatureIdPlan,
+        ) -> Vec<CreatureRecord> {
+            if tick > 0 {
+                return Vec::new();
+            }
+            vec![CreatureRecord {
+                creature_id: ids.creature_id(),
+                species: "bear".into(),
+                translation_m: [4.0, 0.5, 4.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                locomotion_tag: 0,
+                clip_phase_tick: 0,
+            }]
+        }
+
+        fn motion(&mut self, _: u64, sim: &Simulation) -> Vec<CreatureAction> {
+            let Some(pose) = sim.creature_poses().first().copied() else {
+                return Vec::new();
+            };
+            [0, 1]
+                .map(|slot| CreatureAction::HitPlayer {
+                    creature_id: pose.creature_id,
+                    player: player_entity_for(slot),
+                    damage: 30,
+                })
+                .into()
+        }
+    }
+
+    #[test]
+    fn a_creature_hits_only_a_player_within_reach() {
+        let mut sim =
+            Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+        sim.initialize_creature_host().unwrap();
+        let near = sim.add_player(player_entity_for(0), [5.5, 0.5, 4.0]);
+        let far = sim.add_player(player_entity_for(1), [7.5, 0.5, 4.0]);
+        let service = CreatureService::new(Box::new(Hitter));
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        assert_eq!(sim.player_health(near), Some(PLAYER_MAX_HEALTH - 30));
+        assert_eq!(
+            sim.player_health(far),
+            Some(PLAYER_MAX_HEALTH),
+            "3.5 m away"
+        );
+        for _ in 0..3 {
+            service.run_motion(&mut sim).unwrap();
+        }
+        // The fourth hit was lethal: full health again, back at the spawn.
+        assert_eq!(sim.player_health(near), Some(PLAYER_MAX_HEALTH));
+        assert_eq!(sim.player_health(far), Some(PLAYER_MAX_HEALTH));
     }
 }

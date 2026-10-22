@@ -45,6 +45,7 @@ impl Simulation {
             &mut transfer_ids,
         )?;
         drop(pipeline_span);
+        self.advance_carcasses();
         let mut report = report;
         // Only a committed change to a terrain brick at or next to a region's
         // fluid domain can change that region's boundary.
@@ -93,12 +94,18 @@ impl Simulation {
         drop(water_span);
         let vegetation_span = crate::prof::Span::start("tick.vegetation");
         self.advance_vegetation(&report)?;
+        drop(vegetation_span);
+        let weather_span = crate::prof::Span::start("tick.weather");
         self.advance_weather();
+        drop(weather_span);
+        let snow_span = crate::prof::Span::start("tick.snow");
         self.snow
             .advance(&self.weather, self.tick.get())
             .map_err(TickError::Snow)?;
+        drop(snow_span);
+        let snow_refresh_span = crate::prof::Span::start("tick.snow_refresh");
         self.refresh_snow_from_report(&report);
-        drop(vegetation_span);
+        drop(snow_refresh_span);
         // Bodies float: buoyancy and drag from the column water, before the
         // physics step that integrates them.
         if let Some(water) = &self.column_water {

@@ -14,7 +14,7 @@
 
 use spall_core::{EntityId, PlayerInput, VolumeId};
 use spall_physics::{CharacterParams, CharacterState};
-use spall_protocol::{InputSeq, TopologyOp, TopologyTransaction};
+use spall_protocol::{InputSeq, PlayerId, TopologyOp, TopologyTransaction};
 
 /// Ticks a held input is reused after the last fresh frame before it is dropped
 /// to neutral — 250 ms at the fixed 60 Hz tick.
@@ -24,6 +24,20 @@ pub const HELD_INPUT_TIMEOUT_TICKS: u32 = 15;
 /// topology edit invalidates the player's predicted history and forces an
 /// authoritative depenetration.
 pub const INVALIDATION_MARGIN_M: f64 = 2.0;
+
+/// Health of a freshly spawned or respawned player (ENG-223). Game rules size
+/// their damage against it.
+pub const PLAYER_MAX_HEALTH: u16 = 100;
+
+/// What one [`crate::Simulation::damage_player`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerDamage {
+    /// The player survived with this much health left.
+    Hurt { health: u16 },
+    /// The damage was lethal: the player respawned at its spawn point with
+    /// [`PLAYER_MAX_HEALTH`].
+    Killed,
+}
 
 /// One authoritative player capsule.
 #[derive(Debug, Clone)]
@@ -48,6 +62,13 @@ pub struct Player {
     /// the client compares it and rebuilds prediction from the authoritative
     /// snapshot.
     pub movement_epoch: u64,
+    /// Current health, always `1..=PLAYER_MAX_HEALTH`: lethal damage respawns
+    /// the capsule at full health instead of leaving it at zero.
+    pub health: u16,
+    /// The stable account that owns this capsule, when its connection
+    /// authenticated with a player credential. Health is remembered and
+    /// persisted per account, not per capsule.
+    pub principal: Option<PlayerId>,
 }
 
 impl Player {
@@ -64,6 +85,8 @@ impl Player {
             ticks_since_input: 0,
             pending_fresh: false,
             movement_epoch: 0,
+            health: PLAYER_MAX_HEALTH,
+            principal: None,
         }
     }
 

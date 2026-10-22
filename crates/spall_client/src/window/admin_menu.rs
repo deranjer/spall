@@ -47,6 +47,9 @@ pub(crate) struct AdminMenuView {
     pub ground_snow_enabled: bool,
     pub snow: String,
     pub reduced_weather_flashes: bool,
+    /// Felt cold and wetness, 0..=1, as the screen shows them.
+    pub body: BodyState,
+    pub body_preview: BodyPreview,
     pub flying: bool,
     /// Server's reply to the last admin command, or "waiting" while pending.
     pub admin_status: Option<String>,
@@ -98,6 +101,9 @@ pub(crate) struct AdminMenuActions {
     pub toggle_bounce: bool,
     pub cycle_lighting: bool,
     pub copy_debug_report: bool,
+    /// Added to the matching [`BodyPreview`] look this frame.
+    pub body_preview_delta: BodyPreview,
+    pub clear_body_preview: bool,
 }
 
 pub(super) fn section(title: &'static str) {
@@ -301,6 +307,43 @@ pub(super) fn admin_menu_panel(
                         12.0,
                         "Snow builds below freezing. Walk to leave tracks; fly to inspect them.",
                     );
+                    section("Body");
+                    muted(
+                        12.0,
+                        format!(
+                            "Felt cold {:.0}% | wet {:.0}% (from weather, shelter and water)",
+                            view.body.cold * 100.0,
+                            view.body.wet * 100.0
+                        ),
+                    );
+                    muted(12.0, "Preview looks for stats that do not exist yet:");
+                    let delta = &mut actions.body_preview_delta;
+                    let preview = view.body_preview;
+                    stepper_row(
+                        &format!("Injury {:.0}%", preview.injury * 100.0),
+                        &mut delta.injury,
+                        -0.25,
+                        0.25,
+                    );
+                    stepper_row(
+                        &format!("Thirst {:.0}%", preview.thirst * 100.0),
+                        &mut delta.thirst,
+                        -0.25,
+                        0.25,
+                    );
+                    stepper_row(
+                        &format!("Exhaustion {:.0}%", preview.exhaustion * 100.0),
+                        &mut delta.exhaustion,
+                        -0.25,
+                        0.25,
+                    );
+                    stepper_row(
+                        &format!("Hunger {:.0}%", preview.hunger * 100.0),
+                        &mut delta.hunger,
+                        -0.25,
+                        0.25,
+                    );
+                    actions.clear_body_preview |= yakui::button("Clear previews").clicked;
                     section("Movement");
                     muted(
                         13.0,

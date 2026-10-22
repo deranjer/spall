@@ -182,6 +182,20 @@ Other players' capsule snapshots are kept per entity in `ReplicaWorld::remote_pl
 
 T19 outcome — headless core (`spall_physics::character` + `spall_sim::player` + `spall_client::predict`): a player is a **kinematic capsule**, not a `spall_sim` body — it has no voxel volume, never splits, and never enters the dynamic-body set, so it does not touch the edit / split / collider path. It nevertheless carries an explicit effective contact mass for server-side momentum transfer. `spall_physics::character::step_character` is the one **pure** movement kernel (ground input → world-frame wish velocity, preserved airborne horizontal momentum, gravity, rising-edge jump, post-move vertical clamp) and both sides run it: the server uses `PhysicsWorld::sweep_character_pushing_excluding`, which wraps Rapier's `KinematicCharacterController` and solves contact impulses against dynamic bodies; `spall_client::predict::ClientPhysics` runs the non-pushing sweep against replica terrain plus query-only, server-pose-driven mirrors of detached-body voxel colliders. These mirrors affect only the character query; they never simulate body motion or gain client authority. Physics is not lockstep (`docs/protocol.md`), so this buys only bounded agreement — `PredictedPlayer` keeps a bounded input history, snaps to each authoritative `MotionSnapshot` at its `acked_input`, and replays the still-unacknowledged inputs; the residual is reported as a bounded correction. The player capsule advances in `Simulation::tick` **after** `step_physics` (so the sweep sees the broad-phase BVH that tick's collider rebuilds refreshed) and before snapshot extraction. A committed edit within `INVALIDATION_MARGIN_M` of a player bumps its `movement_epoch` and depenetrates it server-side; the client, on any terrain-hash change near its path, rebuilds `ClientPhysics` and rebases prediction on the last authoritative state rather than replaying through geometry that no longer exists. Held input is reused for a 250 ms window then cleared to neutral, so a lost "button up" cannot leave the player walking or holding jump. The player id is a reserved band (`spall_core::player_entity_for(slot)` — `1 << 48 + slot`) both ends derive from the session slot, so no wire record was added; player state rides the existing 20 Hz `MotionSnapshot` with `body =` the player entity and `acked_input =` the last consumed input sequence. `spall_server::serve` gives each connecting client a capsule and reads `InputFrame` datagrams (one applied per player per tick, redundant `recent` copies recover a dropped frame). Moving-body **crush** outcomes are handled by the separate T21 contact-damage path.
 
+ENG-223 player health: each capsule carries `health` (`1..=PLAYER_MAX_HEALTH`, 100) and an optional
+`principal` (the authenticated `PlayerId`). `Simulation::damage_player` is the one damage entry
+point; it runs on the owning thread between ticks, and damage that would leave no health respawns
+the capsule at its spawn point with full health in the same call. Game rules size their damage
+against the engine maximum (the sandbox's `BEAR_SWIPE_DAMAGE` makes two bear swipes lethal). The
+server binds a capsule to its account on join (`bind_player_principal`), which restores the
+account's remembered health, and sends each session its own health as a `PlayerHealth` record when
+it changes. Accounts not currently bound keep their health in the simulation's roster; the checkpoint
+stores both, so health survives a restart. There is no health bar: the client feeds its latest
+health into the existing injury look (`body_state::with_health`: red pulsing vignette, colour
+drain, edge blur, and the injury reminder icon from one bear swipe down), which clears when a
+respawn restores full health. Game creatures hurt players through the director's
+`CreatureAction::HitPlayer`, which the server refuses beyond 3 m of the creature's root (ENG-240).
+
 The interactive launcher also has an explicit testing-only escape hatch:
 `--client-authoritative`. In that mode `ClientPhysics` promotes replicated body
 colliders to locally stepped dynamic bodies, computes mass/COM/inertia from the
@@ -539,7 +553,10 @@ The clock is presentation state, not persisted world state: a newly started
 simulation begins at day one sunrise. Explicit environment selection and the
 in-game cycle pause are visual overrides; resuming restores tick-derived
 lighting. No protocol clock field is needed because the existing server tick
-already supplies synchronization.
+already supplies synchronization. The tick -> time-of-day mapping
+(`spall_core::time_of_day::state_at_tick`) lives in `spall_core` so server-side
+game systems can read it without the client; client lighting builds on the same
+mapping, and night is when `DayNightState::sun_height()` is negative.
 
 ### ENG-130 regional terrain startup
 

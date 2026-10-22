@@ -7,7 +7,7 @@
 //! ignored.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -32,11 +32,17 @@ struct MotionSample {
     clip_phase_tick: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Newest received poses, oldest first; never empty. The render time lags the
+/// newest by [`CREATURE_RENDER_DELAY`], longer than the server's move interval,
+/// so keeping only the newest two left it before both: the creature held, then
+/// jumped when the next pose arrived.
+#[derive(Debug, Clone)]
 struct MotionTrack {
-    previous: Option<MotionSample>,
-    current: MotionSample,
+    samples: VecDeque<MotionSample>,
 }
+
+/// Enough poses to bracket the render time through a short delivery stall.
+const MAX_MOTION_SAMPLES: usize = 8;
 
 /// A creature's presented pose at a render instant.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,29 +143,41 @@ impl ReplicaCreatures {
                 clip_phase_tick: entry.clip_phase_tick,
             };
             match self.motion.get_mut(&entry.creature_id) {
-                Some(track) if frame.server_tick <= track.current.server_tick => continue,
+                Some(track)
+                    if track
+                        .samples
+                        .back()
+                        .is_some_and(|newest| frame.server_tick <= newest.server_tick) =>
+                {
+                    continue;
+                }
                 // The server only moves a creature every few ticks but sends its pose
                 // more often. An unchanged pose must not become a new keyframe, or the
                 // presented motion would hold, jump and hold. Keep the arrival time of
                 // the sample that introduced the pose.
                 Some(track)
-                    if track.current.translation_m == sample.translation_m
-                        && track.current.rotation_xyzw == sample.rotation_xyzw
-                        && track.current.locomotion_tag == sample.locomotion_tag =>
+                    if track.samples.back().is_some_and(|newest| {
+                        newest.translation_m == sample.translation_m
+                            && newest.rotation_xyzw == sample.rotation_xyzw
+                            && newest.locomotion_tag == sample.locomotion_tag
+                    }) =>
                 {
-                    track.current.server_tick = sample.server_tick;
+                    if let Some(newest) = track.samples.back_mut() {
+                        newest.server_tick = sample.server_tick;
+                    }
                     continue;
                 }
                 Some(track) => {
-                    track.previous = Some(track.current);
-                    track.current = sample;
+                    if track.samples.len() == MAX_MOTION_SAMPLES {
+                        track.samples.pop_front();
+                    }
+                    track.samples.push_back(sample);
                 }
                 None => {
                     self.motion.insert(
                         entry.creature_id,
                         MotionTrack {
-                            previous: None,
-                            current: sample,
+                            samples: VecDeque::from([sample]),
                         },
                     );
                 }
@@ -183,15 +201,26 @@ impl ReplicaCreatures {
         let Some(track) = self.motion.get(&record.creature_id) else {
             return fallback;
         };
+        let (Some(&oldest), Some(&newest)) = (track.samples.front(), track.samples.back()) else {
+            return fallback;
+        };
         let render_at = now.checked_sub(CREATURE_RENDER_DELAY).unwrap_or(now);
-        let current = track.current;
         let phase_at = |sample: &MotionSample, at: Instant| {
             sample.clip_phase_tick as f64
                 + at.saturating_duration_since(sample.at).as_secs_f64() * 60.0
         };
-        if let Some(previous) = track.previous
-            && render_at < current.at
-        {
+        if render_at < oldest.at {
+            // Older than anything kept: hold the oldest pose.
+            return CreaturePresentation {
+                translation_m: oldest.translation_m,
+                rotation_xyzw: oldest.rotation_xyzw,
+                locomotion_tag: oldest.locomotion_tag,
+                clip_phase_tick: oldest.clip_phase_tick as f64,
+            };
+        }
+        if let Some(index) = track.samples.iter().position(|s| s.at > render_at) {
+            // Between the two samples that bracket the render time.
+            let (previous, current) = (track.samples[index - 1], track.samples[index]);
             let span = current
                 .at
                 .saturating_duration_since(previous.at)
@@ -217,6 +246,7 @@ impl ReplicaCreatures {
                 clip_phase_tick: phase_at(&previous, render_at),
             };
         }
+        let current = newest;
         let ahead = render_at
             .saturating_duration_since(current.at)
             .min(MAX_EXTRAPOLATION)

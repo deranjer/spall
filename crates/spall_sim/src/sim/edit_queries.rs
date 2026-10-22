@@ -52,9 +52,10 @@ impl Simulation {
         self.tick
     }
 
-    /// `true` when every accepted intent has committed or been rejected.
+    /// `true` when every accepted intent has committed or been rejected and
+    /// no carcass is still being placed.
     pub fn is_idle(&self) -> bool {
-        self.pipeline.is_idle()
+        self.pipeline.is_idle() && self.carcasses.is_empty()
     }
 
     /// Conservative count of allocator IDs the upcoming edit tick may need

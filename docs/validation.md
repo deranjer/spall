@@ -1008,8 +1008,10 @@ See [camera correction evidence](reports/ENG-127-camera-correction.md).
 
 ### ENG-128 day/night clock validation
 
-Run `cargo test -p spall_client day_night::tests` for clock landmarks, wrap,
-night readability, lunar phase progression, and daytime moon visibility. Run
+Run `cargo test -p spall_core time_of_day::tests` for clock landmarks, wrap,
+the day/night split, and lunar phase progression, and
+`cargo test -p spall_client day_night::tests` for night readability and
+daytime moon visibility. Run
 `cargo check -p spall_render -p spall_client -p sandbox --features client` for
 client integration. Run the focused `spall_render` GPU renderer test to compile
 and exercise the skybox and surface-lighting shaders. Hardware presentation is

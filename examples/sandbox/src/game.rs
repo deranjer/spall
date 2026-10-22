@@ -67,6 +67,17 @@ pub const fn contact_damage_config() -> spall_sim::ContactDamageConfig {
     IMPACT_DAMAGE_RULES
 }
 
+/// Health one bear swipe removes from a player (ENG-223). Two swipes kill a
+/// player at full [`spall_sim::PLAYER_MAX_HEALTH`]; one never does. A bear's
+/// landed swipe applies it through [`spall_sim::Simulation::damage_player`]
+/// (ENG-240).
+pub const BEAR_SWIPE_DAMAGE: u16 = 60;
+
+const _: () = assert!(
+    BEAR_SWIPE_DAMAGE < spall_sim::PLAYER_MAX_HEALTH
+        && 2 * BEAR_SWIPE_DAMAGE >= spall_sim::PLAYER_MAX_HEALTH
+);
+
 /// Per-material impact response. These are game-owned balance choices; the
 /// engine applies the scales to its shared threshold, brush, and detachment
 /// rules without knowing the material names.
@@ -1081,6 +1092,22 @@ pub fn spawn_loaded_voxel_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_bear_swipes_kill_a_full_health_player_and_one_does_not() {
+        use spall_sim::fixtures::{WALK_ARENA_SPAWNS, walk_arena_setup};
+        use spall_sim::{PlayerDamage, Simulation, SimulationConfig};
+        let mut sim = Simulation::new(SimulationConfig::new(walk_arena_setup())).unwrap();
+        let player = sim.add_player(spall_core::player_entity_for(0), WALK_ARENA_SPAWNS[0]);
+        assert!(matches!(
+            sim.damage_player(player, BEAR_SWIPE_DAMAGE),
+            Some(PlayerDamage::Hurt { .. })
+        ));
+        assert_eq!(
+            sim.damage_player(player, BEAR_SWIPE_DAMAGE),
+            Some(PlayerDamage::Killed)
+        );
+    }
 
     #[test]
     fn manifest_is_valid_and_ids_are_fixed() {
