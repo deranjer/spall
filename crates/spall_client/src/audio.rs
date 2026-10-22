@@ -29,6 +29,12 @@ pub struct BiomeAudioConfig {
     /// Which `tracks` are running water (streams, shores). Weather ducks them
     /// far less than other ambience and they win a mix slot over other layers.
     pub water_tracks: Vec<bool>,
+    /// Which `tracks` are mostly birdsong. They play quietly unless a bird
+    /// is near (see [`birdsong_level`]), so a looping song does not follow
+    /// the player across a whole biome.
+    pub birdsong_tracks: Vec<bool>,
+    /// Creature species that count as birds for [`birdsong_level`].
+    pub bird_species: Vec<String>,
     pub footsteps: crate::footsteps::FootstepConfig,
     pub breathing: crate::breathing::BreathingConfig,
 }
@@ -52,6 +58,22 @@ const MAX_LAYERS: usize = 4;
 /// Time constant of a layer's volume approaching its target, so a layer fades
 /// in and out over a few seconds instead of switching.
 const LAYER_RAMP: Duration = Duration::from_millis(1200);
+
+/// Birdsong tracks play at this fraction with no bird near.
+const BIRDSONG_FLOOR: f32 = 0.15;
+/// A bird this close lifts birdsong to full volume...
+const BIRD_NEAR_M: f64 = 15.0;
+/// ...fading back to [`BIRDSONG_FLOOR`] by this distance.
+const BIRD_FAR_M: f64 = 60.0;
+
+/// Gain for birdsong tracks given the distance to the nearest bird, if any:
+/// faint everywhere, full when a bird is close.
+pub fn birdsong_level(nearest_bird_m: Option<f64>) -> f32 {
+    let near = nearest_bird_m.map_or(0.0, |distance| {
+        ((BIRD_FAR_M - distance) / (BIRD_FAR_M - BIRD_NEAR_M)).clamp(0.0, 1.0) as f32
+    });
+    BIRDSONG_FLOOR + (1.0 - BIRDSONG_FLOOR) * near
+}
 
 /// Resolves a world-space listener position into the replicated climate field.
 /// Bounds are checked before `CoverGrid::at`, whose public lookup otherwise
@@ -102,6 +124,13 @@ impl BiomeAudioConfig {
             .collect()
     }
 
+    pub fn is_birdsong(&self, biome: u8) -> bool {
+        self.birdsong_tracks
+            .get(usize::from(biome))
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub fn is_water(&self, biome: u8) -> bool {
         self.water_tracks
             .get(usize::from(biome))
@@ -134,6 +163,7 @@ const MAX_SEARCH_M: f64 = 130.0;
 /// other layers so a full mix never drops a nearby stream for a quieter bird.
 pub fn ambience_mix(
     weather_duck: f32,
+    birdsong: f32,
     field: &spall_ecology::cover::CoverField,
     grid: &spall_ecology::cover::CoverGrid,
     position_m: [f64; 3],
@@ -200,6 +230,11 @@ pub fn ambience_mix(
             weather_duck
         };
         let volume = volume * duck.clamp(0.0, 1.0);
+        let volume = if config.is_birdsong(biome) {
+            volume * birdsong.clamp(0.0, 1.0)
+        } else {
+            volume
+        };
         match layers.iter_mut().find(|(existing, _, _)| existing == path) {
             Some(entry) => {
                 entry.1 = entry.1.max(volume);
@@ -511,7 +546,7 @@ mod tests {
             ..Default::default()
         };
         let volume_of = |x: f64, name: &str| {
-            ambience_mix(1.0, &field, &grid, [x, 10.0, 100.0], &config)
+            ambience_mix(1.0, 1.0, &field, &grid, [x, 10.0, 100.0], &config)
                 .into_iter()
                 .find(|(path, _)| path.to_str() == Some(name))
                 .map_or(0.0, |(_, v)| v)
@@ -537,7 +572,7 @@ mod tests {
             ..Default::default()
         };
         let at = |config: &BiomeAudioConfig, duck: f32| {
-            ambience_mix(duck, &field, &grid, [61.0, 10.0, 100.0], config)
+            ambience_mix(duck, 1.0, &field, &grid, [61.0, 10.0, 100.0], config)
         };
         let get = |mix: &[(PathBuf, f32)], name: &str| {
             mix.iter()
@@ -582,5 +617,14 @@ mod tests {
             rle: vec![1, 0],
         };
         assert!(malformed.expand().is_err());
+    }
+
+    #[test]
+    fn birdsong_is_faint_without_a_bird_and_full_beside_one() {
+        let floor = birdsong_level(None);
+        assert!(floor > 0.0 && floor < 0.3, "{floor}");
+        assert_eq!(birdsong_level(Some(200.0)), floor);
+        assert!(birdsong_level(Some(40.0)) > floor);
+        assert!((birdsong_level(Some(10.0)) - 1.0).abs() < 1e-6);
     }
 }

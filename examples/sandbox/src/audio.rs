@@ -273,6 +273,16 @@ pub fn config() -> BiomeAudioConfig {
                 )
             })
             .collect(),
+        birdsong_tracks: TRACK_NAMES
+            .iter()
+            .map(|name| {
+                matches!(
+                    *name,
+                    "meadow-pipit.ogg" | "alpine-chiffchaff.ogg" | "temperate-forest.ogg"
+                )
+            })
+            .collect(),
+        bird_species: vec!["crow".to_owned()],
         footsteps: footsteps(&root),
         breathing: breathing(&root),
     }

@@ -31,6 +31,8 @@ pub(super) struct InteractiveApp {
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
+    /// Distance to the nearest bird creature, for birdsong volume.
+    nearest_bird_m: Option<f64>,
     /// Ambience layers last sent to the audio thread, volumes in twentieths.
     ambience_layers: Vec<(PathBuf, u8)>,
     ambience_mix_at: Option<Instant>,
@@ -272,6 +274,7 @@ impl InteractiveApp {
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
+            nearest_bird_m: None,
             ambience_layers: Vec::new(),
             ambience_mix_at: None,
             weather_audio: AmbienceAudio::start(0.3),
@@ -381,6 +384,24 @@ impl InteractiveApp {
         self.ambience_check_at = Instant::now();
         if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
             self.latest_weather = replica.weather().cloned();
+            // Distance to the nearest bird, for how loud birdsong plays.
+            let listener = self
+                .session
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(|view| view.predicted.position_m);
+            self.nearest_bird_m = listener.and_then(|at| {
+                replica
+                    .creatures()
+                    .records()
+                    .filter(|record| self.biome_audio.bird_species.contains(&record.species))
+                    .map(|record| {
+                        let [x, y, z] = record.translation_m;
+                        ((x - at[0]).powi(2) + (y - at[1]).powi(2) + (z - at[2]).powi(2)).sqrt()
+                    })
+                    .min_by(f64::total_cmp)
+            });
         }
         // Weather ducks each ambience layer (water far less, see `ambience_mix`).
         let weather_duck = if self.nature_preview.is_some() {
@@ -514,6 +535,7 @@ impl InteractiveApp {
                     let grid = self.ambience_grid.as_ref()?;
                     Some(crate::audio::ambience_mix(
                         weather_duck,
+                        crate::audio::birdsong_level(self.nearest_bird_m),
                         field,
                         grid,
                         position,
