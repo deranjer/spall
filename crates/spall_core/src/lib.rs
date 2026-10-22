@@ -1,6 +1,7 @@
 //! Foundation types shared across the engine: integer coordinates, stable ids
 //! and monotonic counters, materials and the world material manifest, fixed
-//! cell sizes and brush/pose units, plus the T00 process-lifecycle records.
+//! cell sizes and brush/pose units, the tick-derived time of day, plus the T00
+//! process-lifecycle records.
 //!
 //! Everything here is data and pure logic. No GPU, window, network, or
 //! filesystem dependency belongs in this crate beyond the JSONL process log
@@ -10,6 +11,7 @@ pub mod coord;
 pub mod ids;
 pub mod input;
 pub mod material;
+pub mod time_of_day;
 pub mod units;
 
 pub use coord::{BRICK_EDGE, BrickCoord, CELLS_PER_BRICK, CoordOverflow, GlobalCell, LocalCell};

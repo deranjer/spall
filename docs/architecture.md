@@ -539,7 +539,10 @@ The clock is presentation state, not persisted world state: a newly started
 simulation begins at day one sunrise. Explicit environment selection and the
 in-game cycle pause are visual overrides; resuming restores tick-derived
 lighting. No protocol clock field is needed because the existing server tick
-already supplies synchronization.
+already supplies synchronization. The tick -> time-of-day mapping
+(`spall_core::time_of_day::state_at_tick`) lives in `spall_core` so server-side
+game systems can read it without the client; client lighting builds on the same
+mapping, and night is when `DayNightState::sun_height()` is negative.
 
 ### ENG-130 regional terrain startup
 
