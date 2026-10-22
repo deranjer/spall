@@ -351,3 +351,95 @@ fn players_walk_through_creatures_instead_of_being_blocked_by_them() {
         deer[0]
     );
 }
+
+/// One deer alone near the floor's centre, settled, with a player standing
+/// `offset_x` metres from it along X. Returns the deer's id and position.
+fn deer_with_player_at(offset_x: f64) -> (Simulation, CreatureService, u64, [f64; 3], [f64; 3]) {
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE};
+
+    let mut sim = simulation();
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[1], 9)
+        .unwrap()
+        .with_radius_m(0.0, 0.5);
+    let service = CreatureService::new(Box::new(director));
+    for _ in 0..30 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+    }
+    let deer = sim.creature_poses()[0];
+    let player_at = [deer.translation_m[0] - offset_x, 0.6, deer.translation_m[2]];
+    sim.add_player(EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap(), player_at);
+    (
+        sim,
+        service,
+        deer.creature_id,
+        deer.translation_m,
+        player_at,
+    )
+}
+
+fn deer_record(sim: &Simulation, id: u64) -> spall_protocol::CreatureRecord {
+    sim.creature_records()
+        .into_iter()
+        .find(|c| c.creature_id == id)
+        .unwrap()
+}
+
+fn horizontal(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (a[0] - b[0]).hypot(a[2] - b[2])
+}
+
+#[test]
+fn a_deer_bolts_at_a_run_from_a_player_close_by() {
+    let (mut sim, service, id, start, player) = deer_with_player_at(3.0);
+    for _ in 0..24 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+    }
+    let deer = deer_record(&sim, id);
+    assert_eq!(deer.locomotion_tag, sandbox::animals::LOCOMOTION_RUN);
+    let gained = horizontal(deer.translation_m, player) - horizontal(start, player);
+    // Three moves at 7.5 m/s are 3 m; turning away from the player costs some.
+    assert!(gained > 1.5, "deer only gained {gained:.2} m on the player");
+}
+
+#[test]
+fn a_deer_watches_a_player_at_a_distance_then_leaves() {
+    let (mut sim, service, id, start, _) = deer_with_player_at(20.0);
+    for _ in 0..16 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+    }
+    let deer = deer_record(&sim, id);
+    assert_eq!(deer.locomotion_tag, sandbox::animals::LOCOMOTION_ALERT);
+    assert!(
+        horizontal(deer.translation_m, start) < 0.05,
+        "an alert deer stands still"
+    );
+    // A player who stays inside the notice distance is fled from once the deer
+    // has watched for a few seconds.
+    let ran = (0..240).any(|_| {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        deer_record(&sim, id).locomotion_tag == sandbox::animals::LOCOMOTION_RUN
+    });
+    assert!(ran, "the deer never fled the watching player");
+}
+
+#[test]
+fn a_deer_ignores_a_far_player() {
+    let (mut sim, service, id, _, _) = deer_with_player_at(60.0);
+    for _ in 0..600 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        let tag = deer_record(&sim, id).locomotion_tag;
+        assert!(
+            tag != sandbox::animals::LOCOMOTION_ALERT && tag != sandbox::animals::LOCOMOTION_RUN,
+            "deer reacted to a player 60 m away"
+        );
+    }
+}

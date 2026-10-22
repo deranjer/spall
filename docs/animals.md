@@ -79,7 +79,13 @@ through them. `--animals N` spawns N deer, N/2 crows and N/8 (rounded up) each
 of grizzly bears and snow leopards in a worldgen sandbox; trout need live
 column-water placement and are not spawned yet. Each walking species has its
 own pace and foot capsule, sized to fit inside its body; placement envelopes and
-foot height are measured from the asset's idle and walk poses. The model, what it
+foot height are measured from the asset's idle and walk poses.
+
+Deer notice players: one within 28 m makes a deer stop and watch it (`alert`
+clip); one within 14 m, or sprinting inside 28 m, makes it bolt at 7.5 m/s
+(`run` clip), faster than a sprinting player. A deer that watched for a few
+seconds with the player still near leaves anyway, and a fleeing deer calms
+down once every player is 45 m away. Other species ignore players for now. The model, what it
 replaced, and the planned hunting design are in
 [animal lifecycle](animal-lifecycle.md). Habitat, species and spawn rules are
 game content in `examples/sandbox`.

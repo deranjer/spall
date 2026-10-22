@@ -30,6 +30,9 @@ struct SpeciesDef {
     walk_speed_m_s: f64,
     /// Foot capsule for walking species: radius, half cylinder height.
     capsule_m: (f32, f32),
+    /// Pace when fleeing players, metres per second. Species with one notice
+    /// players, stand `alert`, then flee at a `run`; others ignore players.
+    flee_speed_m_s: Option<f64>,
 }
 
 const SPECIES: [SpeciesDef; 5] = [
@@ -40,6 +43,8 @@ const SPECIES: [SpeciesDef; 5] = [
         move_clip: "walk",
         walk_speed_m_s: 1.4,
         capsule_m: (0.35, 0.35),
+        // Faster than a sprinting player (5.8 m/s), so a chase is lost.
+        flee_speed_m_s: Some(7.5),
     },
     SpeciesDef {
         key: "crow",
@@ -48,6 +53,7 @@ const SPECIES: [SpeciesDef; 5] = [
         move_clip: "flap",
         walk_speed_m_s: 0.0,
         capsule_m: (0.0, 0.0),
+        flee_speed_m_s: None,
     },
     SpeciesDef {
         key: "trout",
@@ -56,6 +62,7 @@ const SPECIES: [SpeciesDef; 5] = [
         move_clip: "swim",
         walk_speed_m_s: 0.0,
         capsule_m: (0.0, 0.0),
+        flee_speed_m_s: None,
     },
     SpeciesDef {
         key: "bear",
@@ -64,6 +71,7 @@ const SPECIES: [SpeciesDef; 5] = [
         move_clip: "walk",
         walk_speed_m_s: 1.2,
         capsule_m: (0.45, 0.1),
+        flee_speed_m_s: None,
     },
     SpeciesDef {
         key: "snow_leopard",
@@ -72,6 +80,7 @@ const SPECIES: [SpeciesDef; 5] = [
         move_clip: "walk",
         walk_speed_m_s: 1.1,
         capsule_m: (0.28, 0.1),
+        flee_speed_m_s: None,
     },
 ];
 /// Gap kept between an animal's lowest cell and the terrain it stands on.
@@ -79,6 +88,19 @@ pub const GROUND_CLEARANCE_M: f64 = 0.05;
 /// Locomotion selectors carried in motion frames.
 pub const LOCOMOTION_IDLE: u8 = 0;
 pub const LOCOMOTION_MOVE: u8 = 1;
+/// Standing still, watching a player (`alert` clip).
+pub const LOCOMOTION_ALERT: u8 = 2;
+/// Fleeing a player (`run` clip).
+pub const LOCOMOTION_RUN: u8 = 3;
+/// A player this close is noticed by a fleeing species, which stops to watch.
+const NOTICE_M: f64 = 28.0;
+/// A player this close, or a sprinting one inside the notice distance, makes
+/// the animal bolt at once.
+const BOLT_M: f64 = 14.0;
+/// A fleeing animal calms down once every player is this far away.
+const CALM_M: f64 = 45.0;
+/// Horizontal speed above which a player counts as sprinting (walk is slower).
+const SPRINT_M_S: f32 = 4.5;
 /// Capsule swept around a flying animal (about a crow: small body, wings folded in).
 const FLY_CAPSULE_RADIUS_M: f32 = 0.25;
 const FLY_CAPSULE_HALF_HEIGHT_M: f32 = 0.1;
@@ -86,15 +108,18 @@ const FLY_CAPSULE_HALF_HEIGHT_M: f32 = 0.1;
 const MOVE_PERIOD_TICKS: u64 = 8;
 const MOVE_DT_S: f64 = MOVE_PERIOD_TICKS as f64 / 60.0;
 
-/// The clip a species plays while moving.
+/// The clip a species plays for a locomotion tag.
 pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
     if tag == LOCOMOTION_IDLE {
         return Some("idle");
     }
-    SPECIES
-        .iter()
-        .find(|def| def.key == species)
-        .map(|def| def.move_clip)
+    let def = SPECIES.iter().find(|def| def.key == species)?;
+    match tag {
+        LOCOMOTION_MOVE => Some(def.move_clip),
+        LOCOMOTION_ALERT if def.flee_speed_m_s.is_some() => Some("alert"),
+        LOCOMOTION_RUN if def.flee_speed_m_s.is_some() => Some("run"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Error)]
@@ -112,6 +137,8 @@ pub struct AnimalSpecies {
     pub walk_speed_m_s: f64,
     /// Foot capsule (radius, half cylinder height) for walking species.
     pub capsule_m: (f32, f32),
+    /// Pace when fleeing players; `None` for species that ignore them.
+    pub flee_speed_m_s: Option<f64>,
 }
 
 /// Decodes every authored species.
@@ -127,6 +154,7 @@ pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
                 asset,
                 walk_speed_m_s: def.walk_speed_m_s,
                 capsule_m: def.capsule_m,
+                flee_speed_m_s: def.flee_speed_m_s,
             })
         })
         .collect()
@@ -170,6 +198,39 @@ enum Gait {
     Walk { target: [f64; 2], until: u64 },
     /// Fly a circle around `home` at angle `theta`, rate `omega` rad/s.
     Orbit { theta: f64, omega: f64, radius: f64 },
+    /// Stand facing a player who came near, until `until`.
+    Alert { until: u64 },
+    /// Run away from players until clear of them or `until`.
+    Flee { until: u64 },
+}
+
+/// The nearest player to an animal, horizontally.
+#[derive(Debug, Clone, Copy)]
+struct Threat {
+    distance_m: f64,
+    /// Unit vector from the player toward the animal (x, z).
+    away: [f64; 2],
+    sprinting: bool,
+}
+
+fn nearest_threat(players: &[([f64; 3], bool)], here: [f64; 3]) -> Option<Threat> {
+    players
+        .iter()
+        .map(|&(at, sprinting)| {
+            let (dx, dz) = (here[0] - at[0], here[2] - at[2]);
+            let distance_m = dx.hypot(dz);
+            let away = if distance_m > 1.0e-6 {
+                [dx / distance_m, dz / distance_m]
+            } else {
+                [1.0, 0.0]
+            };
+            Threat {
+                distance_m,
+                away,
+                sprinting,
+            }
+        })
+        .min_by(|a, b| a.distance_m.total_cmp(&b.distance_m))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,7 +239,8 @@ struct Walker {
     home: [f64; 3],
     gait: Gait,
     clip_phase: u64,
-    moving: bool,
+    /// Locomotion tag sent last update.
+    tag: u8,
     /// Heading the animal was last asked to face (about +Y).
     yaw: f64,
     /// Where the animal last stood, for choosing a detour when stuck.
@@ -365,6 +427,49 @@ impl AnimalDirector {
         })
     }
 
+    /// Moves a species that flees players between its calm gaits, `Alert` and
+    /// `Flee`, from where the nearest player is.
+    fn react_to_players(&mut self, walker: &mut Walker, threat: Option<Threat>, tick: u64) {
+        let bolts = |t: &Threat| t.distance_m < BOLT_M || (t.sprinting && t.distance_m < NOTICE_M);
+        let flee = Gait::Flee {
+            until: tick + 60 * 20,
+        };
+        match walker.gait {
+            Gait::Flee { until } => {
+                if tick >= until || threat.is_none_or(|t| t.distance_m > CALM_M) {
+                    walker.detours = 0;
+                    walker.gait = Gait::Rest {
+                        until: tick + 120 + (self.next() % 240),
+                    };
+                }
+            }
+            Gait::Alert { until } => match threat {
+                Some(t) if bolts(&t) => walker.gait = flee,
+                // Watched long enough: leave if the player is still around.
+                Some(t) if tick >= until && t.distance_m < NOTICE_M => walker.gait = flee,
+                _ if tick >= until => {
+                    walker.gait = Gait::Rest {
+                        until: tick + 60 + (self.next() % 120),
+                    };
+                }
+                _ => {}
+            },
+            Gait::Rest { .. } | Gait::Walk { .. } => match threat {
+                Some(t) if bolts(&t) => {
+                    walker.detours = 0;
+                    walker.gait = flee;
+                }
+                Some(t) if t.distance_m < NOTICE_M => {
+                    walker.gait = Gait::Alert {
+                        until: tick + 90 + (self.next() % 90),
+                    };
+                }
+                _ => {}
+            },
+            Gait::Orbit { .. } => {}
+        }
+    }
+
     fn birth(&self, placement: &Placement, ids: &mut CreatureIdPlan) -> CreatureRecord {
         let (sin, cos) = (
             (placement.yaw_rad * 0.5).sin(),
@@ -446,7 +551,7 @@ impl CreatureDirector for AnimalDirector {
                             home,
                             gait,
                             clip_phase: 0,
-                            moving: false,
+                            tag: LOCOMOTION_IDLE,
                             last_desired: 0.0,
                             stuck: 0,
                             detours: 0,
@@ -520,6 +625,14 @@ impl CreatureDirector for AnimalDirector {
         let wrap = |angle: f64| {
             (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
         };
+        let players: Vec<([f64; 3], bool)> = sim
+            .world()
+            .players()
+            .map(|player| {
+                let [vx, _, vz] = player.state.velocity_m_s;
+                (player.state.position_m, vx.hypot(vz) > SPRINT_M_S)
+            })
+            .collect();
         let mut actions = Vec::new();
         for alive in sim.creature_poses() {
             let id = alive.creature_id;
@@ -537,7 +650,12 @@ impl CreatureDirector for AnimalDirector {
             let mut desired = [0.0_f64; 2];
             let mut fly_target = here;
             let mut yaw = walker.yaw;
-            let mut moving = false;
+            let mut tag = LOCOMOTION_IDLE;
+            let flee_speed = self.species[walker.species].flee_speed_m_s;
+            let threat = flee_speed.and_then(|_| nearest_threat(&players, here));
+            if flee_speed.is_some() {
+                self.react_to_players(&mut walker, threat, tick);
+            }
             match walker.gait {
                 Gait::Rest { until } => {
                     if tick >= until {
@@ -578,7 +696,7 @@ impl CreatureDirector for AnimalDirector {
                     } else {
                         let want = f64::atan2(-dz, dx);
                         let turn = wrap(want - walker.yaw);
-                        moving = true;
+                        tag = LOCOMOTION_MOVE;
                         if turn.abs() > 0.35 {
                             // Turn toward the target in place, a bounded angle per step.
                             yaw = walker.yaw + turn.clamp(-0.35, 0.35);
@@ -608,26 +726,57 @@ impl CreatureDirector for AnimalDirector {
                     ];
                     // Tangent of the circle, nose along the direction of travel.
                     yaw = f64::atan2(-theta.cos() * omega.signum(), -theta.sin() * omega.signum());
-                    moving = true;
+                    tag = LOCOMOTION_MOVE;
+                }
+                Gait::Alert { .. } => {
+                    // Turn to watch the player, a bounded angle per step.
+                    if let Some(threat) = threat {
+                        let want = f64::atan2(threat.away[1], -threat.away[0]);
+                        yaw = walker.yaw + wrap(want - walker.yaw).clamp(-0.6, 0.6);
+                    }
+                    tag = LOCOMOTION_ALERT;
+                }
+                Gait::Flee { .. } => {
+                    // Straight away from the nearest player; a blocked runner
+                    // veers further off each time until it gets going again.
+                    let away = threat.map_or([yaw.cos(), -yaw.sin()], |t| t.away);
+                    const VEERS: [f64; 6] = [0.9, -0.9, 1.6, -1.6, 2.3, -2.3];
+                    if walker.stuck >= 2 {
+                        walker.stuck = 0;
+                        walker.detours += 1;
+                    }
+                    let veer = match walker.detours {
+                        0 => 0.0,
+                        n => VEERS[(n as usize - 1) % VEERS.len()],
+                    };
+                    let want = f64::atan2(-away[1], away[0]) + veer;
+                    // Turns sharply, but keeps running through the turn.
+                    yaw = walker.yaw + wrap(want - walker.yaw).clamp(-1.2, 1.2);
+                    let step = flee_speed.unwrap_or(0.0) * MOVE_DT_S;
+                    desired = [step * yaw.cos(), -step * yaw.sin()];
+                    tag = LOCOMOTION_RUN;
                 }
             }
-            if moving {
+            // A new activity starts its clip from the beginning.
+            if tag != walker.tag {
+                walker.clip_phase = 0;
+            } else if tag != LOCOMOTION_IDLE {
                 walker.clip_phase += MOVE_PERIOD_TICKS;
             }
-            let was_moving = walker.moving;
-            walker.moving = moving;
+            let was = walker.tag;
+            walker.tag = tag;
             walker.last_desired = desired[0].hypot(desired[1]);
             walker.yaw = yaw;
             self.walkers.insert(id, walker);
-            if !moving && !was_moving {
+            // A creature that just stopped sends one stationary pose so clients
+            // switch back to idle; a resting one sends nothing.
+            if tag == LOCOMOTION_IDLE && was == LOCOMOTION_IDLE {
                 continue;
             }
-            // A creature that just stopped sends one stationary pose so clients
-            // switch from the move clip back to idle.
-            let (tag, phase) = if moving {
-                (LOCOMOTION_MOVE, walker.clip_phase)
+            let phase = if tag == LOCOMOTION_IDLE {
+                0
             } else {
-                (LOCOMOTION_IDLE, 0)
+                walker.clip_phase
             };
             let (sin, cos) = ((yaw * 0.5).sin(), (yaw * 0.5).cos());
             let rotation = [0.0, sin as f32, 0.0, cos as f32];
@@ -662,6 +811,25 @@ impl CreatureDirector for AnimalDirector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A species that flees players must have the clips its alert and run tags
+    /// name, or clients would draw nothing while it reacts.
+    #[test]
+    fn fleeing_species_have_alert_and_run_clips() {
+        for species in species().unwrap() {
+            if species.flee_speed_m_s.is_none() {
+                continue;
+            }
+            for tag in [LOCOMOTION_ALERT, LOCOMOTION_RUN] {
+                let clip = locomotion_clip(species.key, tag).unwrap();
+                assert!(
+                    species.asset.clips.iter().any(|c| c.name == clip),
+                    "{} has no {clip} clip",
+                    species.key
+                );
+            }
+        }
+    }
 
     /// A walker's foot capsule must fit inside its own body: a capsule wider or
     /// taller than the animal blocks it where its body would pass, and one with
