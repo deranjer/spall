@@ -628,7 +628,7 @@ pub(super) async fn serve_async(
                         if !spawns.is_empty() {
                             let slot = session.slot().0 as usize;
                             let spawn = spawns[slot.min(spawns.len() - 1)];
-                            sim.add_player(session_player_entity(session), spawn);
+                            join_player(&mut sim, session, spawn, player_id);
                             // T23 / G3 row 14: remember which spawn this slot
                             // got, so the final per-connection egress report
                             // can be read alongside *where* that connection's

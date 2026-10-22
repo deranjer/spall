@@ -164,6 +164,10 @@ pub struct Simulation {
     creatures: Option<crate::creatures::CreatureHost>,
     /// Carcasses still being placed, one supported layer at a time.
     carcasses: Vec<creature_death::PendingCarcass>,
+    /// Last known health of every authenticated account whose capsule is not
+    /// currently bound (ENG-223). Live bound capsules hold their own health;
+    /// checkpoints carry both.
+    player_health: std::collections::HashMap<spall_protocol::PlayerId, u16>,
 }
 
 /// Frees a large value on a background thread. Dropping a full-size world (hundreds of thousands

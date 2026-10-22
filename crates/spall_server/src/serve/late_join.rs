@@ -137,6 +137,8 @@ pub(super) struct LateJoin {
     pub(super) capture_pool: CapturePool,
     /// Game creature service, when the world has animals.
     pub(super) creatures: Option<crate::creature_service::CreatureService>,
+    /// ENG-223: the health each live session was last sent for its own player.
+    pub(super) health_sent: HashMap<u64, u16>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -173,6 +175,7 @@ impl LateJoin {
             pending_captures: HashMap::new(),
             capture_pool: CapturePool::new(capture_workers),
             creatures: None,
+            health_sent: HashMap::new(),
         }
     }
 
@@ -305,6 +308,7 @@ impl LateJoin {
         // rejected after the link is gone.
         self.links.remove(&session.raw());
         self.pending_captures.remove(&session.raw());
+        self.health_sent.remove(&session.raw());
     }
 
     /// Every connected session, live or joining.

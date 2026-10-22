@@ -107,6 +107,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         bodies: vec![],
         column_water: None,
         weather: None,
+        players: Vec::new(),
         snow: None,
         bricks: vec![StoredBrick {
             volume_id: 1,
