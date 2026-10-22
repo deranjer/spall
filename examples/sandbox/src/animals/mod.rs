@@ -16,6 +16,7 @@ mod fish;
 mod land;
 mod leopards;
 mod players;
+mod wolves;
 
 use glam::DVec3;
 use spall_asset::{Asset, decode};
@@ -40,6 +41,7 @@ enum Family {
     Fish,
     Bear,
     Leopard,
+    Wolf,
 }
 
 /// Per-species authoring and locomotion choices; everything else (envelope,
@@ -68,7 +70,7 @@ struct SpeciesDef {
     uplands: bool,
 }
 
-const SPECIES: [SpeciesDef; 5] = [
+const SPECIES: [SpeciesDef; 6] = [
     SpeciesDef {
         key: "deer",
         family: Family::Deer,
@@ -137,6 +139,19 @@ const SPECIES: [SpeciesDef; 5] = [
         perches: false,
         uplands: true,
     },
+    SpeciesDef {
+        key: "wolf",
+        family: Family::Wolf,
+        habitat: AnimalHabitat::Land,
+        bytes: include_bytes!("../../assets/animals/wolf.spvox"),
+        move_clip: "walk",
+        walk_speed_m_s: 1.4,
+        capsule_m: (0.22, 0.1),
+        flee_speed_m_s: None,
+        grazes: false,
+        perches: false,
+        uplands: false,
+    },
 ];
 /// Gap kept between an animal's lowest cell and the terrain it stands on.
 pub const GROUND_CLEARANCE_M: f64 = 0.05;
@@ -169,6 +184,8 @@ pub const LOCOMOTION_POUNCE: u8 = 21;
 pub const LOCOMOTION_EAT: u8 = 22;
 /// A bear rearing up at a player who came too close (`stand` clip).
 pub const LOCOMOTION_REAR: u8 = 23;
+/// A wolf howling, muzzle to the sky (`howl` clip).
+pub const LOCOMOTION_HOWL: u8 = 24;
 /// Capsule swept around a flying animal (about a crow: small body, wings folded in).
 const FLY_CAPSULE_RADIUS_M: f32 = 0.25;
 const FLY_CAPSULE_HALF_HEIGHT_M: f32 = 0.1;
@@ -198,6 +215,12 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
             if matches!(def.family, Family::Bear) =>
         {
             bears::clip(tag)
+        }
+        LOCOMOTION_RUN | LOCOMOTION_STALK | LOCOMOTION_POUNCE | LOCOMOTION_EAT
+        | LOCOMOTION_HOWL
+            if matches!(def.family, Family::Wolf) =>
+        {
+            wolves::clip(tag)
         }
         _ => None,
     }
@@ -314,6 +337,7 @@ enum Gait {
     Bird(birds::BirdGait),
     Fish(fish::FishGait),
     Bear(bears::BearGait),
+    Wolf(wolves::WolfGait),
 }
 
 fn wrap_angle(angle: f64) -> f64 {
@@ -413,6 +437,8 @@ pub struct AnimalDirector {
     bears: std::collections::HashMap<u64, bears::Bear>,
     /// Nest site and building progress, per crow.
     crows: std::collections::HashMap<u64, birds::Crow>,
+    /// Wolf packs and their shared hunt, meal and howl.
+    wolves: wolves::Packs,
     last_tick: u64,
     /// Per species: (staged moves, blocked moves, walks started), logged periodically.
     stats: Vec<(u64, u64, u64)>,
@@ -488,6 +514,7 @@ impl AnimalDirector {
             walkers: std::collections::BTreeMap::new(),
             bears: std::collections::HashMap::new(),
             crows: std::collections::HashMap::new(),
+            wolves: wolves::Packs::default(),
             last_tick: 0,
             stats: vec![(0, 0, 0); count],
         })
@@ -562,8 +589,16 @@ impl AnimalDirector {
         };
         let angle = self.unit() * std::f64::consts::TAU;
         let radius = self.radius_m.0 + self.unit() * (reach - self.radius_m.0);
-        let x = anchor[0] + radius * angle.cos();
-        let z = anchor[2] + radius * angle.sin();
+        let (mut x, mut z) = (
+            anchor[0] + radius * angle.cos(),
+            anchor[2] + radius * angle.sin(),
+        );
+        // Wolves are born beside the rest of their pack.
+        if let Family::Wolf = SPECIES[species].family
+            && let Some([den_x, den_z]) = wolves::den_spot(self)
+        {
+            (x, z) = (den_x, den_z);
+        }
         let (x_cell, z_cell) = ((x / 0.25).floor() as i64, (z / 0.25).floor() as i64);
         let ground = Self::ground_y_m(sim, x_cell, z_cell)?;
         if uplands && !leopards::upland_birthplace(sim, x_cell, z_cell, ground, anchor[1]) {
@@ -644,8 +679,13 @@ impl CreatureDirector for AnimalDirector {
             let (gait, home) = match SPECIES[species].family {
                 Family::Bird => birds::start(self, sim, root),
                 Family::Fish => fish::start(self, tick, root),
-                Family::Deer | Family::Bear | Family::Leopard => (land::start(self, tick), root),
+                Family::Deer | Family::Bear | Family::Leopard | Family::Wolf => {
+                    (land::start(self, tick), root)
+                }
             };
+            if let Family::Wolf = SPECIES[species].family {
+                wolves::join(self, record.creature_id, tick);
+            }
             self.walkers.insert(
                 record.creature_id,
                 Walker {
@@ -681,6 +721,7 @@ impl CreatureDirector for AnimalDirector {
         self.walkers.clear();
         self.bears.clear();
         self.crows.clear();
+        self.wolves.clear();
     }
 
     /// Fish a bear caught: gone whole, no carcass.
@@ -713,6 +754,11 @@ impl CreatureDirector for AnimalDirector {
                 }
             }
             CreatureActionOutcome::Grazed(ate) => deer::on_grazed(walker, ate, self.last_tick),
+            outcome @ (CreatureActionOutcome::Killed(_) | CreatureActionOutcome::HitPlayer(_))
+                if matches!(SPECIES[walker.species].family, Family::Wolf) =>
+            {
+                wolves::on_outcome(&mut self.wolves, creature_id, outcome, self.last_tick)
+            }
             CreatureActionOutcome::Killed(kill) => {
                 bears::on_killed(&mut self.bears, creature_id, kill, self.last_tick)
             }
@@ -741,6 +787,7 @@ impl CreatureDirector for AnimalDirector {
         let walkers = &self.walkers;
         self.bears.retain(|id, _| walkers.contains_key(id));
         self.crows.retain(|id, _| walkers.contains_key(id));
+        self.wolves.retain(|id| walkers.contains_key(&id));
         let mut actions = Vec::new();
         for alive in poses {
             let id = alive.creature_id;
@@ -771,6 +818,7 @@ impl CreatureDirector for AnimalDirector {
                 Family::Fish => fish::step(self, &mut walker, &cx, &mut actions),
                 Family::Bear => bears::step(self, &mut walker, &cx, &mut actions),
                 Family::Leopard => leopards::step(self, &mut walker, &cx, &mut actions),
+                Family::Wolf => wolves::step(self, &mut walker, &cx, &mut actions),
             };
             // A new activity starts its clip from the beginning.
             if tag != walker.tag {
@@ -873,6 +921,15 @@ mod tests {
                     LOCOMOTION_POUNCE,
                     LOCOMOTION_EAT,
                     LOCOMOTION_REAR,
+                ]);
+            }
+            if species.key == "wolf" {
+                sends.extend([
+                    LOCOMOTION_RUN,
+                    LOCOMOTION_STALK,
+                    LOCOMOTION_POUNCE,
+                    LOCOMOTION_EAT,
+                    LOCOMOTION_HOWL,
                 ]);
             }
             if species.perches {

@@ -28,7 +28,8 @@ pub(super) struct Threat {
 }
 
 /// Every player's position and whether it is sprinting, then every bear's
-/// that is not stalking (a charging bear counts as sprinting).
+/// that is not stalking and every wolf's that is not encircling (a charging
+/// bear or a wolf running in counts as sprinting).
 pub(super) fn threat_sources(dir: &AnimalDirector, sim: &Simulation) -> Vec<([f64; 3], bool)> {
     sim.world()
         .players()
@@ -37,6 +38,7 @@ pub(super) fn threat_sources(dir: &AnimalDirector, sim: &Simulation) -> Vec<([f6
             (player.state.position_m, vx.hypot(vz) > SPRINT_M_S)
         })
         .chain(super::bears::threats(dir))
+        .chain(super::wolves::threats(dir))
         .collect()
 }
 

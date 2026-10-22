@@ -566,13 +566,15 @@ fn run_serve(args: Args) -> ExitCode {
         let anchors: Vec<[f64; 3]> = anchors.into_iter().take(1).collect();
         match sandbox::animals::AnimalDirector::new(
             anchors,
-            // Deer, crows, trout (only in deep enough live water), bears, snow leopards.
+            // Deer, crows, trout (only in deep enough live water), bears, snow
+            // leopards, and a pack of four wolves per 16.
             &[
                 args.animals,
                 args.animals / 2,
                 args.animals.div_ceil(4),
                 args.animals.div_ceil(8),
                 args.animals.div_ceil(8),
+                args.animals.div_ceil(16) * 4,
             ],
             args.seed,
         ) {

@@ -76,7 +76,8 @@ world voxels, so they cannot be cut apart voxel by voxel and are not saved with
 the world. The server moves deer and crows with a capsule swept against terrain;
 clients receive spawn, despawn and motion records. Players and bodies pass
 through them. `--animals N` spawns N deer, N/2 crows and N/8 (rounded up) each
-of grizzly bears and snow leopards, and N/4 trout, in a worldgen sandbox. Each walking species has its
+of grizzly bears and snow leopards, N/4 trout, and a pack of four wolves per
+16 (rounded up), in a worldgen sandbox. Each walking species has its
 own pace and foot capsule, sized to fit inside its body; placement envelopes and
 foot height are measured from the asset's idle and walk poses.
 
@@ -145,6 +146,40 @@ deep (or stops on the bank) beside a trout within 40 m, waits, and swipes
 caught trout simply despawns on every client, with no carcass; the bear eats it
 for 5 s (`eat`) and is hungry again 90 s later. Hovering trout swim away from a
 bear standing in the water within 2 m.
+
+Wolves live in packs (ENG-243). A pack is born around one den; the first
+living member leads on the shared land walk and the others follow behind it,
+running to catch up when they fall back. A hungry pack (30 s after birth, then
+5 minutes after each meal) hunts the nearest deer within 60 m of its leader by
+encircling it: each wolf takes a slot evenly spaced on an 18 m ring round the
+deer and works its way round to it, running when far and creeping (`stalk`)
+when close, never cutting across the deer. Deer do not see encircling wolves.
+Once every wolf is within 4 m of its slot, or after 30 s, the pack runs in at
+9 m/s (deer flee at 7.5 m/s) for up to 8 s, so a deer bolting from the nearest
+wolf runs at another. The first wolf within 1.8 m kills it (`bite` clip)
+through the engine's creature kill, and the whole pack eats the carcass, each
+wolf from its own side, one cell per bite through single-cell server edits,
+until it is gone or after 40 bites. A failed hunt rests the pack 40 s.
+
+With no deer near, a hungry pack decides every 20 s whether to hunt the
+nearest player within 40 m: 20 % by day, 50 % at night. It encircles the
+player on a 12 m ring, then runs in at 7 m/s (faster than a sprint); a wolf
+within 1.6 m bites for `WOLF_BITE_DAMAGE` (20 of 100) and darts back out for
+1.5 s. The pack gives up after three bites, 20 s of running in, or a kill, and
+leaves players alone for 3 minutes. Wolves never attack a full-health player
+to death on their own.
+
+Wolves avoid bears: a bear within 22 m of any wolf ends the pack's hunt and the
+pack runs away from it until 5 s after none is that close. They fear fire.
+There is no campfire yet, so the torch's emissive lamp voxel counts: a wolf
+within 8 m of one backs away, and a pack gives up prey (deer or player) within
+12 m of one. The leader looks for lamp cells in edited bricks within 30 m every
+2 s; worldgen bricks are never edited, so only player-built areas are read.
+
+At night a calm pack howls together every 90 s to 4 minutes: each wolf throws
+its head back (`howl` clip) for 5 s, joining 0.8 s after the one before. A howl
+is only a clip for now; its sound waits on the sound list below and positional
+audio.
 
 An animal can die. A hammer (cutting tool) strike that meets an animal's posed
 voxels before any terrain kills it with one blow: the server despawns it, and
@@ -228,6 +263,26 @@ biome audio. Range is roughly how far away the sound should still be audible.
 | Small splash | A trout turning near the surface; scattering from a bear | 10 m | [search](https://freesound.org/search/?q=fish+splash&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
 | Flopping | Stranded on a drained bed | 8 m | [search](https://freesound.org/search/?q=fish+flopping&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
 | Catch splash | A bear catches a trout | 20 m | [search](https://freesound.org/search/?q=big+splash+water&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
+
+### Wolf (ENG-243, awaiting review)
+
+Specific CC0 files are named where Freesound's CC0 filter turned up real wolves;
+the rest are searches. Recordings marked *dog* or *imitation* are stand-ins, not
+wolves. The howl range is the long one: the server sends creature motion to a
+client within 320 m, so that is as far as a howl can be heard until creature
+replication reaches further.
+
+| Cue | Trigger | Range | Candidates |
+| --- | --- | --- | --- |
+| Lone howl | `howl` (the first wolf of a pack howl, at night) | 320 m | [betchkal, wild Alaskan wolf, very clear](https://freesound.org/people/betchkal/sounds/500646/), [taure, single howl with distant echo](https://freesound.org/people/taure/sounds/380156/), [efsdcnveoi](https://freesound.org/people/efsdcnveoi/sounds/427694/), [JoseAgudelo](https://freesound.org/people/JoseAgudelo/sounds/472402/) |
+| Pack chorus | `howl` from the rest of the pack joining in | 320 m | [Paresh, Wolf Haven sanctuary pack](https://freesound.org/people/Paresh/sounds/158780/), [ondrosik, five wolves](https://freesound.org/people/ondrosik/sounds/143568/), [Kingcornz, howling wolves](https://freesound.org/people/Kingcornz/sounds/378334/) |
+| Growl / snarl | Closing in on prey or a player (`run` after encircling) | 25 m | [Christopherderp, beast snarling](https://freesound.org/people/Christopherderp/sounds/342204/), [qubodup, dog growling and snarling](https://freesound.org/people/qubodup/sounds/122183/) *(dog)*, [Ovkovko, wolf growls](https://freesound.org/people/Ovkovko/sounds/826786/) *(imitation)* |
+| Bite snap | `bite` (a kill, or a bite on a player) | 15 m | [qubodup, Malinois growling in play](https://freesound.org/people/qubodup/sounds/823544/) *(dog)*, [search](https://freesound.org/search/?q=dog+bite+snap&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
+| Alarm bark / huff | A wolf backing off from a bear or a fire | 60 m | [exe2be, single bark](https://freesound.org/people/exe2be/sounds/535457/) *(dog)*, [search](https://freesound.org/search/?q=wolf+bark&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
+| Yips and whines | Occasionally while the pack rests together | 30 m | [search](https://freesound.org/search/?q=wolf+whine&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first), [search](https://freesound.org/search/?q=coyote+yip&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
+| Padding steps | `walk`, `stalk` | 10 m | [search](https://freesound.org/search/?q=dog+paws+footsteps&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
+| Running | `run` | 30 m | [search](https://freesound.org/search/?q=dog+running+leaves&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
+| Tearing and chewing meat | `eat` on a carcass | 15 m | Same pick as the bear's |
 
 ### Shared
 
