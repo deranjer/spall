@@ -246,3 +246,15 @@ fn a_player_beside_a_fire_is_left_alone() {
         "a wolf bit a player at a fire"
     );
 }
+
+#[test]
+fn snow_leopards_with_no_mountain_do_not_keep_wolves_from_spawning() {
+    // The flat field has no high or steep ground, so no snow leopard can be
+    // placed; the species after it must still get its turns.
+    let mut sim = simulation(&[]);
+    let service = service(vec![[MIDDLE, 0.5, MIDDLE]], &[0, 0, 0, 0, 4, 4], 9);
+    for _ in 0..200 {
+        run(&mut sim, &service);
+    }
+    assert_eq!(wolves(&sim).len(), 4);
+}

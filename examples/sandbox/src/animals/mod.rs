@@ -186,6 +186,10 @@ pub const LOCOMOTION_EAT: u8 = 22;
 pub const LOCOMOTION_REAR: u8 = 23;
 /// A wolf howling, muzzle to the sky (`howl` clip).
 pub const LOCOMOTION_HOWL: u8 = 24;
+/// A wolf running in at its prey (`run` clip).
+pub const LOCOMOTION_CHASE: u8 = 25;
+/// A wolf backing away from a bear or a fire (`run` clip).
+pub const LOCOMOTION_SHY: u8 = 26;
 /// Capsule swept around a flying animal (about a crow: small body, wings folded in).
 const FLY_CAPSULE_RADIUS_M: f32 = 0.25;
 const FLY_CAPSULE_HALF_HEIGHT_M: f32 = 0.1;
@@ -217,7 +221,7 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
             bears::clip(tag)
         }
         LOCOMOTION_RUN | LOCOMOTION_STALK | LOCOMOTION_POUNCE | LOCOMOTION_EAT
-        | LOCOMOTION_HOWL
+        | LOCOMOTION_HOWL | LOCOMOTION_CHASE | LOCOMOTION_SHY
             if matches!(def.family, Family::Wolf) =>
         {
             wolves::clip(tag)
@@ -665,8 +669,14 @@ impl CreatureDirector for AnimalDirector {
         let mut intents = Vec::new();
         while intents.len() < self.max_per_tick && !self.done() {
             self.attempts += 1;
-            let Some(species) =
-                (0..self.species.len()).find(|&i| self.spawned[i] < self.targets[i])
+            // Species unfilled so far take turns, so one that is hard to place
+            // (snow leopards with no mountain near) cannot use up every attempt
+            // and starve the species after it.
+            let count = self.species.len();
+            let first = self.attempts as usize % count;
+            let Some(species) = (0..count)
+                .map(|i| (first + i) % count)
+                .find(|&i| self.spawned[i] < self.targets[i])
             else {
                 break;
             };
@@ -930,6 +940,8 @@ mod tests {
                     LOCOMOTION_POUNCE,
                     LOCOMOTION_EAT,
                     LOCOMOTION_HOWL,
+                    LOCOMOTION_CHASE,
+                    LOCOMOTION_SHY,
                 ]);
             }
             if species.perches {
