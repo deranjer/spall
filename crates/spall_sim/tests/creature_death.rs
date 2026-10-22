@@ -58,11 +58,13 @@ fn sim_with_creature() -> Simulation {
 }
 
 fn run_until_idle(sim: &mut Simulation) {
-    for _ in 0..200 {
+    // Off-thread staging finishes in wall time, so pace the ticks a little.
+    for _ in 0..2000 {
         sim.tick().unwrap();
         if sim.is_idle() {
             return;
         }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
     panic!("edits never finished");
 }
@@ -206,4 +208,99 @@ fn a_creature_kills_another_and_edits_single_cells() {
 
     // Only a hosted creature edits.
     assert!(sim.creature_edit_cell(1, cell, None).is_err());
+}
+
+/// Local terrain cells of a four-legged animal, one 0.25 m voxel per cell:
+/// legs two cells high under a 6 x 3 body, a neck and head sticking out ahead
+/// of the front legs, and a tail behind. Its body and head are held up only
+/// through the legs.
+fn legged_cells() -> Vec<[i64; 3]> {
+    let mut cells = Vec::new();
+    for (x, z) in [(1, 0), (1, 2), (4, 0), (4, 2)] {
+        for y in 0..2 {
+            cells.push([x, y, z]);
+        }
+    }
+    for x in 0..6 {
+        for z in 0..3 {
+            cells.push([x, 2, z]);
+        }
+    }
+    // Neck and head ahead (-X), tail behind (+X).
+    cells.extend([[-1, 2, 1], [-1, 3, 1], [-2, 3, 1], [-2, 4, 1], [-3, 4, 1]]);
+    cells.push([6, 2, 1]);
+    cells
+}
+
+fn legged_shape() -> CreatureShape {
+    CreatureShape::new(|record: &CreatureRecord| {
+        let root = DVec3::from_array(record.translation_m);
+        legged_cells()
+            .into_iter()
+            .map(|[x, y, z]| CreatureVoxel {
+                centre_m: (root + (DVec3::new(x as f64, y as f64, z as f64) + 0.5) * 0.25)
+                    .to_array(),
+                edge_m: 0.25,
+                material: fixtures::STONE,
+            })
+            .collect()
+    })
+}
+
+fn legged_kill_lands_as_terrain(off_thread: bool) {
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    if off_thread {
+        sim.enable_off_thread_staging();
+    }
+    sim.initialize_creature_host().unwrap();
+    sim.set_creature_shape(legged_shape()).unwrap();
+    // Root corner at cell (8, 3, 10): its feet hover one cell above the floor
+    // (top solid cell y = 1), so the carcass drops one cell.
+    sim.spawn_creatures(vec![CreatureRecord {
+        creature_id: 1,
+        species: "legged".into(),
+        translation_m: [2.0, 0.75, 2.5],
+        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        locomotion_tag: 0,
+        clip_phase_tick: 0,
+    }])
+    .unwrap();
+    let bodies_before = sim.world().body_count();
+    let kill = sim
+        .kill_creature(1, Some(RequestId(7)), EntityId::new(9).unwrap())
+        .unwrap();
+    assert_eq!(kill.carcass.len(), legged_cells().len());
+    assert_eq!(
+        kill.first_status.as_ref().map(|s| s.request_id),
+        Some(RequestId(7))
+    );
+    run_until_idle(&mut sim);
+    assert!(sim.committed(RequestId(7)).is_some(), "the strike commits");
+    let missing = kill
+        .carcass
+        .iter()
+        .filter(|(cell, _)| !filled(&sim, *cell))
+        .count();
+    let new_bodies = sim.world().body_count() - bodies_before;
+    assert!(
+        missing == 0 && new_bodies == 0,
+        "{missing} of {} carcass cells are not terrain; {new_bodies} new bodies",
+        kill.carcass.len()
+    );
+    for [x, y, z] in legged_cells() {
+        assert!(filled(&sim, GlobalCell::new(8 + x, 2 + y, 10 + z)));
+    }
+}
+
+/// ENG-242: a carcass held up through its legs lands as connected terrain,
+/// not as loose single-cell bodies, whatever order its cells commit in.
+#[test]
+fn a_legged_carcass_lands_as_connected_terrain() {
+    legged_kill_lands_as_terrain(false);
+}
+
+/// The same with staging on its worker thread, as the server runs it.
+#[test]
+fn a_legged_carcass_lands_as_connected_terrain_off_thread() {
+    legged_kill_lands_as_terrain(true);
 }

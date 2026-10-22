@@ -45,6 +45,7 @@ impl Simulation {
             &mut transfer_ids,
         )?;
         drop(pipeline_span);
+        self.advance_carcasses();
         let mut report = report;
         // Only a committed change to a terrain brick at or next to a region's
         // fluid domain can change that region's boundary.

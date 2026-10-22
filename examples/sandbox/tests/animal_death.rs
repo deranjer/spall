@@ -2,7 +2,8 @@
 //! ENG-237, end to end: a real server hosts a generated world with one deer
 //! and the game's creature shape. A client swings the hammer at the deer: the
 //! deer disappears from the client's replica, its voxels appear as terrain
-//! where it stood, and a second swing cuts part of that carcass away.
+//! where it stood, and a second swing cuts part of that carcass away. ENG-242:
+//! the carcass lands as connected terrain, not as loose bodies.
 //!
 //! Run: `cargo test --release -p sandbox --features client --test animal_death`.
 
@@ -22,10 +23,11 @@ use spall_client::{
 };
 use spall_core::{GlobalCell, MaterialId};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
-use spall_protocol::CreatureRecord;
+use spall_protocol::{CreatureRecord, RequestId};
 use spall_server::creature_service::{CreatureDirector, CreatureIdPlan, CreatureService};
 use spall_server::{Scene, ServeConfig};
-use spall_sim::Simulation;
+use spall_sim::intent::{EditIntent, EditTarget};
+use spall_sim::{Simulation, SimulationConfig};
 use spall_voxel::Sample;
 
 const CELL_M: f64 = 0.25;
@@ -218,6 +220,24 @@ fn a_hammer_strike_kills_a_deer_and_leaves_an_editable_carcass() {
         std::thread::sleep(Duration::from_millis(20));
     };
 
+    // The first structural commit anywhere splits off the few loose cells the
+    // generated world already has. Make that happen before the kill with a
+    // single-cell swing at the ground 2 m west of the spawn, so the body count
+    // below sees only what the carcass does.
+    let ground = [spawn[0] - 2.0, spawn[1], spawn[2]];
+    let column_lo = GlobalCell::new(cell(ground[0]), cell(ground[1]) - 16, cell(ground[2]));
+    let column_hi = GlobalCell::new(cell(ground[0]), cell(ground[1]) + 4, cell(ground[2]));
+    let column = terrain_cells(&replica, column_lo, column_hi).expect("resident ground");
+    let eye = Vec3::new(ground[0] as f32, ground[1] as f32 + 1.5, ground[2] as f32);
+    session.push_action(hammer_request(1_999_999, eye, Vec3::NEG_Y, 0));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while terrain_cells(&replica, column_lo, column_hi).as_ref() == Some(&column) {
+        assert!(Instant::now() < deadline, "the ground swing never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let bodies_before = replica.lock().unwrap().body_ids().count();
+
     // Swing at the deer's body from 3 m west and 1.5 m up.
     let eye = body + Vec3::new(-3.0, 1.5, 0.0);
     session.push_action(hammer_request(2_000_000, eye, (body - eye).normalize(), 2));
@@ -250,7 +270,20 @@ fn a_hammer_strike_kills_a_deer_and_leaves_an_editable_carcass() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    println!("carcass of {} terrain cells", carcass.len());
+    // ENG-242: the carcass lands as connected terrain. A cell placed before
+    // the cells holding it up would split off as a loose body instead, which
+    // the terrain count above cannot see.
+    let new_bodies = replica
+        .lock()
+        .unwrap()
+        .body_ids()
+        .count()
+        .saturating_sub(bodies_before);
+    println!(
+        "carcass of {} terrain cells, {new_bodies} new bodies",
+        carcass.len()
+    );
+    assert_eq!(new_bodies, 0, "carcass cells fell off as loose bodies");
     for (cell, material) in &carcass {
         assert!(
             deer_materials.contains(material),
@@ -289,4 +322,96 @@ fn a_hammer_strike_kills_a_deer_and_leaves_an_editable_carcass() {
     session.request_stop();
     client.join().unwrap().expect("client run");
     server.join().unwrap().expect("server run");
+}
+
+/// ENG-242, in the simulation alone: a deer killed where the end-to-end test
+/// kills it lands as terrain. Every carcass cell is solid once the edit queue
+/// drains, and no cell split off as a loose body.
+#[test]
+fn a_deer_carcass_lands_as_connected_terrain() {
+    let scene = worldgen_scene::generate("showcase", 1, 256).expect("generate");
+    let spawn = scene.player_spawns()[0];
+    let cells = deer_visual().sample("idle", 0.0).unwrap();
+    let low = cells.iter().map(|c| c.center.y).fold(f32::MAX, f32::min);
+    let root = [spawn[0] + 3.0, spawn[1] - f64::from(low) + 0.05, spawn[2]];
+
+    let mut setup = scene.world_setup();
+    setup.materials = game::manifest();
+    let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
+    sim.initialize_creature_host().unwrap();
+    sim.set_creature_shape(sandbox::animal_visual::creature_shape().unwrap())
+        .unwrap();
+    sim.spawn_creatures(vec![CreatureRecord {
+        creature_id: 1,
+        species: "deer".into(),
+        translation_m: root,
+        rotation_xyzw: Quat::IDENTITY.to_array(),
+        locomotion_tag: 0,
+        clip_phase_tick: 0,
+    }])
+    .unwrap();
+    let actor = spall_core::EntityId::new(9).unwrap();
+
+    // The first structural commit anywhere splits off the few loose cells the
+    // generated world already has. Cut one ground cell 2 m west of the spawn
+    // first, so the body count below sees only what the carcass does.
+    let cell = |m: f64| (m / CELL_M).floor() as i64;
+    let mut ground = GlobalCell::new(cell(spawn[0] - 2.0), cell(spawn[1]), cell(spawn[2]));
+    while matches!(
+        sim.world().terrain().volume.sample(ground),
+        Ok(Sample::Empty { .. })
+    ) {
+        ground.y -= 1;
+    }
+    let unit = spall_core::BRUSH_UNIT;
+    let brush = spall_core::SphereBrush::new(
+        spall_core::units::BrushPoint::from_units(
+            ground.x * unit + unit / 2,
+            ground.y * unit + unit / 2,
+            ground.z * unit + unit / 2,
+        ),
+        0,
+    )
+    .unwrap();
+    sim.submit(EditIntent::cut(
+        RequestId(5),
+        actor,
+        EditTarget::Terrain,
+        brush,
+    ))
+    .unwrap();
+    run_until_idle(&mut sim);
+    assert!(
+        sim.committed(RequestId(5)).is_some(),
+        "the ground cut commits"
+    );
+    let bodies_before = sim.world().body_count();
+
+    let kill = sim.kill_creature(1, Some(RequestId(7)), actor).unwrap();
+    run_until_idle(&mut sim);
+    assert!(sim.committed(RequestId(7)).is_some(), "the strike commits");
+    let volume = &sim.world().terrain().volume;
+    let terrain = kill
+        .carcass
+        .iter()
+        .filter(|(cell, _)| matches!(volume.sample(*cell), Ok(Sample::Filled(_))))
+        .count();
+    let new_bodies = sim.world().body_count() - bodies_before;
+    println!(
+        "deer carcass: {terrain} of {} cells terrain, {new_bodies} new bodies",
+        kill.carcass.len()
+    );
+    assert!(kill.carcass.len() >= 40, "a deer-sized carcass");
+    assert_eq!(terrain, kill.carcass.len(), "every carcass cell is terrain");
+    assert_eq!(new_bodies, 0, "no carcass cell split off as a body");
+}
+
+fn run_until_idle(sim: &mut Simulation) {
+    for _ in 0..600 {
+        sim.tick().unwrap();
+        if sim.is_idle() {
+            return;
+        }
+    }
+    panic!("edits never finished");
 }
