@@ -159,6 +159,8 @@ pub const LOCOMOTION_PECK: u8 = 7;
 pub const LOCOMOTION_TAKEOFF: u8 = 8;
 /// A deer lying asleep at night (`sleep` clip).
 pub const LOCOMOTION_SLEEP: u8 = 9;
+/// A crow sitting in its nest for the night (its `idle` clip).
+pub const LOCOMOTION_ROOST: u8 = 10;
 /// A predator creeping up on prey (a bear's slow `walk`).
 pub const LOCOMOTION_STALK: u8 = 20;
 /// A predator's killing blow (a bear's `swipe`).
@@ -187,6 +189,7 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
         LOCOMOTION_HOP if def.perches => Some("hop"),
         LOCOMOTION_PECK if def.perches => Some("peck"),
         LOCOMOTION_TAKEOFF if def.perches => Some("takeoff"),
+        LOCOMOTION_ROOST if def.perches => Some("idle"),
         LOCOMOTION_SLEEP if matches!(def.family, Family::Deer) => Some("sleep"),
         LOCOMOTION_RUN | LOCOMOTION_STALK | LOCOMOTION_POUNCE | LOCOMOTION_EAT
             if matches!(def.family, Family::Bear) =>
@@ -405,6 +408,8 @@ pub struct AnimalDirector {
     walkers: std::collections::BTreeMap<u64, Walker>,
     /// Hunger and the carcass being eaten, per bear.
     bears: std::collections::HashMap<u64, bears::Bear>,
+    /// Nest site and building progress, per crow.
+    crows: std::collections::HashMap<u64, birds::Crow>,
     last_tick: u64,
     /// Per species: (staged moves, blocked moves, walks started), logged periodically.
     stats: Vec<(u64, u64, u64)>,
@@ -479,6 +484,7 @@ impl AnimalDirector {
             radius_m: (6.0, 50.0),
             walkers: std::collections::BTreeMap::new(),
             bears: std::collections::HashMap::new(),
+            crows: std::collections::HashMap::new(),
             last_tick: 0,
             stats: vec![(0, 0, 0); count],
         })
@@ -671,6 +677,7 @@ impl CreatureDirector for AnimalDirector {
         self.attempts = 0;
         self.walkers.clear();
         self.bears.clear();
+        self.crows.clear();
     }
 
     fn on_action_outcome(&mut self, creature_id: u64, outcome: CreatureActionOutcome) {
@@ -725,6 +732,7 @@ impl CreatureDirector for AnimalDirector {
             .retain(|id, _| poses.iter().any(|pose| pose.creature_id == *id));
         let walkers = &self.walkers;
         self.bears.retain(|id, _| walkers.contains_key(id));
+        self.crows.retain(|id, _| walkers.contains_key(id));
         let mut actions = Vec::new();
         for alive in poses {
             let id = alive.creature_id;
@@ -864,6 +872,7 @@ mod tests {
                     LOCOMOTION_HOP,
                     LOCOMOTION_PECK,
                     LOCOMOTION_TAKEOFF,
+                    LOCOMOTION_ROOST,
                 ]);
             }
             for tag in sends {
