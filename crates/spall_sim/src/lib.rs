@@ -79,7 +79,8 @@ pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};
 pub use player::{
-    HELD_INPUT_TIMEOUT_TICKS, Player, transaction_world_box, transaction_world_boxes,
+    HELD_INPUT_TIMEOUT_TICKS, PLAYER_MAX_HEALTH, Player, PlayerDamage, transaction_world_box,
+    transaction_world_boxes,
 };
 pub use playground::{
     DropSchedule, DropZone, PLAYGROUND_DEBRIS_COUNT, PLAYGROUND_PLINKO_COUNT,

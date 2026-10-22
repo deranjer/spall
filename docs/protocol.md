@@ -308,8 +308,8 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 17): one wire version for the handshake and every record, bumped on
-any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 7, defined in
+`PROTOCOL_VERSION` (currently 19): one wire version for the handshake and every record, bumped on
+any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 8, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
 
@@ -683,6 +683,17 @@ Weather overrides require the existing admin authorization and persist through
 checkpoint/restart; world reset clears them. Per-weather stream fences allow
 weather older than motion while refusing stale weather/reset records. See
 reports/ENG-196-weather-foundation.md and reports/ENG-199-weather-controls.md.
+
+### ENG-223 - Player health
+
+Protocol 19 adds `PlayerHealth` tag 29 (`health`, `max_health`, both `u16`), sent server to
+client on the control stream to the owning session only: once when the session goes live and
+again whenever its player's health changes. `health` is always `1..=max_health`; a death shows
+as health jumping back to `max_health` together with the respawn teleport (a `movement_epoch`
+bump). Save version 8 adds the `checkpoint_players` row: the health of every authenticated
+account (`PlayerId`) the world has seen. Unauthenticated sessions have no stable identity and
+always start at full health. Health is checkpointed, not journaled, so a crash can lose health
+changes since the last checkpoint.
 
 ### ENG-206/208 - Ground snow and footprints
 

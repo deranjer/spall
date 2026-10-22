@@ -154,6 +154,14 @@ pub struct StoredBrick {
     pub payload: BrickPayload,
 }
 
+/// One authenticated account's health (ENG-223), keyed by its stable
+/// [`spall_protocol::PlayerId`] bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPlayerHealth {
+    pub player_id: [u8; 16],
+    pub health: u16,
+}
+
 /// A coherent, immutable saved simulation snapshot at one tick, plus the
 /// journal cursor it is consistent with. Publishing this and its cursor in one
 /// DB transaction is the checkpoint-publication contract.
@@ -168,6 +176,9 @@ pub struct Checkpoint {
     /// Versioned canonical thin snow; transient footprints are excluded by the owner.
     /// None when the caller has no snow state.
     pub snow: Option<Vec<u8>>,
+    /// Health of every authenticated account the world has seen, sorted by
+    /// account. Unauthenticated sessions have no stable identity to key by.
+    pub players: Vec<StoredPlayerHealth>,
     pub tick: u64,
     /// Highest journal sequence this checkpoint already includes. Recovery
     /// replays the durable journal suffix strictly after this.
@@ -720,6 +731,7 @@ mod tests {
             vegetation: Vec::new(),
             column_water: None,
             weather: None,
+            players: Vec::new(),
             snow: None,
             tick: 120,
             journal_cursor: 5,

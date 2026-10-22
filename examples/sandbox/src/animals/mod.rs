@@ -716,7 +716,7 @@ impl CreatureDirector for AnimalDirector {
             CreatureActionOutcome::Killed(kill) => {
                 bears::on_killed(&mut self.bears, creature_id, kill, self.last_tick)
             }
-            CreatureActionOutcome::CellEdited(_) => {}
+            CreatureActionOutcome::CellEdited(_) | CreatureActionOutcome::HitPlayer(_) => {}
         }
     }
 

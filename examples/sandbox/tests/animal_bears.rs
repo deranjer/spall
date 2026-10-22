@@ -1,7 +1,9 @@
 #![cfg(feature = "client")]
 //! ENG-238: a hungry bear stalks a deer, charges, kills it, and eats the
 //! carcass a cell at a time; the deer runs from the charge, and its despawn
-//! reaches a replica the way the serve loop announces it.
+//! reaches a replica the way the serve loop announces it. ENG-240: a bluff
+//! leaves the player unhurt; a player who presses a bear is hit, and two hits
+//! respawn them.
 //!
 //! Run: `cargo test --release -p sandbox --features client --test animal_bears`.
 
@@ -205,8 +207,6 @@ fn a_hungry_bear_stalks_catches_kills_and_eats_a_deer() {
 /// One bear alone in the middle of the field, settled, and a player standing
 /// `offset_x` metres from it. Returns the bear's id and the player's position.
 fn bear_with_player_at(offset_x: f64) -> (Simulation, CreatureService, u64, [f64; 3]) {
-    use spall_core::{EntityId, PLAYER_ENTITY_BASE};
-
     let mut sim = simulation();
     let middle = SIDE as f64 * 0.125;
     let director = AnimalDirector::new(vec![[middle, 0.5, middle]], &[0, 0, 0, 1, 0], 3)
@@ -219,8 +219,12 @@ fn bear_with_player_at(offset_x: f64) -> (Simulation, CreatureService, u64, [f64
     }
     let bear = sim.creature_poses()[0];
     let player = [bear.translation_m[0] - offset_x, 0.6, bear.translation_m[2]];
-    sim.add_player(EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap(), player);
+    sim.add_player(player_entity(), player);
     (sim, service, bear.creature_id, player)
+}
+
+fn player_entity() -> spall_core::EntityId {
+    spall_core::EntityId::new(spall_core::PLAYER_ENTITY_BASE + 1).unwrap()
 }
 
 fn bear_record(sim: &Simulation, id: u64) -> spall_protocol::CreatureRecord {
@@ -257,6 +261,62 @@ fn a_bear_rears_bluffs_and_backs_off_from_a_player_who_comes_close() {
     assert!(
         distance > 8.0,
         "bear ended only {distance:.1} m from the player"
+    );
+    assert_eq!(
+        sim.player_health(player_entity()),
+        Some(spall_sim::PLAYER_MAX_HEALTH),
+        "a bluff that stops short must not hurt"
+    );
+}
+
+#[test]
+fn a_bear_pressed_hard_hits_and_a_second_hit_respawns_the_player() {
+    use sandbox::game::BEAR_SWIPE_DAMAGE;
+    use spall_sim::PLAYER_MAX_HEALTH;
+
+    // The player starts 3 m off and keeps closing to 3 m whenever the bear
+    // gets further away, retreats included.
+    let (mut sim, service, id, spawn) = bear_with_player_at(3.0);
+    let player = player_entity();
+    let mut healths = vec![PLAYER_MAX_HEALTH];
+    let mut killed_at = None;
+    for _ in 0..3000 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        let health = sim.player_health(player).unwrap();
+        if healths.last() != Some(&health) {
+            healths.push(health);
+            if health == PLAYER_MAX_HEALTH {
+                killed_at = Some(sim.player_state(player).unwrap().position_m);
+                break;
+            }
+        }
+        let bear = bear_record(&sim, id).translation_m;
+        let feet = sim.player_state(player).unwrap().position_m;
+        let (dx, dz) = (feet[0] - bear[0], feet[2] - bear[2]);
+        let distance = dx.hypot(dz);
+        if distance > 3.2 {
+            let scale = 3.0 / distance;
+            sim.teleport_player(
+                player,
+                [bear[0] + dx * scale, feet[1], bear[2] + dz * scale],
+            );
+        }
+    }
+    assert_eq!(
+        healths,
+        [
+            PLAYER_MAX_HEALTH,
+            PLAYER_MAX_HEALTH - BEAR_SWIPE_DAMAGE,
+            PLAYER_MAX_HEALTH
+        ],
+        "one hit hurts, the second kills"
+    );
+    let at = killed_at.unwrap();
+    assert!(
+        (at[0] - spawn[0]).hypot(at[2] - spawn[2]) < 0.5,
+        "respawned at {at:?}, spawn {spawn:?}"
     );
 }
 

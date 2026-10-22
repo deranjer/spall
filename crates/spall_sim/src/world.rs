@@ -274,7 +274,7 @@ pub struct SimWorld {
     volume_owner: BTreeMap<u64, u64>,
     /// Authoritative player capsules keyed by their reserved-band entity id
     /// (T19). Not bodies: no volume, never split, never in the dynamic set.
-    players: BTreeMap<u64, Player>,
+    pub(crate) players: BTreeMap<u64, Player>,
     physics_origin: PhysicsOrigin,
     physics: PhysicsWorld,
     /// Installed at startup by default. `None` denotes an explicit legacy

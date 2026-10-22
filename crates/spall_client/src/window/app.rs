@@ -64,6 +64,9 @@ pub(super) struct InteractiveApp {
     pub(super) body_state: BodyState,
     /// Admin-menu previews of looks for stats the game does not model yet.
     pub(super) body_preview: BodyPreview,
+    /// This client's authoritative health, last read from the replica; shown
+    /// as the injury look.
+    pub(super) player_health: Option<spall_protocol::PlayerHealth>,
     pub(super) body_state_at: Option<Instant>,
     /// Clock for the screen grade's heartbeat pulse.
     pub(super) body_epoch: Instant,
@@ -294,6 +297,7 @@ impl InteractiveApp {
             weather_exposure: 1.0,
             body_state: BodyState::default(),
             body_preview: BodyPreview::default(),
+            player_health: None,
             body_state_at: None,
             body_epoch: Instant::now(),
             weather_submerge: 0.0,

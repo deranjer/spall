@@ -416,6 +416,7 @@ impl ApplicationHandler for InteractiveApp {
                             (position[2] / 4.0).floor() as i32,
                         );
                     }
+                    self.player_health = replica.player_health();
                     let snow_generation = replica.snow_generation();
                     if renderer.snow_generation != Some(snow_generation) {
                         renderer.snow_frames = replica.snow_frames_shared();
@@ -808,13 +809,17 @@ impl ApplicationHandler for InteractiveApp {
                             submerged,
                         };
                         self.body_state.advance(&conditions, body_dt);
+                        // Real injury from the server's health, or the admin
+                        // preview when that is stronger.
+                        let body_looks =
+                            crate::body_state::with_health(&self.body_preview, self.player_health);
                         renderer.body_reminders =
-                            crate::body_state::reminders(&self.body_state, &self.body_preview);
+                            crate::body_state::reminders(&self.body_state, &body_looks);
                         renderer
                             .scene
                             .set_screen_grade(crate::body_state::screen_grade(
                                 &self.body_state,
-                                &self.body_preview,
+                                &body_looks,
                                 self.body_epoch.elapsed().as_secs_f32(),
                             ));
                         let menu_view = self.admin_menu_open.then(|| {

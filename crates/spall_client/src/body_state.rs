@@ -1,8 +1,9 @@
 //! How the local player's body state looks on screen. This is presentation,
 //! not gameplay: cold and wetness are eased from signals the client already
 //! has (the replicated weather, shelter, the replicated water surface), and
-//! nothing here is sent to the server or decides an outcome. When survival
-//! stats become server-authoritative they replace these inputs.
+//! nothing here is sent to the server or decides an outcome. Injury comes from
+//! the server's authoritative health (ENG-223); when the other survival stats
+//! become server-authoritative they replace their inputs the same way.
 
 use spall_render::ScreenGrade;
 
@@ -74,6 +75,28 @@ pub struct BodyPreview {
     pub thirst: f32,
     pub exhaustion: f32,
     pub hunger: f32,
+}
+
+/// Health fraction at and below which the injury look is at full strength.
+/// Above it the look grows linearly with lost health, so one bear swipe
+/// (40 of 100 left) is past the reminder icon's [`REMINDER_AT`].
+const INJURY_FULL_AT: f32 = 0.2;
+
+/// `preview` with its injury raised to what this client's latest
+/// authoritative `health` shows (the larger of the two). No health yet, or
+/// full health after a respawn, adds nothing.
+pub fn with_health(
+    preview: &BodyPreview,
+    health: Option<spall_protocol::PlayerHealth>,
+) -> BodyPreview {
+    let injury = health.filter(|h| h.max_health > 0).map_or(0.0, |h| {
+        let lost = 1.0 - f32::from(h.health) / f32::from(h.max_health);
+        (lost / (1.0 - INJURY_FULL_AT)).clamp(0.0, 1.0)
+    });
+    BodyPreview {
+        injury: finite_unit(preview.injury).max(injury),
+        ..*preview
+    }
 }
 
 /// The screen grade for `state` plus any `preview` looks at `time_s` (drives
@@ -367,6 +390,43 @@ mod tests {
         );
         assert_eq!(full[4], (BodyCue::Cold, 1.0));
         assert!(full[5].1 > 0.0 && full[5].1 < 1.0, "fades in: {full:?}");
+    }
+
+    #[test]
+    fn lost_health_shows_as_injury_and_full_health_clears_it() {
+        let health = |health| {
+            Some(spall_protocol::PlayerHealth {
+                health,
+                max_health: 100,
+            })
+        };
+        let none = BodyPreview::default();
+        let body = BodyState::default();
+        for unhurt in [None, health(100)] {
+            let preview = with_health(&none, unhurt);
+            assert_eq!(screen_grade(&body, &preview, 0.3), ScreenGrade::IDENTITY);
+            assert!(reminders(&body, &preview).iter().all(|(_, o)| *o == 0.0));
+        }
+        // One bear swipe: a red, drained screen and the injury icon.
+        let hurt = with_health(&none, health(40));
+        let grade = screen_grade(&body, &hurt, 0.0);
+        assert!(grade.vignette > 0.3 && grade.saturation < 0.6, "{grade:?}");
+        assert!(
+            grade.vignette_color[0] > grade.vignette_color[1],
+            "{grade:?}"
+        );
+        assert_eq!(reminders(&body, &hurt)[0].0, BodyCue::Injury);
+        assert!(reminders(&body, &hurt)[0].1 > 0.0);
+        // A scratch is a faint look and no icon; the admin preview still wins
+        // when it is stronger.
+        let scratch = with_health(&none, health(90));
+        assert!(scratch.injury > 0.0 && scratch.injury < 0.2, "{scratch:?}");
+        assert_eq!(reminders(&body, &scratch)[0].1, 0.0);
+        let preview = BodyPreview {
+            injury: 0.9,
+            ..none
+        };
+        assert_eq!(with_health(&preview, health(90)).injury, 0.9);
     }
 
     #[test]
