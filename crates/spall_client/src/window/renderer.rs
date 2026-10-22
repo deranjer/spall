@@ -56,6 +56,10 @@ pub(crate) struct WorldRenderer {
     /// ratio needed to finish the projection).
     aspect: f32,
     yakui: yakui::Yakui,
+    /// Body-state reminder icons, in [`BodyCue::ALL`] order.
+    body_icons: [yakui::ManagedTextureId; 6],
+    /// Each reminder icon's opacity this frame (`body_state::reminders`).
+    pub(super) body_reminders: [(BodyCue, f32); 6],
     yakui_winit: YakuiWinit,
     yakui_wgpu: YakuiWgpu,
     yakui_buffers: yakui_wgpu::Buffers,
@@ -328,7 +332,8 @@ impl WorldRenderer {
         };
         surface.configure(&device, &surface_config);
         let aspect = surface_config.width as f32 / surface_config.height.max(1) as f32;
-        let yakui = yakui::Yakui::new();
+        let mut yakui = yakui::Yakui::new();
+        let body_icons = load_body_icons(&mut yakui)?;
         let yakui_winit = YakuiWinit::new(&window);
         let yakui_wgpu = YakuiWgpu::new(device.clone(), queue.clone());
         let yakui_buffers = yakui_wgpu.buffers();
@@ -398,6 +403,8 @@ impl WorldRenderer {
             yakui,
             yakui_winit,
             yakui_wgpu,
+            body_icons,
+            body_reminders: BodyCue::ALL.map(|cue| (cue, 0.0)),
             yakui_buffers,
             hud_gpu_timer,
             screenshot_request: None,
@@ -953,6 +960,7 @@ impl WorldRenderer {
         if let Some(crosshair) = &self.crosshair {
             draw_crosshair(crosshair);
         }
+        draw_body_reminders(&self.body_icons, &self.body_reminders);
         self.yakui.finish();
         if let Some(preset) = selected_environment {
             self.environment = preset.environment();
