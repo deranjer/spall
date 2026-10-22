@@ -1,10 +1,12 @@
-//! Deer: the shared land walk, fleeing players, and cropping the grass under
-//! their mouths now and then while resting.
+//! Deer: the shared land walk, fleeing players, cropping the grass under
+//! their mouths now and then while resting, and sleeping through the night.
 
 use spall_server::creature_service::CreatureAction;
 use spall_sim::Simulation;
 
-use super::{AnimalDirector, Cx, Gait, LOCOMOTION_GRAZE, Step, Walker, land, players};
+use super::{
+    AnimalDirector, Cx, Gait, LOCOMOTION_GRAZE, LOCOMOTION_SLEEP, Step, Walker, land, players,
+};
 
 /// The worldgen grass material; its appearance variants count as grass too.
 const GRASS: spall_core::MaterialId = spall_core::MaterialId(10);
@@ -12,6 +14,14 @@ const GRASS: spall_core::MaterialId = spall_core::MaterialId(10);
 const GRAZE_CHANCE: f64 = 0.5;
 /// Ticks between bites while grazing (1.5 s).
 const BITE_TICKS: u64 = 90;
+/// A sleeping deer wakes for a walking player this close...
+const WAKE_M: f64 = 10.0;
+/// ...or a sprinting one this close. Both are inside the awake notice
+/// distance in `players.rs`, so a player can creep up on a sleeping herd.
+const WAKE_SPRINT_M: f64 = 20.0;
+/// Each deer's bedtime and wake time trail sunset and sunrise by up to this
+/// many ticks (one in-game hour), so a herd does not switch in one tick.
+const SLEEP_LAG_TICKS: u64 = 3_000;
 
 /// Deer-only states.
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +29,23 @@ pub(super) enum DeerGait {
     /// Stand cropping the grass under the mouth, a bite every [`BITE_TICKS`],
     /// until `until` or the grass in reach is gone.
     Graze { until: u64, next_bite: u64 },
+    /// Lie still with the `sleep` clip until morning or a player comes close.
+    Sleep,
+}
+
+/// Whether deer `id` sleeps at `tick`: the sun is down
+/// ([`spall_core::time_of_day`]) at a time shifted back by a per-deer lag, so
+/// bedtime and waking are staggered across a herd.
+fn sleepy(tick: u64, id: u64) -> bool {
+    let mut mix = id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mix ^= mix >> 29;
+    let lag = mix % SLEEP_LAG_TICKS;
+    tick >= lag && spall_core::time_of_day::state_at_tick(tick - lag).sun_height() < 0.0
+}
+
+/// Whether the nearest player is close enough to wake a sleeping deer.
+fn wakes(threat: Option<players::Threat>) -> bool {
+    threat.is_some_and(|t| t.distance_m < if t.sprinting { WAKE_SPRINT_M } else { WAKE_M })
 }
 
 /// Terrain materials that count as grass.
@@ -42,8 +69,26 @@ pub(super) fn step(
 ) -> Step {
     let (sim, here, tick) = (cx.sim, cx.here, cx.tick);
     let flee_speed = dir.species[walker.species].flee_speed_m_s;
-    if flee_speed.is_some() {
+    // Morning or a close player ends sleep; a player farther off goes
+    // unnoticed. A woken deer then reacts to players like a resting one.
+    if matches!(walker.gait, Gait::Deer(DeerGait::Sleep))
+        && (wakes(cx.threat) || !sleepy(tick, cx.id))
+    {
+        walker.gait = Gait::Rest {
+            until: tick + 60 + dir.next() % 240,
+        };
+    }
+    if !matches!(walker.gait, Gait::Deer(DeerGait::Sleep)) && flee_speed.is_some() {
         dir.react_to_players(walker, cx.threat, tick);
+    }
+    // A resting or wandering deer lies down where it is at bedtime.
+    if matches!(walker.gait, Gait::Rest { .. } | Gait::Walk { .. }) && sleepy(tick, cx.id) {
+        walker.gait = Gait::Deer(DeerGait::Sleep);
+    }
+    if matches!(walker.gait, Gait::Deer(DeerGait::Sleep)) {
+        let mut step = Step::still(walker, here);
+        step.tag = LOCOMOTION_SLEEP;
+        return step;
     }
     let mut step = match walker.gait {
         Gait::Rest { until } => {
@@ -131,5 +176,76 @@ impl AnimalDirector {
         !eaten
             && Self::ground(sim, column[0], column[1])
                 .is_some_and(|(_, material)| self.grass.contains(&material))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spall_core::time_of_day::DAY_CYCLE_TICKS;
+
+    const HOUR: u64 = DAY_CYCLE_TICKS / 24;
+
+    /// Ticks at a clock hour on day 3 (the server tick starts at 06:00).
+    fn at(hour: u64) -> u64 {
+        DAY_CYCLE_TICKS * 3 + ((hour + 24 - 6) % 24) * HOUR
+    }
+
+    #[test]
+    fn deer_sleep_through_the_night_and_not_by_day() {
+        for id in 0..200 {
+            assert!(!sleepy(at(12), id), "deer {id} asleep at noon");
+            assert!(
+                !sleepy(at(8), id),
+                "deer {id} asleep two hours after sunrise"
+            );
+            assert!(sleepy(at(0), id), "deer {id} awake at midnight");
+            assert!(sleepy(at(20), id), "deer {id} awake two hours after sunset");
+        }
+    }
+
+    #[test]
+    fn bedtime_and_waking_are_staggered_across_a_herd() {
+        // Half an hour after sunset (and sunrise) some deer have switched and
+        // some have not.
+        let half = HOUR / 2;
+        let asleep = (0..200).filter(|&id| sleepy(at(18) + half, id)).count();
+        assert!(
+            (20..180).contains(&asleep),
+            "{asleep} of 200 asleep at 18:30"
+        );
+        let still = (0..200).filter(|&id| sleepy(at(6) + half, id)).count();
+        assert!((20..180).contains(&still), "{still} of 200 asleep at 06:30");
+        // The first night has its staggered bedtime too: tick 0 is morning.
+        assert!(!sleepy(0, 1));
+    }
+
+    #[test]
+    fn a_close_player_wakes_a_sleeper_and_a_sprinter_sooner() {
+        let player = |distance_m, sprinting| {
+            Some(players::Threat {
+                distance_m,
+                away: [1.0, 0.0],
+                sprinting,
+            })
+        };
+        assert!(!wakes(None));
+        assert!(wakes(player(9.0, false)));
+        // Walking up to here would make an awake deer bolt.
+        assert!(!wakes(player(12.0, false)));
+        assert!(wakes(player(18.0, true)));
+        assert!(!wakes(player(22.0, true)));
+    }
+
+    #[test]
+    fn only_deer_have_a_sleep_clip() {
+        assert_eq!(
+            super::super::locomotion_clip("deer", LOCOMOTION_SLEEP),
+            Some("sleep")
+        );
+        assert_eq!(
+            super::super::locomotion_clip("bear", LOCOMOTION_SLEEP),
+            None
+        );
     }
 }

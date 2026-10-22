@@ -157,6 +157,8 @@ pub const LOCOMOTION_HOP: u8 = 6;
 pub const LOCOMOTION_PECK: u8 = 7;
 /// Climbing from the ground back to its circle (`takeoff` clip).
 pub const LOCOMOTION_TAKEOFF: u8 = 8;
+/// A deer lying asleep at night (`sleep` clip).
+pub const LOCOMOTION_SLEEP: u8 = 9;
 /// Capsule swept around a flying animal (about a crow: small body, wings folded in).
 const FLY_CAPSULE_RADIUS_M: f32 = 0.25;
 const FLY_CAPSULE_HALF_HEIGHT_M: f32 = 0.1;
@@ -179,6 +181,7 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
         LOCOMOTION_HOP if def.perches => Some("hop"),
         LOCOMOTION_PECK if def.perches => Some("peck"),
         LOCOMOTION_TAKEOFF if def.perches => Some("takeoff"),
+        LOCOMOTION_SLEEP if matches!(def.family, Family::Deer) => Some("sleep"),
         _ => None,
     }
 }
