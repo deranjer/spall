@@ -10,6 +10,10 @@ autobins = false
 fixtures = ["spall_voxel/fixtures"]
 # Offline benchmark binaries.
 bench = ["fixtures"]
+# Per-substep source-cell attribution of articulated contacts
+# (`PhysicsWorld::articulated_contact_witnesses`), for tests and evidence.
+# Off in the game: it costs ~10 ms a server tick with a few dozen animals.
+contact-witnesses = []
 
 [lints.clippy]
 # The feasibility harness has a few functions with many measured knobs.

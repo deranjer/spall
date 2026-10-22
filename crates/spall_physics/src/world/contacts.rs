@@ -104,6 +104,7 @@ impl PhysicsWorld {
     /// can recycle or discard it. The returned records contain no Rapier
     /// handles; published query pose tokens are updated only after the complete
     /// outer step.
+    #[cfg(any(test, feature = "contact-witnesses"))]
     pub(super) fn capture_articulated_contact_witnesses(
         &mut self,
         substep: usize,
@@ -210,6 +211,7 @@ impl PhysicsWorld {
         self.articulated_contact_witnesses.extend(captured);
     }
 
+    #[cfg(any(test, feature = "contact-witnesses"))]
     fn source_contact_witness(
         &self,
         body: BodyId,
@@ -258,12 +260,14 @@ impl PhysicsWorld {
     /// Their authored pose token and substep fraction identify the source pose
     /// that generated them; the records do not mutate or replace ray-query
     /// provenance.
+    #[cfg(any(test, feature = "contact-witnesses"))]
     pub fn articulated_contact_witnesses(&self) -> &[ArticulatedContactWitness] {
         &self.articulated_contact_witnesses
     }
 
     /// Number of source-bearing solver points omitted when the per-step
     /// witness cap was reached.
+    #[cfg(any(test, feature = "contact-witnesses"))]
     pub fn contact_witness_overflow(&self) -> u64 {
         self.contact_witness_overflow
     }

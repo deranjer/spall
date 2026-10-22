@@ -514,6 +514,7 @@ mod tests {
                 )
             })
             .collect();
+        let first_tint = asset.tints_srgb[0];
         let visual = AnimalVisual::new(asset, &mapping(), 1).unwrap();
         let cells = visual.compose(&poses).unwrap();
         assert_eq!(cells.len(), 1);
@@ -525,7 +526,7 @@ mod tests {
                 .distance(Vec3::new(-0.09375, 0.03125, -0.03125))
                 < 1e-6
         );
-        assert_eq!(cells[0].tint_srgb, Some([76, 129, 170]));
+        assert_eq!(cells[0].tint_srgb, Some(first_tint));
     }
 
     #[test]

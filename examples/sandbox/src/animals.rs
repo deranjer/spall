@@ -31,22 +31,61 @@ use crate::animal_habitat::{
     AnimalHabitat, CandidateEnvelope, ValidationLimits, validate_candidate,
 };
 
-const SPECIES_BYTES: [(&str, AnimalHabitat, &[u8]); 3] = [
-    (
-        "deer",
-        AnimalHabitat::Land,
-        include_bytes!("../assets/animals/deer.spvox"),
-    ),
-    (
-        "crow",
-        AnimalHabitat::Flying,
-        include_bytes!("../assets/animals/crow.spvox"),
-    ),
-    (
-        "trout",
-        AnimalHabitat::Aquatic,
-        include_bytes!("../assets/animals/trout.spvox"),
-    ),
+/// Per-species authoring and locomotion choices; everything else (envelope,
+/// foot height) is measured from the asset.
+struct SpeciesDef {
+    key: &'static str,
+    habitat: AnimalHabitat,
+    bytes: &'static [u8],
+    /// Clip played while moving.
+    move_clip: &'static str,
+    /// Walking pace, metres per second (flyers set their own speed).
+    walk_speed_m_s: f64,
+    /// Foot capsule for walking species: radius, half cylinder height.
+    capsule_m: (f32, f32),
+}
+
+const SPECIES: [SpeciesDef; 5] = [
+    SpeciesDef {
+        key: "deer",
+        habitat: AnimalHabitat::Land,
+        bytes: include_bytes!("../assets/animals/deer.spvox"),
+        move_clip: "walk",
+        walk_speed_m_s: 1.4,
+        capsule_m: (0.35, 0.35),
+    },
+    SpeciesDef {
+        key: "crow",
+        habitat: AnimalHabitat::Flying,
+        bytes: include_bytes!("../assets/animals/crow.spvox"),
+        move_clip: "flap",
+        walk_speed_m_s: 0.0,
+        capsule_m: (0.0, 0.0),
+    },
+    SpeciesDef {
+        key: "trout",
+        habitat: AnimalHabitat::Aquatic,
+        bytes: include_bytes!("../assets/animals/trout.spvox"),
+        move_clip: "swim",
+        walk_speed_m_s: 0.0,
+        capsule_m: (0.0, 0.0),
+    },
+    SpeciesDef {
+        key: "bear",
+        habitat: AnimalHabitat::Land,
+        bytes: include_bytes!("../assets/animals/bear.spvox"),
+        move_clip: "walk",
+        walk_speed_m_s: 1.2,
+        capsule_m: (0.45, 0.1),
+    },
+    SpeciesDef {
+        key: "snow_leopard",
+        habitat: AnimalHabitat::Land,
+        bytes: include_bytes!("../assets/animals/leopard.spvox"),
+        move_clip: "walk",
+        walk_speed_m_s: 1.1,
+        capsule_m: (0.28, 0.1),
+    },
 ];
 const CELL_M: f32 = 0.0625;
 /// Gap kept between an animal's lowest cell and the terrain it stands on.
@@ -54,9 +93,6 @@ pub const GROUND_CLEARANCE_M: f64 = 0.05;
 /// Locomotion selectors carried in motion frames.
 pub const LOCOMOTION_IDLE: u8 = 0;
 pub const LOCOMOTION_MOVE: u8 = 1;
-/// Footprint capsule for walking animals (about a deer: 1.06 m tall, 0.56 m wide).
-const WALK_CAPSULE_RADIUS_M: f32 = 0.28;
-const WALK_CAPSULE_HALF_HEIGHT_M: f32 = 0.25;
 /// A creature is moved this often (7.5 Hz at 60 Hz), staggered by id.
 const MOVE_PERIOD_TICKS: u64 = 8;
 const MOVE_DT_S: f64 = MOVE_PERIOD_TICKS as f64 / 60.0;
@@ -66,12 +102,10 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
     if tag == LOCOMOTION_IDLE {
         return Some("idle");
     }
-    match species {
-        "deer" => Some("walk"),
-        "crow" => Some("flap"),
-        "trout" => Some("swim"),
-        _ => None,
-    }
+    SPECIES
+        .iter()
+        .find(|def| def.key == species)
+        .map(|def| def.move_clip)
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +120,9 @@ pub struct AnimalSpecies {
     pub key: &'static str,
     pub habitat: AnimalHabitat,
     pub asset: Asset,
+    pub walk_speed_m_s: f64,
+    /// Foot capsule (radius, half cylinder height) for walking species.
+    pub capsule_m: (f32, f32),
 }
 
 impl AnimalSpecies {
@@ -99,14 +136,17 @@ impl AnimalSpecies {
 
 /// Decodes every authored species.
 pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
-    SPECIES_BYTES
+    SPECIES
         .iter()
-        .map(|(key, habitat, bytes)| {
-            let asset = decode(bytes).map_err(|e| AnimalError::Asset(key, e.to_string()))?;
+        .map(|def| {
+            let asset =
+                decode(def.bytes).map_err(|e| AnimalError::Asset(def.key, e.to_string()))?;
             Ok(AnimalSpecies {
-                key,
-                habitat: *habitat,
+                key: def.key,
+                habitat: def.habitat,
                 asset,
+                walk_speed_m_s: def.walk_speed_m_s,
+                capsule_m: def.capsule_m,
             })
         })
         .collect()
@@ -189,6 +229,36 @@ fn part_cells(
     cells
 }
 
+/// Root-relative bounds of every cell over the idle and move clips, metres.
+fn pose_bounds(visual: &crate::animal_visual::AnimalVisual, key: &str) -> (glam::Vec3, glam::Vec3) {
+    let (mut lo, mut hi) = (
+        glam::Vec3::splat(f32::INFINITY),
+        glam::Vec3::splat(f32::NEG_INFINITY),
+    );
+    for clip in [
+        "idle",
+        locomotion_clip(key, LOCOMOTION_MOVE).unwrap_or("idle"),
+    ] {
+        let duration = visual.clip_duration(clip).unwrap_or(1).max(1);
+        for phase in (0..duration).step_by(2) {
+            if let Ok(cells) = visual.sample(clip, f64::from(phase)) {
+                for cell in cells {
+                    lo = lo.min(cell.center - cell.size * 0.5);
+                    hi = hi.max(cell.center + cell.size * 0.5);
+                }
+            }
+        }
+    }
+    if lo.is_finite() && hi.is_finite() {
+        (lo, hi)
+    } else {
+        (
+            glam::Vec3::new(-0.5, -0.5, -0.5),
+            glam::Vec3::new(0.5, 0.5, 0.5),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Gait {
     /// Stand still until this tick.
@@ -231,6 +301,8 @@ pub struct AnimalDirector {
     species: Vec<AnimalSpecies>,
     /// Root-to-lowest-foot offset over every pose of the idle and move clips.
     walk_feet: Vec<f32>,
+    /// Placement envelope over the same poses, metres.
+    envelope_m: Vec<DVec3>,
     anchors: Vec<[f64; 3]>,
     targets: Vec<u32>,
     spawned: Vec<u32>,
@@ -246,8 +318,9 @@ pub struct AnimalDirector {
 }
 
 impl AnimalDirector {
-    /// `targets` is the desired count per species, in [`species`] order.
-    pub fn new(anchors: Vec<[f64; 3]>, targets: [u32; 3], seed: u64) -> Result<Self, AnimalError> {
+    /// `targets` is the desired count per species, in [`species`] order;
+    /// species past the end of the slice get none.
+    pub fn new(anchors: Vec<[f64; 3]>, targets: &[u32], seed: u64) -> Result<Self, AnimalError> {
         let species = species()?;
         let catalog = catalog(&species);
         let materials = crate::animal_visual::material_mapping(&crate::game::manifest());
@@ -262,34 +335,31 @@ impl AnimalDirector {
                 .map_err(|e| AnimalError::Asset(s.key, e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let walk_feet = species
+        let (walk_feet, envelope_m) = species
             .iter()
             .zip(&visuals)
             .map(|(species, visual)| {
-                let mut lowest = f32::INFINITY;
-                for clip in [
-                    "idle",
-                    locomotion_clip(species.key, LOCOMOTION_MOVE).unwrap_or("idle"),
-                ] {
-                    let duration = visual.clip_duration(clip).unwrap_or(1).max(1);
-                    for phase in (0..duration).step_by(2) {
-                        if let Ok(cells) = visual.sample(clip, f64::from(phase)) {
-                            for cell in cells {
-                                lowest = lowest.min(cell.center.y - cell.size.y * 0.5);
-                            }
-                        }
-                    }
-                }
-                if lowest.is_finite() { lowest } else { -0.5 }
+                let (lo, hi) = pose_bounds(visual, species.key);
+                // Yaw-invariant envelope with a little slack around the body,
+                // snapped up to whole terrain cells: an off-grid height leaves the
+                // envelope's floor a rounding error inside the ground cell.
+                let snap = |m: f32| ((f64::from(m) + 0.2) / 0.25).ceil() * 0.25;
+                let reach = snap((hi.x - lo.x).max(hi.z - lo.z));
+                let envelope = DVec3::new(reach, snap(hi.y - lo.y), reach);
+                (lo.y, envelope)
             })
-            .collect();
+            .unzip();
+        let count = species.len();
         Ok(Self {
             catalog,
             species,
             walk_feet,
+            envelope_m,
             anchors,
-            targets: targets.to_vec(),
-            spawned: vec![0; 3],
+            targets: (0..count)
+                .map(|i| targets.get(i).copied().unwrap_or(0))
+                .collect(),
+            spawned: vec![0; count],
             attempts: 0,
             rng: seed ^ 0x9E37_79B9_7F4A_7C15,
             max_per_tick: 2,
@@ -297,7 +367,7 @@ impl AnimalDirector {
             radius_m: (6.0, 50.0),
             walkers: std::collections::BTreeMap::new(),
             last_tick: 0,
-            stats: vec![(0, 0, 0); 3],
+            stats: vec![(0, 0, 0); count],
         })
     }
 
@@ -372,8 +442,7 @@ impl AnimalDirector {
             _ => 0.0,
         };
         let root = DVec3::new(x, ground + height_above_ground + foot, z);
-        // Envelope around the whole idle body; generous and axis aligned.
-        let size = DVec3::new(1.2, 1.4, 1.2);
+        let size = self.envelope_m[species];
         let center = DVec3::new(x, ground + height_above_ground + size.y * 0.5, z);
         validate_candidate(
             &sim.world().terrain().volume,
@@ -641,11 +710,15 @@ impl CreatureDirector for AnimalDirector {
     fn motion(&mut self, tick: u64, sim: &Simulation) -> Vec<CreatureAction> {
         self.last_tick = tick;
         if tick.is_multiple_of(1200) {
-            tracing::info!(
-                deer = ?self.stats[0],
-                crow = ?self.stats[1],
-                "animal moves (applied, stuck or blocked) per species"
-            );
+            for (species, stats) in self.species.iter().zip(&self.stats) {
+                if stats.0 + stats.1 > 0 {
+                    tracing::info!(
+                        species = species.key,
+                        moves = ?stats,
+                        "animal moves (applied, stuck or blocked)"
+                    );
+                }
+            }
         }
         let wrap = |angle: f64| {
             (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
@@ -716,7 +789,8 @@ impl CreatureDirector for AnimalDirector {
                             yaw = walker.yaw + turn.clamp(-0.35, 0.35);
                         } else {
                             yaw = walker.yaw + turn;
-                            let step = (1.4 * MOVE_DT_S).min(distance);
+                            let speed = self.species[walker.species].walk_speed_m_s;
+                            let step = (speed * MOVE_DT_S).min(distance);
                             desired = [dx / distance * step, dz / distance * step];
                         }
                     }
@@ -784,11 +858,50 @@ impl CreatureDirector for AnimalDirector {
                     locomotion_tag: tag,
                     clip_phase_tick: phase,
                     feet_offset_m: self.walk_feet[walker.species],
-                    capsule_radius_m: WALK_CAPSULE_RADIUS_M,
-                    capsule_half_height_m: WALK_CAPSULE_HALF_HEIGHT_M,
+                    capsule_radius_m: self.species[walker.species].capsule_m.0,
+                    capsule_half_height_m: self.species[walker.species].capsule_m.1,
                 }));
             }
         }
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A walker's foot capsule must fit inside its own body: a capsule wider or
+    /// taller than the animal blocks it where its body would pass, and one with
+    /// no size lets it sink into terrain.
+    #[test]
+    fn walking_capsules_fit_their_bodies() {
+        let materials = crate::animal_visual::material_mapping(&crate::game::manifest());
+        for species in species().unwrap() {
+            if species.habitat != AnimalHabitat::Land {
+                continue;
+            }
+            let visual = crate::animal_visual::AnimalVisual::new(
+                species.asset.clone(),
+                &materials,
+                crate::animal_visual::MAX_ANIMAL_VISUAL_CELLS,
+            )
+            .unwrap();
+            let (lo, hi) = pose_bounds(&visual, species.key);
+            let (radius, half_height) = species.capsule_m;
+            let reach = (hi.x - lo.x).max(hi.z - lo.z);
+            assert!(radius > 0.0 && half_height > 0.0, "{} capsule", species.key);
+            assert!(
+                2.0 * radius <= reach,
+                "{} capsule wider than body",
+                species.key
+            );
+            assert!(
+                2.0 * (radius + half_height) <= hi.y - lo.y,
+                "{} capsule taller than body",
+                species.key
+            );
+            assert!(species.walk_speed_m_s > 0.0, "{} cannot walk", species.key);
+        }
     }
 }

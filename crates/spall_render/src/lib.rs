@@ -20,6 +20,7 @@ pub mod occlusion;
 pub mod pipeline;
 pub(crate) mod probe;
 pub mod scene;
+pub mod screen_grade;
 pub mod sky_visibility;
 pub mod snow;
 pub mod target;
@@ -58,6 +59,7 @@ pub use pipeline::{
     CASCADE_COUNT, DebugView, MAX_POINT_LIGHTS, PassTiming, PointLight, ScenePipeline,
 };
 pub use scene::{Material, Scene, SceneItem, default_materials, materials_from_manifest};
+pub use screen_grade::ScreenGrade;
 pub use sky_visibility::{
     SKY_MAX_RAY_CELLS, SkyVisibility, UNKNOWN_CELL, cache_origin_around, mark_world_box,
 };

@@ -21,7 +21,7 @@ fn simulation() -> Simulation {
 fn director_births_deer_and_crows_that_validate_and_replicate() {
     let mut sim = simulation();
     let anchor = [3.0, 1.0, 3.0];
-    let director = AnimalDirector::new(vec![anchor], [2, 2, 0], 7)
+    let director = AnimalDirector::new(vec![anchor], &[2, 2, 0], 7)
         .unwrap()
         .with_radius_m(0.0, 1.0);
     let service = CreatureService::new(Box::new(director));
@@ -88,7 +88,7 @@ fn a_walking_deer_is_swept_against_terrain_and_published_as_motion() {
     use spall_sim::{CreatureMoveOutcome, CreatureMoveRequest};
 
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [1, 0, 0], 3)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[1, 0, 0], 3)
         .unwrap()
         .with_radius_m(0.0, 1.0);
     let service = CreatureService::new(Box::new(director));
@@ -158,7 +158,7 @@ fn a_walking_deer_is_swept_against_terrain_and_published_as_motion() {
 #[test]
 fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [3, 2, 0], 11)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[3, 2, 0], 11)
         .unwrap()
         .with_radius_m(0.0, 1.5);
     let service = CreatureService::new(Box::new(director));
@@ -201,6 +201,39 @@ fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
 }
 
 #[test]
+fn bears_and_snow_leopards_spawn_and_walk_on_their_own_capsules() {
+    let mut sim = simulation();
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[0, 0, 0, 2, 2], 13)
+        .unwrap()
+        .with_radius_m(0.0, 3.0);
+    let service = CreatureService::new(Box::new(director));
+    let mut start = std::collections::BTreeMap::new();
+    for tick in 0..1500 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        if tick == 60 {
+            for alive in sim.alive_creatures() {
+                start.insert(alive.key.creature_id.get(), alive.translation_m);
+            }
+        }
+    }
+    assert_eq!(start.len(), 4, "2 bears and 2 snow leopards alive");
+    let moved: Vec<f64> = sim
+        .alive_creatures()
+        .iter()
+        .map(|alive| {
+            let from = start[&alive.key.creature_id.get()];
+            (alive.translation_m[0] - from[0]).hypot(alive.translation_m[2] - from[2])
+        })
+        .collect();
+    assert!(
+        moved.iter().filter(|d| **d > 0.5).count() >= 2,
+        "bears and leopards barely moved: {moved:?}"
+    );
+}
+
+#[test]
 #[cfg_attr(
     debug_assertions,
     ignore = "timing budget is only meaningful in release"
@@ -210,7 +243,7 @@ fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
     use spall_client::window::CreatureView;
 
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [4, 2, 0], 5)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[4, 2, 0], 5)
         .unwrap()
         .with_radius_m(0.0, 1.5);
     let service = CreatureService::new(Box::new(director));
@@ -256,7 +289,7 @@ fn a_player_walking_into_moving_animals_never_stalls_the_tick() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut sim = simulation();
-        let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [3, 2, 0], 21)
+        let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[3, 2, 0], 21)
             .unwrap()
             .with_radius_m(0.0, 1.0);
         let service = CreatureService::new(Box::new(director));
@@ -299,7 +332,7 @@ fn players_walk_through_creatures_instead_of_being_blocked_by_them() {
     use spall_protocol::InputSeq;
 
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], [1, 0, 0], 4)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[1, 0, 0], 4)
         .unwrap()
         .with_radius_m(0.0, 0.5);
     let service = CreatureService::new(Box::new(director));
