@@ -319,6 +319,51 @@ impl AnimalVisual {
     }
 }
 
+/// The server's view of every species' posed voxels (ENG-237): what a strike
+/// hits and what a carcass is made of. Samples the same clip a client draws for
+/// the record, at the record's clip phase, around its root pose.
+pub fn creature_shape() -> std::result::Result<spall_sim::CreatureShape, crate::animals::AnimalError>
+{
+    let mapping = material_mapping(&crate::game::manifest());
+    let visuals = crate::animals::species()?
+        .into_iter()
+        .map(|s| {
+            AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
+                .map(|visual| (s.key, visual))
+                .map_err(|e| crate::animals::AnimalError::Asset(s.key, e.to_string()))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(spall_sim::CreatureShape::new(move |record| {
+        let Some((key, visual)) = visuals.iter().find(|(key, _)| *key == record.species) else {
+            return Vec::new();
+        };
+        let clip = crate::animals::locomotion_clip(key, record.locomotion_tag).unwrap_or("idle");
+        let duration = f64::from(visual.clip_duration(clip).unwrap_or(1).max(1));
+        let phase = (record.clip_phase_tick as f64).rem_euclid(duration);
+        let Ok(cells) = visual.sample(clip, phase) else {
+            return Vec::new();
+        };
+        let [x, y, z, w] = record.rotation_xyzw;
+        let root_q = Quat::from_xyzw(x, y, z, w).normalize();
+        let root = record.translation_m;
+        cells
+            .iter()
+            .map(|cell| {
+                let offset = root_q * cell.center;
+                spall_sim::CreatureVoxel {
+                    centre_m: [
+                        root[0] + f64::from(offset.x),
+                        root[1] + f64::from(offset.y),
+                        root[2] + f64::from(offset.z),
+                    ],
+                    edge_m: cell.size.max_element(),
+                    material: cell.material,
+                }
+            })
+            .collect()
+    }))
+}
+
 fn validate_run(
     run: &VoxelRun,
     part_ids: &BTreeSet<u32>,

@@ -316,6 +316,7 @@ pub(super) async fn serve_async(
     let residency_limits = config.server.residency;
     let residency_disk_path = config.server.residency_disk_path.clone();
     let creature_service = config.server.creatures.clone();
+    let creature_shape = config.server.creature_shape.clone();
     let contact_damage_cfg = config.server.contact_damage;
     let contact_damage_profiles = damage_profiles;
     let dormancy_cfg = config.server.dormancy;
@@ -374,6 +375,11 @@ pub(super) async fn serve_async(
             }
             if let Err(error) = sim.initialize_creature_host() {
                 return SimResult::error(format!("creature host init failed: {error:?}"), 0);
+            }
+            if let Some(shape) = creature_shape
+                && let Err(error) = sim.set_creature_shape(shape)
+            {
+                return SimResult::error(format!("creature shape install failed: {error}"), 0);
             }
         }
         for (stage, elapsed) in spall_sim::prof::drain() {
@@ -714,14 +720,37 @@ pub(super) async fn serve_async(
                             actions_throttled += 1;
                             continue;
                         }
-                        let resolved = if dev_unvalidated_actions {
-                            dev_intent_from_request(session, &req)
-                                .ok_or(ActionReject::Unsupported("unsupported target"))
-                        } else {
-                            resolve_intent_with_catalog(sim.world(), session, &req, &action_catalog)
+                        // A strike that meets a creature kills it (ENG-237).
+                        let struck = (!dev_unvalidated_actions)
+                            .then(|| {
+                                let (lj, clients) = (&mut lj, &clients_for_sim);
+                                strike_creature(
+                                    &mut sim,
+                                    session,
+                                    &req,
+                                    &action_catalog,
+                                    lj,
+                                    clients,
+                                )
+                            })
+                            .flatten();
+                        let resolved = match struck {
+                            Some(outcome) => outcome.map(Ok),
+                            None if dev_unvalidated_actions => {
+                                dev_intent_from_request(session, &req)
+                                    .ok_or(ActionReject::Unsupported("unsupported target"))
+                                    .map(|intent| sim.submit(intent))
+                            }
+                            None => resolve_intent_with_catalog(
+                                sim.world(),
+                                session,
+                                &req,
+                                &action_catalog,
+                            )
+                            .map(|intent| sim.submit(intent)),
                         };
                         match resolved {
-                            Ok(intent) => match sim.submit(intent) {
+                            Ok(submitted) => match submitted {
                                 Ok(status) => {
                                     submitted_at
                                         .entry(req.request_id)

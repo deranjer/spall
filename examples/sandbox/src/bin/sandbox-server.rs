@@ -587,6 +587,18 @@ fn run_serve(args: Args) -> ExitCode {
     } else {
         None
     };
+    // A hammer strike kills an animal and leaves its voxels as a carcass.
+    let creature_shape = if creatures.is_some() {
+        match sandbox::animal_visual::creature_shape() {
+            Ok(shape) => Some(shape),
+            Err(error) => {
+                eprintln!("sandbox-server: --animals: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
     let residency_disk_path = (args.residency_budget_bricks > 0 && args.residency_disk_backing)
         .then(|| args.world.join("residency.db"));
     if let Some(db) = &residency_disk_path
@@ -699,6 +711,7 @@ fn run_serve(args: Args) -> ExitCode {
             ),
             residency_disk_path,
             creatures,
+            creature_shape,
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),

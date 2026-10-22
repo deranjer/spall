@@ -27,7 +27,11 @@ pub(super) fn run_creatures(
     service.run_motion(sim)?;
     // Presentation frames at 20 Hz, to live sessions only, limited to
     // creatures near that session's player.
-    if sim.current_tick().get() % CREATURE_MOTION_PERIOD_TICKS == 0 {
+    if sim
+        .current_tick()
+        .get()
+        .is_multiple_of(CREATURE_MOTION_PERIOD_TICKS)
+    {
         for session in lj.live_sessions().collect::<Vec<_>>() {
             if water_backlogged(clients_for_sim, session) {
                 continue;
@@ -53,4 +57,45 @@ pub(super) fn run_creatures(
         }
     }
     Ok(())
+}
+
+/// ENG-237: a cutting tool whose aim meets a creature before any geometry
+/// kills it. The despawn is announced to every client and the carcass is
+/// queued, its first cell under the strike's request id. `None` when the
+/// request did not strike a creature.
+pub(super) fn strike_creature(
+    sim: &mut Simulation,
+    session: SessionId,
+    req: &ActionRequest,
+    catalog: &ToolCatalog,
+    lj: &mut LateJoin,
+    clients_for_sim: &ClientMap,
+) -> Option<Result<ActionStatus, ActionReject>> {
+    let creature_id = creature_strike(sim, req, catalog)?;
+    let kill = match sim.kill_creature(creature_id, Some(req.request_id), actor_for(session)) {
+        Ok(kill) => kill,
+        Err(_) => {
+            return Some(Err(ActionReject::Unsupported(
+                "overloaded: no room to queue the carcass, retry",
+            )));
+        }
+    };
+    tracing::info!(
+        creature = creature_id,
+        species = %kill.record.species,
+        carcass_cells = kill.carcass.len(),
+        "creature killed"
+    );
+    lj.fan_out_creature_records(
+        vec![WireRecord::CreatureDespawn(
+            spall_protocol::CreatureDespawn {
+                schema: spall_protocol::WIRE_SCHEMA_VERSION,
+                creature_id,
+            },
+        )],
+        clients_for_sim,
+    );
+    Some(kill.first_status.ok_or(ActionReject::Unsupported(
+        "the creature died but left no room for a carcass",
+    )))
 }
