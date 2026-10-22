@@ -75,6 +75,71 @@ pub fn birdsong_level(nearest_bird_m: Option<f64>) -> f32 {
     BIRDSONG_FLOOR + (1.0 - BIRDSONG_FLOOR) * near
 }
 
+/// How long a birdsong burst lasts, and the rest between bursts with no bird
+/// near and with one near, seconds (min, max).
+const SONG_S: (f32, f32) = (3.0, 8.0);
+const REST_FAR_S: (f32, f32) = (40.0, 120.0);
+const REST_NEAR_S: (f32, f32) = (4.0, 15.0);
+
+/// Birdsong comes and goes: short bursts with long silences, the silences
+/// much shorter while a bird is near. The looping birdsong tracks are only
+/// audible during a burst (each fades over the layer ramp).
+#[derive(Debug, Clone)]
+pub struct BirdsongGate {
+    singing: bool,
+    until: Instant,
+    rng: u64,
+}
+
+impl BirdsongGate {
+    /// Starts resting; `seed` varies the schedule between clients.
+    pub fn new(now: Instant, seed: u64) -> Self {
+        let mut gate = Self {
+            singing: false,
+            until: now,
+            rng: seed ^ 0x9E37_79B9_7F4A_7C15,
+        };
+        gate.until = now + gate.span(REST_NEAR_S);
+        gate
+    }
+
+    /// Whether birdsong is audible at `now`, advancing the schedule. A bird
+    /// coming near cuts a long rest short.
+    pub fn singing(&mut self, now: Instant, bird_near: bool) -> bool {
+        if bird_near && !self.singing {
+            let cap = now + Duration::from_secs_f32(REST_NEAR_S.1);
+            self.until = self.until.min(cap);
+        }
+        if now >= self.until {
+            self.singing = !self.singing;
+            let span = if self.singing {
+                SONG_S
+            } else if bird_near {
+                REST_NEAR_S
+            } else {
+                REST_FAR_S
+            };
+            self.until = now + self.span(span);
+        }
+        self.singing
+    }
+
+    fn span(&mut self, (min, max): (f32, f32)) -> Duration {
+        // splitmix64: deterministic and dependency-free.
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let unit = ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32;
+        Duration::from_secs_f32(min + (max - min) * unit)
+    }
+}
+
+/// Whether a bird at this distance counts as near for [`BirdsongGate`].
+pub fn bird_near(nearest_bird_m: Option<f64>) -> bool {
+    nearest_bird_m.is_some_and(|distance| distance < BIRD_FAR_M)
+}
+
 /// Resolves a world-space listener position into the replicated climate field.
 /// Bounds are checked before `CoverGrid::at`, whose public lookup otherwise
 /// clamps missing coordinates to an edge biome.
@@ -626,5 +691,23 @@ mod tests {
         assert_eq!(birdsong_level(Some(200.0)), floor);
         assert!(birdsong_level(Some(40.0)) > floor);
         assert!((birdsong_level(Some(10.0)) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn birdsong_comes_in_bursts_with_long_rests_unless_a_bird_is_near() {
+        let start = Instant::now();
+        let mut gate = BirdsongGate::new(start, 7);
+        let count = |gate: &mut BirdsongGate, near: bool, from: Instant| {
+            (0..1200)
+                .filter(|i| gate.singing(from + Duration::from_millis(250) * *i, near))
+                .count()
+        };
+        // Five minutes alone: mostly silent.
+        let alone = count(&mut gate, false, start);
+        assert!(alone > 0 && alone < 1200 / 4, "{alone}");
+        // Five minutes beside a bird: far more song, still not constant.
+        let later = start + Duration::from_secs(300);
+        let near = count(&mut gate, true, later);
+        assert!(near > alone * 2 && near < 1200, "{near} vs {alone}");
     }
 }

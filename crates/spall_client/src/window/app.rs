@@ -33,6 +33,7 @@ pub(super) struct InteractiveApp {
     ambience_check_at: Instant,
     /// Distance to the nearest bird creature, for birdsong volume.
     nearest_bird_m: Option<f64>,
+    birdsong_gate: crate::audio::BirdsongGate,
     /// Ambience layers last sent to the audio thread, volumes in twentieths.
     ambience_layers: Vec<(PathBuf, u8)>,
     ambience_mix_at: Option<Instant>,
@@ -275,6 +276,12 @@ impl InteractiveApp {
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
             nearest_bird_m: None,
+            birdsong_gate: crate::audio::BirdsongGate::new(
+                Instant::now(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64),
+            ),
             ambience_layers: Vec::new(),
             ambience_mix_at: None,
             weather_audio: AmbienceAudio::start(0.3),
@@ -520,6 +527,14 @@ impl InteractiveApp {
         if !due && self.nature_preview.is_none() {
             return;
         }
+        let birdsong = if self
+            .birdsong_gate
+            .singing(Instant::now(), crate::audio::bird_near(self.nearest_bird_m))
+        {
+            crate::audio::birdsong_level(self.nearest_bird_m)
+        } else {
+            0.0
+        };
         let mix: Vec<(PathBuf, f32)> = if let Some(index) = self.nature_preview {
             self.biome_audio
                 .tracks
@@ -535,7 +550,7 @@ impl InteractiveApp {
                     let grid = self.ambience_grid.as_ref()?;
                     Some(crate::audio::ambience_mix(
                         weather_duck,
-                        crate::audio::birdsong_level(self.nearest_bird_m),
+                        birdsong,
                         field,
                         grid,
                         position,
