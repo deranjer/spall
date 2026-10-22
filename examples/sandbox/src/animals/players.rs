@@ -27,37 +27,62 @@ pub(super) struct Threat {
     pub(super) sprinting: bool,
 }
 
-/// Every player's position and whether it is sprinting, then every bear's
-/// that is not stalking and every wolf's that is not encircling (a charging
-/// bear or a wolf running in counts as sprinting).
-pub(super) fn threat_sources(dir: &AnimalDirector, sim: &Simulation) -> Vec<([f64; 3], bool)> {
+/// Something a fleeing animal may run from: where it is, whether it counts as
+/// sprinting, and how close it must be to be seen at all.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ThreatSource {
+    pub(super) at: [f64; 3],
+    pub(super) sprinting: bool,
+    pub(super) seen_within_m: f64,
+}
+
+impl ThreatSource {
+    /// Seen at any distance.
+    pub(super) fn open(at: [f64; 3], sprinting: bool) -> Self {
+        Self {
+            at,
+            sprinting,
+            seen_within_m: f64::INFINITY,
+        }
+    }
+}
+
+/// Every player's position and whether it is sprinting, then every bear that
+/// is not stalking and every wolf (a charging bear or a wolf running in counts
+/// as sprinting; an encircling wolf is seen only close up).
+pub(super) fn threat_sources(dir: &AnimalDirector, sim: &Simulation) -> Vec<ThreatSource> {
     sim.world()
         .players()
         .map(|player| {
             let [vx, _, vz] = player.state.velocity_m_s;
-            (player.state.position_m, vx.hypot(vz) > SPRINT_M_S)
+            ThreatSource::open(player.state.position_m, vx.hypot(vz) > SPRINT_M_S)
         })
-        .chain(super::bears::threats(dir))
+        .chain(super::bears::threats(dir).map(|(at, sprinting)| ThreatSource::open(at, sprinting)))
         .chain(super::wolves::threats(dir))
         .collect()
 }
 
-pub(super) fn nearest_threat(players: &[([f64; 3], bool)], here: [f64; 3]) -> Option<Threat> {
-    players
+/// The nearest source `here` can see, horizontally.
+pub(super) fn nearest_threat(sources: &[ThreatSource], here: [f64; 3]) -> Option<Threat> {
+    sources
         .iter()
-        .map(|&(at, sprinting)| {
+        .filter_map(|source| {
+            let ThreatSource { at, sprinting, .. } = *source;
             let (dx, dz) = (here[0] - at[0], here[2] - at[2]);
             let distance_m = dx.hypot(dz);
+            if distance_m > source.seen_within_m {
+                return None;
+            }
             let away = if distance_m > 1.0e-6 {
                 [dx / distance_m, dz / distance_m]
             } else {
                 [1.0, 0.0]
             };
-            Threat {
+            Some(Threat {
                 distance_m,
                 away,
                 sprinting,
-            }
+            })
         })
         .min_by(|a, b| a.distance_m.total_cmp(&b.distance_m))
 }

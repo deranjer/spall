@@ -155,13 +155,18 @@ running to catch up when they fall back. A hungry pack (30 s after birth, then
 5 minutes after each meal) hunts the nearest deer within 60 m of its leader by
 encircling it: each wolf takes a slot evenly spaced on an 18 m ring round the
 deer and works its way round to it, running when far and creeping (`stalk`)
-when close, never cutting across the deer. Deer do not see encircling wolves.
-Once every wolf is within 4 m of its slot, or after 30 s, the pack runs in at
-9 m/s (deer flee at 7.5 m/s) for up to 8 s, so a deer bolting from the nearest
-wolf runs at another. The first wolf within 1.8 m kills it (`bite` clip)
-through the engine's creature kill, and the whole pack eats the carcass, each
-wolf from its own side, one cell per bite through single-cell server edits,
-until it is gone or after 40 bites. A failed hunt rests the pack 40 s.
+when close, never cutting across the deer. Deer see an encircling wolf only
+within 12 m, so one that cuts in that close sets the deer running, and the
+pack gives chase at once. Otherwise, once every wolf is within 4 m of its slot,
+or after 30 s, the pack runs in at 8.5 m/s (deer flee at 7.5 m/s) for up to
+6 s, so a deer bolting from the nearest wolf runs at another. A wolf within
+1.8 m lunges (`bite` clip), once per hunt: a quarter of lunges kill through the
+engine's creature kill; a wolf that misses drops out of the chase and trots
+after it, and the hunt is lost once every wolf has missed. About half of all
+hunts end in a kill (11 of 24 over 20 seeds on the flat test field). The whole
+pack eats the carcass, each wolf from its own side, one cell per bite through
+single-cell server edits, until it is gone or after 40 bites. A failed hunt
+rests the pack 40 s.
 
 With no deer near, a hungry pack decides every 20 s whether to hunt the
 nearest player within 40 m: 20 % by day, 50 % at night. It encircles the

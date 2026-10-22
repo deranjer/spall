@@ -35,6 +35,7 @@ use spall_voxel::Sample;
 use spall_voxel::volume::BrickState;
 
 use super::bears::{creature_at, horizontal, toward};
+use super::players::ThreatSource;
 use super::{
     AnimalDirector, Cx, Family, Gait, LOCOMOTION_CHASE, LOCOMOTION_EAT, LOCOMOTION_HOWL,
     LOCOMOTION_MOVE, LOCOMOTION_POUNCE, LOCOMOTION_RUN, LOCOMOTION_SHY, LOCOMOTION_STALK,
@@ -65,6 +66,9 @@ const NOTICE_M: f64 = 60.0;
 const LOSE_M: f64 = 90.0;
 /// Encircling ring round a deer: outside the 14 m a deer bolts at.
 const DEER_RING_M: f64 = 18.0;
+/// A deer sees an encircling wolf this close, inside its 14 m bolt distance,
+/// so a wolf that cuts in too close sets it running.
+const SPOTTED_M: f64 = 12.0;
 /// Encircling ring round a player.
 const PLAYER_RING_M: f64 = 12.0;
 /// A wolf this close to its ring slot is in place.
@@ -77,13 +81,15 @@ const ENCIRCLE_CREEP_SPEED_M_S: f64 = 2.0;
 const ENCIRCLE_TICKS: u64 = 60 * 30;
 /// Closing at a run: faster than a fleeing deer (7.5 m/s) and a sprinting
 /// player (5.8 m/s).
-const CLOSE_SPEED_M_S: f64 = 9.0;
+const CLOSE_SPEED_M_S: f64 = 8.5;
 const CLOSE_PLAYER_SPEED_M_S: f64 = 7.0;
 /// Longest run-in at a deer (8 s) and at a player (20 s).
-const CLOSE_TICKS: u64 = 60 * 8;
+const CLOSE_TICKS: u64 = 60 * 6;
 const CLOSE_PLAYER_TICKS: u64 = 60 * 20;
-/// Root-to-root distance at which a wolf takes a deer.
+/// Root-to-root distance at which a wolf lunges at a deer...
 const KILL_REACH_M: f64 = 1.8;
+/// ...and the chance the lunge misses. Each wolf lunges once per hunt.
+const MISS_CHANCE: f64 = 0.75;
 /// Root-to-feet distance at which a wolf bites a player.
 const BITE_REACH_M: f64 = 1.6;
 /// The bite clip, then a dart back out at a run.
@@ -164,6 +170,9 @@ pub(super) enum WolfGait {
     BackOff {
         until: u64,
     },
+    /// Missed its lunge at a deer: trots after the chase without lunging
+    /// again this hunt.
+    Spent,
     /// Eating the pack's carcass, biting next at `next_bite`.
     Eat {
         next_bite: u64,
@@ -288,16 +297,20 @@ pub(super) fn join(dir: &mut AnimalDirector, id: u64, tick: u64) {
     dir.wolves.of.insert(id, index);
 }
 
-/// Wolves as threats to deer: position and whether running in. Encircling
-/// wolves are not seen.
-pub(super) fn threats(dir: &AnimalDirector) -> impl Iterator<Item = ([f64; 3], bool)> + '_ {
+/// Wolves as threats to deer. A wolf running in counts as sprinting; an
+/// encircling wolf is seen only within [`SPOTTED_M`].
+pub(super) fn threats(dir: &AnimalDirector) -> impl Iterator<Item = ThreatSource> + '_ {
     dir.walkers
         .values()
         .filter(|walker| matches!(SPECIES[walker.species].family, Family::Wolf))
-        .filter_map(|walker| match walker.gait {
-            Gait::Wolf(WolfGait::Encircle) => None,
-            Gait::Wolf(WolfGait::Close) => Some((walker.at, true)),
-            _ => Some((walker.at, false)),
+        .map(|walker| match walker.gait {
+            Gait::Wolf(WolfGait::Encircle) => ThreatSource {
+                at: walker.at,
+                sprinting: false,
+                seen_within_m: SPOTTED_M,
+            },
+            Gait::Wolf(WolfGait::Close) => ThreatSource::open(walker.at, true),
+            _ => ThreatSource::open(walker.at, false),
         })
 }
 
@@ -454,6 +467,24 @@ fn lead(dir: &mut AnimalDirector, index: usize, cx: &Cx) {
         }
     }
     if let Some(mut hunt) = dir.wolves.packs[index].hunt {
+        // Every wolf has lunged at the deer and missed: the chase is lost.
+        let all_missed = hunt.closing
+            && dir.wolves.packs[index].members.iter().all(|id| {
+                dir.walkers.get(id).is_some_and(|wolf| {
+                    matches!(
+                        wolf.gait,
+                        Gait::Wolf(WolfGait::Spent | WolfGait::Bite { .. })
+                    )
+                })
+            });
+        // A deer that saw a wolf and bolted is chased at once.
+        let bolted = match hunt.prey {
+            Prey::Deer(id) => dir
+                .walkers
+                .get(&id)
+                .is_some_and(|deer| matches!(deer.gait, Gait::Flee { .. })),
+            Prey::Player(_) => false,
+        };
         let pack = &dir.wolves.packs[index];
         let near_fire = |at: [f64; 3]| {
             nearest(&pack.fires, at).is_some_and(|(_, distance)| distance < FIRE_SAFE_M)
@@ -464,6 +495,7 @@ fn lead(dir: &mut AnimalDirector, index: usize, cx: &Cx) {
                 horizontal(at, cx.here) > LOSE_M
                     || near_fire(at)
                     || (hunt.closing && tick >= hunt.until)
+                    || all_missed
                     || hunt.bites >= PLAYER_BITES
             }
         };
@@ -485,8 +517,14 @@ fn lead(dir: &mut AnimalDirector, index: usize, cx: &Cx) {
                 let slot = ring_slot(at, hunt.base, i, count, ring);
                 horizontal(wolf, slot) < SLOT_M
             });
-            if in_place || tick >= hunt.until {
-                tracing::info!(leader = cx.id, prey = ?hunt.prey, in_place, "wolf pack closes in");
+            if in_place || bolted || tick >= hunt.until {
+                tracing::info!(
+                    leader = cx.id,
+                    prey = ?hunt.prey,
+                    in_place,
+                    bolted,
+                    "wolf pack closes in"
+                );
                 hunt.closing = true;
                 hunt.until = tick
                     + match hunt.prey {
@@ -732,6 +770,11 @@ fn hunt_step(
             step.desired = [0.0; 2];
             return step;
         }
+        // A wolf that missed a deer is out of this chase; after a bite on a
+        // player the wolf darts back out first.
+        Gait::Wolf(WolfGait::Bite { .. }) if matches!(hunt.prey, Prey::Deer(_)) => {
+            walker.gait = Gait::Wolf(WolfGait::Spent);
+        }
         Gait::Wolf(WolfGait::Bite { .. }) => {
             walker.gait = Gait::Wolf(WolfGait::BackOff {
                 until: tick + BACK_OFF_TICKS,
@@ -744,6 +787,10 @@ fn hunt_step(
     {
         return away(walker, cx.here, at);
     }
+    if let Gait::Wolf(WolfGait::Spent) = walker.gait {
+        let walk = dir.species[walker.species].walk_speed_m_s;
+        return toward(walker, cx.here, at, walk * 2.0, 0.8, 6.0, LOCOMOTION_MOVE);
+    }
     if !hunt.closing {
         walker.gait = Gait::Wolf(WolfGait::Encircle);
         let count = dir.wolves.packs[index].members.len();
@@ -753,6 +800,17 @@ fn hunt_step(
     let distance = horizontal(at, cx.here);
     let level = (at[1] - cx.here[1]).abs() < 2.0;
     match hunt.prey {
+        Prey::Deer(prey) if distance <= KILL_REACH_M && level && dir.unit() < MISS_CHANCE => {
+            // The lunge misses: the wolf snaps at air while the deer runs on,
+            // and drops out of the chase.
+            tracing::info!(wolf = cx.id, deer = prey, "wolf misses a deer");
+            walker.gait = Gait::Wolf(WolfGait::Bite {
+                until: tick + BITE_TICKS,
+            });
+            let mut step = toward(walker, cx.here, at, 0.0, 1.2, 0.0, LOCOMOTION_POUNCE);
+            step.desired = [0.0; 2];
+            step
+        }
         Prey::Deer(prey) if distance <= KILL_REACH_M && level => {
             actions.push(CreatureAction::Kill {
                 creature_id: cx.id,
@@ -977,6 +1035,24 @@ mod tests {
         // The pack overlaps: the leader still howls when the last joins.
         assert!(howling(start, 0, start + 3 * HOWL_STAGGER_TICKS));
         assert!(!howling(start, 0, start + HOWL_TICKS));
+    }
+
+    #[test]
+    fn a_deer_sees_an_encircling_wolf_only_close_up() {
+        use super::super::players::nearest_threat;
+        let wolf = |x: f64| ThreatSource {
+            at: [x, 0.0, 0.0],
+            sprinting: false,
+            seen_within_m: SPOTTED_M,
+        };
+        let deer = [0.0; 3];
+        assert!(nearest_threat(&[wolf(DEER_RING_M - SLOT_M)], deer).is_none());
+        let seen = nearest_threat(&[wolf(SPOTTED_M - 1.0)], deer).unwrap();
+        assert!(seen.distance_m < 14.0, "close enough to bolt");
+        // A farther player is still seen, and the near hidden wolf is not.
+        let player = ThreatSource::open([30.0, 0.0, 0.0], false);
+        let nearest = nearest_threat(&[wolf(15.0), player], deer).unwrap();
+        assert_eq!(nearest.distance_m, 30.0);
     }
 
     #[test]

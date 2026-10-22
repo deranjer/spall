@@ -106,6 +106,8 @@ fn a_pack_surrounds_a_deer_takes_it_and_eats_together() {
     // A deer and a pack born 45 m apart: out of the deer's notice, within
     // the pack's.
     let anchors = vec![[MIDDLE - 22.0, 0.5, MIDDLE], [MIDDLE + 23.0, 0.5, MIDDLE]];
+    // About half of all hunts fail (each wolf gets one lunge, and misses
+    // most); this seed's first hunt fails and its second takes the deer.
     let service = service(anchors, &[1, 0, 0, 0, 0, 4], 7);
     let mut deer_id = None;
     let mut deer_at = [0.0; 3];
