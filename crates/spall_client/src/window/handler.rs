@@ -246,6 +246,7 @@ impl ApplicationHandler for InteractiveApp {
                 let now = Instant::now();
                 self.update_ambience();
                 self.update_footsteps(now);
+                self.update_creature_sounds(now);
                 self.update_endurance();
                 let handler_started = now;
                 self.advance_script(now, event_loop);

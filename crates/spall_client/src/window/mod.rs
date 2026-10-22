@@ -56,6 +56,7 @@ mod admin_menu;
 mod app;
 mod bodies;
 mod camera;
+mod creature_sound_update;
 mod endurance;
 mod footstep_update;
 mod gpu_timer;

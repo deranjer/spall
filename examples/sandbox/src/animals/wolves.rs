@@ -36,9 +36,9 @@ use spall_voxel::volume::BrickState;
 
 use super::bears::{creature_at, horizontal, toward};
 use super::{
-    AnimalDirector, Cx, Family, Gait, LOCOMOTION_EAT, LOCOMOTION_HOWL, LOCOMOTION_MOVE,
-    LOCOMOTION_POUNCE, LOCOMOTION_RUN, LOCOMOTION_STALK, MOVE_DT_S, SPECIES, Step, Walker, land,
-    wrap_angle,
+    AnimalDirector, Cx, Family, Gait, LOCOMOTION_CHASE, LOCOMOTION_EAT, LOCOMOTION_HOWL,
+    LOCOMOTION_MOVE, LOCOMOTION_POUNCE, LOCOMOTION_RUN, LOCOMOTION_SHY, LOCOMOTION_STALK,
+    MOVE_DT_S, SPECIES, Step, Walker, land, wrap_angle,
 };
 
 /// Wolves per pack at birth.
@@ -241,7 +241,9 @@ impl Packs {
 /// The clip a wolf plays for a locomotion tag of its own.
 pub(super) fn clip(tag: u8) -> Option<&'static str> {
     match tag {
-        LOCOMOTION_RUN => Some("run"),
+        // Running in at prey and backing off are runs too; their own tags
+        // let clients play a growl or an alarm bark.
+        LOCOMOTION_RUN | LOCOMOTION_CHASE | LOCOMOTION_SHY => Some("run"),
         LOCOMOTION_STALK => Some("stalk"),
         LOCOMOTION_POUNCE => Some("bite"),
         LOCOMOTION_EAT => Some("eat"),
@@ -706,7 +708,7 @@ fn away(walker: &Walker, here: [f64; 3], from: [f64; 3]) -> Step {
         AVOID_SPEED_M_S,
         1.2,
         0.0,
-        LOCOMOTION_RUN,
+        LOCOMOTION_SHY,
     )
 }
 
@@ -790,7 +792,7 @@ fn hunt_step(
             CLOSE_SPEED_M_S,
             1.2,
             0.0,
-            LOCOMOTION_RUN,
+            LOCOMOTION_CHASE,
         ),
         Prey::Player(_) => toward(
             walker,
@@ -799,7 +801,7 @@ fn hunt_step(
             CLOSE_PLAYER_SPEED_M_S,
             1.2,
             0.0,
-            LOCOMOTION_RUN,
+            LOCOMOTION_CHASE,
         ),
     }
 }

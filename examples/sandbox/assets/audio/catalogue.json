@@ -2,7 +2,7 @@
   "schema_version": 1,
   "provenance_report": "docs/reports/ENG-194-biome-audio.md",
   "source_archive": "artifacts/audio-research/download-audit.json",
-  "approved_original_count": 39,
+  "approved_original_count": 48,
   "auditioned": false,
   "weather_auto_play": false,
   "assets": [
@@ -44,7 +44,16 @@
     {"file":"player/breathing-calm.ogg","kind":"player","original":"336532_1738686-hq.mp3","segment":"0-28 s as a 25 s loop","creator":"giddster","license":"CC0 1.0","source":"https://freesound.org/people/giddster/sounds/336532/","default":false},
     {"file":"player/breathing-exerted.ogg","kind":"player","original":"554907_9250976-hq.mp3","segment":"4.7 s loop","creator":"Nox_Sound","license":"CC0 1.0","source":"https://freesound.org/people/Nox_Sound/sounds/554907/","default":false},
     {"file":"player/breathing-exhausted.ogg","kind":"player","original":"319103_4039477-hq.mp3","segment":"21 s loop","creator":"AbuNijmeh","license":"CC0 1.0","source":"https://freesound.org/people/AbuNijmeh/sounds/319103/","default":false},
-    {"file":"player/breathing-accent.ogg","kind":"player","original":"422342_6613494-hq.mp3","segment":"single 2.4 s breath","creator":"BehanSean","license":"CC0 1.0","source":"https://freesound.org/people/BehanSean/sounds/422342/","default":false}
+    {"file":"player/breathing-accent.ogg","kind":"player","original":"422342_6613494-hq.mp3","segment":"single 2.4 s breath","creator":"BehanSean","license":"CC0 1.0","source":"https://freesound.org/people/BehanSean/sounds/422342/","default":false},
+    {"file":"animals/wolf-howl.ogg","kind":"animal","original":"500646_339183-hq.mp3","segment":"28.8-38.5 s, the second howl","creator":"betchkal","license":"CC0 1.0","source":"https://freesound.org/people/betchkal/sounds/500646/","default":false},
+    {"file":"animals/wolf-chorus-sanctuary.ogg","kind":"animal","original":"158780_229952-hq.mp3","segment":"1-14 s","creator":"Paresh","license":"CC0 1.0","source":"https://freesound.org/people/Paresh/sounds/158780/","default":false},
+    {"file":"animals/wolf-chorus.ogg","kind":"animal","original":"378334_4804147-hq.mp3","segment":"0.6-7.2 s","creator":"Kingcornz","license":"CC0 1.0","source":"https://freesound.org/people/Kingcornz/sounds/378334/","default":false},
+    {"file":"animals/wolf-growl.ogg","kind":"animal","original":"122183_71257-hq.mp3","segment":"4-9 s","creator":"qubodup","license":"CC0 1.0","source":"https://freesound.org/people/qubodup/sounds/122183/","default":false},
+    {"file":"animals/wolf-bite.ogg","kind":"animal","original":"823544_71257-hq.mp3","segment":"4.6-6.2 s","creator":"qubodup","license":"CC0 1.0","source":"https://freesound.org/people/qubodup/sounds/823544/","default":false},
+    {"file":"animals/wolf-bark.ogg","kind":"animal","original":"535457_2587400-hq.mp3","segment":"whole preview","creator":"exe2be","license":"CC0 1.0","source":"https://freesound.org/people/exe2be/sounds/535457/","default":false},
+    {"file":"animals/wolf-bark-pack.ogg","kind":"animal","original":"420451_2402876-hq.mp3","segment":"0-3 s","creator":"Mrthenoronha","license":"CC0 1.0","source":"https://freesound.org/people/Mrthenoronha/sounds/420451/","default":false},
+    {"file":"animals/wolf-yips.ogg","kind":"animal","original":"711262_3298379-hq.mp3","segment":"13-18.2 s","creator":"buzzatsea","license":"CC0 1.0","source":"https://freesound.org/people/buzzatsea/sounds/711262/","default":false},
+    {"file":"animals/wolf-steps.ogg","kind":"animal","original":"628400_12013381-hq.mp3","segment":"0-3 s","creator":"melle_teich","license":"CC0 1.0","source":"https://freesound.org/people/melle_teich/sounds/628400/","default":false}
   ],
   "excluded": [
     {"name":"SnowFall.ogg","reason":"User identified it as music and rejected it; do not fetch or use."},

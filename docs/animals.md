@@ -77,7 +77,9 @@ the world. The server moves deer and crows with a capsule swept against terrain;
 clients receive spawn, despawn and motion records. Players and bodies pass
 through them. `--animals N` spawns N deer, N/2 crows and N/8 (rounded up) each
 of grizzly bears and snow leopards, N/4 trout, and a pack of four wolves per
-16 (rounded up), in a worldgen sandbox. Each walking species has its
+16 (rounded up), in a worldgen sandbox. Species still short of their count
+take turns at placement, so one that cannot be placed (snow leopards with no
+mountain near) does not keep the others from spawning. Each walking species has its
 own pace and foot capsule, sized to fit inside its body; placement envelopes and
 foot height are measured from the asset's idle and walk poses.
 
@@ -177,9 +179,8 @@ within 8 m of one backs away, and a pack gives up prey (deer or player) within
 2 s; worldgen bricks are never edited, so only player-built areas are read.
 
 At night a calm pack howls together every 90 s to 4 minutes: each wolf throws
-its head back (`howl` clip) for 5 s, joining 0.8 s after the one before. A howl
-is only a clip for now; its sound waits on the sound list below and positional
-audio.
+its head back (`howl` clip) for 5 s, joining 0.8 s after the one before. The first wolf
+is heard as a lone howl and the others as a pack chorus (see Wolf sounds).
 
 An animal can die. A hammer (cutting tool) strike that meets an animal's posed
 voxels before any terrain kills it with one blow: the server despawns it, and
@@ -196,14 +197,20 @@ finer-than-terrain carcasses,
 swimming and flight physics beyond the capsule, saving animals, and the
 population/performance measurements a populated world needs.
 
-## Sound list (candidates, not yet auditioned or integrated)
+## Sound list
 
-No animal makes a sound yet. The client's audio (`spall_client::audio`) only plays
-non-positional ambience, footsteps and breathing. Animal sounds first need
-**positional playback**: a one-shot or loop at a world position, attenuated by
-distance and panned by direction, and triggered from replicated creature state.
-Most cues below fire when a creature's locomotion tag changes (for example
-`LOCOMOTION_REAR`) or while a tag is held (walk, run).
+Only wolves make sounds so far; the other species' lists below are candidates,
+not yet auditioned or integrated.
+
+Creature sounds are game-owned cues (`spall_client::creature_sounds`): a
+species, a locomotion tag, recordings, a range, a gain, an optional repeat
+while the tag is held and a chance. Each frame the client reads every
+creature's presented tag and position from the replica. A cue starts when a
+creature's tag changes to its tag; a creature first seen mid-tag stays silent.
+Loudness falls off as (1 - distance / range)^2 and the sound is panned by which
+side of the listener it is on, both fixed when it starts. When another creature
+of the species within 40 m already had the tag, the cue's chorus recordings
+play instead. The ambience audio worker plays at most 8 such sounds at once.
 
 All links are Freesound searches filtered to **CC0**. Accepted files go into
 `examples/sandbox/assets/audio/animals/` and `CREDITS.md` the same way as the
@@ -266,22 +273,26 @@ biome audio. Range is roughly how far away the sound should still be audible.
 
 ### Wolf (ENG-243, approved 2026-10-22)
 
-The user auditioned the candidates and approved these. Recordings marked *dog*
-are stand-ins for wolves. A howl can be heard only as far as the server sends
-creature motion to a client (320 m). No wolf sound plays yet: the files still
-need downloading and converting, and the client needs positional playback.
+The user auditioned the candidates and approved these; they ship as trimmed,
+loudness-normalized mono Ogg files in `assets/audio/animals/` (credits in
+`CREDITS.md`). Recordings marked *dog* are stand-ins for wolves. A howl can be
+heard only as far as the server sends creature motion to a client (320 m).
+Running in at prey and backing off are runs with their own tags
+(`LOCOMOTION_CHASE`, `LOCOMOTION_SHY`) so they can growl or bark. Half the
+wolves backing off bark; a resting wolf yips one time in ten, every 20 to 60
+s; steps repeat every 3 s while walking or stalking.
 
 | Cue | Trigger | Range | Approved |
 | --- | --- | --- | --- |
 | Lone howl | `howl` (the first wolf of a pack howl, at night) | 320 m | [betchkal, wild Alaskan wolf](https://freesound.org/people/betchkal/sounds/500646/) |
 | Pack chorus | `howl` from the rest of the pack joining in | 320 m | [Paresh, Wolf Haven sanctuary pack](https://freesound.org/people/Paresh/sounds/158780/), [Kingcornz, howling wolves](https://freesound.org/people/Kingcornz/sounds/378334/) |
-| Growl / snarl | Closing in on prey or a player (`run` after encircling) | 25 m | [qubodup, dog growling and snarling](https://freesound.org/people/qubodup/sounds/122183/) *(dog)* |
+| Growl / snarl | Closing in on prey or a player (`LOCOMOTION_CHASE`) | 25 m | [qubodup, dog growling and snarling](https://freesound.org/people/qubodup/sounds/122183/) *(dog)* |
 | Bite snap | `bite` (a kill, or a bite on a player) | 15 m | [qubodup, Malinois growling in play](https://freesound.org/people/qubodup/sounds/823544/) *(dog)* |
-| Alarm bark | A wolf backing off from a bear or a fire | 60 m | [exe2be, single bark](https://freesound.org/people/exe2be/sounds/535457/) *(dog)*, [Mrthenoronha, dogs barking](https://freesound.org/people/Mrthenoronha/sounds/420451/) *(dog)* |
-| Yips | Occasionally while the pack rests together | 30 m | [buzzatsea](https://freesound.org/people/buzzatsea/sounds/711262/) |
+| Alarm bark | A wolf backing off from a bear or a fire (`LOCOMOTION_SHY`) | 60 m | [exe2be, single bark](https://freesound.org/people/exe2be/sounds/535457/) *(dog)*, [Mrthenoronha, dogs barking](https://freesound.org/people/Mrthenoronha/sounds/420451/) *(dog)* |
+| Yips | Occasionally while resting (`idle`) | 30 m | [buzzatsea](https://freesound.org/people/buzzatsea/sounds/711262/) |
 | Padding steps | `walk`, `stalk` | 10 m | [melle_teich, dry leaves](https://freesound.org/people/melle_teich/sounds/628400/) (best found so far) |
-| Running | `run` | 30 m | None chosen yet |
-| Tearing and chewing meat | `eat` on a carcass | 15 m | Same pick as the bear's |
+| Running | `run` | 30 m | None chosen yet (silent) |
+| Tearing and chewing meat | `eat` on a carcass | 15 m | The bear's pick, once chosen (silent until then) |
 
 ### Shared
 
