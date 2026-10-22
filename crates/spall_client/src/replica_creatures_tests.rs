@@ -120,25 +120,10 @@ fn motion_frames_interpolate_hold_and_ignore_stale_entries() {
 
 #[test]
 fn steady_motion_presents_without_hold_and_jump() {
-    let (mut sim, catalog) = server();
-    let mut replica = replica(&catalog);
-    let intent = birth_intent(&sim, &catalog, [12.0, 6.0, 12.0]);
-    let born = commit(&mut sim, &catalog, 1, 1, intent);
-    assert!(matches!(
-        replica.apply_transaction(&born.topology),
-        ApplyOutcome::Published { .. }
-    ));
-    let key = replica
-        .creatures()
-        .unwrap()
-        .records()
-        .next()
-        .unwrap()
-        .state
-        .key;
-    let (id, epoch) = (key.creature_id.get(), key.world_epoch.get());
-    let creatures = replica.creatures_mut_for_tests();
-    let record = creatures.records().next().unwrap().clone();
+    let mut creatures = ReplicaCreatures::new();
+    creatures.spawn(&spawn(7, 0.0)).unwrap();
+    let id = 7;
+    let record = creatures.get(id).unwrap().clone();
 
     // The server moves a walker 0.2 m every 8 ticks (133 ms); frames are drawn
     // every 16 ms and each draw first takes whatever poses have arrived.
@@ -151,7 +136,7 @@ fn steady_motion_presents_without_hold_and_jump() {
         while t0 + move_every * sent <= now {
             let tick = 10 + u64::from(sent) * 8;
             creatures.apply_motion(
-                &motion_frame(epoch, tick, id, 0.2 * f64::from(sent)),
+                &motion_frame(tick, id, 0.2 * f64::from(sent)),
                 t0 + move_every * sent,
             );
             sent += 1;
