@@ -30,6 +30,9 @@ const SINK_M_S: f64 = 2.0;
 /// Largest heading change per update, radians.
 const MAX_TURN_RAD: f64 = 0.5;
 const CELL_M: f64 = 0.25;
+/// A hovering trout swims off from a bear standing in the water this close,
+/// horizontally.
+const SCATTER_M: f64 = 2.0;
 
 /// Fish-only states.
 #[derive(Debug, Clone, Copy)]
@@ -250,8 +253,12 @@ pub(super) fn step(
     };
     match gait {
         FishGait::Hover { until } => {
-            if tick >= until {
-                walker.gait = match wander(dir, cx.sim, &water, species, here) {
+            // A bear standing in the water close by scares a hovering trout
+            // off, away from it.
+            let bear = super::bears::wading(dir)
+                .find(|at| (at[0] - here[0]).hypot(at[2] - here[2]) < SCATTER_M);
+            if tick >= until || bear.is_some() {
+                walker.gait = match wander(dir, cx.sim, &water, species, here, bear) {
                     Some(target) => Gait::Fish(FishGait::Swim {
                         target,
                         until: tick + 60 * 20,
@@ -310,8 +317,27 @@ pub(super) fn step(
 }
 
 /// A wander target 1.5 to 6 m away whose whole body is in water, if one of a
-/// few tries finds one.
+/// few tries finds one. Fleeing a bear at `away`, only targets farther from
+/// it than here count, and the farthest is taken.
 fn wander(
+    dir: &mut AnimalDirector,
+    sim: &Simulation,
+    water: &ColumnWaterFrame,
+    species: usize,
+    here: [f64; 3],
+    away: Option<[f64; 3]>,
+) -> Option<[f64; 3]> {
+    let Some(bear) = away else {
+        return wander_once(dir, sim, water, species, here);
+    };
+    let from_bear = |p: &[f64; 3]| (p[0] - bear[0]).hypot(p[2] - bear[2]);
+    (0..4)
+        .filter_map(|_| wander_once(dir, sim, water, species, here))
+        .filter(|target| from_bear(target) > from_bear(&here))
+        .max_by(|a, b| from_bear(a).total_cmp(&from_bear(b)))
+}
+
+fn wander_once(
     dir: &mut AnimalDirector,
     sim: &Simulation,
     water: &ColumnWaterFrame,

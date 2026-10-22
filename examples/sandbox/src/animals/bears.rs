@@ -7,6 +7,12 @@
 //! edits, until it is gone or the bear is full, and is hungry again a few
 //! minutes later. Bears ignore players. Deer see a bear as a threat unless it
 //! is stalking; a charging bear counts as a sprinting one.
+//!
+//! A hungry bear with no deer to hunt fishes instead (ENG-239): it walks to
+//! shallow water (or the bank) beside a trout it knows of, waits there, and
+//! swipes at a trout that swims within reach of its front. A catch despawns
+//! the trout outright, with no carcass, and the bear eats it briefly; a fish
+//! keeps it fed for less time than a deer.
 
 use std::collections::HashMap;
 
@@ -16,8 +22,9 @@ use spall_sim::{CreatureKill, Simulation};
 use spall_voxel::Sample;
 
 use super::{
-    AnimalDirector, Cx, Family, Gait, LOCOMOTION_EAT, LOCOMOTION_MOVE, LOCOMOTION_POUNCE,
-    LOCOMOTION_RUN, LOCOMOTION_STALK, MOVE_DT_S, SPECIES, Step, Walker, land, wrap_angle,
+    AnimalDirector, Cx, Family, Gait, LOCOMOTION_EAT, LOCOMOTION_IDLE, LOCOMOTION_MOVE,
+    LOCOMOTION_POUNCE, LOCOMOTION_RUN, LOCOMOTION_STALK, MOVE_DT_S, SPECIES, Step, Walker, land,
+    wrap_angle,
 };
 
 /// A hungry bear notices a deer this close, horizontally.
@@ -56,6 +63,23 @@ const STRETCH_M: f64 = 2.6;
 /// A fed bear is hungry again this long after its meal (4 min).
 const HUNGER_TICKS: u64 = 60 * 60 * 4;
 
+/// A hungry bear with no deer goes fishing for a trout this close.
+const FISH_NOTICE_M: f64 = 40.0;
+/// Deepest water a bear wades into, metres; it stops short of deeper water.
+const WADE_MAX_M: f64 = 0.8;
+/// Longest a bear goes to the water and waits there for a catch (90 s).
+const FISH_TICKS: u64 = 60 * 90;
+/// The paw's reach point, this far ahead of the root.
+const FRONT_M: f64 = 0.8;
+/// A trout this close to the reach point, horizontally, can be swiped.
+const SWIPE_REACH_M: f64 = 1.5;
+/// Chance a swipe catches the trout.
+const CATCH_CHANCE: f64 = 0.5;
+/// Time spent eating a caught fish (5 s).
+const FISH_MEAL_TICKS: u64 = 60 * 5;
+/// A bear fed on a fish is hungry again this long after (90 s).
+const FISH_HUNGER_TICKS: u64 = 60 * 90;
+
 /// Bear-only states.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum BearGait {
@@ -67,6 +91,22 @@ pub(super) enum BearGait {
     Pounce { until: u64 },
     /// Eat the carcass, a bite every [`BITE_TICKS`].
     Eat { next_bite: u64 },
+    /// Walk to the wading spot `spot` (x, z), then stand there (`standing`)
+    /// and watch for trout, until `until`.
+    Wade {
+        spot: [f64; 2],
+        standing: bool,
+        until: u64,
+    },
+    /// A swipe at a trout until `until`; `caught` says whether it landed.
+    /// A miss goes back to waiting until `give_up`.
+    Swipe {
+        caught: bool,
+        until: u64,
+        give_up: u64,
+    },
+    /// Eat a caught fish until `until`.
+    EatFish { until: u64 },
 }
 
 /// What a bear keeps between gaits.
@@ -80,6 +120,8 @@ pub(super) struct Bear {
     bites: u32,
     /// Until this tick the carcass may still be committing.
     settle_until: u64,
+    /// A trout just caught, for the director to despawn.
+    caught: Option<u64>,
 }
 
 /// The clip a bear plays for a locomotion tag of its own. The bear asset has
@@ -108,6 +150,28 @@ pub(super) fn threats(dir: &AnimalDirector) -> impl Iterator<Item = ([f64; 3], b
         })
 }
 
+/// Where bears stand fishing in the water, for trout to scatter from.
+pub(super) fn wading(dir: &AnimalDirector) -> impl Iterator<Item = [f64; 3]> + '_ {
+    dir.walkers
+        .values()
+        .filter(|walker| {
+            matches!(
+                walker.gait,
+                Gait::Bear(BearGait::Wade { standing: true, .. } | BearGait::Swipe { .. })
+            )
+        })
+        .map(|walker| walker.at)
+}
+
+/// The trout bears caught since the last call. They leave the world without
+/// a carcass, through the director's despawn hook.
+pub(super) fn caught_fish(bears: &mut HashMap<u64, Bear>) -> Vec<u64> {
+    bears
+        .values_mut()
+        .filter_map(|bear| bear.caught.take())
+        .collect()
+}
+
 /// A kill's outcome: the bear eats the carcass it left.
 pub(super) fn on_killed(bears: &mut HashMap<u64, Bear>, bear: u64, kill: CreatureKill, tick: u64) {
     let bear = bears.entry(bear).or_default();
@@ -129,15 +193,23 @@ pub(super) fn step(
         Gait::Walk { .. } => true,
         _ => false,
     };
-    if calm
-        && dir.bears.entry(cx.id).or_default().hungry_at <= tick
-        && let Some(prey) = nearest_deer(dir, cx.here)
-    {
-        walker.stuck = 0;
-        walker.gait = Gait::Bear(BearGait::Stalk {
-            prey,
-            until: tick + STALK_TICKS,
-        });
+    if calm && dir.bears.entry(cx.id).or_default().hungry_at <= tick {
+        if let Some(prey) = nearest_deer(dir, cx.here) {
+            walker.stuck = 0;
+            walker.gait = Gait::Bear(BearGait::Stalk {
+                prey,
+                until: tick + STALK_TICKS,
+            });
+        } else if let Some(spot) = nearest_trout(dir, cx.here, FISH_NOTICE_M)
+            .and_then(|(_, trout)| wading_spot(cx.sim, cx.here, trout))
+        {
+            walker.stuck = 0;
+            walker.gait = Gait::Bear(BearGait::Wade {
+                spot,
+                standing: false,
+                until: tick + FISH_TICKS,
+            });
+        }
     }
     match walker.gait {
         Gait::Bear(BearGait::Stalk { prey, until }) => stalk(walker, cx, prey, until),
@@ -155,6 +227,44 @@ pub(super) fn step(
             step
         }
         Gait::Bear(BearGait::Eat { next_bite }) => eat(dir, walker, cx, next_bite, actions),
+        Gait::Bear(BearGait::Wade {
+            spot,
+            standing,
+            until,
+        }) => wade(dir, walker, cx, spot, standing, until),
+        Gait::Bear(BearGait::Swipe {
+            caught,
+            until,
+            give_up,
+        }) => {
+            if tick >= until {
+                walker.gait = if caught {
+                    Gait::Bear(BearGait::EatFish {
+                        until: tick + FISH_MEAL_TICKS,
+                    })
+                } else {
+                    // Missed: back to watching from where it stands.
+                    Gait::Bear(BearGait::Wade {
+                        spot: [cx.here[0], cx.here[2]],
+                        standing: true,
+                        until: give_up,
+                    })
+                };
+            }
+            let mut step = Step::still(walker, cx.here);
+            step.tag = LOCOMOTION_POUNCE;
+            step
+        }
+        Gait::Bear(BearGait::EatFish { until }) => {
+            if tick >= until {
+                dir.bears.entry(cx.id).or_default().hungry_at = tick + FISH_HUNGER_TICKS;
+                walker.gait = Gait::Rest { until: tick + 120 };
+                return Step::still(walker, cx.here);
+            }
+            let mut step = Step::still(walker, cx.here);
+            step.tag = LOCOMOTION_EAT;
+            step
+        }
         _ => land::step(dir, walker, cx, land::wander, |_| true),
     }
 }
@@ -168,6 +278,121 @@ fn nearest_deer(dir: &AnimalDirector, here: [f64; 3]) -> Option<u64> {
         .filter(|&(_, distance, y)| distance < NOTICE_M && (y - here[1]).abs() < 8.0)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(id, _, _)| id)
+}
+
+/// The nearest trout within `within_m` of `here`, horizontally, that no bear
+/// has caught already: (id, root).
+fn nearest_trout(dir: &AnimalDirector, here: [f64; 3], within_m: f64) -> Option<(u64, [f64; 3])> {
+    dir.walkers
+        .iter()
+        .filter(|(_, walker)| matches!(SPECIES[walker.species].family, Family::Fish))
+        .filter(|(id, _)| dir.bears.values().all(|bear| bear.caught != Some(**id)))
+        .map(|(&id, walker)| (id, walker.at, horizontal(here, walker.at)))
+        .filter(|&(_, _, distance)| distance < within_m)
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(id, at, _)| (id, at))
+}
+
+/// Water depth over the ground of the column under (`x`, `z`), metres: zero
+/// on dry ground, `None` where the ground is unknown.
+fn water_depth_m(sim: &Simulation, x: f64, z: f64) -> Option<f64> {
+    let ground =
+        AnimalDirector::ground_y_m(sim, (x / 0.25).floor() as i64, (z / 0.25).floor() as i64)?;
+    let surface = sim
+        .column_water()
+        .and_then(|water| water.water_sample_at_m(x, ground + 0.05, z))
+        .map_or(ground, |sample| sample.surface_y);
+    Some((surface - ground).max(0.0))
+}
+
+/// Where a bear at `here` stands to fish for the trout at `trout`: of the
+/// columns on the nearest ring (1 to 4 m) around the trout with ground near
+/// its level and water no deeper than [`WADE_MAX_M`] (dry bank counts), the
+/// one closest to the bear.
+fn wading_spot(sim: &Simulation, here: [f64; 3], trout: [f64; 3]) -> Option<[f64; 2]> {
+    let from_bear = |p: &[f64; 2]| (p[0] - here[0]).hypot(p[1] - here[2]);
+    [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+        .into_iter()
+        .find_map(|radius| {
+            (0..16)
+                .map(|i| f64::from(i) * std::f64::consts::TAU / 16.0)
+                .map(|angle| {
+                    [
+                        trout[0] + radius * angle.cos(),
+                        trout[2] + radius * angle.sin(),
+                    ]
+                })
+                .filter(|&[x, z]| {
+                    let cell = ((x / 0.25).floor() as i64, (z / 0.25).floor() as i64);
+                    AnimalDirector::ground_y_m(sim, cell.0, cell.1)
+                        .is_some_and(|ground| (ground - trout[1]).abs() < 3.0)
+                        && water_depth_m(sim, x, z).is_some_and(|depth| depth <= WADE_MAX_M)
+                })
+                .min_by(|a, b| from_bear(a).total_cmp(&from_bear(b)))
+        })
+}
+
+/// Fishing: walk to `spot`, never into water deeper than [`WADE_MAX_M`],
+/// then stand facing the nearest trout and swipe at one in reach of the paw.
+fn wade(
+    dir: &mut AnimalDirector,
+    walker: &mut Walker,
+    cx: &Cx,
+    spot: [f64; 2],
+    standing: bool,
+    until: u64,
+) -> Step {
+    let tick = cx.tick;
+    if tick >= until {
+        walker.gait = Gait::Rest { until: tick + 600 };
+        return Step::still(walker, cx.here);
+    }
+    if !standing {
+        let (dx, dz) = (spot[0] - cx.here[0], spot[1] - cx.here[2]);
+        let distance = dx.hypot(dz);
+        let too_deep = distance > 0.3 && {
+            let ahead = 0.6 / distance;
+            water_depth_m(cx.sim, cx.here[0] + dx * ahead, cx.here[2] + dz * ahead)
+                .is_none_or(|depth| depth > WADE_MAX_M)
+        };
+        if distance > 0.3 && !too_deep && walker.stuck < 4 {
+            let speed = dir.species[walker.species].walk_speed_m_s;
+            let target = [spot[0], cx.here[1], spot[1]];
+            return toward(walker, cx.here, target, speed, 0.35, 0.0, LOCOMOTION_MOVE);
+        }
+        // There, or as close as shallow water and the ground allow.
+        walker.stuck = 0;
+        walker.gait = Gait::Bear(BearGait::Wade {
+            spot,
+            standing: true,
+            until,
+        });
+    }
+    let Some((trout, at)) = nearest_trout(dir, cx.here, 8.0) else {
+        return Step::still(walker, cx.here);
+    };
+    let front = [
+        cx.here[0] + FRONT_M * walker.yaw.cos(),
+        cx.here[2] - FRONT_M * walker.yaw.sin(),
+    ];
+    let in_reach = (at[0] - front[0]).hypot(at[2] - front[1]) <= SWIPE_REACH_M
+        && (at[1] - cx.here[1]).abs() < 2.0;
+    let mut step = toward(walker, cx.here, at, 0.0, 0.35, 0.0, LOCOMOTION_IDLE);
+    step.desired = [0.0; 2];
+    if in_reach {
+        let caught = dir.unit() < CATCH_CHANCE;
+        if caught {
+            dir.bears.entry(cx.id).or_default().caught = Some(trout);
+            tracing::info!(bear = cx.id, trout, "bear caught a trout");
+        }
+        walker.gait = Gait::Bear(BearGait::Swipe {
+            caught,
+            until: tick + POUNCE_TICKS,
+            give_up: until,
+        });
+        step.tag = LOCOMOTION_POUNCE;
+    }
+    step
 }
 
 fn creature_at(sim: &Simulation, id: u64) -> Option<[f64; 3]> {

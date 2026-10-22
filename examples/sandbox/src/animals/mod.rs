@@ -680,6 +680,11 @@ impl CreatureDirector for AnimalDirector {
         self.crows.clear();
     }
 
+    /// Fish a bear caught: gone whole, no carcass.
+    fn despawns(&mut self, _tick: u64, _sim: &Simulation) -> Vec<u64> {
+        bears::caught_fish(&mut self.bears)
+    }
+
     fn on_action_outcome(&mut self, creature_id: u64, outcome: CreatureActionOutcome) {
         let Some(walker) = self.walkers.get_mut(&creature_id) else {
             return;
