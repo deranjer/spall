@@ -260,3 +260,65 @@ fn snow_leopards_with_no_mountain_do_not_keep_wolves_from_spawning() {
     }
     assert_eq!(wolves(&sim).len(), 4);
 }
+
+/// A settled pack (before it is first hungry) and a player standing still
+/// `offset_m` from the middle of it for `ticks`. Returns whether any wolf
+/// backed away barking (`LOCOMOTION_SHY`) and the player's lowest health.
+fn player_steps_up(seed: u64, offset_m: f64, lamp: bool, ticks: u64) -> (bool, u16) {
+    let anchor = [MIDDLE, 0.5, MIDDLE];
+    let player_at = [MIDDLE - offset_m, 0.6, MIDDLE];
+    let lamps = if lamp {
+        vec![[player_at[0] - 1.0, player_at[2]]]
+    } else {
+        Vec::new()
+    };
+    let mut sim = simulation(&lamps);
+    let service = service(vec![anchor], &PACK, seed);
+    for _ in 0..60 {
+        run(&mut sim, &service);
+    }
+    assert_eq!(wolves(&sim).len(), 4, "the pack is not all there");
+    let player = player_entity();
+    sim.add_player(player, player_at);
+    let mut shy = false;
+    let mut lowest = PLAYER_MAX_HEALTH;
+    for _ in 0..ticks {
+        run(&mut sim, &service);
+        sim.teleport_player(player, player_at);
+        shy |= wolves(&sim)
+            .iter()
+            .any(|w| w.locomotion_tag == sandbox::animals::LOCOMOTION_SHY);
+        lowest = lowest.min(sim.player_health(player).unwrap());
+    }
+    (shy, lowest)
+}
+
+#[test]
+fn a_pack_backs_away_barking_from_a_close_player_or_attacks() {
+    let (mut backed, mut attacked) = (0, 0);
+    for seed in 1..=12 {
+        let (shy, lowest) = player_steps_up(seed, 5.0, false, 300);
+        assert!(
+            shy || lowest < PLAYER_MAX_HEALTH,
+            "seed {seed}: the pack ignored a player 5 m away"
+        );
+        if lowest < PLAYER_MAX_HEALTH {
+            attacked += 1;
+        } else {
+            backed += 1;
+        }
+    }
+    assert!(
+        backed > attacked,
+        "{backed} backed away, {attacked} attacked"
+    );
+    assert!(attacked > 0, "no pack attacked in 12 encounters");
+}
+
+#[test]
+fn a_close_player_at_a_fire_is_never_attacked() {
+    for seed in 1..=6 {
+        let (_, lowest) = player_steps_up(seed, 5.0, true, 300);
+        assert_eq!(lowest, PLAYER_MAX_HEALTH, "seed {seed}: bitten at a fire");
+    }
+}

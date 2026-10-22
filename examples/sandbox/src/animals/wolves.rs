@@ -110,6 +110,21 @@ const PLAYER_NOTICE_M: f64 = 40.0;
 /// ...and leaves players alone this long after a player hunt (3 min).
 const PLAYER_REST_TICKS: u64 = 60 * 60 * 3;
 
+/// A player this close to any wolf, or sprinting this close, makes the pack
+/// react: back away, or attack.
+const WARY_M: f64 = 8.0;
+const WARY_SPRINT_M: f64 = 14.0;
+/// Horizontal speed above which a player counts as sprinting.
+const SPRINT_M_S: f32 = 4.5;
+/// Chance the pack attacks a player who came close, by day and at night...
+const CLOSE_ATTACK_CHANCE: f64 = 0.2;
+const CLOSE_ATTACK_NIGHT_CHANCE: f64 = 0.4;
+/// ...and how much likelier when it is guarding a carcass.
+const GUARD_ATTACK_CHANCE: f64 = 0.3;
+/// Backing away from a close player at a run (3 s).
+const BACK_AWAY_TICKS: u64 = 60 * 3;
+/// After reacting, a close player only makes the pack back away (20 s).
+const WARY_TICKS: u64 = 60 * 20;
 /// A bear this close to any member sends the pack away.
 const BEAR_AVOID_M: f64 = 22.0;
 /// A wolf this close to a fire backs away from it.
@@ -223,6 +238,8 @@ pub(super) struct Pack {
     next_howl: u64,
     next_player_choice: u64,
     players_left_until: u64,
+    /// Until this tick a close player is backed away from, not attacked.
+    players_wary_until: u64,
 }
 
 /// Every pack, and which pack each wolf is in.
@@ -466,6 +483,11 @@ fn lead(dir: &mut AnimalDirector, index: usize, cx: &Cx) {
             pack.danger = None;
         }
     }
+    meet_players(dir, index, cx, &members);
+    // Again: meeting a player may have started a hunt on it.
+    let prey = dir.wolves.packs[index]
+        .hunt
+        .and_then(|hunt| prey_at(cx.sim, hunt.prey));
     if let Some(mut hunt) = dir.wolves.packs[index].hunt {
         // Every wolf has lunged at the deer and missed: the chase is lost.
         let all_missed = hunt.closing
@@ -561,6 +583,67 @@ fn lead(dir: &mut AnimalDirector, index: usize, cx: &Cx) {
             dir.wolves.packs[index].next_howl = tick + rest;
         }
         None => {}
+    }
+}
+
+/// A player who comes close to the pack makes it react: most often the
+/// wolves bark and back away; sometimes (more at night, and more when they
+/// are guarding a carcass) they attack. A player beside a fire is never
+/// attacked. Once the pack has reacted, a close player only makes it back
+/// away again for a while.
+fn meet_players(dir: &mut AnimalDirector, index: usize, cx: &Cx, members: &[[f64; 3]]) {
+    let tick = cx.tick;
+    let pack = &dir.wolves.packs[index];
+    let hunting_a_player = matches!(
+        pack.hunt,
+        Some(Hunt {
+            prey: Prey::Player(_),
+            ..
+        })
+    );
+    if hunting_a_player || pack.danger.is_some() {
+        return;
+    }
+    let close = cx.sim.world().players().find_map(|player| {
+        let at = player.state.position_m;
+        let [vx, _, vz] = player.state.velocity_m_s;
+        let sprinting = vx.hypot(vz) > SPRINT_M_S;
+        let distance = members
+            .iter()
+            .map(|&wolf| horizontal(wolf, at))
+            .fold(f64::INFINITY, f64::min);
+        (distance < WARY_M || (sprinting && distance < WARY_SPRINT_M))
+            .then_some((player.entity, at))
+    });
+    let Some((entity, at)) = close else {
+        return;
+    };
+    let by_fire = nearest(&pack.fires, at).is_some_and(|(_, distance)| distance < FIRE_SAFE_M);
+    let mut chance = if is_night(tick) {
+        CLOSE_ATTACK_NIGHT_CHANCE
+    } else {
+        CLOSE_ATTACK_CHANCE
+    };
+    if !pack.carcass.is_empty() {
+        chance += GUARD_ATTACK_CHANCE;
+    }
+    let fresh = tick >= pack.players_wary_until && tick >= pack.players_left_until;
+    let attack = !by_fire && fresh && dir.unit() < chance;
+    let pack = &mut dir.wolves.packs[index];
+    pack.players_wary_until = tick + WARY_TICKS;
+    pack.howl_at = None;
+    if attack {
+        tracing::info!(leader = cx.id, player = ?entity, "wolf pack attacks a player who came close");
+        pack.hunt = Some(Hunt {
+            prey: Prey::Player(entity),
+            base: 0.0,
+            closing: true,
+            until: tick + CLOSE_PLAYER_TICKS,
+            bites: 0,
+        });
+    } else {
+        tracing::info!(leader = cx.id, player = ?entity, "wolf pack backs away from a player");
+        pack.danger = Some((at, tick + BACK_AWAY_TICKS));
     }
 }
 

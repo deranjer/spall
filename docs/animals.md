@@ -75,7 +75,8 @@ root pose and a clip. They are drawn from the species' SPVX asset and own no
 world voxels, so they cannot be cut apart voxel by voxel and are not saved with
 the world. The server moves deer and crows with a capsule swept against terrain;
 clients receive spawn, despawn and motion records. Players and bodies pass
-through them. `--animals N` spawns N deer, N/2 crows and N/8 (rounded up) each
+through them. Each is drawn in its asset's palette colours (fur is the
+`wood` material, which on its own is brown). `--animals N` spawns N deer, N/2 crows and N/8 (rounded up) each
 of grizzly bears and snow leopards, N/4 trout, and a pack of four wolves per
 16 (rounded up), in a worldgen sandbox. Species still short of their count
 take turns at placement, so one that cannot be placed (snow leopards with no
@@ -175,6 +176,13 @@ within 1.6 m bites for `WOLF_BITE_DAMAGE` (20 of 100) and darts back out for
 1.5 s. The pack gives up after three bites, 20 s of running in, or a kill, and
 leaves players alone for 3 minutes. Wolves never attack a full-health player
 to death on their own.
+
+A player who comes within 8 m of any wolf (14 m sprinting) makes the pack
+react. Usually it backs away at a run for 3 s (`LOCOMOTION_SHY`, with alarm
+barks); one time in five (two in five at night, and 30 points more when the
+pack is guarding a carcass) it attacks instead, running straight in and biting
+as in a player hunt. A player within 12 m of a fire is never attacked. For 20 s
+after reacting, a close player only makes the pack back away again.
 
 Wolves avoid bears: a bear within 22 m of any wolf ends the pack's hunt and the
 pack runs away from it until 5 s after none is that close. They fear fire.
