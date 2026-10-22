@@ -40,6 +40,16 @@ pub enum CreatureAction {
     /// A creature eats the ground cover in one terrain column (cells), through
     /// the same destroyed-cover record a surface edit makes.
     Graze { creature_id: u64, column: [i64; 2] },
+    /// The creature kills `prey`, which dies as from a strike: despawned,
+    /// announced to every client, and left as a terrain carcass.
+    Kill { creature_id: u64, prey: u64 },
+    /// The creature changes one terrain cell through the committed edit path:
+    /// `place` fills it if empty, `None` clears it if solid.
+    EditCell {
+        creature_id: u64,
+        cell: spall_core::GlobalCell,
+        place: Option<spall_core::MaterialId>,
+    },
 }
 
 impl CreatureAction {
@@ -47,17 +57,23 @@ impl CreatureAction {
         match self {
             Self::Fly(request) => request.creature_id,
             Self::Walk(request) => request.creature_id,
-            Self::Graze { creature_id, .. } => *creature_id,
+            Self::Graze { creature_id, .. }
+            | Self::Kill { creature_id, .. }
+            | Self::EditCell { creature_id, .. } => *creature_id,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CreatureActionOutcome {
     Fly(spall_sim::CreatureMoveOutcome),
     Walked(spall_sim::CreatureWalkOutcome),
     /// Whether there was cover to eat.
     Grazed(bool),
+    /// The prey died; its carcass cells are queued.
+    Killed(spall_sim::CreatureKill),
+    /// Whether the cell edit was queued (`false`: the cell already was so).
+    CellEdited(bool),
 }
 
 pub trait CreatureDirector: Send {
@@ -164,7 +180,8 @@ impl CreatureService {
 
     /// Collects the director's movement for this tick and applies it. A request
     /// the engine rejects is logged and skipped; it never stops the server.
-    pub fn run_motion(&self, sim: &mut Simulation) -> Result<(), String> {
+    /// Returns the creatures its kills removed, for the caller to announce.
+    pub fn run_motion(&self, sim: &mut Simulation) -> Result<CreatureRoster, String> {
         let started = std::time::Instant::now();
         let result = self.run_motion_inner(sim);
         let elapsed = started.elapsed();
@@ -185,7 +202,7 @@ impl CreatureService {
         result
     }
 
-    fn run_motion_inner(&self, sim: &mut Simulation) -> Result<(), String> {
+    fn run_motion_inner(&self, sim: &mut Simulation) -> Result<CreatureRoster, String> {
         let tick = sim.current_tick().get();
         let actions = self
             .director
@@ -193,8 +210,13 @@ impl CreatureService {
             .map_err(|_| "creature director panicked earlier".to_string())?
             .motion(tick, sim);
         let mut outcomes = Vec::with_capacity(actions.len());
+        let mut roster = CreatureRoster::default();
         for action in actions {
             let creature_id = action.creature_id();
+            // A creature killed earlier in this batch does nothing more.
+            if roster.despawned.contains(&creature_id) {
+                continue;
+            }
             let result = match action {
                 CreatureAction::Fly(request) => {
                     sim.move_creature(request).map(CreatureActionOutcome::Fly)
@@ -205,11 +227,28 @@ impl CreatureService {
                 CreatureAction::Graze { column, .. } => Ok(CreatureActionOutcome::Grazed(
                     sim.graze_cover(column[0], column[1]),
                 )),
+                CreatureAction::Kill { prey, .. } => sim
+                    .kill_creature_by(creature_id, prey)
+                    .map(|kill| {
+                        tracing::info!(
+                            creature = creature_id,
+                            prey,
+                            species = %kill.record.species,
+                            carcass_cells = kill.carcass.len(),
+                            "creature killed by a creature"
+                        );
+                        roster.despawned.push(prey);
+                        CreatureActionOutcome::Killed(kill)
+                    })
+                    .map_err(|error| error.to_string()),
+                CreatureAction::EditCell { cell, place, .. } => sim
+                    .creature_edit_cell(creature_id, cell, place)
+                    .map(CreatureActionOutcome::CellEdited),
             };
             match result {
                 Ok(outcome) => outcomes.push((creature_id, outcome)),
                 Err(error) => {
-                    tracing::warn!(creature = creature_id, %error, "creature move rejected");
+                    tracing::warn!(creature = creature_id, %error, "creature action rejected");
                 }
             }
         }
@@ -220,7 +259,7 @@ impl CreatureService {
         for (creature_id, outcome) in outcomes {
             director.on_action_outcome(creature_id, outcome);
         }
-        Ok(())
+        Ok(roster)
     }
 
     /// Tells the director the world was replaced.

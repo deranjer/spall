@@ -169,3 +169,41 @@ fn killing_needs_a_hosted_creature() {
     sim.kill_creature(1, None, actor).unwrap();
     assert!(sim.kill_creature(1, None, actor).is_err());
 }
+
+/// ENG-238: one creature kills another, then clears and fills single terrain
+/// cells through committed server edits.
+#[test]
+fn a_creature_kills_another_and_edits_single_cells() {
+    let mut sim = sim_with_creature();
+    sim.spawn_creatures(vec![CreatureRecord {
+        creature_id: 2,
+        species: "slab".into(),
+        translation_m: [4.5, 1.5, 4.5],
+        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        locomotion_tag: 0,
+        clip_phase_tick: 0,
+    }])
+    .unwrap();
+    assert!(sim.kill_creature_by(1, 1).is_err(), "not itself");
+    assert!(sim.kill_creature_by(3, 1).is_err(), "an unknown killer");
+    let kill = sim.kill_creature_by(2, 1).unwrap();
+    assert_eq!(sim.creature_records().len(), 1, "the prey is gone");
+    run_until_idle(&mut sim);
+    let (cell, material) = kill.carcass[0];
+    assert!(filled(&sim, cell));
+
+    // Clearing a solid cell queues a cut; clearing it again is a no-op.
+    assert_eq!(sim.creature_edit_cell(2, cell, None), Ok(true));
+    run_until_idle(&mut sim);
+    assert!(!filled(&sim, cell), "the bitten cell is gone");
+    assert_eq!(sim.creature_edit_cell(2, cell, None), Ok(false));
+
+    // Filling an empty cell places; filling a solid one changes nothing.
+    assert_eq!(sim.creature_edit_cell(2, cell, Some(material)), Ok(true));
+    run_until_idle(&mut sim);
+    assert!(filled(&sim, cell), "the placed cell is there");
+    assert_eq!(sim.creature_edit_cell(2, cell, Some(material)), Ok(false));
+
+    // Only a hosted creature edits.
+    assert!(sim.creature_edit_cell(1, cell, None).is_err());
+}

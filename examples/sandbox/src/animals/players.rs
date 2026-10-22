@@ -27,14 +27,16 @@ pub(super) struct Threat {
     pub(super) sprinting: bool,
 }
 
-/// Every player's position and whether it is sprinting.
-pub(super) fn threat_sources(sim: &Simulation) -> Vec<([f64; 3], bool)> {
+/// Every player's position and whether it is sprinting, then every bear's
+/// that is not stalking (a charging bear counts as sprinting).
+pub(super) fn threat_sources(dir: &AnimalDirector, sim: &Simulation) -> Vec<([f64; 3], bool)> {
     sim.world()
         .players()
         .map(|player| {
             let [vx, _, vz] = player.state.velocity_m_s;
             (player.state.position_m, vx.hypot(vz) > SPRINT_M_S)
         })
+        .chain(super::bears::threats(dir))
         .collect()
 }
 

@@ -108,6 +108,14 @@ At night (sun below the horizon) a resting or wandering deer lies down with its
 sunset and sunrise by up to one in-game hour. While asleep it ignores players
 beyond 10 m (20 m sprinting); closer, it wakes and flees as usual.
 
+Bears hunt. A hungry bear stalks a deer it notices within 40 m (0.7 m/s, unseen
+by deer), charges from 14 m at 10 m/s for up to 5 s, and kills on contact; the
+despawn reaches every client like a hammer kill. It then eats the carcass top
+down, one terrain cell every 0.5 s through single-cell server edits
+(`CreatureAction::EditCell`), until it is gone or after 48 bites, and is hungry
+again 4 minutes later. Deer flee a bear that is not stalking; a charging bear
+counts as sprinting.
+
 An animal can die. A hammer (cutting tool) strike that meets an animal's posed
 voxels before any terrain kills it with one blow: the server despawns it, and
 its voxels, at 0.25 m terrain cells dropped onto the ground below, are written
@@ -118,7 +126,7 @@ The model, what it replaced, and the planned hunting design are in
 [animal lifecycle](animal-lifecycle.md). Habitat, species and spawn rules are
 game content in `examples/sandbox`.
 
-Planned, not built: health and damage, drops, bears eating carcasses,
+Planned, not built: health and damage, drops,
 finer-than-terrain carcasses, roosting crows,
 swimming and flight physics beyond the capsule, saving animals, and the
 population/performance measurements a populated world needs.
