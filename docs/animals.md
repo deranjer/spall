@@ -76,8 +76,7 @@ world voxels, so they cannot be cut apart voxel by voxel and are not saved with
 the world. The server moves deer and crows with a capsule swept against terrain;
 clients receive spawn, despawn and motion records. Players and bodies pass
 through them. `--animals N` spawns N deer, N/2 crows and N/8 (rounded up) each
-of grizzly bears and snow leopards in a worldgen sandbox; trout need live
-column-water placement and are not spawned yet. Each walking species has its
+of grizzly bears and snow leopards, and N/4 trout, in a worldgen sandbox. Each walking species has its
 own pace and foot capsule, sized to fit inside its body; placement envelopes and
 foot height are measured from the asset's idle and walk poses.
 
@@ -97,6 +96,18 @@ circle. Snow leopards spawn only on ground 8 m above their spawn anchor or on
 steep ground, and wander no more than 6 m below where they were born; a world
 with no high ground near the anchors has none.
 
+Trout are born only where the live column water is deep enough for the whole
+body (with 0.25 m below it), within six times the land spawn ring, and wander
+inside the water at 0.6 m/s (`swim` clip); every step is checked to stay
+underwater. A trout whose water drains sinks straight to the bed and lies still
+until the water returns. A world with no deep water near the anchor has no
+trout, and the other species keep their placement attempts.
+
+At night (sun below the horizon) a resting or wandering deer lies down with its
+`sleep` clip and stays put until morning; each deer's bedtime and waking trail
+sunset and sunrise by up to one in-game hour. While asleep it ignores players
+beyond 10 m (20 m sprinting); closer, it wakes and flees as usual.
+
 An animal can die. A hammer (cutting tool) strike that meets an animal's posed
 voxels before any terrain kills it with one blow: the server despawns it, and
 its voxels, at 0.25 m terrain cells dropped onto the ground below, are written
@@ -108,6 +119,6 @@ The model, what it replaced, and the planned hunting design are in
 game content in `examples/sandbox`.
 
 Planned, not built: health and damage, drops, bears eating carcasses,
-finer-than-terrain carcasses, night behaviour (sleeping deer, roosting crows),
+finer-than-terrain carcasses, roosting crows,
 swimming and flight physics beyond the capsule, saving animals, and the
 population/performance measurements a populated world needs.

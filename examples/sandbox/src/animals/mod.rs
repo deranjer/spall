@@ -746,8 +746,9 @@ impl CreatureDirector for AnimalDirector {
             walker.yaw = yaw;
             self.walkers.insert(id, walker);
             // A creature that just stopped sends one stationary pose so clients
-            // switch back to idle; a resting one sends nothing.
-            if tag == LOCOMOTION_IDLE && was == LOCOMOTION_IDLE {
+            // switch back to idle; a resting one sends nothing, and neither does
+            // a sleeper after lying down (clients run its clip on their own).
+            if tag == was && (tag == LOCOMOTION_IDLE || tag == LOCOMOTION_SLEEP) {
                 continue;
             }
             let phase = if tag == LOCOMOTION_IDLE {
@@ -823,6 +824,9 @@ mod tests {
             }
             if species.grazes {
                 sends.push(LOCOMOTION_GRAZE);
+            }
+            if species.key == "deer" {
+                sends.push(LOCOMOTION_SLEEP);
             }
             if species.perches {
                 sends.extend([
