@@ -68,9 +68,9 @@ pub const fn contact_damage_config() -> spall_sim::ContactDamageConfig {
 }
 
 /// Health one bear swipe removes from a player (ENG-223). Two swipes kill a
-/// player at full [`spall_sim::PLAYER_MAX_HEALTH`]; one never does. The bear
-/// attack applies it through [`spall_sim::Simulation::damage_player`] once
-/// animal behaviour lands (ENG-226).
+/// player at full [`spall_sim::PLAYER_MAX_HEALTH`]; one never does. A bear's
+/// landed swipe applies it through [`spall_sim::Simulation::damage_player`]
+/// (ENG-240).
 pub const BEAR_SWIPE_DAMAGE: u16 = 60;
 
 const _: () = assert!(

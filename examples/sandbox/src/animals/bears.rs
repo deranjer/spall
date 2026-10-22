@@ -11,7 +11,10 @@
 //! Bears do not like being run at. A player who comes close, or sprints at a
 //! bear from further off, makes it rear up and watch; one who keeps coming gets
 //! a short bluff charge and a cuffing swipe, then the bear backs off. A bear
-//! that has just backed off tolerates a walker nearby for a while.
+//! that has just backed off tolerates a walker nearby for a while. Most bluffs
+//! stop out of reach; a player who stays close while the bear rears (or, now
+//! and then, any bluffed player) gets a real charge, and a swipe that lands
+//! hurts through the engine's player damage (ENG-240). Two hits kill.
 //!
 //! A hungry bear with no deer to hunt fishes instead (ENG-239): it walks to
 //! shallow water (or the bank) beside a trout it knows of, waits there, and
@@ -21,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use spall_core::{GlobalCell, MaterialId};
+use spall_core::{EntityId, GlobalCell, MaterialId};
 use spall_server::creature_service::CreatureAction;
 use spall_sim::{CreatureKill, Simulation};
 use spall_voxel::Sample;
@@ -47,9 +50,20 @@ const REAR_TICKS: u64 = 90;
 const BLUFF_M: f64 = 7.0;
 const BLUFF_SPEED_M_S: f64 = 7.0;
 const BLUFF_TICKS: u64 = 120;
-/// The bluff stops this close and cuffs the air in front of the player.
-const CUFF_REACH_M: f64 = 2.2;
+/// A bluff stops this far from the player, out of [`HIT_REACH_M`], and cuffs
+/// the air in front of it.
+const BLUFF_STOP_M: f64 = 3.5;
+/// A player still inside this once the bear has looked gets a real attack.
+const PRESS_M: f64 = 4.0;
+/// Chance any other bluff is a real attack.
+const ATTACK_CHANCE: f64 = 0.15;
+/// A real attack closes to this distance before swiping.
+const ATTACK_STOP_M: f64 = 1.8;
 const CUFF_TICKS: u64 = 45;
+/// The paw lands this long into the swipe, on a player within
+/// [`HIT_REACH_M`] (horizontally, root to feet) at that moment.
+const HIT_AT_TICKS: u64 = 18;
+const HIT_REACH_M: f64 = 2.5;
 /// Backing off, at a walk, away from the player.
 const RETREAT_SPEED_M_S: f64 = 1.8;
 const RETREAT_TICKS: u64 = 60 * 6;
@@ -138,10 +152,12 @@ pub(super) enum BearGait {
     EatFish { until: u64 },
     /// Rear up on the hind legs facing a player who came too close.
     Rear { until: u64 },
-    /// A short charge at that player, stopping short of it.
-    Bluff { until: u64 },
-    /// A swipe at the air in front of the player.
-    Cuff { until: u64 },
+    /// A short charge at that player: a real `attack` closes to swiping
+    /// distance, a bluff stops short of it.
+    Bluff { until: u64, attack: bool },
+    /// A swipe in front of the player; the paw lands at `hit_at` (then
+    /// `None`), hurting a player still in reach.
+    Cuff { until: u64, hit_at: Option<u64> },
     /// Walk away from the player.
     Retreat { until: u64 },
 }
@@ -229,7 +245,7 @@ pub(super) fn step(
 ) -> Step {
     let tick = cx.tick;
     let player = nearest_player(cx.sim, cx.here);
-    if let Some((_, distance, sprinting)) = player {
+    if let Some((_, distance, sprinting, _)) = player {
         let tolerant = dir
             .bears
             .get(&cx.id)
@@ -255,7 +271,7 @@ pub(super) fn step(
             });
         }
     }
-    if let Some(step) = react(dir, walker, cx, player) {
+    if let Some(step) = react(dir, walker, cx, player, actions) {
         return step;
     }
     let calm = match walker.gait {
@@ -342,25 +358,29 @@ pub(super) fn step(
     }
 }
 
-/// The nearest player to `here`: position, horizontal distance, sprinting.
-fn nearest_player(sim: &Simulation, here: [f64; 3]) -> Option<([f64; 3], f64, bool)> {
+/// The nearest player to `here`: feet, horizontal distance, sprinting, id.
+type NearPlayer = ([f64; 3], f64, bool, EntityId);
+
+fn nearest_player(sim: &Simulation, here: [f64; 3]) -> Option<NearPlayer> {
     sim.world()
         .players()
         .map(|player| {
             let at = player.state.position_m;
             let [vx, _, vz] = player.state.velocity_m_s;
-            (at, horizontal(here, at), vx.hypot(vz) > SPRINT_M_S)
+            let sprinting = vx.hypot(vz) > SPRINT_M_S;
+            (at, horizontal(here, at), sprinting, player.entity)
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
 }
 
-/// The bear's reaction to a player, while it is reacting: rear, bluff, cuff,
-/// back off. `None` once it is doing anything else.
+/// The bear's reaction to a player, while it is reacting: rear, bluff (or
+/// attack), cuff, back off. `None` once it is doing anything else.
 fn react(
     dir: &mut AnimalDirector,
     walker: &mut Walker,
     cx: &Cx,
-    player: Option<([f64; 3], f64, bool)>,
+    player: Option<NearPlayer>,
+    actions: &mut Vec<CreatureAction>,
 ) -> Option<Step> {
     let tick = cx.tick;
     let Gait::Bear(gait) = walker.gait else {
@@ -375,11 +395,13 @@ fn react(
         BearGait::Rear { until } => {
             if tick >= until {
                 match player {
-                    Some((_, distance, sprinting))
+                    Some((_, distance, sprinting, _))
                         if distance < BLUFF_M || (sprinting && distance < WARY_M) =>
                     {
+                        let attack = distance < PRESS_M || dir.unit() < ATTACK_CHANCE;
                         walker.gait = Gait::Bear(BearGait::Bluff {
                             until: tick + BLUFF_TICKS,
+                            attack,
                         });
                     }
                     _ => retreat(walker),
@@ -392,26 +414,46 @@ fn react(
             step.tag = LOCOMOTION_REAR;
             step
         }
-        BearGait::Bluff { until } => match player {
-            Some((at, distance, _)) if distance > CUFF_REACH_M && tick < until => toward(
-                walker,
-                cx.here,
-                at,
-                BLUFF_SPEED_M_S,
-                1.2,
-                CUFF_REACH_M,
-                LOCOMOTION_RUN,
-            ),
-            _ => {
-                walker.gait = Gait::Bear(BearGait::Cuff {
-                    until: tick + CUFF_TICKS,
-                });
-                let mut step = Step::still(walker, cx.here);
-                step.tag = LOCOMOTION_POUNCE;
-                step
+        BearGait::Bluff { until, attack } => {
+            let stop = if attack { ATTACK_STOP_M } else { BLUFF_STOP_M };
+            match player {
+                Some((at, distance, ..)) if distance > stop && tick < until => toward(
+                    walker,
+                    cx.here,
+                    at,
+                    BLUFF_SPEED_M_S,
+                    1.2,
+                    stop,
+                    LOCOMOTION_RUN,
+                ),
+                _ => {
+                    walker.gait = Gait::Bear(BearGait::Cuff {
+                        until: tick + CUFF_TICKS,
+                        hit_at: Some(tick + HIT_AT_TICKS),
+                    });
+                    let mut step = Step::still(walker, cx.here);
+                    step.tag = LOCOMOTION_POUNCE;
+                    step
+                }
             }
-        },
-        BearGait::Cuff { until } => {
+        }
+        BearGait::Cuff { until, hit_at } => {
+            if hit_at.is_some_and(|at| tick >= at) {
+                walker.gait = Gait::Bear(BearGait::Cuff {
+                    until,
+                    hit_at: None,
+                });
+                if let Some((at, distance, _, entity)) = player
+                    && distance <= HIT_REACH_M
+                    && (at[1] - cx.here[1]).abs() < 2.0
+                {
+                    actions.push(CreatureAction::HitPlayer {
+                        creature_id: cx.id,
+                        player: entity,
+                        damage: crate::game::BEAR_SWIPE_DAMAGE,
+                    });
+                }
+            }
             if tick >= until {
                 retreat(walker);
             }

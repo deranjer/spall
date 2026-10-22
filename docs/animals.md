@@ -126,9 +126,16 @@ counts as sprinting.
 
 Bears do not like being run at. A player within 10 m, or one sprinting inside
 22 m, makes a bear rear up (`stand` clip) and watch; if the player is still
-within 7 m (or sprinting inside 10 m) it bluff-charges to 2.2 m, cuffs the air
-(`swipe`) and backs off at a walk for 6 s, after which only a player inside 4 m
-bothers it for 15 s. It does not hurt players yet (player health, ENG-223). A
+within 7 m (or sprinting inside 10 m) it bluff-charges, swipes (`swipe`) and
+backs off at a walk for 6 s, after which only a player inside 4 m bothers it
+for 15 s. Most charges are bluffs that stop 3.5 m short and cuff the air. A
+player still inside 4 m when the bear finishes rearing, or one bluffed player
+in about seven by a seeded roll (15 %), gets a real charge that closes to
+1.8 m (ENG-240). Either way, the paw lands 0.3 s into the swipe on a player
+within 2.5 m of the bear's root, so stepping into a bluff gets you hit too. A
+hit removes `BEAR_SWIPE_DAMAGE` (60 of 100) through `Simulation::damage_player`;
+two kill, and the player respawns at their spawn with full health. The server
+refuses a creature hit on a player more than 3 m from the creature's root. A
 bear chased off a carcass goes back to it. Bears are about 2.75 m long and
 1.3 m at the hump.
 
