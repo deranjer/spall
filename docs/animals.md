@@ -124,6 +124,13 @@ down, one terrain cell every 0.5 s through single-cell server edits
 again 4 minutes later. Deer flee a bear that is not stalking; a charging bear
 counts as sprinting.
 
+A hungry bear with no deer in notice fishes: it walks into water at most 0.8 m
+deep (or stops on the bank) beside a trout within 40 m, waits, and swipes
+(`swipe` clip) at a trout within 1.5 m of its paw, catching it half the time. A
+caught trout simply despawns on every client, with no carcass; the bear eats it
+for 5 s (`eat`) and is hungry again 90 s later. Hovering trout swim away from a
+bear standing in the water within 2 m.
+
 An animal can die. A hammer (cutting tool) strike that meets an animal's posed
 voxels before any terrain kills it with one blow: the server despawns it, and
 its voxels, at 0.25 m terrain cells dropped onto the ground below, are written
