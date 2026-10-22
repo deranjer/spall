@@ -264,24 +264,23 @@ biome audio. Range is roughly how far away the sound should still be audible.
 | Flopping | Stranded on a drained bed | 8 m | [search](https://freesound.org/search/?q=fish+flopping&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
 | Catch splash | A bear catches a trout | 20 m | [search](https://freesound.org/search/?q=big+splash+water&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
 
-### Wolf (ENG-243, awaiting review)
+### Wolf (ENG-243, approved 2026-10-22)
 
-Specific CC0 files are named where Freesound's CC0 filter turned up real wolves;
-the rest are searches. Recordings marked *dog* or *imitation* are stand-ins, not
-wolves. The howl range is the long one: the server sends creature motion to a
-client within 320 m, so that is as far as a howl can be heard until creature
-replication reaches further.
+The user auditioned the candidates and approved these. Recordings marked *dog*
+are stand-ins for wolves. A howl can be heard only as far as the server sends
+creature motion to a client (320 m). No wolf sound plays yet: the files still
+need downloading and converting, and the client needs positional playback.
 
-| Cue | Trigger | Range | Candidates |
+| Cue | Trigger | Range | Approved |
 | --- | --- | --- | --- |
-| Lone howl | `howl` (the first wolf of a pack howl, at night) | 320 m | [betchkal, wild Alaskan wolf, very clear](https://freesound.org/people/betchkal/sounds/500646/), [taure, single howl with distant echo](https://freesound.org/people/taure/sounds/380156/), [efsdcnveoi](https://freesound.org/people/efsdcnveoi/sounds/427694/), [JoseAgudelo](https://freesound.org/people/JoseAgudelo/sounds/472402/) |
-| Pack chorus | `howl` from the rest of the pack joining in | 320 m | [Paresh, Wolf Haven sanctuary pack](https://freesound.org/people/Paresh/sounds/158780/), [ondrosik, five wolves](https://freesound.org/people/ondrosik/sounds/143568/), [Kingcornz, howling wolves](https://freesound.org/people/Kingcornz/sounds/378334/) |
-| Growl / snarl | Closing in on prey or a player (`run` after encircling) | 25 m | [Christopherderp, beast snarling](https://freesound.org/people/Christopherderp/sounds/342204/), [qubodup, dog growling and snarling](https://freesound.org/people/qubodup/sounds/122183/) *(dog)*, [Ovkovko, wolf growls](https://freesound.org/people/Ovkovko/sounds/826786/) *(imitation)* |
-| Bite snap | `bite` (a kill, or a bite on a player) | 15 m | [qubodup, Malinois growling in play](https://freesound.org/people/qubodup/sounds/823544/) *(dog)*, [search](https://freesound.org/search/?q=dog+bite+snap&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
-| Alarm bark / huff | A wolf backing off from a bear or a fire | 60 m | [exe2be, single bark](https://freesound.org/people/exe2be/sounds/535457/) *(dog)*, [search](https://freesound.org/search/?q=wolf+bark&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
-| Yips and whines | Occasionally while the pack rests together | 30 m | [search](https://freesound.org/search/?q=wolf+whine&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first), [search](https://freesound.org/search/?q=coyote+yip&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
-| Padding steps | `walk`, `stalk` | 10 m | [search](https://freesound.org/search/?q=dog+paws+footsteps&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
-| Running | `run` | 30 m | [search](https://freesound.org/search/?q=dog+running+leaves&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
+| Lone howl | `howl` (the first wolf of a pack howl, at night) | 320 m | [betchkal, wild Alaskan wolf](https://freesound.org/people/betchkal/sounds/500646/) |
+| Pack chorus | `howl` from the rest of the pack joining in | 320 m | [Paresh, Wolf Haven sanctuary pack](https://freesound.org/people/Paresh/sounds/158780/), [Kingcornz, howling wolves](https://freesound.org/people/Kingcornz/sounds/378334/) |
+| Growl / snarl | Closing in on prey or a player (`run` after encircling) | 25 m | [qubodup, dog growling and snarling](https://freesound.org/people/qubodup/sounds/122183/) *(dog)* |
+| Bite snap | `bite` (a kill, or a bite on a player) | 15 m | [qubodup, Malinois growling in play](https://freesound.org/people/qubodup/sounds/823544/) *(dog)* |
+| Alarm bark | A wolf backing off from a bear or a fire | 60 m | [exe2be, single bark](https://freesound.org/people/exe2be/sounds/535457/) *(dog)*, [Mrthenoronha, dogs barking](https://freesound.org/people/Mrthenoronha/sounds/420451/) *(dog)* |
+| Yips | Occasionally while the pack rests together | 30 m | [buzzatsea](https://freesound.org/people/buzzatsea/sounds/711262/) |
+| Padding steps | `walk`, `stalk` | 10 m | [melle_teich, dry leaves](https://freesound.org/people/melle_teich/sounds/628400/) (best found so far) |
+| Running | `run` | 30 m | None chosen yet |
 | Tearing and chewing meat | `eat` on a carcass | 15 m | Same pick as the bear's |
 
 ### Shared
