@@ -40,14 +40,31 @@ rightmost. The icons are `crates/spall_client/assets/hud/*.png`, drawn by
 When survival stats become server-authoritative, they replace these inputs; the
 grade mapping stays.
 
+## Built: the pack (Tab)
+
+`Tab` kneels and unrolls a canvas tarp on the ground in front of the player,
+weighted with stones at the corners, and lays the inventory out on it. Each stack
+shows up to four copies of the item's model with a small label ("Log ×12") over
+it; the stack under the cursor lifts and its label brightens. `Tab` or `Esc` rolls
+it back up, and walking or jumping gets up and goes. The world keeps running.
+
+- **Client-side only.** The tarp and items are overlay cubes, like the animals; the
+  server keeps the inventory as stable item IDs. While the pack is open the client
+  asks for it (`ProgressionRequest::InspectInventory`) every 1.5 s, so harvests show
+  up without reopening.
+- **Game-owned look.** `spall_client::window::PackView` gives names and cube models
+  per item ID, and the tarp, twine and stone materials. The sandbox's
+  `SandboxPackView` draws logs, planks, stone chunks and stone blocks from manifest
+  materials. Up to 12 stacks fit (4 by 3); more show a "+N more" note.
+- **Not yet:** crafting on the cloth, moving items, belt slots, sounds, and a tarp
+  that follows uneven ground (it lies flat at the player's feet height).
+
 ## Planned
 
 - **Sounds** for the body states and inventory (list below). None is integrated yet.
 - **Belt:** 4 to 6 worn quick slots, visible on the player body, switched without a menu.
-- **Pack:** kneel and unroll a tarp on the ground in front of you, with items as
-  their real voxel models. Crafting happens on a cloth; the world never pauses, and
-  other players see you kneeling. The tarp and items are client-side render only:
-  the server keeps the inventory as a list of stable item IDs.
+- **Pack crafting:** craft on the cloth from the laid-out items; other players see
+  you kneeling.
 - **Camp storage:** racks, woodpiles and shelves as destructible world geometry.
 - **Wrist cord and journal:** the day count and exact readouts for players who want
   numbers.

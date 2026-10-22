@@ -470,6 +470,35 @@ pub(super) fn draw_body_reminders(
     });
 }
 
+/// Item names over the open pack: small dark tags centred over each stack,
+/// brighter and larger for the one under the cursor.
+pub(super) fn draw_pack_labels(labels: &[PackLabelView]) {
+    for label in labels {
+        let size = if label.hovered { 15.0 } else { 13.0 };
+        // Centre the tag on its point; text width is estimated, not measured.
+        let width = label.text.chars().count() as f32 * size * 0.55 + 16.0;
+        yakui::align(yakui::Alignment::TOP_LEFT, || {
+            yakui::offset(
+                yakui::Vec2::new(label.at[0] - width * 0.5, label.at[1] - size - 6.0),
+                || {
+                    let alpha = if label.hovered { 0.8 } else { 0.45 };
+                    yakui::colored_box_container(PANEL_BG.with_alpha(alpha), || {
+                        yakui::pad(yakui::widgets::Pad::balanced(8.0, 3.0), || {
+                            let mut text = yakui::widgets::Text::new(size, label.text.clone());
+                            text.style.color = if label.hovered {
+                                yakui::Color::rgb(255, 244, 220)
+                            } else {
+                                yakui::Color::rgb(225, 214, 190)
+                            };
+                            text.show();
+                        });
+                    });
+                },
+            );
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

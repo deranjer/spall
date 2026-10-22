@@ -784,6 +784,9 @@ fn run_interactive(args: Args) -> ExitCode {
             creature_view: Some(std::sync::Arc::new(
                 sandbox::animal_view::AnimalView::new().expect("authored animal assets build"),
             )),
+            pack_view: Some(std::sync::Arc::new(
+                sandbox::pack_view::SandboxPackView::new(),
+            )),
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,

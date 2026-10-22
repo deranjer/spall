@@ -13,6 +13,12 @@ pub(super) struct InteractiveApp {
     ambience: Option<AmbienceAudio>,
     pub(super) biome_audio: BiomeAudioConfig,
     pub(super) creature_view: Option<std::sync::Arc<dyn CreatureView>>,
+    pub(super) pack_view: Option<std::sync::Arc<dyn PackView>>,
+    /// The pack (Tab): open, kneeling, or rolling up.
+    pub(super) pack: Pack,
+    pub(super) pack_frame_at: Option<Instant>,
+    /// The cursor, physical pixels, for hovering items in the open pack.
+    pub(super) cursor_px: Option<[f32; 2]>,
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
@@ -222,6 +228,10 @@ impl InteractiveApp {
             ambience,
             biome_audio: options.biome_audio,
             creature_view: options.creature_view,
+            pack_view: options.pack_view,
+            pack: Pack::new(),
+            pack_frame_at: None,
+            cursor_px: None,
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
@@ -930,6 +940,31 @@ impl InteractiveApp {
         self.hammer_pending = false;
         self.torch_pending = false;
         self.held.clear_on_focus_loss(&self.session.input);
+    }
+
+    /// Tab: kneel and unroll the pack where the player stands. Not while
+    /// flying, and only when the game supplied a [`PackView`].
+    pub(super) fn open_pack(&mut self) {
+        if self.pack_view.is_none() || self.fly_eye.is_some() {
+            return;
+        }
+        let Some(view) = *self.session.view.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return;
+        };
+        self.clear_held_actions();
+        // An answer from an earlier opening is stale.
+        *self
+            .session
+            .progression_reply
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.pack.open(view.predicted.position_m, self.yaw);
+        self.set_cursor_locked(false);
+    }
+
+    pub(super) fn close_pack(&mut self) {
+        self.pack.close();
+        self.set_cursor_locked(true);
     }
 
     pub(super) fn set_cursor_locked(&mut self, locked: bool) {

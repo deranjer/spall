@@ -20,6 +20,28 @@ pub struct InteractiveOptions {
     pub biome_audio: BiomeAudioConfig,
     /// Game-owned drawing of replicated creatures as lit cubes each frame.
     pub creature_view: Option<std::sync::Arc<dyn CreatureView>>,
+    /// Game-owned look of the inventory laid out on the pack's tarp (Tab).
+    /// `None` leaves Tab unbound.
+    pub pack_view: Option<std::sync::Arc<dyn PackView>>,
+}
+
+/// What the game's items look like laid out on the pack's tarp. The engine
+/// owns opening the pack, the kneel, the layout and fetching the inventory;
+/// the game owns item names and models.
+pub trait PackView: Send + Sync + std::fmt::Debug {
+    /// The game's recipe catalogue version, sent with inventory requests.
+    fn catalog_version(&self) -> u32;
+    /// Display name for a stable item ID; `None` for an item this build
+    /// does not know (it is still laid out, as a plain crate).
+    fn item_name(&self, item_id: u16) -> Option<&str>;
+    /// The item's cubes in item-local metres: `+X` to the player's right,
+    /// `-Z` away from them, resting on `y = 0` and centred on X and Z.
+    /// Empty for an unknown item.
+    fn item_model(&self, item_id: u16) -> &[CubeInstance];
+    /// Material of the tarp the items lie on.
+    fn tarp_material(&self) -> u32;
+    /// Material of the twine and the stones pinning the tarp's corners.
+    fn trim_materials(&self) -> [u32; 2];
 }
 
 /// Turns replicated creature ownership records into cubes to draw this frame.

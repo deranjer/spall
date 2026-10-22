@@ -2378,6 +2378,12 @@ async fn run_async(
                         }
                     }
                     Ok(Some(WireRecord::ProgressionResponse(response))) => {
+                        if let Some(session) = &interactive {
+                            *session
+                                .progression_reply
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(response.clone());
+                        }
                         progression_responses
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -3410,6 +3416,17 @@ async fn run_async(
                                 admin_conn.send_record(WireRecord::AdminRequest(request)).await
                             {
                                 eprintln!("spall-client: admin request could not be sent: {error}");
+                            }
+                        }
+                        let progression: Vec<_> = interactive
+                            .as_ref()
+                            .map(|s| std::mem::take(&mut *s.progression_queue.lock().unwrap_or_else(|e| e.into_inner())))
+                            .unwrap_or_default();
+                        for request in progression {
+                            if let Err(error) =
+                                admin_conn.send_record(WireRecord::ProgressionRequest(request)).await
+                            {
+                                eprintln!("spall-client: progression request could not be sent: {error}");
                             }
                         }
                         // Tool uses from the window (the hammer) go out on the

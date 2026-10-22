@@ -15,6 +15,8 @@ pub mod editor_scene;
 /// Minimal game content (material catalog, player tools) that turns tool use
 /// into engine [`spall_sim::EditIntent`]s. The engine never imports this.
 pub mod game;
+#[cfg(feature = "client")]
+pub mod pack_view;
 pub mod progression_store;
 pub mod worldgen_scene;
 

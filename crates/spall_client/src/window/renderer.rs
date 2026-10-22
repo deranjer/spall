@@ -60,6 +60,8 @@ pub(crate) struct WorldRenderer {
     body_icons: [yakui::ManagedTextureId; 6],
     /// Each reminder icon's opacity this frame (`body_state::reminders`).
     pub(super) body_reminders: [(BodyCue, f32); 6],
+    /// Item labels over the open pack, already on screen.
+    pub(super) pack_labels: Vec<PackLabelView>,
     yakui_winit: YakuiWinit,
     yakui_wgpu: YakuiWgpu,
     yakui_buffers: yakui_wgpu::Buffers,
@@ -405,6 +407,7 @@ impl WorldRenderer {
             yakui_wgpu,
             body_icons,
             body_reminders: BodyCue::ALL.map(|cue| (cue, 0.0)),
+            pack_labels: Vec::new(),
             yakui_buffers,
             hud_gpu_timer,
             screenshot_request: None,
@@ -553,6 +556,36 @@ impl WorldRenderer {
                 "scene GPU timing unavailable | greedy {terrain_chunks} terrain chunks / {terrain_triangles} tris + {body_meshes} body meshes / {body_triangles} tris + {overlay} debug cubes ({memory:.1} MiB)"
             ),
         }
+    }
+
+    /// Logical pixels per physical pixel's inverse: divide a physical cursor
+    /// position by this to get the UI's logical pixels.
+    pub(super) fn ui_scale(&self) -> f32 {
+        self.yakui.scale_factor()
+    }
+
+    /// Where `world` lands on screen, in logical pixels from the top left,
+    /// for the game camera at `eye` looking along `look`; `None` behind it.
+    pub(super) fn screen_point(&self, eye: Vec3, look: Vec3, world: Vec3) -> Option<[f32; 2]> {
+        let mut camera = Camera::looking_along(
+            eye,
+            look,
+            CAMERA_FOV_Y_DEG.to_radians(),
+            self.aspect.max(1e-4),
+        );
+        camera.z_near = CAMERA_Z_NEAR_M;
+        camera.z_far = CAMERA_Z_FAR_M;
+        let clip = camera.view_projection() * world.extend(1.0);
+        if clip.w <= CAMERA_Z_NEAR_M {
+            return None;
+        }
+        let scale = self.yakui.scale_factor();
+        let width = self.surface_config.width as f32 / scale;
+        let height = self.surface_config.height as f32 / scale;
+        Some([
+            (clip.x / clip.w * 0.5 + 0.5) * width,
+            (0.5 - clip.y / clip.w * 0.5) * height,
+        ])
     }
 
     pub(crate) fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
@@ -961,6 +994,7 @@ impl WorldRenderer {
             draw_crosshair(crosshair);
         }
         draw_body_reminders(&self.body_icons, &self.body_reminders);
+        draw_pack_labels(&self.pack_labels);
         self.yakui.finish();
         if let Some(preset) = selected_environment {
             self.environment = preset.environment();

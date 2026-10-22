@@ -96,7 +96,7 @@ impl ApplicationHandler for InteractiveApp {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if !self.cursor_locked && !ui_consumed => {
+            } if !self.cursor_locked && !ui_consumed && !self.pack.is_open() => {
                 self.set_cursor_locked(true);
             }
             WindowEvent::MouseInput {
@@ -120,6 +120,9 @@ impl ApplicationHandler for InteractiveApp {
                     );
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_px = Some([position.x as f32, position.y as f32]);
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if ui_consumed {
                     return;
@@ -128,6 +131,27 @@ impl ApplicationHandler for InteractiveApp {
                     return;
                 };
                 let held = event.state == ElementState::Pressed;
+                // Tab or Esc rolls the pack up; walking or jumping gets up
+                // and goes.
+                if held
+                    && !event.repeat
+                    && self.pack.is_open()
+                    && matches!(
+                        code,
+                        KeyCode::Tab
+                            | KeyCode::Escape
+                            | KeyCode::KeyW
+                            | KeyCode::KeyA
+                            | KeyCode::KeyS
+                            | KeyCode::KeyD
+                            | KeyCode::Space
+                    )
+                {
+                    self.close_pack();
+                    if matches!(code, KeyCode::Tab | KeyCode::Escape) {
+                        return;
+                    }
+                }
                 match code {
                     KeyCode::KeyW => self.held.forward = held,
                     KeyCode::KeyS => self.held.back = held,
@@ -167,6 +191,10 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     KeyCode::KeyR if held && !event.repeat => {
                         self.recentre_view();
+                        return;
+                    }
+                    KeyCode::Tab if held && !event.repeat => {
+                        self.open_pack();
                         return;
                     }
                     KeyCode::KeyT if held && !event.repeat => {
@@ -232,6 +260,26 @@ impl ApplicationHandler for InteractiveApp {
                 let handler_started = now;
                 self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);
+                let pack_dt = self.pack_frame_at.replace(now).map_or(0.0, |at| {
+                    now.saturating_duration_since(at).as_secs_f32().min(0.1)
+                });
+                self.pack.advance(pack_dt);
+                if let Some(pack_view) = &self.pack_view
+                    && self.pack.is_open()
+                {
+                    let reply = self
+                        .session
+                        .progression_reply
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    if let Some(request) =
+                        self.pack
+                            .sync_inventory(reply, pack_view.catalog_version(), now)
+                    {
+                        self.session.push_progression(request);
+                    }
+                }
 
                 // Drain the background worker's result, if a fresh one has
                 // landed since the last frame (never blocks — `try_recv`).
@@ -326,6 +374,7 @@ impl ApplicationHandler for InteractiveApp {
                 // The cells the hammer would break (last frame's target).
                 if let Some((cell, _)) = self.hammer_target
                     && !self.admin_menu_open
+                    && !self.pack.is_shown()
                 {
                     overlay.extend(hammer_outline(
                         cell,
@@ -419,6 +468,11 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         self.sky_dirty = false;
                     }
+                }
+                if let Some(pack_view) = &self.pack_view
+                    && self.pack.is_shown()
+                {
+                    overlay.extend(self.pack.instances(pack_view.as_ref()));
                 }
                 if let Some(view) = &self.creature_view
                     && let Some(replica) =
@@ -541,9 +595,39 @@ impl ApplicationHandler for InteractiveApp {
                                 }
                                 (*eye, look_dir)
                             } else {
-                                (followed, look_dir)
+                                self.pack.camera(followed, look_dir)
                             }
                         });
+                        renderer.pack_labels = match (&self.pack_view, cam) {
+                            (Some(pack_view), Some((eye, dir))) => {
+                                let projected: Vec<_> = self
+                                    .pack
+                                    .labels(pack_view.as_ref())
+                                    .into_iter()
+                                    .filter_map(|label| {
+                                        renderer
+                                            .screen_point(eye, dir, label.at)
+                                            .map(|at| (label, at))
+                                    })
+                                    .collect();
+                                let scale = renderer.ui_scale();
+                                let anchors: Vec<_> =
+                                    projected.iter().map(|(l, at)| (l.item, *at)).collect();
+                                self.pack.hovered = self.cursor_px.and_then(|[x, y]| {
+                                    hovered_item(&anchors, [x / scale, y / scale])
+                                });
+                                projected
+                                    .into_iter()
+                                    .map(|(label, at)| PackLabelView {
+                                        at,
+                                        hovered: label.item.is_some()
+                                            && label.item == self.pack.hovered,
+                                        text: label.text,
+                                    })
+                                    .collect()
+                            }
+                            _ => Vec::new(),
+                        };
                         self.hammer_target = match cam {
                             Some((eye, dir)) => {
                                 match self.session.replica.get().and_then(|r| r.try_lock().ok()) {
@@ -564,27 +648,30 @@ impl ApplicationHandler for InteractiveApp {
                                 eye,
                             ));
                         }
-                        renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(
-                            || CrosshairView {
-                                in_reach: self.hammer_target.is_some(),
-                                label: match self.hammer_target {
-                                    // A click only captures the mouse until it is.
-                                    _ if !self.cursor_locked => {
-                                        "click to capture the mouse, then click to break".to_owned()
-                                    }
-                                    Some((_, material)) => format!(
+                        renderer.set_crosshair(
+                            (!self.admin_menu_open && !self.pack.is_shown() && cam.is_some()).then(
+                                || CrosshairView {
+                                    in_reach: self.hammer_target.is_some(),
+                                    label: match self.hammer_target {
+                                        // A click only captures the mouse until it is.
+                                        _ if !self.cursor_locked => {
+                                            "click to capture the mouse, then click to break"
+                                                .to_owned()
+                                        }
+                                        Some((_, material)) => format!(
                                             "hammer r{}  {}",
                                             self.hammer_radius,
                                             self.material_names
                                                 .get(&material.0)
                                                 .map_or("?", String::as_str)
                                         ),
-                                    None => {
-                                        format!("hammer r{}  out of reach", self.hammer_radius)
-                                    }
+                                        None => {
+                                            format!("hammer r{}  out of reach", self.hammer_radius)
+                                        }
+                                    },
                                 },
-                            },
-                        ));
+                            ),
+                        );
                         if let Some((eye, dir)) = cam
                             && self.cursor_locked
                             && hammer_due(
