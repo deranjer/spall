@@ -133,6 +133,9 @@ pub(super) struct InteractiveApp {
     pub(super) frame_history: std::collections::VecDeque<f32>,
     /// Swapchain acquire and queue submit time of the same frames (ms).
     pub(super) frame_waits: std::collections::VecDeque<(f32, f32)>,
+    /// Handler time of the same frames minus the swapchain acquire and
+    /// present waits, where vsync blocks (ms): the frame's own CPU work.
+    pub(super) frame_work: std::collections::VecDeque<f32>,
     /// The last line the HUD printed, kept for the debug report.
     pub(super) last_hud_line: String,
     /// What the last "copy debug report" did, shown in the menu for a while.
@@ -334,6 +337,7 @@ impl InteractiveApp {
             pending_mesh_detail_only: Vec::new(),
             frame_history: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
             frame_waits: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
+            frame_work: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
             last_hud_line: String::new(),
             report_status: None,
             copy_report_key: false,

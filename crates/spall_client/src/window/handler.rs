@@ -929,6 +929,15 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 self.frame_waits
                     .push_back((timing.acquire_ms, timing.submit_ms));
+                if self.frame_work.len() >= FRAME_HISTORY {
+                    self.frame_work.pop_front();
+                }
+                self.frame_work.push_back(
+                    (handler_started.elapsed().as_secs_f32() * 1000.0
+                        - timing.acquire_ms
+                        - timing.present_ms)
+                        .max(0.0),
+                );
                 if std::env::var_os("SPALL_FRAME_CSV").is_some() {
                     eprintln!(
                         "spall-frame-csv: {:.1},{:.2},{:.2},{:.2},{}",
@@ -1135,17 +1144,18 @@ impl ApplicationHandler for InteractiveApp {
                         window_stats,
                     );
                     let line = format!("{line} | {}", self.pose_stats.take_report());
-                    // What the frame work alone costs, without the frame limiter's
-                    // wait: the rate this machine could reach uncapped.
-                    let line = if self.frame_history.is_empty() {
-                        line
-                    } else {
-                        let busy = self.frame_history.iter().sum::<f32>()
-                            / self.frame_history.len() as f32;
-                        format!(
-                            "{line} | work {busy:.2} ms/frame = {:.0} fps uncapped potential",
-                            1000.0 / busy.max(0.01)
-                        )
+                    // Headroom right after the fps, so it shows in the title.
+                    let gpu_ms = self
+                        .renderer
+                        .as_ref()
+                        .and_then(|r| r.scene.pass_timings())
+                        .map(|t| t.total_ms());
+                    let line = match (headroom(&self.frame_work, gpu_ms), line.split_once(" | ")) {
+                        (Some(headroom), Some((fps, rest))) => {
+                            format!("{fps} | {headroom} | {rest}")
+                        }
+                        (Some(headroom), None) => format!("{line} | {headroom}"),
+                        (None, _) => line,
                     };
                     let line = match view {
                         Some(v) => format!(
