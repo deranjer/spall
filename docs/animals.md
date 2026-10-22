@@ -237,5 +237,20 @@ biome audio. Range is roughly how far away the sound should still be audible.
 | Body fall | Carcass lands | 20 m | [search](https://freesound.org/search/?q=body+fall+ground&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
 | Cutting a carcass | Player or bear removes carcass cells | 10 m | [search](https://freesound.org/search/?q=flesh+tear&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
 
-The biome beds already carry distant bird song (chiffchaff, pipit,
-temperate forest); those stay ambience and are not tied to crows.
+### Ambient birdsong (to vary the biome beds)
+
+The meadow pipit, alpine chiffchaff and temperate forest beds now play only in
+short bursts (more often near a crow). A pool of different songs, picked at
+random per burst, would stop one bird repeating. Specific CC0 candidates
+(Freesound's CC0 filter; not yet auditioned):
+
+| Bird | Candidates |
+| --- | --- |
+| Blackbird | [solo, good quality](https://freesound.org/people/Sacha.Julien/sounds/725332/), [isolated](https://freesound.org/people/richwise/sounds/811988/), [252](https://freesound.org/people/nigelcoop/sounds/116791/) |
+| Robin | [Madeira forest](https://freesound.org/people/Sacha.Julien/sounds/725201/), [good quality](https://freesound.org/people/Sacha.Julien/sounds/725331/), [European robin](https://freesound.org/people/TheKingOfGeeks360/sounds/855901/) |
+| Song thrush | [richwise 795708](https://freesound.org/people/richwise/sounds/795708/), [richwise 785669](https://freesound.org/people/richwise/sounds/785669/) |
+| Blackcap | [short and good](https://freesound.org/people/Sacha.Julien/sounds/725333/) |
+| Thrush nightingale | [01](https://freesound.org/people/LilMati/sounds/365658/), [04](https://freesound.org/people/LilMati/sounds/365668/) |
+| Starling | [common starling](https://freesound.org/people/Vrymaa/sounds/737756/) |
+| Single bird, quiet forest | [HECKFRICKER](https://freesound.org/people/HECKFRICKER/sounds/730301/) |
+| Swift | [chimney swift, single](https://freesound.org/people/TheKingOfGeeks360/sounds/856266/) |
