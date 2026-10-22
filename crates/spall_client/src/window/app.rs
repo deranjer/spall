@@ -527,14 +527,9 @@ impl InteractiveApp {
         if !due && self.nature_preview.is_none() {
             return;
         }
-        let birdsong = if self
-            .birdsong_gate
-            .singing(Instant::now(), crate::audio::bird_near(self.nearest_bird_m))
-        {
-            crate::audio::birdsong_level(self.nearest_bird_m)
-        } else {
-            0.0
-        };
+        let bird_near = crate::audio::bird_near(self.nearest_bird_m);
+        let singing = self.birdsong_gate.singing(Instant::now(), bird_near);
+        let birdsong_level = crate::audio::birdsong_level(self.nearest_bird_m);
         let mix: Vec<(PathBuf, f32)> = if let Some(index) = self.nature_preview {
             self.biome_audio
                 .tracks
@@ -548,13 +543,20 @@ impl InteractiveApp {
                 .and_then(|position| {
                     let field = self.ambience_field.as_ref()?;
                     let grid = self.ambience_grid.as_ref()?;
-                    Some(crate::audio::ambience_mix(
+                    let mix = crate::audio::ambience_mix(
                         weather_duck,
-                        birdsong,
                         field,
                         grid,
                         position,
                         &self.biome_audio,
+                    );
+                    Some(crate::audio::with_birdsong(
+                        mix,
+                        &self.biome_audio,
+                        &self.birdsong_gate,
+                        singing,
+                        birdsong_level,
+                        if bird_near { weather_duck } else { 0.0 },
                     ))
                 })
                 .unwrap_or_default()

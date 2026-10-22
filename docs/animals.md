@@ -239,9 +239,13 @@ biome audio. Range is roughly how far away the sound should still be audible.
 
 ### Ambient birdsong (to vary the biome beds)
 
-The meadow pipit, alpine chiffchaff and temperate forest beds now play only in
-short bursts (more often near a crow). A pool of different songs, picked at
-random per burst, would stop one bird repeating. Specific CC0 candidates
+Birdsong plays only in short bursts (3-8 s, every 40-120 s, or every 4-15 s
+with a crow within 60 m), where a birdsong biome (meadow, alpine, temperate
+forest) is in earshot or a crow is near. Each burst picks at random between the
+biome's own track and a pool in `assets/audio/birds/`: blackbird (isolated),
+robin (Madeira forest, first 2:25) and blackcap (first 56 s), all CC0 and
+credited in `CREDITS.md`. A recording keeps playing silently between bursts, so
+the next burst resumes on a different phrase. Further CC0 candidates
 (Freesound's CC0 filter; not yet auditioned):
 
 | Bird | Candidates |

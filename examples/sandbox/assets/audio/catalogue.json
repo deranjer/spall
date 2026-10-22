@@ -44,7 +44,10 @@
     {"file":"player/breathing-calm.ogg","kind":"player","original":"336532_1738686-hq.mp3","segment":"0-28 s as a 25 s loop","creator":"giddster","license":"CC0 1.0","source":"https://freesound.org/people/giddster/sounds/336532/","default":false},
     {"file":"player/breathing-exerted.ogg","kind":"player","original":"554907_9250976-hq.mp3","segment":"4.7 s loop","creator":"Nox_Sound","license":"CC0 1.0","source":"https://freesound.org/people/Nox_Sound/sounds/554907/","default":false},
     {"file":"player/breathing-exhausted.ogg","kind":"player","original":"319103_4039477-hq.mp3","segment":"21 s loop","creator":"AbuNijmeh","license":"CC0 1.0","source":"https://freesound.org/people/AbuNijmeh/sounds/319103/","default":false},
-    {"file":"player/breathing-accent.ogg","kind":"player","original":"422342_6613494-hq.mp3","segment":"single 2.4 s breath","creator":"BehanSean","license":"CC0 1.0","source":"https://freesound.org/people/BehanSean/sounds/422342/","default":false}
+    {"file":"player/breathing-accent.ogg","kind":"player","original":"422342_6613494-hq.mp3","segment":"single 2.4 s breath","creator":"BehanSean","license":"CC0 1.0","source":"https://freesound.org/people/BehanSean/sounds/422342/","default":false},
+    {"file":"birds/blackbird.ogg","kind":"birdsong","original":"811988_1481531-hq.mp3","segment":"whole preview (59 s)","creator":"richwise","license":"CC0 1.0","source":"https://freesound.org/people/richwise/sounds/811988/","default":false},
+    {"file":"birds/robin.ogg","kind":"birdsong","original":"725201_14889307-hq.mp3","segment":"0-145 s","creator":"Sacha.Julien","license":"CC0 1.0","source":"https://freesound.org/people/Sacha.Julien/sounds/725201/","default":false},
+    {"file":"birds/blackcap.ogg","kind":"birdsong","original":"725333_14889307-hq.mp3","segment":"0-56 s","creator":"Sacha.Julien","license":"CC0 1.0","source":"https://freesound.org/people/Sacha.Julien/sounds/725333/","default":false}
   ],
   "excluded": [
     {"name":"SnowFall.ogg","reason":"User identified it as music and rejected it; do not fetch or use."},
