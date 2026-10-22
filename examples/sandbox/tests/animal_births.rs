@@ -197,36 +197,64 @@ fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
 }
 
 #[test]
-fn bears_and_snow_leopards_spawn_and_walk_on_their_own_capsules() {
-    let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[0, 0, 0, 2, 2], 13)
+/// Bears walk the meadow around their anchor; snow leopards are born on the
+/// mountain beside it (a 10 m plateau with a cliff) and their wandering keeps
+/// them on it, both on their own capsules.
+fn bears_walk_the_lowland_and_snow_leopards_stay_on_the_mountain() {
+    // 32 m x 12 m: lowland (top face 0.5 m) for x < 16 m, plateau (10.25 m) beyond.
+    let mut sim = terrain_simulation(128, 48, 72, 64, 40);
+    let director = AnimalDirector::new(vec![[6.0, 0.5, 6.0]], &[0, 0, 0, 2, 2], 13)
         .unwrap()
-        .with_radius_m(0.0, 3.0);
+        .with_radius_m(0.0, 5.0);
     let service = CreatureService::new(Box::new(director));
     let mut start = std::collections::BTreeMap::new();
-    for tick in 0..1500 {
-        sim.tick().unwrap();
-        service.run_tick(&mut sim).unwrap();
-        service.run_motion(&mut sim).unwrap();
+    let mut leopard_low = Vec::new();
+    for tick in 0..3000 {
+        step(&mut sim, &service);
         if tick == 60 {
-            for alive in sim.creature_poses() {
+            for alive in sim.creature_records() {
                 start.insert(alive.creature_id, alive.translation_m);
             }
         }
+        for leopard in sim.creature_records() {
+            let at = leopard.translation_m;
+            // Within a body length of the cliff counts as on the mountain.
+            if leopard.species == "snow_leopard" && at[0] < 16.0 - 1.5 {
+                leopard_low.push((tick, at));
+            }
+        }
     }
+    let records = sim.creature_records();
     assert_eq!(start.len(), 4, "2 bears and 2 snow leopards alive");
-    let moved: Vec<f64> = sim
-        .creature_poses()
+    for creature in &records {
+        let born = start[&creature.creature_id];
+        if creature.species == "snow_leopard" {
+            assert!(born[1] > 10.0, "a snow leopard was born low: {born:?}");
+        } else {
+            assert!(born[1] < 2.0, "a bear was born on the mountain: {born:?}");
+        }
+    }
+    assert!(
+        leopard_low.is_empty(),
+        "snow leopards left the mountain: {:?}",
+        &leopard_low[..leopard_low.len().min(4)]
+    );
+    let moved: Vec<(String, f64)> = records
         .iter()
         .map(|alive| {
             let from = start[&alive.creature_id];
-            (alive.translation_m[0] - from[0]).hypot(alive.translation_m[2] - from[2])
+            (
+                alive.species.clone(),
+                (alive.translation_m[0] - from[0]).hypot(alive.translation_m[2] - from[2]),
+            )
         })
         .collect();
-    assert!(
-        moved.iter().filter(|d| **d > 0.5).count() >= 2,
-        "bears and leopards barely moved: {moved:?}"
-    );
+    for species in ["bear", "snow_leopard"] {
+        assert!(
+            moved.iter().any(|(s, d)| s == species && *d > 0.5),
+            "{species} barely moved: {moved:?}"
+        );
+    }
 }
 
 #[test]

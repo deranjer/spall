@@ -38,6 +38,9 @@ struct SpeciesDef {
     /// A flyer that sometimes lands, hops and pecks on the ground, walking on
     /// its `capsule_m` there.
     perches: bool,
+    /// Lives on or near mountains: spawns on high or steep ground and wanders
+    /// no lower than a little under where it was born.
+    uplands: bool,
 }
 
 const SPECIES: [SpeciesDef; 5] = [
@@ -52,6 +55,7 @@ const SPECIES: [SpeciesDef; 5] = [
         flee_speed_m_s: Some(7.5),
         grazes: true,
         perches: false,
+        uplands: false,
     },
     SpeciesDef {
         key: "crow",
@@ -65,6 +69,7 @@ const SPECIES: [SpeciesDef; 5] = [
         flee_speed_m_s: None,
         grazes: false,
         perches: true,
+        uplands: false,
     },
     SpeciesDef {
         key: "trout",
@@ -76,6 +81,7 @@ const SPECIES: [SpeciesDef; 5] = [
         flee_speed_m_s: None,
         grazes: false,
         perches: false,
+        uplands: false,
     },
     SpeciesDef {
         key: "bear",
@@ -87,6 +93,7 @@ const SPECIES: [SpeciesDef; 5] = [
         flee_speed_m_s: None,
         grazes: false,
         perches: false,
+        uplands: false,
     },
     SpeciesDef {
         key: "snow_leopard",
@@ -98,6 +105,7 @@ const SPECIES: [SpeciesDef; 5] = [
         flee_speed_m_s: None,
         grazes: false,
         perches: false,
+        uplands: true,
     },
 ];
 /// Gap kept between an animal's lowest cell and the terrain it stands on.
@@ -138,6 +146,17 @@ const SPOOK_M: f64 = 10.0;
 /// How far a circling bird may climb over its first height to get round
 /// whatever blocks its circle; past that it turns round instead (ENG-230).
 const MAX_ORBIT_CLIMB_M: f64 = 12.0;
+/// An upland species is born on ground at least this far above the spawn
+/// anchor it was placed around, or on steep ground.
+const UPLAND_RISE_M: f64 = 8.0;
+/// Ground is steep where it rises or falls this much within 1 m (about 39°).
+const STEEP_RISE_M: f64 = 0.8;
+/// An upland species wanders to ground no lower than this under where it was
+/// born.
+const UPLAND_SLACK_M: f64 = 6.0;
+/// An upland species searches this many times farther than the spawn ring
+/// for its mountain.
+const UPLAND_SEARCH_SCALE: f64 = 3.0;
 /// A player this close is noticed by a fleeing species, which stops to watch.
 const NOTICE_M: f64 = 28.0;
 /// A player this close, or a sprinting one inside the notice distance, makes
@@ -192,6 +211,7 @@ pub struct AnimalSpecies {
     pub flee_speed_m_s: Option<f64>,
     pub grazes: bool,
     pub perches: bool,
+    pub uplands: bool,
 }
 
 /// Decodes every authored species.
@@ -210,6 +230,7 @@ pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
                 flee_speed_m_s: def.flee_speed_m_s,
                 grazes: def.grazes,
                 perches: def.perches,
+                uplands: def.uplands,
             })
         })
         .collect()
@@ -546,6 +567,46 @@ impl AnimalDirector {
                 .is_some_and(|(_, material)| self.grass.contains(&material))
     }
 
+    /// Whether the ground at a column (top face `ground` metres) rises or
+    /// falls [`STEEP_RISE_M`] within 1 m along x or z.
+    fn steep(sim: &Simulation, x_cell: i64, z_cell: i64, ground: f64) -> bool {
+        [(4, 0), (-4, 0), (0, 4), (0, -4)]
+            .into_iter()
+            .any(|(dx, dz)| {
+                Self::ground_y_m(sim, x_cell + dx, z_cell + dz)
+                    .is_some_and(|y| (y - ground).abs() >= STEEP_RISE_M)
+            })
+    }
+
+    /// A wander target for an upland animal at `here`, born at root height
+    /// `home_y`: the first of a few random ones on ground high enough, else
+    /// where it stands (it rests and tries again later).
+    fn upland_target(&mut self, sim: &Simulation, here: [f64; 3], home_y: f64) -> [f64; 2] {
+        for _ in 0..8 {
+            let angle = self.unit() * std::f64::consts::TAU;
+            let distance = 4.0 + self.unit() * 14.0;
+            let target = [
+                here[0] + distance * angle.cos(),
+                here[2] - distance * angle.sin(),
+            ];
+            if Self::upland_ok(sim, target, home_y) {
+                return target;
+            }
+        }
+        [here[0], here[2]]
+    }
+
+    /// Whether `target` (x, z) is on ground high enough for an upland animal
+    /// born at root height `home_y`. Height alone: steep ground below would
+    /// include the foot of a cliff, and the walk there goes over its edge.
+    fn upland_ok(sim: &Simulation, target: [f64; 2], home_y: f64) -> bool {
+        let (x, z) = (
+            (target[0] / 0.25).floor() as i64,
+            (target[1] / 0.25).floor() as i64,
+        );
+        Self::ground_y_m(sim, x, z).is_some_and(|ground| ground >= home_y - UPLAND_SLACK_M)
+    }
+
     fn find_placement(&mut self, sim: &Simulation, species: usize) -> Option<Placement> {
         if self.anchors.is_empty() {
             return None;
@@ -557,12 +618,24 @@ impl AnimalDirector {
         }
         let pick = (self.next() as usize) % self.anchors.len();
         let anchor = self.anchors[pick];
+        let uplands = self.species[species].uplands;
+        let reach = if uplands {
+            self.radius_m.1 * UPLAND_SEARCH_SCALE
+        } else {
+            self.radius_m.1
+        };
         let angle = self.unit() * std::f64::consts::TAU;
-        let radius = self.radius_m.0 + self.unit() * (self.radius_m.1 - self.radius_m.0);
+        let radius = self.radius_m.0 + self.unit() * (reach - self.radius_m.0);
         let x = anchor[0] + radius * angle.cos();
         let z = anchor[2] + radius * angle.sin();
         let (x_cell, z_cell) = ((x / 0.25).floor() as i64, (z / 0.25).floor() as i64);
         let ground = Self::ground_y_m(sim, x_cell, z_cell)?;
+        if uplands
+            && ground < anchor[1] + UPLAND_RISE_M
+            && !Self::steep(sim, x_cell, z_cell, ground)
+        {
+            return None;
+        }
         // Hover a few centimetres above the ground: a swept pose that starts in
         // exact contact with terrain reports an impact at time zero.
         let foot = f64::from(-self.walk_feet[species]) + GROUND_CLEARANCE_M;
@@ -1049,13 +1122,18 @@ impl CreatureDirector for AnimalDirector {
                             next_bite: tick,
                         };
                     } else if tick >= until {
-                        let angle = self.unit() * std::f64::consts::TAU;
-                        let distance = 4.0 + self.unit() * 14.0;
-                        walker.gait = Gait::Walk {
-                            target: [
+                        let target = if self.species[walker.species].uplands {
+                            self.upland_target(sim, here, walker.home[1])
+                        } else {
+                            let angle = self.unit() * std::f64::consts::TAU;
+                            let distance = 4.0 + self.unit() * 14.0;
+                            [
                                 here[0] + distance * angle.cos(),
                                 here[2] - distance * angle.sin(),
-                            ],
+                            ]
+                        };
+                        walker.gait = Gait::Walk {
+                            target,
                             until: tick + 60 * 20,
                         };
                     }
@@ -1078,10 +1156,19 @@ impl CreatureDirector for AnimalDirector {
                         } else {
                             const TURNS: [f64; 6] = [0.8, -0.8, 1.6, -1.6, 2.4, -2.4];
                             let angle = walker.yaw + TURNS[(walker.detours as usize - 1) % 6];
-                            walker.gait = Gait::Walk {
-                                target: [here[0] + 5.0 * angle.cos(), here[2] - 5.0 * angle.sin()],
-                                until,
-                            };
+                            let detour = [here[0] + 5.0 * angle.cos(), here[2] - 5.0 * angle.sin()];
+                            // An upland animal does not detour off its mountain;
+                            // the next stuck step tries the next heading.
+                            if !self.species[walker.species].uplands
+                                || Self::upland_ok(sim, detour, walker.home[1])
+                            {
+                                walker.gait = Gait::Walk {
+                                    target: detour,
+                                    until,
+                                };
+                            } else {
+                                walker.stuck = 3;
+                            }
                         }
                     } else {
                         let want = f64::atan2(-dz, dx);
