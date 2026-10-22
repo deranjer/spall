@@ -443,3 +443,124 @@ fn a_deer_ignores_a_far_player() {
         );
     }
 }
+
+/// A deer resting on grass in a generated world sometimes stops to graze, and
+/// each bite clears the grass under its muzzle through the server's
+/// destroyed-cover record: the same record a dig makes, saved and sent to
+/// clients in the vegetation frame. A player close by ends the meal at a run.
+#[test]
+fn a_grazing_deer_eats_the_grass_under_its_muzzle() {
+    use sandbox::animals::{LOCOMOTION_GRAZE, LOCOMOTION_RUN};
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE};
+    use spall_voxel::Sample;
+
+    let scene = sandbox::worldgen_scene::generate("showcase", 4, 256).unwrap();
+    let mut config = SimulationConfig::new(scene.world_setup());
+    config.vegetation = Some(scene.vegetation().clone());
+    let mut sim = Simulation::new(config).unwrap();
+    sim.initialize_creature_host().unwrap();
+    let grass = |sim: &Simulation, x: i64, z: i64| {
+        (0..200_i64)
+            .rev()
+            .find_map(|y| {
+                match sim
+                    .world()
+                    .terrain()
+                    .volume
+                    .sample(spall_core::GlobalCell::new(x, y, z))
+                {
+                    Ok(Sample::Filled(material)) => Some((y, material)),
+                    _ => None,
+                }
+            })
+            .filter(|&(_, material)| {
+                sandbox::appearance::base_material(material) == spall_core::MaterialId(10)
+            })
+    };
+    // Flat open grass, the same height all around, for the herd to start on.
+    let (gx, gy, gz) = (32..224_i64)
+        .flat_map(|x| (32..224_i64).map(move |z| (x, z)))
+        .find_map(|(x, z)| {
+            let (y, _) = grass(&sim, x, z)?;
+            (-4..=4_i64)
+                .flat_map(|dx| (-4..=4_i64).map(move |dz| (dx, dz)))
+                .all(|(dx, dz)| grass(&sim, x + dx, z + dz).is_some_and(|(h, _)| h == y))
+                .then_some((x, y, z))
+        })
+        .expect("the showcase world has a flat meadow");
+    let anchor = [
+        gx as f64 * 0.25 + 0.125,
+        (gy + 1) as f64 * 0.25,
+        gz as f64 * 0.25 + 0.125,
+    ];
+    let director = AnimalDirector::new(vec![anchor], &[3], 17)
+        .unwrap()
+        .with_radius_m(0.0, 2.0);
+    let service = CreatureService::new(Box::new(director));
+    assert!(sim.vegetation_state().unwrap().cleared.is_empty());
+    // (column centre x, z, the grazing deer's root and rotation at the bite)
+    let mut bites: Vec<(f64, f64, [f64; 3], [f32; 4])> = Vec::new();
+    for _ in 0..3600 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        for c in &sim.vegetation_state().unwrap().cleared {
+            let (cx, cz) = (f64::from(c.x) * 0.25 + 0.125, f64::from(c.z) * 0.25 + 0.125);
+            if bites.iter().any(|&(x, z, _, _)| (x, z) == (cx, cz)) {
+                continue;
+            }
+            // Only a grazing deer eats; the nearest one took this bite.
+            let deer = sim
+                .creature_records()
+                .into_iter()
+                .filter(|d| d.locomotion_tag == LOCOMOTION_GRAZE)
+                .min_by(|a, b| {
+                    let d = |r: &spall_protocol::CreatureRecord| {
+                        (r.translation_m[0] - cx).hypot(r.translation_m[2] - cz)
+                    };
+                    d(a).total_cmp(&d(b))
+                })
+                .expect("grass was cleared with no deer grazing");
+            bites.push((cx, cz, deer.translation_m, deer.rotation_xyzw));
+        }
+    }
+    assert!(bites.len() >= 2, "deer hardly grazed: {bites:?}");
+    for &(cx, cz, root, [_, sin, _, cos]) in &bites {
+        let yaw = 2.0 * f64::from(sin).atan2(f64::from(cos));
+        let (dx, dz) = (cx - root[0], cz - root[2]);
+        let ahead = dx * yaw.cos() - dz * yaw.sin();
+        assert!(
+            dx.hypot(dz) < 1.5 && ahead > 0.3,
+            "bite at ({cx:.2}, {cz:.2}) is not under the muzzle of a deer at {root:?} facing {yaw:.2}"
+        );
+    }
+    // Clients draw cover from the vegetation frame, which carries the record.
+    let state = sim.vegetation_state().unwrap();
+    assert_eq!(sim.vegetation_visual().unwrap().cleared, state.cleared);
+
+    // Wait for a deer to graze again, then walk a player up to it: it runs.
+    let grazing = (0..3600)
+        .find_map(|_| {
+            sim.tick().unwrap();
+            service.run_tick(&mut sim).unwrap();
+            service.run_motion(&mut sim).unwrap();
+            sim.creature_records()
+                .into_iter()
+                .find(|d| d.locomotion_tag == LOCOMOTION_GRAZE)
+        })
+        .expect("a deer grazes again");
+    let at = grazing.translation_m;
+    sim.add_player(
+        EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap(),
+        [at[0] + 3.0, at[1] + 0.5, at[2]],
+    );
+    let ran = (0..24).any(|_| {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        sim.creature_records()
+            .iter()
+            .any(|d| d.creature_id == grazing.creature_id && d.locomotion_tag == LOCOMOTION_RUN)
+    });
+    assert!(ran, "a player beside a grazing deer did not make it flee");
+}

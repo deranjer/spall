@@ -33,6 +33,8 @@ struct SpeciesDef {
     /// Pace when fleeing players, metres per second. Species with one notice
     /// players, stand `alert`, then flee at a `run`; others ignore players.
     flee_speed_m_s: Option<f64>,
+    /// Crops the grass under its mouth (`graze` clip) now and then while resting.
+    grazes: bool,
 }
 
 const SPECIES: [SpeciesDef; 5] = [
@@ -45,6 +47,7 @@ const SPECIES: [SpeciesDef; 5] = [
         capsule_m: (0.35, 0.35),
         // Faster than a sprinting player (5.8 m/s), so a chase is lost.
         flee_speed_m_s: Some(7.5),
+        grazes: true,
     },
     SpeciesDef {
         key: "crow",
@@ -54,6 +57,7 @@ const SPECIES: [SpeciesDef; 5] = [
         walk_speed_m_s: 0.0,
         capsule_m: (0.0, 0.0),
         flee_speed_m_s: None,
+        grazes: false,
     },
     SpeciesDef {
         key: "trout",
@@ -63,6 +67,7 @@ const SPECIES: [SpeciesDef; 5] = [
         walk_speed_m_s: 0.0,
         capsule_m: (0.0, 0.0),
         flee_speed_m_s: None,
+        grazes: false,
     },
     SpeciesDef {
         key: "bear",
@@ -72,6 +77,7 @@ const SPECIES: [SpeciesDef; 5] = [
         walk_speed_m_s: 1.2,
         capsule_m: (0.45, 0.1),
         flee_speed_m_s: None,
+        grazes: false,
     },
     SpeciesDef {
         key: "snow_leopard",
@@ -81,6 +87,7 @@ const SPECIES: [SpeciesDef; 5] = [
         walk_speed_m_s: 1.1,
         capsule_m: (0.28, 0.1),
         flee_speed_m_s: None,
+        grazes: false,
     },
 ];
 /// Gap kept between an animal's lowest cell and the terrain it stands on.
@@ -92,6 +99,14 @@ pub const LOCOMOTION_MOVE: u8 = 1;
 pub const LOCOMOTION_ALERT: u8 = 2;
 /// Fleeing a player (`run` clip).
 pub const LOCOMOTION_RUN: u8 = 3;
+/// Cropping grass where it stands (`graze` clip).
+pub const LOCOMOTION_GRAZE: u8 = 4;
+/// The worldgen grass material; its appearance variants count as grass too.
+const GRASS: spall_core::MaterialId = spall_core::MaterialId(10);
+/// Chance a grazing species crops the grass when a rest ends on grass.
+const GRAZE_CHANCE: f64 = 0.5;
+/// Ticks between bites while grazing (1.5 s).
+const BITE_TICKS: u64 = 90;
 /// A player this close is noticed by a fleeing species, which stops to watch.
 const NOTICE_M: f64 = 28.0;
 /// A player this close, or a sprinting one inside the notice distance, makes
@@ -118,6 +133,7 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
         LOCOMOTION_MOVE => Some(def.move_clip),
         LOCOMOTION_ALERT if def.flee_speed_m_s.is_some() => Some("alert"),
         LOCOMOTION_RUN if def.flee_speed_m_s.is_some() => Some("run"),
+        LOCOMOTION_GRAZE if def.grazes => Some("graze"),
         _ => None,
     }
 }
@@ -139,6 +155,7 @@ pub struct AnimalSpecies {
     pub capsule_m: (f32, f32),
     /// Pace when fleeing players; `None` for species that ignore them.
     pub flee_speed_m_s: Option<f64>,
+    pub grazes: bool,
 }
 
 /// Decodes every authored species.
@@ -155,6 +172,7 @@ pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
                 walk_speed_m_s: def.walk_speed_m_s,
                 capsule_m: def.capsule_m,
                 flee_speed_m_s: def.flee_speed_m_s,
+                grazes: def.grazes,
             })
         })
         .collect()
@@ -162,14 +180,25 @@ pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
 
 /// Root-relative bounds of every cell over the idle and move clips, metres.
 fn pose_bounds(visual: &crate::animal_visual::AnimalVisual, key: &str) -> (glam::Vec3, glam::Vec3) {
+    clip_bounds(
+        visual,
+        &[
+            "idle",
+            locomotion_clip(key, LOCOMOTION_MOVE).unwrap_or("idle"),
+        ],
+    )
+}
+
+/// Root-relative bounds of every cell over the named clips, metres.
+fn clip_bounds(
+    visual: &crate::animal_visual::AnimalVisual,
+    clips: &[&str],
+) -> (glam::Vec3, glam::Vec3) {
     let (mut lo, mut hi) = (
         glam::Vec3::splat(f32::INFINITY),
         glam::Vec3::splat(f32::NEG_INFINITY),
     );
-    for clip in [
-        "idle",
-        locomotion_clip(key, LOCOMOTION_MOVE).unwrap_or("idle"),
-    ] {
+    for &clip in clips {
         let duration = visual.clip_duration(clip).unwrap_or(1).max(1);
         for phase in (0..duration).step_by(2) {
             if let Ok(cells) = visual.sample(clip, f64::from(phase)) {
@@ -202,6 +231,9 @@ enum Gait {
     Alert { until: u64 },
     /// Run away from players until clear of them or `until`.
     Flee { until: u64 },
+    /// Stand cropping the grass under the mouth, a bite every [`BITE_TICKS`],
+    /// until `until` or the grass in reach is gone.
+    Graze { until: u64, next_bite: u64 },
 }
 
 /// The nearest player to an animal, horizontally.
@@ -267,6 +299,10 @@ pub struct AnimalDirector {
     walk_feet: Vec<f32>,
     /// Placement envelope over the same poses, metres.
     envelope_m: Vec<DVec3>,
+    /// How far ahead of the root the mouth reaches the ground while grazing.
+    mouth_m: Vec<f64>,
+    /// Terrain materials that count as grass.
+    grass: Vec<spall_core::MaterialId>,
     anchors: Vec<[f64; 3]>,
     targets: Vec<u32>,
     spawned: Vec<u32>,
@@ -312,11 +348,27 @@ impl AnimalDirector {
                 (lo.y, envelope)
             })
             .unzip();
+        // The head points along +X; its forward reach in the graze pose is
+        // where the muzzle meets the grass.
+        let mouth_m = visuals
+            .iter()
+            .map(|visual| f64::from(clip_bounds(visual, &["graze"]).1.x.max(0.0)))
+            .collect();
+        let grass = std::iter::once(GRASS)
+            .chain(
+                crate::appearance::variants()
+                    .into_iter()
+                    .filter(|variant| variant.base == GRASS)
+                    .map(|variant| variant.id),
+            )
+            .collect();
         let count = species.len();
         Ok(Self {
             species,
             walk_feet,
             envelope_m,
+            mouth_m,
+            grass,
             anchors,
             targets: (0..count)
                 .map(|i| targets.get(i).copied().unwrap_or(0))
@@ -363,6 +415,11 @@ impl AnimalDirector {
     /// Height of the top solid cell's upper face at the given column, if a
     /// fully known column has one.
     fn ground_y_m(sim: &Simulation, x_cell: i64, z_cell: i64) -> Option<f64> {
+        Self::ground(sim, x_cell, z_cell).map(|(y, _)| y)
+    }
+
+    /// [`Self::ground_y_m`] and the material of that top cell.
+    fn ground(sim: &Simulation, x_cell: i64, z_cell: i64) -> Option<(f64, spall_core::MaterialId)> {
         let body = sim.world().terrain();
         let (min, max) = body.collider_region;
         if x_cell < min.x || x_cell > max.x || z_cell < min.z || z_cell > max.z {
@@ -371,12 +428,40 @@ impl AnimalDirector {
         let mut y = max.y;
         while y >= min.y {
             match body.volume.sample(GlobalCell::new(x_cell, y, z_cell)) {
-                Ok(Sample::Filled(_)) => return Some((y + 1) as f64 * 0.25),
+                Ok(Sample::Filled(material)) => return Some(((y + 1) as f64 * 0.25, material)),
                 Ok(Sample::Empty { .. }) => y -= 1,
                 _ => return None,
             }
         }
         None
+    }
+
+    /// The terrain column under the mouth of a grazing animal at `here` facing
+    /// `yaw`, shifted `side` cells to its left (+) or right (-).
+    fn mouth_column(&self, species: usize, here: [f64; 3], yaw: f64, side: i64) -> [i64; 2] {
+        let reach = self.mouth_m[species] * 0.9;
+        let side_m = side as f64 * 0.25;
+        let x = here[0] + reach * yaw.cos() - side_m * yaw.sin();
+        let z = here[2] - reach * yaw.sin() - side_m * yaw.cos();
+        [(x / 0.25).floor() as i64, (z / 0.25).floor() as i64]
+    }
+
+    /// Whether the column carries grass that is not cropped or regrowing. A
+    /// world without vegetation has none to eat.
+    fn uncropped_grass(&self, sim: &Simulation, column: [i64; 2]) -> bool {
+        let Some(vegetation) = sim.vegetation_state() else {
+            return false;
+        };
+        let (Ok(x), Ok(z)) = (u16::try_from(column[0]), u16::try_from(column[1])) else {
+            return false;
+        };
+        let eaten = vegetation
+            .cleared
+            .binary_search_by_key(&(x, z), |c| (c.x, c.z))
+            .is_ok();
+        !eaten
+            && Self::ground(sim, column[0], column[1])
+                .is_some_and(|(_, material)| self.grass.contains(&material))
     }
 
     fn find_placement(&mut self, sim: &Simulation, species: usize) -> Option<Placement> {
@@ -454,7 +539,8 @@ impl AnimalDirector {
                 }
                 _ => {}
             },
-            Gait::Rest { .. } | Gait::Walk { .. } => match threat {
+            // A player interrupts grazing like any other calm moment.
+            Gait::Rest { .. } | Gait::Walk { .. } | Gait::Graze { .. } => match threat {
                 Some(t) if bolts(&t) => {
                     walker.detours = 0;
                     walker.gait = flee;
@@ -606,6 +692,14 @@ impl CreatureDirector for AnimalDirector {
                     walker.detours = 0;
                 }
             }
+            CreatureActionOutcome::Grazed(ate) => {
+                // The grass in reach is gone: stop and move on.
+                if !ate && matches!(walker.gait, Gait::Graze { .. }) {
+                    walker.gait = Gait::Rest {
+                        until: self.last_tick,
+                    };
+                }
+            }
         }
     }
 
@@ -658,7 +752,17 @@ impl CreatureDirector for AnimalDirector {
             }
             match walker.gait {
                 Gait::Rest { until } => {
-                    if tick >= until {
+                    let grazes = self.species[walker.species].grazes
+                        && tick >= until
+                        && self
+                            .uncropped_grass(sim, self.mouth_column(walker.species, here, yaw, 0))
+                        && self.unit() < GRAZE_CHANCE;
+                    if grazes {
+                        walker.gait = Gait::Graze {
+                            until: tick + 300 + self.next() % 420,
+                            next_bite: tick,
+                        };
+                    } else if tick >= until {
                         let angle = self.unit() * std::f64::consts::TAU;
                         let distance = 4.0 + self.unit() * 14.0;
                         walker.gait = Gait::Walk {
@@ -756,6 +860,35 @@ impl CreatureDirector for AnimalDirector {
                     desired = [step * yaw.cos(), -step * yaw.sin()];
                     tag = LOCOMOTION_RUN;
                 }
+                Gait::Graze { .. } => {}
+            }
+            // Grazing is checked after the match so a rest that just turned
+            // into grazing takes its first bite this update.
+            if let Gait::Graze { until, next_bite } = walker.gait {
+                tag = LOCOMOTION_GRAZE;
+                if tick >= until {
+                    // Had enough here: walk on after this update.
+                    walker.gait = Gait::Rest { until: tick };
+                } else if tick >= next_bite {
+                    let bite = [0, 1, -1]
+                        .into_iter()
+                        .map(|side| self.mouth_column(walker.species, here, yaw, side))
+                        .find(|&column| self.uncropped_grass(sim, column));
+                    match bite {
+                        Some(column) => {
+                            walker.gait = Gait::Graze {
+                                until,
+                                next_bite: tick + BITE_TICKS,
+                            };
+                            actions.push(CreatureAction::Graze {
+                                creature_id: id,
+                                column,
+                            });
+                        }
+                        // Nothing left in reach.
+                        None => walker.gait = Gait::Rest { until: tick },
+                    }
+                }
             }
             // A new activity starts its clip from the beginning.
             if tag != walker.tag {
@@ -812,19 +945,32 @@ impl CreatureDirector for AnimalDirector {
 mod tests {
     use super::*;
 
-    /// A species that flees players must have the clips its alert and run tags
-    /// name, or clients would draw nothing while it reacts.
+    /// Every tag a species can send names a clip its asset has, or clients
+    /// would draw nothing while it does that; and the behaviours a species is
+    /// given come with their tags.
     #[test]
-    fn fleeing_species_have_alert_and_run_clips() {
+    fn every_locomotion_tag_names_an_authored_clip() {
         for species in species().unwrap() {
-            if species.flee_speed_m_s.is_none() {
-                continue;
+            for tag in 0..=u8::MAX {
+                if let Some(clip) = locomotion_clip(species.key, tag) {
+                    assert!(
+                        species.asset.clips.iter().any(|c| c.name == clip),
+                        "{} has no {clip} clip for tag {tag}",
+                        species.key
+                    );
+                }
             }
-            for tag in [LOCOMOTION_ALERT, LOCOMOTION_RUN] {
-                let clip = locomotion_clip(species.key, tag).unwrap();
+            let mut sends = vec![LOCOMOTION_IDLE, LOCOMOTION_MOVE];
+            if species.flee_speed_m_s.is_some() {
+                sends.extend([LOCOMOTION_ALERT, LOCOMOTION_RUN]);
+            }
+            if species.grazes {
+                sends.push(LOCOMOTION_GRAZE);
+            }
+            for tag in sends {
                 assert!(
-                    species.asset.clips.iter().any(|c| c.name == clip),
-                    "{} has no {clip} clip",
+                    locomotion_clip(species.key, tag).is_some(),
+                    "{} sends tag {tag} with no clip",
                     species.key
                 );
             }
