@@ -340,6 +340,15 @@ struct Region {
     steady_ref: Vec<(u32, f32, f32)>,
 }
 
+/// A sleeping region wakes when water in one of its border spans stands this
+/// far (cells) above or below the span next to it inside the region. A live
+/// pipe from an active neighbour moves water into (or out of) that border span,
+/// but the interior is not stepped: before this check a river reaching a
+/// sleeping region over many pipes, each under the sleep flow, filled its
+/// first column and never woke it, and the region upstream filled behind it
+/// as a flat pool with a straight wall.
+const BORDER_WAKE_HEAD: f32 = 0.5;
+
 /// A region of still sea kept as a record (see [`ColumnConfig::lazy_ocean`]).
 struct Dormant {
     /// Per column: the floor y and the height of the span the sea fills.
@@ -680,6 +689,34 @@ impl ColumnWorld {
             .iter()
             .filter(|r| r.active && !r.frozen && r.resting)
             .count()
+    }
+
+    /// Whether the region holding column `(x, z)` rested in the last step (far
+    /// from every focus point, see [`ColumnConfig::throttle_from_cells`]).
+    pub fn is_column_resting(&self, x: i64, z: i64) -> bool {
+        self.slot_of.get(&region_of(x, z)).is_some_and(|&s| {
+            let r = &self.regions[s as usize];
+            r.active && !r.frozen && r.resting
+        })
+    }
+
+    /// Whether span `s`, at the edge of the sleeping region `region`, stands
+    /// over [`BORDER_WAKE_HEAD`] above or below a span inside that region it
+    /// is piped to (see the constant).
+    fn border_out_of_level(&self, s: usize, region: u32) -> bool {
+        let hs = self.effective_head(s);
+        let (a, b) = (self.adj_start[s] as usize, self.adj_start[s + 1] as usize);
+        self.adj[a..b].iter().any(|&entry| {
+            let p = &self.pipes[(entry >> 1) as usize];
+            if p.ra != region || p.rb != region {
+                return false;
+            }
+            let t = if entry & 1 == 1 { p.b } else { p.a } as usize;
+            let ht = self.effective_head(t);
+            let lo = p.lo as f32;
+            Self::wetted_area(p, hs, ht) >= self.config.min_film_depth
+                && (hs.max(lo) - ht.max(lo)).abs() > BORDER_WAKE_HEAD
+        })
     }
 
     /// Whether a region takes part in the step being run.
@@ -1171,12 +1208,14 @@ impl ColumnWorld {
             let mut wake = BTreeSet::new();
             for &pi in &self.act_pipes {
                 let p = self.pipes[pi as usize];
-                if self.q[pi as usize].abs() > cfg.sleep_flow {
-                    for r in [p.ra, p.rb] {
-                        let reg = &self.regions[r as usize];
-                        if !reg.active && !reg.steady {
-                            wake.insert(r as usize);
-                        }
+                let fast = self.q[pi as usize].abs() > cfg.sleep_flow;
+                for (s, r) in [(p.a, p.ra), (p.b, p.rb)] {
+                    let reg = &self.regions[r as usize];
+                    if !reg.active
+                        && !reg.steady
+                        && (fast || self.border_out_of_level(s as usize, r))
+                    {
+                        wake.insert(r as usize);
                     }
                 }
             }
@@ -1244,6 +1283,7 @@ impl ColumnWorld {
             peak: 0.0,
             wake: BTreeSet::new(),
         };
+        let this = &*self;
         let (pipes, q, eff, regions) = (&self.pipes, &self.q, &self.eff, &self.regions);
         // Fixed-size chunks: a parallel fold would split into thousands of tasks,
         // each allocating and merging a vector the size of every allocated region.
@@ -1261,12 +1301,13 @@ impl ColumnWorld {
                     if area >= cfg.min_film_depth {
                         acc.peak = acc.peak.max(qa / area);
                     }
-                    if qa > cfg.sleep_flow {
-                        for r in [p.ra, p.rb] {
-                            let reg = &regions[r as usize];
-                            if !reg.active && !reg.steady {
-                                acc.wake.insert(r);
-                            }
+                    for (s, r) in [(p.a, p.ra), (p.b, p.rb)] {
+                        let reg = &regions[r as usize];
+                        if !reg.active
+                            && !reg.steady
+                            && (qa > cfg.sleep_flow || this.border_out_of_level(s as usize, r))
+                        {
+                            acc.wake.insert(r);
                         }
                     }
                     // A steady region wakes at once if a boundary flow jumps from its

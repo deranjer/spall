@@ -473,8 +473,14 @@ impl Shared {
 
     /// Adds one slice of every discharge spring's flow. A spring in a column
     /// with no open span at its cell adds nothing (the terrain was dug away).
+    /// Far water that rested this slice runs in slow motion, and so does its
+    /// spring: at the full rate it piled up around the spring faster than the
+    /// region (stepped one slice in 2, 4 or 8) could carry it away.
     fn discharge(&self, core: &mut Core) {
         for d in &self.setup.discharges {
+            if core.world.is_column_resting(d.cell.x, d.cell.z) {
+                continue;
+            }
             let volume = d.flow_cells3_s * SLICE_DT_S;
             if core.world.add_flow(d.cell, volume).is_ok() {
                 core.added_cells3 += volume;
