@@ -80,6 +80,16 @@ of grizzly bears and snow leopards, and N/4 trout, in a worldgen sandbox. Each w
 own pace and foot capsule, sized to fit inside its body; placement envelopes and
 foot height are measured from the asset's idle and walk poses.
 
+The client (`examples/sandbox/src/animal_view.rs`) poses every clip once per
+whole tick at startup, as part placements rather than cells (about 0.6 MB for
+all five species), so a frame only places each cell at its creature's root.
+Clip phases are rounded down to whole ticks (60 per second). Creatures outside
+a cone around the camera's view, or farther than the view distance, are not
+drawn; the cone's apex sits 3 m behind the camera and each creature is tested
+by the farthest any of its cells reaches in any pose, so bodies at the screen
+edge stay drawn. The 1 km herd (48 animals, about 75,000 cubes) costs about
+0.5 ms per frame unculled in a release build, down from about 2.5-3.5 ms.
+
 Deer notice players: one within 28 m makes a deer stop and watch it (`alert`
 clip); one within 14 m, or sprinting inside 28 m, makes it bolt at 7.5 m/s
 (`run` clip), faster than a sprinting player. A deer that watched for a few
