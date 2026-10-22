@@ -35,6 +35,9 @@ pub use creature_motion::{
     CreatureMoveOutcome, CreatureMoveRequest, CreaturePose, CreatureWalkOutcome,
     CreatureWalkRequest,
 };
+#[path = "creature_death.rs"]
+mod creature_death;
+pub use creature_death::{CreatureKill, CreatureKillError};
 
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a

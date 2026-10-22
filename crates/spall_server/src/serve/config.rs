@@ -65,6 +65,10 @@ pub struct HostConfig {
     /// director requires an ephemeral world (`save` unset): animals are not
     /// saved, and startup fails loudly rather than drop them.
     pub creatures: Option<crate::creature_service::CreatureService>,
+    /// Game-owned posed voxels of a creature. With it, a cutting tool's strike
+    /// that meets a creature before any geometry kills it and leaves a carcass
+    /// of those voxels in the terrain. Ignored without `creatures`.
+    pub creature_shape: Option<spall_sim::CreatureShape>,
     /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
     /// damage pass. `None` keeps every prior run byte-identical (the pass is
     /// never invoked, exactly like every scene before this increment).
@@ -237,6 +241,7 @@ impl ServeConfig {
                 residency: None,
                 residency_disk_path: None,
                 creatures: None,
+                creature_shape: None,
                 contact_damage: None,
                 dormancy: None,
                 credential_registry_file: None,
