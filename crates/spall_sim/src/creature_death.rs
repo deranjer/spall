@@ -1,4 +1,4 @@
-//! Striking and killing creatures.
+//! Striking and killing creatures, and the terrain cells creatures edit.
 //!
 //! A tool strike hits a creature when the aim ray meets one of its posed voxels
 //! (from the game's [`CreatureShape`]). Killing a creature despawns it and
@@ -8,6 +8,11 @@
 //! ordinary committed edit path (one single-cell `Place` per cell, the way
 //! vegetation grows). The carcass is then plain terrain: it replicates like any
 //! edit and can be cut away cell by cell.
+//!
+//! A creature can also kill another ([`Simulation::kill_creature_by`]) and
+//! fill or clear single terrain cells ([`Simulation::creature_edit_cell`]),
+//! as a bear eating a carcass does. Each such cell takes the same committed
+//! edit path under a server request id.
 use std::collections::{BTreeMap, HashMap};
 
 use super::*;
@@ -24,8 +29,9 @@ const STRIKE_MARGIN_M: f64 = 4.0;
 const MAX_CARCASS_CELLS: usize = 192;
 /// Furthest a carcass falls to reach the ground, in terrain cells (64 m).
 const MAX_CARCASS_DROP_CELLS: i64 = 256;
-/// Journal provenance for a carcass cell the server places on its own.
-const CARCASS_ACTOR_ID: u64 = (1 << 40) + 3;
+/// Journal provenance for a cell the server edits on a creature's account: a
+/// carcass, or a creature's own bite or placement.
+const CREATURE_EDIT_ACTOR_ID: u64 = (1 << 40) + 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CreatureKillError {
@@ -117,31 +123,15 @@ impl Simulation {
             .voxels(&record);
         let cells = self.carcass_cells(&voxels);
 
-        let server_actor = EntityId::new(CARCASS_ACTOR_ID).expect("non-zero reserved actor id");
+        let server_actor = creature_edit_actor();
         let mut carcass = Vec::with_capacity(cells.len());
         let mut first_status = None;
         for (i, (cell, material)) in cells.into_iter().enumerate() {
             let (request, by) = match (i, request_id) {
                 (0, Some(request)) => (request, actor),
-                _ => {
-                    let request = RequestId(SERVER_REQUEST_ID_BAND | self.next_damage_seq);
-                    self.next_damage_seq += 1;
-                    (request, server_actor)
-                }
+                _ => (self.next_server_request(), server_actor),
             };
-            let centre = BrushPoint::from_units(
-                cell.x * BRUSH_UNIT + BRUSH_UNIT / 2,
-                cell.y * BRUSH_UNIT + BRUSH_UNIT / 2,
-                cell.z * BRUSH_UNIT + BRUSH_UNIT / 2,
-            );
-            let intent = EditIntent {
-                request_id: request,
-                actor: by,
-                target: EditTarget::Terrain,
-                kind: EditKind::Place(material),
-                brush: SphereBrush::new(centre, 0).expect("a single-cell brush is valid"),
-                explosion: None,
-            };
+            let intent = single_cell_intent(cell, EditKind::Place(material), request, by);
             match self.submit(intent) {
                 Ok(status) => {
                     first_status.get_or_insert(status);
@@ -157,6 +147,59 @@ impl Simulation {
             carcass,
             first_status,
         })
+    }
+
+    /// A creature kills another: `prey` dies exactly as from a strike, its
+    /// whole carcass under server request ids. Fails if either is not hosted.
+    pub fn kill_creature_by(
+        &mut self,
+        predator_id: u64,
+        prey_id: u64,
+    ) -> Result<CreatureKill, CreatureKillError> {
+        if predator_id == prey_id || !self.hosts_creature(predator_id) {
+            return Err(CreatureKillError::NotHosted);
+        }
+        self.kill_creature(prey_id, None, creature_edit_actor())
+    }
+
+    /// A creature changes one terrain cell: `place` fills it if it is empty,
+    /// `None` clears it if it is solid. Queued as a single-cell edit under a
+    /// server request id, the committed path a carcass takes. `Ok(false)` when
+    /// the cell already is what was asked, so nothing was queued. An error
+    /// when the creature is not hosted, the cell is not resident, or the edit
+    /// queue is full.
+    pub fn creature_edit_cell(
+        &mut self,
+        creature_id: u64,
+        cell: GlobalCell,
+        place: Option<MaterialId>,
+    ) -> Result<bool, String> {
+        if !self.hosts_creature(creature_id) {
+            return Err(format!("creature {creature_id} is not hosted"));
+        }
+        let place = place.filter(|material| !material.is_air());
+        let kind = match (self.world.terrain().volume.sample(cell), place) {
+            (Ok(Sample::Filled(_)), None) => EditKind::Cut,
+            (Ok(Sample::Empty { .. }), Some(material)) => EditKind::Place(material),
+            (Ok(Sample::Filled(_) | Sample::Empty { .. }), _) => return Ok(false),
+            _ => return Err(format!("cell {cell:?} is not resident")),
+        };
+        let request = self.next_server_request();
+        let intent = single_cell_intent(cell, kind, request, creature_edit_actor());
+        self.submit(intent).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    fn hosts_creature(&self, creature_id: u64) -> bool {
+        self.creatures
+            .as_ref()
+            .is_some_and(|host| host.get(creature_id).is_some())
+    }
+
+    fn next_server_request(&mut self) -> RequestId {
+        let request = RequestId(SERVER_REQUEST_ID_BAND | self.next_damage_seq);
+        self.next_damage_seq += 1;
+        request
     }
 
     /// The terrain cells a carcass of `voxels` fills: each terrain cell any
@@ -212,6 +255,32 @@ impl Simulation {
             .filter(|&(cell, material)| !material.is_air() && empty(cell))
             .take(MAX_CARCASS_CELLS)
             .collect()
+    }
+}
+
+fn creature_edit_actor() -> EntityId {
+    EntityId::new(CREATURE_EDIT_ACTOR_ID).expect("non-zero reserved actor id")
+}
+
+/// An edit of exactly one terrain cell.
+fn single_cell_intent(
+    cell: GlobalCell,
+    kind: EditKind,
+    request_id: RequestId,
+    actor: EntityId,
+) -> EditIntent {
+    let centre = BrushPoint::from_units(
+        cell.x * BRUSH_UNIT + BRUSH_UNIT / 2,
+        cell.y * BRUSH_UNIT + BRUSH_UNIT / 2,
+        cell.z * BRUSH_UNIT + BRUSH_UNIT / 2,
+    );
+    EditIntent {
+        request_id,
+        actor,
+        target: EditTarget::Terrain,
+        kind,
+        brush: SphereBrush::new(centre, 0).expect("a single-cell brush is valid"),
+        explosion: None,
     }
 }
 

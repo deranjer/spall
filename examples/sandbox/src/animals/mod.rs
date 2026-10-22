@@ -157,6 +157,12 @@ pub const LOCOMOTION_HOP: u8 = 6;
 pub const LOCOMOTION_PECK: u8 = 7;
 /// Climbing from the ground back to its circle (`takeoff` clip).
 pub const LOCOMOTION_TAKEOFF: u8 = 8;
+/// A predator creeping up on prey (a bear's slow `walk`).
+pub const LOCOMOTION_STALK: u8 = 20;
+/// A predator's killing blow (a bear's `swipe`).
+pub const LOCOMOTION_POUNCE: u8 = 21;
+/// A bear eating a carcass (`eat` clip).
+pub const LOCOMOTION_EAT: u8 = 22;
 /// Capsule swept around a flying animal (about a crow: small body, wings folded in).
 const FLY_CAPSULE_RADIUS_M: f32 = 0.25;
 const FLY_CAPSULE_HALF_HEIGHT_M: f32 = 0.1;
@@ -179,6 +185,11 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
         LOCOMOTION_HOP if def.perches => Some("hop"),
         LOCOMOTION_PECK if def.perches => Some("peck"),
         LOCOMOTION_TAKEOFF if def.perches => Some("takeoff"),
+        LOCOMOTION_RUN | LOCOMOTION_STALK | LOCOMOTION_POUNCE | LOCOMOTION_EAT
+            if matches!(def.family, Family::Bear) =>
+        {
+            bears::clip(tag)
+        }
         _ => None,
     }
 }
@@ -292,6 +303,7 @@ enum Gait {
     },
     Deer(deer::DeerGait),
     Bird(birds::BirdGait),
+    Bear(bears::BearGait),
 }
 
 fn wrap_angle(angle: f64) -> f64 {
@@ -387,6 +399,8 @@ pub struct AnimalDirector {
     max_attempts: u32,
     radius_m: (f64, f64),
     walkers: std::collections::BTreeMap<u64, Walker>,
+    /// Hunger and the carcass being eaten, per bear.
+    bears: std::collections::HashMap<u64, bears::Bear>,
     last_tick: u64,
     /// Per species: (staged moves, blocked moves, walks started), logged periodically.
     stats: Vec<(u64, u64, u64)>,
@@ -460,6 +474,7 @@ impl AnimalDirector {
             max_attempts: 4_000,
             radius_m: (6.0, 50.0),
             walkers: std::collections::BTreeMap::new(),
+            bears: std::collections::HashMap::new(),
             last_tick: 0,
             stats: vec![(0, 0, 0); count],
         })
@@ -651,6 +666,7 @@ impl CreatureDirector for AnimalDirector {
         self.spawned = vec![0; self.species.len()];
         self.attempts = 0;
         self.walkers.clear();
+        self.bears.clear();
     }
 
     fn on_action_outcome(&mut self, creature_id: u64, outcome: CreatureActionOutcome) {
@@ -678,6 +694,10 @@ impl CreatureDirector for AnimalDirector {
                 }
             }
             CreatureActionOutcome::Grazed(ate) => deer::on_grazed(walker, ate, self.last_tick),
+            CreatureActionOutcome::Killed(kill) => {
+                bears::on_killed(&mut self.bears, creature_id, kill, self.last_tick)
+            }
+            CreatureActionOutcome::CellEdited(_) => {}
         }
     }
 
@@ -694,11 +714,13 @@ impl CreatureDirector for AnimalDirector {
                 }
             }
         }
-        let players = players::threat_sources(sim);
+        let players = players::threat_sources(self, sim);
         let poses = sim.creature_poses();
         // A killed animal leaves the roster; forget its walker with it.
         self.walkers
             .retain(|id, _| poses.iter().any(|pose| pose.creature_id == *id));
+        let walkers = &self.walkers;
+        self.bears.retain(|id, _| walkers.contains_key(id));
         let mut actions = Vec::new();
         for alive in poses {
             let id = alive.creature_id;
