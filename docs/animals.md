@@ -108,6 +108,14 @@ At night (sun below the horizon) a resting or wandering deer lies down with its
 sunset and sunrise by up to one in-game hour. While asleep it ignores players
 beyond 10 m (20 m sprinting); closer, it wakes and flees as usual.
 
+Crows nest. Each picks the highest tree top within reach of its circle and
+builds a 9-cell wood cup on it over several trips, one single-cell server edit
+at a time and ground up, so nothing splits off. Nests are ordinary terrain: they
+replicate, can be cut, and are saved like any edit. At night a crow roosts in
+its finished nest until morning (a player within 10 m, or 20 m sprinting, still
+spooks it). It rebuilds missing cells, and picks a new site if the tree top is
+gone.
+
 Bears hunt. A hungry bear stalks a deer it notices within 40 m (0.7 m/s, unseen
 by deer), charges from 14 m at 10 m/s for up to 5 s, and kills on contact; the
 despawn reaches every client like a hammer kill. It then eats the carcass top
@@ -127,6 +135,6 @@ The model, what it replaced, and the planned hunting design are in
 game content in `examples/sandbox`.
 
 Planned, not built: health and damage, drops,
-finer-than-terrain carcasses, roosting crows,
+finer-than-terrain carcasses,
 swimming and flight physics beyond the capsule, saving animals, and the
 population/performance measurements a populated world needs.
