@@ -85,11 +85,29 @@ Deer notice players: one within 28 m makes a deer stop and watch it (`alert`
 clip); one within 14 m, or sprinting inside 28 m, makes it bolt at 7.5 m/s
 (`run` clip), faster than a sprinting player. A deer that watched for a few
 seconds with the player still near leaves anyway, and a fleeing deer calms
-down once every player is 45 m away. Other species ignore players for now. The model, what it
-replaced, and the planned hunting design are in
+down once every player is 45 m away.
+
+Deer resting on grass sometimes graze (`graze` clip) and really eat it: each
+bite clears the ground cover under the muzzle through the server's
+destroyed-cover record, so the patch replicates and regrows like a dug one.
+Circling crows now and then land, hop and peck on the ground, then take off
+back to their circle; a player within 10 m (20 m sprinting) sends them up. A
+circling bird blocked by terrain climbs at most 12 m before reversing its
+circle. Snow leopards spawn only on ground 8 m above their spawn anchor or on
+steep ground, and wander no more than 6 m below where they were born; a world
+with no high ground near the anchors has none.
+
+An animal can die. A hammer (cutting tool) strike that meets an animal's posed
+voxels before any terrain kills it with one blow: the server despawns it, and
+its voxels, at 0.25 m terrain cells dropped onto the ground below, are written
+into the terrain as ordinary committed edits. The carcass replicates and can be
+cut away like any terrain; it is not saved, since worlds with animals are not.
+
+The model, what it replaced, and the planned hunting design are in
 [animal lifecycle](animal-lifecycle.md). Habitat, species and spawn rules are
 game content in `examples/sandbox`.
 
-Planned, not built: hunting (death despawns the animal and the game emits
-drops), swimming and flight physics beyond the capsule, saving animals, and the
+Planned, not built: health and damage, drops, bears eating carcasses,
+finer-than-terrain carcasses, night behaviour (sleeping deer, roosting crows),
+swimming and flight physics beyond the capsule, saving animals, and the
 population/performance measurements a populated world needs.

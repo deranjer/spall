@@ -35,11 +35,20 @@ CreatureRecord { creature_id, species, translation_m, rotation_xyzw,
   checkpoint capture refuse it. Persisting simple records later only needs a
   small section keyed by id.
 
-## Planned: hunting (not built)
+## Death and carcasses
 
-Death despawns the entity and the game emits drops (items, or a corpse). If a
-corpse is wanted it is an ordinary voxel body created through the existing
-split-to-body path, or a simple prop, never a special animal-owned aggregate.
-Damage and hit detection would be a capsule or box test against the record's
-pose, resolved by the server. None of this exists yet; `despawn_creature` and the
-`CreatureDirector::despawns` hook are the only pieces in place.
+A cutting-tool strike whose aim meets a creature's posed voxels before any
+terrain or body kills it (`Simulation::creature_struck`, resolved by the
+server; the client's claimed target is ignored). `Simulation::kill_creature`
+despawns the record, announced with the usual `CreatureDespawn`, and writes the
+carcass: each posed source voxel maps to the 0.25 m terrain cell its centre
+falls in, the whole shape drops onto the ground below, and only empty cells are
+filled, as single-cell `Place` transactions with server request ids (the same
+path vegetation growth uses). The first cell carries the strike's request id,
+so the swing commits like a normal edit. The carcass is ordinary terrain:
+editable and replicated. The game supplies the posed voxels
+through `HostConfig::creature_shape`.
+
+Not built: health and damage (every strike kills), drops, bears eating
+carcasses, and carcasses finer than terrain cells (that needs runtime-born
+fine-cell bodies, which do not replicate today).

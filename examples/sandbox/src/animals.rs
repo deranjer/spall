@@ -1079,8 +1079,12 @@ impl CreatureDirector for AnimalDirector {
                 (player.state.position_m, vx.hypot(vz) > SPRINT_M_S)
             })
             .collect();
+        let poses = sim.creature_poses();
+        // A killed animal leaves the roster; forget its walker with it.
+        self.walkers
+            .retain(|id, _| poses.iter().any(|pose| pose.creature_id == *id));
         let mut actions = Vec::new();
-        for alive in sim.creature_poses() {
+        for alive in poses {
             let id = alive.creature_id;
             if !(tick + id).is_multiple_of(MOVE_PERIOD_TICKS) {
                 continue;
