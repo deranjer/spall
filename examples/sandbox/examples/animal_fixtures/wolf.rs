@@ -3,9 +3,9 @@ use super::*;
 /// Grey wolf palette: grey coat, dark saddle and tail tip, cream belly and
 /// muzzle, black nose, amber eyes.
 const WOLF_PALETTE: [[u8; 3]; 5] = [
-    [132, 128, 120],
-    [72, 68, 64],
-    [214, 206, 188],
+    [128, 128, 126],
+    [64, 64, 66],
+    [214, 212, 206],
     [28, 26, 24],
     [198, 152, 62],
 ];

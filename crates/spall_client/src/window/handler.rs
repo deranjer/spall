@@ -468,6 +468,7 @@ impl ApplicationHandler for InteractiveApp {
                             view.instances(
                                 replica.creatures(),
                                 replica.now_tick_estimate(),
+                                self.creature_tint_base,
                                 Instant::now(),
                             )
                         };

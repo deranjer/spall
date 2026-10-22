@@ -68,6 +68,8 @@ struct SpeciesDef {
     /// Lives on or near mountains: spawns on high or steep ground and wanders
     /// no lower than a little under where it was born.
     uplands: bool,
+    /// Drawn in its asset's palette colours rather than its materials' own.
+    tinted: bool,
 }
 
 const SPECIES: [SpeciesDef; 6] = [
@@ -84,6 +86,7 @@ const SPECIES: [SpeciesDef; 6] = [
         grazes: true,
         perches: false,
         uplands: false,
+        tinted: false,
     },
     SpeciesDef {
         key: "crow",
@@ -99,6 +102,7 @@ const SPECIES: [SpeciesDef; 6] = [
         grazes: false,
         perches: true,
         uplands: false,
+        tinted: false,
     },
     SpeciesDef {
         key: "trout",
@@ -112,6 +116,7 @@ const SPECIES: [SpeciesDef; 6] = [
         grazes: false,
         perches: false,
         uplands: false,
+        tinted: false,
     },
     SpeciesDef {
         key: "bear",
@@ -125,6 +130,7 @@ const SPECIES: [SpeciesDef; 6] = [
         grazes: false,
         perches: false,
         uplands: false,
+        tinted: false,
     },
     SpeciesDef {
         key: "snow_leopard",
@@ -138,6 +144,7 @@ const SPECIES: [SpeciesDef; 6] = [
         grazes: false,
         perches: false,
         uplands: true,
+        tinted: false,
     },
     SpeciesDef {
         key: "wolf",
@@ -151,6 +158,7 @@ const SPECIES: [SpeciesDef; 6] = [
         grazes: false,
         perches: false,
         uplands: false,
+        tinted: true,
     },
 ];
 /// Gap kept between an animal's lowest cell and the terrain it stands on.
@@ -250,6 +258,7 @@ pub struct AnimalSpecies {
     pub grazes: bool,
     pub perches: bool,
     pub uplands: bool,
+    pub tinted: bool,
 }
 
 /// Decodes every authored species.
@@ -269,6 +278,7 @@ pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
                 grazes: def.grazes,
                 perches: def.perches,
                 uplands: def.uplands,
+                tinted: def.tinted,
             })
         })
         .collect()
