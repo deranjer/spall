@@ -58,7 +58,9 @@ pub(super) const FOG_END_FRACTION: f32 = 0.97;
 /// Furthest ground snow is generated, whatever the view distance: beyond this the
 /// geometry rebuild no longer fits a frame budget.
 pub(super) const SNOW_MAX_RADIUS_M: f32 = 96.0;
-pub(super) const SNOW_REBUILD_INTERVAL: Duration = Duration::from_millis(750);
+pub(super) const SNOW_REBUILD_INTERVAL: Duration = Duration::from_millis(100);
+/// Longest one update may spend meshing snow tiles; the rest wait for the next.
+pub(super) const SNOW_BUILD_BUDGET: Duration = Duration::from_millis(4);
 pub(super) const FOLIAGE_REBUILD_INTERVAL: Duration = Duration::from_millis(400);
 
 /// Trees farther than this (metres) are drawn with half-resolution crowns.

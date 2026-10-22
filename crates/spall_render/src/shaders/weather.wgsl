@@ -41,8 +41,10 @@ fn fs_overlay() -> @location(0) vec4<f32> {
     let fog = clamp(1.0 - camera.effects.x, 0.0, 1.0);
     let dim = clamp(camera.effects.y, 0.0, 0.22);
     let flash = clamp(camera.effects.z, 0.0, 0.08);
-    let fog_colour = mix(vec3<f32>(0.08, 0.11, 0.15), vec3<f32>(0.63, 0.72, 0.82), clamp(fog * 2.0, 0.0, 1.0));
+    // Bright grey-white scaled by the scene's brightness; distance fog does most of the whiteout.
+    let white = vec3<f32>(0.9, 0.95, 1.0) * camera.effects.w * 1.15;
+    let fog_colour = mix(vec3<f32>(0.08, 0.11, 0.15), white, clamp(fog * 2.0, 0.0, 1.0));
     let colour = fog_colour * (1.0 - dim) + vec3<f32>(flash * 2.0);
-    let alpha = clamp(fog * 0.24 + dim + flash, 0.0, 0.32);
+    let alpha = clamp(fog * 0.3 + dim + flash, 0.0, 0.36);
     return vec4<f32>(colour, alpha);
 }

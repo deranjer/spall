@@ -789,7 +789,7 @@ impl ClientPhysics {
         if !state.is_finite() {
             return false;
         }
-        let speed = spall_physics::character::tuning::WALK_SPEED_M_S;
+        let speed = spall_physics::character::tuning::RUN_SPEED_M_S;
         let horizontal = f64::from(params.radius_m + speed * dt_s + 0.05);
         let vertical = f64::from(
             state.velocity_m_s[1]

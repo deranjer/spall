@@ -325,7 +325,6 @@ fn client_config(
         join_token: token,
         script: Vec::new(),
         movement_script,
-        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::Walk,
         run_ticks: SERVER_TICKS,
@@ -402,6 +401,7 @@ fn two_quic_clients_share_authoritative_snow_footprints_and_reset_epoch() {
                 30,
                 AdminCommand::SetWeather {
                     kind: Some(WeatherKind::Snow),
+                    intensity: None,
                 },
             ),
             (RESET_TICK, AdminCommand::ResetWorld),

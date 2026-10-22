@@ -1,30 +1,17 @@
-//! Sandbox-owned live animals: the species catalog and the server-side spawn
-//! director. The engine owns lifecycle ordering, validation and replication;
-//! this module only decides which authored species exist and where they appear.
-
-use std::collections::BTreeMap;
-use std::sync::Arc;
+//! Sandbox-owned live animals: the species list and the server-side spawn
+//! director. The engine keeps each animal's authoritative pose and replicates
+//! it; this module only decides which authored species exist, where they
+//! appear and where they walk or fly.
 
 use glam::DVec3;
 use spall_asset::{Asset, decode};
-use spall_core::{
-    BrickCoord, CellSizeCode, CreatureGeneration, CreatureId, CreatureKey, GlobalCell, MaterialId,
-    Revision, VolumeId, WorldEpoch,
-};
-use spall_physics::{PartTransform, Representation};
-use spall_protocol::{
-    CreatureAssetIdentity, CreatureClipMode, CreatureLifecycleState, CreaturePartBinding,
-    CreatureStateV1, Hash32, OwnedCreatureAsset, OwnedCreatureCatalog, OwnedCreatureSpecies,
-    WIRE_SCHEMA_VERSION, content_manifest_hash,
-};
+use spall_core::GlobalCell;
+use spall_protocol::CreatureRecord;
 use spall_server::creature_service::{
     CreatureAction, CreatureActionOutcome, CreatureDirector, CreatureIdPlan,
 };
-use spall_sim::{
-    AuthoritativeCreatureIntent, CreatureBirthPartInput, CreatureMoveOutcome, CreatureMoveRequest,
-    CreatureWalkRequest, Simulation,
-};
-use spall_voxel::{Brick, EditPlan, Sample};
+use spall_sim::{CreatureMoveOutcome, CreatureMoveRequest, CreatureWalkRequest, Simulation};
+use spall_voxel::Sample;
 use thiserror::Error;
 
 use crate::animal_habitat::{
@@ -87,12 +74,14 @@ const SPECIES: [SpeciesDef; 5] = [
         capsule_m: (0.28, 0.1),
     },
 ];
-const CELL_M: f32 = 0.0625;
 /// Gap kept between an animal's lowest cell and the terrain it stands on.
 pub const GROUND_CLEARANCE_M: f64 = 0.05;
 /// Locomotion selectors carried in motion frames.
 pub const LOCOMOTION_IDLE: u8 = 0;
 pub const LOCOMOTION_MOVE: u8 = 1;
+/// Capsule swept around a flying animal (about a crow: small body, wings folded in).
+const FLY_CAPSULE_RADIUS_M: f32 = 0.25;
+const FLY_CAPSULE_HALF_HEIGHT_M: f32 = 0.1;
 /// A creature is moved this often (7.5 Hz at 60 Hz), staggered by id.
 const MOVE_PERIOD_TICKS: u64 = 8;
 const MOVE_DT_S: f64 = MOVE_PERIOD_TICKS as f64 / 60.0;
@@ -125,15 +114,6 @@ pub struct AnimalSpecies {
     pub capsule_m: (f32, f32),
 }
 
-impl AnimalSpecies {
-    pub fn identity(&self) -> CreatureAssetIdentity {
-        CreatureAssetIdentity {
-            uuid: self.asset.uuid,
-            logical_hash: Hash32(self.asset.content_hash),
-        }
-    }
-}
-
 /// Decodes every authored species.
 pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
     SPECIES
@@ -150,83 +130,6 @@ pub fn species() -> Result<Vec<AnimalSpecies>, AnimalError> {
             })
         })
         .collect()
-}
-
-/// The validation catalog both server and client lend to the engine.
-pub fn catalog(species: &[AnimalSpecies]) -> Arc<OwnedCreatureCatalog> {
-    let materials = crate::game::manifest();
-    let mapping = crate::animal_visual::material_mapping(&materials);
-    Arc::new(OwnedCreatureCatalog {
-        assets: species
-            .iter()
-            .map(|s| {
-                let mut parts: Vec<u32> = s.asset.parts.iter().map(|p| p.id).collect();
-                parts.sort_unstable();
-                OwnedCreatureAsset {
-                    uuid: s.asset.uuid,
-                    logical_hash: Hash32(s.asset.content_hash),
-                    part_ids: parts,
-                    clip_names: s.asset.clips.iter().map(|c| c.name.clone()).collect(),
-                    portable_material_keys: s.asset.material_keys.clone(),
-                }
-            })
-            .collect(),
-        species: species
-            .iter()
-            .map(|s| OwnedCreatureSpecies {
-                key: s.key.to_owned(),
-                version: 1,
-                enabled: true,
-                asset: s.identity(),
-            })
-            .collect(),
-        materials,
-        material_mapping_version: 1,
-        material_mapping: mapping.into_iter().collect(),
-    })
-}
-
-/// Complete sampled local pose of every part, in part-id order, as the physics
-/// articulated-pose API requires.
-pub fn pose_parts(
-    asset: &Asset,
-    clip: &str,
-    tick: f64,
-) -> Result<Vec<(u32, PartTransform)>, String> {
-    let sampled = spall_asset::sample_clip(asset, clip, tick).map_err(|e| e.to_string())?;
-    Ok(sampled
-        .into_iter()
-        .map(|(id, pose)| {
-            (
-                id,
-                PartTransform {
-                    translation_m: (pose.transform.translation * CELL_M).to_array(),
-                    rotation_xyzw: pose.transform.rotation.normalize().to_array(),
-                },
-            )
-        })
-        .collect())
-}
-
-/// Part-local occupied cells (6.25 cm) with their mapped manifest material.
-fn part_cells(
-    asset: &Asset,
-    mapping: &BTreeMap<String, MaterialId>,
-) -> BTreeMap<u32, Vec<([i32; 3], MaterialId)>> {
-    let mut cells: BTreeMap<u32, Vec<([i32; 3], MaterialId)>> =
-        asset.parts.iter().map(|p| (p.id, Vec::new())).collect();
-    for run in &asset.runs {
-        let material = mapping[&asset.material_keys[usize::from(run.material_slot - 1)]];
-        if let Some(list) = cells.get_mut(&run.part_id) {
-            for dx in 0..run.length_x {
-                list.push((
-                    [run.start[0] + dx as i32, run.start[1], run.start[2]],
-                    material,
-                ));
-            }
-        }
-    }
-    cells
 }
 
 /// Root-relative bounds of every cell over the idle and move clips, metres.
@@ -297,7 +200,6 @@ struct Placement {
 /// Seeded, bounded director: spawns a fixed starting population around the
 /// world's spawn points, a few animals per tick.
 pub struct AnimalDirector {
-    catalog: Arc<OwnedCreatureCatalog>,
     species: Vec<AnimalSpecies>,
     /// Root-to-lowest-foot offset over every pose of the idle and move clips.
     walk_feet: Vec<f32>,
@@ -322,7 +224,6 @@ impl AnimalDirector {
     /// species past the end of the slice get none.
     pub fn new(anchors: Vec<[f64; 3]>, targets: &[u32], seed: u64) -> Result<Self, AnimalError> {
         let species = species()?;
-        let catalog = catalog(&species);
         let materials = crate::animal_visual::material_mapping(&crate::game::manifest());
         let visuals = species
             .iter()
@@ -351,7 +252,6 @@ impl AnimalDirector {
             .unzip();
         let count = species.len();
         Ok(Self {
-            catalog,
             species,
             walk_feet,
             envelope_m,
@@ -465,129 +365,29 @@ impl AnimalDirector {
         })
     }
 
-    fn birth(
-        &self,
-        sim: &Simulation,
-        placement: &Placement,
-        ids: &mut CreatureIdPlan,
-    ) -> Option<AuthoritativeCreatureIntent> {
-        let species = &self.species[placement.species];
-        let asset = &species.asset;
-        let materials = sim.world().materials();
-        let mapping = crate::animal_visual::material_mapping(materials);
-        let mut cells = part_cells(asset, &mapping);
-        let creature_id = ids.creature_id();
-        let mut bindings = Vec::new();
-        let mut parts = Vec::new();
-        let mut asset_parts = asset.parts.clone();
-        asset_parts.sort_by_key(|p| p.id);
-        for part in &asset_parts {
-            let volume_id = VolumeId::new(ids.volume_id()).ok()?;
-            let part_cells = cells.remove(&part.id)?;
-            let mut volume = spall_voxel::Volume::new(volume_id, CellSizeCode::Sixteenth);
-            // Every brick the part's box touches must be resident, or the
-            // physics occupancy grid would read absent bricks as unknown.
-            let (mut lo, mut hi) = ([i32::MAX; 3], [i32::MIN; 3]);
-            for (at, _) in &part_cells {
-                for axis in 0..3 {
-                    lo[axis] = lo[axis].min(at[axis]);
-                    hi[axis] = hi[axis].max(at[axis]);
-                }
-            }
-            let brick = |v: i32| i64::from(v).div_euclid(32);
-            for bz in brick(lo[2])..=brick(hi[2]) {
-                for by in brick(lo[1])..=brick(hi[1]) {
-                    for bx in brick(lo[0])..=brick(hi[0]) {
-                        volume
-                            .insert_brick(
-                                BrickCoord::new(bx, by, bz),
-                                Brick::uniform(MaterialId::AIR, Revision(1)),
-                            )
-                            .ok()?;
-                    }
-                }
-            }
-            let mut plan = EditPlan::new(volume_id);
-            for (at, material) in part_cells {
-                plan.set(
-                    GlobalCell::new(at[0].into(), at[1].into(), at[2].into()),
-                    material,
-                );
-            }
-            volume.apply_edit(&plan).ok()?;
-            bindings.push(CreaturePartBinding {
-                part_id: part.id,
-                source_volume_id: volume_id,
-                source_revision: volume.next_revision().get().saturating_sub(1).max(1),
-            });
-            parts.push(CreatureBirthPartInput {
-                part_id: part.id,
-                parent_id: (part.parent_id != 0).then_some(part.parent_id),
-                local_transform: PartTransform {
-                    translation_m: (part.rest.translation * CELL_M).to_array(),
-                    rotation_xyzw: part.rest.rotation.normalize().to_array(),
-                },
-                volume,
-            });
-        }
+    fn birth(&self, placement: &Placement, ids: &mut CreatureIdPlan) -> CreatureRecord {
         let (sin, cos) = (
             (placement.yaw_rad * 0.5).sin(),
             (placement.yaw_rad * 0.5).cos(),
         );
-        let mapping_hash = self
-            .catalog
-            .with_view(|view| view.material_mapping_hash)
-            .ok()?;
-        let state = CreatureStateV1 {
-            schema: WIRE_SCHEMA_VERSION,
-            key: CreatureKey::new(
-                sim.creature_allocator_snapshot()?.world_id,
-                WorldEpoch::new(sim.creature_allocator_snapshot()?.world_epoch).ok()?,
-                CreatureId::new(creature_id).ok()?,
-                CreatureGeneration::INITIAL,
-            )
-            .ok()?,
-            state_revision: 1,
-            lifecycle: CreatureLifecycleState::Alive,
-            species_key: species.key.to_owned(),
-            species_version: 1,
-            asset: species.identity(),
-            material_manifest_hash: content_manifest_hash(materials),
-            material_mapping_version: 1,
-            material_mapping_hash: mapping_hash,
-            clip_name: "idle".into(),
-            clip_mode: CreatureClipMode::Playing,
+        CreatureRecord {
+            creature_id: ids.creature_id(),
+            species: self.species[placement.species].key.to_owned(),
+            translation_m: placement.root_m.to_array(),
+            rotation_xyzw: [0.0, sin as f32, 0.0, cos as f32],
+            locomotion_tag: LOCOMOTION_IDLE,
             clip_phase_tick: 0,
-            clip_subtick_remainder: 0,
-            clip_epoch: 1,
-            source_bindings: bindings,
-            aggregate_topology_revision: 1,
-            pose_epoch: 1,
-            root_translation_m: placement.root_m.to_array(),
-            root_rotation_xyzw: [0.0, sin as f32, 0.0, cos as f32],
-            linear_velocity_m_s: [0.0; 3],
-            angular_velocity_rad_s: [0.0; 3],
-            locomotion_tag: 0,
-        };
-        Some(AuthoritativeCreatureIntent::Birth {
-            state: Box::new(state),
-            parts,
-            representation: Representation::MergedCuboids,
-        })
+        }
     }
 }
 
 impl CreatureDirector for AnimalDirector {
-    fn catalog(&self) -> Arc<OwnedCreatureCatalog> {
-        self.catalog.clone()
-    }
-
     fn plan(
         &mut self,
         tick: u64,
         sim: &Simulation,
         ids: &mut CreatureIdPlan,
-    ) -> Vec<AuthoritativeCreatureIntent> {
+    ) -> Vec<CreatureRecord> {
         // Let the world settle for a moment before the first births.
         if tick < 10 || self.done() {
             return Vec::new();
@@ -603,9 +403,9 @@ impl CreatureDirector for AnimalDirector {
             let Some(placement) = self.find_placement(sim, species) else {
                 continue;
             };
-            let mut trial = *ids;
-            if let Some(intent) = self.birth(sim, &placement, &mut trial) {
-                if let AuthoritativeCreatureIntent::Birth { state, .. } = &intent {
+            {
+                let record = self.birth(&placement, ids);
+                {
                     let gait = match self.species[species].habitat {
                         AnimalHabitat::Flying => Gait::Orbit {
                             theta: self.unit() * std::f64::consts::TAU,
@@ -640,7 +440,7 @@ impl CreatureDirector for AnimalDirector {
                         _ => home,
                     };
                     self.walkers.insert(
-                        state.key.creature_id.get(),
+                        record.creature_id,
                         Walker {
                             species,
                             home,
@@ -655,7 +455,6 @@ impl CreatureDirector for AnimalDirector {
                         },
                     );
                 }
-                *ids = trial;
                 self.spawned[species] += 1;
                 tracing::info!(
                     species = self.species[species].key,
@@ -664,7 +463,7 @@ impl CreatureDirector for AnimalDirector {
                     z = placement.root_m.z,
                     "animal placed"
                 );
-                intents.push(intent);
+                intents.push(record);
             }
         }
         intents
@@ -676,24 +475,22 @@ impl CreatureDirector for AnimalDirector {
         self.walkers.clear();
     }
 
-    fn on_action_outcome(&mut self, key: spall_core::CreatureKey, outcome: CreatureActionOutcome) {
-        let Some(walker) = self.walkers.get_mut(&key.creature_id.get()) else {
+    fn on_action_outcome(&mut self, creature_id: u64, outcome: CreatureActionOutcome) {
+        let Some(walker) = self.walkers.get_mut(&creature_id) else {
             return;
         };
         match outcome {
-            CreatureActionOutcome::Swept(CreatureMoveOutcome::Blocked { .. }) => {
+            CreatureActionOutcome::Fly(CreatureMoveOutcome::Blocked) => {
                 self.stats[walker.species].1 += 1;
                 // A bird whose circle hits something solid (a tree) flies higher.
                 if matches!(walker.gait, Gait::Orbit { .. }) {
                     walker.home[1] += 1.5;
                 }
             }
-            CreatureActionOutcome::Swept(CreatureMoveOutcome::Staged) => {
+            CreatureActionOutcome::Fly(CreatureMoveOutcome::Moved) => {
                 self.stats[walker.species].0 += 1;
             }
-            CreatureActionOutcome::Swept(CreatureMoveOutcome::Busy)
-            | CreatureActionOutcome::Walked(None) => {}
-            CreatureActionOutcome::Walked(Some(walked)) => {
+            CreatureActionOutcome::Walked(walked) => {
                 self.stats[walker.species].0 += 1;
                 let moved = walked.moved_m[0].hypot(walked.moved_m[2]);
                 if walker.last_desired > 0.02 && moved < walker.last_desired * 0.35 {
@@ -724,16 +521,14 @@ impl CreatureDirector for AnimalDirector {
             (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
         };
         let mut actions = Vec::new();
-        for alive in sim.alive_creatures() {
-            let id = alive.key.creature_id.get();
+        for alive in sim.creature_poses() {
+            let id = alive.creature_id;
             if !(tick + id).is_multiple_of(MOVE_PERIOD_TICKS) {
                 continue;
             }
             let Some(mut walker) = self.walkers.get(&id).copied() else {
                 continue;
             };
-            let species_key = self.species[walker.species].key;
-            let move_clip = locomotion_clip(species_key, LOCOMOTION_MOVE).unwrap_or("idle");
             let here = alive.translation_m;
             walker.at = here;
             let flying = matches!(walker.gait, Gait::Orbit { .. });
@@ -829,32 +624,29 @@ impl CreatureDirector for AnimalDirector {
             }
             // A creature that just stopped sends one stationary pose so clients
             // switch from the move clip back to idle.
-            let (clip, tag, phase) = if moving {
-                (move_clip, LOCOMOTION_MOVE, walker.clip_phase)
+            let (tag, phase) = if moving {
+                (LOCOMOTION_MOVE, walker.clip_phase)
             } else {
-                ("idle", LOCOMOTION_IDLE, 0)
-            };
-            let Ok(parts) = pose_parts(&self.species[walker.species].asset, clip, phase as f64)
-            else {
-                continue;
+                (LOCOMOTION_IDLE, 0)
             };
             let (sin, cos) = ((yaw * 0.5).sin(), (yaw * 0.5).cos());
             let rotation = [0.0, sin as f32, 0.0, cos as f32];
             if flying {
-                actions.push(CreatureAction::Swept(CreatureMoveRequest {
-                    key: alive.key,
+                actions.push(CreatureAction::Fly(CreatureMoveRequest {
+                    creature_id: id,
                     target_translation_m: fly_target,
                     target_rotation_xyzw: rotation,
-                    parts,
                     locomotion_tag: tag,
                     clip_phase_tick: phase,
+                    feet_offset_m: self.walk_feet[walker.species],
+                    capsule_radius_m: FLY_CAPSULE_RADIUS_M,
+                    capsule_half_height_m: FLY_CAPSULE_HALF_HEIGHT_M,
                 }));
             } else {
                 actions.push(CreatureAction::Walk(CreatureWalkRequest {
-                    key: alive.key,
+                    creature_id: id,
                     desired_step_m: [desired[0] as f32, desired[1] as f32],
                     target_rotation_xyzw: rotation,
-                    parts,
                     locomotion_tag: tag,
                     clip_phase_tick: phase,
                     feet_offset_m: self.walk_feet[walker.species],

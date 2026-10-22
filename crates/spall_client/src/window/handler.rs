@@ -8,7 +8,7 @@ pub(super) struct HeldKeys {
     right: bool,
     jump: bool,
     descend: bool,
-    fast: bool,
+    pub(super) fast: bool,
 }
 
 impl HeldKeys {
@@ -59,6 +59,7 @@ impl ApplicationHandler for InteractiveApp {
             window.clone(),
             self.environment,
             &self.render_materials,
+            &self.material_kinds,
             self.uncapped,
             self.day_night_cycle,
         ) {
@@ -140,7 +141,22 @@ impl ApplicationHandler for InteractiveApp {
                         }
                     }
                     KeyCode::ControlLeft | KeyCode::ControlRight => self.held.descend = held,
-                    KeyCode::ShiftLeft | KeyCode::ShiftRight => self.held.fast = held,
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                        self.held.fast = held;
+                        if self.fly_eye.is_none() {
+                            self.session.input.set_button(BUTTON_SPRINT, held);
+                        }
+                    }
+                    KeyCode::F8 if held && !event.repeat => {
+                        if self.player_view.is_some() {
+                            self.third_person = !self.third_person;
+                            println!(
+                                "spall-interactive: third-person view {}",
+                                if self.third_person { "ON" } else { "OFF" }
+                            );
+                        }
+                        return;
+                    }
                     KeyCode::F12 if held && !event.repeat => {
                         let stamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -229,6 +245,8 @@ impl ApplicationHandler for InteractiveApp {
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
                 self.update_ambience();
+                self.update_footsteps(now);
+                self.update_endurance();
                 let handler_started = now;
                 self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);
@@ -382,7 +400,22 @@ impl ApplicationHandler for InteractiveApp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
+                if let Some(mut replica) =
+                    self.session.replica.get().and_then(|r| r.try_lock().ok())
+                {
+                    let focus = self
+                        .fly_eye
+                        .map(|eye| eye.to_array().map(f64::from))
+                        .or_else(|| {
+                            (*self.session.view.lock().unwrap_or_else(|e| e.into_inner()))
+                                .map(|v| v.predicted.position_m)
+                        });
+                    if let Some(position) = focus {
+                        replica.set_snow_focus(
+                            (position[0] / 4.0).floor() as i32,
+                            (position[2] / 4.0).floor() as i32,
+                        );
+                    }
                     let snow_generation = replica.snow_generation();
                     if renderer.snow_generation != Some(snow_generation) {
                         renderer.snow_frames = replica.snow_frames_shared();
@@ -420,25 +453,55 @@ impl ApplicationHandler for InteractiveApp {
                         self.sky_dirty = false;
                     }
                 }
+                // The replica lock is only tried, never waited on, so the frame
+                // never stalls behind the network thread. A busy frame reuses
+                // the last creatures and players instead of not drawing them.
                 if let Some(view) = &self.creature_view {
-                    // The network thread holds the replica while it applies a
-                    // batch. Drawing no animals on such a frame made the whole
-                    // herd blink out; draw the last frame's cubes instead.
                     if let Some(replica) =
                         self.session.replica.get().and_then(|r| r.try_lock().ok())
                     {
-                        self.creature_overlay.clear();
-                        if let Some(creatures) = replica.creatures()
-                            && !creatures.is_empty()
-                        {
-                            self.creature_overlay.extend(view.instances(
-                                creatures,
+                        self.last_creature_cubes = if replica.creatures().is_empty() {
+                            Vec::new()
+                        } else {
+                            view.instances(
+                                replica.creatures(),
                                 replica.now_tick_estimate(),
                                 Instant::now(),
-                            ));
-                        }
+                            )
+                        };
                     }
-                    overlay.extend_from_slice(&self.creature_overlay);
+                    overlay.extend_from_slice(&self.last_creature_cubes);
+                }
+                let water = self
+                    .session
+                    .column_surface
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .query();
+                if let Some(player_view) = &self.player_view {
+                    if let Some(mut replica) =
+                        self.session.replica.get().and_then(|r| r.try_lock().ok())
+                    {
+                        let tick = replica.render_tick(Instant::now());
+                        self.last_remote_players = replica
+                            .remote_players(tick)
+                            .into_iter()
+                            .map(|p| PlayerBody {
+                                entity: p.entity.get(),
+                                feet_m: p.feet_m,
+                                velocity_m_s: p.velocity_m_s,
+                                in_water: player_swims(&water, p.feet_m),
+                                look_yaw: None,
+                            })
+                            .collect();
+                    }
+                    if !self.last_remote_players.is_empty() {
+                        overlay.extend(player_view.instances(
+                            &self.last_remote_players,
+                            self.player_tint_base,
+                            Instant::now(),
+                        ));
+                    }
                 }
                 let outcome = match renderer.begin_frame(None, &overlay) {
                     Ok(outcome) => outcome,
@@ -503,9 +566,11 @@ impl ApplicationHandler for InteractiveApp {
                                 self.last_built_pos = None;
                             }
                         }
+                        let mut followed_eye = None;
                         let cam = fresh_view.map(|v| {
                             let followed =
                                 self.camera_follow.eye(v, render_now, local_poses.is_none());
+                            followed_eye = Some(followed);
                             if let Some(eye) = &mut self.fly_eye {
                                 let dt = self
                                     .last_fly_update
@@ -572,6 +637,68 @@ impl ApplicationHandler for InteractiveApp {
                                 eye,
                             ));
                         }
+                        // Third person: the hammer and torch still aim from the eye
+                        // (`cam`); only the drawn camera moves back, and the local
+                        // body appears. First person never draws it.
+                        let mut render_cam = cam;
+                        if self.third_person
+                            && self.fly_eye.is_none()
+                            && let (Some(player_view), Some(v), Some(eye), Some((_, dir))) =
+                                (&self.player_view, fresh_view, followed_eye, cam)
+                        {
+                            let target = self
+                                .session
+                                .replica
+                                .get()
+                                .and_then(|r| r.try_lock().ok())
+                                .map(|replica| {
+                                    replica
+                                        .terrain_volume()
+                                        .map_or(THIRD_PERSON_DISTANCE_M, |volume| {
+                                            third_person_distance(volume, eye, dir)
+                                        })
+                                });
+                            // Pull in at once so terrain never ends up inside the
+                            // camera, ease back out, and hold the last distance on
+                            // a frame that found the replica busy.
+                            let dt = self.third_person_at.map_or(0.0, |at| {
+                                render_now.saturating_duration_since(at).as_secs_f32()
+                            });
+                            self.third_person_at = Some(render_now);
+                            if let Some(target) = target {
+                                let current = self.third_person_distance_m;
+                                self.third_person_distance_m = if target < current {
+                                    target
+                                } else {
+                                    current + (target - current) * (dt * 4.0).min(1.0)
+                                };
+                            }
+                            let reach = self.third_person_distance_m;
+                            render_cam = Some((third_person_eye(eye, dir, reach), dir));
+                            let eye_height =
+                                f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
+                            let feet = [
+                                f64::from(eye.x),
+                                f64::from(eye.y) - eye_height,
+                                f64::from(eye.z),
+                            ];
+                            let local = PlayerBody {
+                                entity: 0,
+                                feet_m: feet,
+                                velocity_m_s: v.predicted.velocity_m_s,
+                                in_water: player_swims(&water, feet),
+                                look_yaw: Some(self.yaw),
+                            };
+                            overlay.extend(player_view.instances(
+                                &[local],
+                                self.player_tint_base,
+                                render_now,
+                            ));
+                            renderer
+                                .scene
+                                .set_overlay(&renderer.device, &renderer.queue, &overlay);
+                        }
+                        renderer.set_endurance(self.endurance_view);
                         renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(
                             || CrosshairView {
                                 in_reach: self.hammer_target.is_some(),
@@ -712,7 +839,7 @@ impl ApplicationHandler for InteractiveApp {
                                 .map(|state| {
                                     format!(
                                         "Weather: {} ({}) | {} | {:.1} C",
-                                        weather_label(state.kind),
+                                        weather_state_label(state),
                                         if state.override_kind.is_some() {
                                             "forced"
                                         } else {
@@ -731,6 +858,7 @@ impl ApplicationHandler for InteractiveApp {
                                 .unwrap_or_else(|| "Weather: waiting for server".into());
                             menu.nature_volume = self.nature_volume;
                             menu.weather_volume = self.weather_volume;
+                            menu.footstep_volume = self.footstep_volume;
                             menu.nature_muted = self.nature_muted;
                             menu.nature_selection = self
                                 .nature_preview
@@ -749,9 +877,23 @@ impl ApplicationHandler for InteractiveApp {
                             menu.body_preview = self.body_preview;
                             menu
                         });
+                        renderer.eye_submerged = render_cam.as_ref().is_some_and(|(eye, _)| {
+                            eye_below_surface(
+                                self.session
+                                    .column_surface
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .sample_at_m(
+                                        f64::from(eye.x),
+                                        f64::from(eye.y),
+                                        f64::from(eye.z),
+                                    ),
+                                f64::from(eye.y),
+                            )
+                        });
                         match renderer.finish_frame(
                             acquired,
-                            cam.as_ref(),
+                            render_cam.as_ref(),
                             &body_mesh_updates,
                             &live_body_meshes,
                             None,
@@ -769,6 +911,8 @@ impl ApplicationHandler for InteractiveApp {
                 self.hud.record_frame(&timing);
                 if let Some(renderer) = &self.renderer {
                     self.weather_exposure = renderer.weather_exposure;
+                    self.weather_submerge = renderer.weather_submerge;
+                    self.weather_wind = renderer.weather_wind;
                 }
                 if self.frame_history.len() >= FRAME_HISTORY {
                     self.frame_history.pop_front();
@@ -840,10 +984,15 @@ impl ApplicationHandler for InteractiveApp {
                     self.session
                         .push_admin(spall_protocol::AdminCommand::SetDamGate { open });
                 }
-                if let Some(kind) = menu_actions.set_weather {
+                if let Some((kind, intensity)) = menu_actions.set_weather {
                     self.admin_request_pending = true;
                     self.session
-                        .push_admin(spall_protocol::AdminCommand::SetWeather { kind });
+                        .push_admin(spall_protocol::AdminCommand::SetWeather { kind, intensity });
+                }
+                if let Some(season) = menu_actions.set_season {
+                    self.admin_request_pending = true;
+                    self.session
+                        .push_admin(spall_protocol::AdminCommand::SetSeason { season });
                 }
                 if menu_actions.toggle_nature_audio {
                     self.nature_muted = !self.nature_muted;
@@ -864,6 +1013,8 @@ impl ApplicationHandler for InteractiveApp {
                     (self.nature_volume + menu_actions.nature_volume_delta).clamp(0.0, 1.0);
                 self.weather_volume =
                     (self.weather_volume + menu_actions.weather_volume_delta).clamp(0.0, 1.0);
+                self.footstep_volume =
+                    (self.footstep_volume + menu_actions.footstep_volume_delta).clamp(0.0, 1.0);
                 if menu_actions.toggle_weather_effects {
                     self.weather_effects_enabled = !self.weather_effects_enabled;
                 }
@@ -906,7 +1057,15 @@ impl ApplicationHandler for InteractiveApp {
                         renderer.snow_frames.clear();
                         renderer.snow_generation = None;
                         renderer.snow_upload_key = None;
+                        let resident = renderer.snow_presentation.resident_keys();
                         renderer.snow_presentation = crate::snow::SnowPresentation::new();
+                        if let Err(error) =
+                            renderer
+                                .scene
+                                .update_snow_meshes(&renderer.device, &[], &resident)
+                        {
+                            tracing::warn!(%error, "clearing snow meshes failed");
+                        }
                     }
                     if self.fly_eye.is_some() {
                         self.fly_eye = None;

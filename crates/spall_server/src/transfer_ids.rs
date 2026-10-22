@@ -1,23 +1,20 @@
 //! One checked runtime allocator for transfer IDs shared by all server paths.
 //!
 //! Low sequence values are global across kinds. The kind is encoded only in
-//! the existing reset/split bits and the reserved creature-lifecycle bit, so
-//! an abandoned reservation still burns its sequence number across namespaces.
+//! the reset/split bits, so an abandoned reservation still burns its sequence
+//! number across namespaces.
 
 use spall_protocol::{SPLIT_BULK_TRANSFER_ID_BIT, TransferId, WORLD_RESET_TRANSFER_ID_BIT};
 use thiserror::Error;
 
-pub use spall_protocol::CREATURE_LIFECYCLE_TRANSFER_ID_BIT;
-const KIND_BITS: u64 =
-    SPLIT_BULK_TRANSFER_ID_BIT | WORLD_RESET_TRANSFER_ID_BIT | CREATURE_LIFECYCLE_TRANSFER_ID_BIT;
-const LOW_ID_MAX: u64 = CREATURE_LIFECYCLE_TRANSFER_ID_BIT - 1;
+const KIND_BITS: u64 = SPLIT_BULK_TRANSFER_ID_BIT | WORLD_RESET_TRANSFER_ID_BIT;
+const LOW_ID_MAX: u64 = (1 << 61) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferNamespace {
     Baseline,
     Reset,
     Split,
-    CreatureLifecycle,
 }
 
 impl TransferNamespace {
@@ -26,7 +23,6 @@ impl TransferNamespace {
             Self::Baseline => 0,
             Self::Reset => WORLD_RESET_TRANSFER_ID_BIT,
             Self::Split => SPLIT_BULK_TRANSFER_ID_BIT,
-            Self::CreatureLifecycle => CREATURE_LIFECYCLE_TRANSFER_ID_BIT,
         }
     }
 
@@ -35,7 +31,6 @@ impl TransferNamespace {
             0 => Some(Self::Baseline),
             WORLD_RESET_TRANSFER_ID_BIT => Some(Self::Reset),
             SPLIT_BULK_TRANSFER_ID_BIT => Some(Self::Split),
-            CREATURE_LIFECYCLE_TRANSFER_ID_BIT => Some(Self::CreatureLifecycle),
             _ => None,
         }
     }
@@ -184,18 +179,14 @@ mod tests {
         let mut baseline = allocator.reserve(TransferNamespace::Baseline, 2).unwrap();
         let mut reset = allocator.reserve(TransferNamespace::Reset, 1).unwrap();
         let mut split = allocator.reserve(TransferNamespace::Split, 1).unwrap();
-        let mut lifecycle = allocator
-            .reserve(TransferNamespace::CreatureLifecycle, 1)
-            .unwrap();
         let ids = [
             baseline.next_id().unwrap(),
             baseline.next_id().unwrap(),
             reset.next_id().unwrap(),
             split.next_id().unwrap(),
-            lifecycle.next_id().unwrap(),
         ];
         let lows: Vec<_> = ids.iter().map(|id| id.0 & !KIND_BITS).collect();
-        assert_eq!(lows, [1, 2, 3, 4, 5]);
+        assert_eq!(lows, [1, 2, 3, 4]);
         assert_eq!(
             ids.iter()
                 .map(|id| id.0)
@@ -211,11 +202,7 @@ mod tests {
             ids[3].0 & SPLIT_BULK_TRANSFER_ID_BIT,
             SPLIT_BULK_TRANSFER_ID_BIT
         );
-        assert_eq!(
-            ids[4].0 & CREATURE_LIFECYCLE_TRANSFER_ID_BIT,
-            CREATURE_LIFECYCLE_TRANSFER_ID_BIT
-        );
-        assert_eq!(allocator.next_low(), 6);
+        assert_eq!(allocator.next_low(), 5);
     }
 
     #[test]
@@ -257,17 +244,16 @@ mod tests {
         let mut allocator = TransferIdAllocator::seeded_from_retained([
             TransferId(WORLD_RESET_TRANSFER_ID_BIT | 37),
             TransferId(SPLIT_BULK_TRANSFER_ID_BIT | 12),
-            TransferId(CREATURE_LIFECYCLE_TRANSFER_ID_BIT | 28),
             TransferId(19),
         ])
         .unwrap();
         assert_eq!(allocator.next_low(), 38);
         assert_eq!(
             allocator
-                .reserve(TransferNamespace::CreatureLifecycle, 1)
+                .reserve(TransferNamespace::Split, 1)
                 .unwrap()
                 .next_id(),
-            Some(TransferId(CREATURE_LIFECYCLE_TRANSFER_ID_BIT | 38))
+            Some(TransferId(SPLIT_BULK_TRANSFER_ID_BIT | 38))
         );
     }
 
@@ -279,7 +265,7 @@ mod tests {
         );
         assert_eq!(
             TransferIdAllocator::seeded_from_retained([TransferId(
-                WORLD_RESET_TRANSFER_ID_BIT | CREATURE_LIFECYCLE_TRANSFER_ID_BIT | 4
+                WORLD_RESET_TRANSFER_ID_BIT | SPLIT_BULK_TRANSFER_ID_BIT | 4
             )])
             .unwrap_err(),
             TransferIdError::InvalidRetainedId

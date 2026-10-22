@@ -1,251 +1,27 @@
-//! End-to-end checks: a real server `Simulation` publishes lifecycle
-//! transactions and a `ReplicaWorld` converges on the same ownership records.
+//! The replica creature store: ordered spawn/despawn, idempotent join lists, and
+//! motion that is ignored unless it belongs to a held creature.
 use super::*;
-use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
-use spall_core::{
-    CellSizeCode, CreatureGeneration, CreatureId, GlobalCell, MaterialId, Tick, WorldEpoch,
-};
-use spall_physics::{PartTransform, Representation};
-use spall_protocol::{
-    ControlSeq, CreatureAssetIdentity, CreatureClipMode, CreatureLifecycleState,
-    CreaturePartBinding, CreatureStateV1, Hash32, OwnedCreatureAsset, OwnedCreatureSpecies,
-    WIRE_SCHEMA_VERSION, content_manifest_hash,
-};
-use spall_sim::{
-    AuthoritativeCreatureIntent, CommittedCreatureLifecycle, CreatureBirthPartInput, Simulation,
-    SimulationConfig, fixtures,
-};
-use spall_voxel::{EditPlan, Volume};
+use spall_protocol::{CreatureMotionEntry, WIRE_SCHEMA_VERSION};
 
-const WORLD: u128 = 900;
-
-fn catalog(materials: spall_core::MaterialManifest) -> Arc<OwnedCreatureCatalog> {
-    let asset = CreatureAssetIdentity {
-        uuid: [3; 16],
-        logical_hash: Hash32([4; 32]),
-    };
-    Arc::new(OwnedCreatureCatalog {
-        assets: vec![OwnedCreatureAsset {
-            uuid: asset.uuid,
-            logical_hash: asset.logical_hash,
-            part_ids: vec![1],
-            clip_names: vec!["idle".into()],
-            portable_material_keys: vec!["stone".into()],
-        }],
-        species: vec![OwnedCreatureSpecies {
-            key: "deer".into(),
-            version: 1,
-            enabled: true,
-            asset,
-        }],
-        materials,
-        material_mapping_version: 1,
-        material_mapping: vec![("stone".into(), MaterialId(1))],
-    })
-}
-
-fn server() -> (Simulation, Arc<OwnedCreatureCatalog>) {
-    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
-    sim.initialize_creature_host(WorldId::from_u128(WORLD))
-        .unwrap();
-    let catalog = catalog(sim.world().materials().clone());
-    (sim, catalog)
-}
-
-fn birth_intent(
-    sim: &Simulation,
-    catalog: &OwnedCreatureCatalog,
-    root: [f64; 3],
-) -> AuthoritativeCreatureIntent {
-    let creature_id = sim.creature_allocator_snapshot().unwrap().next_creature_id;
-    let volume_id = spall_core::VolumeId::new(sim.world().registry().counters().1).unwrap();
-    let mut volume = Volume::new(volume_id, CellSizeCode::Quarter);
-    volume
-        .apply_edit(&EditPlan::filled_box(
-            volume_id,
-            GlobalCell::new(0, 0, 0),
-            GlobalCell::new(0, 0, 0),
-            MaterialId(1),
-        ))
-        .unwrap();
-    let mapping_hash = catalog
-        .with_view(|view| view.material_mapping_hash)
-        .unwrap();
-    let state = CreatureStateV1 {
+fn spawn(creature_id: u64, x: f64) -> CreatureSpawn {
+    CreatureSpawn {
         schema: WIRE_SCHEMA_VERSION,
-        key: CreatureKey::new(
-            WorldId::from_u128(WORLD),
-            WorldEpoch::INITIAL,
-            CreatureId::new(creature_id).unwrap(),
-            CreatureGeneration::INITIAL,
-        )
-        .unwrap(),
-        state_revision: 1,
-        lifecycle: CreatureLifecycleState::Alive,
-        species_key: "deer".into(),
-        species_version: 1,
-        asset: catalog.species[0].asset,
-        material_manifest_hash: content_manifest_hash(sim.world().materials()),
-        material_mapping_version: 1,
-        material_mapping_hash: mapping_hash,
-        clip_name: "idle".into(),
-        clip_mode: CreatureClipMode::Playing,
-        clip_phase_tick: 0,
-        clip_subtick_remainder: 0,
-        clip_epoch: 1,
-        source_bindings: vec![CreaturePartBinding {
-            part_id: 1,
-            source_volume_id: volume_id,
-            source_revision: 1,
-        }],
-        aggregate_topology_revision: 1,
-        pose_epoch: 1,
-        root_translation_m: root,
-        root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-        linear_velocity_m_s: [0.0; 3],
-        angular_velocity_rad_s: [0.0; 3],
-        locomotion_tag: 0,
-    };
-    AuthoritativeCreatureIntent::Birth {
-        state: Box::new(state),
-        parts: vec![CreatureBirthPartInput {
-            part_id: 1,
-            parent_id: None,
-            local_transform: PartTransform::IDENTITY,
-            volume,
-        }],
-        representation: Representation::MergedCuboids,
+        creature: CreatureRecord {
+            creature_id,
+            species: "deer".into(),
+            translation_m: [x, 2.0, 8.0],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            locomotion_tag: 0,
+            clip_phase_tick: 0,
+        },
     }
 }
 
-fn commit(
-    sim: &mut Simulation,
-    catalog: &OwnedCreatureCatalog,
-    tick: u64,
-    seq: u64,
-    intent: AuthoritativeCreatureIntent,
-) -> CommittedCreatureLifecycle {
-    catalog
-        .with_view(|view| {
-            sim.commit_creature_lifecycle_transaction(
-                Tick(tick),
-                ControlSeq(seq),
-                vec![intent],
-                None,
-                view,
-            )
-        })
-        .unwrap()
-        .unwrap()
-}
-
-fn replica(catalog: &Arc<OwnedCreatureCatalog>) -> ReplicaWorld {
-    let mut replica = ReplicaWorld::from_baseline(
-        fixtures::flat_terrain_setup().terrain,
-        ReplicaConfig::default(),
-    );
-    replica.install_creature_catalog(catalog.clone());
-    replica
-}
-
-fn server_record(sim: &Simulation, catalog: &OwnedCreatureCatalog) -> CreatureOwnershipRecordV4 {
-    catalog
-        .with_view(|view| sim.capture_creature_snapshot(view))
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .owners
-        .records[0]
-        .clone()
-}
-
-#[test]
-fn replica_converges_on_authoritative_birth_and_death() {
-    let (mut sim, catalog) = server();
-    let mut replica = replica(&catalog);
-    let intent = birth_intent(&sim, &catalog, [12.0, 6.0, 12.0]);
-    let born = commit(&mut sim, &catalog, 1, 1, intent);
-
-    assert!(matches!(
-        replica.apply_transaction(&born.topology),
-        ApplyOutcome::Published { .. }
-    ));
-    assert!(matches!(
-        replica.apply_transaction(&born.topology),
-        ApplyOutcome::Duplicate
-    ));
-    let creatures = replica.creatures().unwrap();
-    assert_eq!(creatures.len(), 1);
-    let record = creatures.records().next().unwrap().clone();
-    assert_eq!(record, server_record(&sim, &catalog));
-
-    let died = commit(
-        &mut sim,
-        &catalog,
-        2,
-        2,
-        AuthoritativeCreatureIntent::Death {
-            key: record.state.key,
-            expected_state_revision: record.state.state_revision,
-            expected_topology_token: record.state.aggregate_topology_revision,
-            expected_pose_token: 0,
-        },
-    );
-    assert!(matches!(
-        replica.apply_transaction(&died.topology),
-        ApplyOutcome::Published { .. }
-    ));
-    let replicated = replica.creatures().unwrap().get(&record.state.key).unwrap();
-    assert_eq!(replicated.state.lifecycle, CreatureLifecycleState::Corpse);
-    assert_eq!(*replicated, server_record(&sim, &catalog));
-}
-
-#[test]
-fn rejected_lifecycle_leaves_the_replica_unchanged() {
-    let (mut sim, catalog) = server();
-    let mut replica = replica(&catalog);
-    let intent = birth_intent(&sim, &catalog, [12.0, 6.0, 12.0]);
-    let born = commit(&mut sim, &catalog, 1, 1, intent);
-    assert!(matches!(
-        replica.apply_transaction(&born.topology),
-        ApplyOutcome::Published { .. }
-    ));
-    let revision = replica.creatures().unwrap().revision();
-
-    // A replica without the catalog refuses the transaction.
-    let mut bare = ReplicaWorld::from_baseline(
-        fixtures::flat_terrain_setup().terrain,
-        ReplicaConfig::default(),
-    );
-    assert!(matches!(
-        bare.apply_transaction(&born.topology),
-        ApplyOutcome::Rejected { .. }
-    ));
-
-    // The same transaction id with a different payload is divergent.
-    let (mut other_sim, _) = server();
-    let other_intent = birth_intent(&other_sim, &catalog, [20.0, 6.0, 20.0]);
-    let other = commit(&mut other_sim, &catalog, 1, 1, other_intent);
-    assert_eq!(other.topology.transaction_id, born.topology.transaction_id);
-    assert!(matches!(
-        replica.apply_transaction(&other.topology),
-        ApplyOutcome::Rejected { .. }
-    ));
-    assert_eq!(replica.creatures().unwrap().revision(), revision);
-    assert_eq!(replica.creatures().unwrap().len(), 1);
-}
-
-fn motion_frame(
-    world_epoch: u64,
-    server_tick: u64,
-    creature_id: u64,
-    x: f64,
-) -> spall_protocol::CreatureMotionFrame {
-    spall_protocol::CreatureMotionFrame {
-        schema: spall_protocol::WIRE_SCHEMA_VERSION,
-        world_epoch,
+fn motion_frame(server_tick: u64, creature_id: u64, x: f64) -> CreatureMotionFrame {
+    CreatureMotionFrame {
+        schema: WIRE_SCHEMA_VERSION,
         server_tick,
-        entries: vec![spall_protocol::CreatureMotionEntry {
+        entries: vec![CreatureMotionEntry {
             creature_id,
             translation_m: [x, 2.0, 8.0],
             rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
@@ -257,54 +33,72 @@ fn motion_frame(
 }
 
 #[test]
-fn motion_frames_interpolate_hold_and_ignore_stale_or_foreign_entries() {
-    let (mut sim, catalog) = server();
-    let mut replica = replica(&catalog);
-    let intent = birth_intent(&sim, &catalog, [12.0, 6.0, 12.0]);
-    let born = commit(&mut sim, &catalog, 1, 1, intent);
-    assert!(matches!(
-        replica.apply_transaction(&born.topology),
-        ApplyOutcome::Published { .. }
-    ));
-    let key = replica
-        .creatures()
-        .unwrap()
-        .records()
-        .next()
-        .unwrap()
-        .state
-        .key;
-    let id = key.creature_id.get();
-    let epoch = key.world_epoch.get();
+fn spawn_and_despawn_follow_the_stream_and_a_join_list_is_idempotent() {
+    let mut creatures = ReplicaCreatures::new();
+    // The join list, delivered twice (a retried join), installs each creature once.
+    for _ in 0..2 {
+        creatures.spawn(&spawn(1, 10.0)).unwrap();
+        creatures.spawn(&spawn(2, 20.0)).unwrap();
+    }
+    assert_eq!(
+        creatures
+            .records()
+            .map(|c| c.creature_id)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    // A live spawn after the list, then a despawn, in stream order.
+    creatures.spawn(&spawn(3, 30.0)).unwrap();
+    assert!(creatures.despawn(2));
+    assert!(!creatures.despawn(2));
+    assert_eq!(
+        creatures
+            .records()
+            .map(|c| c.creature_id)
+            .collect::<Vec<_>>(),
+        [1, 3]
+    );
+    assert!(creatures.get(2).is_none());
+
+    // An invalid record is refused and changes nothing.
+    let mut bad = spawn(9, 0.0);
+    bad.creature.species.clear();
+    assert_eq!(creatures.spawn(&bad), Err(ReplicaCreatureError::Invalid));
+    assert_eq!(creatures.len(), 2);
+
+    // A baseline reset forgets everyone.
+    creatures.reset();
+    assert!(creatures.is_empty());
+}
+
+#[test]
+fn motion_for_unknown_or_despawned_ids_is_ignored() {
+    let mut creatures = ReplicaCreatures::new();
     let t0 = Instant::now();
-    let creatures = replica.creatures_mut_for_tests();
+    // Motion before any spawn is dropped, not deferred.
+    assert_eq!(creatures.apply_motion(&motion_frame(10, 1, 5.0), t0), 0);
+    creatures.spawn(&spawn(1, 0.0)).unwrap();
+    // Motion for another id is dropped; for the held id it applies.
+    assert_eq!(creatures.apply_motion(&motion_frame(10, 99, 5.0), t0), 0);
+    assert_eq!(creatures.apply_motion(&motion_frame(10, 1, 5.0), t0), 1);
+    // After the despawn the id is unknown again, and its track is gone.
+    assert!(creatures.despawn(1));
+    assert_eq!(creatures.apply_motion(&motion_frame(20, 1, 6.0), t0), 0);
+    assert_eq!(creatures.motion_entries_applied(), 1);
+}
 
-    // An unknown creature and a foreign epoch change nothing.
-    assert_eq!(
-        creatures.apply_motion(&motion_frame(epoch, 10, id + 99, 0.0), t0),
-        0
-    );
-    assert_eq!(
-        creatures.apply_motion(&motion_frame(epoch + 1, 10, id, 0.0), t0),
-        0
-    );
-
-    assert_eq!(
-        creatures.apply_motion(&motion_frame(epoch, 10, id, 10.0), t0),
-        1
-    );
+#[test]
+fn motion_frames_interpolate_hold_and_ignore_stale_entries() {
+    let mut creatures = ReplicaCreatures::new();
+    creatures.spawn(&spawn(7, 0.0)).unwrap();
+    let t0 = Instant::now();
+    assert_eq!(creatures.apply_motion(&motion_frame(10, 7, 10.0), t0), 1);
     let later = t0 + Duration::from_millis(100);
-    assert_eq!(
-        creatures.apply_motion(&motion_frame(epoch, 16, id, 11.0), later),
-        1
-    );
+    assert_eq!(creatures.apply_motion(&motion_frame(16, 7, 11.0), later), 1);
     // A stale tick is ignored.
-    assert_eq!(
-        creatures.apply_motion(&motion_frame(epoch, 13, id, 99.0), later),
-        0
-    );
+    assert_eq!(creatures.apply_motion(&motion_frame(13, 7, 99.0), later), 0);
 
-    let record = creatures.records().next().unwrap().clone();
+    let record = creatures.get(7).unwrap().clone();
     // Render time = now - delay: halfway between the two arrivals.
     let halfway = t0 + CREATURE_RENDER_DELAY + Duration::from_millis(50);
     let mid = creatures.presentation(&record, halfway);
@@ -322,9 +116,6 @@ fn motion_frames_interpolate_hold_and_ignore_stale_or_foreign_entries() {
         "{:?}",
         held.translation_m
     );
-    // A world reset forgets motion.
-    creatures.reset();
-    assert!(creatures.is_empty());
 }
 
 #[test]

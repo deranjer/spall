@@ -1,10 +1,8 @@
 #![cfg(feature = "client")]
-//! The sandbox director spawns the authored species through the engine's
-//! ordered lifecycle path, and the resulting records round-trip through a
-//! replica unchanged.
+//! The sandbox director spawns the authored species as plain creature records,
+//! walks and flies them against terrain, and a replica converges on them.
 
 use sandbox::animals::AnimalDirector;
-use spall_core::WorldId;
 use spall_server::creature_service::CreatureService;
 use spall_sim::{Simulation, SimulationConfig, fixtures};
 
@@ -12,83 +10,63 @@ fn simulation() -> Simulation {
     let mut setup = fixtures::flat_terrain_setup();
     setup.materials = sandbox::game::manifest();
     let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
-    sim.initialize_creature_host(WorldId::from_u128(77))
-        .unwrap();
+    sim.initialize_creature_host().unwrap();
     sim
 }
 
-#[test]
-fn director_births_deer_and_crows_that_validate_and_replicate() {
-    let mut sim = simulation();
-    let anchor = [3.0, 1.0, 3.0];
-    let director = AnimalDirector::new(vec![anchor], &[2, 2, 0], 7)
-        .unwrap()
-        .with_radius_m(0.0, 1.0);
-    let service = CreatureService::new(Box::new(director));
-
-    let mut replica = spall_client::replica::ReplicaWorld::from_baseline(
-        {
-            let mut setup = fixtures::flat_terrain_setup();
-            setup.materials = sandbox::game::manifest();
-            setup.terrain
-        },
+fn replica() -> spall_client::replica::ReplicaWorld {
+    let mut setup = fixtures::flat_terrain_setup();
+    setup.materials = sandbox::game::manifest();
+    spall_client::replica::ReplicaWorld::from_baseline(
+        setup.terrain,
         spall_client::replica::ReplicaConfig::default(),
-    );
-    replica.install_creature_catalog(service.catalog().clone());
+    )
+}
 
-    let mut committed = 0;
-    for _ in 0..400 {
-        sim.tick().unwrap();
-        if let Some(birth) = service.run_tick(&mut sim).expect("birth commits") {
-            committed += 1;
-            let outcome = replica.apply_transaction(&birth.topology);
-            assert!(
-                matches!(
-                    outcome,
-                    spall_client::replica::ApplyOutcome::Published { .. }
-                ),
-                "replica rejected a server birth: {outcome:?}"
-            );
-        }
-    }
-    assert!(committed > 0, "director never spawned anything");
-    let snapshot = service
-        .catalog()
-        .with_view(|view| sim.capture_creature_snapshot(view))
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(snapshot.owners.records.len(), 4, "2 deer + 2 crows");
-    let replicated: Vec<_> = replica.creatures().unwrap().records().cloned().collect();
-    assert_eq!(replicated.len(), snapshot.owners.records.len());
-    for server in &snapshot.owners.records {
-        let client = replicated
-            .iter()
-            .find(|r| r.state.key == server.state.key)
-            .expect("replica holds every server creature");
-        // Topology is exact. Motion is captured live on the server, so the
-        // at-birth record may differ from it only by physics rounding.
-        assert_eq!(client.topology_hash(), server.topology_hash());
-        assert_eq!(client.parts, server.parts);
-        for axis in 0..3 {
-            assert!(
-                (client.state.root_translation_m[axis] - server.state.root_translation_m[axis])
-                    .abs()
-                    < 1e-3,
-                "creature {} root drifted on axis {axis}",
-                server.state.key.creature_id.get()
-            );
-        }
+/// Runs the server tick and announces the roster change to `replica`, as the
+/// serve loop does.
+fn tick_into(
+    sim: &mut Simulation,
+    service: &CreatureService,
+    replica: &mut spall_client::replica::ReplicaWorld,
+) {
+    sim.tick().unwrap();
+    let roster = service.run_tick(sim).expect("spawns commit");
+    for creature in roster.spawned {
+        replica
+            .apply_creature_spawn(&spall_protocol::CreatureSpawn {
+                schema: spall_protocol::WIRE_SCHEMA_VERSION,
+                creature,
+            })
+            .expect("replica accepts a server spawn");
     }
 }
 
 #[test]
-fn a_walking_deer_is_swept_against_terrain_and_published_as_motion() {
-    use sandbox::animals::{pose_parts, species};
-    use spall_sim::{CreatureMoveOutcome, CreatureMoveRequest};
+fn director_spawns_deer_and_crows_that_replicate() {
+    let mut sim = simulation();
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[2, 2, 0], 7)
+        .unwrap()
+        .with_radius_m(0.0, 1.0);
+    let service = CreatureService::new(Box::new(director));
+    let mut replica = replica();
+    for _ in 0..400 {
+        tick_into(&mut sim, &service, &mut replica);
+    }
+    let server = sim.creature_records();
+    assert_eq!(server.len(), 4, "2 deer + 2 crows");
+    assert_eq!(server.iter().filter(|c| c.species == "deer").count(), 2);
+    assert_eq!(server.iter().filter(|c| c.species == "crow").count(), 2);
+    let replicated: Vec<_> = replica.creatures().records().cloned().collect();
+    assert_eq!(replicated, server);
+}
+
+#[test]
+fn a_walking_deer_and_a_flying_crow_are_swept_against_terrain_and_published_as_motion() {
+    use spall_sim::{CreatureMoveOutcome, CreatureMoveRequest, CreatureWalkRequest};
 
     let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[1, 0, 0], 3)
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[1, 1, 0], 3)
         .unwrap()
         .with_radius_m(0.0, 1.0);
     let service = CreatureService::new(Box::new(director));
@@ -96,63 +74,81 @@ fn a_walking_deer_is_swept_against_terrain_and_published_as_motion() {
         sim.tick().unwrap();
         service.run_tick(&mut sim).unwrap();
     }
-    let deer = species()
+    let records = sim.creature_records();
+    let deer = records
+        .iter()
+        .find(|c| c.species == "deer")
         .unwrap()
-        .into_iter()
-        .find(|s| s.key == "deer")
+        .clone();
+    let crow = records
+        .iter()
+        .find(|c| c.species == "crow")
+        .unwrap()
+        .clone();
+
+    // A short step along open ground moves the deer and shows up in the published frame.
+    let outcome = sim
+        .walk_creature(CreatureWalkRequest {
+            creature_id: deer.creature_id,
+            desired_step_m: [0.05, 0.0],
+            target_rotation_xyzw: deer.rotation_xyzw,
+            locomotion_tag: 1,
+            clip_phase_tick: 1,
+            feet_offset_m: -0.5,
+            capsule_radius_m: 0.28,
+            capsule_half_height_m: 0.25,
+        })
         .unwrap();
-    let alive = sim.alive_creatures();
-    assert_eq!(alive.len(), 1);
-    let start = alive[0];
-
-    let request = |dx: f64, dy: f64, phase: u64| CreatureMoveRequest {
-        key: start.key,
-        target_translation_m: [
-            start.translation_m[0] + dx,
-            start.translation_m[1] + dy,
-            start.translation_m[2],
-        ],
-        target_rotation_xyzw: start.rotation_xyzw,
-        parts: pose_parts(&deer.asset, "walk", phase as f64).unwrap(),
-        locomotion_tag: 1,
-        clip_phase_tick: phase,
-    };
-
-    // A short step along open ground is staged, installs on the next step, and
-    // shows up in the applied root and the published frame.
-    assert_eq!(
-        sim.move_creature(request(0.05, 0.0, 1)).unwrap(),
-        CreatureMoveOutcome::Staged
-    );
-    assert_eq!(
-        sim.move_creature(request(0.05, 0.0, 2)).unwrap(),
-        CreatureMoveOutcome::Busy,
-        "a second pose before the first installs must wait"
-    );
-    sim.tick().unwrap();
-    let moved = sim.alive_creatures()[0];
-    assert!(
-        (moved.translation_m[0] - (start.translation_m[0] + 0.05)).abs() < 1e-3,
-        "root moved {:?} -> {:?}",
-        start.translation_m,
-        moved.translation_m
-    );
+    assert!((outcome.moved_m[0] - 0.05).abs() < 1e-3, "{outcome:?}");
+    let moved = sim
+        .creature_poses()
+        .into_iter()
+        .find(|p| p.creature_id == deer.creature_id)
+        .unwrap();
+    assert!((moved.translation_m[0] - (deer.translation_m[0] + outcome.moved_m[0])).abs() < 1e-9);
     let frame = sim
         .creature_motion_frame(&|_| true)
-        .expect("one creature moves");
-    assert_eq!(frame.entries.len(), 1);
-    assert_eq!(frame.entries[0].locomotion_tag, 1);
-    assert_eq!(frame.entries[0].clip_phase_tick, 1);
-    assert!((frame.entries[0].translation_m[0] - moved.translation_m[0]).abs() < 1e-9);
+        .expect("creatures are published");
+    let entry = frame
+        .entries
+        .iter()
+        .find(|e| e.creature_id == deer.creature_id)
+        .unwrap();
+    assert_eq!((entry.locomotion_tag, entry.clip_phase_tick), (1, 1));
     // Interest filtering drops far animals.
     assert!(sim.creature_motion_frame(&|_| false).is_none());
 
-    // Driving the root down into the floor is blocked and changes nothing.
-    let before = sim.alive_creatures()[0];
-    let blocked = sim.move_creature(request(0.0, -3.0, 3)).unwrap();
-    assert!(matches!(blocked, CreatureMoveOutcome::Blocked { .. }));
-    sim.tick().unwrap();
-    assert_eq!(sim.alive_creatures()[0], before);
+    // A crow told to fly into the floor is blocked and stays where it was.
+    let fly = |dx: f64, dy: f64| CreatureMoveRequest {
+        creature_id: crow.creature_id,
+        target_translation_m: [
+            crow.translation_m[0] + dx,
+            crow.translation_m[1] + dy,
+            crow.translation_m[2],
+        ],
+        target_rotation_xyzw: crow.rotation_xyzw,
+        locomotion_tag: 1,
+        clip_phase_tick: 3,
+        feet_offset_m: -0.2,
+        capsule_radius_m: 0.25,
+        capsule_half_height_m: 0.1,
+    };
+    assert_eq!(
+        sim.move_creature(fly(0.0, -30.0)).unwrap(),
+        CreatureMoveOutcome::Blocked
+    );
+    assert_eq!(
+        sim.creature_poses()
+            .into_iter()
+            .find(|p| p.creature_id == crow.creature_id)
+            .unwrap()
+            .translation_m,
+        crow.translation_m
+    );
+    assert_eq!(
+        sim.move_creature(fly(0.3, 0.0)).unwrap(),
+        CreatureMoveOutcome::Moved
+    );
 }
 
 #[test]
@@ -172,8 +168,8 @@ fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
         service.run_motion(&mut sim).unwrap();
         motion_time += started.elapsed();
         if tick == 60 {
-            for alive in sim.alive_creatures() {
-                start.insert(alive.key.creature_id.get(), alive.translation_m);
+            for alive in sim.creature_poses() {
+                start.insert(alive.creature_id, alive.translation_m);
             }
         }
         if tick % 3 == 0 && sim.creature_motion_frame(&|_| true).is_some() {
@@ -183,10 +179,10 @@ fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
     assert_eq!(start.len(), 5, "3 deer and 2 crows alive");
     assert!(frames > 100);
     let moved: Vec<f64> = sim
-        .alive_creatures()
+        .creature_poses()
         .iter()
         .map(|alive| {
-            let from = start[&alive.key.creature_id.get()];
+            let from = start[&alive.creature_id];
             (alive.translation_m[0] - from[0]).hypot(alive.translation_m[2] - from[2])
         })
         .collect();
@@ -213,17 +209,17 @@ fn bears_and_snow_leopards_spawn_and_walk_on_their_own_capsules() {
         service.run_tick(&mut sim).unwrap();
         service.run_motion(&mut sim).unwrap();
         if tick == 60 {
-            for alive in sim.alive_creatures() {
-                start.insert(alive.key.creature_id.get(), alive.translation_m);
+            for alive in sim.creature_poses() {
+                start.insert(alive.creature_id, alive.translation_m);
             }
         }
     }
     assert_eq!(start.len(), 4, "2 bears and 2 snow leopards alive");
     let moved: Vec<f64> = sim
-        .alive_creatures()
+        .creature_poses()
         .iter()
         .map(|alive| {
-            let from = start[&alive.key.creature_id.get()];
+            let from = start[&alive.creature_id];
             (alive.translation_m[0] - from[0]).hypot(alive.translation_m[2] - from[2])
         })
         .collect();
@@ -247,22 +243,11 @@ fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
         .unwrap()
         .with_radius_m(0.0, 1.5);
     let service = CreatureService::new(Box::new(director));
-    let mut replica = spall_client::replica::ReplicaWorld::from_baseline(
-        {
-            let mut setup = fixtures::flat_terrain_setup();
-            setup.materials = sandbox::game::manifest();
-            setup.terrain
-        },
-        spall_client::replica::ReplicaConfig::default(),
-    );
-    replica.install_creature_catalog(service.catalog().clone());
+    let mut replica = replica();
     for _ in 0..200 {
-        sim.tick().unwrap();
-        if let Some(birth) = service.run_tick(&mut sim).unwrap() {
-            replica.apply_transaction(&birth.topology);
-        }
+        tick_into(&mut sim, &service, &mut replica);
     }
-    let creatures = replica.creatures().unwrap();
+    let creatures = replica.creatures();
     assert_eq!(creatures.len(), 6);
     let view = AnimalView::new().unwrap();
     let started = std::time::Instant::now();
@@ -340,7 +325,7 @@ fn players_walk_through_creatures_instead_of_being_blocked_by_them() {
         sim.tick().unwrap();
         service.run_tick(&mut sim).unwrap();
     }
-    let deer = sim.alive_creatures()[0].translation_m;
+    let deer = sim.creature_poses()[0].translation_m;
     let player = EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap();
     // Start well clear of the deer, in line with it, and walk straight through.
     sim.add_player(player, [deer[0] - 2.5, 0.6, deer[2]]);

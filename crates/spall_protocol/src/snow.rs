@@ -9,7 +9,7 @@ use crate::records::{Record, RecordError, WireTag};
 use serde::{Deserialize, Serialize};
 
 pub const SNOW_TILE_CELLS: i32 = 16;
-pub const SNOW_MAX_DEPTH_Q16: u16 = 8192; // 0.125 m, Q16 metres.
+pub const SNOW_MAX_DEPTH_Q16: u16 = 32768; // 0.5 m, Q16 metres.
 pub const SNOW_MIN_FOOTPRINT_DEPTH_Q16: u16 = 132; // At least 2 mm.
 pub const SNOW_MAX_SURFACES_PER_FRAME: usize = 256;
 pub const SNOW_MAX_FOOTPRINTS_PER_FRAME: usize = 64;

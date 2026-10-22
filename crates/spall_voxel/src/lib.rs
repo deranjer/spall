@@ -28,7 +28,6 @@ pub mod edit;
 pub mod fixtures;
 pub mod logical;
 pub mod query;
-pub mod region;
 pub mod residency;
 pub mod transform;
 pub mod volume;
@@ -49,9 +48,6 @@ pub use logical::{
 };
 pub use query::{
     Face, MissReason, Ray, RayConfig, RayError, RayHit, RayOutcome, cast_ray, cast_ray_world,
-};
-pub use region::{
-    ActiveRegions, RegionCoord, RegionInterestRadii, RegionLayout, RegionLayoutError,
 };
 pub use residency::{
     BrickCacheKey, CacheBudget, CacheEntryState, CollisionAdmission, CollisionReadiness,

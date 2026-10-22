@@ -577,6 +577,7 @@ impl ApplicationHandler for EcologyDemoApp {
             window.clone(),
             EnvironmentPreset::Daylight.environment(),
             &materials,
+            &[],
             false,
             false,
         ) {

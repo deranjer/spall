@@ -34,16 +34,6 @@ name = "crash-bench"
 path = "src/bin/crash_bench.rs"
 required-features = ["persist-bench"]
 
-[[bin]]
-name = "region-support-reload-bench"
-path = "src/bin/region_support_reload_bench.rs"
-required-features = ["bench"]
-
-[[bin]]
-name = "active-region-bench"
-path = "src/bin/active_region_bench.rs"
-required-features = ["bench"]
-
 [features]
 # Pulls in the offline persistence crash-suite binary (`cargo xtask crash-test`).
 persist-bench = ["bench"]

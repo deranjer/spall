@@ -136,7 +136,17 @@ fn hash_cell(c: vec3<f32>) -> vec3<f32> {
     return fract((p.xxy + p.yyx) * p.zyx);
 }
 
+// Ground snow (see snow_mesh.rs) is procedural: ids from SNOW_BASE, +1 is packed
+// (footprint floor) snow, a little darker and bluer.
+const SNOW_BASE: u32 = 0xFFFF0000u;
+
 fn get_material(id: u32) -> Material {
+    if id >= SNOW_BASE {
+        if id == SNOW_BASE + 1u {
+            return Material(vec4<f32>(0.20, 0.30, 0.48, 1.0), vec4<f32>(0.9, 0.0, 0.0, 0.0));
+        }
+        return Material(vec4<f32>(0.74, 0.78, 0.86, 1.0), vec4<f32>(0.85, 0.0, 0.0, 0.0));
+    }
     if id < arrayLength(&materials) { return materials[id]; }
     return Material(vec4<f32>(0.8, 0.1, 0.8, 1.0), vec4<f32>(0.8, 0.0, 0.0, 0.0));
 }
@@ -485,6 +495,12 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
         let cell = floor((in.world_pos - n * 0.02) / 0.25);
         let h = hash_cell(cell) * 2.0 - vec3<f32>(1.0);
         base = max(base * (vec3<f32>(1.0) + jitter * (vec3<f32>(h.x) + 0.45 * h.yzx)), vec3<f32>(0.0));
+    }
+
+    if in.material >= SNOW_BASE {
+        // Slight variation per 6.25 cm snow column.
+        let column = floor((in.world_pos - n * 0.01) / 0.0625);
+        base *= 1.0 + 0.04 * (hash_cell(column).x * 2.0 - 1.0);
     }
 
     if mode == 1 { return vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0); }

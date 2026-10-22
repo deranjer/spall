@@ -308,11 +308,10 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 14): one wire version for the handshake and every record, bumped on
-any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 6, defined in
+`PROTOCOL_VERSION` (currently 17): one wire version for the handshake and every record, bumped on
+any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 7, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
-exist (creature owner/change/snapshot/sync/motion/state, column water, weather, snow,
-transaction attachments, lifecycle bulk, `BASELINE_WORLD_SCHEMA`) are now that same value.
+exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
 
 **Endianness.** Every canonical hash pre-image and every frame header field is
 little-endian, fixed width. Canonical sequences carry a `u32` LE length prefix;
@@ -471,8 +470,7 @@ compressed ceiling is 256 MiB; each bulk part remains <=1 MiB, each decoded
 segment <=4 MiB by default, and the manifest's decoded total <=16 GiB.
 Emitted world versions today: 1 (single blob: repairs and split blobs), 3 (streamed), 4 (regional) and 5
 (deferred regional). Version 2 (non-streamed segmented) is no longer produced by the server
-(its constant is still referenced by `serve.rs` and the client accepts it); the former
-version-9 creature-lifecycle constant was unused and has been deleted.
+(its constant is still referenced by `serve.rs` and the client accepts it).
 Version 1 and version 2 retain their 64 MiB compressed ceilings; the
 single-blob decompression bound remains 256 MiB. Unsupported clients receive
 the single-blob format, never an unnegotiated larger transfer. Repairs and bulk
@@ -691,7 +689,7 @@ reports/ENG-196-weather-foundation.md and reports/ENG-199-weather-controls.md.
 Wire schema/protocol 7 originally added `SnowSurfaceFrame` (tag 25), versioned
 separately as snow schema 1. Frames replace one 4 m tile/Y layer, carrying
 disjoint exposed-face cohorts, terrain revisions, quantized depth and bounded
-transient footprints. Empty frames remove old layers. Epoch, sequence and
+transient footprints; depth is capped at 0.5 m (`SNOW_MAX_DEPTH_Q16`, protocol 17). Empty frames remove old layers. Epoch, sequence and
 effective-tick fences prevent stale snow after reset; client cache residency is
 bounded. Server-authoritative grounded travel creates tracks; clients never
 submit imprint positions. See weather.md for rates, caps and exposure rules.
@@ -701,339 +699,34 @@ geometry journal entries preserve exact cohort changes. Footprints clear on
 restart. Live and saved topology/motion records now require protocol/wire 12. Saved
 wire headers 5, 6, 7, 8 and 9 are rejected without migration or header rewriting.
 
-### ENG-218 - Ordered creature lifecycle boundary
+### Creatures
 
-Protocol/wire 12 carries a typed inline `TopologyOp::CreatureLifecycle`
-with the current `CreatureLifecycleCommitV4` and ownership/change schemas 4. The
-operation must use its enclosing transaction ID and exact operation ordinal.
-Multiple operations use the existing transaction count limit. The codec checks
-the 64 KiB control limit before allocating an encoded frame. Catalog, source and
-transition validation still belong to the owning candidate consumer.
+Creatures are server-authoritative entities, not world voxels. The wire carries
+three records, all on the reliable ordered stream the server already uses for
+water and vegetation (`Outbound::Water`), so a client sees them in the order the
+server produced them:
 
-Current protocol/wire 12 includes `TopologyOp::CreatureLifecycleBulk`, binding its
-exact operation ordinal, payload schema, outer commit hash and shared transfer ID.
-`CreatureLifecycleBulkPayloadV4` uses payload schema 4 and world-version tag 9 and bounded postcard/zstd
-framing. The decoder checks the marker correlation prefix before nested owner
-decoding and hashing. Raw commit, cumulative source/ownership work and compressed
-assembly limits are enforced. Geometry split children and their source patch may
-share a geometry transfer ID; lifecycle IDs may not reuse each other or geometry
-IDs. The codec and marker are implemented; network dispatch for tag 7 remains
-closed until atomic typed attachment consumers and the common allocator are ready.
+* `CreatureSpawn` (tag 26): `{ schema, CreatureRecord }`, where `CreatureRecord`
+  is `creature_id`, `species` (a game key of at most 63 bytes), root
+  `translation_m`/`rotation_xyzw`, `locomotion_tag` and `clip_phase_tick`. It is
+  sent when the game's director spawns a creature, and once per held creature in
+  the late-join list. Installing it is idempotent.
+* `CreatureDespawn` (tag 28): `{ schema, creature_id }`.
+* `CreatureMotionFrame` (tag 27): up to 256 entries sorted by id, sent at 20 Hz to
+  live sessions for creatures near that session's player. A frame never creates or
+  retires a creature; a client ignores entries for ids it does not hold and
+  entries no newer than the one it applied.
 
-The current geometry-only replica and SimWorld replay paths reject actor-bearing
-transactions before geometry, clocks, sequence gates or replay receipts change.
-This boundary does not enable spawning or claim complete baseline or durable
-animal journal recovery. Baseline schema 1 remains guarded; current store schema
-4 adds the complete checkpoint section described below. Unsupported old formats
-are rejected; legacy save upgrades and missing-table backfills have been removed
-under the user's explicit compatibility decision. Crash recovery from a valid
-complete checkpoint remains a separate requirement.
+A joining client's queue starts with the creature list taken at the instant its
+baseline capture starts; spawns and despawns committed after that are appended to
+the same queue and delivered with it, so the list and the stream never overlap or
+leave a gap. Creature ids are never reused within a server run, not even across a
+world reset; a reset baseline makes every replica drop its creatures and the
+director spawns new ones with fresh ids. The server owns species and clips: the
+record names only the species, and the client picks the clip from the species and
+`locomotion_tag`.
 
-The standalone schema-1 `TransactionAttachmentSetV1` groups typed geometry and
-lifecycle payloads for one transaction. Its decoder checks exact transfer-ID
-coverage and families, geometry child identities, and lifecycle marker correlation.
-A private validated set also binds the existing parent replay identity, so a
-different transaction body cannot reuse it merely by keeping its transaction ID.
-Source-patch owner authenticity and material/catalog/world validation remain the
-owning consumer's responsibility.
-
-The set retains the 64 MiB cumulative compressed limit, a conservative 256 MiB
-geometry decode/storage budget and 64 MiB lifecycle envelope budget. Geometry
-postcard lengths are scanned before nested vector allocation. Lifecycle work is
-also cumulative across the set, including the existing 1,024-owner, 16 Mi dense-cell
-and 4,000,000-solid-cell limits; compact Uniform encodings cannot bypass them.
-General geometry retains its own bounds rather than inheriting animal-only caps.
-The consuming world must still budget geometry expansion and physics work.
-
-The server allocator uses one checked 61-bit low sequence for baseline, retry,
-repair, reset and geometry split reservations, with namespace bits preserved
-for reset/split and reserved for lifecycle. Dropped reservations burn their range.
-Reset reserves the connected-session group before replacing the world. Geometry
-reserves a bounded owned pool before the existing tick: the bound includes
-carried inflight work and newly admitted edits across all rebase rounds. Idle
-ticks reserve nothing. Bulk markers, streamed payloads and durable geometry
-records retain the same reserved ID; transaction IDs no longer generate it.
-Startup validates IDs from every topology record in the durable recovery suffix
-before restoring or publishing another checkpoint, then seeds the live allocator
-above them. The fresh in-memory journal is not the recovery source. Lifecycle
-reservations and typed runtime consumers remain closed pending complete actor
-checkpoint/baseline restore and ordered attachment transport/replay.
-
-The catalog-free checkpoint capture refuses any initialized creature host,
-including an empty host whose allocator high-water must survive restart. It cannot emit a
-geometry-only checkpoint that silently omits that state. Complete live-animal
-recovery also requires independent applied part-body twists: root motion and
-frozen part poses alone cannot reproduce an animated limb's immediate checked
-death transfer. The physics reconstruction prerequisite carries those measured
-values explicitly, and the current owner/motion records now retain them. Complete
-Simulation checkpoint and baseline integration remains required before enabling
-animal checkpointing.
-
-Whole-owner corpse physics capture now returns the existing runtime
-`DynamicCorpseRestore` DTO. The owning thread supplies canonical original source
-bindings and frozen hierarchy-local transforms; physics validates their complete,
-disjoint cell coverage against every live component and captures real component
-poses/twists. Its expected owner/source/topology/portable-pose/serial fence must
-match, and pending frames refuse. The primary physical component remains element
-zero, followed by stable component ordering. A caller-supplied key for an intact
-checked-death owner is checked without binding or mutating the owner index.
-This runtime DTO is not a complete serialized ownership snapshot: original sparse
-volumes/material catalogs, authored transforms and allocator state still require
-Simulation capture and explicitly versioned complete checkpoint/baseline schemas.
-Ownership-set decoding reuses the existing seeded record reader with per-record
-limits and shared population limits; a fresh per-record Deserialize cannot reset
-aggregate admission. It reads the current V4 ownership layout. The safe
-`CreatureOwnershipSetV4::decode(bytes, catalog)` entry point caps the input frame,
-rejects trailing bytes, and performs bounded parsing followed by catalog/semantic
-validation. Generic Deserialize admits resources only. Unknown ownership map fields
-(including nested fixed metadata) reject before their values; missing optional
-None metadata retains its existing map behavior. State-name byte limits apply
-before creating owned postcard strings. The population reader does not install a checkpoint or introduce a production
-consumer; its resource budgets also apply inside the snapshot envelope below.
-
-Current animated ownership uses V4 owner/set/change/commit and bulk payload
-types, retaining unchanged motion overlay V2 and part velocity V2 DTOs. Superseded
-ownership layouts reject without aliases or migration. Every Alive owner carries a strictly
-ordered `part_velocities` entry for each original source part, with finite bounded
-installed linear/angular velocities. Corpse lists are empty; its independently
-moving component frames remain authoritative. Source-content and topology-only
-hashes exclude measured motion; full/motion and enclosing commit hashes bind it.
-The pre-motion overlay applies the complete measured list before validating the
-expected before hash, including when a client received no motion datagram.
-
-The owning simulation thread samples pending-safe physical part motion with its
-existing source/pose/owner capture and prepared checked-death freshness fence.
-Zero part velocities are authored only for the existing stationary AliveBirth
-installation. The unchanged checked death witness attests the resulting installed
-root transfer; the overlay and complete before hash bind its input motion.
-Replica/recovery do not rerun that physical calculation or keep another ledger.
-Nested velocity vectors are charged against local/population/attachment work and
-owned capacity before allocation or hashing. Wire 11 and earlier, owner/change/commit/bulk
-schemas 1/2/3, and retired lifecycle kinds 6/7/8 have no compatibility path. Geometry
-baseline 1 and store 3 layouts are unchanged; embedded old wire journals reject.
-Complete actor checkpoints, baselines and typed runtime consumers remain gated.
-
-
-Complete capture prerequisite (2026-10-18): ownership V4 records explicitly retain
-`primary_component_serial`. None names the sole intact component; derived corpses
-name an existing nonzero serial below their retained serial high-water. Arrays
-remain sorted by serial; root pose and both twists must match the named primary,
-which need not be the first component. Full and topology hashes bind that identity.
-Empty source parts retain their source identity, hierarchy, bounds and content
-hash with zero resident bricks; every complete animal still needs nonempty exact
-component masks covering all original solid cells.
-
-`CreatureSnapshotV2` schema 2 contains the existing creature allocator snapshot,
-the actual shared `next_volume_id`, and one bounded `CreatureOwnershipSetV4`.
-Even an empty set retains world identity, epoch, next creature ID and retired ID
-gaps. Its full hash binds all those values. Validation requires owner world/epoch
-agreement, creature IDs below the allocator high-water and source volume IDs below
-the shared volume counter. The decoder caps the frame at 64 MiB + 128 bytes, uses
-the existing cumulative ownership reader and strict envelope/allocator maps, then
-validates catalog/identity and refuses trailing data. Raw Deserialize enforces
-resource admission only. Installation must validate source uniqueness against
-geometry and match the accompanying checkpoint's shared counter; this envelope
-never replaces that counter or allocates another ID stream.
-
-The Simulation now provides guarded read-only capture into this envelope,
-including actual applied motion and complete corpse ownership. It does not install
-actors or change baseline 1/store 3 layouts. Source revision-allocator gaps are
-now retained explicitly in source V2 records. Joint prepared
-host/source/physics restore, actor checkpoint/baseline sections and ordered runtime
-replay remain required. Geometry-only checkpoint refusal and closed production
-spawning remain in force.
-
-
-Simulation capture (2026-10-18) preserves a distinction between host logical
-`pose_epoch` and physics' runtime authored `pose_token`. Birth can have runtime
-token zero, and Death advances the logical epoch independently. The owner-thread
-adapter reads both in one immutable window: raw runtime tokens fence physical
-capture, while the authoritative logical epoch is written into the portable
-record and cold-restore bundle. A fresh physics instance initializes its token
-from that portable epoch. No raw runtime token or counter is added to the wire.
-`capture_dynamic_corpse_owner_at_epoch` makes this mapping explicit; the existing
-direct physics capture keeps its existing token-as-portable-epoch contract.
-
-Capture validates exact host/source/metadata/reverse-index/physics-owner bijection,
-source freshness and shared volume namespace, then the actual installed Alive
-source cells/materials/revisions/hierarchy/cell scale. Corpse capture validates the
-complete physical partition. Original sparse bricks, revisions, edited flags,
-bounds and authored transforms are retained separately from current/frozen poses.
-Before output construction, two-pass population admission bounds metadata,
-nonuniform source scans, dense source payload, solids, reconstruction grids,
-components, mask count and capacity (including geometric growth and map overhead).
-Conservative mask bounds may refuse a population that would fit after exact
-partition counting; they do not raise existing limits. Physics reconstruction
-scratch retains its separate bounded per-owner grid/work ceilings.
-
-Current source records use `CreatureSourcePartV2`, which requires the actual
-`next_brick_revision` counter, positive and strictly above every resident brick
-revision. The source-content v2, full owner v4 and topology v4 hashes bind it;
-motion-only hashes exclude it. Static-source lifecycle checks preserve it across
-Death. Current-only owner/set/change/operation/commit/bulk V4 schemas/domains4,
-snapshot V2/schema2/domain2, wire/handshake12 and lifecycle kind9 reject superseded
-layouts without aliases or migration. Unchanged overlays and part velocities stay
-V2; source masks/local poses/components keep V1. Baseline1 remains guarded;
-store5 retains the complete checkpoint section introduced in store4, described below.
-
-Simulation capture now records every actual volume.next_revision, including
-retired gaps, initially empty/emptied sources and u64::MAX exhaustion. The previous
-SourceRevision representability refusal is removed. The pure
-`reconstruct_creature_sources(snapshot, catalog)` validates the whole population
-before copying cells, returns unpublished saved-ID source volumes with original
-bricks/revisions/edited flags/cell size/bounds, then resumes each counter exactly.
-`Volume::resume_revision_counter` refuses zero or rollback without mutation and
-never derives a replacement from resident maxima. The u64::MAX counter is retained
-as exhausted; subsequent edits must refuse rather than reuse a revision. This
-source adapter neither installs ownership/physics nor advances any world IDs.
-Joint prepared Simulation restoration is available as described below. Complete
-checkpoint/baseline sections and ordered runtime consumers remain prerequisites
-for animal saving, spawning and 1 km acceptance.
-
-
-Joint cold animal installation (ENG-218, 2026-10-18) uses the current snapshotV2
-without changing wire12/baseline1/store3 layouts. After geometry recovery,
-`Simulation::prepare_creature_restore(expected_world, snapshot, catalog)` requires
-an uninitialized host, all five source indexes empty, exact expected WorldId and
-shared next-volume counter, and disjoint geometry/source IDs. It reconstructs the
-original volumes and their actual revision counters, admits the complete physical
-grid/mask work under existing per-owner/population ceilings, and prepares one
-AliveRestore/ColdRestore batch plus a detached host and source store. Saved world
-positions must roundtrip through the recovered physics origin exactly; otherwise
-installation refuses instead of changing authoritative positions.
-
-Applied local poses and measured Alive part velocities are retained. Corpse
-components keep masks, independent motion, source generation, serial high-water
-and named primary; portable serial order is converted to primary-first runtime
-order only during reconstruction. The host keeps the existing saved creature
-allocator and record IDs without consuming IDs. Empty populations install their
-saved allocator with no physical operations.
-
-`commit_prepared_creature_restore` revalidates world identity, geometry/physics
-fences, origin, registry counters, journal cursor, bounded catalog fingerprint,
-empty target indexes and geometry namespace, then validates physics before any
-publication. It publishes physics, fills preallocated owner-handle slots, swaps
-the complete source store and installs the complete host. No fallible checks or
-source/host map allocations follow physics publication. It changes neither shared
-registry counters nor journal entries. A stale/foreign/invalid candidate leaves
-all participants unchanged. The API never replaces even an initialized empty
-host. This does not enable actor checkpoints, baseline consumers or live spawning;
-the existing incomplete-format guard remains until their own atomic integration.
-
-
-Complete animal checkpoints (ENG-218, 2026-10-19) advance current-only store schema
-from3 to4, with no migration. Baseline1 and wire12 do not change. Every checkpoint
-has a required checkpoint_creatures row containing a bounded strict Option of
-StoredCreaturesV1, a matching has_host flag and BLAKE3-16 checksum. None explicitly
-means uninitialized, while Some(empty) retains the saved allocator epoch/high-water.
-The section carries the unchanged SnapshotV2, its full canonical hash and finite
-physics origin. Length is queried before SQLite copies a BLOB. Missing/empty/
-oversized/bad-CRC/flag-mismatched or invalid bounded sections invalidate that
-checkpoint; they are never converted into an absent population.
-
-Publication preflights bounded population encoding, snapshot/hash/schema, unique
-creature IDs even across generations, exact world and shared next-volume counter,
-all source cell-size codes, source content hashes and disjoint geometry/source IDs.
-The actor row joins existing body/brick/environment rows, world metadata, cursor
-and complete marker in the same SQLite transaction and checkpoint crash cuts.
-Inside BEGIN IMMEDIATE, the writer checks the prior required actor row, its bounds,
-CRC/framing/flag and bounded hash. It cannot drop an initialized host. Until typed
-animal replay is implemented, actor checkpoint publication refuses a cursor below
-the durable high-water from both journal rows and retained checkpoint cursors;
-further journal appends after an initialized-host checkpoint also refuse. Refusals
-roll back and poison the writer under the existing failure policy. Actor-free
-checkpoint/journal suffix behavior is retained.
-
-Snapshot topology hashing has an explicit v1 domain and binds allocator, source
-counter and owner topology hashes, excluding sampled motion. Checkpoint topology
-composition is version3: initialized hosts compose this with the unchanged geometry
-v2 hash in a separate domain; uninitialized actor-free worlds return the original
-geometry hash exactly. Complete SnapshotV2 canonical hashes separately bind all
-sampled motion. SimWorld::geometry_topology_hash is explicitly partial; ordinary
-world_hash refuses source owners in production as well as tests.
-
-Server persist::capture_with_catalog and restore_with_catalog require game-owned
-references. Capture retains all actual sources/motion through the guarded Simulation
-adapter. Restore verifies the section and catalog, refuses every nonempty actor
-journal suffix, rebuilds geometry detached in the persisted physics frame, verifies
-composed topology, jointly installs the saved actor candidate, then verifies exact
-complete recapture hash before returning the Simulation. Catalog-free callers
-continue to refuse initialized hosts/actor checkpoints. Structural load failures
-use the existing corruption/fallback policy and require explicit acceptance;
-semantic catalog/physics/hash failures return an error without silently selecting
-an older checkpoint. RecoverBase::AtOrBefore(tick) lets an explicit prior-checkpoint
-choice reload the correct suffix from that checkpoint's own cursor. Never reuse a
-previous checkpoint with a suffix loaded relative to the latest checkpoint.
-
-These entrypoints establish complete checkpoint restoration only. Live animal scheduling,
-actor journal/attachment/replica and baseline consumers, bulk production and
-source-edit/fracture synchronization remain closed. Production
-spawning and combined 1024m animal/weather launch acceptance remain gated.
-
-The catalog-aware full-capture adapter requires all logical geometry resident.
-It refuses world.has_evicted() before copying any terrain or actor payload, so a
-checkpoint never combines a complete logical hash with resident-only rows. The
-incremental ResidencyPass::capture_checkpoint_with_catalog supplies the complete
-logical terrain set from its existing verified backing/cache path to the same
-animal capture builder. Its runtime-only world-instance token prevents reuse
-across replacement worlds; no token is serialized. Missing/digest-mismatched
-backing, invalid catalog or incomplete ordinary bodies fail without publishing
-cache/counter changes. Catalog-free capture still refuses initialized hosts.
-Store4/wire12/baseline1 layouts are unchanged by this adapter. Live serve catalog
-handoff and typed animal consumers remain required before 1km acceptance.
-
-
-Typed durable transaction attachments (ENG-218, 2026-10-19): current-only store5
-replaces store4 without migration. JournalPayload::TopologyAttachments replaces
-the geometry-only bulk journal variant. It retains current-wire parent and body
-participant controls plus existing TransactionAttachmentSetV1 bytes. The envelope
-validates every required bulk marker exactly once by family and transfer ID,
-parent transaction/operation ordinal/hash and existing cumulative decoded-work
-budgets. The geometry producer adapter supplies its existing allocator-reserved
-ID; startup retained-ID seeding decodes the same typed record. Wire12, baseline1
-and animal owner/snapshot layouts are unchanged. No second journal or ID ledger.
-
-Typed parent controls cap at64KiB; participant count caps at4096, each control
-at64KiB, total participant bytes at64MiB; attachment bytes cap at64MiB before copy.
-Recovery borrows SQLite row blobs and bounded postcard fields rather than copying
-an unchecked whole journal blob. Full journal row decoding refuses trailing data.
-Nested geometry/lifecycle decoding keeps the existing family-specific cumulative
-budgets. Typed rows must match parent server_tick; invalid records poison the
-writer before any prefix/outbox publishes. Recovery reports the invalid record
-and retains only the validated durable prefix under the existing corruption policy.
-
-The store can retain bounded lifecycle and mixed attachment data, but Simulation
-replay explicitly refuses lifecycle attachments before applying the transaction.
-Existing initialized-host journal suffix guards remain. The in-memory journal
-now carries the same typed attachment set from preparation
-through publication and durable conversion. Bounded bulk lifecycle preparation
-accepts already reserved IDs; the live server intent/reservation caller, atomic
-Simulation replay, client baseline/replica and live catalog handoff remain ENG-218
-work. Storage retention is not live actor replay acceptance.
-
-
-Bounded authoritative bulk production (ENG-218, 2026-10-19): the internal
-Simulation preparation path accepts caller-owned geometry/lifecycle transfer
-reservations. The common lifecycle namespace value (bit61) is now exported by
-protocol and shared with the existing server allocator; no ID values change.
-Intents and supplied ID counts are bounded before traversal. IDs require nonzero
-low values, the exact namespace and unique lifecycle entries. Simulation creates
-no transfer allocator or persistent transfer counter. Global reservation/retained
-ID uniqueness remains the existing server allocator's responsibility.
-
-Inline-fit transactions retain the inline lifecycle form. Oversized transactions
-with sufficient reserved IDs convert all actor ops to V4 bulk markers, preserving
-operation ordinals and exact already-reduced/sampled commits, including checked
-Death witness and measured part motion. Final marker framing must fit64KiB, and
-the complete typed set (geometry plus actors) must pass existing correlation,
-cumulative work and actual encoding before validation/publication. Missing IDs,
-invalid sources/counters/catalogs or stale fences return without mutation.
-
-JournalEntry.attachments replaces its geometry-specific bulk field. The geometry
-producer prepares its typed set before publication as well; persist::journal_records
-encodes that same set, with no geometry-specific reconstruction after commit.
-Mixed publication emits one journal entry after both physical owners. A geometry-
-only borrow adapter refuses any actor transaction, including inline actors next
-to a sole geometry attachment. Store5/wire12/baseline1 layouts are unchanged.
-This internal producer does not enable live scheduling, baseline/replica or
-ordered animal replay; existing recovery refusals and spawning gate remain.
+Worlds with animals cannot be saved. Startup refuses a save path together with a
+creature director, and checkpoint capture refuses a simulation that has a creature
+host. The store has no creature section. Typed durable transaction attachments
+(`JournalPayload::TopologyAttachments`) carry bulk-split geometry only.

@@ -20,9 +20,37 @@ pub struct InteractiveOptions {
     pub biome_audio: BiomeAudioConfig,
     /// Game-owned drawing of replicated creatures as lit cubes each frame.
     pub creature_view: Option<std::sync::Arc<dyn CreatureView>>,
+    /// Game-owned drawing of player bodies as lit cubes each frame. Without it
+    /// other players are not drawn and the third-person toggle does nothing.
+    pub player_view: Option<std::sync::Arc<dyn PlayerView>>,
 }
 
-/// Turns replicated creature ownership records into cubes to draw this frame.
+/// One player capsule to draw this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerBody {
+    /// The player's entity id, or `0` for the local player.
+    pub entity: u64,
+    /// The capsule's lowest point, metres.
+    pub feet_m: [f64; 3],
+    pub velocity_m_s: [f32; 3],
+    /// Whether the player swims (the same test the movement kernel uses).
+    pub in_water: bool,
+    /// Heading of the local player's look direction, as `PlayerInput::yaw`.
+    /// `None` for remote players, whose facing follows their movement.
+    pub look_yaw: Option<f32>,
+}
+
+/// Turns player capsules into cubes to draw this frame.
+pub trait PlayerView: Send + Sync + std::fmt::Debug {
+    /// Manifest materials re-coloured to an sRGB tint. The window appends one
+    /// render-table entry per item, in order, after its debug-overlay entry;
+    /// item `i` is material index `tint_base + i` in [`Self::instances`].
+    fn tints(&self) -> Vec<(spall_core::MaterialId, [u8; 3])>;
+
+    fn instances(&self, players: &[PlayerBody], tint_base: u32, now: Instant) -> Vec<CubeInstance>;
+}
+
+/// Turns replicated creatures into cubes to draw this frame.
 /// The engine owns replication; the game owns what a species looks like.
 pub trait CreatureView: Send + Sync + std::fmt::Debug {
     /// `tick` is the estimated present server tick, fractional, for animation.

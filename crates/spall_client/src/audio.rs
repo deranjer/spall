@@ -19,12 +19,30 @@ const UPDATE: Duration = Duration::from_millis(25);
 pub struct BiomeAudioConfig {
     pub tracks: Vec<Option<PathBuf>>,
     pub labels: Vec<String>,
-    /// Weather beds indexed by the stable WeatherKind code; game-owned assets.
-    pub weather_tracks: Vec<Option<PathBuf>>,
+    /// Weather beds; game-owned assets. Several layers can play at once, each
+    /// for one WeatherKind code and one band of precipitation.
+    pub weather_layers: Vec<WeatherLayer>,
     pub thunder: Option<PathBuf>,
     /// How far (metres) each biome track carries, indexed like `tracks`. A track
     /// without an entry carries [`DEFAULT_RANGE_M`].
     pub ranges_m: Vec<f32>,
+    /// Which `tracks` are running water (streams, shores). Weather ducks them
+    /// far less than other ambience and they win a mix slot over other layers.
+    pub water_tracks: Vec<bool>,
+    pub footsteps: crate::footsteps::FootstepConfig,
+    pub breathing: crate::breathing::BreathingConfig,
+}
+
+/// One looping weather bed: plays at `gain` while the weather is `kind` (the
+/// stable WeatherKind code) and its precipitation, 0..=1, lies in
+/// `precipitation_min..precipitation_max`.
+#[derive(Debug, Clone)]
+pub struct WeatherLayer {
+    pub kind: u8,
+    pub precipitation_min: f32,
+    pub precipitation_max: f32,
+    pub path: PathBuf,
+    pub gain: f32,
 }
 
 /// Distance at which a biome track has faded to silence unless configured.
@@ -71,6 +89,26 @@ impl BiomeAudioConfig {
         self.tracks.get(usize::from(biome)).and_then(Option::as_ref)
     }
 
+    /// The weather beds to play, with their gains, for a kind and precipitation.
+    pub fn weather_mix(&self, kind: u8, precipitation: f32) -> Vec<(PathBuf, f32)> {
+        self.weather_layers
+            .iter()
+            .filter(|layer| {
+                layer.kind == kind
+                    && precipitation >= layer.precipitation_min
+                    && precipitation < layer.precipitation_max
+            })
+            .map(|layer| (layer.path.clone(), layer.gain))
+            .collect()
+    }
+
+    pub fn is_water(&self, biome: u8) -> bool {
+        self.water_tracks
+            .get(usize::from(biome))
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub fn range_m(&self, biome: u8) -> f32 {
         self.ranges_m
             .get(usize::from(biome))
@@ -90,7 +128,12 @@ const MAX_SEARCH_M: f64 = 130.0;
 /// with the distance to the nearest climate square of that biome. The biome
 /// under the listener is always full volume, so a stream carries into the
 /// meadow beside it and fades out gradually instead of cutting at its bank.
+///
+/// `weather_duck` (0..=1, 1 is fair weather) scales every layer, but water
+/// tracks only lose a quarter of the ducking, and water layers sort ahead of
+/// other layers so a full mix never drops a nearby stream for a quieter bird.
 pub fn ambience_mix(
+    weather_duck: f32,
     field: &spall_ecology::cover::CoverField,
     grid: &spall_ecology::cover::CoverGrid,
     position_m: [f64; 3],
@@ -139,7 +182,7 @@ pub fn ambience_mix(
             }
         }
     }
-    let mut layers: Vec<(PathBuf, f32)> = Vec::new();
+    let mut layers: Vec<(PathBuf, f32, bool)> = Vec::new();
     for (biome, distance) in nearest {
         let Some(path) = config.track(biome) else {
             continue;
@@ -150,14 +193,36 @@ pub fn ambience_mix(
         if volume < 0.02 {
             continue;
         }
-        match layers.iter_mut().find(|(existing, _)| existing == path) {
-            Some(entry) => entry.1 = entry.1.max(volume),
-            None => layers.push((path.clone(), volume)),
+        let water = config.is_water(biome);
+        let duck = if water {
+            1.0 - 0.25 * (1.0 - weather_duck)
+        } else {
+            weather_duck
+        };
+        let volume = volume * duck.clamp(0.0, 1.0);
+        match layers.iter_mut().find(|(existing, _, _)| existing == path) {
+            Some(entry) => {
+                entry.1 = entry.1.max(volume);
+                entry.2 |= water;
+            }
+            None => layers.push((path.clone(), volume, water)),
         }
     }
-    layers.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    prioritise(layers)
+}
+
+/// Water layers first, then loudest, capped at [`MAX_LAYERS`].
+fn prioritise(mut layers: Vec<(PathBuf, f32, bool)>) -> Vec<(PathBuf, f32)> {
+    layers.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.1.total_cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     layers.truncate(MAX_LAYERS);
     layers
+        .into_iter()
+        .map(|(path, volume, _)| (path, volume))
+        .collect()
 }
 
 /// Checks the shipped loop format and decodes initial samples without opening
@@ -220,14 +285,6 @@ impl AmbienceAudio {
             tx,
             one_shots,
             gain,
-        })
-    }
-
-    pub fn set_track(&self, path: Option<PathBuf>) -> Result<(), TrySendError<Option<PathBuf>>> {
-        let mix = path.iter().map(|path| (path.clone(), 1.0)).collect();
-        self.tx.try_send(mix).map_err(|error| match error {
-            TrySendError::Full(_) => TrySendError::Full(path.clone()),
-            TrySendError::Disconnected(_) => TrySendError::Disconnected(path.clone()),
         })
     }
 
@@ -450,10 +507,11 @@ mod tests {
         let config = BiomeAudioConfig {
             tracks: vec![Some("meadow.ogg".into()), Some("stream.ogg".into())],
             ranges_m: vec![45.0, 90.0],
+            water_tracks: vec![false, true],
             ..Default::default()
         };
         let volume_of = |x: f64, name: &str| {
-            ambience_mix(&field, &grid, [x, 10.0, 100.0], &config)
+            ambience_mix(1.0, &field, &grid, [x, 10.0, 100.0], &config)
                 .into_iter()
                 .find(|(path, _)| path.to_str() == Some(name))
                 .map_or(0.0, |(_, v)| v)
@@ -467,6 +525,42 @@ mod tests {
         // Out of range the stream drops out entirely, and the meadow stays.
         assert_eq!(volume_of(-100.0 + 0.0, "stream.ogg"), 0.0);
         assert!(volume_of(10.0, "meadow.ogg") > 0.99);
+    }
+
+    #[test]
+    fn weather_ducks_other_ambience_but_keeps_water_audible_and_in_the_mix() {
+        let (field, grid) = two_biome_field();
+        let config = BiomeAudioConfig {
+            tracks: vec![Some("meadow.ogg".into()), Some("stream.ogg".into())],
+            ranges_m: vec![45.0, 90.0],
+            water_tracks: vec![false, true],
+            ..Default::default()
+        };
+        let at = |config: &BiomeAudioConfig, duck: f32| {
+            ambience_mix(duck, &field, &grid, [61.0, 10.0, 100.0], config)
+        };
+        let get = |mix: &[(PathBuf, f32)], name: &str| {
+            mix.iter()
+                .find(|(p, _)| p.to_str() == Some(name))
+                .map_or(0.0, |(_, v)| *v)
+        };
+        let ducked = at(&config, 0.35);
+        assert!(get(&ducked, "stream.ogg") > 0.8, "{ducked:?}");
+        assert!(get(&ducked, "meadow.ogg") < 0.4, "{ducked:?}");
+        // With more layers than mix slots, water still beats louder non-water layers.
+        let crowded = prioritise(vec![
+            ("a.ogg".into(), 1.0, false),
+            ("b.ogg".into(), 0.9, false),
+            ("c.ogg".into(), 0.8, false),
+            ("d.ogg".into(), 0.7, false),
+            ("stream.ogg".into(), 0.1, true),
+        ]);
+        assert_eq!(crowded.len(), MAX_LAYERS);
+        assert!(
+            crowded
+                .iter()
+                .any(|(p, _)| p.to_str() == Some("stream.ogg"))
+        );
     }
 
     #[test]

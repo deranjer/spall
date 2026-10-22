@@ -73,6 +73,11 @@ impl Season {
             _ => None,
         }
     }
+    pub fn from_code(code: u8) -> Option<Self> {
+        [Self::Spring, Self::Summer, Self::Autumn, Self::Winter]
+            .get(usize::from(code))
+            .copied()
+    }
     pub fn at(start: Self, time_ms: u64, season_ms: u64) -> Self {
         [Self::Spring, Self::Summer, Self::Autumn, Self::Winter]
             [(start as usize + (time_ms / season_ms.max(1)) as usize % 4) % 4]

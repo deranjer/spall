@@ -7,18 +7,16 @@
 # domain <path> <literal>   rule 3: existing b"spall.…" hash-domain literal
 # log <path>                rule 9: tracked docs *.jsonl/*.log
 
-lines crates/spall_client/src/net.rs 3695
+lines crates/spall_client/src/net.rs 3692
 lines crates/spall_fluid/src/columns.rs 3245
-lines crates/spall_protocol/src/creature_owner.rs 2061
 lines crates/spall_render/src/capture.rs 2212
-lines crates/spall_server/src/serve/tick_loop.rs 2578
-lines crates/spall_sim/src/world.rs 3291
-lines examples/sandbox/src/bin/sandbox-capture.rs 2979
+lines crates/spall_server/src/serve/tick_loop.rs 2572
+lines crates/spall_sim/src/world.rs 2933
+lines examples/sandbox/src/bin/sandbox-capture.rs 2977
 lines tools/spall_editor/src/ui.rs 2165
 const crates/spall_core/src/lib.rs PROCESS_METADATA_VERSION
 const crates/spall_ecology/src/lib.rs SPECIES_DEFINITION_VERSION
 const crates/spall_ecology/src/living.rs VERSION
-const crates/spall_physics/src/fracture.rs FRACTURE_PLAN_VERSION
 const crates/spall_protocol/src/segment.rs BASELINE_DEFERRED_REGIONAL_WORLD_VERSION
 const crates/spall_protocol/src/segment.rs BASELINE_REGIONAL_WORLD_VERSION
 const crates/spall_protocol/src/segment.rs BASELINE_SEGMENTED_WORLD_VERSION
@@ -48,22 +46,9 @@ domain crates/spall_protocol/src/canonical.rs spall.content-with-assets.v1
 domain crates/spall_protocol/src/canonical.rs spall.manifest.v1
 domain crates/spall_protocol/src/canonical.rs spall.topology.chunk.v2
 domain crates/spall_protocol/src/canonical.rs spall.topology.v2
-domain crates/spall_protocol/src/creature.rs spall.creature-material-mapping.v1
-domain crates/spall_protocol/src/creature_owner.rs spall.creature-change.v4
-domain crates/spall_protocol/src/creature_owner.rs spall.creature-motion.v4
-domain crates/spall_protocol/src/creature_owner.rs spall.creature-owner-set.v4
-domain crates/spall_protocol/src/creature_owner.rs spall.creature-owner.v4
-domain crates/spall_protocol/src/creature_owner.rs spall.creature-source-content.v2
-domain crates/spall_protocol/src/creature_owner.rs spall.creature-topology.v4
-domain crates/spall_protocol/src/creature_snapshot.rs spall.checkpoint-topology.v1
-domain crates/spall_protocol/src/creature_snapshot.rs spall.creature-snapshot-topology.v1
-domain crates/spall_protocol/src/creature_snapshot.rs spall.creature-snapshot.v2
 domain crates/spall_protocol/src/records.rs spall.transaction-replay.v1
 domain crates/spall_protocol/src/segment.rs spall.baseline.capability.segmented.v2
 domain crates/spall_protocol/src/segment.rs spall.baseline.capability.streamed.v3
-domain crates/spall_sim/src/sim/creature_types.rs spall.creature-owner-key.v1
-domain crates/spall_sim/src/sim/creature_types.rs spall.sim-creature-catalog-fence.v1
-domain crates/spall_sim/src/world.rs spall.creature-source-ownership.v1
 domain crates/spall_voxel/src/brick.rs spall.brick.v1
 domain crates/spall_voxel/src/fixtures.rs spall.voxel.fixture.v1
 domain examples/sandbox/examples/animal_fixtures.rs spall.asset.v1

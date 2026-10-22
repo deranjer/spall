@@ -337,10 +337,7 @@ fn retained_bulk_record(recovery: &Recovery) -> Option<(u64, Hash32)> {
             _ => None,
         })?;
         let spall_protocol::ValidatedTransactionAttachmentV1::Geometry(world) =
-            attachments.get(transfer_id)?
-        else {
-            return None;
-        };
+            attachments.get(transfer_id)?;
         Some((transfer_id, Hash32::of(&world.encode())))
     })
 }
@@ -414,12 +411,8 @@ fn oversized_split_shares_one_wire_id_and_durable_replay_then_seeds_restart() {
         .find_map(|row| {
             let (tx, _, set) = row.payload.as_topology_with_attachments()?.ok()?;
             let id = tx.ops.iter().find_map(TopologyOp::bulk_transfer_id)?;
-            match set.get(id)? {
-                spall_protocol::ValidatedTransactionAttachmentV1::Geometry(world) => {
-                    Some(world.clone())
-                }
-                _ => None,
-            }
+            let spall_protocol::ValidatedTransactionAttachmentV1::Geometry(world) = set.get(id)?;
+            Some(world.clone())
         })
         .unwrap();
     assert_eq!(Hash32::of(&durable_baseline.encode()), attached_hash);

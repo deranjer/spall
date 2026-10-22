@@ -505,9 +505,6 @@ fn run_replication(args: Args) -> ExitCode {
         join_token: token,
         script,
         movement_script,
-        creature_catalog: Some(sandbox::animals::catalog(
-            &sandbox::animals::species().expect("authored animal assets decode"),
-        )),
         late_join: args.late_join,
         baseline_scene,
         run_ticks: args.run_ticks,
@@ -733,9 +730,6 @@ fn run_interactive(args: Args) -> ExitCode {
         join_token: token,
         script,
         movement_script: Vec::new(),
-        creature_catalog: Some(sandbox::animals::catalog(
-            &sandbox::animals::species().expect("authored animal assets decode"),
-        )),
         late_join: args.late_join,
         baseline_scene,
         run_ticks: 0,
@@ -783,6 +777,9 @@ fn run_interactive(args: Args) -> ExitCode {
             biome_audio: sandbox::audio::config(),
             creature_view: Some(std::sync::Arc::new(
                 sandbox::animal_view::AnimalView::new().expect("authored animal assets build"),
+            )),
+            player_view: Some(std::sync::Arc::new(
+                sandbox::player_view::PlayerBodyView::new().expect("authored player asset builds"),
             )),
         },
     ) {

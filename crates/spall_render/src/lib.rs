@@ -23,6 +23,7 @@ pub mod scene;
 pub mod screen_grade;
 pub mod sky_visibility;
 pub mod snow;
+pub mod snow_mesh;
 pub mod target;
 pub mod upload;
 pub mod vertex;
@@ -63,13 +64,15 @@ pub use screen_grade::ScreenGrade;
 pub use sky_visibility::{
     SKY_MAX_RAY_CELLS, SkyVisibility, UNKNOWN_CELL, cache_origin_around, mark_world_box,
 };
-pub use snow::{SnowFootprintMark, SnowRenderError, SnowSurfacePatch};
+pub use snow_mesh::{
+    SnowBeyond, SnowFootprintMark, SnowMesh, SnowNeighbours, SnowTile, SnowTileKey, mesh_tile,
+};
 pub use target::OffscreenTarget;
 pub use upload::{GpuMesh, MeshUploader, UploadBudget};
 pub use vertex::{GpuVertex, to_gpu};
 pub use viewport::{MeshChunk, ViewportFrame, ViewportRenderer};
 pub use water::{NO_WATER, WaterField};
-pub use weather::{WeatherLighting, WeatherParticle, WeatherRenderError};
+pub use weather::{MAX_WEATHER_PARTICLES, WeatherLighting, WeatherParticle, WeatherRenderError};
 
 /// Milliseconds on a process-wide clock started at the first call, for lining
 /// up the diagnostic traces (`SPALL_FRAME_TRACE`, `SPALL_SWEEP_TRACE`).

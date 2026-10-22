@@ -7,14 +7,27 @@ pub(super) struct InteractiveApp {
     pub(super) environment: Environment,
     pub(super) day_night_cycle: bool,
     pub(super) render_materials: Vec<spall_render::Material>,
+    /// Seasonal kind of each render material (same indexing), if greenery.
+    pub(super) material_kinds: Vec<Option<crate::season_colour::Greenery>>,
     /// Material index of the debug overlay colour (one past the manifest).
     pub(super) debug_material: u32,
     pub(super) uncapped: bool,
     ambience: Option<AmbienceAudio>,
     pub(super) biome_audio: BiomeAudioConfig,
     pub(super) creature_view: Option<std::sync::Arc<dyn CreatureView>>,
-    /// The animal cubes last drawn, redrawn on a frame whose replica lock is busy.
-    pub(super) creature_overlay: Vec<spall_render::CubeInstance>,
+    pub(super) player_view: Option<std::sync::Arc<dyn PlayerView>>,
+    /// `F8`: the camera sits behind the player, who is drawn in view.
+    pub(super) third_person: bool,
+    /// Render-table index of the player view's first tint material.
+    pub(super) player_tint_base: u32,
+    /// Last drawn creature cubes and remote players. A frame that finds the
+    /// replica lock busy reuses them instead of dropping them for a frame.
+    pub(super) last_creature_cubes: Vec<spall_render::CubeInstance>,
+    pub(super) last_remote_players: Vec<super::options::PlayerBody>,
+    /// Third-person camera distance (metres): pulled in at once when terrain
+    /// is in the way, eased back out, and held when the replica is busy.
+    pub(super) third_person_distance_m: f32,
+    pub(super) third_person_at: Option<Instant>,
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
@@ -22,7 +35,19 @@ pub(super) struct InteractiveApp {
     ambience_layers: Vec<(PathBuf, u8)>,
     ambience_mix_at: Option<Instant>,
     weather_audio: Option<AmbienceAudio>,
-    weather_track: Option<PathBuf>,
+    weather_mix: Vec<(PathBuf, f32)>,
+    pub(super) footsteps: Option<crate::footsteps::FootstepAudio>,
+    pub(super) footstep_volume: f32,
+    /// One stride counter per walking player (`0` is the local player).
+    pub(super) footstep_trackers: HashMap<u64, crate::footsteps::FootstepTracker>,
+    pub(super) footstep_at: Option<Instant>,
+    pub(super) footstep_log: bool,
+    pub(super) breathing: Option<crate::breathing::BreathingAudio>,
+    pub(super) breathing_state: crate::breathing::BreathingState,
+    /// `SPALL_BREATHING_LOG`: print each breathing and endurance state change.
+    pub(super) breathing_log: bool,
+    pub(super) breathing_tick: Instant,
+    pub(super) endurance_view: Option<EnduranceView>,
     pub(super) nature_volume: f32,
     pub(super) weather_volume: f32,
     pub(super) nature_muted: bool,
@@ -42,6 +67,9 @@ pub(super) struct InteractiveApp {
     pub(super) body_state_at: Option<Instant>,
     /// Clock for the screen grade's heartbeat pulse.
     pub(super) body_epoch: Instant,
+    /// Eased 0..1 camera submersion and shared wind strength, from the renderer.
+    pub(super) weather_submerge: f32,
+    pub(super) weather_wind: f32,
     /// When the last frame was requested, for the uncapped frame limiter.
     pub(super) last_redraw: Instant,
     /// Scripted camera tour (`--shots`); empty for normal play.
@@ -212,6 +240,9 @@ impl InteractiveApp {
         )?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         let ambience = AmbienceAudio::start(0.2);
+        let footsteps = crate::footsteps::FootstepAudio::start(&options.biome_audio.footsteps, 0.5);
+        let breathing =
+            crate::breathing::BreathingAudio::start(&options.biome_audio.breathing, 0.6);
         Ok(Self {
             session,
             window: None,
@@ -219,19 +250,36 @@ impl InteractiveApp {
             environment,
             day_night_cycle: options.day_night_cycle.unwrap_or(true),
             render_materials,
+            material_kinds: Vec::new(),
             debug_material,
             uncapped: options.uncapped,
             ambience,
             biome_audio: options.biome_audio,
             creature_view: options.creature_view,
-            creature_overlay: Vec::new(),
+            player_view: options.player_view,
+            third_person: false,
+            player_tint_base: 0,
+            last_creature_cubes: Vec::new(),
+            last_remote_players: Vec::new(),
+            third_person_distance_m: super::camera::THIRD_PERSON_DISTANCE_M,
+            third_person_at: None,
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
             ambience_layers: Vec::new(),
             ambience_mix_at: None,
             weather_audio: AmbienceAudio::start(0.3),
-            weather_track: None,
+            weather_mix: Vec::new(),
+            footsteps,
+            footstep_volume: 0.5,
+            footstep_trackers: HashMap::new(),
+            footstep_at: None,
+            footstep_log: std::env::var_os("SPALL_FOOTSTEP_LOG").is_some(),
+            breathing,
+            breathing_state: crate::breathing::BreathingState::Calm,
+            breathing_tick: Instant::now(),
+            breathing_log: std::env::var_os("SPALL_BREATHING_LOG").is_some(),
+            endurance_view: None,
             nature_volume: 0.2,
             weather_volume: 0.3,
             nature_muted: false,
@@ -248,6 +296,8 @@ impl InteractiveApp {
             body_preview: BodyPreview::default(),
             body_state_at: None,
             body_epoch: Instant::now(),
+            weather_submerge: 0.0,
+            weather_wind: 0.0,
             last_redraw: Instant::now(),
             script: options.shots.into(),
             shots_dir: options.shots_dir,
@@ -324,27 +374,41 @@ impl InteractiveApp {
         if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
             self.latest_weather = replica.weather().cloned();
         }
+        // Weather ducks each ambience layer (water far less, see `ambience_mix`).
+        let weather_duck = if self.nature_preview.is_some() {
+            1.0
+        } else {
+            self.latest_weather.as_ref().map_or(1.0, |state| {
+                1.0 - 0.65 * f32::from(state.precipitation_q16.max(state.gust_q16))
+                    / f32::from(u16::MAX)
+            })
+        };
         if let Some(audio) = &self.ambience {
-            let weather_duck = if self.nature_preview.is_some() {
-                1.0
-            } else {
-                self.latest_weather.as_ref().map_or(1.0, |state| {
-                    1.0 - 0.65 * f32::from(state.precipitation_q16.max(state.gust_q16))
-                        / f32::from(u16::MAX)
-                })
-            };
             audio.set_gain(if self.nature_muted {
                 0.0
             } else {
-                self.nature_volume * weather_duck
+                self.nature_volume
             });
         }
-        let weather_track = self.latest_weather.as_ref().and_then(|state| {
+        // The wind bed swells in gusts and drops in lulls with the shared wind
+        // schedule; full strength is the old constant level.
+        let wind_gain = (0.3 + 0.7 * self.weather_wind).clamp(0.0, 1.0);
+        let weather_mix = self.latest_weather.as_ref().map_or_else(Vec::new, |state| {
+            let windy = matches!(
+                state.kind,
+                spall_protocol::WeatherKind::Blizzard | spall_protocol::WeatherKind::HighWind
+            );
             self.biome_audio
-                .weather_tracks
-                .get(state.kind as usize)
-                .cloned()
-                .flatten()
+                .weather_mix(
+                    state.kind as u8,
+                    f32::from(state.precipitation_q16) / f32::from(u16::MAX),
+                )
+                .into_iter()
+                .map(|(path, gain)| {
+                    let gain = if windy { gain * wind_gain } else { gain };
+                    (path, (gain * 20.0).round() / 20.0)
+                })
+                .collect()
         });
         if let Some(audio) = &self.weather_audio {
             if self
@@ -359,11 +423,13 @@ impl InteractiveApp {
             audio.set_gain(if self.weather_muted {
                 0.0
             } else {
-                self.weather_volume * (0.25 + 0.75 * self.weather_exposure)
+                // Under water the weather is a muffled thud at most.
+                self.weather_volume
+                    * (0.25 + 0.75 * self.weather_exposure)
+                    * (1.0 - 0.93 * self.weather_submerge)
             });
-            if weather_track != self.weather_track && audio.set_track(weather_track.clone()).is_ok()
-            {
-                self.weather_track = weather_track;
+            if weather_mix != self.weather_mix && audio.set_mix(weather_mix.clone()).is_ok() {
+                self.weather_mix = weather_mix;
             }
             if let Some(state) = &self.latest_weather {
                 let event = (state.world_epoch, state.lightning_id);
@@ -439,6 +505,7 @@ impl InteractiveApp {
                     let field = self.ambience_field.as_ref()?;
                     let grid = self.ambience_grid.as_ref()?;
                     Some(crate::audio::ambience_mix(
+                        weather_duck,
                         field,
                         grid,
                         position,
@@ -543,12 +610,22 @@ impl InteractiveApp {
                 }
                 2.0
             }
-            ShotStep::Move { seconds, movement } => {
+            ShotStep::Move {
+                seconds,
+                movement,
+                sprint,
+            } => {
                 if self.fly_eye.is_some() {
                     self.toggle_flight();
                 }
                 self.session.input.set_movement(movement);
+                self.session.input.set_button(BUTTON_SPRINT, sprint);
                 seconds
+            }
+            ShotStep::ThirdPerson(on) => {
+                self.third_person = on && self.player_view.is_some();
+                self.script_at = Some(now + Duration::from_secs(1));
+                return;
             }
             ShotStep::Menu => {
                 self.admin_menu_open = !self.admin_menu_open;
@@ -567,10 +644,16 @@ impl InteractiveApp {
                     .push_admin(spall_protocol::AdminCommand::ResetWorld);
                 6.0
             }
-            ShotStep::Weather(kind) => {
+            ShotStep::Weather(kind, intensity) => {
                 self.admin_request_pending = true;
                 self.session
-                    .push_admin(spall_protocol::AdminCommand::SetWeather { kind });
+                    .push_admin(spall_protocol::AdminCommand::SetWeather { kind, intensity });
+                3.0
+            }
+            ShotStep::Season(season) => {
+                self.admin_request_pending = true;
+                self.session
+                    .push_admin(spall_protocol::AdminCommand::SetSeason { season });
                 3.0
             }
             ShotStep::Play => {
@@ -708,7 +791,9 @@ impl InteractiveApp {
                 .map(|v| self.camera_follow.eye(v, Instant::now(), true));
             self.session.input.set_movement([0.0; 3]);
             self.session.input.set_button(BUTTON_JUMP, false);
+            self.session.input.set_button(BUTTON_SPRINT, false);
         } else {
+            self.session.input.set_button(BUTTON_SPRINT, self.held.fast);
             self.publish_movement();
         }
         self.last_fly_update = Some(Instant::now());

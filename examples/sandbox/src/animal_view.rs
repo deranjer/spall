@@ -13,7 +13,7 @@ use crate::animals::{AnimalError, LOCOMOTION_IDLE, locomotion_clip, species};
 
 #[derive(Debug)]
 pub struct AnimalView {
-    visuals: Vec<([u8; 16], &'static str, AnimalVisual)>,
+    visuals: Vec<(&'static str, AnimalVisual)>,
     started: Instant,
 }
 
@@ -23,10 +23,9 @@ impl AnimalView {
         let visuals = species()?
             .into_iter()
             .map(|s| {
-                let uuid = s.asset.uuid;
                 let key = s.key;
                 AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
-                    .map(|visual| (uuid, key, visual))
+                    .map(|visual| (key, visual))
                     .map_err(|e| AnimalError::Asset(key, e.to_string()))
             })
             .collect::<Result<_, _>>()?;
@@ -46,26 +45,19 @@ impl CreatureView for AnimalView {
     ) -> Vec<CubeInstance> {
         let mut out = Vec::new();
         for record in creatures.records() {
-            let state = &record.state;
-            let Some((_, species_key, visual)) = self
-                .visuals
-                .iter()
-                .find(|(uuid, _, _)| *uuid == state.asset.uuid)
+            let Some((species_key, visual)) =
+                self.visuals.iter().find(|(key, _)| *key == record.species)
             else {
                 continue;
             };
             let presented = creatures.presentation(record, now);
-            let clip = if presented.locomotion_tag == LOCOMOTION_IDLE {
-                state.clip_name.as_str()
-            } else {
-                locomotion_clip(species_key, presented.locomotion_tag).unwrap_or("idle")
-            };
+            let clip = locomotion_clip(species_key, presented.locomotion_tag).unwrap_or("idle");
             let duration = f64::from(visual.clip_duration(clip).unwrap_or(1).max(1));
             // Resting animals idle on a local clock, offset per creature so a herd
             // does not breathe in step.
             let phase = if presented.locomotion_tag == LOCOMOTION_IDLE {
                 now.saturating_duration_since(self.started).as_secs_f64() * 60.0
-                    + (state.key.creature_id.get() % 17) as f64 * 11.0
+                    + (record.creature_id % 17) as f64 * 11.0
             } else {
                 presented.clip_phase_tick
             };

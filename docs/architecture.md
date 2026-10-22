@@ -178,7 +178,7 @@ T06 outcome (`spall_physics`, pinned `rapier3d 0.35.3`): the **merged-cuboid com
 
 Use a capsule character controller with grounded state, gravity, jump, slope/step constraints, swept movement, and server-authoritative interaction with dynamic bodies. Ground input selects horizontal velocity; takeoff preserves that horizontal momentum until the capsule regains ground, with no mid-air steering or braking. The shipped arc uses a `5.7 m/s` launch and `16 m/s²` character gravity: about a `1.0 m` apex with roughly `0.71 s` airtime. The authoritative capsule has an `80 kg` effective contact mass; its sweep transfers impulses to dynamic bodies, whose exact mass / COM / inertia come from the fine material voxel grid, so a larger same-density block is harder to push. Replica colliders remain query-only and never apply client-side impulses. Physics queries need up-to-date collider revisions. Enable CCD selectively for fast damaging bodies; test tunneling and contact-energy thresholds before enabling impact-triggered destruction.
 
-Client player movement is predicted and reconciled. Remote bodies initially use snapshot interpolation plus kinematic collision proxies. They never gain authority from a client's local collision. Later local dynamic extrapolation is optional only if correction tests show a benefit.
+Other players' capsule snapshots are kept per entity in `ReplicaWorld::remote_players` (interpolated like far bodies, dropped after 2 s of silence) and drawn by the game's `PlayerView` (sandbox: `player.spvox`, clip chosen from speed and swimming). Shift sets `BUTTON_SPRINT`, which the shared character kernel turns into run speed on both server and client. The same kernel step advances `CharacterState::endurance` (`0..=1`): sprinting on the ground drains it (about 13.5 s from full), resting regains it (10 s), walking regains it at half that rate, steady swimming drains it slowly and treading water does not. At empty the player is exhausted and falls back to walk speed until endurance passes 30%. The player's `MotionSnapshot` carries `endurance` and `exhausted`, so the predictor reconciles against them; the client draws a bar while it is below full and plays breathing (`spall_client::breathing`: calm / exerted below 60% or while sprinting / exhausted, one crossfaded recording per state, `SPALL_BREATHING_LOG` prints transitions). Client player movement is predicted and reconciled. Remote bodies initially use snapshot interpolation plus kinematic collision proxies. They never gain authority from a client's local collision. Later local dynamic extrapolation is optional only if correction tests show a benefit.
 
 T19 outcome — headless core (`spall_physics::character` + `spall_sim::player` + `spall_client::predict`): a player is a **kinematic capsule**, not a `spall_sim` body — it has no voxel volume, never splits, and never enters the dynamic-body set, so it does not touch the edit / split / collider path. It nevertheless carries an explicit effective contact mass for server-side momentum transfer. `spall_physics::character::step_character` is the one **pure** movement kernel (ground input → world-frame wish velocity, preserved airborne horizontal momentum, gravity, rising-edge jump, post-move vertical clamp) and both sides run it: the server uses `PhysicsWorld::sweep_character_pushing_excluding`, which wraps Rapier's `KinematicCharacterController` and solves contact impulses against dynamic bodies; `spall_client::predict::ClientPhysics` runs the non-pushing sweep against replica terrain plus query-only, server-pose-driven mirrors of detached-body voxel colliders. These mirrors affect only the character query; they never simulate body motion or gain client authority. Physics is not lockstep (`docs/protocol.md`), so this buys only bounded agreement — `PredictedPlayer` keeps a bounded input history, snaps to each authoritative `MotionSnapshot` at its `acked_input`, and replays the still-unacknowledged inputs; the residual is reported as a bounded correction. The player capsule advances in `Simulation::tick` **after** `step_physics` (so the sweep sees the broad-phase BVH that tick's collider rebuilds refreshed) and before snapshot extraction. A committed edit within `INVALIDATION_MARGIN_M` of a player bumps its `movement_epoch` and depenetrates it server-side; the client, on any terrain-hash change near its path, rebuilds `ClientPhysics` and rebases prediction on the last authoritative state rather than replaying through geometry that no longer exists. Held input is reused for a 250 ms window then cleared to neutral, so a lost "button up" cannot leave the player walking or holding jump. The player id is a reserved band (`spall_core::player_entity_for(slot)` — `1 << 48 + slot`) both ends derive from the session slot, so no wire record was added; player state rides the existing 20 Hz `MotionSnapshot` with `body =` the player entity and `acked_input =` the last consumed input sequence. `spall_server::serve` gives each connecting client a capsule and reads `InputFrame` datagrams (one applied per player per tick, redundant `recent` copies recover a dropped frame). Moving-body **crush** outcomes are handled by the separate T21 contact-damage path.
 
@@ -195,7 +195,7 @@ from the new voxel grid as well. This mode does not transfer topology/edit
 authority and is never a multiplayer protocol mode. With the flag absent, the
 normal server-authoritative path above is unchanged.
 
-For a larger world, multiple independently rebased physics regions are necessary when players are far apart. Region merge/split and body transfer must be atomic and tested. A single origin following one player is not an acceptable multiplayer large-world solution. This is a G5 gate, not hidden work in the initial sandbox.
+Multi-region physics (several rebased physics worlds with body transfer) is not implemented: the prototype was removed 2026-10-20 (see git history). Only the single-world origin shift (`PhysicsOrigin`) remains; a larger world with widely separated players needs a new design under G5.
 
 ## Renderer and visual target
 
@@ -265,8 +265,8 @@ re-enters through the existing baseline/repair path.
 
 `spall_store` (`-> spall_protocol`) owns the durable save schema and SQLite I/O
 only, never simulation objects. It exposes: a versioned save schema
-(`STORE_SCHEMA_VERSION`, the one save version shared with the ecology and creature
-checkpoint formats; a `PRAGMA user_version` guard rejects any other database untouched, with an
+(`STORE_SCHEMA_VERSION`, the one save version shared with the ecology
+formats; a `PRAGMA user_version` guard rejects any other database untouched, with an
 "incompatible save" error), zstd-compressed brick payloads with one-brick-bounded decode, a
 single WAL `Writer` that verifies `journal_mode=WAL` + `synchronous=FULL` on
 open and returns a `DurableThrough` only after a successful `COMMIT`, checkpoint
@@ -561,81 +561,16 @@ geometry even outside current interest. Global water/ecology replication is unch
 reduces initial terrain geometry transfer/client residency; it is not server region generation,
 interest-filtered transactions, or distant visual LOD. Those require separate measured work.
 
-## ENG-218 animal ownership integration boundary
+## Animals
 
-Animal source volumes have separate ownership from terrain and ordinary bodies.
-Lifecycle changes belong in the existing ordered topology transaction and journal,
-sharing the world ID allocators and transaction replay receipt. The accepted
-current protocol/wire-12 inline operation and typed bulk marker are framing boundaries: current client and
-geometry-only replay consumers reject actor-bearing transactions before mutation.
-An internal authoritative prepare/validate/publish path now supports inline birth,
-checked death and mixed geometry without publishing a partial candidate. It is
-not connected to live tick admission; dormant mixed targets reject until waking
-can be staged atomically. Bulk, replica, baseline and ordered store replay consumers remain under implementation;
-production animal spawning is disabled. See
-[ENG-218 design](reports/ENG-218-design.md) and
-[measured progress](reports/ENG-218-progress.md).
-
-Only current protocol and save layouts are supported. Old journal headers are
-never rewritten; older DTO layouts and incomplete current store schemas are
-rejected without migration or backfill. Recovery from a complete valid checkpoint
-after corruption remains part of the durability contract.
-
-
-ENG-218 now exposes an opaque joint cold-restore candidate after geometry recovery.
-It stages saved-ID host/source/provenance/frozen-pose state and one bounded physics
-batch, fences the existing shared registry and geometry namespace, and publishes
-all participants together without new IDs or journal entries. It requires an
-uninitialized host and all source indexes empty; initialized empty hosts cannot
-be replaced. Existing geometry/physics/journal/origin fences invalidate stale or
-foreign candidates. Complete actor checkpoint/baseline and ordered journal/replica
-consumers remain the next integration work; production spawning stays disabled.
-
-
-ENG-218 current store schema5 retains the schema4 atomic format and carries a required complete animal checkpoint
-section alongside geometry/environment/cursor state. Catalog-aware capture and
-detached rebuild use the existing bounded SnapshotV2 and joint installer, retaining
-saved IDs/counters, independent motion, fragment masks/primary/high-water and the
-exact physics origin. A separate full snapshot hash and checkpoint topology
-composition version3 bind the population without changing actor-free geometry
-vectors. Catalog-free APIs and the geometry-only world hash remain guarded.
-Missing/invalid animal rows are corruption, not empty population. Explicit prior
-checkpoint selection reloads that checkpoint's own suffix; semantic reconstruction
-failures do not silently choose older history. Until typed actor replay exists,
-writer publication refuses unsupported animal suffixes and future journal appends
-after an initialized-host checkpoint. Live spawning/serve scheduling and baseline/
-replica/attachment consumers remain closed; this is not 1km launch acceptance.
-
-The full catalog-aware checkpoint adapter refuses any evicted geometry before
-capture. ResidencyPass::capture_checkpoint_with_catalog instead assembles complete
-logical terrain from its revision cache and digest-verified backing, then captures
-the same validated animal/environment section. Its cache is bound to the installed
-SimWorld runtime instance; another or replaced world refuses before cache/backing
-access. Cache and counters publish only after the complete checkpoint succeeds.
-Evicted ordinary bodies refuse because this pass reconstructs terrain only.
-The catalog-free entrypoint still refuses initialized hosts. Live serve catalog
-handoff and typed animal journal/baseline/replica consumers remain prerequisites;
-this checkpoint adapter alone is not live 1km animal persistence acceptance.
-
-
-ENG-218 typed journal transport now uses store5 TopologyAttachments with the
-existing bounded typed attachment-set protocol. Actual terrain journal conversion,
-recovery and retained transfer-ID startup seeding use this path; the previous
-geometry-only durable variant is removed. SQLite rows retain parent/participants
-and complete attachment set atomically with the existing outbox, CRC and durable
-sequence. Decoder budgets, parent/marker correlation and row-tick validation fail
-before use/publication; corrupt rows terminate the reported durable prefix.
-Geometry-only runtime replay remains functional. Lifecycle or mixed attachments
-are retained by the storage transport but explicitly refused by runtime replay
-until the joint Simulation consumer exists. Live animals remain gated.
-
-
-ENG-218 bulk producer now prepares exact typed attachment sets in the same
-candidate as host/source/physics/registry changes. Caller-supplied bounded transfer
-reservations precede marker hashing; oversized actor payloads use existing V4 bulk
-markers while inline work stays inline. Both geometry and lifecycle producers
-carry JournalEntry.attachments unchanged to the store adapter. Codec/work/ID
-failure or stale candidate never publishes a prefix. Real three-part Birth,
-independently animated checked Death and full-size mixed terrain split tests cover
-one-entry publication. The live server scheduling/reservation caller and client/
-recovery consumers remain closed; this is not combined 1km launch acceptance.
+An animal is a plain server-authoritative entity: `CreatureRecord` (id, species
+key, root pose, locomotion tag, clip phase). It is drawn from the species' SPVX
+asset and owns no world voxels, so it is not part of any volume hash, journal
+entry or transaction. `spall_sim` keeps the records (`creatures.rs`) and moves
+them by sweeping a capsule against terrain with the same kinematic controller
+players use (`creature_motion.rs`); the game's `CreatureDirector`
+(`spall_server::creature_service`) decides where each one goes. Spawn and despawn
+are replicated records, and positions travel in `CreatureMotionFrame`s; see
+[protocol](protocol.md#creatures). Players and bodies do not collide with
+animals. Worlds with animals cannot be saved. The design and the planned hunting
+path are in [animal lifecycle](animal-lifecycle.md).

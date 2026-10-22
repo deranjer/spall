@@ -139,6 +139,76 @@ pub(super) fn view_dir_from(yaw: f32, pitch: f32) -> [f32; 3] {
     [sin_y * cos_p, sin_p, -cos_y * cos_p]
 }
 
+/// How far behind the eye the third-person camera sits, metres.
+pub(super) const THIRD_PERSON_DISTANCE_M: f32 = 3.5;
+/// How far above the line behind the eye it sits at full distance, metres.
+const THIRD_PERSON_LIFT_M: f32 = 0.4;
+/// Gap kept between the camera and terrain it was pulled in against, metres.
+const THIRD_PERSON_MARGIN_M: f32 = 0.3;
+
+/// The third-person camera: `distance` metres behind `eye` against `dir`, and a
+/// little above.
+pub(super) fn third_person_eye(eye: Vec3, dir: Vec3, distance: f32) -> Vec3 {
+    eye - dir * distance + Vec3::Y * (THIRD_PERSON_LIFT_M * distance / THIRD_PERSON_DISTANCE_M)
+}
+
+/// How far back the third-person camera can sit before terrain would be inside
+/// it: the first solid cell on the ray from `eye` to the full-distance camera,
+/// less a margin, or the full distance when the way is clear.
+pub(super) fn third_person_distance(volume: &Volume, eye: Vec3, dir: Vec3) -> f32 {
+    use spall_voxel::query::{Ray, RayConfig, RayOutcome, cast_ray};
+    let cell_m = f64::from(CELL_M);
+    let back = third_person_eye(eye, dir, THIRD_PERSON_DISTANCE_M) - eye;
+    let length = back.length();
+    let Some(heading) = back.try_normalize() else {
+        return THIRD_PERSON_DISTANCE_M;
+    };
+    let origin = glam::DVec3::new(f64::from(eye.x), f64::from(eye.y), f64::from(eye.z)) / cell_m;
+    let heading = glam::DVec3::new(
+        f64::from(heading.x),
+        f64::from(heading.y),
+        f64::from(heading.z),
+    );
+    match cast_ray(
+        volume,
+        Ray::new(origin, heading),
+        RayConfig::new(f64::from(length) / cell_m),
+    ) {
+        Ok(RayOutcome::Hit(hit)) => {
+            let clear = (hit.t * cell_m) as f32 - THIRD_PERSON_MARGIN_M;
+            THIRD_PERSON_DISTANCE_M * (clear / length).clamp(0.05, 1.0)
+        }
+        _ => THIRD_PERSON_DISTANCE_M,
+    }
+}
+
+/// Whether a player standing at `feet_m` swims, by the water the client holds.
+pub(super) fn player_swims(
+    water: &crate::column_surface::SharedWaterQuery,
+    feet_m: [f64; 3],
+) -> bool {
+    // The probe height the server and the predictor use.
+    spall_physics::is_swimming(
+        water.sample_at_m(feet_m[0], feet_m[1] + 0.05, feet_m[2]),
+        feet_m[1],
+    )
+}
+
+/// Whether a camera eye at height `eye_y` is below the water `sample` (the water
+/// at the eye's column, as `sample_at_m` reports it).
+pub(super) fn eye_below_surface(sample: Option<spall_physics::WaterSample>, eye_y: f64) -> bool {
+    sample.is_some_and(|water| eye_y < water.surface_y)
+}
+
+pub(super) fn srgb_to_linear(channel: u8) -> f32 {
+    let v = f32::from(channel) / 255.0;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// Vertical field of view of the game camera.
 pub(super) const CAMERA_FOV_Y_DEG: f32 = 75.0;
 pub(super) const CAMERA_Z_NEAR_M: f32 = 0.05;
@@ -148,6 +218,19 @@ pub(super) const CAMERA_Z_FAR_M: f32 = 300.0;
 mod tests {
     use super::*;
     use crate::window::test_support::view;
+
+    #[test]
+    fn eye_below_surface_needs_water_above_the_eye() {
+        let water = |surface_y| {
+            Some(spall_physics::WaterSample {
+                surface_y,
+                flow_m_s: [0.0; 2],
+            })
+        };
+        assert!(eye_below_surface(water(10.0), 9.9));
+        assert!(!eye_below_surface(water(10.0), 10.1));
+        assert!(!eye_below_surface(None, -50.0));
+    }
 
     #[test]
     fn camera_interpolation_does_not_overshoot_and_jerk_back_at_a_stop() {

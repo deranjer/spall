@@ -1,6 +1,7 @@
-//! Authoritative creature births reach two real QUIC clients: one that is
-//! connected when they happen (ordered transactions) and one that joins later
-//! (join-time sync). Both replicas must hold identical ownership records.
+//! Creature spawns and despawns reach two real QUIC clients: one that is
+//! connected when they happen (ordered stream) and one that joins later (join
+//! list). Both replicas must hold identical creatures, before and after a world
+//! reset.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -10,26 +11,16 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use spall_client::{BaselineScene, ClientNetConfig, ReplicaReadyHook, run_replication_client};
-use spall_core::{
-    CellSizeCode, CreatureGeneration, CreatureId, CreatureKey, GlobalCell, MaterialId, WorldEpoch,
-    WorldId,
-};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
-use spall_physics::{PartTransform, Representation};
-use spall_protocol::{
-    CreatureAssetIdentity, CreatureClipMode, CreatureLifecycleState, CreaturePartBinding,
-    CreatureStateV1, Hash32, OwnedCreatureAsset, OwnedCreatureCatalog, OwnedCreatureSpecies,
-    WIRE_SCHEMA_VERSION, content_manifest_hash,
-};
+use spall_protocol::CreatureRecord;
 use spall_server::creature_service::{CreatureDirector, CreatureIdPlan, CreatureService};
 use spall_server::{CustomWorld, Scene, ServeConfig, serve};
-use spall_sim::{AuthoritativeCreatureIntent, CreatureBirthPartInput, Simulation};
-use spall_voxel::{EditPlan, Volume};
+use spall_sim::Simulation;
 
-const SERVER_TICKS: u64 = 900; // 15 seconds at 60 Hz.
-const SERVER_WORLD: u128 = spall_server::serve::T10_WORLD_ID;
+const SERVER_TICKS: u64 = 1200; // 20 seconds at 60 Hz.
 const BIRTH_TICKS: [u64; 2] = [20, 120];
-const RESET_TICK: u64 = 420;
+const DESPAWN_TICK: u64 = 200;
+const RESET_TICK: u64 = 600;
 
 fn unique_dir() -> PathBuf {
     let nanos = SystemTime::now()
@@ -61,128 +52,46 @@ fn wait_for_file(path: &PathBuf, timeout: Duration) -> String {
     }
 }
 
-fn asset() -> CreatureAssetIdentity {
-    CreatureAssetIdentity {
-        uuid: [5; 16],
-        logical_hash: Hash32([6; 32]),
-    }
-}
-
-fn catalog() -> Arc<OwnedCreatureCatalog> {
-    Arc::new(OwnedCreatureCatalog {
-        assets: vec![OwnedCreatureAsset {
-            uuid: asset().uuid,
-            logical_hash: asset().logical_hash,
-            part_ids: vec![1],
-            clip_names: vec!["idle".into()],
-            portable_material_keys: vec!["stone".into()],
-        }],
-        species: vec![OwnedCreatureSpecies {
-            key: "deer".into(),
-            version: 1,
-            enabled: true,
-            asset: asset(),
-        }],
-        materials: spall_sim::fixtures::flat_terrain_setup().materials,
-        material_mapping_version: 1,
-        material_mapping: vec![("stone".into(), MaterialId(1))],
-    })
-}
-
+#[derive(Default)]
 struct TestDirector {
-    catalog: Arc<OwnedCreatureCatalog>,
-    reset_pending: bool,
+    reset_seen: bool,
     rebirths_left: u32,
 }
 
 impl CreatureDirector for TestDirector {
-    fn catalog(&self) -> Arc<OwnedCreatureCatalog> {
-        self.catalog.clone()
-    }
-
     fn on_world_reset(&mut self) {
-        self.reset_pending = true;
+        self.reset_seen = true;
+        self.rebirths_left = 2;
     }
 
     fn plan(
         &mut self,
         tick: u64,
-        sim: &Simulation,
+        _sim: &Simulation,
         ids: &mut CreatureIdPlan,
-    ) -> Vec<AuthoritativeCreatureIntent> {
-        if std::mem::take(&mut self.reset_pending) {
-            self.rebirths_left = 2;
-        }
-        let rebirth = self.rebirths_left > 0;
-        if rebirth {
+    ) -> Vec<CreatureRecord> {
+        if self.rebirths_left > 0 {
             self.rebirths_left -= 1;
-        } else if !BIRTH_TICKS.contains(&tick)
-            || sim
-                .creature_allocator_snapshot()
-                .is_none_or(|a| a.world_epoch != 1)
-        {
+        } else if self.reset_seen || !BIRTH_TICKS.contains(&tick) {
             return Vec::new();
         }
         let creature_id = ids.creature_id();
-        let volume_id = spall_core::VolumeId::new(ids.volume_id()).unwrap();
-        let mut volume = Volume::new(volume_id, CellSizeCode::Quarter);
-        volume
-            .apply_edit(&EditPlan::filled_box(
-                volume_id,
-                GlobalCell::new(0, 0, 0),
-                GlobalCell::new(0, 0, 0),
-                MaterialId(1),
-            ))
-            .unwrap();
-        let mapping_hash = self
-            .catalog
-            .with_view(|view| view.material_mapping_hash)
-            .unwrap();
-        let state = CreatureStateV1 {
-            schema: WIRE_SCHEMA_VERSION,
-            key: CreatureKey::new(
-                WorldId::from_u128(SERVER_WORLD),
-                WorldEpoch::new(sim.creature_allocator_snapshot().unwrap().world_epoch).unwrap(),
-                CreatureId::new(creature_id).unwrap(),
-                CreatureGeneration::INITIAL,
-            )
-            .unwrap(),
-            state_revision: 1,
-            lifecycle: CreatureLifecycleState::Alive,
-            species_key: "deer".into(),
-            species_version: 1,
-            asset: asset(),
-            material_manifest_hash: content_manifest_hash(sim.world().materials()),
-            material_mapping_version: 1,
-            material_mapping_hash: mapping_hash,
-            clip_name: "idle".into(),
-            clip_mode: CreatureClipMode::Playing,
-            clip_phase_tick: 0,
-            clip_subtick_remainder: 0,
-            clip_epoch: 1,
-            source_bindings: vec![CreaturePartBinding {
-                part_id: 1,
-                source_volume_id: volume_id,
-                source_revision: 1,
-            }],
-            aggregate_topology_revision: 1,
-            pose_epoch: 1,
-            root_translation_m: [8.0 + creature_id as f64, 2.0, 8.0],
-            root_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-            linear_velocity_m_s: [0.0; 3],
-            angular_velocity_rad_s: [0.0; 3],
+        vec![CreatureRecord {
+            creature_id,
+            species: "deer".into(),
+            translation_m: [8.0 + creature_id as f64, 2.0, 8.0],
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
             locomotion_tag: 0,
-        };
-        vec![AuthoritativeCreatureIntent::Birth {
-            state: Box::new(state),
-            parts: vec![CreatureBirthPartInput {
-                part_id: 1,
-                parent_id: None,
-                local_transform: PartTransform::IDENTITY,
-                volume,
-            }],
-            representation: Representation::MergedCuboids,
+            clip_phase_tick: 0,
         }]
+    }
+
+    fn despawns(&mut self, tick: u64, _sim: &Simulation) -> Vec<u64> {
+        if tick == DESPAWN_TICK {
+            vec![1]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -195,19 +104,16 @@ impl ReplicaHandle {
         Arc::new(move |replica| *slot.lock().unwrap() = Some(replica))
     }
 
-    fn keys(&self) -> BTreeMap<u64, spall_protocol::CreatureOwnershipRecordV4> {
+    fn creatures(&self) -> BTreeMap<u64, CreatureRecord> {
         let Some(replica) = self.0.lock().unwrap().clone() else {
             return BTreeMap::new();
         };
         let replica = replica.lock().unwrap();
         replica
             .creatures()
-            .map(|c| {
-                c.records()
-                    .map(|r| (r.state.key.creature_id.get(), r.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .records()
+            .map(|r| (r.creature_id, r.clone()))
+            .collect()
     }
 }
 
@@ -225,12 +131,11 @@ fn client_config(
         join_token: token,
         script: Vec::new(),
         movement_script: Vec::new(),
-        creature_catalog: Some(catalog()),
         late_join: true,
         baseline_scene: BaselineScene::Walk,
         run_ticks: SERVER_TICKS,
         idle_grace: Duration::from_millis(1500),
-        overall_timeout: Duration::from_secs(45),
+        overall_timeout: Duration::from_secs(60),
         log_json: dir.join(format!("{name}.jsonl")),
         summary_json: Some(dir.join(format!("{name}.summary.json"))),
         transport: TransportConfig::for_tests(),
@@ -241,6 +146,10 @@ fn client_config(
         client_authoritative: false,
         admin_script,
     }
+}
+
+fn ids(creatures: &BTreeMap<u64, CreatureRecord>) -> Vec<u64> {
+    creatures.keys().copied().collect()
 }
 
 #[test]
@@ -267,11 +176,7 @@ fn present_and_late_joining_clients_converge_on_the_authoritative_creatures() {
         spall_sim::fixtures::flat_terrain_setup()
     }));
     server_cfg.server.admin_commands = true;
-    server_cfg.server.creatures = Some(CreatureService::new(Box::new(TestDirector {
-        catalog: catalog(),
-        reset_pending: false,
-        rebirths_left: 0,
-    })));
+    server_cfg.server.creatures = Some(CreatureService::new(Box::new(TestDirector::default())));
     let server_thread = thread::spawn(move || serve(server_cfg));
 
     let fingerprint =
@@ -293,24 +198,47 @@ fn present_and_late_joining_clients_converge_on_the_authoritative_creatures() {
     );
     let late_cfg = client_config(&dir, "late", server, &late, Vec::new());
     let first_thread = thread::spawn(move || run_replication_client(first_cfg));
-    // Join after both births (about tick 120 = 2 s) so only sync can deliver them.
+    // Join after both spawns and the despawn (about tick 240), so only the join
+    // list can deliver the survivor.
     thread::sleep(Duration::from_secs(4));
     let late_thread = thread::spawn(move || run_replication_client(late_cfg));
 
+    // Before the reset, creature 1 is gone from both replicas and 2 remains.
     // Sample before the server stops: replicas are dropped with their clients.
     let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (a, b) = (first.creatures(), late.creatures());
+        if ids(&a) == [2] && a == b {
+            break;
+        }
+        assert!(
+            ids(&a) != [3, 4],
+            "the reset passed before both replicas settled on the survivor: first={:?} late={:?}",
+            ids(&a),
+            ids(&b)
+        );
+        assert!(
+            Instant::now() < deadline,
+            "replicas did not converge: first={:?} late={:?}",
+            ids(&a),
+            ids(&b)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // The reset removes every creature; the director spawns two new ones with
+    // fresh ids.
+    let deadline = Instant::now() + Duration::from_secs(15);
     let (first_records, late_records) = loop {
-        let (a, b) = (first.keys(), late.keys());
-        // Creatures 1 and 2 were born before the reset; only 3 and 4 survive it.
-        let reset_done = a.keys().copied().eq([3, 4]);
-        if a.len() == 2 && a == b && reset_done {
+        let (a, b) = (first.creatures(), late.creatures());
+        if ids(&a) == [3, 4] && a == b {
             break (a, b);
         }
         assert!(
             Instant::now() < deadline,
-            "replicas did not converge: first={:?} late={:?}",
-            a.keys().collect::<Vec<_>>(),
-            b.keys().collect::<Vec<_>>()
+            "replicas did not converge after the reset: first={:?} late={:?}",
+            ids(&a),
+            ids(&b)
         );
         thread::sleep(Duration::from_millis(50));
     };

@@ -9,13 +9,6 @@ rust-version.workspace = true
 # T22 material strength) can cross-check the incremental graph without copying
 # it. Always compiled for this crate's own tests.
 oracle = []
-# Offline region topology benchmark binary.
-bench = []
-
-[[bin]]
-name = "region-topology-bench"
-path = "src/bin/region_topology_bench.rs"
-required-features = ["bench"]
 
 [dependencies]
 spall_core.workspace = true

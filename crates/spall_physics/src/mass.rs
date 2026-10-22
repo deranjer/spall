@@ -11,7 +11,6 @@
 
 use spall_core::MaterialId;
 
-use crate::articulated::{PartTransform, SourcePart, compose, rotate};
 use crate::occupancy::OccupancyGrid;
 
 /// Rigid mass properties in a grid-local metre frame.
@@ -40,108 +39,6 @@ pub struct BodyMassProperties {
     pub local_com_m: [f32; 3],
     /// Inertia tensor about the centre of mass, `kg·m²`, row-major (symmetric).
     pub inertia_com_kg_m2: [[f32; 3]; 3],
-}
-
-/// Exact source-cell volume-sum mass properties for frozen parts in an
-/// assembly-local frame. Coincident source cells intentionally count once per
-/// source volume (mass is additive); callers must treat overlaps as an explicit
-/// modeling choice. Per-cell cubes are isotropic, so rotation changes only the
-/// parallel-axis terms.
-pub fn articulated_mass_properties(
-    parts: &[SourcePart],
-    poses: &[PartTransform],
-    density: impl Fn(MaterialId) -> f64,
-) -> Option<MassProperties> {
-    if parts.len() != poses.len() || poses.iter().any(|pose| !pose.is_valid()) {
-        return None;
-    }
-    let locals: std::collections::BTreeMap<_, _> = parts
-        .iter()
-        .zip(poses)
-        .map(|(part, pose)| (part.part_id, *pose))
-        .collect();
-    if locals.len() != parts.len() {
-        return None;
-    }
-    let mut flattened = std::collections::BTreeMap::new();
-    while flattened.len() < parts.len() {
-        let mut progress = false;
-        for part in parts {
-            if flattened.contains_key(&part.part_id) {
-                continue;
-            }
-            let local = locals[&part.part_id];
-            let pose = match part.parent_id {
-                None => local,
-                Some(parent) => match flattened.get(&parent).copied() {
-                    Some(parent_pose) => compose(parent_pose, local),
-                    None => continue,
-                },
-            };
-            flattened.insert(part.part_id, pose);
-            progress = true;
-        }
-        if !progress {
-            return None;
-        }
-    }
-    let mut cells = Vec::new();
-    let mut mass = 0.0;
-    let mut moment = [0.0; 3];
-    let mut valid_density = true;
-    for part in parts {
-        let pose = &flattened[&part.part_id];
-        let origin = part.grid.origin();
-        let s = f64::from(part.cell_m);
-        part.grid.for_each_solid(|x, y, z, mat| {
-            let local = [
-                (origin.x as f64 + f64::from(x) + 0.5) * s,
-                (origin.y as f64 + f64::from(y) + 0.5) * s,
-                (origin.z as f64 + f64::from(z) + 0.5) * s,
-            ];
-            let rotated = rotate(pose.rotation_xyzw, local.map(|v| v as f32));
-            let c = [
-                f64::from(pose.translation_m[0] + rotated[0]),
-                f64::from(pose.translation_m[1] + rotated[1]),
-                f64::from(pose.translation_m[2] + rotated[2]),
-            ];
-            let rho = density(mat);
-            if !rho.is_finite() || rho <= 0.0 {
-                valid_density = false;
-                return;
-            }
-            let m = rho * s * s * s;
-            mass += m;
-            for a in 0..3 {
-                moment[a] += m * c[a];
-            }
-            cells.push((c, m, s));
-        });
-    }
-    if !valid_density || mass <= 0.0 || !mass.is_finite() {
-        return None;
-    }
-    let com = if mass > 0.0 {
-        moment.map(|v| v / mass)
-    } else {
-        [0.0; 3]
-    };
-    let mut inertia = [[0.0; 3]; 3];
-    for (c, m, s) in cells {
-        let r = [c[0] - com[0], c[1] - com[1], c[2] - com[2]];
-        let r2 = r.iter().map(|v| v * v).sum::<f64>();
-        for a in 0..3 {
-            for b in 0..3 {
-                let diagonal = if a == b { 1.0 } else { 0.0 };
-                inertia[a][b] += m * s * s / 6.0 * diagonal + m * (diagonal * r2 - r[a] * r[b]);
-            }
-        }
-    }
-    Some(MassProperties {
-        mass_kg: mass,
-        com_m: com,
-        inertia_com: inertia,
-    })
 }
 
 impl MassProperties {

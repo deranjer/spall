@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use glam::DQuat;
 use spall_core::{
-    BrickCoord, CellSizeCode, CreatureKey, EntityId, GlobalCell, IdError, MaterialId, PlayerInput,
-    Revision, VolumeId,
+    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, MaterialId, PlayerInput, Revision,
+    VolumeId,
 };
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
@@ -68,8 +68,6 @@ pub enum WorldError {
     WaterInitialization(String),
     #[error("vegetation initialization: {0}")]
     VegetationInitialization(String),
-    #[error("cannot replace a simulation with one carrying creature identity state")]
-    CreatureIdentityReplacement,
 }
 
 /// A terrain collider change: the revision it produced and the world box (min, max, metres) it
@@ -199,12 +197,6 @@ pub(crate) struct PreparedTerrainBrickPublication {
     localized_grid: Option<(OccupancyGrid, [f32; 3])>,
 }
 
-impl PreparedTerrainBrickPublication {
-    pub(crate) fn adds_body_slot(&self) -> bool {
-        self.existing.is_none() && self.localized_grid.is_some()
-    }
-}
-
 /// Exact world/target/collider read set captured by a prepared geometry commit.
 /// Kept private to simulation so it cannot become a second public transaction API.
 pub(crate) struct GeometryCommitFence {
@@ -323,74 +315,6 @@ pub struct SimWorld {
     /// one; with `None`, an edit that needs evicted geometry is rejected rather
     /// than reloaded.
     backing: Option<std::sync::Arc<dyn crate::backing::BrickBacking>>,
-    /// Actor source volumes remain separate from ordinary Body lookup. Ordered
-    /// lifecycle commits are the only production mutation path.
-    creature_sources: CreatureSourceStore,
-}
-
-#[derive(Default)]
-pub(crate) struct CreatureSourceStore {
-    owners: BTreeMap<CreatureKey, BTreeMap<u32, Volume>>,
-    metadata: BTreeMap<CreatureKey, BTreeMap<u32, CreatureSourceMetadata>>,
-    volume_owner: BTreeMap<VolumeId, (CreatureKey, u32)>,
-    // None exists only in an unpublished restore candidate. Published stores
-    // have every slot filled, without allocating map nodes after physics commit.
-    physics_owner: BTreeMap<CreatureKey, Option<spall_physics::ArticulatedBodyId>>,
-    frozen_poses: BTreeMap<CreatureKey, Vec<(u32, spall_physics::PartTransform)>>,
-}
-
-impl CreatureSourceStore {
-    pub(crate) fn stage_owner(
-        &mut self,
-        key: CreatureKey,
-        parts: Vec<(u32, Volume, CreatureSourceMetadata)>,
-        frozen: Option<Vec<(u32, spall_physics::PartTransform)>>,
-    ) {
-        let mut volumes = BTreeMap::new();
-        let mut metadata = BTreeMap::new();
-        for (part_id, volume, provenance) in parts {
-            self.volume_owner.insert(volume.id(), (key, part_id));
-            volumes.insert(part_id, volume);
-            metadata.insert(part_id, provenance);
-        }
-        self.owners.insert(key, volumes);
-        self.metadata.insert(key, metadata);
-        self.physics_owner.insert(key, None);
-        if let Some(poses) = frozen {
-            self.frozen_poses.insert(key, poses);
-        }
-    }
-
-    pub(crate) fn bind_owner(&mut self, key: CreatureKey, id: spall_physics::ArticulatedBodyId) {
-        *self
-            .physics_owner
-            .get_mut(&key)
-            .expect("prepared restore owner slot") = Some(id);
-    }
-
-    pub(crate) fn volume_ids(&self) -> impl Iterator<Item = VolumeId> + '_ {
-        self.volume_owner.keys().copied()
-    }
-}
-
-/// Immutable source provenance and authored hierarchy needed to reconstruct a
-/// part without retaining any physics-library handles.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct CreatureSourceMetadata {
-    pub parent_id: Option<u32>,
-    pub initial_local_transform: spall_physics::PartTransform,
-    pub state_stamp: u64,
-    pub content_hash: Hash32,
-    pub brick_revisions: Vec<(BrickCoord, u64)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg(test)]
-pub(crate) struct CreatureHierarchyPartSnapshot {
-    pub part_id: u32,
-    pub parent_id: Option<u32>,
-    pub initial_local_transform: spall_physics::PartTransform,
-    pub frozen_local_transform: spall_physics::PartTransform,
 }
 
 /// A shared empty digest set, so [`SimWorld::evicted`] can return a reference
@@ -522,7 +446,6 @@ impl SimWorld {
             window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
             backing: None,
-            creature_sources: CreatureSourceStore::default(),
         };
         if mode == TerrainColliderMode::PerBrick {
             world.ensure_terrain_brick_colliders()?;
@@ -1335,265 +1258,6 @@ impl SimWorld {
                 .map(|entry| (entry.phys, entry.built_revision, entry.has_collider));
             current == *expected
         })
-    }
-
-    /// Validates a private in-memory source ownership candidate. This does not
-    /// publish actor volumes into ordinary Body lookup or volume hashes.
-    pub(crate) fn validate_creature_sources<T: std::borrow::Borrow<Volume>>(
-        &self,
-        key: CreatureKey,
-        parts: &[(u32, T)],
-    ) -> Result<(), &'static str> {
-        key.validate().map_err(|_| "invalid creature key")?;
-        if parts.is_empty() || parts.len() > spall_protocol::MAX_CREATURE_SOURCE_PARTS {
-            return Err("source part count outside bound");
-        }
-        if self.creature_sources.owners.contains_key(&key) {
-            return Err("creature source owner already exists");
-        }
-        let mut part_ids = std::collections::BTreeSet::new();
-        let mut volume_ids = std::collections::BTreeSet::new();
-        for (part_id, volume) in parts {
-            let volume = volume.borrow();
-            if *part_id == 0 || !part_ids.insert(*part_id) {
-                return Err("source part IDs must be unique and nonzero");
-            }
-            let id = volume.id();
-            if !volume_ids.insert(id)
-                || self.volume_ref(id).is_some()
-                || self.creature_sources.volume_owner.contains_key(&id)
-            {
-                return Err("source volume is already owned");
-            }
-            if solid_cells(volume) == 0 {
-                return Err("new source part must contain solid cells");
-            }
-        }
-        let total_parts = self
-            .creature_sources
-            .owners
-            .values()
-            .try_fold(parts.len(), |count, existing| {
-                count.checked_add(existing.len())
-            })
-            .ok_or("source part count overflow")?;
-        if total_parts
-            > crate::creatures::MAX_CREATURE_HOST_RECORDS
-                * spall_protocol::MAX_CREATURE_SOURCE_PARTS
-        {
-            return Err("total source part count exceeds bound");
-        }
-        Ok(())
-    }
-
-    /// Publishes a prevalidated source candidate without a fallible step.
-    #[cfg(test)]
-    pub(crate) fn publish_creature_sources(&mut self, key: CreatureKey, parts: Vec<(u32, Volume)>) {
-        let parts = parts
-            .into_iter()
-            .map(|(part_id, volume)| {
-                let brick_revisions = volume
-                    .resident_brick_coords()
-                    .into_iter()
-                    .filter_map(|coord| {
-                        volume
-                            .brick_revision(coord)
-                            .ok()
-                            .flatten()
-                            .map(|revision| (coord, revision.0))
-                    })
-                    .collect();
-                let metadata = CreatureSourceMetadata {
-                    parent_id: None,
-                    initial_local_transform: spall_physics::PartTransform::IDENTITY,
-                    state_stamp: volume.state_stamp(),
-                    content_hash: volume_topology_hash_for(&volume, CanonicalOwner::Terrain),
-                    brick_revisions,
-                };
-                (part_id, volume, metadata)
-            })
-            .collect();
-        self.publish_creature_sources_with_metadata(key, parts);
-    }
-
-    pub(crate) fn publish_creature_sources_with_metadata(
-        &mut self,
-        key: CreatureKey,
-        parts: Vec<(u32, Volume, CreatureSourceMetadata)>,
-    ) {
-        // The caller validated this complete source set while it was still a
-        // candidate. Publication intentionally does not re-run fallible or
-        // potentially large source validation after another transaction
-        // participant has published.
-        let mut owner_parts = BTreeMap::new();
-        let mut metadata = BTreeMap::new();
-        for (part_id, volume, source_metadata) in parts {
-            let id = volume.id();
-            self.creature_sources
-                .volume_owner
-                .insert(id, (key, part_id));
-            owner_parts.insert(part_id, volume);
-            metadata.insert(part_id, source_metadata);
-        }
-        self.creature_sources.owners.insert(key, owner_parts);
-        self.creature_sources.metadata.insert(key, metadata);
-    }
-
-    pub(crate) fn creature_source_metadata(
-        &self,
-        key: CreatureKey,
-        part_id: u32,
-    ) -> Option<&CreatureSourceMetadata> {
-        self.creature_sources.metadata.get(&key)?.get(&part_id)
-    }
-
-    pub(crate) fn creature_source_owner(&self, volume: VolumeId) -> Option<(CreatureKey, u32)> {
-        self.creature_sources.volume_owner.get(&volume).copied()
-    }
-
-    /// Scalar admission before walking or copying any source payload.
-    pub(crate) fn creature_source_counts(&self) -> [usize; 5] {
-        let sources = &self.creature_sources;
-        [
-            sources.owners.len(),
-            sources.metadata.len(),
-            sources.volume_owner.len(),
-            sources.physics_owner.len(),
-            sources.frozen_poses.len(),
-        ]
-    }
-
-    pub(crate) fn publish_restored_creature_sources(&mut self, sources: CreatureSourceStore) {
-        self.creature_sources = sources;
-    }
-
-    pub(crate) fn creature_source_part_counts(&self, key: CreatureKey) -> Option<(usize, usize)> {
-        Some((
-            self.creature_sources.owners.get(&key)?.len(),
-            self.creature_sources.metadata.get(&key)?.len(),
-        ))
-    }
-
-    pub(crate) fn creature_source_part(&self, key: CreatureKey, part_id: u32) -> Option<&Volume> {
-        self.creature_sources.owners.get(&key)?.get(&part_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replace_creature_source(
-        &mut self,
-        key: CreatureKey,
-        part_id: u32,
-        replacement: Volume,
-    ) -> Result<(), &'static str> {
-        let current = self
-            .creature_sources
-            .owners
-            .get_mut(&key)
-            .and_then(|parts| parts.get_mut(&part_id))
-            .ok_or("source part is not owned")?;
-        if current.id() != replacement.id() {
-            return Err("replacement changed source volume identity");
-        }
-        *current = replacement;
-        Ok(())
-    }
-
-    pub(crate) fn set_creature_physics_owner(
-        &mut self,
-        key: CreatureKey,
-        owner: spall_physics::ArticulatedBodyId,
-    ) {
-        debug_assert!(self.creature_sources.owners.contains_key(&key));
-        self.creature_sources.physics_owner.insert(key, Some(owner));
-    }
-
-    pub(crate) fn creature_physics_owner(
-        &self,
-        key: CreatureKey,
-    ) -> Option<spall_physics::ArticulatedBodyId> {
-        self.creature_sources
-            .physics_owner
-            .get(&key)
-            .copied()
-            .flatten()
-    }
-
-    pub(crate) fn set_creature_frozen_poses(
-        &mut self,
-        key: CreatureKey,
-        mut poses: Vec<(u32, spall_physics::PartTransform)>,
-    ) {
-        debug_assert!(self.creature_sources.owners.contains_key(&key));
-        poses.sort_by_key(|(part_id, _)| *part_id);
-        self.creature_sources.frozen_poses.insert(key, poses);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn creature_hierarchy(
-        &self,
-        key: CreatureKey,
-    ) -> Option<Vec<CreatureHierarchyPartSnapshot>> {
-        let sources = self.creature_sources.owners.get(&key)?;
-        let metadata = self.creature_sources.metadata.get(&key)?;
-        let frozen = self.creature_sources.frozen_poses.get(&key)?;
-        if sources.len() != metadata.len() || sources.len() != frozen.len() {
-            return None;
-        }
-        frozen
-            .iter()
-            .map(|(part_id, current_local)| {
-                let source = metadata.get(part_id)?;
-                Some(CreatureHierarchyPartSnapshot {
-                    part_id: *part_id,
-                    parent_id: source.parent_id,
-                    initial_local_transform: source.initial_local_transform,
-                    frozen_local_transform: *current_local,
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn creature_frozen_poses(
-        &self,
-        key: CreatureKey,
-    ) -> Option<&[(u32, spall_physics::PartTransform)]> {
-        self.creature_sources
-            .frozen_poses
-            .get(&key)
-            .map(Vec::as_slice)
-    }
-
-    /// Separate, versioned source digest for fixture checks. This is not a
-    /// complete world hash and is never included in legacy world_hash bytes.
-    #[cfg(test)]
-    pub(crate) fn creature_source_hash_for_test(&self) -> Hash32 {
-        let mut writer =
-            spall_protocol::CanonicalWriter::with_domain(b"spall.creature-source-ownership.v1");
-        writer.seq(self.creature_sources.owners.len());
-        for (key, parts) in &self.creature_sources.owners {
-            writer
-                .blob(&key.world_id.to_le_bytes())
-                .u64(key.world_epoch.get())
-                .u64(key.creature_id.get())
-                .u32(key.generation.get())
-                .seq(parts.len());
-            for (part_id, volume) in parts {
-                writer
-                    .u32(*part_id)
-                    .u64(volume.id().get())
-                    .u64(
-                        volume
-                            .resident_brick_coords()
-                            .iter()
-                            .filter_map(|coord| volume.brick_revision(*coord).ok().flatten())
-                            .map(|revision| revision.0)
-                            .max()
-                            .unwrap_or(0),
-                    )
-                    .blob(&volume_topology_hash_for(volume, CanonicalOwner::Terrain).0);
-            }
-        }
-        writer.hash()
     }
 
     /// Advances physics one fixed step and refreshes every dynamic body's
@@ -2490,20 +2154,6 @@ impl SimWorld {
     ) -> Result<(), WorldError> {
         use spall_protocol::TopologyOp;
 
-        // This entry point owns geometry only. Refuse actor-bearing records
-        // before checking or mutating any geometry so mixed transactions stay
-        // fail-closed until Simulation has the complete candidate path.
-        if tx.ops.iter().any(|op| {
-            matches!(
-                op,
-                TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
-            )
-        }) {
-            return Err(WorldError::ReplayResultHash(
-                "creature lifecycle replay requires Simulation ownership".into(),
-            ));
-        }
-
         // T17 increment 2: a giant split's `SplitOffBulkBaseline` /
         // `SourcePatchBulkBaseline` markers get their geometry from this
         // out-of-band world, delivered as a `spall_store` `TopologyAttachments`
@@ -2717,9 +2367,6 @@ impl SimWorld {
                     flush(self, group.take(), &mut touched, &mut new_children)?;
                     let bv = bulk_volume(*source)?;
                     self.patch_source_from_baseline(*source, bv, &mut touched)?;
-                }
-                TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. } => {
-                    unreachable!("preflight rejects creature lifecycle operations")
                 }
             }
         }
@@ -3014,15 +2661,10 @@ impl SimWorld {
 
     /// Canonical topology hash of the whole world (terrain + every body).
     pub fn world_hash(&self) -> Hash32 {
-        assert!(
-            self.creature_sources.owners.is_empty(),
-            "legacy world_hash is unavailable when creature source owners exist"
-        );
         self.geometry_topology_hash()
     }
 
-    /// Partial geometry topology (terrain and ordinary bodies only). Compose
-    /// with the validated creature snapshot for a complete checkpoint hash.
+    /// Topology hash of terrain and every ordinary body.
     pub fn geometry_topology_hash(&self) -> Hash32 {
         let mut volumes: Vec<(&Volume, CanonicalOwner)> =
             vec![(&self.terrain.volume, CanonicalOwner::Terrain)];
@@ -3575,152 +3217,5 @@ mod window_change_tests {
             9,
             centre
         ));
-    }
-}
-
-#[cfg(test)]
-mod creature_source_owner_tests {
-    use super::*;
-    use spall_core::{CreatureGeneration, CreatureId, WorldEpoch, WorldId};
-
-    fn key(id: u64) -> CreatureKey {
-        CreatureKey::new(
-            WorldId::from_u128(0x216),
-            WorldEpoch::INITIAL,
-            CreatureId::new(id).unwrap(),
-            CreatureGeneration::INITIAL,
-        )
-        .unwrap()
-    }
-
-    fn source(world: &mut SimWorld) -> Volume {
-        let id = world.registry_mut().allocate_volume().unwrap();
-        let mut volume = Volume::new(id, CellSizeCode::Quarter);
-        volume
-            .apply_edit(&EditPlan::filled_box(
-                id,
-                GlobalCell::new(0, 0, 0),
-                GlobalCell::new(1, 0, 0),
-                crate::fixtures::STONE,
-            ))
-            .unwrap();
-        volume
-    }
-
-    #[test]
-    fn source_owner_is_disjoint_from_body_lookup_and_legacy_hash_is_gated() {
-        let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
-        let source = source(&mut world);
-        let id = source.id();
-        let candidate = vec![(7, source.clone())];
-        assert!(world.validate_creature_sources(key(1), &candidate).is_ok());
-        let before = world.creature_source_hash_for_test();
-        world.publish_creature_sources(key(1), candidate);
-
-        assert_eq!(world.creature_source_owner(id), Some((key(1), 7)));
-        assert!(world.volume_ref(id).is_none());
-        assert!(world.body_by_volume(id).is_none());
-        assert_ne!(world.creature_source_hash_for_test(), before);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.world_hash())).is_err()
-        );
-
-        // A second logical actor cannot claim the same original source volume.
-        assert!(
-            world
-                .validate_creature_sources(key(2), &[(8, source)])
-                .is_err()
-        );
-        assert_eq!(world.creature_source_owner(id), Some((key(1), 7)));
-    }
-
-    #[test]
-    fn failed_source_preflight_leaves_owner_hash_and_reverse_index_unchanged() {
-        let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
-        let source = source(&mut world);
-        let candidate = vec![(3, source.clone()), (3, source)];
-        let hash_before = world.creature_source_hash_for_test();
-        assert!(world.validate_creature_sources(key(1), &candidate).is_err());
-        assert_eq!(world.creature_source_hash_for_test(), hash_before);
-        assert_eq!(world.creature_source_owner(candidate[0].1.id()), None);
-    }
-
-    #[test]
-    fn geometry_replay_rejects_inline_and_bulk_lifecycle_before_mutation() {
-        use spall_core::{Tick, TransactionId};
-        use spall_protocol::{
-            CreatureLifecycleChangeV4, CreatureLifecycleCommitV4, CreatureLifecycleOperationV4,
-            CreatureOwnershipRecordV4, Hash32, TopologyOp, TopologyTransaction,
-            WIRE_SCHEMA_VERSION,
-        };
-
-        let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
-        let catalog = crate::creatures::tests::FixtureCatalog::new();
-        let state = catalog.state(1, 1001);
-        let empty_record = CreatureOwnershipRecordV4 {
-            primary_component_serial: None,
-            part_velocities: vec![],
-            schema: WIRE_SCHEMA_VERSION,
-            state,
-            owner_key: 1,
-            source_generation: 1,
-            next_component_serial: 1,
-            parts: Vec::new(),
-            components: Vec::new(),
-        };
-        let txid = TransactionId::new(1).unwrap();
-        let inline = TopologyOp::CreatureLifecycle {
-            commit: Box::new(CreatureLifecycleCommitV4 {
-                schema: WIRE_SCHEMA_VERSION,
-                change: CreatureLifecycleChangeV4 {
-                    schema: WIRE_SCHEMA_VERSION,
-                    transaction_id: txid,
-                    operation_ordinal: 0,
-                    expected_before_hash: Hash32::ZERO,
-                    expected_after_hash: Hash32::ZERO,
-                    operation: CreatureLifecycleOperationV4::Birth {
-                        after: empty_record,
-                    },
-                },
-                expected_before_topology_hash: Hash32::ZERO,
-                pre_motion: None,
-                death_witness: None,
-            }),
-        };
-        let bulk = TopologyOp::CreatureLifecycleBulk {
-            operation_ordinal: 0,
-            payload_schema: spall_protocol::WIRE_SCHEMA_VERSION,
-            commit_hash: Hash32::ZERO,
-            transfer_id: 1,
-        };
-
-        for op in [inline, bulk] {
-            let transaction = TopologyTransaction {
-                transaction_id: txid,
-                server_tick: Tick(1),
-                control_seq: spall_protocol::ControlSeq(1),
-                algorithm_version: 1,
-                dependencies: Vec::new(),
-                before: Vec::new(),
-                after: Vec::new(),
-                ops: vec![op],
-                result_hashes: Vec::new(),
-            };
-            let before = (
-                world.world_hash(),
-                world.registry().counters(),
-                world.physics().body_count(),
-            );
-            assert!(world.replay_transaction(&transaction, &[], None).is_err());
-            assert_eq!(
-                (
-                    world.world_hash(),
-                    world.registry().counters(),
-                    world.physics().body_count()
-                ),
-                before,
-                "geometry-only replay must reject actor payloads without partial mutation"
-            );
-        }
     }
 }

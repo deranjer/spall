@@ -431,9 +431,6 @@ pub struct ClientNetConfig {
     /// movement locally, sends `InputFrame` datagrams, and reconciles against
     /// the server's player snapshots.
     pub movement_script: Vec<MovementStep>,
-    /// Game-supplied creature catalog. With it the replica applies creature
-    /// lifecycle transactions; without it such transactions are rejected.
-    pub creature_catalog: Option<Arc<spall_protocol::OwnedCreatureCatalog>>,
     /// T17: request a full late-join baseline over a bulk transfer instead of
     /// installing the fixed `bridge_scene`. The replica reaches the server's
     /// current topology hash with no edit replay from world creation.
@@ -571,13 +568,13 @@ pub struct ClientSummary {
     pub weather_snapshots_received: u64,
     /// Admin world-reset baselines installed as a replacement world.
     pub world_resets_installed: u64,
-    /// Creature ownership records held by the replica at the end of the run.
+    /// Creatures held by the replica at the end of the run.
     #[serde(default)]
     pub creatures_replicated: usize,
     /// Creature motion entries applied over the run.
     #[serde(default)]
     pub creature_motion_entries: u64,
-    /// Largest horizontal distance a creature was presented from its birth root.
+    /// Largest horizontal distance a creature was presented from where it spawned.
     #[serde(default)]
     pub creature_max_displacement_m: f64,
     /// Server answers to `admin_script` commands, in arrival order.
@@ -897,15 +894,15 @@ fn retry_kind(reason: &str) -> Option<bool> {
 /// that should grow unbounded if a script somehow floods rejections.
 const MAX_RECORDED_ACTION_REJECT_REASONS: usize = 8;
 
-/// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
-/// discarded (players walk upright); `grounded` / `jump_held_last` are not on
-/// the wire and the next reconcile / step re-derives them.
+/// A player [`MotionSnapshot`]'s `CharacterState`; `grounded` / `jump_held_last` are re-derived.
 fn state_from_snapshot(snap: &MotionSnapshot) -> CharacterState {
     CharacterState {
         position_m: snap.pose.translation_m,
         velocity_m_s: snap.linear_velocity,
         grounded: snap.linear_velocity[1].abs() < 0.6,
         jump_held_last: false,
+        endurance: snap.endurance,
+        exhausted: snap.exhausted,
     }
 }
 
@@ -1727,12 +1724,6 @@ async fn run_async(
             ReplicaConfig::default(),
         )
     }));
-    if let Some(catalog) = config.creature_catalog.clone() {
-        replica
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .install_creature_catalog(catalog);
-    }
     let counters = Arc::new(Counters::default());
     *counters
         .scripted_uncommitted
@@ -1965,14 +1956,20 @@ async fn run_async(
                             .unwrap_or_else(|e| e.into_inner())
                             .apply_creature_motion(&frame, std::time::Instant::now());
                     }
-                    Ok(Some(WireRecord::CreatureSync(sync))) => {
+                    Ok(Some(WireRecord::CreatureSpawn(spawn))) => {
                         if let Err(error) = replica
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .apply_creature_sync(&sync)
+                            .apply_creature_spawn(&spawn)
                         {
-                            eprintln!("spall-client: rejected creature sync: {error}");
+                            eprintln!("spall-client: rejected creature spawn: {error}");
                         }
+                    }
+                    Ok(Some(WireRecord::CreatureDespawn(despawn))) => {
+                        replica
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_creature_despawn(&despawn);
                     }
                     Ok(Some(WireRecord::SnowSurfaceFrame(frame))) => {
                         if frame.effective_tick < weather_floor {
@@ -3617,11 +3614,11 @@ async fn run_async(
         water_keyframe_errors: counters.water_errors.load(Ordering::Relaxed),
         weather_snapshots_received: counters.weather_snapshots.load(Ordering::Relaxed),
         world_resets_installed: counters.world_resets.load(Ordering::Relaxed),
-        creatures_replicated: guard.creatures().map_or(0, |c| c.len()),
-        creature_motion_entries: guard.creatures().map_or(0, |c| c.motion_entries_applied()),
+        creatures_replicated: guard.creatures().len(),
+        creature_motion_entries: guard.creatures().motion_entries_applied(),
         creature_max_displacement_m: guard
             .creatures()
-            .map_or(0.0, |c| c.max_displacement_m(std::time::Instant::now())),
+            .max_displacement_m(std::time::Instant::now()),
         admin_statuses: admin_statuses
             .lock()
             .unwrap_or_else(|e| e.into_inner())

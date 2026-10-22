@@ -21,8 +21,8 @@ The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It c
 Animated animal source fixtures (trout, crow and deer) have a bounded renderer
 preview: `cargo run -p sandbox --features client --example animal-preview -- --bounded`.
 It writes pose captures under `.local/animal-preview`. Live deer and crows can be
-spawned in a worldgen sandbox with `--animals N` (below); trout, death/damage and
-persistence recovery with animals remain open in [the animal plan](docs/animals.md).
+spawned in a worldgen sandbox with `--animals N` (below); trout, hunting and
+saving a world with animals remain open in [the animal plan](docs/animals.md).
 
 Visit the small animated zoo with
 `cargo run -p sandbox --features client --example animal-zoo`.
@@ -31,6 +31,8 @@ Press **1/2/3** for trout/crow/deer or **0** for the whole zoo; **WASD** moves,
 **Tab** switches idle/action, and **Esc** releases the mouse or closes the window.
 This is an authored animation showroom with a free camera; live creature
 behavior and physical world integration remain separate gates.
+
+In `cargo xtask play`, hold **Shift** to run (about 1.45x walk speed). Running spends endurance (empty in about 13 s; a bar appears low on the screen while it recovers, and turns orange when you are exhausted and cannot run until it is back past 30%), and you breathe harder as it drops and press **F8** for a third-person view of your own player body; other players are always drawn with that body.
 
 Generated-world play loads nearby terrain at startup and streams surrounding bricks as the player
 moves. Distant terrain retains exact revision/hash records; the authoritative server still generates
@@ -124,13 +126,14 @@ The first useful deliverable is a networked destruction sandbox. It must already
 Nature and weather playtest: `cargo xtask play --release --worldgen natural
 --worldgen-size 4096 --season winter` launches a 1024 m world. Add `--animals 24`
 to spawn that many deer and half as many crows (server-authoritative; they walk or fly
-under kinematic movement, and `--save` with animals is refused until actor
-journal replay exists; trout are not spawned yet). **F10** selects
-automatic or forced weather, previews nature sounds, adjusts nature/weather
+under kinematic movement, and `--save` with animals is refused; trout are not
+spawned yet). **F10** selects
+automatic or forced weather (snow in light, medium or heavy tiers, and a blizzard whiteout),
+switches the season (Spring to Winter), previews nature sounds, adjusts nature/weather
 volume and mute, and toggles visual effects/reduced lightning. Scroll the menu
-for the remaining controls. Weather choices are server-authorized; changing a
-weather profile does not change the ecological season. Thin ground snow and
-footprints remain planned work. See [weather plan](docs/weather.md) and
+for the remaining controls. Weather and season choices are server-authorized; a
+weather profile does not change the season, a season button does. Ground snow is a layer of
+fine 6.25 cm voxels up to 0.5 m deep with carved footprints (see the weather plan). See [weather plan](docs/weather.md) and
 [combined test evidence](docs/reports/ENG-198-integrated-weather-playtest.md).
 
 - [Architecture and invariants](docs/architecture.md): subsystem ownership, voxel representation, structural destruction, physics, and renderer.

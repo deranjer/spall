@@ -17,7 +17,7 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
     ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),
-    ("Shift", "Fly faster"),
+    ("Shift", "Sprint (walking) / fly faster (flying)"),
     ("F", "Toggle flight"),
     ("R", "Recentre the view on your player"),
     ("F10", "Open / close this menu"),
@@ -29,6 +29,7 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
     ("F5", "Toggle visibility-aware skylight"),
     ("F6", "Toggle diffuse bounce"),
     ("F7", "Cycle lighting quality"),
+    ("F8", "Toggle third-person view"),
     ("F9", "Copy a debug report to the clipboard"),
 ];
 
@@ -38,6 +39,7 @@ pub(crate) struct AdminMenuView {
     pub weather: String,
     pub nature_volume: f32,
     pub weather_volume: f32,
+    pub footstep_volume: f32,
     pub nature_muted: bool,
     pub nature_selection: String,
     pub weather_muted: bool,
@@ -70,13 +72,19 @@ pub(crate) struct AdminMenuView {
 /// Buttons clicked in the admin menu this frame.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AdminMenuActions {
-    pub set_weather: Option<Option<spall_protocol::WeatherKind>>,
+    pub set_weather: Option<(
+        Option<spall_protocol::WeatherKind>,
+        Option<spall_protocol::SnowTier>,
+    )>,
+    /// Season to switch to, 0 spring .. 3 winter.
+    pub set_season: Option<u8>,
     pub toggle_nature_audio: bool,
     pub nature_follow: bool,
     pub nature_next: bool,
     pub toggle_weather_audio: bool,
     pub nature_volume_delta: f32,
     pub weather_volume_delta: f32,
+    pub footstep_volume_delta: f32,
     pub toggle_weather_effects: bool,
     pub toggle_ground_snow: bool,
     pub toggle_weather_flashes: bool,
@@ -118,6 +126,17 @@ pub(super) fn weather_label(kind: spall_protocol::WeatherKind) -> &'static str {
     }
 }
 
+/// The weather kind, with the tier for snow.
+pub(super) fn weather_state_label(state: &spall_protocol::WeatherState) -> String {
+    match state.kind {
+        spall_protocol::WeatherKind::Snow => format!(
+            "Snow ({})",
+            spall_protocol::SnowTier::from_precipitation(state.precipitation_q16).label()
+        ),
+        kind => weather_label(kind).to_string(),
+    }
+}
+
 pub(super) fn muted(size: f32, line: impl Into<std::borrow::Cow<'static, str>>) {
     let mut text = yakui::widgets::Text::new(size, line.into());
     text.style.color = PANEL_MUTED;
@@ -148,7 +167,7 @@ pub(super) fn admin_menu_panel(
                     muted(13.0, view.weather.clone());
                     yakui::row(|| {
                         if yakui::button("Automatic").clicked {
-                            actions.set_weather = Some(None);
+                            actions.set_weather = Some((None, None));
                         }
                         for kind in [
                             spall_protocol::WeatherKind::Clear,
@@ -157,20 +176,42 @@ pub(super) fn admin_menu_panel(
                         ] {
                             yakui::pad(yakui::widgets::Pad::horizontal(3.0), || {
                                 if yakui::button(weather_label(kind)).clicked {
-                                    actions.set_weather = Some(Some(kind));
+                                    actions.set_weather = Some((Some(kind), None));
+                                }
+                            });
+                        }
+                    });
+                    yakui::row(|| {
+                        for tier in spall_protocol::SnowTier::ALL {
+                            yakui::pad(yakui::widgets::Pad::horizontal(3.0), || {
+                                let label = format!("Snow ({})", tier.label());
+                                if yakui::button(label).clicked {
+                                    actions.set_weather =
+                                        Some((Some(spall_protocol::WeatherKind::Snow), Some(tier)));
                                 }
                             });
                         }
                     });
                     yakui::row(|| {
                         for kind in [
-                            spall_protocol::WeatherKind::Snow,
                             spall_protocol::WeatherKind::HighWind,
                             spall_protocol::WeatherKind::Blizzard,
                         ] {
                             yakui::pad(yakui::widgets::Pad::horizontal(3.0), || {
                                 if yakui::button(weather_label(kind)).clicked {
-                                    actions.set_weather = Some(Some(kind));
+                                    actions.set_weather = Some((Some(kind), None));
+                                }
+                            });
+                        }
+                    });
+                    yakui::row(|| {
+                        for (code, name) in ["Spring", "Summer", "Autumn", "Winter"]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            yakui::pad(yakui::widgets::Pad::horizontal(3.0), || {
+                                if yakui::button(name).clicked {
+                                    actions.set_season = Some(code as u8);
                                 }
                             });
                         }
@@ -218,6 +259,18 @@ pub(super) fn admin_menu_panel(
                         }
                         if yakui::button("+ Weather").clicked {
                             actions.weather_volume_delta = 0.1;
+                        }
+                    });
+                    yakui::row(|| {
+                        muted(
+                            13.0,
+                            format!("Footsteps {:.0}% ", view.footstep_volume * 100.0),
+                        );
+                        if yakui::button("- Steps").clicked {
+                            actions.footstep_volume_delta = -0.1;
+                        }
+                        if yakui::button("+ Steps").clicked {
+                            actions.footstep_volume_delta = 0.1;
                         }
                     });
                     yakui::row(|| {

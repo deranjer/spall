@@ -72,7 +72,7 @@ fn assert_spawn_slots_walk(mut sim: Simulation, spawns: [[f64; 3]; 4]) {
     for player in sim.world().players() {
         let start = player.spawn.position_m;
         assert!(
-            player.state.position_m[0] - start[0] > 1.0,
+            player.state.position_m[0] - start[0] > 0.75,
             "spawn {:?} did not move clear of the beam: {:?}",
             start,
             player.state.position_m

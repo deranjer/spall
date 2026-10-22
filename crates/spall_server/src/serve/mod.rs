@@ -292,6 +292,10 @@ pub const AWAIT_SETTLE_STABLE_TICKS: u64 = 60;
 pub const T10_CONTENT_TAG: &[u8] = b"spall-t10-bridge-v1";
 /// World id used by the built-in T10 scene.
 /// Creature motion frames go out every this many ticks (20 Hz at 60 Hz).
+/// Snow frames sent per client every 12 ticks: the nearest tiles to the player, then a
+/// cursor sweep of the rest. Enough to refill the ring in a few seconds after the player moves.
+const SNOW_CENTER_PAGE_TILES: usize = 64;
+const SNOW_RING_PAGE_TILES: usize = 16;
 const CREATURE_MOTION_PERIOD_TICKS: u64 = 3;
 /// Only creatures within this horizontal distance of a session's player are sent.
 const CREATURE_MOTION_RADIUS_M: f64 = 320.0;

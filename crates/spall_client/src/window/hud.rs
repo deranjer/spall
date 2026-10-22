@@ -212,6 +212,46 @@ pub(crate) struct CrosshairView {
     pub label: String,
 }
 
+/// The endurance bar: how full it is, and whether the player is exhausted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EnduranceView {
+    pub fraction: f32,
+    pub exhausted: bool,
+}
+
+/// The bar to draw for the local player: hidden at full endurance, so it only
+/// shows while draining or recovering.
+pub(super) fn endurance_view(endurance: f32, exhausted: bool) -> Option<EnduranceView> {
+    (exhausted || endurance < 0.995).then(|| EnduranceView {
+        fraction: endurance.clamp(0.0, 1.0),
+        exhausted,
+    })
+}
+
+/// A thin bar low on the screen, above the hammer label: pale while spending or
+/// regaining endurance, amber-red while exhausted.
+pub(super) fn draw_endurance(view: EnduranceView) {
+    const WIDTH: f32 = 160.0;
+    const HEIGHT: f32 = 5.0;
+    let fill = if view.exhausted {
+        yakui::Color::rgb(235, 110, 70)
+    } else {
+        yakui::Color::rgb(215, 225, 235)
+    };
+    yakui::align(yakui::Alignment::BOTTOM_CENTER, || {
+        yakui::pad(yakui::widgets::Pad::all(78.0), || {
+            // Two fixed-size boxes stacked at the same corner: track, then fill.
+            yakui::stack(|| {
+                yakui::colored_box(PANEL_BG.with_alpha(0.85), yakui::Vec2::new(WIDTH, HEIGHT));
+                yakui::colored_box(
+                    fill.with_alpha(0.85),
+                    yakui::Vec2::new(WIDTH * view.fraction.max(0.01), HEIGHT),
+                );
+            });
+        });
+    });
+}
+
 /// Mean, percentiles and worst of the recent frames' handler time, and how many
 /// ran long, as a few lines.
 pub(super) fn frame_summary(history: &std::collections::VecDeque<f32>) -> Vec<String> {
@@ -343,6 +383,7 @@ pub(super) fn admin_menu_view(
         weather: String::new(),
         nature_volume: 0.0,
         weather_volume: 0.0,
+        footstep_volume: 0.0,
         nature_muted: false,
         nature_selection: String::new(),
         weather_muted: false,
@@ -473,6 +514,16 @@ pub(super) fn draw_body_reminders(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_endurance_bar_hides_when_full_and_flags_exhaustion() {
+        assert_eq!(endurance_view(1.0, false), None);
+        assert_eq!(endurance_view(0.7, false).map(|v| v.exhausted), Some(false));
+        let drained = endurance_view(0.0, true).unwrap();
+        assert!(drained.exhausted && drained.fraction == 0.0);
+        // Recovered past the exhaustion line but not yet full: shown, normal colour.
+        assert_eq!(endurance_view(0.4, false).map(|v| v.exhausted), Some(false));
+    }
 
     #[test]
     fn the_frame_summary_reports_percentiles_and_long_frames() {
