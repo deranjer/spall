@@ -104,12 +104,18 @@ impl Simulation {
         drop(water_span);
         let vegetation_span = crate::prof::Span::start("tick.vegetation");
         self.advance_vegetation(&report)?;
+        drop(vegetation_span);
+        let weather_span = crate::prof::Span::start("tick.weather");
         self.advance_weather();
+        drop(weather_span);
+        let snow_span = crate::prof::Span::start("tick.snow");
         self.snow
             .advance(&self.weather, self.tick.get())
             .map_err(TickError::Snow)?;
+        drop(snow_span);
+        let snow_refresh_span = crate::prof::Span::start("tick.snow_refresh");
         self.refresh_snow_from_report(&report);
-        drop(vegetation_span);
+        drop(snow_refresh_span);
         if let (Some(creatures), Some(rules)) = (&mut self.creatures, rules) {
             let terrain_revision = self.world.terrain().volume.next_revision().get();
             let water_frame_revision = self.column_water.as_ref().map(|water| water.frame().seq);
