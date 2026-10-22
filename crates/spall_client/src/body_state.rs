@@ -87,11 +87,11 @@ pub fn screen_grade(state: &BodyState, preview: &BodyPreview, time_s: f32) -> Sc
     let hunger = finite_unit(preview.hunger);
 
     // Colour drains with injury above all; cold, thirst and hunger dull it.
-    let saturation = 1.0 - (0.75 * injury + 0.35 * cold + 0.15 * thirst + 0.25 * hunger).min(0.9);
+    let saturation = 1.0 - (0.75 * injury + 0.26 * cold + 0.15 * thirst + 0.25 * hunger).min(0.9);
     // Cold pulls toward blue, being wet slightly darker and cooler.
     let tint = [
-        1.0 - 0.10 * cold - 0.06 * wet,
-        1.0 - 0.04 * cold - 0.03 * wet,
+        1.0 - 0.075 * cold - 0.06 * wet,
+        1.0 - 0.03 * cold - 0.03 * wet,
         1.0 - 0.02 * wet,
     ];
     // Vignettes combine: strengths as independent coverage, colour weighted
@@ -124,7 +124,8 @@ pub fn screen_grade(state: &BodyState, preview: &BodyPreview, time_s: f32) -> Sc
         vignette: 1.0 - clear,
         vignette_color,
         edge_blur: (0.8 * thirst + 0.3 * injury + 0.2 * exhaustion).min(1.0),
-        frost: smoothstep(0.35, 1.0, cold),
+        // Kept short of full: frost at full strength hid too much of the view.
+        frost: 0.75 * smoothstep(0.35, 1.0, cold),
     }
     .clamped()
 }
@@ -289,7 +290,7 @@ mod tests {
             180,
         );
         let grade = screen_grade(&state, &BodyPreview::default(), 0.0);
-        assert!(grade.frost > 0.9 && grade.saturation < 0.7, "{grade:?}");
+        assert!(grade.frost > 0.7 && grade.saturation < 0.8, "{grade:?}");
         run(&mut state, MILD, 120);
         assert_eq!(
             screen_grade(&state, &BodyPreview::default(), 0.0).frost,

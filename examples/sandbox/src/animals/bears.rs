@@ -5,8 +5,13 @@
 //! the engine's creature kill, which leaves the deer as a terrain carcass. The
 //! bear then eats that carcass a cell at a time, through single-cell server
 //! edits, until it is gone or the bear is full, and is hungry again a few
-//! minutes later. Bears ignore players. Deer see a bear as a threat unless it
-//! is stalking; a charging bear counts as a sprinting one.
+//! minutes later. Deer see a bear as a threat unless it is stalking; a charging
+//! bear counts as a sprinting one.
+//!
+//! Bears do not like being run at. A player who comes close, or sprints at a
+//! bear from further off, makes it rear up and watch; one who keeps coming gets
+//! a short bluff charge and a cuffing swipe, then the bear backs off. A bear
+//! that has just backed off tolerates a walker nearby for a while.
 //!
 //! A hungry bear with no deer to hunt fishes instead (ENG-239): it walks to
 //! shallow water (or the bank) beside a trout it knows of, waits there, and
@@ -23,9 +28,33 @@ use spall_voxel::Sample;
 
 use super::{
     AnimalDirector, Cx, Family, Gait, LOCOMOTION_EAT, LOCOMOTION_IDLE, LOCOMOTION_MOVE,
-    LOCOMOTION_POUNCE, LOCOMOTION_RUN, LOCOMOTION_STALK, MOVE_DT_S, SPECIES, Step, Walker, land,
-    wrap_angle,
+    LOCOMOTION_POUNCE, LOCOMOTION_REAR, LOCOMOTION_RUN, LOCOMOTION_STALK, MOVE_DT_S, SPECIES, Step,
+    Walker, land, wrap_angle,
 };
+
+/// A player this close bothers a bear.
+const WARY_M: f64 = 10.0;
+/// A sprinting player bothers a bear from this far.
+const WARY_SPRINT_M: f64 = 22.0;
+/// A player this close bothers even a bear that just backed off.
+const CROWDED_M: f64 = 4.0;
+/// Horizontal speed above which a player counts as sprinting.
+const SPRINT_M_S: f32 = 4.5;
+/// Rearing up to look at the player, before deciding.
+const REAR_TICKS: u64 = 90;
+/// A player still this close (or sprinting inside [`WARY_M`]) once the bear
+/// has looked is bluff-charged.
+const BLUFF_M: f64 = 7.0;
+const BLUFF_SPEED_M_S: f64 = 7.0;
+const BLUFF_TICKS: u64 = 120;
+/// The bluff stops this close and cuffs the air in front of the player.
+const CUFF_REACH_M: f64 = 2.2;
+const CUFF_TICKS: u64 = 45;
+/// Backing off, at a walk, away from the player.
+const RETREAT_SPEED_M_S: f64 = 1.8;
+const RETREAT_TICKS: u64 = 60 * 6;
+/// After backing off, only a player inside [`CROWDED_M`] bothers it.
+const TOLERANT_TICKS: u64 = 60 * 15;
 
 /// A hungry bear notices a deer this close, horizontally.
 const NOTICE_M: f64 = 40.0;
@@ -107,6 +136,14 @@ pub(super) enum BearGait {
     },
     /// Eat a caught fish until `until`.
     EatFish { until: u64 },
+    /// Rear up on the hind legs facing a player who came too close.
+    Rear { until: u64 },
+    /// A short charge at that player, stopping short of it.
+    Bluff { until: u64 },
+    /// A swipe at the air in front of the player.
+    Cuff { until: u64 },
+    /// Walk away from the player.
+    Retreat { until: u64 },
 }
 
 /// What a bear keeps between gaits.
@@ -122,6 +159,8 @@ pub(super) struct Bear {
     settle_until: u64,
     /// A trout just caught, for the director to despawn.
     caught: Option<u64>,
+    /// Until this tick only a crowding player bothers the bear.
+    tolerant_until: u64,
 }
 
 /// The clip a bear plays for a locomotion tag of its own. The bear asset has
@@ -133,6 +172,7 @@ pub(super) fn clip(tag: u8) -> Option<&'static str> {
         LOCOMOTION_STALK => Some("walk"),
         LOCOMOTION_POUNCE => Some("swipe"),
         LOCOMOTION_EAT => Some("eat"),
+        LOCOMOTION_REAR => Some("stand"),
         _ => None,
     }
 }
@@ -145,7 +185,7 @@ pub(super) fn threats(dir: &AnimalDirector) -> impl Iterator<Item = ([f64; 3], b
         .filter(|walker| matches!(SPECIES[walker.species].family, Family::Bear))
         .filter_map(|walker| match walker.gait {
             Gait::Bear(BearGait::Stalk { .. }) => None,
-            Gait::Bear(BearGait::Charge { .. }) => Some((walker.at, true)),
+            Gait::Bear(BearGait::Charge { .. } | BearGait::Bluff { .. }) => Some((walker.at, true)),
             _ => Some((walker.at, false)),
         })
 }
@@ -188,12 +228,45 @@ pub(super) fn step(
     actions: &mut Vec<CreatureAction>,
 ) -> Step {
     let tick = cx.tick;
+    let player = nearest_player(cx.sim, cx.here);
+    if let Some((_, distance, sprinting)) = player {
+        let tolerant = dir
+            .bears
+            .get(&cx.id)
+            .is_some_and(|b| tick < b.tolerant_until);
+        let bothered = distance < CROWDED_M
+            || (!tolerant && (distance < WARY_M || (sprinting && distance < WARY_SPRINT_M)));
+        // A bear mid-kill finishes it; one already reacting carries on.
+        let busy = matches!(
+            walker.gait,
+            Gait::Bear(
+                BearGait::Charge { .. }
+                    | BearGait::Pounce { .. }
+                    | BearGait::Rear { .. }
+                    | BearGait::Bluff { .. }
+                    | BearGait::Cuff { .. }
+                    | BearGait::Retreat { .. }
+            )
+        );
+        if bothered && !busy {
+            walker.stuck = 0;
+            walker.gait = Gait::Bear(BearGait::Rear {
+                until: tick + REAR_TICKS,
+            });
+        }
+    }
+    if let Some(step) = react(dir, walker, cx, player) {
+        return step;
+    }
     let calm = match walker.gait {
         Gait::Rest { until } => tick >= until,
         Gait::Walk { .. } => true,
         _ => false,
     };
-    if calm && dir.bears.entry(cx.id).or_default().hungry_at <= tick {
+    // A bear chased off its meal goes back to it once it has calmed down.
+    if calm && dir.bears.get(&cx.id).is_some_and(|b| !b.carcass.is_empty()) {
+        walker.gait = Gait::Bear(BearGait::Eat { next_bite: tick });
+    } else if calm && dir.bears.entry(cx.id).or_default().hungry_at <= tick {
         if let Some(prey) = nearest_deer(dir, cx.here) {
             walker.stuck = 0;
             walker.gait = Gait::Bear(BearGait::Stalk {
@@ -267,6 +340,117 @@ pub(super) fn step(
         }
         _ => land::step(dir, walker, cx, land::wander, |_| true),
     }
+}
+
+/// The nearest player to `here`: position, horizontal distance, sprinting.
+fn nearest_player(sim: &Simulation, here: [f64; 3]) -> Option<([f64; 3], f64, bool)> {
+    sim.world()
+        .players()
+        .map(|player| {
+            let at = player.state.position_m;
+            let [vx, _, vz] = player.state.velocity_m_s;
+            (at, horizontal(here, at), vx.hypot(vz) > SPRINT_M_S)
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+}
+
+/// The bear's reaction to a player, while it is reacting: rear, bluff, cuff,
+/// back off. `None` once it is doing anything else.
+fn react(
+    dir: &mut AnimalDirector,
+    walker: &mut Walker,
+    cx: &Cx,
+    player: Option<([f64; 3], f64, bool)>,
+) -> Option<Step> {
+    let tick = cx.tick;
+    let Gait::Bear(gait) = walker.gait else {
+        return None;
+    };
+    let retreat = |walker: &mut Walker| {
+        walker.gait = Gait::Bear(BearGait::Retreat {
+            until: tick + RETREAT_TICKS,
+        });
+    };
+    Some(match gait {
+        BearGait::Rear { until } => {
+            if tick >= until {
+                match player {
+                    Some((_, distance, sprinting))
+                        if distance < BLUFF_M || (sprinting && distance < WARY_M) =>
+                    {
+                        walker.gait = Gait::Bear(BearGait::Bluff {
+                            until: tick + BLUFF_TICKS,
+                        });
+                    }
+                    _ => retreat(walker),
+                }
+            }
+            let mut step = match player {
+                Some((at, ..)) => toward(walker, cx.here, at, 0.0, 0.6, 0.0, LOCOMOTION_REAR),
+                None => Step::still(walker, cx.here),
+            };
+            step.tag = LOCOMOTION_REAR;
+            step
+        }
+        BearGait::Bluff { until } => match player {
+            Some((at, distance, _)) if distance > CUFF_REACH_M && tick < until => toward(
+                walker,
+                cx.here,
+                at,
+                BLUFF_SPEED_M_S,
+                1.2,
+                CUFF_REACH_M,
+                LOCOMOTION_RUN,
+            ),
+            _ => {
+                walker.gait = Gait::Bear(BearGait::Cuff {
+                    until: tick + CUFF_TICKS,
+                });
+                let mut step = Step::still(walker, cx.here);
+                step.tag = LOCOMOTION_POUNCE;
+                step
+            }
+        },
+        BearGait::Cuff { until } => {
+            if tick >= until {
+                retreat(walker);
+            }
+            let mut step = Step::still(walker, cx.here);
+            step.tag = LOCOMOTION_POUNCE;
+            step
+        }
+        BearGait::Retreat { until } => {
+            if tick >= until {
+                dir.bears.entry(cx.id).or_default().tolerant_until = tick + TOLERANT_TICKS;
+                walker.gait = Gait::Rest { until: tick + 120 };
+                return Some(Step::still(walker, cx.here));
+            }
+            // Directly away from the player, or on along its heading.
+            let away = match player {
+                Some((at, ..)) => {
+                    let (dx, dz) = (cx.here[0] - at[0], cx.here[2] - at[2]);
+                    let length = dx.hypot(dz).max(1.0e-6);
+                    [dx / length, dz / length]
+                }
+                None => [walker.yaw.cos(), -walker.yaw.sin()],
+            };
+            let target = [
+                cx.here[0] + away[0] * 10.0,
+                cx.here[1],
+                cx.here[2] + away[1] * 10.0,
+            ];
+            toward(
+                walker,
+                cx.here,
+                target,
+                RETREAT_SPEED_M_S,
+                0.8,
+                0.0,
+                LOCOMOTION_MOVE,
+            )
+        }
+        _ => return None,
+    })
 }
 
 /// The nearest deer a bear at `here` notices.

@@ -41,7 +41,7 @@ Facing +X, +Y up, +Z to the animal's left. Sizes are the generated rest bounds
 | Trout | `5a871001-2026-4001-8000-000000000001` | 14 × 7 × 5 | 0.85 m long | 102 | 5 |
 | Crow | `5a871002-2026-4001-8000-000000000002` | 16 × 10 × 19 | 0.5 m body, 1.2 m wingspan | 228 | 6 |
 | Deer | `5a871003-2026-4001-8000-000000000003` | 33 × 32 × 9 | 2.0 m long, 1.1 m at the shoulder | 2,023 | 13 |
-| Bear | `5a871004-2026-4001-8000-000000000004` | 38 × 19 × 13 | 2.4 m long, 1.15 m at the hump | 4,269 | 12 |
+| Bear | `5a871004-2026-4001-8000-000000000004` | 44 × 22 × 13 | 2.75 m long, 1.3 m at the hump | 6,578 | 12 |
 | Leopard | `5a871005-2026-4001-8000-000000000005` | 39 × 13 × 7 | 1.2 m body plus 0.8 m tail, 0.75 m tall | 1,112 | 13 |
 
 ## Parts and clips

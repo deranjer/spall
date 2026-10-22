@@ -6,7 +6,8 @@
 //! Run: `cargo test --release -p sandbox --features client --test animal_bears`.
 
 use sandbox::animals::{
-    AnimalDirector, LOCOMOTION_EAT, LOCOMOTION_POUNCE, LOCOMOTION_RUN, LOCOMOTION_STALK,
+    AnimalDirector, LOCOMOTION_EAT, LOCOMOTION_MOVE, LOCOMOTION_POUNCE, LOCOMOTION_REAR,
+    LOCOMOTION_RUN, LOCOMOTION_STALK,
 };
 use spall_client::replica::{ReplicaConfig, ReplicaWorld};
 use spall_core::{CellSizeCode, GlobalCell, MaterialId};
@@ -199,4 +200,77 @@ fn a_hungry_bear_stalks_catches_kills_and_eats_a_deer() {
         "the kill left {most_carcass} carcass cells"
     );
     assert!(eaten >= 10, "the bear ate only {eaten} carcass cells");
+}
+
+/// One bear alone in the middle of the field, settled, and a player standing
+/// `offset_x` metres from it. Returns the bear's id and the player's position.
+fn bear_with_player_at(offset_x: f64) -> (Simulation, CreatureService, u64, [f64; 3]) {
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE};
+
+    let mut sim = simulation();
+    let middle = SIDE as f64 * 0.125;
+    let director = AnimalDirector::new(vec![[middle, 0.5, middle]], &[0, 0, 0, 1, 0], 3)
+        .unwrap()
+        .with_radius_m(0.0, 1.0);
+    let service = CreatureService::new(Box::new(director));
+    for _ in 0..30 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+    }
+    let bear = sim.creature_poses()[0];
+    let player = [bear.translation_m[0] - offset_x, 0.6, bear.translation_m[2]];
+    sim.add_player(EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap(), player);
+    (sim, service, bear.creature_id, player)
+}
+
+fn bear_record(sim: &Simulation, id: u64) -> spall_protocol::CreatureRecord {
+    sim.creature_records()
+        .into_iter()
+        .find(|c| c.creature_id == id)
+        .unwrap()
+}
+
+#[test]
+fn a_bear_rears_bluffs_and_backs_off_from_a_player_who_comes_close() {
+    let (mut sim, service, id, player) = bear_with_player_at(6.0);
+    let mut tags = Vec::new();
+    for _ in 0..900 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        let tag = bear_record(&sim, id).locomotion_tag;
+        if tags.last() != Some(&tag) {
+            tags.push(tag);
+        }
+    }
+    let at = |tag: u8| tags.iter().position(|t| *t == tag);
+    let (Some(rear), Some(cuff)) = (at(LOCOMOTION_REAR), at(LOCOMOTION_POUNCE)) else {
+        panic!("bear never reared and cuffed: tags {tags:?}");
+    };
+    assert!(rear < cuff, "cuffed before rearing: {tags:?}");
+    assert!(
+        tags[cuff..].contains(&LOCOMOTION_MOVE),
+        "never backed off after the cuff: {tags:?}"
+    );
+    let end = bear_record(&sim, id).translation_m;
+    let distance = (end[0] - player[0]).hypot(end[2] - player[2]);
+    assert!(
+        distance > 8.0,
+        "bear ended only {distance:.1} m from the player"
+    );
+}
+
+#[test]
+fn a_bear_ignores_a_player_standing_well_off() {
+    let (mut sim, service, id, _) = bear_with_player_at(30.0);
+    for _ in 0..600 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        let tag = bear_record(&sim, id).locomotion_tag;
+        assert!(
+            tag != LOCOMOTION_REAR && tag != LOCOMOTION_POUNCE,
+            "bear reacted to a player 30 m off"
+        );
+    }
 }

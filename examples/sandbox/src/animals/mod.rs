@@ -118,7 +118,7 @@ const SPECIES: [SpeciesDef; 5] = [
         bytes: include_bytes!("../../assets/animals/bear.spvox"),
         move_clip: "walk",
         walk_speed_m_s: 1.2,
-        capsule_m: (0.45, 0.1),
+        capsule_m: (0.5, 0.12),
         flee_speed_m_s: None,
         grazes: false,
         perches: false,
@@ -167,6 +167,8 @@ pub const LOCOMOTION_STALK: u8 = 20;
 pub const LOCOMOTION_POUNCE: u8 = 21;
 /// A bear eating a carcass (`eat` clip).
 pub const LOCOMOTION_EAT: u8 = 22;
+/// A bear rearing up at a player who came too close (`stand` clip).
+pub const LOCOMOTION_REAR: u8 = 23;
 /// Capsule swept around a flying animal (about a crow: small body, wings folded in).
 const FLY_CAPSULE_RADIUS_M: f32 = 0.25;
 const FLY_CAPSULE_HALF_HEIGHT_M: f32 = 0.1;
@@ -192,6 +194,7 @@ pub fn locomotion_clip(species: &str, tag: u8) -> Option<&'static str> {
         LOCOMOTION_ROOST if def.perches => Some("idle"),
         LOCOMOTION_SLEEP if matches!(def.family, Family::Deer) => Some("sleep"),
         LOCOMOTION_RUN | LOCOMOTION_STALK | LOCOMOTION_POUNCE | LOCOMOTION_EAT
+        | LOCOMOTION_REAR
             if matches!(def.family, Family::Bear) =>
         {
             bears::clip(tag)
@@ -869,6 +872,7 @@ mod tests {
                     LOCOMOTION_STALK,
                     LOCOMOTION_POUNCE,
                     LOCOMOTION_EAT,
+                    LOCOMOTION_REAR,
                 ]);
             }
             if species.perches {

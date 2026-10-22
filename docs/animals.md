@@ -124,6 +124,14 @@ down, one terrain cell every 0.5 s through single-cell server edits
 again 4 minutes later. Deer flee a bear that is not stalking; a charging bear
 counts as sprinting.
 
+Bears do not like being run at. A player within 10 m, or one sprinting inside
+22 m, makes a bear rear up (`stand` clip) and watch; if the player is still
+within 7 m (or sprinting inside 10 m) it bluff-charges to 2.2 m, cuffs the air
+(`swipe`) and backs off at a walk for 6 s, after which only a player inside 4 m
+bothers it for 15 s. It does not hurt players yet (player health, ENG-223). A
+bear chased off a carcass goes back to it. Bears are about 2.75 m long and
+1.3 m at the hump.
+
 A hungry bear with no deer in notice fishes: it walks into water at most 0.8 m
 deep (or stops on the bank) beside a trout within 40 m, waits, and swipes
 (`swipe` clip) at a trout within 1.5 m of its paw, catching it half the time. A
