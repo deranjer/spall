@@ -18,6 +18,10 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
         "Tab",
         "Pack: lay out what you carry (Tab, Esc or walk to pack up)",
     ),
+    (
+        "B",
+        "Blueprint book: pick a blueprint, lay its pattern on the cloth, Craft",
+    ),
     ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),

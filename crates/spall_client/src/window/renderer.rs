@@ -63,6 +63,9 @@ pub(crate) struct WorldRenderer {
     /// The pack laid out for this frame, if it is on screen.
     pub(super) pack_frame: Option<PackFrame>,
     pack_tarp: yakui::ManagedTextureId,
+    /// The blueprint book laid out for this frame, if it is on screen.
+    pub(super) book_frame: Option<BookFrame>,
+    book_textures: BookTextures,
     /// The game's item icons, uploaded on first sight; `None` if one would
     /// not decode (reported once, then drawn as a plain marker).
     item_icons: HashMap<u16, Option<yakui::ManagedTextureId>>,
@@ -345,6 +348,18 @@ impl WorldRenderer {
             include_bytes!("../../assets/hud/tarp.png"),
             "pack tarp",
         )?;
+        let book_textures = BookTextures {
+            book: png_texture(
+                &mut yakui,
+                include_bytes!("../../assets/hud/book.png"),
+                "blueprint book",
+            )?,
+            cloth: png_texture(
+                &mut yakui,
+                include_bytes!("../../assets/hud/cloth.png"),
+                "crafting cloth",
+            )?,
+        };
         let yakui_winit = YakuiWinit::new(&window);
         let yakui_wgpu = YakuiWgpu::new(device.clone(), queue.clone());
         let yakui_buffers = yakui_wgpu.buffers();
@@ -418,6 +433,8 @@ impl WorldRenderer {
             body_reminders: BodyCue::ALL.map(|cue| (cue, 0.0)),
             pack_frame: None,
             pack_tarp,
+            book_frame: None,
+            book_textures,
             item_icons: HashMap::new(),
             yakui_buffers,
             hud_gpu_timer,
@@ -949,18 +966,19 @@ impl WorldRenderer {
         {
             timer.write_start(&mut encoder);
         }
-        if let Some(frame) = &self.pack_frame {
-            for slot in &frame.slots {
-                if let (Some(png), false) =
-                    (slot.icon_png, self.item_icons.contains_key(&slot.item_id))
-                {
-                    let icon = png_texture(&mut self.yakui, png, "item icon")
-                        .inspect_err(|error| {
-                            eprintln!("spall-interactive: item {}: {error}", slot.item_id)
-                        })
-                        .ok();
-                    self.item_icons.insert(slot.item_id, icon);
-                }
+        let wanted: Vec<(u16, &'static [u8])> = self
+            .pack_frame
+            .iter()
+            .flat_map(|frame| frame.slots.iter().map(|slot| (slot.item_id, slot.icon_png)))
+            .chain(self.book_frame.iter().flat_map(BookFrame::icons))
+            .filter_map(|(item, png)| Some((item, png?)))
+            .collect();
+        for (item, png) in wanted {
+            if !self.item_icons.contains_key(&item) {
+                let icon = png_texture(&mut self.yakui, png, "item icon")
+                    .inspect_err(|error| eprintln!("spall-interactive: item {item}: {error}"))
+                    .ok();
+                self.item_icons.insert(item, icon);
             }
         }
         self.yakui.start();
@@ -1006,6 +1024,9 @@ impl WorldRenderer {
         draw_body_reminders(&self.body_icons, &self.body_reminders);
         if let Some(frame) = &self.pack_frame {
             draw_pack(frame, self.pack_tarp, &self.item_icons, self.ui_size());
+        }
+        if let Some(frame) = &self.book_frame {
+            draw_book(frame, &self.book_textures, &self.item_icons, self.ui_size());
         }
         self.yakui.finish();
         if let Some(preset) = selected_environment {

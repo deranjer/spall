@@ -60,11 +60,35 @@ the cursor grows slightly and its name darkens. Text scales with the tarp. `Tab`
   `make_items.py`.
 - **Not yet:** crafting on the cloth, moving items, belt slots, and sounds.
 
+## Built: the blueprint book (B)
+
+`B` slides an open leather journal over the screen. Its pages hold a blue
+blueprint card for each of the game's recipes: what it makes, its pattern of raw
+materials, and each material as have / need (red when short). Clicking a card
+turns to the crafting cloth: the blueprint on the left page, a 3 by 3 canvas cloth
+on the right, and a strip of the pack's materials under it. Drag materials onto
+the cloth's squares; drag a square somewhere else to move it, or click it to take
+it back. Once the materials lie in the blueprint's pattern (anywhere on the cloth,
+with nothing else on it), **Craft** lights up and asks the server for one batch
+(`ProgressionOperation::Craft`). On success the cloth clears and says what was
+made; a refusal keeps the cloth and says why. A craft beaten by a harvest (stale
+inventory revision) is retried once. `B` or `Esc` closes the book, `Tab` swaps to
+the pack, and walking closes it.
+
+- **Engine and game.** The engine draws the book and cloth
+  (`crates/spall_client/assets/hud/book.png` and `cloth.png`, drawn by
+  `make_book.py`), lays out up to 12 blueprints, matches patterns and sends the
+  craft. The game's `PackView::blueprints` gives each blueprint's recipe, output and
+  pattern; the sandbox's are one log for 4 planks and a 2 by 2 square of stones for
+  a stone block, checked against its server recipes.
+- **Shared inventory.** The pack and the book read one `InventoryFeed`, refreshed
+  every 1.5 s while either is open.
+- **Not yet:** more than 12 blueprints (paging), blueprints learned in play, sounds.
+
 ## Planned
 
 - **Sounds** for the body states and inventory (list below). None is integrated yet.
 - **Belt:** 4 to 6 worn quick slots, visible on the player body, switched without a menu.
-- **Pack crafting:** craft on the cloth from the laid-out items.
 - **Camp:** being rethought; a first cut (a claimed area around a fire pit) was tried and taken out.
 - **Wrist cord and journal:** the day count and exact readouts for players who want
   numbers.

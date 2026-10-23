@@ -16,6 +16,10 @@ pub(super) struct InteractiveApp {
     pub(super) pack_view: Option<std::sync::Arc<dyn PackView>>,
     /// The pack (Tab): open, or sliding in or out.
     pub(super) pack: Pack,
+    /// The blueprint book (B) and its crafting cloth.
+    pub(super) book: Book,
+    /// The inventory the pack and book show, and the book's craft.
+    pub(super) inventory: InventoryFeed,
     pub(super) pack_frame_at: Option<Instant>,
     /// The cursor, physical pixels, for hovering items in the open pack.
     pub(super) cursor_px: Option<[f32; 2]>,
@@ -230,6 +234,8 @@ impl InteractiveApp {
             creature_view: options.creature_view,
             pack_view: options.pack_view,
             pack: Pack::new(),
+            book: Book::new(),
+            inventory: InventoryFeed::new(),
             pack_frame_at: None,
             cursor_px: None,
             ambience_field: None,
@@ -942,12 +948,18 @@ impl InteractiveApp {
         self.held.clear_on_focus_loss(&self.session.input);
     }
 
-    /// Tab: lay the pack out on the tarp, only when the game supplied a
-    /// [`PackView`].
-    pub(super) fn open_pack(&mut self) {
-        if self.pack_view.is_none() {
-            return;
-        }
+    /// The pack or the book is open (the cursor is the player's).
+    pub(super) fn inventory_ui_open(&self) -> bool {
+        self.pack.is_open() || self.book.is_open()
+    }
+
+    /// The pack or the book is on screen, open or sliding away.
+    pub(super) fn inventory_ui_shown(&self) -> bool {
+        self.pack.is_shown() || self.book.is_shown()
+    }
+
+    /// Frees the cursor and asks for a fresh inventory, for the pack or book.
+    fn begin_inventory_ui(&mut self) {
         self.clear_held_actions();
         // An answer from an earlier opening is stale.
         *self
@@ -955,13 +967,65 @@ impl InteractiveApp {
             .progression_reply
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        self.pack.open();
+        self.inventory.reset();
         self.set_cursor_locked(false);
+    }
+
+    /// Tab: lay the pack out on the tarp, only when the game supplied a
+    /// [`PackView`].
+    pub(super) fn open_pack(&mut self) {
+        if self.pack_view.is_none() {
+            return;
+        }
+        self.book.close();
+        self.begin_inventory_ui();
+        self.pack.open();
     }
 
     pub(super) fn close_pack(&mut self) {
         self.pack.close();
         self.set_cursor_locked(true);
+    }
+
+    /// B: open the blueprint book at its contents.
+    pub(super) fn open_book(&mut self) {
+        if self.pack_view.is_none() {
+            return;
+        }
+        self.pack.close();
+        self.begin_inventory_ui();
+        self.book.open();
+    }
+
+    pub(super) fn close_book(&mut self) {
+        self.book.close();
+        self.set_cursor_locked(true);
+    }
+
+    /// The cursor in the UI's logical pixels, and the screen's size in them.
+    pub(super) fn ui_pointer(&self) -> Option<([f32; 2], [f32; 2])> {
+        let renderer = self.renderer.as_ref()?;
+        let scale = renderer.ui_scale();
+        let [x, y] = self.cursor_px?;
+        Some((renderer.ui_size(), [x / scale, y / scale]))
+    }
+
+    /// The left button in the open book: picks up, drops or crafts.
+    pub(super) fn book_button(&mut self, pressed: bool) {
+        let Some(view) = self.pack_view.clone() else {
+            return;
+        };
+        if let Some((screen, cursor)) = self.ui_pointer() {
+            self.book.pointer(screen, cursor);
+        }
+        if pressed {
+            self.book.press(view.as_ref(), &self.inventory);
+        } else if let Some(BookAction::Craft(recipe_id)) =
+            self.book.release(view.as_ref(), &self.inventory)
+        {
+            let request = self.inventory.craft(recipe_id, view.catalog_version());
+            self.session.push_progression(request);
+        }
     }
 
     pub(super) fn set_cursor_locked(&mut self, locked: bool) {

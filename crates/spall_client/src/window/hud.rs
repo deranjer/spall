@@ -575,6 +575,306 @@ pub(super) fn draw_pack(
     });
 }
 
+/// The blueprint book's art.
+pub(super) struct BookTextures {
+    pub(super) book: yakui::ManagedTextureId,
+    pub(super) cloth: yakui::ManagedTextureId,
+}
+
+/// Places `children` with its top left at `(x, y)` logical pixels.
+fn place(x: f32, y: f32, children: impl FnOnce()) {
+    yakui::align(yakui::Alignment::TOP_LEFT, || {
+        yakui::offset(yakui::Vec2::new(x, y), children);
+    });
+}
+
+fn ink_text(size: f32, color: yakui::Color, line: impl Into<String>) {
+    let mut text = yakui::widgets::Text::new(size, line.into());
+    text.style.color = color;
+    text.show();
+}
+
+/// A filled rectangle.
+fn fill(rect: UiRect, color: yakui::Color) {
+    place(rect.x, rect.y, || {
+        yakui::colored_box(color, yakui::Vec2::new(rect.w, rect.h));
+    });
+}
+
+/// A rectangle's outline, `width` logical pixels thick.
+fn outline(rect: UiRect, color: yakui::Color, width: f32) {
+    let UiRect { x, y, w, h } = rect;
+    for side in [
+        UiRect { x, y, w, h: width },
+        UiRect {
+            x,
+            y: y + h - width,
+            w,
+            h: width,
+        },
+        UiRect { x, y, w: width, h },
+        UiRect {
+            x: x + w - width,
+            y,
+            w: width,
+            h,
+        },
+    ] {
+        fill(side, color);
+    }
+}
+
+/// `rect` shrunk by `share` of its width on every side.
+fn padded(rect: UiRect, share: f32) -> UiRect {
+    let pad = rect.w * share;
+    UiRect {
+        x: rect.x + pad,
+        y: rect.y + pad,
+        w: rect.w - 2.0 * pad,
+        h: rect.h - 2.0 * pad,
+    }
+}
+
+/// An item's icon filling `rect`, or a plain marker when it has none.
+fn item_icon(
+    rect: UiRect,
+    item: &ItemDraw,
+    icons: &HashMap<u16, Option<yakui::ManagedTextureId>>,
+    color: yakui::Color,
+) {
+    match icons.get(&item.item_id).copied().flatten() {
+        Some(texture) => place(rect.x, rect.y, || {
+            let mut image = yakui::widgets::Image::new(texture, yakui::Vec2::new(rect.w, rect.h));
+            image.color = color;
+            image.show();
+        }),
+        None => fill(
+            padded(rect, 0.25),
+            PACK_INK.with_alpha(0.35 * color.a as f32 / 255.0),
+        ),
+    }
+}
+
+/// A blueprint card: blue paper with white linework, its name, what it
+/// makes, its pattern, and each material as have / need (red when short).
+fn draw_blueprint_card(
+    card: &BlueprintCard,
+    icons: &HashMap<u16, Option<yakui::ManagedTextureId>>,
+    alpha: f32,
+) {
+    let paper = if card.hovered {
+        yakui::Color::rgb(58, 98, 148)
+    } else {
+        yakui::Color::rgb(44, 78, 122)
+    };
+    let line = yakui::Color::rgb(226, 236, 248);
+    let r = card.rect;
+    fill(r, paper.with_alpha(0.94 * alpha));
+    outline(r, line.with_alpha(0.55 * alpha), 2.0);
+    let title = (r.h * 0.12).clamp(15.0, 30.0);
+    place(r.x + r.w * 0.06, r.y + r.h * 0.06, || {
+        ink_text(title, line.with_alpha(alpha), card.name.clone());
+    });
+    // What it makes, top right, with how many.
+    let side = r.h * 0.2;
+    let out = UiRect {
+        x: r.x + r.w * 0.94 - side,
+        y: r.y + r.h * 0.04,
+        w: side,
+        h: side,
+    };
+    item_icon(
+        out,
+        &card.output,
+        icons,
+        yakui::Color::WHITE.with_alpha(alpha),
+    );
+    if card.output.count > 1 {
+        place(out.x - title * 1.6, out.y + side * 0.2, || {
+            ink_text(
+                title * 0.9,
+                line.with_alpha(alpha),
+                format!("\u{d7}{}", card.output.count),
+            );
+        });
+    }
+    for (square, item) in &card.pattern {
+        fill(*square, line.with_alpha(0.08 * alpha));
+        outline(*square, line.with_alpha(0.6 * alpha), 1.5);
+        if let Some(item) = item {
+            item_icon(
+                padded(*square, 0.1),
+                item,
+                icons,
+                yakui::Color::WHITE.with_alpha(alpha),
+            );
+        }
+    }
+    let size = (r.h * 0.09).clamp(13.0, 24.0);
+    for (i, need) in card.needs.iter().enumerate() {
+        let color = if need.have >= need.need {
+            line
+        } else {
+            yakui::Color::rgb(255, 150, 135)
+        };
+        place(
+            r.x + r.w * 0.54,
+            r.y + r.h * 0.34 + size * 1.5 * i as f32,
+            || {
+                ink_text(
+                    size,
+                    color.with_alpha(alpha),
+                    format!("{} {}/{}", need.name, need.have.min(9999), need.need),
+                );
+            },
+        );
+    }
+}
+
+/// The blueprint book: the contents (every blueprint as a card), or one
+/// blueprint beside the crafting cloth, the materials to drag onto it and
+/// the Craft button.
+pub(super) fn draw_book(
+    frame: &BookFrame,
+    textures: &BookTextures,
+    icons: &HashMap<u16, Option<yakui::ManagedTextureId>>,
+    screen: [f32; 2],
+) {
+    let a = frame.shown;
+    let white = yakui::Color::WHITE.with_alpha(a);
+    yakui::colored_box(
+        yakui::Color::BLACK.with_alpha(0.4 * a),
+        yakui::Vec2::from_array(screen),
+    );
+    let b = frame.book;
+    place(b.x, b.y, || {
+        let mut image = yakui::widgets::Image::new(textures.book, yakui::Vec2::new(b.w, b.h));
+        image.color = white;
+        image.show();
+    });
+    let size = (b.h * 0.028).clamp(15.0, 28.0);
+    match &frame.page {
+        BookPage::Contents { cards, note } => {
+            for card in cards {
+                draw_blueprint_card(card, icons, a);
+            }
+            if let Some(note) = note {
+                let width = note.chars().count() as f32 * size * 0.52;
+                place(b.x + (b.w - width) * 0.5, b.y + b.h * 0.47, || {
+                    ink_text(size * 1.2, PACK_INK.with_alpha(0.8 * a), note.clone());
+                });
+            }
+            let hint = "Click a blueprint to craft it  \u{b7}  B to close";
+            let width = hint.chars().count() as f32 * size * 0.4;
+            place(b.x + (b.w - width) * 0.5, b.y + b.h * 0.945, || {
+                ink_text(
+                    size * 0.75,
+                    yakui::Color::rgb(236, 224, 196).with_alpha(0.8 * a),
+                    hint,
+                );
+            });
+        }
+        BookPage::Cloth(page) => {
+            let ink = |alpha: f32| PACK_INK.with_alpha(alpha * a);
+            place(page.back.x, page.back.y, || {
+                let alpha = if page.back_hovered { 1.0 } else { 0.7 };
+                ink_text(size, ink(alpha), "\u{2190} Blueprints");
+            });
+            draw_blueprint_card(&page.blueprint, icons, a);
+            let c = page.cloth;
+            place(c.x, c.y, || {
+                let mut image =
+                    yakui::widgets::Image::new(textures.cloth, yakui::Vec2::new(c.w, c.h));
+                image.color = white;
+                image.show();
+            });
+            for square in &page.squares {
+                fill(square.rect, ink(if square.hovered { 0.14 } else { 0.06 }));
+                outline(square.rect, ink(0.35), 1.5);
+                if let Some(item) = &square.item {
+                    item_icon(padded(square.rect, 0.08), item, icons, white);
+                }
+            }
+            for slot in &page.materials {
+                let r = slot.rect;
+                let some = slot.item.count > 0;
+                if slot.hovered && some {
+                    fill(r, ink(0.1));
+                }
+                let pad = r.w * 0.12;
+                let inner = UiRect {
+                    x: r.x + pad,
+                    y: r.y + pad * 0.5,
+                    w: r.w - 2.0 * pad,
+                    h: r.w - 2.0 * pad,
+                };
+                let shade = if some { a } else { 0.35 * a };
+                item_icon(
+                    inner,
+                    &slot.item,
+                    icons,
+                    yakui::Color::WHITE.with_alpha(shade),
+                );
+                place(inner.x + inner.w * 0.6, inner.y + inner.h * 0.62, || {
+                    let alpha = if some { 1.0 } else { 0.4 };
+                    ink_text(
+                        size * 0.95,
+                        ink(alpha),
+                        format!("\u{d7}{}", slot.item.count),
+                    );
+                });
+                let width = slot.name.chars().count() as f32 * size * 0.38;
+                place(r.x + (r.w - width) * 0.5, inner.y + inner.h + 2.0, || {
+                    ink_text(size * 0.72, ink(0.8), slot.name.clone());
+                });
+            }
+            let button = page.craft;
+            let grey = yakui::Color::rgb(120, 110, 95);
+            let (colour, label) = if page.crafting {
+                (grey.with_alpha(0.7 * a), "Crafting\u{2026}")
+            } else if page.ready {
+                let green = if page.craft_hovered {
+                    yakui::Color::rgb(78, 132, 70)
+                } else {
+                    yakui::Color::rgb(62, 110, 58)
+                };
+                (green.with_alpha(a), "Craft")
+            } else {
+                (grey.with_alpha(0.45 * a), "Craft")
+            };
+            fill(button, colour);
+            outline(button, ink(0.6), 2.0);
+            let width = label.chars().count() as f32 * size * 0.55;
+            place(
+                button.x + (button.w - width) * 0.5,
+                button.y + (button.h - size * 1.2) * 0.5,
+                || {
+                    ink_text(
+                        size * 1.05,
+                        yakui::Color::rgb(245, 238, 220).with_alpha(a),
+                        label,
+                    )
+                },
+            );
+            let hint = "Lay the materials out in the pattern";
+            let note = page
+                .note
+                .clone()
+                .or_else(|| (!page.ready).then(|| hint.to_owned()));
+            if let Some(note) = note {
+                let small = size * 0.8;
+                let width = note.chars().count() as f32 * small * 0.5;
+                place(c.x + (c.w - width) * 0.5, button.y - small * 1.8, || {
+                    ink_text(small, ink(0.85), note);
+                });
+            }
+            if let Some((rect, item)) = &page.dragging {
+                item_icon(*rect, item, icons, white);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,18 +1,16 @@
 //! The pack (Tab): a canvas tarp slides up over the screen with the
 //! inventory laid out on it as the game's item icons. It is UI only; the
-//! world keeps running behind it. The server's inventory (a list of stable
-//! item IDs) is fetched over the progression stream while the pack is open.
+//! world keeps running behind it. The inventory comes from the
+//! [`InventoryFeed`] while the pack is open.
 
 use super::*;
-use spall_protocol::{InventoryEntry, ProgressionOperation, ProgressionRequest};
+use spall_protocol::InventoryEntry;
 
 /// Seconds for the tarp to slide in, or back out.
 const SLIDE_S: f32 = 0.3;
 /// Item stacks laid out per row, and rows that fit on the tarp.
 const COLUMNS: usize = 4;
 const ROWS: usize = 3;
-/// How often an open pack asks the server for the inventory again.
-const REFRESH: Duration = Duration::from_millis(1500);
 /// The tarp art's width over its height (`assets/hud/tarp.png`).
 const TARP_ASPECT: f32 = 1200.0 / 820.0;
 /// The tarp's share of the screen: at most this much of its width or height.
@@ -34,7 +32,7 @@ pub(super) struct UiRect {
 }
 
 impl UiRect {
-    fn contains(self, [x, y]: [f32; 2]) -> bool {
+    pub(super) fn contains(self, [x, y]: [f32; 2]) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 }
@@ -67,27 +65,14 @@ pub(super) struct Pack {
     open: bool,
     /// 0 out of sight, 1 fully in (linear in time).
     amount: f32,
-    /// `None` until the first answer since the pack was opened.
-    inventory: Option<Vec<InventoryEntry>>,
-    requested_at: Option<Instant>,
-    next_request_id: u64,
     hovered: Option<u16>,
 }
 
 impl Pack {
     pub(super) fn new() -> Self {
-        // The server keeps a per-player high-water mark of request IDs, so
-        // start each session above any earlier one: wall-clock milliseconds.
-        let next_request_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(1, |since| since.as_millis() as u64)
-            .max(1);
         Self {
             open: false,
             amount: 0.0,
-            inventory: None,
-            requested_at: None,
-            next_request_id,
             hovered: None,
         }
     }
@@ -103,8 +88,6 @@ impl Pack {
 
     pub(super) fn open(&mut self) {
         self.open = true;
-        self.inventory = None;
-        self.requested_at = None;
     }
 
     pub(super) fn close(&mut self) {
@@ -127,52 +110,25 @@ impl Pack {
         t * t * (3.0 - 2.0 * t)
     }
 
-    /// Takes the newest progression answer, and returns the inventory
-    /// request to send when one is due.
-    pub(super) fn sync_inventory(
-        &mut self,
-        reply: Option<spall_protocol::ProgressionResponse>,
-        catalog_version: u32,
-        now: Instant,
-    ) -> Option<ProgressionRequest> {
-        if !self.open {
-            return None;
-        }
-        if let Some(reply) = reply {
-            self.inventory = Some(reply.inventory);
-        }
-        if self
-            .requested_at
-            .is_some_and(|at| now.saturating_duration_since(at) < REFRESH)
-        {
-            return None;
-        }
-        self.requested_at = Some(now);
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
-        Some(ProgressionRequest {
-            request_id,
-            catalog_version,
-            expected_inventory_revision: 0,
-            operation: ProgressionOperation::InspectInventory,
-        })
-    }
-
     /// The stacks that fit on the tarp, in slot order.
-    fn laid_out(&self) -> &[InventoryEntry] {
-        let all = self.inventory.as_deref().unwrap_or_default();
+    fn laid_out(stacks: Option<&[InventoryEntry]>) -> &[InventoryEntry] {
+        let all = stacks.unwrap_or_default();
         &all[..all.len().min(COLUMNS * ROWS)]
     }
 
     /// Hovers the stack under `cursor` (logical pixels), if any.
-    pub(super) fn hover(&mut self, screen: [f32; 2], cursor: [f32; 2]) {
+    pub(super) fn hover(
+        &mut self,
+        screen: [f32; 2],
+        cursor: [f32; 2],
+        stacks: Option<&[InventoryEntry]>,
+    ) {
         self.hovered = None;
         if !self.open {
             return;
         }
         let tarp = tarp_rect(screen, self.eased());
-        self.hovered = self
-            .laid_out()
+        self.hovered = Self::laid_out(stacks)
             .iter()
             .enumerate()
             .find(|(slot, _)| slot_cell(tarp, *slot).contains(cursor))
@@ -181,14 +137,18 @@ impl Pack {
 
     /// This frame's pack on a `screen` of logical pixels, or `None` when
     /// it is out of sight.
-    pub(super) fn frame(&self, view: &dyn PackView, screen: [f32; 2]) -> Option<PackFrame> {
+    pub(super) fn frame(
+        &self,
+        view: &dyn PackView,
+        screen: [f32; 2],
+        stacks: Option<&[InventoryEntry]>,
+    ) -> Option<PackFrame> {
         if !self.is_shown() {
             return None;
         }
         let shown = self.eased();
         let tarp = tarp_rect(screen, shown);
-        let slots = self
-            .laid_out()
+        let slots = Self::laid_out(stacks)
             .iter()
             .enumerate()
             .map(|(slot, entry)| {
@@ -207,8 +167,8 @@ impl Pack {
                 }
             })
             .collect();
-        let note = match &self.inventory {
-            Some(stacks) if stacks.is_empty() => Some("Nothing in the pack".to_owned()),
+        let note = match stacks {
+            Some([]) => Some("Nothing in the pack".to_owned()),
             Some(stacks) if stacks.len() > COLUMNS * ROWS => {
                 Some(format!("+{} more", stacks.len() - COLUMNS * ROWS))
             }
@@ -281,14 +241,16 @@ mod tests {
         fn item_icon_png(&self, item_id: u16) -> Option<&'static [u8]> {
             (item_id == 1).then_some(&LOG_PNG[..])
         }
+        fn blueprints(&self) -> &[Blueprint] {
+            &[]
+        }
     }
 
     const SCREEN: [f32; 2] = [1280.0, 720.0];
 
-    fn opened(inventory: Vec<InventoryEntry>) -> Pack {
+    fn opened() -> Pack {
         let mut pack = Pack::new();
         pack.open();
-        pack.inventory = Some(inventory);
         pack.advance(SLIDE_S);
         pack
     }
@@ -302,14 +264,14 @@ mod tests {
     fn the_tarp_slides_up_into_the_middle_and_back_out() {
         let mut pack = Pack::new();
         assert!(
-            pack.frame(&TestView, SCREEN).is_none(),
+            pack.frame(&TestView, SCREEN, None).is_none(),
             "closed: nothing drawn"
         );
         pack.open();
         pack.advance(SLIDE_S * 0.5);
-        let rising = pack.frame(&TestView, SCREEN).unwrap().tarp;
+        let rising = pack.frame(&TestView, SCREEN, None).unwrap().tarp;
         pack.advance(SLIDE_S);
-        let tarp = pack.frame(&TestView, SCREEN).unwrap().tarp;
+        let tarp = pack.frame(&TestView, SCREEN, None).unwrap().tarp;
         assert!(rising.y > tarp.y, "still rising half way");
         assert!((tarp.x + tarp.w * 0.5 - SCREEN[0] * 0.5).abs() < 0.01);
         assert!((tarp.y + tarp.h * 0.5 - SCREEN[1] * 0.5).abs() < 0.01);
@@ -323,12 +285,13 @@ mod tests {
         pack.close();
         assert!(pack.is_shown(), "slides away over time, not at once");
         pack.advance(SLIDE_S);
-        assert!(pack.frame(&TestView, SCREEN).is_none());
+        assert!(pack.frame(&TestView, SCREEN, None).is_none());
     }
 
     #[test]
     fn stacks_fill_the_tarp_in_rows_inside_its_hem_with_names_and_counts() {
-        let pack = opened(vec![
+        let pack = opened();
+        let two = [
             InventoryEntry {
                 item_id: 1,
                 count: 12,
@@ -337,8 +300,8 @@ mod tests {
                 item_id: 4,
                 count: 1,
             },
-        ]);
-        let frame = pack.frame(&TestView, SCREEN).unwrap();
+        ];
+        let frame = pack.frame(&TestView, SCREEN, Some(&two)).unwrap();
         assert_eq!(frame.note, None);
         let [log, other] = &frame.slots[..] else {
             panic!("two slots: {:?}", frame.slots)
@@ -354,8 +317,8 @@ mod tests {
             "same row"
         );
 
-        let full = opened(stacks(1..=12));
-        let frame = full.frame(&TestView, SCREEN).unwrap();
+        let full = stacks(1..=12);
+        let frame = pack.frame(&TestView, SCREEN, Some(&full)).unwrap();
         let tarp = frame.tarp;
         for slot in &frame.slots {
             let UiRect { x, y, w, h } = slot.cell;
@@ -372,20 +335,17 @@ mod tests {
 
     #[test]
     fn notes_cover_an_empty_pack_and_stacks_that_do_not_fit() {
-        let empty = opened(Vec::new());
-        let frame = empty.frame(&TestView, SCREEN).unwrap();
+        let pack = opened();
+        let frame = pack.frame(&TestView, SCREEN, Some(&[])).unwrap();
         assert!(frame.slots.is_empty());
         assert_eq!(frame.note.as_deref(), Some("Nothing in the pack"));
 
-        let many = opened(stacks(1..=15));
-        let frame = many.frame(&TestView, SCREEN).unwrap();
+        let many = stacks(1..=15);
+        let frame = pack.frame(&TestView, SCREEN, Some(&many)).unwrap();
         assert_eq!(frame.slots.len(), COLUMNS * ROWS);
         assert_eq!(frame.note.as_deref(), Some("+3 more"));
 
-        let mut waiting = Pack::new();
-        waiting.open();
-        waiting.advance(SLIDE_S);
-        let frame = waiting.frame(&TestView, SCREEN).unwrap();
+        let frame = pack.frame(&TestView, SCREEN, None).unwrap();
         assert!(
             frame.slots.is_empty() && frame.note.is_none(),
             "no answer yet"
@@ -394,65 +354,29 @@ mod tests {
 
     #[test]
     fn the_cursor_hovers_the_stack_under_it_only_while_open() {
-        let mut pack = opened(stacks(1..=3));
-        let second = pack.frame(&TestView, SCREEN).unwrap().slots[1].cell;
+        let mut pack = opened();
+        let three = stacks(1..=3);
+        let three = Some(&three[..]);
+        let second = pack.frame(&TestView, SCREEN, three).unwrap().slots[1].cell;
         let inside = [second.x + second.w * 0.5, second.y + second.h * 0.5];
-        pack.hover(SCREEN, inside);
-        let frame = pack.frame(&TestView, SCREEN).unwrap();
+        pack.hover(SCREEN, inside, three);
+        let frame = pack.frame(&TestView, SCREEN, three).unwrap();
         assert_eq!(
             frame.slots.iter().map(|s| s.hovered).collect::<Vec<_>>(),
             [false, true, false]
         );
-        pack.hover(SCREEN, [1.0, 1.0]);
-        assert!(
-            pack.frame(&TestView, SCREEN)
+        pack.hover(SCREEN, [1.0, 1.0], three);
+        let hovered = |pack: &Pack| {
+            pack.frame(&TestView, SCREEN, three)
                 .unwrap()
                 .slots
                 .iter()
-                .all(|s| !s.hovered)
-        );
-        pack.hover(SCREEN, inside);
-        pack.close();
-        pack.hover(SCREEN, inside);
-        assert!(
-            pack.frame(&TestView, SCREEN)
-                .unwrap()
-                .slots
-                .iter()
-                .all(|s| !s.hovered)
-        );
-    }
-
-    #[test]
-    fn open_pack_asks_for_the_inventory_and_keeps_the_newest_answer() {
-        let mut pack = Pack::new();
-        let now = Instant::now();
-        assert_eq!(pack.sync_inventory(None, 1, now), None, "closed");
-
-        pack.open();
-        let first = pack.sync_inventory(None, 1, now).expect("asks at open");
-        assert_eq!(first.operation, ProgressionOperation::InspectInventory);
-        assert_eq!(first.catalog_version, 1);
-        assert_eq!(
-            pack.sync_inventory(None, 1, now + Duration::from_millis(100)),
-            None
-        );
-        let second = pack
-            .sync_inventory(None, 1, now + REFRESH)
-            .expect("refresh");
-        assert!(second.request_id > first.request_id);
-
-        let reply = spall_protocol::ProgressionResponse {
-            request_id: second.request_id,
-            catalog_version: 1,
-            inventory_revision: 3,
-            outcome: spall_protocol::ProgressionOutcome::Inventory,
-            inventory: vec![InventoryEntry {
-                item_id: 1,
-                count: 5,
-            }],
+                .any(|s| s.hovered)
         };
-        pack.sync_inventory(Some(reply), 1, now + REFRESH);
-        assert_eq!(pack.laid_out().len(), 1);
+        assert!(!hovered(&pack));
+        pack.hover(SCREEN, inside, three);
+        pack.close();
+        pack.hover(SCREEN, inside, three);
+        assert!(!hovered(&pack));
     }
 }
