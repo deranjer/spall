@@ -178,7 +178,13 @@ impl Pack {
         };
         let s = self.eased();
         let forward = forward(anchor.yaw);
-        let kneel = eye - Vec3::Y * (KNEEL_DROP_M * s) + forward * (KNEEL_LEAN_M * s);
+        // Kneeling, the eye is pinned to where the pack was opened. Following
+        // the live eye would carry the small reconciliation corrections the
+        // player gets even standing still, and right over a tarp fixed in the
+        // world that reads as the whole mat jittering.
+        let pinned = anchor.feet + Vec3::Y * eye_height_m();
+        let kneel =
+            eye.lerp(pinned, s) - Vec3::Y * (KNEEL_DROP_M * s) + forward * (KNEEL_LEAN_M * s);
         let target = tarp_centre(anchor) + Vec3::Y * 0.05;
         let to_tarp = (target - kneel).normalize_or(look);
         let blended = (look * (1.0 - s) + to_tarp * s).normalize_or(look);
@@ -542,6 +548,11 @@ fn ring_instances(ring: &[Vec3], twine: u32, stone: u32) -> Vec<CubeInstance> {
     out
 }
 
+/// Standing eye height above the feet, as the camera uses.
+fn eye_height_m() -> f32 {
+    CharacterParams::DEFAULT.total_height_m() * 0.9
+}
+
 /// Horizontal facing for a yaw (zero looks along `-Z`).
 fn forward(yaw: f32) -> Vec3 {
     Vec3::new(yaw.sin(), 0.0, -yaw.cos())
@@ -680,14 +691,22 @@ mod tests {
     #[test]
     fn opening_kneels_toward_the_tarp_and_closing_gives_the_view_back() {
         let mut pack = Pack::new();
-        let eye = Vec3::new(10.0, 6.6, -3.0);
+        // Off by a correction's few centimetres from the opening pose.
+        let eye = Vec3::new(10.03, 5.0 + eye_height_m() + 0.02, -3.0);
         let ahead = Vec3::new(0.0, 0.0, -1.0);
         assert_eq!(pack.camera(eye, ahead), (eye, ahead));
 
         pack.open([10.0, 5.0, -3.0], 0.0);
         pack.advance(UNROLL_S * 2.0);
         let (kneel, look) = pack.camera(eye, ahead);
-        assert!((kneel.y - (eye.y - KNEEL_DROP_M)).abs() < 1e-4);
+        let pinned = Vec3::new(
+            10.0,
+            5.0 + eye_height_m() - KNEEL_DROP_M,
+            -3.0 - KNEEL_LEAN_M,
+        );
+        assert!(kneel.distance(pinned) < 1e-4, "{kneel:?}");
+        // Corrections to the live eye no longer move the kneeling camera.
+        assert_eq!(pack.camera(eye + Vec3::X * 0.05, ahead).0, kneel);
         assert!(look.y < -0.5, "looks down at the tarp: {look:?}");
         assert!(look.z < 0.0, "still facing the way the player faced");
 
