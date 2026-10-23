@@ -23,10 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
-use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{
-    EntityId, JsonlError, JsonlLog, PlayerInput, ProcessEvent, ProcessRecord, ProcessRole,
-    SphereBrush, Tick, VolumeId,
+    EntityId, JsonlError, JsonlLog, PlayerInput, ProcessEvent, ProcessRecord, ProcessRole, Tick,
+    VolumeId,
 };
 use spall_net::{
     Connection, DatagramRecord, Fingerprint, JoinToken, TransportConfig, TransportError,
@@ -34,12 +33,13 @@ use spall_net::{
 };
 use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::{
-    ActionKind, ActionOutcome, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld,
-    ClaimedTarget, Handshake, Hash32, InputFrame, InputSeq, MotionSnapshot, NegotiatedLimits,
-    PROTOCOL_VERSION, ProgressionRequest, ProgressionResponse, RecentInput, RepairKey, RequestId,
-    TransferId, session_player_entity,
+    ActionOutcome, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld, ClaimedTarget,
+    Handshake, Hash32, InputFrame, InputSeq, MotionSnapshot, NegotiatedLimits, PROTOCOL_VERSION,
+    ProgressionRequest, ProgressionResponse, RecentInput, RepairKey, RequestId, TransferId,
+    session_player_entity,
 };
 
+pub use crate::action_requests::{cut_request, tool_request};
 use crate::interactive::{InteractiveSession, InteractiveView};
 use crate::predict::{
     BodyMotion, ClientBodyCollision, ClientPhysics, PlayerMovementSummary, PredictedPlayer,
@@ -292,56 +292,6 @@ pub struct ScriptedAction {
     pub request: ActionRequest,
     /// Retarget the request at the detached body before sending it.
     pub target: ScriptTarget,
-}
-
-/// A `Cut` request with a sphere brush centred on `(cell_x, cell_y, cell_z)` in
-/// the terrain volume's local cell space.
-pub fn cut_request(
-    request_id: u64,
-    input_seq: u64,
-    cell: [i64; 3],
-    radius_cells: i64,
-) -> ActionRequest {
-    tool_request(
-        0,
-        ActionKind::Cut,
-        request_id,
-        input_seq,
-        cell,
-        radius_cells,
-    )
-}
-
-/// A request for a game-selected, server-approved tool. The server resolves
-/// the tool ID to its own operation and validates the aim and brush claims.
-pub fn tool_request(
-    tool: u16,
-    action: ActionKind,
-    request_id: u64,
-    input_seq: u64,
-    cell: [i64; 3],
-    radius_cells: i64,
-) -> ActionRequest {
-    let h = BRUSH_UNIT / 2;
-    let brush = SphereBrush::new(
-        BrushPoint::from_units(
-            cell[0] * BRUSH_UNIT + h,
-            cell[1] * BRUSH_UNIT + h,
-            cell[2] * BRUSH_UNIT + h,
-        ),
-        radius_cells * BRUSH_UNIT,
-    )
-    .expect("radius within brush limits");
-    ActionRequest {
-        request_id: RequestId(request_id),
-        input_seq: InputSeq(input_seq),
-        action,
-        tool,
-        aim_origin_m: [0.0, 1.0, 0.0],
-        aim_dir: [0.0, 0.0, 1.0],
-        claimed_target: ClaimedTarget::Terrain,
-        claimed_brush: brush,
-    }
 }
 
 /// Which fixed baseline scene a live (non-late-join) replica installs. Must
@@ -2425,6 +2375,12 @@ async fn run_async(
                         }
                     }
                     Ok(Some(WireRecord::ProgressionResponse(response))) => {
+                        if let Some(session) = &interactive {
+                            *session
+                                .progression_reply
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(response.clone());
+                        }
                         progression_responses
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -3457,6 +3413,17 @@ async fn run_async(
                                 admin_conn.send_record(WireRecord::AdminRequest(request)).await
                             {
                                 eprintln!("spall-client: admin request could not be sent: {error}");
+                            }
+                        }
+                        let progression: Vec<_> = interactive
+                            .as_ref()
+                            .map(|s| std::mem::take(&mut *s.progression_queue.lock().unwrap_or_else(|e| e.into_inner())))
+                            .unwrap_or_default();
+                        for request in progression {
+                            if let Err(error) =
+                                admin_conn.send_record(WireRecord::ProgressionRequest(request)).await
+                            {
+                                eprintln!("spall-client: progression request could not be sent: {error}");
                             }
                         }
                         // Tool uses from the window (the hammer) go out on the

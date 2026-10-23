@@ -70,6 +70,15 @@ pub(crate) struct WorldRenderer {
     body_icons: [yakui::ManagedTextureId; 6],
     /// Each reminder icon's opacity this frame (`body_state::reminders`).
     pub(super) body_reminders: [(BodyCue, f32); 6],
+    /// The pack laid out for this frame, if it is on screen.
+    pub(super) pack_frame: Option<PackFrame>,
+    pack_tarp: yakui::ManagedTextureId,
+    /// The blueprint book laid out for this frame, if it is on screen.
+    pub(super) book_frame: Option<BookFrame>,
+    book_textures: BookTextures,
+    /// The game's item icons, uploaded on first sight; `None` if one would
+    /// not decode (reported once, then drawn as a plain marker).
+    item_icons: HashMap<u16, Option<yakui::ManagedTextureId>>,
     yakui_winit: YakuiWinit,
     yakui_wgpu: YakuiWgpu,
     yakui_buffers: yakui_wgpu::Buffers,
@@ -349,6 +358,23 @@ impl WorldRenderer {
         let aspect = surface_config.width as f32 / surface_config.height.max(1) as f32;
         let mut yakui = yakui::Yakui::new();
         let body_icons = load_body_icons(&mut yakui)?;
+        let pack_tarp = png_texture(
+            &mut yakui,
+            include_bytes!("../../assets/hud/tarp.png"),
+            "pack tarp",
+        )?;
+        let book_textures = BookTextures {
+            book: png_texture(
+                &mut yakui,
+                include_bytes!("../../assets/hud/book.png"),
+                "blueprint book",
+            )?,
+            cloth: png_texture(
+                &mut yakui,
+                include_bytes!("../../assets/hud/cloth.png"),
+                "crafting cloth",
+            )?,
+        };
         let yakui_winit = YakuiWinit::new(&window);
         let yakui_wgpu = YakuiWgpu::new(device.clone(), queue.clone());
         let yakui_buffers = yakui_wgpu.buffers();
@@ -433,6 +459,11 @@ impl WorldRenderer {
             yakui_wgpu,
             body_icons,
             body_reminders: BodyCue::ALL.map(|cue| (cue, 0.0)),
+            pack_frame: None,
+            pack_tarp,
+            book_frame: None,
+            book_textures,
+            item_icons: HashMap::new(),
             yakui_buffers,
             hud_gpu_timer,
             screenshot_request: None,
@@ -581,6 +612,21 @@ impl WorldRenderer {
                 "scene GPU timing unavailable | greedy {terrain_chunks} terrain chunks / {terrain_triangles} tris + {body_meshes} body meshes / {body_triangles} tris + {overlay} debug cubes ({memory:.1} MiB)"
             ),
         }
+    }
+
+    /// Logical pixels per physical pixel's inverse: divide a physical cursor
+    /// position by this to get the UI's logical pixels.
+    pub(super) fn ui_scale(&self) -> f32 {
+        self.yakui.scale_factor()
+    }
+
+    /// The screen in logical pixels.
+    pub(super) fn ui_size(&self) -> [f32; 2] {
+        let scale = self.yakui.scale_factor();
+        [
+            self.surface_config.width as f32 / scale,
+            self.surface_config.height as f32 / scale,
+        ]
     }
 
     pub(crate) fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
@@ -973,6 +1019,21 @@ impl WorldRenderer {
         {
             timer.write_start(&mut encoder);
         }
+        let wanted: Vec<(u16, &'static [u8])> = self
+            .pack_frame
+            .iter()
+            .flat_map(|frame| frame.slots.iter().map(|slot| (slot.item_id, slot.icon_png)))
+            .chain(self.book_frame.iter().flat_map(BookFrame::icons))
+            .filter_map(|(item, png)| Some((item, png?)))
+            .collect();
+        for (item, png) in wanted {
+            if !self.item_icons.contains_key(&item) {
+                let icon = png_texture(&mut self.yakui, png, "item icon")
+                    .inspect_err(|error| eprintln!("spall-interactive: item {item}: {error}"))
+                    .ok();
+                self.item_icons.insert(item, icon);
+            }
+        }
         self.yakui.start();
         let mut selected_environment = None;
         let mut admin_menu = admin_menu;
@@ -1014,6 +1075,12 @@ impl WorldRenderer {
             draw_crosshair(crosshair);
         }
         draw_body_reminders(&self.body_icons, &self.body_reminders);
+        if let Some(frame) = &self.pack_frame {
+            draw_pack(frame, self.pack_tarp, &self.item_icons, self.ui_size());
+        }
+        if let Some(frame) = &self.book_frame {
+            draw_book(frame, &self.book_textures, &self.item_icons, self.ui_size());
+        }
         if let Some(bar) = self.endurance {
             draw_endurance(bar);
         }

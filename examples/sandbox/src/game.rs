@@ -105,7 +105,7 @@ pub fn contact_damage_profiles() -> Vec<(MaterialId, spall_sim::ContactDamageMat
 }
 
 /// Version of the sandbox's stable recipe definitions.
-pub const RECIPE_CATALOG_VERSION: u32 = 1;
+pub const RECIPE_CATALOG_VERSION: u32 = 2;
 
 /// Stable game item identity, independent of display names or source order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -121,12 +121,17 @@ pub mod items {
     pub const WOOD_PLANK: ItemId = ItemId(2);
     pub const STONE_CHUNK: ItemId = ItemId(3);
     pub const STONE_BLOCK: ItemId = ItemId(4);
+    pub const STICK: ItemId = ItemId(5);
+    /// A fire pit ready to set down (placing it is not built yet).
+    pub const FIRE_PIT: ItemId = ItemId(6);
 }
 
 pub mod recipe_ids {
     use super::RecipeId;
     pub const SAW_PLANKS: RecipeId = RecipeId(1);
     pub const SHAPE_STONE: RecipeId = RecipeId(2);
+    pub const SPLIT_STICKS: RecipeId = RecipeId(3);
+    pub const BUILD_FIRE_PIT: RecipeId = RecipeId(4);
 }
 
 /// A positive count of one stable game item.
@@ -602,6 +607,34 @@ pub fn recipe_catalog() -> RecipeCatalog {
                 }],
                 outputs: vec![ItemStack {
                     item: items::STONE_BLOCK,
+                    count: 1,
+                }],
+            },
+            Recipe {
+                id: recipe_ids::SPLIT_STICKS,
+                ingredients: vec![ItemStack {
+                    item: items::WOOD_LOG,
+                    count: 1,
+                }],
+                outputs: vec![ItemStack {
+                    item: items::STICK,
+                    count: 6,
+                }],
+            },
+            Recipe {
+                id: recipe_ids::BUILD_FIRE_PIT,
+                ingredients: vec![
+                    ItemStack {
+                        item: items::STONE_CHUNK,
+                        count: 6,
+                    },
+                    ItemStack {
+                        item: items::STICK,
+                        count: 6,
+                    },
+                ],
+                outputs: vec![ItemStack {
+                    item: items::FIRE_PIT,
                     count: 1,
                 }],
             },

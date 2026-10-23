@@ -20,9 +20,80 @@ pub struct InteractiveOptions {
     pub biome_audio: BiomeAudioConfig,
     /// Game-owned drawing of replicated creatures as lit cubes each frame.
     pub creature_view: Option<std::sync::Arc<dyn CreatureView>>,
+    /// Game-owned look of the inventory laid out on the pack's tarp (Tab).
+    /// `None` leaves Tab unbound.
+    pub pack_view: Option<std::sync::Arc<dyn PackView>>,
     /// Game-owned drawing of player bodies as lit cubes each frame. Without it
     /// other players are not drawn and the third-person toggle does nothing.
     pub player_view: Option<std::sync::Arc<dyn PlayerView>>,
+}
+
+/// What the game's items look like laid out on the pack's tarp. The engine
+/// owns opening the pack, the tarp, the layout and fetching the inventory;
+/// the game owns item names and icons.
+pub trait PackView: Send + Sync + std::fmt::Debug {
+    /// The game's recipe catalogue version, sent with inventory requests.
+    fn catalog_version(&self) -> u32;
+    /// Display name for a stable item ID; `None` for an item this build
+    /// does not know (it is still laid out, as "Unknown item").
+    fn item_name(&self, item_id: u16) -> Option<&str>;
+    /// The item's icon as PNG bytes, drawn about 100 logical pixels square
+    /// on the tarp: an item on transparency, lit from the top left. `None`
+    /// draws a plain marker.
+    fn item_icon_png(&self, item_id: u16) -> Option<&'static [u8]>;
+    /// The blueprints in the book (B), in page order. Each must match one of
+    /// the game's server-side recipes.
+    fn blueprints(&self) -> &[Blueprint];
+}
+
+/// One page of the blueprint book: a recipe, and where its raw materials
+/// must be laid on the crafting cloth. Each slot takes one item; a material
+/// dropped near a slot that takes it snaps into place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Blueprint {
+    /// The game's recipe, sent in the craft request.
+    pub recipe_id: u16,
+    /// What the blueprint makes, and how many.
+    pub output: (u16, u32),
+    /// How the cloth is drawn: looking down at it, or from the side with a
+    /// ground line (for things that stand or stack).
+    pub view: BlueprintView,
+    pub slots: Vec<BlueprintSlot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlueprintView {
+    Overhead,
+    /// From the side: the ground runs across the cloth at [`SIDE_GROUND`].
+    Side,
+}
+
+/// Where the ground line runs in a side view, as a share of the cloth's
+/// height from the top.
+pub const SIDE_GROUND: f32 = 0.74;
+
+/// One place on the cloth for one item.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlueprintSlot {
+    pub item: u16,
+    /// The slot's centre: across and down the cloth, each 0 to 1.
+    pub at: [f32; 2],
+    /// The item's drawn size as a share of the cloth's width.
+    pub size: f32,
+}
+
+impl Blueprint {
+    /// Each raw material the blueprint uses and how many, in first-use order.
+    pub fn needs(&self) -> Vec<(u16, u32)> {
+        let mut needs: Vec<(u16, u32)> = Vec::new();
+        for slot in &self.slots {
+            match needs.iter_mut().find(|(id, _)| *id == slot.item) {
+                Some((_, count)) => *count += 1,
+                None => needs.push((slot.item, 1)),
+            }
+        }
+        needs
+    }
 }
 
 /// One player capsule to draw this frame.

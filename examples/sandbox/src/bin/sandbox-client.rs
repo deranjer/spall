@@ -781,6 +781,9 @@ fn run_interactive(args: Args) -> ExitCode {
             player_view: Some(std::sync::Arc::new(
                 sandbox::player_view::PlayerBodyView::new().expect("authored player asset builds"),
             )),
+            pack_view: Some(std::sync::Arc::new(
+                sandbox::pack_view::SandboxPackView::new(),
+            )),
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,
