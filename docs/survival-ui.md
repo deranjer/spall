@@ -63,27 +63,45 @@ the cursor grows slightly and its name darkens. Text scales with the tarp. `Tab`
 ## Built: the blueprint book (B)
 
 `B` slides an open leather journal over the screen. Its pages hold a blue
-blueprint card for each of the game's recipes: what it makes, its pattern of raw
-materials, and each material as have / need (red when short). Clicking a card
-turns to the crafting cloth: the blueprint on the left page, a 3 by 3 canvas cloth
-on the right, and a strip of the pack's materials under it. Drag materials onto
-the cloth's squares; drag a square somewhere else to move it, or click it to take
-it back. Once the materials lie in the blueprint's pattern (anywhere on the cloth,
-with nothing else on it), **Craft** lights up and asks the server for one batch
-(`ProgressionOperation::Craft`). On success the cloth clears and says what was
-made; a refusal keeps the cloth and says why. A craft beaten by a harvest (stale
-inventory revision) is retried once. `B` or `Esc` closes the book, `Tab` swaps to
-the pack, and walking closes it.
+blueprint card for each of the game's recipes: what it makes, a small drawing of
+where its materials go, and each material as have / need (red when short).
+Clicking a card turns to the crafting cloth: the blueprint on the left page, a
+canvas cloth on the right, and a strip of the pack's materials under it.
+
+Blueprints are not a grid. Each lists **slots**: a position on the cloth, the item
+it takes and the item's drawn size, and the blueprint is seen either **from above**
+or **from the side** (side views draw a ground line). Empty slots show as faint
+outlines of their item. Drag a material onto the cloth and it snaps into the
+nearest empty slot that takes it (within the slot's half size plus 8% of the
+cloth); the slot it would snap into is lit while dragging, and a drop with no home
+goes back to the pack. Drag a laid material to move it, or click it to take it
+back. When every slot is filled, **Craft** lights up and asks the server for one
+batch (`ProgressionOperation::Craft`). On success the cloth clears and says what
+was made; a refusal keeps the cloth and says why. A craft beaten by a harvest
+(stale inventory revision) is retried once. `B` or `Esc` closes the book, `Tab`
+swaps to the pack, and walking closes it.
+
+The sandbox's blueprints:
+
+| Blueprint | View | Lay out | Makes |
+| --- | --- | --- | --- |
+| Planks | Side | a log on the ground | 4 planks |
+| Stone block | Side | two stones stacked on two | 1 stone block |
+| Sticks | Above | a log | 6 sticks |
+| Fire pit | Above | six sticks in the centre, six stones in a ring round them | 1 fire pit |
+
+Sticks and the fire pit are new items (recipe catalogue version 2). A fire pit
+sits in the pack; setting one down in the world is not built yet.
 
 - **Engine and game.** The engine draws the book and cloth
   (`crates/spall_client/assets/hud/book.png` and `cloth.png`, drawn by
-  `make_book.py`), lays out up to 12 blueprints, matches patterns and sends the
-  craft. The game's `PackView::blueprints` gives each blueprint's recipe, output and
-  pattern; the sandbox's are one log for 4 planks and a 2 by 2 square of stones for
-  a stone block, checked against its server recipes.
+  `make_book.py`), lays out up to 12 blueprints, snaps materials and sends the
+  craft. The game's `PackView::blueprints` gives each blueprint's recipe, output,
+  view and slots; the sandbox checks each against its server recipe.
 - **Shared inventory.** The pack and the book read one `InventoryFeed`, refreshed
   every 1.5 s while either is open.
-- **Not yet:** more than 12 blueprints (paging), blueprints learned in play, sounds.
+- **Not yet:** more than 12 blueprints (paging), rotated items on the cloth,
+  blueprints learned in play, placing a fire pit, sounds.
 
 ## Planned
 

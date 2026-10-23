@@ -698,17 +698,25 @@ fn draw_blueprint_card(
             );
         });
     }
-    for (square, item) in &card.pattern {
-        fill(*square, line.with_alpha(0.08 * alpha));
-        outline(*square, line.with_alpha(0.6 * alpha), 1.5);
-        if let Some(item) = item {
-            item_icon(
-                padded(*square, 0.1),
-                item,
-                icons,
-                yakui::Color::WHITE.with_alpha(alpha),
-            );
-        }
+    // The layout: a faint panel, the ground for a side view, then each
+    // slot's item where it goes.
+    let d = card.diagram;
+    fill(d, line.with_alpha(0.07 * alpha));
+    outline(d, line.with_alpha(0.45 * alpha), 1.5);
+    if card.view == BlueprintView::Side {
+        let ground = d.y + d.h * SIDE_GROUND;
+        fill(
+            UiRect {
+                x: d.x,
+                y: ground,
+                w: d.w,
+                h: 2.0,
+            },
+            line.with_alpha(0.7 * alpha),
+        );
+    }
+    for (rect, item) in &card.pattern {
+        item_icon(*rect, item, icons, yakui::Color::WHITE.with_alpha(alpha));
     }
     let size = (r.h * 0.09).clamp(13.0, 24.0);
     for (i, need) in card.needs.iter().enumerate() {
@@ -788,12 +796,39 @@ pub(super) fn draw_book(
                 image.color = white;
                 image.show();
             });
-            for square in &page.squares {
-                fill(square.rect, ink(if square.hovered { 0.14 } else { 0.06 }));
-                outline(square.rect, ink(0.35), 1.5);
-                if let Some(item) = &square.item {
-                    item_icon(padded(square.rect, 0.08), item, icons, white);
+            // Side views get a ground line; both say which way they look.
+            if page.view == BlueprintView::Side {
+                let ground = c.y + c.h * SIDE_GROUND;
+                fill(
+                    UiRect {
+                        x: c.x + c.w * 0.05,
+                        y: ground,
+                        w: c.w * 0.9,
+                        h: 3.0,
+                    },
+                    ink(0.55),
+                );
+            }
+            place(c.x + c.w * 0.07, c.y + c.h * 0.06, || {
+                let label = match page.view {
+                    BlueprintView::Overhead => "From above",
+                    BlueprintView::Side => "From the side",
+                };
+                ink_text(size * 0.7, ink(0.5), label);
+            });
+            // Empty slots are faint outlines of their item; the slot a drag
+            // would snap into is lit; filled slots show the item itself.
+            for slot in page.slots.iter().filter(|slot| !slot.filled) {
+                if slot.snap {
+                    fill(padded(slot.rect, 0.04), ink(0.16));
                 }
+                item_icon(slot.rect, &slot.item, icons, white.with_alpha(0.22 * a));
+            }
+            for slot in page.slots.iter().filter(|slot| slot.filled) {
+                if slot.hovered {
+                    fill(padded(slot.rect, 0.04), ink(0.1));
+                }
+                item_icon(slot.rect, &slot.item, icons, white);
             }
             for slot in &page.materials {
                 let r = slot.rect;

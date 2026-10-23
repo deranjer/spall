@@ -316,7 +316,7 @@ impl ApplicationHandler for InteractiveApp {
                             self.session.push_progression(request);
                         }
                     }
-                    self.book.reconcile(&self.inventory);
+                    self.book.reconcile(pack_view.as_ref(), &self.inventory);
                     if let Some(request) =
                         self.inventory.due_request(pack_view.catalog_version(), now)
                     {

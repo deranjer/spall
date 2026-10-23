@@ -1,9 +1,10 @@
 //! The blueprint book (B): an open journal of the game's blueprints, each
-//! showing its pattern and how much of each raw material it needs against
+//! showing where its raw materials go and how much of each it needs against
 //! how much the player has. Clicking one turns to the crafting cloth: the
-//! player drags raw materials from the pack onto a 3 by 3 cloth, and once
-//! they lie in the blueprint's pattern, Craft asks the server for it. UI
-//! only; the world keeps running.
+//! player drags raw materials from the pack onto the cloth, where each snaps
+//! into a slot that takes it, seen from above or from the side as the
+//! blueprint says. Once every slot is filled, Craft asks the server for it.
+//! UI only; the world keeps running.
 
 use super::*;
 
@@ -24,11 +25,13 @@ const PAGE_H: f32 = 780.0 / 900.0;
 const CARD_COLUMNS: usize = 2;
 const CARD_ROWS: usize = 3;
 const CARDS: usize = 2 * CARD_COLUMNS * CARD_ROWS;
-/// The crafting cloth's squares on a side.
-const CLOTH_SIDE: usize = 3;
-const CLOTH_SQUARES: usize = CLOTH_SIDE * CLOTH_SIDE;
 /// Material slots along the strip under the cloth.
 const MATERIAL_SLOTS: usize = 6;
+/// A dropped material snaps into a slot whose centre is within the slot's
+/// half size plus this share of the cloth.
+const SNAP_REACH: f32 = 0.08;
+/// A press and release this close together (logical pixels) is a click.
+const CLICK_SLOP_PX: f32 = 5.0;
 
 /// One frame of the book, laid out for the screen.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,8 +76,10 @@ pub(super) struct BlueprintCard {
     pub(super) hovered: bool,
     pub(super) name: String,
     pub(super) output: ItemDraw,
-    /// The pattern's squares, each with its item if any.
-    pub(super) pattern: Vec<(UiRect, Option<ItemDraw>)>,
+    pub(super) view: BlueprintView,
+    /// The little drawing of the layout, and each slot in it.
+    pub(super) diagram: UiRect,
+    pub(super) pattern: Vec<(UiRect, ItemDraw)>,
     pub(super) needs: Vec<NeedLine>,
 }
 
@@ -85,10 +90,11 @@ pub(super) struct ClothPage {
     /// The chosen blueprint, drawn large on the left page.
     pub(super) blueprint: BlueprintCard,
     pub(super) cloth: UiRect,
-    pub(super) squares: Vec<ClothSquare>,
+    pub(super) view: BlueprintView,
+    pub(super) slots: Vec<ClothSlot>,
     pub(super) materials: Vec<MaterialSlot>,
     pub(super) craft: UiRect,
-    /// The materials lie in the blueprint's pattern.
+    /// Every slot is filled.
     pub(super) ready: bool,
     pub(super) craft_hovered: bool,
     /// A craft is waiting on the server.
@@ -98,11 +104,15 @@ pub(super) struct ClothPage {
     pub(super) dragging: Option<(UiRect, ItemDraw)>,
 }
 
+/// One slot on the cloth: the item it takes, and whether one lies there.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct ClothSquare {
+pub(super) struct ClothSlot {
     pub(super) rect: UiRect,
-    pub(super) item: Option<ItemDraw>,
+    pub(super) item: ItemDraw,
+    pub(super) filled: bool,
     pub(super) hovered: bool,
+    /// Where the material being dragged would snap if dropped now.
+    pub(super) snap: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,15 +136,17 @@ enum Target {
     Blueprint(usize),
     Back,
     Material(u16),
-    Square(usize),
+    Slot(usize),
     Craft,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Drag {
     item: u16,
-    /// The square it was picked up from, or `None` from the strip.
+    /// The slot it was picked up from, or `None` from the strip.
     from: Option<usize>,
+    /// Where the press happened, to tell a click from a drag.
+    pressed_at: [f32; 2],
 }
 
 pub(super) struct Book {
@@ -143,7 +155,8 @@ pub(super) struct Book {
     amount: f32,
     /// The blueprint whose cloth is open.
     selected: Option<usize>,
-    squares: [Option<u16>; CLOTH_SQUARES],
+    /// Which of the selected blueprint's slots hold their item.
+    filled: Vec<bool>,
     drag: Option<Drag>,
     pressed: Option<Target>,
     screen: [f32; 2],
@@ -157,7 +170,7 @@ impl Book {
             open: false,
             amount: 0.0,
             selected: None,
-            squares: [None; CLOTH_SQUARES],
+            filled: Vec::new(),
             drag: None,
             pressed: None,
             screen: [0.0; 2],
@@ -178,11 +191,8 @@ impl Book {
     /// Opens at the contents; materials left on the cloth go back.
     pub(super) fn open(&mut self) {
         self.open = true;
-        self.selected = None;
-        self.squares = [None; CLOTH_SQUARES];
-        self.drag = None;
+        self.select(None);
         self.pressed = None;
-        self.note = None;
     }
 
     pub(super) fn close(&mut self) {
@@ -205,37 +215,66 @@ impl Book {
         t * t * (3.0 - 2.0 * t)
     }
 
+    fn select(&mut self, index: Option<usize>) {
+        self.selected = index;
+        self.filled.clear();
+        self.drag = None;
+        self.note = None;
+    }
+
     /// The cursor moved (logical pixels on a `screen` of logical pixels).
     pub(super) fn pointer(&mut self, screen: [f32; 2], cursor: [f32; 2]) {
         self.screen = screen;
         self.cursor = cursor;
     }
 
-    /// How many of `item_id` lie on the cloth.
-    fn placed(&self, item_id: u16) -> u32 {
-        self.squares
-            .iter()
-            .filter(|square| **square == Some(item_id))
-            .count() as u32
-            + u32::from(self.drag.is_some_and(|drag| drag.item == item_id))
+    fn blueprint<'v>(&self, view: &'v dyn PackView) -> Option<&'v Blueprint> {
+        view.blueprints().get(self.selected?)
+    }
+
+    fn is_filled(&self, slot: usize) -> bool {
+        self.filled.get(slot).copied().unwrap_or(false)
+    }
+
+    fn set_filled(&mut self, slot: usize, filled: bool) {
+        if self.filled.len() <= slot {
+            self.filled.resize(slot + 1, false);
+        }
+        self.filled[slot] = filled;
+    }
+
+    /// How many of `item_id` lie on the cloth (or are being dragged).
+    fn placed(&self, blueprint: Option<&Blueprint>, item_id: u16) -> u32 {
+        let on_cloth = blueprint.map_or(0, |blueprint| {
+            blueprint
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(i, slot)| slot.item == item_id && self.is_filled(*i))
+                .count()
+        });
+        on_cloth as u32 + u32::from(self.drag.is_some_and(|drag| drag.item == item_id))
     }
 
     /// How many of `item_id` are still in the pack, off the cloth.
-    fn available(&self, item_id: u16, feed: &InventoryFeed) -> u32 {
-        feed.count(item_id).saturating_sub(self.placed(item_id))
+    fn available(&self, blueprint: Option<&Blueprint>, item_id: u16, feed: &InventoryFeed) -> u32 {
+        feed.count(item_id)
+            .saturating_sub(self.placed(blueprint, item_id))
     }
 
     /// Takes back anything on the cloth the inventory no longer has (it was
     /// crafted, or used elsewhere).
-    pub(super) fn reconcile(&mut self, feed: &InventoryFeed) {
+    pub(super) fn reconcile(&mut self, view: &dyn PackView, feed: &InventoryFeed) {
         if feed.stacks().is_none() {
             return;
         }
-        for i in 0..CLOTH_SQUARES {
-            if let Some(item) = self.squares[i]
-                && self.placed(item) > feed.count(item)
-            {
-                self.squares[i] = None;
+        let Some(blueprint) = self.blueprint(view) else {
+            return;
+        };
+        for i in 0..blueprint.slots.len() {
+            let item = blueprint.slots[i].item;
+            if self.is_filled(i) && self.placed(Some(blueprint), item) > feed.count(item) {
+                self.set_filled(i, false);
             }
         }
     }
@@ -246,29 +285,27 @@ impl Book {
         }
         let target = self.target(view, feed);
         self.pressed = target;
+        let blueprint = self.blueprint(view);
         match target {
-            Some(Target::Blueprint(index)) => {
-                self.selected = Some(index);
-                self.squares = [None; CLOTH_SQUARES];
+            Some(Target::Blueprint(index)) => self.select(Some(index)),
+            Some(Target::Back) => self.select(None),
+            Some(Target::Material(item)) if self.available(blueprint, item, feed) > 0 => {
+                self.drag = Some(Drag {
+                    item,
+                    from: None,
+                    pressed_at: self.cursor,
+                });
                 self.note = None;
             }
-            Some(Target::Back) => {
-                self.selected = None;
-                self.squares = [None; CLOTH_SQUARES];
+            Some(Target::Slot(index)) if self.is_filled(index) => {
+                let item = blueprint.expect("a slot means a blueprint").slots[index].item;
+                self.set_filled(index, false);
+                self.drag = Some(Drag {
+                    item,
+                    from: Some(index),
+                    pressed_at: self.cursor,
+                });
                 self.note = None;
-            }
-            Some(Target::Material(item)) if self.available(item, feed) > 0 => {
-                self.drag = Some(Drag { item, from: None });
-                self.note = None;
-            }
-            Some(Target::Square(index)) => {
-                if let Some(item) = self.squares[index].take() {
-                    self.drag = Some(Drag {
-                        item,
-                        from: Some(index),
-                    });
-                    self.note = None;
-                }
             }
             _ => {}
         }
@@ -283,13 +320,12 @@ impl Book {
         let target = self.target(view, feed);
         let pressed = self.pressed.take();
         if let Some(drag) = self.drag.take() {
-            // A material dropped on a bare square stays there; anywhere else
-            // (including back where it came from) it returns to the pack.
-            if let Some(Target::Square(index)) = target
-                && Some(index) != drag.from
-                && self.squares[index].is_none()
-            {
-                self.squares[index] = Some(drag.item);
+            let moved =
+                (drag.pressed_at[0] - self.cursor[0]).hypot(drag.pressed_at[1] - self.cursor[1]);
+            // Clicking a laid material (no drag) takes it back to the pack.
+            let clicked_off = drag.from.is_some() && moved < CLICK_SLOP_PX;
+            if !clicked_off && let Some(slot) = self.snap_slot(view, drag.item) {
+                self.set_filled(slot, true);
             }
             return None;
         }
@@ -297,7 +333,7 @@ impl Book {
             && target == Some(Target::Craft)
             && !feed.crafting()
             && let Some(blueprint) = self.blueprint(view)
-            && arranged(blueprint, &self.squares)
+            && self.complete(blueprint)
         {
             self.note = Some("Crafting\u{2026}".to_owned());
             return Some(BookAction::Craft(blueprint.recipe_id));
@@ -305,11 +341,39 @@ impl Book {
         None
     }
 
+    fn complete(&self, blueprint: &Blueprint) -> bool {
+        (0..blueprint.slots.len()).all(|i| self.is_filled(i))
+    }
+
+    /// The empty slot taking `item` that a drop at the cursor snaps into:
+    /// the nearest within reach.
+    fn snap_slot(&self, view: &dyn PackView, item: u16) -> Option<usize> {
+        let blueprint = self.blueprint(view)?;
+        let cloth = cloth_rect(pages(book_rect(self.screen, self.eased())).1);
+        let [x, y] = self.cursor;
+        blueprint
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, slot)| slot.item == item && !self.is_filled(*i))
+            .filter_map(|(i, slot)| {
+                let centre = [
+                    cloth.x + slot.at[0] * cloth.w,
+                    cloth.y + slot.at[1] * cloth.h,
+                ];
+                let distance = (centre[0] - x).hypot(centre[1] - y);
+                let reach = (slot.size * 0.5 + SNAP_REACH) * cloth.w;
+                (distance <= reach).then_some((i, distance))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
+    }
+
     /// The server answered the craft.
     pub(super) fn crafted(&mut self, outcome: &CraftOutcome, view: &dyn PackView) {
         self.note = Some(match outcome {
             CraftOutcome::Crafted { recipe_id } => {
-                self.squares = [None; CLOTH_SQUARES];
+                self.filled.clear();
                 match view
                     .blueprints()
                     .iter()
@@ -332,15 +396,11 @@ impl Book {
         });
     }
 
-    fn blueprint<'v>(&self, view: &'v dyn PackView) -> Option<&'v Blueprint> {
-        view.blueprints().get(self.selected?)
-    }
-
     /// What lies under the cursor in the current layout.
     fn target(&self, view: &dyn PackView, feed: &InventoryFeed) -> Option<Target> {
         let book = book_rect(self.screen, self.eased());
         let at = self.cursor;
-        let Some(_) = self.blueprint(view) else {
+        let Some(blueprint) = self.blueprint(view) else {
             return (0..view.blueprints().len().min(CARDS))
                 .find(|&i| card_rect(book, i).contains(at))
                 .map(Target::Blueprint);
@@ -350,8 +410,17 @@ impl Book {
             return Some(Target::Back);
         }
         let cloth = cloth_rect(right);
-        if let Some(i) = (0..CLOTH_SQUARES).find(|&i| square_rect(cloth, i).contains(at)) {
-            return Some(Target::Square(i));
+        // The topmost (last drawn) filled slot under the cursor, else any.
+        let under: Vec<usize> = (0..blueprint.slots.len())
+            .filter(|&i| slot_rect(cloth, &blueprint.slots[i]).contains(at))
+            .collect();
+        if let Some(&i) = under
+            .iter()
+            .rev()
+            .find(|&&i| self.is_filled(i))
+            .or(under.last())
+        {
+            return Some(Target::Slot(i));
         }
         if craft_rect(right).contains(at) {
             return Some(Target::Craft);
@@ -407,39 +476,50 @@ impl Book {
                 let back = back_rect(left);
                 let below_back = UiRect {
                     y: back.y + back.h * 1.4,
-                    h: left.h - (back.y + back.h * 1.4 - left.y) - left.h * 0.06,
+                    h: left.h - (back.y + back.h * 1.4 - left.y) - left.h * 0.3,
                     ..left
                 };
                 let cloth = cloth_rect(right);
-                let cell = square_rect(cloth, 0);
+                let snap = self.drag.and_then(|drag| self.snap_slot(view, drag.item));
                 BookPage::Cloth(Box::new(ClothPage {
                     back,
                     back_hovered: hovered == Some(Target::Back),
-                    blueprint: card(view, feed, blueprint, inset(below_back, 0.08), false),
+                    blueprint: card(view, feed, blueprint, inset(below_back, 0.06), false),
                     cloth,
-                    squares: (0..CLOTH_SQUARES)
-                        .map(|i| ClothSquare {
-                            rect: square_rect(cloth, i),
-                            item: self.squares[i].map(|item| draw(item, 0)),
-                            hovered: hovered == Some(Target::Square(i)),
+                    view: blueprint.view,
+                    slots: blueprint
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .map(|(i, slot)| ClothSlot {
+                            rect: slot_rect(cloth, slot),
+                            item: draw(slot.item, 0),
+                            filled: self.is_filled(i),
+                            hovered: hovered == Some(Target::Slot(i)),
+                            snap: snap == Some(i),
                         })
                         .collect(),
                     materials: materials(feed)
                         .enumerate()
                         .map(|(i, item)| MaterialSlot {
                             rect: material_rect(right, i),
-                            item: draw(item, self.available(item, feed)),
+                            item: draw(item, self.available(Some(blueprint), item, feed)),
                             name: view.item_name(item).unwrap_or("Unknown item").to_owned(),
                             hovered: hovered == Some(Target::Material(item)),
                         })
                         .collect(),
                     craft: craft_rect(right),
-                    ready: arranged(blueprint, &self.squares),
+                    ready: self.complete(blueprint),
                     craft_hovered: hovered == Some(Target::Craft),
                     crafting: feed.crafting(),
                     note: self.note.clone(),
                     dragging: self.drag.map(|drag| {
-                        let side = cell.w * 0.8;
+                        let size = blueprint
+                            .slots
+                            .iter()
+                            .find(|slot| slot.item == drag.item)
+                            .map_or(0.16, |slot| slot.size);
+                        let side = size * cloth.w;
                         (
                             UiRect {
                                 x: self.cursor[0] - side * 0.5,
@@ -462,7 +542,7 @@ impl BookFrame {
     pub(super) fn icons(&self) -> Vec<(u16, Option<&'static [u8]>)> {
         let card_icons = |card: &BlueprintCard| {
             std::iter::once(&card.output)
-                .chain(card.pattern.iter().filter_map(|(_, item)| item.as_ref()))
+                .chain(card.pattern.iter().map(|(_, item)| item))
                 .map(|item| (item.item_id, item.icon_png))
                 .collect::<Vec<_>>()
         };
@@ -480,7 +560,7 @@ impl BookFrame {
     }
 }
 
-/// A blueprint drawn in `rect`: name, pattern, needs against the inventory.
+/// A blueprint drawn in `rect`: name, layout, needs against the inventory.
 fn card(
     view: &dyn PackView,
     feed: &InventoryFeed,
@@ -489,32 +569,14 @@ fn card(
     hovered: bool,
 ) -> BlueprintCard {
     let (item, count) = blueprint.output;
-    let (w, h) = blueprint.size();
-    // The pattern sits in the card's left half, below the name.
-    let area = UiRect {
-        x: rect.x + rect.w * 0.06,
-        y: rect.y + rect.h * 0.28,
-        w: rect.w * 0.42,
-        h: rect.h * 0.64,
+    // The layout drawing: a square in the card's left half, below the name.
+    let side = (rect.w * 0.44).min(rect.h * 0.66);
+    let diagram = UiRect {
+        x: rect.x + rect.w * 0.05,
+        y: rect.y + rect.h * 0.27,
+        w: side,
+        h: side,
     };
-    let side = (area.w / w.max(1) as f32).min(area.h / h.max(1) as f32);
-    let pattern = (0..h)
-        .flat_map(|y| (0..w).map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let square = UiRect {
-                x: area.x + side * x as f32,
-                y: area.y + side * y as f32,
-                w: side,
-                h: side,
-            };
-            let item = blueprint.at(x, y).map(|item| ItemDraw {
-                item_id: item,
-                icon_png: view.item_icon_png(item),
-                count: 0,
-            });
-            (square, item)
-        })
-        .collect();
     BlueprintCard {
         rect,
         hovered,
@@ -524,7 +586,22 @@ fn card(
             icon_png: view.item_icon_png(item),
             count,
         },
-        pattern,
+        view: blueprint.view,
+        diagram,
+        pattern: blueprint
+            .slots
+            .iter()
+            .map(|slot| {
+                (
+                    slot_rect(diagram, slot),
+                    ItemDraw {
+                        item_id: slot.item,
+                        icon_png: view.item_icon_png(slot.item),
+                        count: 0,
+                    },
+                )
+            })
+            .collect(),
         needs: blueprint
             .needs()
             .into_iter()
@@ -544,26 +621,6 @@ fn materials(feed: &InventoryFeed) -> impl Iterator<Item = u16> + '_ {
         .iter()
         .take(MATERIAL_SLOTS)
         .map(|entry| entry.item_id)
-}
-
-/// Whether `squares` hold exactly the blueprint's pattern, placed anywhere on
-/// the cloth, with nothing else on it.
-pub(super) fn arranged(blueprint: &Blueprint, squares: &[Option<u16>; CLOTH_SQUARES]) -> bool {
-    let (w, h) = blueprint.size();
-    if w == 0 || h == 0 || w > CLOTH_SIDE || h > CLOTH_SIDE {
-        return false;
-    }
-    (0..=CLOTH_SIDE - h).any(|dy| {
-        (0..=CLOTH_SIDE - w).any(|dx| {
-            (0..CLOTH_SQUARES).all(|i| {
-                let (x, y) = (i % CLOTH_SIDE, i / CLOTH_SIDE);
-                let wanted = (x >= dx && y >= dy)
-                    .then(|| blueprint.at(x - dx, y - dy))
-                    .flatten();
-                squares[i] == wanted
-            })
-        })
-    })
 }
 
 fn book_rect([sw, sh]: [f32; 2], shown: f32) -> UiRect {
@@ -628,28 +685,24 @@ fn back_rect(left: UiRect) -> UiRect {
 
 /// The cloth: a square near the top of the right page.
 fn cloth_rect(right: UiRect) -> UiRect {
-    let side = (right.w * 0.74).min(right.h * 0.58);
+    let side = (right.w * 0.82).min(right.h * 0.6);
     UiRect {
         x: right.x + (right.w - side) * 0.5,
-        y: right.y + right.h * 0.05,
+        y: right.y + right.h * 0.04,
         w: side,
         h: side,
     }
 }
 
-/// Cloth square `index`, inside the cloth's hem, rows from the top.
-fn square_rect(cloth: UiRect, index: usize) -> UiRect {
-    let inner = inset(cloth, 0.08);
-    let side = inner.w / CLOTH_SIDE as f32;
-    inset(
-        UiRect {
-            x: inner.x + side * (index % CLOTH_SIDE) as f32,
-            y: inner.y + side * (index / CLOTH_SIDE) as f32,
-            w: side,
-            h: side,
-        },
-        0.06,
-    )
+/// Where `slot` lies in `area` (the cloth, or a card's little drawing).
+fn slot_rect(area: UiRect, slot: &BlueprintSlot) -> UiRect {
+    let side = slot.size * area.w;
+    UiRect {
+        x: area.x + slot.at[0] * area.w - side * 0.5,
+        y: area.y + slot.at[1] * area.h - side * 0.5,
+        w: side,
+        h: side,
+    }
 }
 
 /// Material slot `index` in the strip under the cloth.
@@ -682,9 +735,10 @@ mod tests {
     use spall_protocol::{InventoryEntry, ProgressionOutcome, ProgressionResponse};
 
     const LOG: u16 = 1;
-    const PLANK: u16 = 2;
     const STONE: u16 = 3;
     const BLOCK: u16 = 4;
+    const STICK: u16 = 5;
+    const PIT: u16 = 6;
     const SCREEN: [f32; 2] = [1600.0, 900.0];
 
     #[derive(Debug)]
@@ -697,9 +751,10 @@ mod tests {
         fn item_name(&self, item_id: u16) -> Option<&str> {
             Some(match item_id {
                 LOG => "Log",
-                PLANK => "Plank",
                 STONE => "Stone",
                 BLOCK => "Stone block",
+                STICK => "Stick",
+                PIT => "Fire pit",
                 _ => return None,
             })
         }
@@ -711,19 +766,45 @@ mod tests {
         }
     }
 
+    fn ring(item: u16, count: usize, radius: f32, size: f32) -> Vec<BlueprintSlot> {
+        (0..count)
+            .map(|i| {
+                let a = i as f32 / count as f32 * std::f32::consts::TAU;
+                BlueprintSlot {
+                    item,
+                    at: [0.5 + radius * a.cos(), 0.5 + radius * a.sin()],
+                    size,
+                }
+            })
+            .collect()
+    }
+
+    /// A fire pit from above (six stones round six sticks) and a stone block
+    /// from the side (two stones on two).
     fn view() -> TestView {
+        let mut pit = ring(STONE, 6, 0.34, 0.16);
+        pit.extend(ring(STICK, 6, 0.09, 0.12));
+        let stone = |x: f32, y: f32| BlueprintSlot {
+            item: STONE,
+            at: [x, y],
+            size: 0.2,
+        };
         TestView(vec![
             Blueprint {
-                recipe_id: 1,
-                output: (PLANK, 4),
-                pattern: vec![vec![Some(LOG)]],
+                recipe_id: 4,
+                output: (PIT, 1),
+                view: BlueprintView::Overhead,
+                slots: pit,
             },
             Blueprint {
                 recipe_id: 2,
                 output: (BLOCK, 1),
-                pattern: vec![
-                    vec![Some(STONE), Some(STONE)],
-                    vec![Some(STONE), Some(STONE)],
+                view: BlueprintView::Side,
+                slots: vec![
+                    stone(0.4, 0.64),
+                    stone(0.6, 0.64),
+                    stone(0.4, 0.44),
+                    stone(0.6, 0.44),
                 ],
             },
         ])
@@ -767,10 +848,10 @@ mod tests {
         book.release(view, feed)
     }
 
-    fn drag(book: &mut Book, view: &TestView, feed: &InventoryFeed, from: UiRect, to: UiRect) {
-        book.pointer(SCREEN, centre(from));
+    fn drag(book: &mut Book, view: &TestView, feed: &InventoryFeed, from: [f32; 2], to: [f32; 2]) {
+        book.pointer(SCREEN, from);
         book.press(view, feed);
-        book.pointer(SCREEN, centre(to));
+        book.pointer(SCREEN, to);
         assert_eq!(book.release(view, feed), None);
     }
 
@@ -781,176 +862,214 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_pattern_matches_anywhere_on_the_cloth_and_nothing_else_may_lie_there() {
-        let view = view();
-        let [planks, block] = &view.0[..] else {
-            unreachable!()
+    fn open_blueprint(
+        book: &mut Book,
+        view: &TestView,
+        feed: &InventoryFeed,
+        index: usize,
+    ) -> ClothPage {
+        let BookPage::Contents { cards, .. } = book.frame(view, feed).unwrap().page else {
+            panic!("on the contents")
         };
-        let mut squares = [None; CLOTH_SQUARES];
-        assert!(!arranged(planks, &squares));
-        squares[8] = Some(LOG);
-        assert!(arranged(planks, &squares), "one log in any square");
-        squares[0] = Some(LOG);
-        assert!(!arranged(planks, &squares), "an extra log spoils it");
+        assert_eq!(click(book, view, feed, centre(cards[index].rect)), None);
+        cloth(book, view, feed)
+    }
 
-        let mut squares = [None; CLOTH_SQUARES];
-        for i in [4, 5, 7, 8] {
-            squares[i] = Some(STONE);
-        }
-        assert!(
-            arranged(block, &squares),
-            "a 2 by 2 square in the lower right"
-        );
-        squares[5] = None;
-        squares[3] = Some(STONE);
-        assert!(!arranged(block, &squares), "four stones, wrong shape");
-        assert_eq!(block.needs(), vec![(STONE, 4)]);
+    fn material(page: &ClothPage, item: u16) -> [f32; 2] {
+        centre(
+            page.materials
+                .iter()
+                .find(|m| m.item.item_id == item)
+                .unwrap()
+                .rect,
+        )
     }
 
     #[test]
-    fn the_contents_show_each_blueprints_needs_against_what_the_player_has() {
+    fn the_contents_show_each_blueprints_layout_and_needs_against_the_pack() {
         let view = view();
-        let feed = feed(&[(STONE, 3)]);
+        let feed = feed(&[(STONE, 3), (STICK, 7)]);
         let book = opened();
         let frame = book.frame(&view, &feed).unwrap();
         let BookPage::Contents { cards, note } = frame.page else {
             panic!("opens at the contents")
         };
         assert_eq!(note, None);
-        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].name, "Fire pit");
         assert_eq!(
-            (cards[0].name.as_str(), cards[0].output.count),
-            ("Plank", 4)
+            cards[0].needs,
+            vec![
+                NeedLine {
+                    name: "Stone".into(),
+                    need: 6,
+                    have: 3
+                },
+                NeedLine {
+                    name: "Stick".into(),
+                    need: 6,
+                    have: 7
+                },
+            ]
         );
-        assert_eq!(
-            cards[1].needs,
-            vec![NeedLine {
-                name: "Stone".into(),
-                need: 4,
-                have: 3
-            }]
-        );
-        assert_eq!(cards[1].pattern.len(), 4, "a 2 by 2 pattern");
+        assert_eq!(cards[0].pattern.len(), 12);
+        assert_eq!(cards[1].view, BlueprintView::Side);
         for card in &cards {
-            let UiRect { x, y, w, h } = card.rect;
-            let b = frame.book;
-            assert!(x >= b.x && y >= b.y && x + w <= b.x + b.w && y + h <= b.y + b.h);
+            for (rect, _) in &card.pattern {
+                let d = card.diagram;
+                assert!(
+                    rect.x >= d.x - 1.0 && rect.x + rect.w <= d.x + d.w + 1.0,
+                    "drawn in the diagram"
+                );
+            }
         }
     }
 
     #[test]
-    fn laying_stones_in_the_pattern_readies_craft_and_sends_the_recipe() {
+    fn a_material_dropped_near_a_slot_that_takes_it_snaps_in() {
         let view = view();
-        let mut feed = feed(&[(STONE, 5), (LOG, 1)]);
+        let feed = feed(&[(STONE, 6), (STICK, 6)]);
         let mut book = opened();
-        let BookPage::Contents { cards, .. } = book.frame(&view, &feed).unwrap().page else {
-            unreachable!()
-        };
-        assert_eq!(click(&mut book, &view, &feed, centre(cards[1].rect)), None);
+        let page = open_blueprint(&mut book, &view, &feed, 0);
+        let stone_slot = page.slots[0].rect;
+        // Dropped a little off the slot's centre: it snaps in.
+        let near = [
+            centre(stone_slot)[0] + stone_slot.w * 0.4,
+            centre(stone_slot)[1],
+        ];
+        drag(&mut book, &view, &feed, material(&page, STONE), near);
         let page = cloth(&book, &view, &feed);
-        assert!(!page.ready);
-        let stone = page
-            .materials
+        assert!(page.slots[0].filled);
+        // A stick dropped on a stone slot finds no home: back to the pack.
+        drag(
+            &mut book,
+            &view,
+            &feed,
+            material(&page, STICK),
+            centre(page.slots[1].rect),
+        );
+        let page = cloth(&book, &view, &feed);
+        assert_eq!(page.slots.iter().filter(|s| s.filled).count(), 1);
+        // A stick dropped in the middle snaps to one of the centre slots.
+        drag(
+            &mut book,
+            &view,
+            &feed,
+            material(&page, STICK),
+            centre(page.cloth),
+        );
+        let page = cloth(&book, &view, &feed);
+        let sticks = page
+            .slots
             .iter()
-            .find(|m| m.item.item_id == STONE)
-            .unwrap()
-            .rect;
-        for i in [0, 1, 3, 4] {
-            drag(&mut book, &view, &feed, stone, page.squares[i].rect);
+            .filter(|s| s.filled && s.item.item_id == STICK)
+            .count();
+        assert_eq!(sticks, 1);
+        // Far off the cloth, nothing snaps.
+        drag(&mut book, &view, &feed, material(&page, STONE), [5.0, 5.0]);
+        let page = cloth(&book, &view, &feed);
+        assert_eq!(page.slots.iter().filter(|s| s.filled).count(), 2);
+    }
+
+    #[test]
+    fn filling_every_slot_readies_craft_and_a_success_clears_the_cloth() {
+        let view = view();
+        let mut feed = feed(&[(STONE, 6), (STICK, 6)]);
+        let mut book = opened();
+        let page = open_blueprint(&mut book, &view, &feed, 0);
+        assert!(!page.ready);
+        let slots = page.slots.clone();
+        for (i, slot) in slots.iter().enumerate() {
+            drag(
+                &mut book,
+                &view,
+                &feed,
+                material(&page, slot.item.item_id),
+                centre(slot.rect),
+            );
+            if i + 1 < slots.len() {
+                assert_eq!(
+                    click(&mut book, &view, &feed, centre(page.craft)),
+                    None,
+                    "not yet"
+                );
+            }
         }
         let page = cloth(&book, &view, &feed);
+        assert!(page.slots.iter().all(|s| s.filled), "{:?}", page.slots);
         assert!(page.ready);
-        let left = page
-            .materials
-            .iter()
-            .find(|m| m.item.item_id == STONE)
-            .unwrap();
-        assert_eq!(left.item.count, 1, "four of five stones on the cloth");
-        // A craft must be a click on the button, not a drop on it.
+        assert!(
+            page.materials.iter().all(|m| m.item.count == 0),
+            "all laid out"
+        );
         assert_eq!(
             click(&mut book, &view, &feed, centre(page.craft)),
-            Some(BookAction::Craft(2))
+            Some(BookAction::Craft(4))
         );
-        let request = feed.craft(2, 1);
+        let request = feed.craft(4, 1);
         let (outcome, _) = feed.take_reply(ProgressionResponse {
             request_id: request.request_id,
             catalog_version: 1,
             inventory_revision: 6,
             outcome: ProgressionOutcome::Crafted,
-            inventory: vec![
-                InventoryEntry {
-                    item_id: STONE,
-                    count: 1,
-                },
-                InventoryEntry {
-                    item_id: BLOCK,
-                    count: 1,
-                },
-            ],
+            inventory: vec![InventoryEntry {
+                item_id: PIT,
+                count: 1,
+            }],
         });
         book.crafted(&outcome.unwrap(), &view);
-        book.reconcile(&feed);
+        book.reconcile(&view, &feed);
         let page = cloth(&book, &view, &feed);
-        assert!(
-            page.squares.iter().all(|s| s.item.is_none()),
-            "the cloth is cleared"
-        );
-        assert_eq!(page.note.as_deref(), Some("Made 1 Stone block"));
+        assert!(page.slots.iter().all(|s| !s.filled), "the cloth is cleared");
+        assert_eq!(page.note.as_deref(), Some("Made 1 Fire pit"));
     }
 
     #[test]
-    fn craft_waits_for_the_pattern_and_materials_cannot_exceed_the_pack() {
+    fn materials_on_the_cloth_never_exceed_the_pack() {
         let view = view();
         let feed = feed(&[(STONE, 2)]);
         let mut book = opened();
-        let BookPage::Contents { cards, .. } = book.frame(&view, &feed).unwrap().page else {
-            unreachable!()
-        };
-        click(&mut book, &view, &feed, centre(cards[1].rect));
-        let page = cloth(&book, &view, &feed);
-        let stone = page.materials[0].rect;
-        for i in [0, 1, 3] {
-            drag(&mut book, &view, &feed, stone, page.squares[i].rect);
+        let page = open_blueprint(&mut book, &view, &feed, 1);
+        assert_eq!(page.view, BlueprintView::Side);
+        for slot in page.slots.clone() {
+            drag(
+                &mut book,
+                &view,
+                &feed,
+                material(&page, STONE),
+                centre(slot.rect),
+            );
         }
         let page = cloth(&book, &view, &feed);
-        let on_cloth = page.squares.iter().filter(|s| s.item.is_some()).count();
-        assert_eq!(on_cloth, 2, "only two stones to lay out");
+        assert_eq!(page.slots.iter().filter(|s| s.filled).count(), 2);
         assert!(!page.ready);
         assert_eq!(click(&mut book, &view, &feed, centre(page.craft)), None);
     }
 
     #[test]
-    fn a_square_clicked_or_dragged_off_gives_its_material_back_and_can_move() {
+    fn a_laid_material_clicked_goes_back_and_dragged_moves() {
         let view = view();
-        let feed = feed(&[(LOG, 1)]);
+        let feed = feed(&[(STONE, 1)]);
         let mut book = opened();
-        let BookPage::Contents { cards, .. } = book.frame(&view, &feed).unwrap().page else {
-            unreachable!()
-        };
-        click(&mut book, &view, &feed, centre(cards[0].rect));
-        let page = cloth(&book, &view, &feed);
-        let log = page.materials[0].rect;
-        drag(&mut book, &view, &feed, log, page.squares[0].rect);
+        let page = open_blueprint(&mut book, &view, &feed, 1);
         drag(
             &mut book,
             &view,
             &feed,
-            page.squares[0].rect,
-            page.squares[8].rect,
+            material(&page, STONE),
+            centre(page.slots[0].rect),
+        );
+        drag(
+            &mut book,
+            &view,
+            &feed,
+            centre(page.slots[0].rect),
+            centre(page.slots[3].rect),
         );
         let page = cloth(&book, &view, &feed);
-        assert!(
-            page.squares[0].item.is_none() && page.squares[8].item.is_some(),
-            "moved"
-        );
-        assert!(page.ready, "one log anywhere");
-        click(&mut book, &view, &feed, centre(page.squares[8].rect));
+        assert!(!page.slots[0].filled && page.slots[3].filled, "moved");
+        click(&mut book, &view, &feed, centre(page.slots[3].rect));
         let page = cloth(&book, &view, &feed);
-        assert!(
-            page.squares.iter().all(|s| s.item.is_none()),
-            "clicked back"
-        );
+        assert!(page.slots.iter().all(|s| !s.filled), "clicked back");
         assert_eq!(page.materials[0].item.count, 1);
 
         click(&mut book, &view, &feed, centre(page.back));
@@ -961,28 +1080,41 @@ mod tests {
     }
 
     #[test]
+    fn while_dragging_the_slot_it_would_snap_into_is_marked() {
+        let view = view();
+        let feed = feed(&[(STONE, 1)]);
+        let mut book = opened();
+        let page = open_blueprint(&mut book, &view, &feed, 1);
+        book.pointer(SCREEN, material(&page, STONE));
+        book.press(&view, &feed);
+        book.pointer(SCREEN, centre(page.slots[2].rect));
+        let page = cloth(&book, &view, &feed);
+        assert_eq!(
+            page.slots.iter().map(|s| s.snap).collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
+        assert!(page.dragging.is_some());
+    }
+
+    #[test]
     fn a_rejected_craft_keeps_the_cloth_and_says_why() {
         let view = view();
-        let feed = feed(&[(LOG, 1)]);
+        let feed = feed(&[(STONE, 1)]);
         let mut book = opened();
-        let BookPage::Contents { cards, .. } = book.frame(&view, &feed).unwrap().page else {
-            unreachable!()
-        };
-        click(&mut book, &view, &feed, centre(cards[0].rect));
-        let page = cloth(&book, &view, &feed);
+        let page = open_blueprint(&mut book, &view, &feed, 1);
         drag(
             &mut book,
             &view,
             &feed,
-            page.materials[0].rect,
-            page.squares[4].rect,
+            material(&page, STONE),
+            centre(page.slots[1].rect),
         );
         book.crafted(
             &CraftOutcome::Rejected(spall_protocol::ProgressionRejectCode::InsufficientItems),
             &view,
         );
         let page = cloth(&book, &view, &feed);
-        assert!(page.squares[4].item.is_some());
+        assert!(page.slots[1].filled);
         assert_eq!(page.note.as_deref(), Some("Not enough materials"));
     }
 }

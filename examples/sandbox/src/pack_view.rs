@@ -2,7 +2,7 @@
 //! names and painted icons (`assets/items/*.png`, drawn by `make_items.py`),
 //! and the blueprint book's (B) patterns for the game's recipes.
 
-use spall_client::window::{Blueprint, PackView};
+use spall_client::window::{Blueprint, BlueprintSlot, BlueprintView, PackView};
 
 use crate::game::{RECIPE_CATALOG_VERSION, items, recipe_ids};
 
@@ -13,21 +13,56 @@ pub struct SandboxPackView {
 
 impl SandboxPackView {
     pub fn new() -> Self {
-        let log = Some(items::WOOD_LOG.0);
-        let stone = Some(items::STONE_CHUNK.0);
+        let slot = |item: crate::game::ItemId, x: f32, y: f32, size: f32| BlueprintSlot {
+            item: item.0,
+            at: [x, y],
+            size,
+        };
+        // A ring of `count` slots round the cloth's centre.
+        let ring = |item, count: usize, radius: f32, size: f32, turn: f32| {
+            (0..count)
+                .map(|i| {
+                    let a = (i as f32 + turn) / count as f32 * std::f32::consts::TAU;
+                    slot(item, 0.5 + radius * a.cos(), 0.5 + radius * a.sin(), size)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut fire_pit = ring(items::STONE_CHUNK, 6, 0.34, 0.17, 0.0);
+        fire_pit.extend(ring(items::STICK, 6, 0.1, 0.15, 0.5));
         Self {
             blueprints: vec![
-                // Saw a log into planks: one log on the cloth.
+                // From the side: a log laid on the ground, sawn into planks.
                 Blueprint {
                     recipe_id: recipe_ids::SAW_PLANKS.0,
                     output: (items::WOOD_PLANK.0, 4),
-                    pattern: vec![vec![log]],
+                    view: BlueprintView::Side,
+                    slots: vec![slot(items::WOOD_LOG, 0.5, 0.6, 0.46)],
                 },
-                // Shape a block: four stones in a square.
+                // From the side: two stones stacked on two, shaped into a block.
                 Blueprint {
                     recipe_id: recipe_ids::SHAPE_STONE.0,
                     output: (items::STONE_BLOCK.0, 1),
-                    pattern: vec![vec![stone, stone], vec![stone, stone]],
+                    view: BlueprintView::Side,
+                    slots: vec![
+                        slot(items::STONE_CHUNK, 0.39, 0.64, 0.22),
+                        slot(items::STONE_CHUNK, 0.61, 0.64, 0.22),
+                        slot(items::STONE_CHUNK, 0.39, 0.44, 0.22),
+                        slot(items::STONE_CHUNK, 0.61, 0.44, 0.22),
+                    ],
+                },
+                // From above: a log laid out to split into sticks.
+                Blueprint {
+                    recipe_id: recipe_ids::SPLIT_STICKS.0,
+                    output: (items::STICK.0, 6),
+                    view: BlueprintView::Overhead,
+                    slots: vec![slot(items::WOOD_LOG, 0.5, 0.5, 0.42)],
+                },
+                // From above: six stones in a ring round six sticks.
+                Blueprint {
+                    recipe_id: recipe_ids::BUILD_FIRE_PIT.0,
+                    output: (items::FIRE_PIT.0, 1),
+                    view: BlueprintView::Overhead,
+                    slots: fire_pit,
                 },
             ],
         }
@@ -51,6 +86,8 @@ impl PackView for SandboxPackView {
             items::WOOD_PLANK => "Plank",
             items::STONE_CHUNK => "Stone",
             items::STONE_BLOCK => "Stone block",
+            items::STICK => "Stick",
+            items::FIRE_PIT => "Fire pit",
             _ => return None,
         })
     }
@@ -61,6 +98,8 @@ impl PackView for SandboxPackView {
             items::WOOD_PLANK => include_bytes!("../assets/items/plank.png"),
             items::STONE_CHUNK => include_bytes!("../assets/items/stone.png"),
             items::STONE_BLOCK => include_bytes!("../assets/items/stone_block.png"),
+            items::STICK => include_bytes!("../assets/items/stick.png"),
+            items::FIRE_PIT => include_bytes!("../assets/items/fire_pit.png"),
             _ => return None,
         })
     }
@@ -84,6 +123,8 @@ mod tests {
             items::WOOD_PLANK,
             items::STONE_CHUNK,
             items::STONE_BLOCK,
+            items::STICK,
+            items::FIRE_PIT,
         ] {
             assert!(view.item_name(item.0).is_some(), "{item:?}");
             let png = view.item_icon_png(item.0).expect("icon");
@@ -124,8 +165,14 @@ mod tests {
                 .map(|stack| (stack.item.0, stack.count))
                 .collect();
             assert_eq!(outputs, vec![blueprint.output]);
-            let (w, h) = blueprint.size();
-            assert!(w <= 3 && h <= 3, "fits the cloth");
+            for slot in &blueprint.slots {
+                let half = slot.size * 0.5;
+                assert!(
+                    slot.at.iter().all(|&c| c - half >= 0.0 && c + half <= 1.0),
+                    "recipe {}: slot {slot:?} off the cloth",
+                    blueprint.recipe_id
+                );
+            }
         }
     }
 }

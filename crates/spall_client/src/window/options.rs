@@ -43,38 +43,50 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
     fn blueprints(&self) -> &[Blueprint];
 }
 
-/// One page of the blueprint book: a recipe and the pattern its raw
-/// materials must be laid out in on the crafting cloth.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One page of the blueprint book: a recipe, and where its raw materials
+/// must be laid on the crafting cloth. Each slot takes one item; a material
+/// dropped near a slot that takes it snaps into place.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Blueprint {
     /// The game's recipe, sent in the craft request.
     pub recipe_id: u16,
     /// What the blueprint makes, and how many.
     pub output: (u16, u32),
-    /// Rows from the top, at most 3 by 3: the item for each square, or
-    /// `None` for a square left bare. It may sit anywhere on the cloth.
-    pub pattern: Vec<Vec<Option<u16>>>,
+    /// How the cloth is drawn: looking down at it, or from the side with a
+    /// ground line (for things that stand or stack).
+    pub view: BlueprintView,
+    pub slots: Vec<BlueprintSlot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlueprintView {
+    Overhead,
+    /// From the side: the ground runs across the cloth at [`SIDE_GROUND`].
+    Side,
+}
+
+/// Where the ground line runs in a side view, as a share of the cloth's
+/// height from the top.
+pub const SIDE_GROUND: f32 = 0.74;
+
+/// One place on the cloth for one item.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlueprintSlot {
+    pub item: u16,
+    /// The slot's centre: across and down the cloth, each 0 to 1.
+    pub at: [f32; 2],
+    /// The item's drawn size as a share of the cloth's width.
+    pub size: f32,
 }
 
 impl Blueprint {
-    /// The pattern's width and height in squares.
-    pub fn size(&self) -> (usize, usize) {
-        let width = self.pattern.iter().map(Vec::len).max().unwrap_or(0);
-        (width, self.pattern.len())
-    }
-
-    /// The pattern's item at column `x`, row `y`.
-    pub fn at(&self, x: usize, y: usize) -> Option<u16> {
-        self.pattern.get(y)?.get(x).copied().flatten()
-    }
-
-    /// Each raw material the pattern uses and how many, in first-use order.
+    /// Each raw material the blueprint uses and how many, in first-use order.
     pub fn needs(&self) -> Vec<(u16, u32)> {
         let mut needs: Vec<(u16, u32)> = Vec::new();
-        for item in self.pattern.iter().flatten().flatten() {
-            match needs.iter_mut().find(|(id, _)| id == item) {
+        for slot in &self.slots {
+            match needs.iter_mut().find(|(id, _)| *id == slot.item) {
                 Some((_, count)) => *count += 1,
-                None => needs.push((*item, 1)),
+                None => needs.push((slot.item, 1)),
             }
         }
         needs

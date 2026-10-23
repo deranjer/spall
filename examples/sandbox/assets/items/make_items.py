@@ -109,7 +109,42 @@ def stone_block(d):
         d.line([(c + 30, y + 30), (c + s - 30, y)], fill=(78, 78, 84, 255), width=5)
 
 
-ICONS = dict(log=log, plank=plank, stone=stone, stone_block=stone_block)
+def stick(d):
+    # A thin, slightly crooked branch with a side twig and a pale cut end.
+    a = math.radians(-35)
+    ca, sa = math.cos(a), math.sin(a)
+    def rot(x, y):
+        return (S / 2 + x * ca - y * sa, S / 2 + 10 + x * sa + y * ca)
+    spine = [(-240, 6), (-120, -4), (0, 6), (120, -2), (240, 4)]
+    top = [rot(x, y - 22) for x, y in spine]
+    bottom = [rot(x, y + 22) for x, y in reversed(spine)]
+    shape(d, top + bottom, (128, 90, 54, 255), 21, width=12)
+    twig = [rot(40, -16), rot(110, -96), rot(124, -88), rot(66, -10)]
+    shape(d, twig, (128, 90, 54, 255), 22, width=10)
+    end = ellipse_pts(*rot(-240, 6), 12, 22, 24)
+    shape(d, end, (214, 178, 122, 255), 23, width=8)
+    d.line([rot(-200, -6), rot(200, -8)], fill=(156, 114, 70, 255), width=6)
+
+
+def fire_pit(d):
+    # A ring of stones round a little teepee of sticks over glowing embers.
+    c = S / 2
+    d.ellipse([c - 120, c + 60, c + 120, c + 150], fill=(230, 120, 40, 255))
+    d.ellipse([c - 70, c + 80, c + 70, c + 130], fill=(255, 200, 90, 255))
+    for i, (x0, x1) in enumerate([(-110, 20), (110, -20), (-40, 30), (40, -30)]):
+        shape(d, [(c + x0 - 10, c + 120), (c + x1 - 8, c - 150), (c + x1 + 8, c - 150), (c + x0 + 10, c + 120)],
+              (128, 90, 54, 255), 30 + i, width=10)
+    rnd = random.Random(31)
+    for i in range(8):
+        t = math.pi * (0.05 + 0.9 * i / 7)
+        x, y = c + 230 * math.cos(t), c + 120 + 60 * math.sin(t)
+        r = 52 + rnd.uniform(-8, 8)
+        pts = [(x + r * math.cos(k * 2 * math.pi / 7), y + r * 0.72 * math.sin(k * 2 * math.pi / 7)) for k in range(7)]
+        shape(d, pts, (132, 132, 136, 255), 40 + i, width=10)
+        d.ellipse([x - r * 0.4, y - r * 0.5, x + r * 0.2, y - r * 0.1], fill=(168, 168, 172, 255))
+
+
+ICONS = dict(log=log, plank=plank, stone=stone, stone_block=stone_block, stick=stick, fire_pit=fire_pit)
 
 
 def render(fn):
