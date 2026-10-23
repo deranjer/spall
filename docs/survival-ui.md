@@ -65,7 +65,7 @@ it back up, and walking or jumping gets up and goes. The world keeps running.
 - **Belt:** 4 to 6 worn quick slots, visible on the player body, switched without a menu.
 - **Pack crafting:** craft on the cloth from the laid-out items; other players see
   you kneeling.
-- **Camp storage:** racks, woodpiles and shelves as destructible world geometry.
+- **Camp:** being rethought; a first cut (a claimed area around a fire pit) was tried and taken out.
 - **Wrist cord and journal:** the day count and exact readouts for players who want
   numbers.
 
