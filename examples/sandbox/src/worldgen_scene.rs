@@ -210,7 +210,28 @@ pub fn column_water_setup(
         setup.config.throttle_from_cells = [640.0, 1280.0, 2560.0];
         setup.config.catch_up_substeps = 24;
     }
+    if water_coarse() {
+        // `SPALL_WATER_COARSE=1`: 1 m water columns, with the sea
+        // held at its level and evaporation balancing the springs. A coarse
+        // pipe is four terrain pipes wide, so the same speed carries four times
+        // the flow; distances are in coarse columns. Not saved (see
+        // `take_journal_delta`).
+        let n = spall_fluid::columns::COARSE_CELLS as f32;
+        setup.config.column_cells = n as u32;
+        setup.config.sleep_flow *= n;
+        setup.config.throttle_from_cells = setup.config.throttle_from_cells.map(|c| c / n);
+        setup.config.lazy_ocean = false;
+        setup.sea_level_y = Some((plan.surface_y + 1) as f64);
+        setup.evaporation_cells_per_s = 1.45e-4;
+        setup.evaporation_above_y = (plan.surface_y + 2) as f64;
+    }
     Some(setup)
+}
+
+/// Whether `SPALL_WATER_COARSE=1` asks for 1 m water columns (off by default
+/// while it is compared in play).
+pub fn water_coarse() -> bool {
+    std::env::var("SPALL_WATER_COARSE").is_ok_and(|v| v == "1")
 }
 
 impl GeneratedScene {

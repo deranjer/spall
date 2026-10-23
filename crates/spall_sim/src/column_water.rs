@@ -9,14 +9,15 @@
 //! [`COLUMN_STEP_DT_S`], independent of the server tick. Bodies are ignored by
 //! water, as before.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use spall_core::{BrickCoord, GlobalCell};
 use spall_fluid::columns::{
-    CELL_SIZE_M, ColumnConfig, ColumnStepMetrics, ColumnWorld, RegionKey, VolumeTerrain,
+    CELL_SIZE_M, CoarseVolumeTerrain, ColumnConfig, ColumnStepMetrics, ColumnWorld, RegionKey,
+    TerrainSource, VolumeTerrain,
 };
 use spall_physics::WaterSample;
 use spall_protocol::WIRE_SCHEMA_VERSION;
@@ -89,7 +90,19 @@ pub struct ColumnWaterSetup {
     /// A fixed amount of simulated time, never wall time: the result is
     /// deterministic. 0 starts at rest.
     pub prewarm_s: f64,
+    /// Evaporation, cells of depth per second, from water open to the sky whose
+    /// surface is above `evaporation_above_y` (a global y in cells; the sea
+    /// below it keeps its level). 0 turns it off. Springs and evaporation
+    /// balance, so lakes settle at the size their inflow can keep up.
+    pub evaporation_cells_per_s: f64,
+    pub evaporation_above_y: f64,
+    /// The sea's surface (global y, cells), held fixed after every
+    /// slice (see `ColumnWorld::hold_sea_level`); `None` leaves the sea free.
+    pub sea_level_y: Option<f64>,
 }
+
+/// Fluid seconds between evaporation passes: one pass walks every span.
+const EVAPORATE_EVERY_S: f64 = 10.0;
 
 impl ColumnWaterSetup {
     pub fn new(y_lo: i32, y_hi: i32, initial_cells: Vec<GlobalCell>) -> Self {
@@ -105,6 +118,9 @@ impl ColumnWaterSetup {
             discharges: Vec::new(),
             gated_rate: 0,
             prewarm_s: 0.0,
+            evaporation_cells_per_s: 0.0,
+            evaporation_above_y: 0.0,
+            sea_level_y: None,
         }
     }
 }
@@ -214,6 +230,13 @@ struct Core {
     /// A terrain change since the last journal delta: it journals at once, and
     /// the next frame covers it even mid-step.
     edit_pending: bool,
+    /// Fluid time since the last evaporation pass.
+    evaporating_s: f64,
+    /// With wide columns: the terrain at its own resolution, and the open runs
+    /// of each terrain region's columns read from it (cached; an edit drops
+    /// the regions it touched).
+    fine: Option<FineTerrain>,
+    fine_runs: HashMap<RegionKey, Arc<ColumnRuns>>,
 }
 
 /// What the fluid step publishes for the tick thread to read without waiting
@@ -249,7 +272,8 @@ struct RefreshMetrics {
 /// A committed terrain change waiting for the water: the terrain as it was then,
 /// the regions whose bricks were edited, and those whose bricks became resident.
 struct PendingTerrain {
-    source: Arc<VolumeTerrain<Arc<Volume>>>,
+    source: Arc<dyn TerrainSource>,
+    fine: Option<FineTerrain>,
     edited: Vec<RegionKey>,
     reloaded: Vec<RegionKey>,
 }
@@ -371,15 +395,173 @@ fn check_setup(setup: &ColumnWaterSetup) -> Result<(), ColumnWaterError> {
     Ok(())
 }
 
-fn terrain_source(terrain: &Volume, setup: &ColumnWaterSetup) -> Arc<VolumeTerrain<Arc<Volume>>> {
-    Arc::new(VolumeTerrain::new(
-        Arc::new(terrain.clone()),
-        setup.y_lo,
-        setup.y_hi,
-    ))
+/// Terrain read at terrain resolution, for drawing wide columns' water against
+/// the voxels (see `Core::region_frames`).
+type FineTerrain = Arc<VolumeTerrain<Arc<Volume>>>;
+
+/// The open runs `(floor y, one past the top)` of each column of a terrain
+/// region (`lx + 32 * lz`).
+type ColumnRuns = Vec<Vec<(i32, i32)>>;
+
+/// The water's terrain source, and with wide columns the terrain at its own
+/// resolution as well.
+fn terrain_source(
+    terrain: &Volume,
+    setup: &ColumnWaterSetup,
+) -> (Arc<dyn TerrainSource>, Option<FineTerrain>) {
+    let volume = Arc::new(terrain.clone());
+    if setup.config.column_cells > 1 {
+        let fine = Arc::new(VolumeTerrain::new(volume.clone(), setup.y_lo, setup.y_hi));
+        let wide = Arc::new(CoarseVolumeTerrain::new(volume, setup.y_lo, setup.y_hi));
+        (wide, Some(fine))
+    } else {
+        (
+            Arc::new(VolumeTerrain::new(volume, setup.y_lo, setup.y_hi)),
+            None,
+        )
+    }
+}
+
+/// Terrain cells per water column edge (1 at terrain resolution).
+fn wide(setup: &ColumnWaterSetup) -> i64 {
+    i64::from(setup.config.column_cells.max(1))
+}
+
+/// The water region a terrain cell's spring or drain falls in.
+fn exchange_region(c: &GlobalCell, n: i64) -> RegionKey {
+    spall_fluid::columns::region_of(c.x.div_euclid(n), c.z.div_euclid(n))
 }
 
 impl Core {
+    /// The terrain regions (what clients draw) water region `key` covers:
+    /// itself, or with wide columns the `n` x `n` under it.
+    fn frame_keys(&self, key: RegionKey) -> Vec<RegionKey> {
+        let n = self.world.config().column_cells as i32;
+        (0..n)
+            .flat_map(|dz| (0..n).map(move |dx| (key.0 * n + dx, key.1 * n + dz)))
+            .collect()
+    }
+
+    /// Reads the open runs of every terrain region under `keys` not cached yet.
+    fn cache_fine_runs(&mut self, keys: &[RegionKey]) {
+        let Some(fine) = self.fine.clone() else {
+            return;
+        };
+        let (y_lo, y_hi) = fine.y_range();
+        let missing: Vec<RegionKey> = keys
+            .iter()
+            .flat_map(|&k| self.frame_keys(k))
+            .filter(|k| !self.fine_runs.contains_key(k))
+            .collect();
+        use rayon::prelude::*;
+        let read: Vec<(RegionKey, Option<ColumnRuns>)> = missing
+            .par_iter()
+            .map(|&k| {
+                let runs = fine
+                    .region(k)
+                    .map(|t| spall_fluid::columns::open_runs(&t, y_lo, y_hi));
+                (k, runs)
+            })
+            .collect();
+        for (k, runs) in read {
+            if let Some(runs) = runs {
+                self.fine_runs.insert(k, Arc::new(runs));
+            }
+        }
+    }
+
+    /// The frames of the terrain regions water region `key` covers. With wide
+    /// columns each terrain column is drawn against its own voxels: its surface
+    /// blends between the wide columns around it (so the water does not step
+    /// every metre), it takes the open run of its own column that the surface
+    /// falls in as its floor, and it is dry where its terrain stands above the
+    /// surface (so the water's bottom is never a wide column's raised floor).
+    fn region_frames(&self, key: RegionKey) -> Vec<(RegionKey, Option<RegionFrame>)> {
+        let n = i64::from(self.world.config().column_cells);
+        if n == 1 {
+            return vec![(key, self.region_frame(key))];
+        }
+        let edge = spall_fluid::columns::REGION_EDGE;
+        let per = edge / n;
+        // The surface of the wet span of wide column (x, z) within a cell of
+        // height `h`: a neighbour across a fall or a wall does not blend.
+        let near_surface = |x: i64, z: i64, h: f64| -> Option<f64> {
+            self.world
+                .spans_in_column(x, z)
+                .iter()
+                .filter(|s| s.volume > DRY_VOLUME)
+                .map(|s| s.floor_y as f64 + s.depth)
+                .filter(|t| (t - h).abs() < 1.0)
+                .min_by(|a, b| (a - h).abs().total_cmp(&(b - h).abs()))
+        };
+        let subs: Vec<RegionKey> = self.frame_keys(key);
+        let runs: Vec<Option<&Arc<ColumnRuns>>> =
+            subs.iter().map(|k| self.fine_runs.get(k)).collect();
+        let mut spans: Vec<Vec<FrameSpan>> = vec![Vec::new(); subs.len()];
+        for (column, floor_y, volume, height, flow) in
+            self.world.region_wet_spans_with_flow(key, DRY_VOLUME)
+        {
+            let surface = f64::from(floor_y) + volume.min(f64::from(height));
+            let (wx, wz) = (i64::from(column) % edge, i64::from(column) / edge);
+            let (gx, gz) = (i64::from(key.0) * edge + wx, i64::from(key.1) * edge + wz);
+            let west = near_surface(gx - 1, gz, surface).unwrap_or(surface);
+            let east = near_surface(gx + 1, gz, surface).unwrap_or(surface);
+            let north = near_surface(gx, gz - 1, surface).unwrap_or(surface);
+            let south = near_surface(gx, gz + 1, surface).unwrap_or(surface);
+            let sub = (wx / per + n * (wz / per)) as usize;
+            let flow = quantize_flow(flow);
+            for dz in 0..n {
+                for dx in 0..n {
+                    // Offset of this terrain column's centre from the wide
+                    // column's, in wide columns (-0.375..0.375 for n = 4).
+                    let u = (dx as f64 + 0.5) / n as f64 - 0.5;
+                    let v = (dz as f64 + 0.5) / n as f64 - 0.5;
+                    let along_x = if u < 0.0 { west } else { east };
+                    let along_z = if v < 0.0 { north } else { south };
+                    let top =
+                        surface + u.abs() * (along_x - surface) + v.abs() * (along_z - surface);
+                    let (fx, fz) = ((wx % per) * n + dx, (wz % per) * n + dz);
+                    let fcol = (fx + edge * fz) as usize;
+                    // The terrain column's own open run holding the surface.
+                    let run = match runs[sub] {
+                        Some(r) => r[fcol]
+                            .iter()
+                            .copied()
+                            .find(|&(y0, y1)| f64::from(y0) < top && top <= f64::from(y1)),
+                        None => Some((floor_y, floor_y + height)),
+                    };
+                    let Some((y0, y1)) = run else {
+                        continue;
+                    };
+                    let depth = (top - f64::from(y0)).min(f64::from(y1 - y0));
+                    let depth_q =
+                        (depth * FRAME_DEPTH_SCALE).round().min(f64::from(u16::MAX)) as u16;
+                    if depth_q == 0 {
+                        continue;
+                    }
+                    spans[sub].push(FrameSpan {
+                        column: fcol as u16,
+                        floor_y: y0,
+                        ceiling_y: y1,
+                        depth_q,
+                        flow,
+                    });
+                }
+            }
+        }
+        subs.into_iter()
+            .zip(spans)
+            .map(|(fkey, mut spans)| {
+                spans.sort_by_key(|s| (s.column, s.floor_y));
+                spans.dedup_by_key(|s| (s.column, s.floor_y));
+                (
+                    fkey,
+                    (!spans.is_empty()).then_some(RegionFrame { key: fkey, spans }),
+                )
+            })
+            .collect()
+    }
+
     fn region_frame(&self, key: RegionKey) -> Option<RegionFrame> {
         // A span too shallow to quantize above zero is not published: depth
         // zero means dry on the wire, and a region of only such films would
@@ -413,13 +595,14 @@ impl Core {
         keys: Option<Vec<RegionKey>>,
     ) -> Option<(Arc<ColumnWaterFrame>, usize)> {
         let keys = keys.unwrap_or_else(|| self.world.region_keys());
+        self.cache_fine_runs(&keys);
         let mut changed = Vec::new();
         let span_rf = crate::prof::Span::start("water.frames.regions");
         // Each region's frame reads the world only; build them in parallel.
         use rayon::prelude::*;
         let built: Vec<(RegionKey, Option<RegionFrame>)> = keys
             .par_iter()
-            .map(|&key| (key, self.region_frame(key)))
+            .flat_map_iter(|&key| self.region_frames(key))
             .collect();
         for (key, new) in built {
             let old = self.regions.get(&key);
@@ -477,12 +660,29 @@ impl Shared {
     /// spring: at the full rate it piled up around the spring faster than the
     /// region (stepped one slice in 2, 4 or 8) could carry it away.
     fn discharge(&self, core: &mut Core) {
+        let rate = self.setup.evaporation_cells_per_s;
+        if rate > 0.0 {
+            core.evaporating_s += SLICE_DT_S;
+            if core.evaporating_s >= EVAPORATE_EVERY_S {
+                let (removed, _) = core
+                    .world
+                    .evaporate(rate * core.evaporating_s, self.setup.evaporation_above_y);
+                core.removed_cells3 += removed;
+                core.evaporating_s = 0.0;
+            }
+        }
+        if let Some(top) = self.setup.sea_level_y {
+            core.removed_cells3 += core.world.hold_sea_level(top);
+        }
         for d in &self.setup.discharges {
-            if core.world.is_column_resting(d.cell.x, d.cell.z) {
+            let Some(cell) = core.world.world_cell(d.cell) else {
+                continue;
+            };
+            if core.world.is_column_resting(cell.x, cell.z) {
                 continue;
             }
             let volume = d.flow_cells3_s * SLICE_DT_S;
-            if core.world.add_flow(d.cell, volume).is_ok() {
+            if core.world.add_flow(cell, volume).is_ok() {
                 core.added_cells3 += volume;
             }
         }
@@ -495,11 +695,17 @@ impl Shared {
             .checked_sub(1)
             .and_then(|i| self.setup.gated_sources.get(i));
         for &cell in self.setup.sources.iter().chain(gated.into_iter().flatten()) {
+            let Some(cell) = core.world.world_cell(cell) else {
+                continue;
+            };
             if let Some(added) = core.world.fill_cell(cell) {
                 core.added_cells3 += added;
             }
         }
         for &cell in &self.setup.sinks {
+            let Some(cell) = core.world.world_cell(cell) else {
+                continue;
+            };
             if let Some(removed) = core.world.drain_cell(cell) {
                 core.removed_cells3 += removed;
             }
@@ -515,6 +721,20 @@ impl Shared {
         let mut refresh = RefreshMetrics::default();
         for change in pending {
             let started = Instant::now();
+            // Wide columns draw against the voxels: the edited regions' cached
+            // terrain runs are stale.
+            if change.fine.is_some() {
+                let stale: Vec<RegionKey> = change
+                    .edited
+                    .iter()
+                    .chain(&change.reloaded)
+                    .flat_map(|&k| core.frame_keys(k))
+                    .collect();
+                for k in stale {
+                    core.fine_runs.remove(&k);
+                }
+                core.fine = change.fine;
+            }
             let report = core.world.replace_terrain(change.source, &change.edited);
             core.world.notify_resident(&change.reloaded);
             core.edit_pending = true;
@@ -667,7 +887,7 @@ impl AuthoritativeColumnWater {
     pub fn new(terrain: &Volume, setup: ColumnWaterSetup) -> Result<Self, ColumnWaterError> {
         check_setup(&setup)?;
         let mut world =
-            ColumnWorld::with_terrain(terrain_source(terrain, &setup), sliced(setup.config));
+            ColumnWorld::with_terrain(terrain_source(terrain, &setup).0, sliced(setup.config));
         let rejected = world.seed_cells(&setup.initial_cells);
         let rejected_levels = world.seed_levels(&setup.initial_levels);
         // Springs and drains need their regions allocated even in a dry world.
@@ -677,7 +897,7 @@ impl AuthoritativeColumnWater {
             .chain(setup.gated_sources.iter().flatten())
             .chain(&setup.sinks)
             .chain(setup.discharges.iter().map(|d| &d.cell))
-            .map(|c| spall_fluid::columns::region_of(c.x, c.z))
+            .map(|c| exchange_region(c, wide(&setup)))
             .collect();
         world.allocate_regions(&exchange_keys.into_iter().collect::<Vec<_>>());
         let seed = ColumnSeedReport {
@@ -690,7 +910,8 @@ impl AuthoritativeColumnWater {
         let mut setup = setup;
         setup.initial_cells = Vec::new();
         setup.initial_levels = Vec::new();
-        let mut water = Self::assemble(setup, world, seed);
+        let fine = terrain_source(terrain, &setup).1;
+        let mut water = Self::assemble(setup, world, seed, fine);
         water.set_gated_sources_rate(gated_rate);
         if prewarm_s > 0.0 {
             water.prewarm = Some(water.run_prewarm(prewarm_s));
@@ -730,7 +951,12 @@ impl AuthoritativeColumnWater {
         }
     }
 
-    fn assemble(setup: ColumnWaterSetup, world: ColumnWorld, seed: ColumnSeedReport) -> Self {
+    fn assemble(
+        setup: ColumnWaterSetup,
+        world: ColumnWorld,
+        seed: ColumnSeedReport,
+        fine: Option<FineTerrain>,
+    ) -> Self {
         let empty = Arc::new(ColumnWaterFrame {
             seq: 1,
             fluid_time_s: 0.0,
@@ -757,6 +983,9 @@ impl AuthoritativeColumnWater {
                 skipped_s: 0.0,
                 journal_dirty: BTreeSet::new(),
                 edit_pending: false,
+                evaporating_s: 0.0,
+                fine,
+                fine_runs: HashMap::new(),
             }),
             owed: Mutex::new(Owed {
                 seconds: 0.0,
@@ -842,7 +1071,7 @@ impl AuthoritativeColumnWater {
             .chain(setup.gated_sources.iter().flatten())
             .chain(&setup.sinks)
             .chain(setup.discharges.iter().map(|d| &d.cell))
-            .map(|c| spall_fluid::columns::region_of(c.x, c.z))
+            .map(|c| exchange_region(c, wide(setup)))
             .collect();
         let bands = [0.1f32, 1.0, 10.0, 100.0];
         let mut count = [0usize; 5];
@@ -956,7 +1185,10 @@ impl AuthoritativeColumnWater {
             b.y >= i64::from(self.shared.setup.y_lo) / 32
                 && b.y < i64::from(self.shared.setup.y_hi) / 32
         };
-        let region = |b: &BrickCoord| (b.x as i32, b.z as i32);
+        // A brick's footprint is one terrain region; wider water columns put
+        // `n` x `n` of them in one water region.
+        let n = wide(&self.shared.setup);
+        let region = |b: &BrickCoord| (b.x.div_euclid(n) as i32, b.z.div_euclid(n) as i32);
         let edited_keys: BTreeSet<RegionKey> =
             edited.iter().filter(|b| in_height(b)).map(region).collect();
         let reloaded_keys: Vec<RegionKey> = reloaded
@@ -970,8 +1202,10 @@ impl AuthoritativeColumnWater {
         if terrain_changed {
             // Applied by the next step (see `Shared::pending_terrain`); the
             // terrain is captured now, so the refresh sees this commit.
+            let (source, fine) = terrain_source(terrain, &self.shared.setup);
             lock(&self.shared.pending_terrain).push(PendingTerrain {
-                source: terrain_source(terrain, &self.shared.setup),
+                source,
+                fine,
                 edited: edited_keys.iter().copied().collect(),
                 reloaded: reloaded_keys.clone(),
             });
@@ -1020,6 +1254,11 @@ impl AuthoritativeColumnWater {
     /// water has moved. Resting water journals nothing. With a worker, a step
     /// in flight defers the delta to a later tick.
     pub fn take_journal_delta(&mut self) -> Option<ColumnWaterDelta> {
+        // Wide columns are not journalled yet (the save format is per
+        // terrain column); such a world is ephemeral.
+        if wide(&self.shared.setup) > 1 {
+            return None;
+        }
         self.journal_wait_ticks = self.journal_wait_ticks.saturating_add(1);
         let mut core = match self.shared.core.try_lock() {
             Ok(core) => core,
@@ -1133,7 +1372,8 @@ impl AuthoritativeColumnWater {
             })
             .collect();
         check_setup(&setup)?;
-        let mut world = ColumnWorld::with_terrain(terrain_source(terrain, &setup), sliced(config));
+        let (source, fine) = terrain_source(terrain, &setup);
+        let mut world = ColumnWorld::with_terrain(source, sliced(config));
         let keys: Vec<RegionKey> = state.regions.iter().map(|r| (r.rx, r.rz)).collect();
         let exchange_keys: BTreeSet<RegionKey> = setup
             .sources
@@ -1141,7 +1381,7 @@ impl AuthoritativeColumnWater {
             .chain(setup.gated_sources.iter().flatten())
             .chain(&setup.sinks)
             .chain(setup.discharges.iter().map(|d| &d.cell))
-            .map(|c| spall_fluid::columns::region_of(c.x, c.z))
+            .map(|c| exchange_region(c, wide(&setup)))
             .collect();
         let mut keys = keys;
         keys.extend(exchange_keys);
@@ -1168,7 +1408,7 @@ impl AuthoritativeColumnWater {
         }
         world.add_unplaced(volume_from_fixed(state.unplaced_fixed));
         world.sleep_all();
-        let mut water = Self::assemble(setup, world, ColumnSeedReport::default());
+        let mut water = Self::assemble(setup, world, ColumnSeedReport::default(), fine);
         {
             let mut core = lock(&water.shared.core);
             core.seq = state.frame_seq;

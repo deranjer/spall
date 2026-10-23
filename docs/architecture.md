@@ -565,6 +565,25 @@ starts out of rest in places (at seeding, 173 columns stand over a metre above
 an open neighbour: lakes over dry cave pockets, river reaches seeded as
 stair-steps), held only by sleep until something wakes it.
 
+Water at 1 m columns (`SPALL_WATER_COARSE=1` on the server, off by default
+while it is compared in play; `ColumnConfig::column_cells`). One column covers
+4 x 4 terrain cells and keeps their 0.25 m vertical resolution; a 1 m cell is
+solid if any terrain cell in it is (`CoarseVolumeTerrain`), so a wall one cell
+thick holds water and a channel narrower than about 1 m carries none. Springs
+and drains are placed on the 1 m cell they fall in (`ColumnWorld::world_cell`),
+and an edit refreshes the 1 m region it falls in. Clients are unchanged: each
+1 m region is published as the 16 terrain regions under it, each terrain column
+drawn against its own voxels (its own floor, dry where its terrain stands above
+the water) with the surface blended between 1 m columns. In this mode the sea
+is held at its level (a river ends where it meets it) and inland water open to
+the sky evaporates 1.45e-4 cells a second (about 4 cm per game day), which
+balances the springs on the 1 km natural world. It is not saved yet: the
+server refuses `--save` with it. Measured headless (1 km natural seed 1, all
+cores, settle then 900 s standing): the water settles after 1,600 s of water
+time instead of 3,300 s, keeps 162-172 active regions, and a whole water step
+takes 4.2-6.6 ms against about 19 ms at 0.25 m. Report:
+`docs/reports/2026-10-23-water-direction-decision.md`.
+
 ENG-122 worker observability and transport profiling sections (2026-10-04, removed grid solver): see [reports/history-architecture.md](reports/history-architecture.md).
 
 ### ENG-128 day/night presentation clock

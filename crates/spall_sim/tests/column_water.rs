@@ -378,3 +378,233 @@ fn a_far_spring_runs_in_slow_motion_with_its_water() {
         "no mound at the far spring: {far_depth} cells against {near_depth} near"
     );
 }
+
+/// The server's water at 1 m columns (`ColumnConfig::column_cells =
+/// 4`). Terrain: 128 x 32 x 128 cells, a floor below y = 2, a rim, and a dam at
+/// terrain x = 62 (one cell thick) up to y = 24.
+mod wide_columns {
+    use super::*;
+    use spall_sim::column_water::Discharge;
+
+    const N: i64 = 128;
+
+    fn terrain(dam: bool) -> Volume {
+        terrain_with(dam, |_, _, _| false)
+    }
+
+    fn terrain_with(dam: bool, extra: impl Fn(i64, i64, i64) -> bool) -> Volume {
+        let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        for bz in 0..N / 32 {
+            for bx in 0..N / 32 {
+                terrain
+                    .insert_brick(
+                        BrickCoord::new(bx, 0, bz),
+                        Brick::uniform(MaterialId::AIR, Revision(1)),
+                    )
+                    .unwrap();
+            }
+        }
+        let mut plan = EditPlan::new(terrain.id());
+        for z in 0..N {
+            for y in 0..32 {
+                for x in 0..N {
+                    let rim = x == 0 || z == 0 || x == N - 1 || z == N - 1;
+                    if y < 2 || (rim && y < 28) || (dam && x == 62 && y < 24) || extra(x, y, z) {
+                        plan.set(GlobalCell::new(x, y, z), STONE);
+                    }
+                }
+            }
+        }
+        terrain.apply_edit(&plan).unwrap();
+        terrain
+    }
+
+    /// A pool west of the dam, surface at cell 12 (top cell 11).
+    fn setup() -> ColumnWaterSetup {
+        let mut setup = ColumnWaterSetup::new(0, 32, Vec::new());
+        setup.config.column_cells = 4;
+        setup.initial_levels = (1..N - 1)
+            .flat_map(|z| (1..62).map(move |x| (x, z, 1, 11)))
+            .collect();
+        setup
+    }
+
+    fn tick(water: &mut AuthoritativeColumnWater, terrain: &Volume, seconds: f64) {
+        for _ in 0..(seconds * 60.0) as u32 {
+            water.tick(terrain, &[], &[], 1.0 / 60.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_pool_at_rest_is_published_per_terrain_region_at_its_level() {
+        let terrain = terrain(true);
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup()).unwrap();
+        tick(&mut water, &terrain, 5.0);
+        let frame = water.frame();
+        // The frame speaks terrain regions (32 x 32 terrain columns).
+        assert!(
+            frame
+                .regions
+                .keys()
+                .all(|k| (0..4).contains(&k.0) && (0..4).contains(&k.1))
+        );
+        assert!(frame.regions.contains_key(&(0, 0)) && frame.regions.contains_key(&(1, 3)));
+        assert!(
+            !frame.regions.contains_key(&(3, 0)),
+            "nothing east of the dam"
+        );
+        // Standing in the pool: the surface is at 12 cells (3 m).
+        let sample = water.water_sample_at_m(5.0, 1.0, 5.0).expect("in the pool");
+        assert!(
+            (sample.surface_y - 3.0).abs() < 0.05,
+            "surface {}",
+            sample.surface_y
+        );
+        assert!(
+            water.water_sample_at_m(25.0, 1.0, 5.0).is_none(),
+            "dry past the dam"
+        );
+    }
+
+    /// One raised terrain cell lifts its wide column's floor; the water is
+    /// still drawn against each terrain column's own floor, so its bottom is
+    /// never the raised floor hanging over lower ground.
+    #[test]
+    fn frames_draw_each_terrain_column_against_its_own_floor() {
+        // A bump up to y = 6 at terrain (9, 9), in the wide column (2, 2).
+        let terrain = terrain_with(true, |x, y, z| x == 9 && z == 9 && y < 6);
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup()).unwrap();
+        tick(&mut water, &terrain, 5.0);
+        let frame = water.frame();
+        let region = frame
+            .regions
+            .get(&(0, 0))
+            .expect("the pool's corner region");
+        let span = |x: u16, z: u16| {
+            region
+                .spans
+                .iter()
+                .find(|s| s.column == x + 32 * z)
+                .copied()
+                .expect("wet")
+        };
+        let surface = |s: spall_sim::column_water::FrameSpan| {
+            f64::from(s.floor_y) + f64::from(s.depth_q) / 128.0
+        };
+        let (beside, bump) = (span(8, 8), span(9, 9));
+        assert_eq!(beside.floor_y, 2, "the real floor beside the bump");
+        assert_eq!(bump.floor_y, 6, "the bump's own floor");
+        assert!((surface(beside) - surface(bump)).abs() < 0.05);
+        assert!(
+            (surface(beside) - 12.0).abs() < 0.1,
+            "surface {}",
+            surface(beside)
+        );
+    }
+
+    /// Flowing water slopes between wide columns: the frames blend each
+    /// terrain column's surface between its wide column and the neighbours,
+    /// so it does not step a metre at a time.
+    #[test]
+    fn frames_blend_the_surface_between_wide_columns() {
+        let mut terrain = terrain(true);
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup()).unwrap();
+        tick(&mut water, &terrain, 1.0);
+        let mut plan = EditPlan::new(terrain.id());
+        for z in 56..72 {
+            for y in 2..24 {
+                plan.set(GlobalCell::new(62, y, z), MaterialId::AIR);
+            }
+        }
+        terrain.apply_edit(&plan).unwrap();
+        let edited = [BrickCoord::new(1, 0, 1), BrickCoord::new(1, 0, 2)];
+        water.tick(&terrain, &edited, &[], 1.0 / 60.0).unwrap();
+        tick(&mut water, &terrain, 3.0);
+        // Along terrain row z = 65 (row 1 of terrain region z = 2; wide row 16), x 40..90.
+        let frame = water.frame();
+        let fine: Vec<Option<f64>> = (40..90i64)
+            .map(|x| {
+                let region = frame.regions.get(&((x / 32) as i32, 2))?;
+                region
+                    .spans
+                    .iter()
+                    .find(|s| i64::from(s.column) == x % 32 + 32)
+                    .map(|s| f64::from(s.floor_y) + f64::from(s.depth_q) / 128.0)
+            })
+            .collect();
+        let world = water.world();
+        let wide: Vec<Option<f64>> = (10..23i64)
+            .map(|x| {
+                world
+                    .spans_in_column(x, 16)
+                    .iter()
+                    .find(|s| s.volume > 1e-3)
+                    .map(|s| s.floor_y as f64 + s.depth)
+            })
+            .collect();
+        let worst = |v: &[Option<f64>]| {
+            v.windows(2)
+                .filter_map(|w| Some((w[0]? - w[1]?).abs()))
+                .filter(|d| *d < 1.0)
+                .fold(0.0f64, f64::max)
+        };
+        let (fine_step, wide_step) = (worst(&fine), worst(&wide));
+        assert!(
+            wide_step > 0.05,
+            "the water is flowing: steps of {wide_step}"
+        );
+        assert!(
+            fine_step < 0.5 * wide_step,
+            "terrain columns step {fine_step}, wide columns {wide_step}"
+        );
+    }
+
+    #[test]
+    fn a_spring_adds_its_rate_and_nothing_is_lost() {
+        let terrain = terrain(true);
+        let mut setup = setup();
+        setup.initial_levels.clear();
+        setup.discharges = vec![Discharge {
+            cell: GlobalCell::new(10, 2, 10),
+            flow_cells3_s: 32.0,
+        }];
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+        tick(&mut water, &terrain, 10.0);
+        let frame = water.frame();
+        let expected = frame.fluid_time_s * 32.0 * 0.25f64.powi(3);
+        assert!((frame.spring_added_m3 - expected).abs() < 1e-6 * expected);
+        assert!((frame.volume_m3 - frame.spring_added_m3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cutting_the_dam_lets_the_pool_through() {
+        let mut terrain = terrain(true);
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup()).unwrap();
+        tick(&mut water, &terrain, 2.0);
+        let start = water.frame().volume_m3;
+        // Open a gap 8 cells (2 m) wide in the dam.
+        let mut plan = EditPlan::new(terrain.id());
+        for z in 60..68 {
+            for y in 2..24 {
+                plan.set(GlobalCell::new(62, y, z), MaterialId::AIR);
+            }
+        }
+        terrain.apply_edit(&plan).unwrap();
+        let edited = [BrickCoord::new(1, 0, 1), BrickCoord::new(1, 0, 2)];
+        water.tick(&terrain, &edited, &[], 1.0 / 60.0).unwrap();
+        tick(&mut water, &terrain, 60.0);
+        let east = water
+            .water_sample_at_m(25.0, 1.0, 16.0)
+            .expect("water got through");
+        assert!(
+            east.surface_y > 0.6,
+            "east of the dam at {}",
+            east.surface_y
+        );
+        let volume = water.frame().volume_m3;
+        assert!(
+            (volume - start).abs() < 1e-6 * start,
+            "{volume} against {start}"
+        );
+    }
+}

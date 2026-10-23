@@ -257,6 +257,33 @@ fn a_wide_trickle_into_a_sleeping_region_flows_on_instead_of_damming() {
     );
 }
 
+/// Evaporation takes the same depth from every column of still water, so a
+/// pool at rest stays level and asleep; water at or below the cut-off (the
+/// sea) keeps its level.
+#[test]
+fn evaporation_lowers_still_water_evenly_without_waking_it() {
+    let terrain = Flat::new(|x, _, z| {
+        (9..=64).contains(&x) && (4..=20).contains(&z) && (x == 9 || x == 64 || z == 4 || z == 20)
+    });
+    let mut world = ColumnWorld::with_terrain(terrain, ColumnConfig::default());
+    world.seed_cells(&pool_cells(10, 64, 5, 20, 4));
+    let start = world.total_volume();
+    let (removed, wet) = world.evaporate(0.25, 1.0);
+    assert_eq!(wet, 54 * 15, "every wet column open to the sky");
+    assert!((removed - 0.25 * wet as f64).abs() < 1e-9);
+    assert!((start - removed - world.total_volume()).abs() < 1e-9);
+    assert_eq!(world.active_region_count(), 0, "nothing woke");
+    run(&mut world, 2.0);
+    assert_eq!(world.active_region_count(), 0, "and nothing moves");
+    let surface = |x: i64| {
+        let s = world.spans_in_column(x, 12)[0];
+        s.floor_y as f64 + s.depth
+    };
+    assert!((surface(11) - 4.75).abs() < 1e-9 && (surface(60) - 4.75).abs() < 1e-9);
+    // Water whose surface is at or under the cut-off is the sea: untouched.
+    assert_eq!(world.evaporate(0.25, 5.0), (0.0, 0));
+}
+
 /// A non-resident neighbour is a closed wall: water neither drains into it nor
 /// stops being counted. When it returns, both sides exchange.
 #[test]

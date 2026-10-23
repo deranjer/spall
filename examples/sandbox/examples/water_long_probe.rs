@@ -2,7 +2,9 @@
 //! one player standing still (or flying a loop, `FLY=speed_m_s`): how many
 //! regions stay awake, how long a step takes, and whether water stands
 //! unsupported anywhere. `NOSPRINGS=1` drops springs and drains, `NOSINKS=1`
-//! drains only, `SINKS=1` lists the drains.
+//! drains only, `SINKS=1` lists the drains, `SETTLE=max_seconds` first runs the
+//! water with no player until its regions stop changing, and
+//! `SPALL_WATER_COARSE=1` runs it at 1 m columns.
 //! `cargo run --release -p sandbox --example water_long_probe -- PRESET SEED SIZE SECONDS X_M Z_M`
 use std::time::Instant;
 
@@ -114,6 +116,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut water = AuthoritativeColumnWater::new(&scene.world().terrain, setup)?;
     water.set_focus(&[[x_m, z_m]]);
+    {
+        // Wet columns open to the sky, above the sea and at it: what evaporation
+        // would act on.
+        let sea = scene.world().water.surface_y as f64 + 2.0;
+        let world = water.world();
+        let (mut inland, mut sea_cols) = (0usize, 0usize);
+        for key in world.region_keys() {
+            for c in 0..1024i64 {
+                let (x, z) = (
+                    i64::from(key.0) * 32 + c % 32,
+                    i64::from(key.1) * 32 + c / 32,
+                );
+                for s in world.spans_in_column(x, z) {
+                    if s.sky && s.volume > 1e-6 {
+                        if s.floor_y as f64 + s.volume > sea {
+                            inland += 1;
+                        } else {
+                            sea_cols += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let springs: f64 = water
+            .setup()
+            .discharges
+            .iter()
+            .map(|d| d.flow_cells3_s)
+            .sum();
+        eprintln!(
+            "wet sky columns: {inland} above the sea ({:.0} m2), {sea_cols} sea (dormant not counted); springs {springs:.1} cells3/s: balance at {:.2e} cells/s",
+            inland as f64 * 0.0625,
+            springs / inland.max(1) as f64
+        );
+    }
     // A 600 m square loop around the world centre.
     let half = f64::from(size) * 0.25 * 0.5;
     let corners = [
@@ -134,6 +171,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|w| (w.1, w.2, w.3, w.4))
         .collect();
+    // `SETTLE=max_seconds`: first run the water with no player (nothing
+    // throttled) until the active and allocated regions stop changing, checked
+    // every 100 s, then play as usual from the settled state.
+    if let Some(max) = std::env::var("SETTLE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        water.set_focus(&[]);
+        let settle_start = Instant::now();
+        let (mut prev, mut calm) = ((0usize, 0usize), 0u32);
+        let mut t = 0.0;
+        while t < max {
+            let mut m = water.tick(&scene.world().terrain, &[], &[], dt)?;
+            for _ in 1..6000 {
+                m = water.tick(&scene.world().terrain, &[], &[], dt)?;
+            }
+            t += 100.0;
+            let now = (m.active_regions, m.allocated_regions);
+            let still = now.1 == prev.1
+                && (now.0 as f64 - prev.0 as f64).abs() <= 0.03 * prev.0.max(1) as f64;
+            calm = if still { calm + 1 } else { 0 };
+            eprintln!(
+                "settle t {t:6.0}s | wall {:6.1}s | active {} | allocated {} | steady {} | {:.0} m3 | calm {calm}",
+                settle_start.elapsed().as_secs_f64(),
+                now.0,
+                now.1,
+                m.steady_regions,
+                m.volume_m3
+            );
+            prev = now;
+            if calm >= 2 {
+                break;
+            }
+        }
+        eprintln!("settled after {t:.0} s of water time");
+        report_walls(&water.world(), &seeded);
+        water.set_focus(&[[x_m, z_m]]);
+    }
     let started = Instant::now();
     let mut last = Instant::now();
     let mut steps = 0u64;
@@ -173,6 +248,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 m.volume_m3,
                 m.skipped_s,
                 water.diag_summary(),
+            );
+            eprintln!(
+                "springs +{:.0} m3, drains, evaporation and the held sea -{:.0} m3",
+                water.frame().spring_added_m3,
+                water.frame().drain_removed_m3
             );
             steps = 0;
             (solve, subs, spans, resting, caught) = (0.0, 0, 0, 0, 0);
