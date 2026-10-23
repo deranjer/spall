@@ -14,7 +14,7 @@ pub(super) struct InteractiveApp {
     pub(super) biome_audio: BiomeAudioConfig,
     pub(super) creature_view: Option<std::sync::Arc<dyn CreatureView>>,
     pub(super) pack_view: Option<std::sync::Arc<dyn PackView>>,
-    /// The pack (Tab): open, kneeling, or rolling up.
+    /// The pack (Tab): open, or sliding in or out.
     pub(super) pack: Pack,
     pub(super) pack_frame_at: Option<Instant>,
     /// The cursor, physical pixels, for hovering items in the open pack.
@@ -942,15 +942,12 @@ impl InteractiveApp {
         self.held.clear_on_focus_loss(&self.session.input);
     }
 
-    /// Tab: kneel and unroll the pack where the player stands. Not while
-    /// flying, and only when the game supplied a [`PackView`].
+    /// Tab: lay the pack out on the tarp, only when the game supplied a
+    /// [`PackView`].
     pub(super) fn open_pack(&mut self) {
-        if self.pack_view.is_none() || self.fly_eye.is_some() {
+        if self.pack_view.is_none() {
             return;
         }
-        let Some(view) = *self.session.view.lock().unwrap_or_else(|e| e.into_inner()) else {
-            return;
-        };
         self.clear_held_actions();
         // An answer from an earlier opening is stale.
         *self
@@ -958,7 +955,7 @@ impl InteractiveApp {
             .progression_reply
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        self.pack.open(view.predicted.position_m, self.yaw);
+        self.pack.open();
         self.set_cursor_locked(false);
     }
 

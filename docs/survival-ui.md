@@ -42,29 +42,29 @@ grade mapping stays.
 
 ## Built: the pack (Tab)
 
-`Tab` kneels and unrolls a canvas tarp on the ground in front of the player,
-weighted with stones at the corners, and lays the inventory out on it. Each stack
-shows up to four copies of the item's model with a small label ("Log ×12") over
-it; the stack under the cursor lifts and its label brightens. `Tab` or `Esc` rolls
-it back up, and walking or jumping gets up and goes. The world keeps running.
+`Tab` slides a weathered canvas tarp up over the screen, dims the world a little,
+and lays the inventory out on it. It is UI only: nothing is drawn in the world,
+the camera does not move, and the world keeps running behind it. Each stack shows
+the item's painted icon, a charcoal count ("×12") and its name; the stack under
+the cursor grows slightly and its name darkens. Text scales with the tarp. `Tab` or
+`Esc` packs it away again, and walking or jumping closes it.
 
-- **Client-side only.** The tarp and items are overlay cubes, like the animals; the
-  server keeps the inventory as stable item IDs. While the pack is open the client
-  asks for it (`ProgressionRequest::InspectInventory`) every 1.5 s, so harvests show
-  up without reopening.
-- **Game-owned look.** `spall_client::window::PackView` gives names and cube models
-  per item ID, and the tarp, twine and stone materials. The sandbox's
-  `SandboxPackView` draws logs, planks, stone chunks and stone blocks from manifest
-  materials. Up to 12 stacks fit (4 by 3); more show a "+N more" note.
-- **Not yet:** crafting on the cloth, moving items, belt slots, sounds, and a tarp
-  that follows uneven ground (it lies flat at the player's feet height).
+- **Inventory.** The server keeps the inventory as stable item IDs. While the pack
+  is open the client asks for it (`ProgressionRequest::InspectInventory`) every
+  1.5 s, so harvests show up without reopening.
+- **Engine and game.** The engine draws the tarp
+  (`crates/spall_client/assets/hud/tarp.png`, drawn by `make_tarp.py`), lays out up
+  to 12 stacks (4 by 3; more show a "+N more" note) and loads icons on first sight.
+  The game's `spall_client::window::PackView` gives each item ID a name and PNG
+  icon. The sandbox's icons are `examples/sandbox/assets/items/*.png`, drawn by
+  `make_items.py`.
+- **Not yet:** crafting on the cloth, moving items, belt slots, and sounds.
 
 ## Planned
 
 - **Sounds** for the body states and inventory (list below). None is integrated yet.
 - **Belt:** 4 to 6 worn quick slots, visible on the player body, switched without a menu.
-- **Pack crafting:** craft on the cloth from the laid-out items; other players see
-  you kneeling.
+- **Pack crafting:** craft on the cloth from the laid-out items.
 - **Camp:** being rethought; a first cut (a claimed area around a fire pit) was tried and taken out.
 - **Wrist cord and journal:** the day count and exact readouts for players who want
   numbers.
@@ -100,7 +100,7 @@ those searches. Accepted files go into `examples/sandbox/assets/audio/` and
 | Cue | Use | Candidates |
 | --- | --- | --- |
 | Tarp unroll | Opening the pack | [craigsmith tent/tarp whoosh](https://freesound.org/people/craigsmith/sounds/481896/), [search](https://freesound.org/search/?q=tarp&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
-| Pack open / close | Kneel, roll the tarp back up | [Fission9 inventory open](https://freesound.org/people/Fission9/sounds/568992/), [Fission9 inventory close](https://freesound.org/people/Fission9/sounds/568991/) |
+| Pack open / close | Tarp slides in and away | [Fission9 inventory open](https://freesound.org/people/Fission9/sounds/568992/), [Fission9 inventory close](https://freesound.org/people/Fission9/sounds/568991/) |
 | Fabric handling | Moving items on the tarp | [dynamique fabric rubbing](https://freesound.org/people/dynamique/sounds/554561/) |
 | Pouch | Belt slot grab | [Canakinsound coin pouch](https://freesound.org/people/Canakinsound/sounds/722039/) |
 | Wood stick | Picking up sticks or logs | [gashasound wood stick](https://freesound.org/people/gashasound/sounds/470914/), [search](https://freesound.org/search/?q=stick+wood&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |

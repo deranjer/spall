@@ -133,8 +133,7 @@ impl ApplicationHandler for InteractiveApp {
                     return;
                 }
                 let held = event.state == ElementState::Pressed;
-                // Tab or Esc rolls the pack up; walking or jumping gets up
-                // and goes.
+                // Tab or Esc packs up; walking or jumping gets going.
                 if held
                     && !event.repeat
                     && self.pack.is_open()
@@ -471,11 +470,6 @@ impl ApplicationHandler for InteractiveApp {
                         self.sky_dirty = false;
                     }
                 }
-                if let Some(pack_view) = &self.pack_view
-                    && self.pack.is_shown()
-                {
-                    overlay.extend(self.pack.instances(pack_view.as_ref()));
-                }
                 if let Some(view) = &self.creature_view
                     && let Some(replica) =
                         self.session.replica.get().and_then(|r| r.try_lock().ok())
@@ -597,39 +591,17 @@ impl ApplicationHandler for InteractiveApp {
                                 }
                                 (*eye, look_dir)
                             } else {
-                                self.pack.camera(followed, look_dir)
+                                (followed, look_dir)
                             }
                         });
-                        renderer.pack_labels = match (&self.pack_view, cam) {
-                            (Some(pack_view), Some((eye, dir))) => {
-                                let projected: Vec<_> = self
-                                    .pack
-                                    .labels(pack_view.as_ref())
-                                    .into_iter()
-                                    .filter_map(|label| {
-                                        renderer
-                                            .screen_point(eye, dir, label.at)
-                                            .map(|at| (label, at))
-                                    })
-                                    .collect();
-                                let scale = renderer.ui_scale();
-                                let anchors: Vec<_> =
-                                    projected.iter().map(|(l, at)| (l.item, *at)).collect();
-                                self.pack.hovered = self.cursor_px.and_then(|[x, y]| {
-                                    hovered_item(&anchors, [x / scale, y / scale])
-                                });
-                                projected
-                                    .into_iter()
-                                    .map(|(label, at)| PackLabelView {
-                                        at,
-                                        hovered: label.item.is_some()
-                                            && label.item == self.pack.hovered,
-                                        text: label.text,
-                                    })
-                                    .collect()
+                        renderer.pack_frame = self.pack_view.as_ref().and_then(|pack_view| {
+                            let screen = renderer.ui_size();
+                            let scale = renderer.ui_scale();
+                            if let Some([x, y]) = self.cursor_px {
+                                self.pack.hover(screen, [x / scale, y / scale]);
                             }
-                            _ => Vec::new(),
-                        };
+                            self.pack.frame(pack_view.as_ref(), screen)
+                        });
                         self.hammer_target = match cam {
                             Some((eye, dir)) => {
                                 match self.session.replica.get().and_then(|r| r.try_lock().ok()) {

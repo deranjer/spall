@@ -60,8 +60,12 @@ pub(crate) struct WorldRenderer {
     body_icons: [yakui::ManagedTextureId; 6],
     /// Each reminder icon's opacity this frame (`body_state::reminders`).
     pub(super) body_reminders: [(BodyCue, f32); 6],
-    /// Item labels over the open pack, already on screen.
-    pub(super) pack_labels: Vec<PackLabelView>,
+    /// The pack laid out for this frame, if it is on screen.
+    pub(super) pack_frame: Option<PackFrame>,
+    pack_tarp: yakui::ManagedTextureId,
+    /// The game's item icons, uploaded on first sight; `None` if one would
+    /// not decode (reported once, then drawn as a plain marker).
+    item_icons: HashMap<u16, Option<yakui::ManagedTextureId>>,
     yakui_winit: YakuiWinit,
     yakui_wgpu: YakuiWgpu,
     yakui_buffers: yakui_wgpu::Buffers,
@@ -336,6 +340,11 @@ impl WorldRenderer {
         let aspect = surface_config.width as f32 / surface_config.height.max(1) as f32;
         let mut yakui = yakui::Yakui::new();
         let body_icons = load_body_icons(&mut yakui)?;
+        let pack_tarp = png_texture(
+            &mut yakui,
+            include_bytes!("../../assets/hud/tarp.png"),
+            "pack tarp",
+        )?;
         let yakui_winit = YakuiWinit::new(&window);
         let yakui_wgpu = YakuiWgpu::new(device.clone(), queue.clone());
         let yakui_buffers = yakui_wgpu.buffers();
@@ -407,7 +416,9 @@ impl WorldRenderer {
             yakui_wgpu,
             body_icons,
             body_reminders: BodyCue::ALL.map(|cue| (cue, 0.0)),
-            pack_labels: Vec::new(),
+            pack_frame: None,
+            pack_tarp,
+            item_icons: HashMap::new(),
             yakui_buffers,
             hud_gpu_timer,
             screenshot_request: None,
@@ -564,28 +575,13 @@ impl WorldRenderer {
         self.yakui.scale_factor()
     }
 
-    /// Where `world` lands on screen, in logical pixels from the top left,
-    /// for the game camera at `eye` looking along `look`; `None` behind it.
-    pub(super) fn screen_point(&self, eye: Vec3, look: Vec3, world: Vec3) -> Option<[f32; 2]> {
-        let mut camera = Camera::looking_along(
-            eye,
-            look,
-            CAMERA_FOV_Y_DEG.to_radians(),
-            self.aspect.max(1e-4),
-        );
-        camera.z_near = CAMERA_Z_NEAR_M;
-        camera.z_far = CAMERA_Z_FAR_M;
-        let clip = camera.view_projection() * world.extend(1.0);
-        if clip.w <= CAMERA_Z_NEAR_M {
-            return None;
-        }
+    /// The screen in logical pixels.
+    pub(super) fn ui_size(&self) -> [f32; 2] {
         let scale = self.yakui.scale_factor();
-        let width = self.surface_config.width as f32 / scale;
-        let height = self.surface_config.height as f32 / scale;
-        Some([
-            (clip.x / clip.w * 0.5 + 0.5) * width,
-            (0.5 - clip.y / clip.w * 0.5) * height,
-        ])
+        [
+            self.surface_config.width as f32 / scale,
+            self.surface_config.height as f32 / scale,
+        ]
     }
 
     pub(crate) fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
@@ -953,6 +949,20 @@ impl WorldRenderer {
         {
             timer.write_start(&mut encoder);
         }
+        if let Some(frame) = &self.pack_frame {
+            for slot in &frame.slots {
+                if let (Some(png), false) =
+                    (slot.icon_png, self.item_icons.contains_key(&slot.item_id))
+                {
+                    let icon = png_texture(&mut self.yakui, png, "item icon")
+                        .inspect_err(|error| {
+                            eprintln!("spall-interactive: item {}: {error}", slot.item_id)
+                        })
+                        .ok();
+                    self.item_icons.insert(slot.item_id, icon);
+                }
+            }
+        }
         self.yakui.start();
         let mut selected_environment = None;
         let mut admin_menu = admin_menu;
@@ -994,7 +1004,9 @@ impl WorldRenderer {
             draw_crosshair(crosshair);
         }
         draw_body_reminders(&self.body_icons, &self.body_reminders);
-        draw_pack_labels(&self.pack_labels);
+        if let Some(frame) = &self.pack_frame {
+            draw_pack(frame, self.pack_tarp, &self.item_icons, self.ui_size());
+        }
         self.yakui.finish();
         if let Some(preset) = selected_environment {
             self.environment = preset.environment();

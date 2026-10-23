@@ -412,19 +412,28 @@ pub(super) fn load_body_icons(
             BodyCue::Cold => include_bytes!("../../assets/hud/cold.png"),
             BodyCue::Wet => include_bytes!("../../assets/hud/wet.png"),
         };
-        let icon = image::load_from_memory(png)
-            .map_err(|error| ClientError::Render(format!("{cue:?} HUD icon: {error}")))?
-            .into_rgba8();
-        let size = yakui::UVec2::new(icon.width(), icon.height());
-        let mut texture = yakui::paint::Texture::new(
-            yakui::paint::TextureFormat::Rgba8Srgb,
-            size,
-            icon.into_raw(),
-        );
-        texture.min_filter = yakui::paint::TextureFilter::Linear;
-        ids.push(yakui.add_texture(texture));
+        ids.push(png_texture(yakui, png, &format!("{cue:?} HUD icon"))?);
     }
     Ok(ids.try_into().expect("one icon per cue"))
+}
+
+/// Decodes `png` and uploads it as a linearly filtered UI texture.
+pub(super) fn png_texture(
+    yakui: &mut yakui::Yakui,
+    png: &[u8],
+    what: &str,
+) -> Result<yakui::ManagedTextureId, ClientError> {
+    let image = image::load_from_memory(png)
+        .map_err(|error| ClientError::Render(format!("{what}: {error}")))?
+        .into_rgba8();
+    let size = yakui::UVec2::new(image.width(), image.height());
+    let mut texture = yakui::paint::Texture::new(
+        yakui::paint::TextureFormat::Rgba8Srgb,
+        size,
+        image.into_raw(),
+    );
+    texture.min_filter = yakui::paint::TextureFilter::Linear;
+    Ok(yakui.add_texture(texture))
 }
 
 /// Ink colour of each reminder icon.
@@ -470,33 +479,100 @@ pub(super) fn draw_body_reminders(
     });
 }
 
-/// Item names over the open pack: small dark tags centred over each stack,
-/// brighter and larger for the one under the cursor.
-pub(super) fn draw_pack_labels(labels: &[PackLabelView]) {
-    for label in labels {
-        let size = if label.hovered { 22.0 } else { 19.0 };
-        // Centre the tag on its point; text width is estimated, not measured.
-        let width = label.text.chars().count() as f32 * size * 0.55 + 20.0;
+/// Ink on the tarp: names and counts, written like charcoal on canvas.
+const PACK_INK: yakui::Color = yakui::Color::rgb(48, 34, 22);
+
+/// The pack: the world dimmed a little, the tarp, and each stack's icon,
+/// count and name. A hovered stack's icon grows and its name darkens.
+pub(super) fn draw_pack(
+    frame: &PackFrame,
+    tarp: yakui::ManagedTextureId,
+    icons: &HashMap<u16, Option<yakui::ManagedTextureId>>,
+    screen: [f32; 2],
+) {
+    let fade = |color: yakui::Color, alpha: f32| color.with_alpha(alpha * frame.shown);
+    let at = |x: f32, y: f32, children: &mut dyn FnMut()| {
         yakui::align(yakui::Alignment::TOP_LEFT, || {
-            yakui::offset(
-                yakui::Vec2::new(label.at[0] - width * 0.5, label.at[1] - size - 6.0),
-                || {
-                    let alpha = if label.hovered { 0.8 } else { 0.45 };
-                    yakui::colored_box_container(PANEL_BG.with_alpha(alpha), || {
-                        yakui::pad(yakui::widgets::Pad::balanced(10.0, 4.0), || {
-                            let mut text = yakui::widgets::Text::new(size, label.text.clone());
-                            text.style.color = if label.hovered {
-                                yakui::Color::rgb(255, 244, 220)
-                            } else {
-                                yakui::Color::rgb(225, 214, 190)
-                            };
-                            text.show();
-                        });
-                    });
-                },
-            );
+            yakui::offset(yakui::Vec2::new(x, y), children);
+        });
+    };
+    yakui::colored_box(
+        fade(yakui::Color::BLACK, 0.35),
+        yakui::Vec2::from_array(screen),
+    );
+    let t = frame.tarp;
+    at(t.x, t.y, &mut || {
+        let mut image = yakui::widgets::Image::new(tarp, yakui::Vec2::new(t.w, t.h));
+        image.color = fade(yakui::Color::WHITE, 1.0);
+        image.show();
+    });
+    // Text scales with the tarp so it stays readable at any window size.
+    let name_size = (t.h * 0.034).clamp(16.0, 30.0);
+    let count_size = name_size * 1.15;
+    let text = |size: f32, color: yakui::Color, line: String| {
+        let mut text = yakui::widgets::Text::new(size, line);
+        text.style.color = color;
+        text.show();
+    };
+    for slot in &frame.slots {
+        let grow = if slot.hovered { 1.12 } else { 1.0 };
+        let icon = slot.icon;
+        let side = icon.w * grow;
+        let (x, y) = (
+            icon.x - (side - icon.w) * 0.5,
+            icon.y - (side - icon.h) * 0.5,
+        );
+        at(
+            x,
+            y,
+            &mut || match icons.get(&slot.item_id).copied().flatten() {
+                Some(texture) => {
+                    let mut image = yakui::widgets::Image::new(texture, yakui::Vec2::splat(side));
+                    image.color = fade(yakui::Color::WHITE, 1.0);
+                    image.show();
+                }
+                None => {
+                    yakui::colored_box(fade(PACK_INK, 0.35), yakui::Vec2::splat(side * 0.6));
+                }
+            },
+        );
+        if slot.count > 1 {
+            let label = format!("\u{d7}{}", slot.count);
+            at(icon.x + icon.w * 0.72, icon.y + icon.h * 0.72, &mut || {
+                text(count_size, fade(PACK_INK, 1.0), label.clone());
+            });
+        }
+        // Centre the name under the icon; text width is estimated.
+        let width = slot.name.chars().count() as f32 * name_size * 0.52;
+        let cell = slot.cell;
+        let ink = if slot.hovered {
+            PACK_INK
+        } else {
+            PACK_INK.with_alpha(0.8)
+        };
+        at(
+            cell.x + (cell.w - width) * 0.5,
+            icon.y + icon.h + cell.h * 0.04,
+            &mut || {
+                text(
+                    name_size,
+                    fade(ink, ink.a as f32 / 255.0),
+                    slot.name.clone(),
+                )
+            },
+        );
+    }
+    if let Some(note) = &frame.note {
+        let width = note.chars().count() as f32 * name_size * 0.52;
+        at(t.x + (t.w - width) * 0.5, t.y + t.h * 0.47, &mut || {
+            text(name_size * 1.2, fade(PACK_INK, 0.8), note.clone());
         });
     }
+    let hint = "Tab to pack up";
+    let width = hint.chars().count() as f32 * name_size * 0.4;
+    at(t.x + (t.w - width) * 0.5, t.y + t.h * 0.9, &mut || {
+        text(name_size * 0.75, fade(PACK_INK, 0.55), hint.to_owned());
+    });
 }
 
 #[cfg(test)]
