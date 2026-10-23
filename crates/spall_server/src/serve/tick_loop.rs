@@ -445,6 +445,7 @@ pub(super) async fn serve_async(
         let mut actions_requested = 0u64;
         let mut actions_staged = 0u64;
         let mut submitted_at: HashMap<RequestId, std::time::Instant> = HashMap::new();
+        let mut build_queue = BuildQueue::default();
         // The session that staged each still-pending request, so the tick-report
         // outcome (`action_statuses`) can be routed back to only that client
         // instead of every connected client.
@@ -721,6 +722,16 @@ pub(super) async fn serve_async(
                                 .ok_or(ActionReject::Unsupported("unsupported target"))
                         } else {
                             resolve_intent_with_catalog(sim.world(), session, &req, &action_catalog)
+                                .and_then(|intent| {
+                                    build_queue.accept(
+                                        sim.world(),
+                                        &action_catalog,
+                                        session,
+                                        player_principals.get(&session.raw()).copied(),
+                                        &req,
+                                        intent,
+                                    )
+                                })
                         };
                         match resolved {
                             Ok(intent) => match sim.submit(intent) {
@@ -1098,6 +1109,7 @@ pub(super) async fn serve_async(
                 }
             }
             let before_tick = started.elapsed();
+            build_queue.submit_due(&mut sim);
             // Reserve a conservative shared-ID range before the tick can
             // mutate simulation state. Unused IDs are intentionally burned.
             let split_id_bound = sim.transfer_reservation_bound();

@@ -306,6 +306,28 @@ impl Inventory {
             .map(|(&item, &count)| ItemStack { item, count })
     }
 
+    /// Takes `costs` out at once, or nothing if any is short.
+    pub fn spend(&mut self, costs: &[ItemStack]) -> Result<(), CraftError> {
+        let mut next = self.stacks.clone();
+        for cost in costs {
+            let have = next.get(&cost.item).copied().unwrap_or(0);
+            let left = have
+                .checked_sub(cost.count)
+                .ok_or(CraftError::InsufficientItems(cost.item))?;
+            if left == 0 {
+                next.remove(&cost.item);
+            } else {
+                next.insert(cost.item, left);
+            }
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(CraftError::RevisionExhausted)?;
+        self.stacks = next;
+        Ok(())
+    }
+
     /// Commits a staged crafting transaction atomically if its base revision is
     /// still current. Rejected/stale commits leave the inventory unchanged.
     pub fn commit(&mut self, transaction: CraftTransaction) -> Result<CraftReceipt, CraftError> {
@@ -618,6 +640,8 @@ pub mod tool_ids {
     pub const PLACE_DIRT: u16 = 3;
     /// The torch: places the emissive lamp where the player aims.
     pub const PLACE_LAMP: u16 = 4;
+    /// Builds a fire pit and founds the player's camp (ENG-245).
+    pub const FIRE_PIT: u16 = 5;
 }
 
 fn def(id: MaterialId, name: &str, density: f32, albedo: [f32; 3]) -> MaterialDef {
@@ -890,6 +914,14 @@ pub fn tool_catalog() -> spall_server::ToolCatalog {
                 kind: EditKind::Place(materials::LAMP),
                 max_radius_cells: 0,
                 reach_m: 12.0,
+            },
+            // A build tool (see `crate::camp`): validated like a one-cell
+            // placement, then the server places the whole fire pit.
+            ToolRule {
+                id: tool_ids::FIRE_PIT,
+                kind: EditKind::Place(materials::STONE),
+                max_radius_cells: 0,
+                reach_m: 6.0,
             },
         ],
     )

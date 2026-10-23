@@ -7,11 +7,11 @@
 # domain <path> <literal>   rule 3: existing b"spall.…" hash-domain literal
 # log <path>                rule 9: tracked docs *.jsonl/*.log
 
-lines crates/spall_client/src/net.rs 3695
+lines crates/spall_client/src/net.rs 3662
 lines crates/spall_fluid/src/columns.rs 3245
 lines crates/spall_protocol/src/creature_owner.rs 2061
 lines crates/spall_render/src/capture.rs 2212
-lines crates/spall_server/src/serve/tick_loop.rs 2578
+lines crates/spall_server/src/serve/tick_loop.rs 2474
 lines crates/spall_sim/src/world.rs 3291
 lines examples/sandbox/src/bin/sandbox-capture.rs 2979
 lines tools/spall_editor/src/ui.rs 2165

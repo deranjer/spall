@@ -42,6 +42,22 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
     fn tarp_material(&self) -> u32;
     /// Material of the twine and the stones pinning the tarp's corners.
     fn trim_materials(&self) -> [u32; 2];
+    /// How far a camp reaches from a site of this kind, for the site kinds
+    /// that found a camp.
+    fn camp_radius_m(&self, site_kind: u16) -> Option<f32>;
+    /// The build tool that founds a camp, offered on the tarp when the
+    /// player has none.
+    fn camp_tool(&self) -> Option<CampTool>;
+}
+
+/// The game's camp-founding build tool, as the pack offers it.
+#[derive(Debug, Clone, Copy)]
+pub struct CampTool {
+    pub tool: u16,
+    /// Item IDs and counts the build costs.
+    pub cost: &'static [(u16, u32)],
+    /// The cost as the player reads it ("4 stones").
+    pub cost_text: &'static str,
 }
 
 /// Turns replicated creature ownership records into cubes to draw this frame.

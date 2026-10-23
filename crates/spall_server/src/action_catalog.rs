@@ -1,8 +1,9 @@
 //! Versioned, server-owned action policy supplied by the game host.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use spall_core::{MAX_BRUSH_RADIUS_CELLS, MaterialId};
+use spall_core::{GlobalCell, MAX_BRUSH_RADIUS_CELLS, MaterialId};
 use spall_sim::EditKind;
 
 /// One game-approved edit tool. Clients send only `id`; operation, reach, and
@@ -21,6 +22,44 @@ pub struct ToolRule {
 pub struct ToolCatalog {
     version: u32,
     tools: BTreeMap<u16, ToolRule>,
+    builds: Option<BuildTools>,
+}
+
+/// What an approved build action asks the game for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildRequest {
+    pub player_id: Option<spall_protocol::PlayerId>,
+    /// Session slot, for hosts without player credentials.
+    pub slot: u32,
+    pub tool: u16,
+    /// The empty terrain cell against the struck surface, where a placement
+    /// with this tool would land.
+    pub cell: GlobalCell,
+    /// The player's facing in quarter turns: 0 looks along `-Z`, 1 along
+    /// `+X`, 2 along `+Z`, 3 along `-X`.
+    pub facing: u8,
+}
+
+/// The game's structures: turns an approved build action into the terrain
+/// cells to fill and their materials, or refuses with a reason the player
+/// sees (for example, a missing cost). The server places the cells a few
+/// per tick and skips any that are no longer empty, so a build can end up
+/// partial; the game must charge for it when it accepts.
+pub type StructureBuilder =
+    Arc<dyn Fn(&BuildRequest) -> Result<Vec<(GlobalCell, MaterialId)>, &'static str> + Send + Sync>;
+
+#[derive(Clone)]
+struct BuildTools {
+    ids: BTreeSet<u16>,
+    builder: StructureBuilder,
+}
+
+impl std::fmt::Debug for BuildTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildTools")
+            .field("ids", &self.ids)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -33,6 +72,8 @@ pub enum ToolCatalogError {
     InvalidRadius(u16),
     #[error("tool {0} has an invalid ray reach")]
     InvalidReach(u16),
+    #[error("build tool {0} must be a declared single-cell placement tool")]
+    InvalidBuildTool(u16),
 }
 
 impl ToolCatalog {
@@ -55,7 +96,38 @@ impl ToolCatalog {
                 return Err(ToolCatalogError::DuplicateId(rule.id));
             }
         }
-        Ok(Self { version, tools })
+        Ok(Self {
+            version,
+            tools,
+            builds: None,
+        })
+    }
+
+    /// Marks `ids` as build tools: each is validated like its single-cell
+    /// placement (reach, server raycast), then `builder` decides the cells.
+    pub fn with_build_tools(
+        mut self,
+        ids: impl IntoIterator<Item = u16>,
+        builder: StructureBuilder,
+    ) -> Result<Self, ToolCatalogError> {
+        let ids: BTreeSet<u16> = ids.into_iter().collect();
+        for &id in &ids {
+            match self.tools.get(&id) {
+                Some(rule)
+                    if matches!(rule.kind, EditKind::Place(_)) && rule.max_radius_cells == 0 => {}
+                _ => return Err(ToolCatalogError::InvalidBuildTool(id)),
+            }
+        }
+        self.builds = Some(BuildTools { ids, builder });
+        Ok(self)
+    }
+
+    /// The game's builder when `id` is a build tool.
+    pub fn builder_for(&self, id: u16) -> Option<&StructureBuilder> {
+        self.builds
+            .as_ref()
+            .filter(|builds| builds.ids.contains(&id))
+            .map(|builds| &builds.builder)
     }
 
     pub const fn version(&self) -> u32 {

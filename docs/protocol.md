@@ -26,7 +26,7 @@ Handshake includes protocol version, exact content manifest hash, world ID, gene
 | RepairRequest | object/brick key, expected/current revision and hash; rate-limited |
 | DurableThrough | highest contiguous journal sequence flushed to durable storage; distinct from simulation commit |
 | ProgressionRequest | nonzero request ID, recipe catalog version, expected inventory revision, and inspect/craft operation; authenticated control stream only |
-| ProgressionResponse | request ID, current catalog/inventory revisions, outcome/rejection code, and complete sorted inventory snapshot |
+| ProgressionResponse | request ID, current catalog/inventory revisions, outcome/rejection code, complete sorted inventory snapshot, and the player's placed structures (`SiteEntry`: stable site ID, game kind code, anchor cell, quarter-turn facing; at most 64) |
 
 Never serialize Rapier handles, ECS entities, pointers, platform-sized integers, or raw Rust structs. DTOs use explicit numeric sizes, tags, units, and bounds. Pre-release there are exactly two version numbers: `PROTOCOL_VERSION` (wire; every record header carries it as `WIRE_SCHEMA_VERSION`, which is the same value) and `STORE_SCHEMA_VERSION` (save). Client and server ship together, so a mismatch is a clear rejection, not speculative compatibility code. Per-record and per-family schema numbers return at the first public release, when real saves and third-party clients need protecting.
 
@@ -308,7 +308,7 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 14): one wire version for the handshake and every record, bumped on
+`PROTOCOL_VERSION` (currently 15): one wire version for the handshake and every record, bumped on
 any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 6, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (creature owner/change/snapshot/sync/motion/state, column water, weather, snow,

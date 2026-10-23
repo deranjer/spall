@@ -833,6 +833,8 @@ fn run_serve(args: Args) -> ExitCode {
                 std::collections::BTreeMap<u64, spall_protocol::ProgressionResponse>,
             ),
         >::new()));
+    let camps = std::sync::Arc::new(std::sync::Mutex::new(sandbox::camp::Camps::default()));
+    let progression_camps = camps.clone();
     let progression_inventories = player_inventories.clone();
     let progression_cache = progression_ledger.clone();
     let progression_store = durable_progression.clone();
@@ -889,10 +891,12 @@ fn run_serve(args: Args) -> ExitCode {
                 rejected.outcome = spall_protocol::ProgressionOutcome::Rejected(
                     spall_protocol::ProgressionRejectCode::Unavailable,
                 );
+                rejected.sites = site_list(&progression_camps, player_id, session);
                 return rejected;
             }
             ledger.0 = request.request_id;
-            let response = sandbox_progression_response(inventory, request);
+            let mut response = sandbox_progression_response(inventory, request);
+            response.sites = site_list(&progression_camps, player_id, session);
             ledger.1.insert(request.request_id, response.clone());
             while ledger.1.len() > 128 {
                 ledger.1.pop_first();
@@ -900,7 +904,31 @@ fn run_serve(args: Args) -> ExitCode {
             response
         },
     );
-    let tool_catalog = sandbox::game::tool_catalog();
+    // ENG-245: build tools. Sites live in memory beside the slot
+    // inventories; durable sites with player accounts are ENG-247.
+    let durable_builds = durable_progression.is_some();
+    let build_inventories = player_inventories.clone();
+    let builder: spall_server::StructureBuilder = std::sync::Arc::new(move |request| {
+        if durable_builds {
+            return Err("camps are not saved on servers with player accounts yet");
+        }
+        let owner = sandbox::camp::SiteOwner::new(request.player_id, request.slot);
+        let mut inventories = build_inventories.lock().unwrap_or_else(|e| e.into_inner());
+        let inventory = match request.player_id {
+            Some(player_id) => inventories.ensure_player(player_id),
+            None => inventories.ensure(request.slot),
+        };
+        match request.tool {
+            sandbox::game::tool_ids::FIRE_PIT => camps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .found(owner, inventory, request.cell, request.facing),
+            _ => Err("unknown structure"),
+        }
+    });
+    let tool_catalog = sandbox::game::tool_catalog()
+        .with_build_tools([sandbox::game::tool_ids::FIRE_PIT], builder)
+        .expect("the fire pit is a single-cell placement tool");
     let materials = sandbox::game::manifest();
     let profiles = sandbox::game::contact_damage_profiles();
     let serve_result = if let Some(credentials) = credentials {
@@ -995,6 +1023,18 @@ fn run_serve(args: Args) -> ExitCode {
     }
 }
 
+/// The player's sites for a progression response.
+fn site_list(
+    camps: &std::sync::Mutex<sandbox::camp::Camps>,
+    player_id: Option<spall_protocol::PlayerId>,
+    session: spall_protocol::SessionId,
+) -> Vec<spall_protocol::SiteEntry> {
+    camps
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sites(sandbox::camp::SiteOwner::new(player_id, session.slot().0))
+}
+
 fn sandbox_progression_response(
     inventory: &mut sandbox::game::Inventory,
     request: spall_protocol::ProgressionRequest,
@@ -1048,6 +1088,7 @@ fn sandbox_progression_response(
                 count: stack.count,
             })
             .collect(),
+        sites: Vec::new(),
     }
 }
 

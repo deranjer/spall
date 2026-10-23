@@ -19,6 +19,8 @@ pub(super) struct InteractiveApp {
     pub(super) pack_frame_at: Option<Instant>,
     /// The cursor, physical pixels, for hovering items in the open pack.
     pub(super) cursor_px: Option<[f32; 2]>,
+    /// "Make camp here" was clicked: send the build on the next frame.
+    pub(super) camp_pending: bool,
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
@@ -232,6 +234,7 @@ impl InteractiveApp {
             pack: Pack::new(),
             pack_frame_at: None,
             cursor_px: None,
+            camp_pending: false,
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),

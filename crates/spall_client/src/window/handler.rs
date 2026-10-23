@@ -100,6 +100,13 @@ impl ApplicationHandler for InteractiveApp {
                 self.set_cursor_locked(true);
             }
             WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if self.pack.is_open() && !ui_consumed => {
+                self.camp_pending = self.pack.hovered == Some(PackTarget::MakeCamp);
+            }
+            WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
@@ -470,6 +477,14 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 }
                 if let Some(pack_view) = &self.pack_view
+                    && self.pack.needs_ring(pack_view.as_ref())
+                    && let Some(replica) =
+                        self.session.replica.get().and_then(|r| r.try_lock().ok())
+                    && let Some(volume) = replica.terrain_volume()
+                {
+                    self.pack.set_ring_on(pack_view.as_ref(), volume);
+                }
+                if let Some(pack_view) = &self.pack_view
                     && self.pack.is_shown()
                 {
                     overlay.extend(self.pack.instances(pack_view.as_ref()));
@@ -612,16 +627,16 @@ impl ApplicationHandler for InteractiveApp {
                                     .collect();
                                 let scale = renderer.ui_scale();
                                 let anchors: Vec<_> =
-                                    projected.iter().map(|(l, at)| (l.item, *at)).collect();
+                                    projected.iter().map(|(l, at)| (l.target, *at)).collect();
                                 self.pack.hovered = self.cursor_px.and_then(|[x, y]| {
-                                    hovered_item(&anchors, [x / scale, y / scale])
+                                    hovered_target(&anchors, [x / scale, y / scale])
                                 });
                                 projected
                                     .into_iter()
                                     .map(|(label, at)| PackLabelView {
                                         at,
-                                        hovered: label.item.is_some()
-                                            && label.item == self.pack.hovered,
+                                        hovered: label.target.is_some()
+                                            && label.target == self.pack.hovered,
                                         text: label.text,
                                     })
                                     .collect()
@@ -707,6 +722,23 @@ impl ApplicationHandler for InteractiveApp {
                                 dir,
                                 self.hammer_radius,
                             ));
+                        }
+                        if std::mem::take(&mut self.camp_pending)
+                            && let (Some(pack_view), Some((eye, _))) = (&self.pack_view, cam)
+                            && let (Some(camp), Some(spot)) =
+                                (pack_view.camp_tool(), self.pack.camp_spot())
+                        {
+                            let id = self.next_action_id;
+                            self.next_action_id += 1;
+                            self.session.push_action(tool_request(
+                                id,
+                                camp.tool,
+                                spall_protocol::ActionKind::Place,
+                                eye,
+                                (spot - eye).normalize_or(Vec3::NEG_Y),
+                                0,
+                            ));
+                            self.pack.refresh_soon();
                         }
                         if self.torch_pending {
                             self.torch_pending = false;
