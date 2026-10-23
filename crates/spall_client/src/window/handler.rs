@@ -131,12 +131,14 @@ impl ApplicationHandler for InteractiveApp {
                 self.cursor_px = Some([position.x as f32, position.y as f32]);
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if ui_consumed {
-                    return;
-                }
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
+                // Yakui sinks Tab for its focus navigation even with no
+                // widget focused; Tab is the pack's key.
+                if ui_consumed && code != KeyCode::Tab {
+                    return;
+                }
                 let held = event.state == ElementState::Pressed;
                 // Tab or Esc rolls the pack up; walking or jumping gets up
                 // and goes.
