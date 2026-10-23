@@ -54,7 +54,3 @@ name = "region-origin-bench"
 path = "src/bin/region_origin_bench.rs"
 required-features = ["bench"]
 
-[[bin]]
-name = "region-coordination-bench"
-path = "src/bin/region_coordination_bench.rs"
-required-features = ["bench"]

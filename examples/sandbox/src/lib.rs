@@ -17,6 +17,8 @@ pub mod editor_scene;
 pub mod game;
 #[cfg(feature = "client")]
 pub mod pack_view;
+#[cfg(feature = "client")]
+pub mod player_view;
 pub mod progression_store;
 pub mod worldgen_scene;
 

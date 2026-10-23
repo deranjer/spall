@@ -1,12 +1,11 @@
 //! Live creature motion frames.
 //!
-//! Ownership records (topology, sources, birth state) change only through
-//! ordered lifecycle transactions. What moves every tick is the root pose and
-//! which locomotion the animal is performing; that travels in these frames,
-//! sampled from the authoritative physics body. A frame is a presentation
-//! update: it never creates, retires or edits a creature, and a client ignores
-//! entries for creatures it does not hold or that are not newer than the one it
-//! already applied.
+//! Creatures appear and disappear through ordered [`crate::CreatureSpawn`] and
+//! [`crate::CreatureDespawn`] records. What moves every tick is the root pose and
+//! which locomotion the animal is performing; that travels in these frames. A
+//! frame is a presentation update: it never creates, retires or edits a
+//! creature, and a client ignores entries for creatures it does not hold or that
+//! are not newer than the one it already applied.
 
 use crate::records::WIRE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
@@ -23,7 +22,7 @@ pub struct CreatureMotionEntry {
     /// Unit quaternion `[x, y, z, w]`.
     pub rotation_xyzw: [f32; 4],
     pub linear_velocity_m_s: [f32; 3],
-    /// Game-defined locomotion selector, matching `CreatureStateV1::locomotion_tag`.
+    /// Game-defined locomotion selector, matching `CreatureRecord::locomotion_tag`.
     pub locomotion_tag: u8,
     /// Clip phase in server ticks at `server_tick`.
     pub clip_phase_tick: u64,
@@ -32,7 +31,6 @@ pub struct CreatureMotionEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreatureMotionFrame {
     pub schema: u16,
-    pub world_epoch: u64,
     pub server_tick: u64,
     pub entries: Vec<CreatureMotionEntry>,
 }
@@ -46,9 +44,6 @@ impl Record for CreatureMotionFrame {
                 "unsupported creature motion schema",
             ));
         }
-        if self.world_epoch == 0 {
-            return Err(RecordError::Inconsistent("creature motion epoch is zero"));
-        }
         if self.entries.len() > MAX_CREATURE_MOTION_ENTRIES {
             return Err(RecordError::OutOfRange {
                 field: "CreatureMotionFrame.entries",
@@ -56,12 +51,9 @@ impl Record for CreatureMotionFrame {
             });
         }
         for entry in &self.entries {
-            let rotation_len_sq: f32 = entry.rotation_xyzw.iter().map(|v| v * v).sum();
             if entry.creature_id == 0
-                || entry.translation_m.iter().any(|v| !v.is_finite())
                 || entry.linear_velocity_m_s.iter().any(|v| !v.is_finite())
-                || entry.rotation_xyzw.iter().any(|v| !v.is_finite())
-                || (rotation_len_sq - 1.0).abs() > 1.0e-3
+                || !crate::creature::pose_is_valid(&entry.translation_m, &entry.rotation_xyzw)
             {
                 return Err(RecordError::Inconsistent("invalid creature motion entry"));
             }
@@ -98,7 +90,6 @@ mod tests {
     fn frame(entries: Vec<CreatureMotionEntry>) -> CreatureMotionFrame {
         CreatureMotionFrame {
             schema: WIRE_SCHEMA_VERSION,
-            world_epoch: 1,
             server_tick: 100,
             entries,
         }
@@ -137,9 +128,6 @@ mod tests {
         let mut wrong = frame(vec![entry(1)]);
         wrong.schema = 9;
         assert!(wrong.validate().is_err());
-        let mut no_epoch = frame(vec![entry(1)]);
-        no_epoch.world_epoch = 0;
-        assert!(no_epoch.validate().is_err());
         let too_many = frame((1..=300).map(entry).collect());
         assert!(too_many.validate().is_err());
     }

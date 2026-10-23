@@ -1,7 +1,15 @@
-//! Converts bounded authoritative snow tile frames into camera-local renderer
-//! geometry. Exposure is revalidated against the current immutable terrain
-//! replica; absent/failed bricks, stale revisions, and unknown above-cells are
-//! never treated as exposed air.
+//! Turns authoritative snow tile frames into per-tile fine-voxel meshes.
+//!
+//! Exposure is revalidated against the current immutable terrain replica: a
+//! face stays only while its cell below is solid and the cell above is air.
+//! Absent or failed bricks are never treated as air, but they also never make
+//! existing snow vanish: a cell whose geometry is momentarily unknown keeps what
+//! it showed. A terrain revision change alone does not hide snow either, since
+//! the sampled geometry is what decides. Every update replaces a tile's mesh
+//! whole, so snow never flickers out while a replacement is built.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use spall_core::GlobalCell;
 use spall_protocol::WIRE_SCHEMA_VERSION;
@@ -9,39 +17,86 @@ use spall_protocol::snow::{
     SNOW_MAX_DEPTH_Q16, SNOW_MIN_FOOTPRINT_DEPTH_Q16, SNOW_TILE_CELLS, SnowSurface,
     SnowSurfaceFrame,
 };
-use spall_render::{SnowFootprintMark, SnowSurfacePatch};
+use spall_render::vertex::GpuVertex;
+use spall_render::{
+    SnowBeyond, SnowFootprintMark, SnowMesh, SnowNeighbours, SnowTile, SnowTileKey, mesh_tile,
+};
 use spall_voxel::{Sample, Volume};
 
 const CELL_M: f32 = 0.25;
-const CAMERA_BUCKET_M: f32 = 8.0;
+const TILE_M: f32 = 4.0;
 /// Default draw radius; the window sets it to the terrain view distance.
 const CAMERA_RADIUS_M: f32 = 72.0;
-const MAX_INPUT_FRAMES: usize = 4_096;
-const MIN_RENDER_DEPTH_Q16: u16 = 33; // About 0.5 mm; zero-depth cohorts stay invisible.
+const MAX_INPUT_FRAMES: usize = 8_192;
+/// Tiles nearer than this are meshed with 6.25 cm columns; they go back to
+/// cell-sized columns only beyond the outer radius, so a camera hovering at the
+/// boundary does not flip a tile every update.
+const FINE_IN_M: f32 = 14.0;
+const FINE_OUT_M: f32 = 18.0;
+/// Tiles stay resident this much beyond the draw radius before they are dropped.
+const KEEP_MARGIN_M: f32 = 8.0;
 
 /// Compact counters for weather HUDs and bounded capture diagnostics.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct SnowPresentationStats {
     pub frames_considered: usize,
-    pub surface_cohorts: usize,
-    pub confirmed_faces: usize,
+    pub tiles: usize,
+    pub fine_tiles: usize,
     pub rendered_faces: usize,
-    pub patches: usize,
     pub footprints: usize,
+    /// Mesh quads of packed (carved) snow across the resident tiles.
+    pub carved_quads: usize,
     pub max_depth_mm: u16,
-    pub cap_limited_surfaces: usize,
-    pub revision_mismatches: usize,
     pub hidden_or_unknown_faces: usize,
+    /// Faces the server marked but the terrain replica shows solid-free or covered.
+    pub stale_faces: usize,
+    /// Distance to the nearest frame tile, metres.
+    pub nearest_frame_m: f32,
+    /// Resident triangles over all tile meshes.
+    pub triangles: usize,
+    /// Tiles whose mesh is out of date and waits for the next update.
+    pub pending_tiles: usize,
+    /// Wall time of the tile meshing done by the latest update.
+    pub last_build_ms: f32,
+    pub last_rebuilt_tiles: usize,
 }
-/// Cached camera-local snow mesh inputs. Call `update` when frames publish or
-/// the camera moves into another 8 m bucket; a stable frame/volume/bucket key
-/// returns the same slices without rescanning terrain cells.
+
+/// Mesh changes to apply to the renderer. Each upsert replaces a tile whole;
+/// `removed` lists tiles that no longer have snow.
 #[derive(Debug, Default)]
+pub struct SnowMeshUpdate {
+    pub upserts: Vec<(SnowTileKey, Vec<GpuVertex>, Vec<u32>)>,
+    pub removed: Vec<SnowTileKey>,
+}
+
+struct Validated {
+    stale: usize,
+    epoch: u64,
+    seq: u64,
+    terrain: u64,
+    depth_q16: [u16; 256],
+    marks: Vec<SnowFootprintMark>,
+    hidden: usize,
+}
+
+struct TileEntry {
+    valid: Validated,
+    fine: bool,
+    /// Hash of the inputs the resident mesh was built from; `None` before the first build.
+    built: Option<u64>,
+    has_mesh: bool,
+    triangles: usize,
+    carved_quads: usize,
+    distance_m: f32,
+    seen: u64,
+}
+
+/// Per-tile snow meshes and the cached validation behind them.
+#[derive(Default)]
 pub struct SnowPresentation {
     radius_m: f32,
-    cache_key: Option<u64>,
-    patches: Vec<SnowSurfacePatch>,
-    footprints: Vec<SnowFootprintMark>,
+    tiles: HashMap<SnowTileKey, TileEntry>,
+    update_counter: u64,
     stats: SnowPresentationStats,
 }
 
@@ -53,224 +108,311 @@ impl SnowPresentation {
         }
     }
 
-    /// Sets how far from the camera snow is generated. A change invalidates the
-    /// cached geometry.
+    /// Sets how far from the camera snow is generated. Tiles beyond it are
+    /// dropped by the next update.
     pub fn set_radius_m(&mut self, radius_m: f32) {
-        let radius_m = radius_m.clamp(16.0, 128.0);
-        if (radius_m - self.radius_m).abs() > f32::EPSILON {
-            self.radius_m = radius_m;
-            self.cache_key = None;
-        }
+        self.radius_m = radius_m.clamp(16.0, 128.0);
     }
 
-    /// Diagnostic counters from the current cached mesh.
     pub fn stats(&self) -> SnowPresentationStats {
         self.stats
     }
 
-    /// Returns merged exposed-face rectangles and clipped footprint marks.
-    /// `camera` is in world metres; the volume uses quarter-metre cells.
-    pub fn update<'a, F: std::borrow::Borrow<SnowSurfaceFrame>>(
-        &'a mut self,
+    /// True while some tile's mesh is stale (a time budget cut the last update
+    /// short); call `update` again soon.
+    pub fn pending(&self) -> bool {
+        self.stats.pending_tiles > 0
+    }
+
+    /// Tiles that currently have a mesh in the renderer.
+    pub fn resident_keys(&self) -> Vec<SnowTileKey> {
+        self.tiles
+            .iter()
+            .filter(|(_, tile)| tile.has_mesh)
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    /// Validates changed frames and rebuilds stale tile meshes nearest-first
+    /// until `budget` is spent. `camera` is in world metres; the volume uses
+    /// quarter-metre cells.
+    pub fn update<F: std::borrow::Borrow<SnowSurfaceFrame>>(
+        &mut self,
         frames: &[F],
         volume: &Volume,
         camera: [f32; 3],
-    ) -> (&'a [SnowSurfacePatch], &'a [SnowFootprintMark]) {
-        let frames: Vec<&SnowSurfaceFrame> =
-            frames.iter().map(std::borrow::Borrow::borrow).collect();
-        let frames = frames.as_slice();
+        budget: Duration,
+    ) -> SnowMeshUpdate {
+        let mut out = SnowMeshUpdate::default();
         if camera.iter().any(|value| !value.is_finite())
             || (volume.cell_size().metres() - f64::from(CELL_M)).abs() > f64::EPSILON
         {
-            self.cache_key = None;
-            self.patches.clear();
-            self.footprints.clear();
+            out.removed = self.resident_keys();
+            self.tiles.clear();
             self.stats = SnowPresentationStats::default();
-            return (&self.patches, &self.footprints);
+            return out;
         }
-        let camera_bucket = camera.map(|value| (value / CAMERA_BUCKET_M).floor() as i64);
-        let key = cache_key(frames, volume.state_stamp(), camera_bucket);
-        if self.cache_key == Some(key) {
-            return (&self.patches, &self.footprints);
-        }
-        self.cache_key = Some(key);
-        self.patches.clear();
-        self.footprints.clear();
-        self.stats = SnowPresentationStats::default();
-        if frames.is_empty() {
-            return (&self.patches, &self.footprints);
-        }
-
+        self.update_counter += 1;
         let current_epoch = frames
             .iter()
-            .map(|frame| frame.world_epoch)
+            .map(|frame| frame.borrow().world_epoch)
             .max()
             .unwrap_or(0);
-        let radius_m = self.radius_m;
-        let mut nearby: Vec<&SnowSurfaceFrame> = frames
-            .iter()
-            .copied()
-            .filter(|frame| {
-                frame.schema == WIRE_SCHEMA_VERSION
-                    && frame.world_epoch == current_epoch
-                    && tile_distance_squared(frame, camera) <= radius_m * radius_m
-            })
-            .collect();
-        nearby.sort_by(|a, b| {
-            tile_distance_squared(a, camera)
-                .total_cmp(&tile_distance_squared(b, camera))
-                .then_with(|| a.tile_z.cmp(&b.tile_z))
-                .then_with(|| a.tile_x.cmp(&b.tile_x))
-                .then_with(|| a.top_cell_y.cmp(&b.top_cell_y))
-        });
-        nearby.truncate(MAX_INPUT_FRAMES);
-        self.stats.frames_considered = nearby.len();
-
-        let mut patch_budget = spall_render::snow::MAX_SNOW_PATCHES;
-        let mut mark_budget = spall_render::snow::MAX_SNOW_FOOTPRINTS;
-        'frames: for frame in nearby {
-            let tile_min_x = i64::from(frame.tile_x) * i64::from(SNOW_TILE_CELLS);
-            let tile_min_z = i64::from(frame.tile_z) * i64::from(SNOW_TILE_CELLS);
-            for surface in &frame.surfaces {
-                if patch_budget == 0 {
-                    break 'frames;
-                }
-                if surface.top_cell_y != frame.top_cell_y
-                    || surface.depth_q16 < MIN_RENDER_DEPTH_Q16
-                    || surface.depth_q16 > SNOW_MAX_DEPTH_Q16
-                    || surface.exposed_faces.iter().all(|mask| *mask == 0)
-                {
-                    continue;
-                }
-                self.stats.surface_cohorts += 1;
-                self.stats.max_depth_mm = self
-                    .stats
-                    .max_depth_mm
-                    .max(((u32::from(surface.depth_q16) * 1_000) / 65_536) as u16);
-                let (valid_faces, revision_mismatches, hidden_or_unknown) =
-                    validate_surface_faces(surface, tile_min_x, tile_min_z, volume);
-                self.stats.revision_mismatches += revision_mismatches;
-                self.stats.hidden_or_unknown_faces += hidden_or_unknown;
-                let face_count = valid_faces
-                    .iter()
-                    .map(|word| word.count_ones() as usize)
-                    .sum::<usize>();
-                self.stats.confirmed_faces += face_count;
-                let rects = greedy_rectangles(valid_faces);
-                if rects.len() > patch_budget {
-                    self.stats.cap_limited_surfaces += 1;
-                    break 'frames;
-                }
-                self.stats.rendered_faces += face_count;
-                patch_budget -= rects.len();
-                let depth_m = f32::from(surface.depth_q16) / 65_536.0;
-                for (x, z, width, height) in rects {
-                    let min_x = tile_min_x + x as i64;
-                    let min_z = tile_min_z + z as i64;
-                    self.patches.push(SnowSurfacePatch {
-                        centre: [
-                            (min_x as f32 + width as f32 * 0.5) * CELL_M,
-                            (frame.top_cell_y as f32 + 1.0) * CELL_M,
-                            (min_z as f32 + height as f32 * 0.5) * CELL_M,
-                        ],
-                        half_extent_xz: [width as f32 * CELL_M * 0.5, height as f32 * CELL_M * 0.5],
-                        depth_m,
-                        variation: u32::from_le_bytes(
-                            surface.id.0[..4].try_into().expect("four ID bytes"),
-                        ),
-                    });
-                }
-                if mark_budget > 0 && surface.depth_q16 >= SNOW_MIN_FOOTPRINT_DEPTH_Q16 {
-                    for mark in frame.footprints.iter().filter(|mark| {
-                        mark.surface_id == surface.id
-                            && mark.geometry_revision == surface.geometry_revision
-                            && mark.contact_cell[1] == surface.top_cell_y
-                            && face_valid(&valid_faces, mark.contact_cell, tile_min_x, tile_min_z)
-                    }) {
-                        if mark_budget == 0 {
-                            break;
-                        }
-                        let [cell_x, cell_y, cell_z] = mark.contact_cell;
-                        let origin_x = cell_x as f32 * CELL_M;
-                        let origin_z = cell_z as f32 * CELL_M;
-                        let x = origin_x + f32::from(mark.offset_mm[0]) * 0.001;
-                        let z = origin_z + f32::from(mark.offset_mm[1]) * 0.001;
-                        self.footprints.push(SnowFootprintMark {
-                            centre: [
-                                x,
-                                (cell_y as f32 + 1.0) * CELL_M + depth_m.max(0.0015) + 0.0015,
-                                z,
-                            ],
-                            cell_centre_xz: [origin_x + CELL_M * 0.5, origin_z + CELL_M * 0.5],
-                            heading_rad: f32::from(mark.heading_q15) / 32768.0
-                                * std::f32::consts::PI,
-                            foot: mark.foot,
-                            strength: f32::from(mark.strength_q8) / 255.0,
-                        });
-                        mark_budget -= 1;
+        let radius = self.radius_m;
+        let mut stats = SnowPresentationStats::default();
+        let mut considered = 0usize;
+        for frame in frames {
+            let frame = frame.borrow();
+            let key = (frame.tile_x, frame.tile_z, frame.top_cell_y);
+            if frame.schema != WIRE_SCHEMA_VERSION || frame.world_epoch != current_epoch {
+                continue;
+            }
+            let distance = tile_distance(frame.tile_x, frame.tile_z, camera);
+            let keep = if self.tiles.contains_key(&key) {
+                radius + KEEP_MARGIN_M
+            } else {
+                radius
+            };
+            if distance > keep || considered >= MAX_INPUT_FRAMES {
+                continue;
+            }
+            considered += 1;
+            let terrain = terrain_fingerprint(volume, key);
+            let previous = self.tiles.get(&key);
+            let fresh = previous.is_some_and(|tile| {
+                tile.valid.epoch == frame.world_epoch
+                    && tile.valid.seq == frame.snapshot_seq
+                    && tile.valid.terrain == terrain
+            });
+            if !fresh {
+                let valid = validate_frame(frame, terrain, volume, previous.map(|t| &t.valid));
+                match self.tiles.get_mut(&key) {
+                    Some(tile) => tile.valid = valid,
+                    None => {
+                        self.tiles.insert(
+                            key,
+                            TileEntry {
+                                valid,
+                                fine: distance < FINE_IN_M,
+                                built: None,
+                                has_mesh: false,
+                                triangles: 0,
+                                carved_quads: 0,
+                                distance_m: distance,
+                                seen: 0,
+                            },
+                        );
                     }
                 }
             }
+            let tile = self.tiles.get_mut(&key).expect("inserted above");
+            tile.seen = self.update_counter;
+            tile.distance_m = distance;
+            tile.fine = if distance < FINE_IN_M {
+                true
+            } else if distance > FINE_OUT_M {
+                false
+            } else {
+                tile.fine
+            };
         }
-        self.stats.patches = self.patches.len();
-        self.stats.footprints = self.footprints.len();
-        (&self.patches, &self.footprints)
+        stats.frames_considered = considered;
+        stats.nearest_frame_m = self
+            .tiles
+            .values()
+            .map(|tile| tile.distance_m)
+            .fold(f32::INFINITY, f32::min);
+        let counter = self.update_counter;
+        self.tiles.retain(|key, tile| {
+            let keep = tile.seen == counter;
+            if !keep && tile.has_mesh {
+                out.removed.push(*key);
+            }
+            keep
+        });
+
+        // Which tiles need a new mesh, nearest first.
+        let mut stale: Vec<(SnowTileKey, u64)> = self
+            .tiles
+            .iter()
+            .filter_map(|(key, tile)| {
+                let stamp = self.mesh_stamp(*key, tile);
+                (tile.built != Some(stamp)).then_some((*key, stamp))
+            })
+            .collect();
+        stale.sort_by(|a, b| {
+            self.tiles[&a.0]
+                .distance_m
+                .total_cmp(&self.tiles[&b.0].distance_m)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let started = Instant::now();
+        let mut rebuilt = 0usize;
+        let mut built: Vec<(SnowTileKey, u64, usize, bool, usize)> = Vec::new();
+        for (key, stamp) in &stale {
+            if rebuilt > 0 && started.elapsed() >= budget {
+                break;
+            }
+            let tile = &self.tiles[key];
+            let data = SnowTile {
+                key: *key,
+                depth_q16: tile.valid.depth_q16,
+                fine: tile.fine,
+                marks: tile.valid.marks.clone(),
+            };
+            let mut mesh = SnowMesh::default();
+            mesh_tile(
+                &data,
+                &Neighbours {
+                    tiles: &self.tiles,
+                    volume,
+                },
+                &mut mesh,
+            );
+            let triangles = mesh.triangles();
+            let has_mesh = triangles > 0;
+            let carved = mesh
+                .vertices
+                .iter()
+                .filter(|v| v.material == spall_render::snow_mesh::SNOW_MATERIAL_PACKED)
+                .count()
+                / 4;
+            built.push((*key, *stamp, triangles, has_mesh, carved));
+            if has_mesh {
+                out.upserts.push((*key, mesh.vertices, mesh.indices));
+            } else if tile.has_mesh {
+                out.removed.push(*key);
+            }
+            rebuilt += 1;
+        }
+        for (key, stamp, triangles, has_mesh, carved) in built {
+            if let Some(tile) = self.tiles.get_mut(&key) {
+                tile.built = Some(stamp);
+                tile.has_mesh = has_mesh;
+                tile.triangles = triangles;
+                tile.carved_quads = carved;
+            }
+        }
+        stats.last_rebuilt_tiles = rebuilt;
+        stats.pending_tiles = stale.len() - rebuilt;
+        stats.last_build_ms = started.elapsed().as_secs_f32() * 1000.0;
+        for tile in self.tiles.values() {
+            stats.tiles += usize::from(tile.has_mesh);
+            stats.fine_tiles += usize::from(tile.has_mesh && tile.fine);
+            stats.triangles += tile.triangles;
+            stats.carved_quads += tile.carved_quads;
+            stats.hidden_or_unknown_faces += tile.valid.hidden;
+            stats.stale_faces += tile.valid.stale;
+            stats.footprints += if tile.fine { tile.valid.marks.len() } else { 0 };
+            for depth in tile.valid.depth_q16.iter().filter(|d| **d > 0) {
+                stats.rendered_faces += 1;
+                stats.max_depth_mm = stats
+                    .max_depth_mm
+                    .max(((u32::from(*depth) * 1_000) / 65_536) as u16);
+            }
+        }
+        self.stats = stats;
+        out
+    }
+
+    /// Everything the tile's mesh depends on: its validated data and LOD, and
+    /// the same for the four tiles that border it at the same layer.
+    fn mesh_stamp(&self, key: SnowTileKey, tile: &TileEntry) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut write = |value: u64| {
+            for byte in value.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        let mut absorb = |entry: Option<&TileEntry>| match entry {
+            Some(entry) => {
+                write(entry.valid.seq);
+                write(entry.valid.terrain);
+                write(u64::from(entry.fine));
+            }
+            None => write(u64::MAX),
+        };
+        absorb(Some(tile));
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            absorb(self.tiles.get(&(key.0 + dx, key.1 + dz, key.2)));
+        }
+        hash
     }
 }
 
-fn cache_key(frames: &[&SnowSurfaceFrame], volume_stamp: u64, camera_bucket: [i64; 3]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut write = |value: u64| {
-        for byte in value.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100_0000_01b3);
+struct Neighbours<'a> {
+    tiles: &'a HashMap<SnowTileKey, TileEntry>,
+    volume: &'a Volume,
+}
+
+impl SnowNeighbours for Neighbours<'_> {
+    fn beyond(&self, cell_x: i64, cell_z: i64, layer_y: i32) -> SnowBeyond {
+        let side = i64::from(SNOW_TILE_CELLS);
+        let key = (
+            cell_x.div_euclid(side) as i32,
+            cell_z.div_euclid(side) as i32,
+            layer_y,
+        );
+        if let Some(tile) = self.tiles.get(&key) {
+            let local = (cell_z.rem_euclid(side) * side + cell_x.rem_euclid(side)) as usize;
+            let depth = tile.valid.depth_q16[local];
+            if depth > 0 {
+                return SnowBeyond::Snow {
+                    depth_q16: depth,
+                    fine: tile.fine,
+                };
+            }
+        }
+        let above = GlobalCell::new(cell_x, i64::from(layer_y) + 1, cell_z);
+        match self.volume.sample(above) {
+            Ok(Sample::Empty { .. }) => SnowBeyond::Open,
+            // Solid or unknown: hide the side rather than draw it inside terrain.
+            _ => SnowBeyond::Wall,
+        }
+    }
+}
+
+fn terrain_fingerprint(volume: &Volume, key: SnowTileKey) -> u64 {
+    let x = i64::from(key.0) * i64::from(SNOW_TILE_CELLS);
+    let z = i64::from(key.1) * i64::from(SNOW_TILE_CELLS);
+    let y = i64::from(key.2);
+    let revision = |y: i64| {
+        let (brick, _) = GlobalCell::new(x, y, z).split();
+        match volume.brick_revision(brick) {
+            Ok(Some(revision)) => revision.0.wrapping_add(1),
+            Ok(None) => 0,
+            Err(_) => u64::MAX,
         }
     };
-    write(volume_stamp);
-    for coordinate in camera_bucket {
-        write(coordinate as u64);
-    }
-    write(frames.len() as u64);
-    for frame in frames {
-        write(frame.world_epoch);
-        write(frame.snapshot_seq);
-        write(frame.world_revision);
-        write(frame.tile_x as u32 as u64);
-        write(frame.tile_z as u32 as u64);
-        write(frame.top_cell_y as u32 as u64);
-    }
-    hash
+    revision(y).rotate_left(17) ^ revision(y + 1)
 }
 
-fn tile_distance_squared(frame: &SnowSurfaceFrame, camera: [f32; 3]) -> f32 {
-    let min_x = frame.tile_x as f32 * 4.0;
-    let min_z = frame.tile_z as f32 * 4.0;
-    let dx = if camera[0] < min_x {
-        min_x - camera[0]
-    } else if camera[0] > min_x + 4.0 {
-        camera[0] - min_x - 4.0
-    } else {
-        0.0
+fn tile_distance(tile_x: i32, tile_z: i32, camera: [f32; 3]) -> f32 {
+    let axis = |tile: i32, value: f32| {
+        let min = tile as f32 * TILE_M;
+        if value < min {
+            min - value
+        } else if value > min + TILE_M {
+            value - min - TILE_M
+        } else {
+            0.0
+        }
     };
-    let dz = if camera[2] < min_z {
-        min_z - camera[2]
-    } else if camera[2] > min_z + 4.0 {
-        camera[2] - min_z - 4.0
-    } else {
-        0.0
-    };
-    dx * dx + dz * dz
+    axis(tile_x, camera[0]).hypot(axis(tile_z, camera[2]))
 }
 
+/// Samples each exposed face. Returns the bitmasks of faces that are confirmed
+/// and of faces whose geometry is unknown (not yet loaded, or failed).
 fn validate_surface_faces(
     surface: &SnowSurface,
     tile_min_x: i64,
     tile_min_z: i64,
     volume: &Volume,
-) -> ([u64; 4], usize, usize) {
+    stale: &mut usize,
+) -> ([u64; 4], [u64; 4]) {
     let mut valid = [0u64; 4];
-    let mut revision_mismatches = 0;
-    let mut hidden_or_unknown = 0;
+    let mut unknown = [0u64; 4];
     let y = i64::from(surface.top_cell_y);
     for index in 0..256 {
         let bit = 1u64 << (index % 64);
@@ -281,18 +423,6 @@ fn validate_surface_faces(
         let z = tile_min_z + (index / 16) as i64;
         let solid = GlobalCell::new(x, y, z);
         let above = GlobalCell::new(x, y + 1, z);
-        let (brick, _) = solid.split();
-        match volume.brick_revision(brick) {
-            Ok(Some(revision)) if revision.0 == surface.geometry_revision => {}
-            Ok(Some(_)) => {
-                revision_mismatches += 1;
-                continue;
-            }
-            Ok(None) | Err(_) => {
-                hidden_or_unknown += 1;
-                continue;
-            }
-        }
         match (volume.sample(solid), volume.sample(above)) {
             (Ok(Sample::Filled(_)), Ok(Sample::Empty { .. })) => valid[index / 64] |= bit,
             (Ok(Sample::Filled(_)), Err(spall_voxel::AccessError::OutOfBounds { .. }))
@@ -301,13 +431,87 @@ fn validate_surface_faces(
                 }) =>
             {
                 // The declared world ceiling is known exterior sky. An absent
-                // in-bounds brick is still unknown and takes the default path.
+                // in-bounds brick is still unknown.
                 valid[index / 64] |= bit;
             }
-            _ => hidden_or_unknown += 1,
+            (Ok(Sample::Empty { .. }), _) | (Ok(Sample::Filled(_)), Ok(Sample::Filled(_))) => {
+                // Known to be gone or covered: the authoritative face is stale.
+                *stale += 1;
+            }
+            _ => unknown[index / 64] |= bit,
         }
     }
-    (valid, revision_mismatches, hidden_or_unknown)
+    (valid, unknown)
+}
+
+fn validate_frame(
+    frame: &SnowSurfaceFrame,
+    terrain: u64,
+    volume: &Volume,
+    previous: Option<&Validated>,
+) -> Validated {
+    let tile_min_x = i64::from(frame.tile_x) * i64::from(SNOW_TILE_CELLS);
+    let tile_min_z = i64::from(frame.tile_z) * i64::from(SNOW_TILE_CELLS);
+    let mut depth_q16 = [0u16; 256];
+    let mut hidden = 0usize;
+    let mut stale = 0usize;
+    let mut face_masks: Vec<(&SnowSurface, [u64; 4])> = Vec::new();
+    for surface in &frame.surfaces {
+        if surface.top_cell_y != frame.top_cell_y
+            || surface.depth_q16 > SNOW_MAX_DEPTH_Q16
+            || surface.exposed_faces.iter().all(|mask| *mask == 0)
+        {
+            continue;
+        }
+        let (valid, unknown) =
+            validate_surface_faces(surface, tile_min_x, tile_min_z, volume, &mut stale);
+        for index in 0..256 {
+            let bit = 1u64 << (index % 64);
+            if valid[index / 64] & bit != 0 {
+                depth_q16[index] = surface.depth_q16;
+            } else if unknown[index / 64] & bit != 0 {
+                hidden += 1;
+                // Unknown geometry keeps what the cell last showed, at the new depth.
+                if previous.is_some_and(|p| p.depth_q16[index] > 0) {
+                    depth_q16[index] = surface.depth_q16;
+                }
+            }
+        }
+        face_masks.push((surface, valid));
+    }
+    let mut marks = Vec::new();
+    for mark in &frame.footprints {
+        let Some((surface, valid)) = face_masks
+            .iter()
+            .find(|(surface, _)| surface.id == mark.surface_id)
+        else {
+            continue;
+        };
+        if surface.depth_q16 < SNOW_MIN_FOOTPRINT_DEPTH_Q16
+            || mark.contact_cell[1] != surface.top_cell_y
+            || !face_valid(valid, mark.contact_cell, tile_min_x, tile_min_z)
+        {
+            continue;
+        }
+        let [cell_x, _, cell_z] = mark.contact_cell;
+        marks.push(SnowFootprintMark {
+            centre_xz: [
+                cell_x as f32 * CELL_M + f32::from(mark.offset_mm[0]) * 0.001,
+                cell_z as f32 * CELL_M + f32::from(mark.offset_mm[1]) * 0.001,
+            ],
+            heading_rad: f32::from(mark.heading_q15) / 32768.0 * std::f32::consts::PI,
+            strength: f32::from(mark.strength_q8) / 255.0,
+        });
+    }
+    Validated {
+        stale,
+        epoch: frame.world_epoch,
+        seq: frame.snapshot_seq,
+        terrain,
+        depth_q16,
+        marks,
+        hidden,
+    }
 }
 
 fn face_valid(mask: &[u64; 4], cell: [i32; 3], tile_min_x: i64, tile_min_z: i64) -> bool {
@@ -320,81 +524,14 @@ fn face_valid(mask: &[u64; 4], cell: [i32; 3], tile_min_x: i64, tile_min_z: i64)
     mask[index / 64] & (1u64 << (index % 64)) != 0
 }
 
-/// Greedy, non-overlapping rectangles over a single validated 16×16 cohort.
-/// Cohorts/depth/Y layers are converted independently, so merging never bridges
-/// a sloped face, another surface, or an unexposed cell.
-fn greedy_rectangles(mask: [u64; 4]) -> Vec<(usize, usize, usize, usize)> {
-    let mut remaining = mask;
-    let mut result = Vec::new();
-    while let Some(index) = (0..4).find_map(|word| {
-        (remaining[word] != 0).then_some(word * 64 + remaining[word].trailing_zeros() as usize)
-    }) {
-        let x = index % 16;
-        let z = index / 16;
-        let mut width = 0;
-        while x + width < 16 && mask_bit(&remaining, x + width, z) {
-            width += 1;
-        }
-        let mut height = 1;
-        'rows: while z + height < 16 {
-            for dx in 0..width {
-                if !mask_bit(&remaining, x + dx, z + height) {
-                    break 'rows;
-                }
-            }
-            height += 1;
-        }
-        for dz in 0..height {
-            for dx in 0..width {
-                clear_mask_bit(&mut remaining, x + dx, z + dz);
-            }
-        }
-        result.push((x, z, width, height));
-    }
-    result
-}
-
-fn mask_bit(mask: &[u64; 4], x: usize, z: usize) -> bool {
-    let index = z * 16 + x;
-    mask[index / 64] & (1u64 << (index % 64)) != 0
-}
-
-fn clear_mask_bit(mask: &mut [u64; 4], x: usize, z: usize) {
-    let index = z * 16 + x;
-    mask[index / 64] &= !(1u64 << (index % 64));
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn greedy_rectangles_merge_flat_surfaces_without_crossing_holes() {
-        let mut mask = [0u64; 4];
-        for z in 0..3 {
-            for x in 0..4 {
-                if !(x == 2 && z == 1) {
-                    let index = z * 16 + x;
-                    mask[index / 64] |= 1u64 << (index % 64);
-                }
-            }
-        }
-        let rects = greedy_rectangles(mask);
-        let covered: usize = rects
-            .iter()
-            .map(|(_, _, width, height)| width * height)
-            .sum();
-        assert_eq!(covered, 11);
-        assert_eq!(rects.len(), 4);
-    }
-}
-
-#[cfg(test)]
-mod presentation_tests {
     use super::*;
     use spall_core::{BrickCoord, CellSizeCode, LocalCell, MaterialId, Revision, VolumeId};
     use spall_protocol::SnowFootprint;
     use spall_voxel::Brick;
+
+    const BUDGET: Duration = Duration::from_millis(500);
 
     fn surface(top_cell_y: i32, depth_q16: u16) -> SnowSurface {
         let mut exposed_faces = [0u64; 4];
@@ -424,9 +561,9 @@ mod presentation_tests {
         }
     }
 
-    fn plane(top_y: u8, add_above: bool) -> Volume {
+    fn plane(top_y: u8, add_above: bool, revision: u64) -> Volume {
         let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
-        let mut brick = Brick::uniform(MaterialId::AIR, Revision(1));
+        let mut brick = Brick::uniform(MaterialId::AIR, Revision(revision));
         assert!(brick.set_cell(LocalCell::new(0, top_y, 0).unwrap(), MaterialId(3),));
         if add_above && top_y < 31 {
             assert!(brick.set_cell(LocalCell::new(0, top_y + 1, 0).unwrap(), MaterialId(4),));
@@ -437,53 +574,38 @@ mod presentation_tests {
         volume
     }
 
+    const CAMERA: [f32; 3] = [0.5, 1.0, 0.5];
+
     #[test]
-    fn converter_keeps_only_current_revision_exposed_solid_faces() {
+    fn converter_keeps_only_exposed_solid_faces() {
         let mut presentation = SnowPresentation::new();
-        let camera = [0.5, 1.0, 0.5];
-        let supported = plane(0, false);
-        let (patches, _) = presentation.update(&[frame(0, 132)], &supported, camera);
-        assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].centre, [0.125, 0.25, 0.125]);
-        assert_eq!(patches[0].half_extent_xz, [0.125, 0.125]);
+        let update = presentation.update(&[frame(0, 20_000)], &plane(0, false, 1), CAMERA, BUDGET);
+        assert_eq!(update.upserts.len(), 1);
+        assert!(update.removed.is_empty());
+        assert_eq!(presentation.stats().rendered_faces, 1);
 
-        let roofed = plane(0, true);
-        let (patches, _) = presentation.update(&[frame(0, 132)], &roofed, camera);
-        assert!(
-            patches.is_empty(),
-            "a newly filled above-cell blocks stale snow"
-        );
-
-        let stale = plane(0, false);
-        let mut stale_frame = frame(0, 132);
-        stale_frame.surfaces[0].geometry_revision = 2;
-        let (patches, _) = presentation.update(&[stale_frame], &stale, camera);
-        assert!(
-            patches.is_empty(),
-            "a brick revision mismatch suppresses the face"
-        );
+        // A newly filled above-cell removes the snow.
+        let mut roofed = frame(0, 20_000);
+        roofed.snapshot_seq = 2;
+        let update = presentation.update(&[roofed], &plane(0, true, 2), CAMERA, BUDGET);
+        assert_eq!(update.removed, vec![(0, 0, 0)]);
+        assert_eq!(presentation.stats().rendered_faces, 0);
     }
 
     #[test]
-    fn unknown_above_brick_suppresses_snow_and_unknown_support_is_never_air() {
+    fn unknown_support_never_becomes_snow() {
         let mut presentation = SnowPresentation::new();
-        let top_of_brick = plane(31, false);
-        let (patches, _) = presentation.update(&[frame(31, 132)], &top_of_brick, [0.5, 8.0, 0.5]);
-        assert!(
-            patches.is_empty(),
-            "unloaded brick above the surface is unknown"
-        );
-
         let empty = Volume::new(VolumeId::new(2).unwrap(), CellSizeCode::Quarter);
-        let (patches, _) = presentation.update(&[frame(0, 132)], &empty, [0.5, 1.0, 0.5]);
-        assert!(
-            patches.is_empty(),
-            "unloaded support cell cannot receive snow"
-        );
+        let update = presentation.update(&[frame(0, 20_000)], &empty, CAMERA, BUDGET);
+        assert!(update.upserts.is_empty());
+        let top_of_brick = plane(31, false, 1);
+        let update =
+            presentation.update(&[frame(31, 20_000)], &top_of_brick, [0.5, 8.0, 0.5], BUDGET);
+        assert!(update.upserts.is_empty(), "unloaded brick above is unknown");
     }
 
     #[test]
-    fn declared_world_ceiling_is_known_sky_unlike_an_absent_in_bounds_brick() {
+    fn declared_world_ceiling_is_known_sky() {
         let bounds =
             spall_voxel::BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(0, 0, 0))
                 .unwrap();
@@ -494,37 +616,77 @@ mod presentation_tests {
             .insert_brick(BrickCoord::new(0, 0, 0), brick)
             .unwrap();
         let mut presentation = SnowPresentation::new();
-        let (patches, _) = presentation.update(&[frame(31, 132)], &volume, [0.5, 8.0, 0.5]);
-        assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].centre[1], 8.0);
+        let update = presentation.update(&[frame(31, 20_000)], &volume, [0.5, 8.0, 0.5], BUDGET);
+        assert_eq!(update.upserts.len(), 1);
     }
 
     #[test]
-    fn footprint_requires_a_deep_confirmed_contact_face_and_stays_in_its_cell() {
+    fn depth_changes_replace_the_tile_in_place_without_an_empty_frame() {
         let mut presentation = SnowPresentation::new();
-        let volume = plane(0, false);
-        let mut snapshot = frame(0, 132);
+        let terrain = plane(0, false, 1);
+        let first = presentation.update(&[frame(0, 12_000)], &terrain, CAMERA, BUDGET);
+        assert_eq!(first.upserts.len(), 1);
+
+        // Snow deepens, the frame's cohort is re-identified and the terrain
+        // revision moved on: the tile is replaced, never removed.
+        let mut deeper = frame(0, 24_000);
+        deeper.snapshot_seq = 2;
+        deeper.surfaces[0].geometry_revision = 2;
+        let second = presentation.update(&[deeper], &plane(0, false, 2), CAMERA, BUDGET);
+        assert!(second.removed.is_empty());
+        assert_eq!(second.upserts.len(), 1);
+        assert!(!second.upserts[0].1.is_empty());
+        let top = |update: &SnowMeshUpdate| {
+            update.upserts[0]
+                .1
+                .iter()
+                .map(|v| v.position[1])
+                .fold(f32::MIN, f32::max)
+        };
+        assert!(top(&second) > top(&first), "deeper snow stands taller");
+    }
+
+    #[test]
+    fn unknown_geometry_keeps_the_snow_it_showed() {
+        let mut presentation = SnowPresentation::new();
+        presentation.update(&[frame(0, 20_000)], &plane(0, false, 1), CAMERA, BUDGET);
+        let mut next = frame(0, 22_000);
+        next.snapshot_seq = 2;
+        let empty = Volume::new(VolumeId::new(2).unwrap(), CellSizeCode::Quarter);
+        let update = presentation.update(&[next], &empty, CAMERA, BUDGET);
+        assert!(update.removed.is_empty());
+        assert_eq!(update.upserts.len(), 1);
+        assert!(!update.upserts[0].1.is_empty());
+    }
+
+    #[test]
+    fn footprint_needs_a_confirmed_deep_face_and_far_tiles_skip_it() {
+        let mut presentation = SnowPresentation::new();
+        let volume = plane(0, false, 1);
+        let mut snapshot = frame(0, 20_000);
         snapshot.footprints.push(SnowFootprint {
             id: 1,
             surface_id: snapshot.surfaces[0].id,
             geometry_revision: 1,
             contact_cell: [0, 0, 0],
-            offset_mm: [240, 125],
+            offset_mm: [125, 125],
             heading_q15: 8192,
             foot: 1,
             created_tick: 119,
             strength_q8: 255,
         });
-        let (patches, marks) = presentation.update(&[snapshot.clone()], &volume, [0.5, 1.0, 0.5]);
-        assert_eq!(patches.len(), 1);
-        assert_eq!(marks.len(), 1);
-        assert_eq!(marks[0].foot, 1);
-        assert!(marks[0].centre[1] > patches[0].centre[1]);
-        assert!(marks[0].heading_rad > 0.0);
+        let update = presentation.update(&[snapshot.clone()], &volume, CAMERA, BUDGET);
+        assert_eq!(presentation.stats().footprints, 1);
+        let packed = update.upserts[0]
+            .1
+            .iter()
+            .filter(|v| v.material == spall_render::snow_mesh::SNOW_MATERIAL_PACKED)
+            .count();
+        assert!(packed > 0, "the print is carved into the mesh");
 
         snapshot.snapshot_seq += 1;
         snapshot.surfaces[0].depth_q16 = SNOW_MIN_FOOTPRINT_DEPTH_Q16 - 1;
-        let (_, marks) = presentation.update(&[snapshot], &volume, [0.5, 1.0, 0.5]);
-        assert!(marks.is_empty());
+        presentation.update(&[snapshot], &volume, CAMERA, BUDGET);
+        assert_eq!(presentation.stats().footprints, 0);
     }
 }

@@ -112,7 +112,6 @@ fn column_cut_client(
             target: spall_client::ScriptTarget::Terrain,
         }],
         movement_script: Vec::new(),
-        creature_catalog: None,
         late_join: false,
         baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,

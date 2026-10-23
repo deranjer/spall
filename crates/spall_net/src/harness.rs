@@ -334,6 +334,8 @@ pub async fn run_server_connection(
                     linear_velocity: [0.0; 3],
                     angular_velocity: [0.0; 3],
                     sleeping: false,
+                    endurance: 1.0,
+                    exhausted: false,
                 };
                 if conn.send_datagram(seq, &snap).await.is_err() {
                     break;

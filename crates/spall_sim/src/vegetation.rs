@@ -38,7 +38,7 @@ pub(crate) struct AuthoritativeVegetation {
     columns: ColumnMap,
     pending: BTreeMap<u64, Growth>,
     jobs: VecDeque<ClearJob>,
-    dirty: bool,
+    pub(crate) dirty: bool,
     /// The tick of the last growth edit submitted.
     last_growth_tick: Option<u64>,
 }

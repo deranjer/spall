@@ -65,9 +65,7 @@ pub fn classify(bumped_epoch: bool, tx: &TopologyTransaction) -> CommitClass {
             | TopologyOp::SplitOffBaseline { .. }
             | TopologyOp::SourcePatchBaseline { .. }
             | TopologyOp::SplitOffBulkBaseline { .. }
-            | TopologyOp::SourcePatchBulkBaseline { .. }
-            | TopologyOp::CreatureLifecycle { .. }
-            | TopologyOp::CreatureLifecycleBulk { .. } => 0,
+            | TopologyOp::SourcePatchBulkBaseline { .. } => 0,
         })
         .sum();
     if detached_cells >= LARGE_COLLAPSE_CELLS {

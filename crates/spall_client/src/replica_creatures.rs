@@ -1,44 +1,23 @@
-//! Replica-side creature ownership store.
+//! Replica-side creature store.
 //!
-//! Applies the ordered `CreatureLifecycle` operations of committed topology
-//! transactions through the same protocol reducer the server uses, so a replica
-//! converges on the authoritative portable records without any physics or
-//! rendering dependency. Live motion arrives separately; this store holds the
-//! ownership/topology records and the at-birth motion they were published with.
-//!
-//! The replica cannot know the server's exact shared volume counter (retired
-//! volume ids leave gaps), so it enforces what it can observe: creature ids and
-//! source volume ids must be monotone and unique. Exact allocator continuity is
-//! the server's invariant and is checked by the reducer there.
+//! Holds the creatures the server announced with `CreatureSpawn` (and removed
+//! with `CreatureDespawn`) and the motion samples that move them. The store has
+//! no physics or rendering dependency; the game draws what it holds. Motion for
+//! an id the replica does not hold, or no newer than what it already applied, is
+//! ignored.
 
 use std::{
-    collections::BTreeMap,
-    sync::Arc,
+    collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
 };
 
-use spall_core::{
-    CreatureAllocatorSnapshotV1, CreatureKey, STORE_SCHEMA_VERSION_U16, VolumeId, WorldId,
-};
-use spall_protocol::{
-    CreatureLifecycleCommitV4, CreatureLifecycleContextV1, CreatureLifecycleOperationV4,
-    CreatureOwnershipError, CreatureOwnershipRecordV4, CreatureStateError, OwnedCreatureCatalog,
-    TopologyOp, TopologyTransaction,
-};
+use spall_protocol::{CreatureMotionFrame, CreatureRecord, CreatureSpawn};
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum ReplicaCreatureError {
-    #[error("creature catalog: {0}")]
-    Catalog(#[from] CreatureStateError),
-    #[error("creature ownership: {0}")]
-    Ownership(#[from] CreatureOwnershipError),
-    #[error("creature belongs to a different world or epoch")]
-    World,
-    #[error("creature or source volume id is not newer than replica state")]
-    NotMonotone,
-    #[error("bulk lifecycle payload delivery is not supported yet")]
-    BulkUnsupported,
+    #[error("invalid creature record")]
+    Invalid,
 }
 
 /// One received root pose, stamped with its arrival time.
@@ -53,11 +32,17 @@ struct MotionSample {
     clip_phase_tick: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Newest received poses, oldest first; never empty. The render time lags the
+/// newest by [`CREATURE_RENDER_DELAY`], longer than the server's move interval,
+/// so keeping only the newest two left it before both: the creature held, then
+/// jumped when the next pose arrived.
+#[derive(Debug, Clone)]
 struct MotionTrack {
-    previous: Option<MotionSample>,
-    current: MotionSample,
+    samples: VecDeque<MotionSample>,
 }
+
+/// Enough poses to bracket the render time through a short delivery stall.
+const MAX_MOTION_SAMPLES: usize = 8;
 
 /// A creature's presented pose at a render instant.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,54 +60,34 @@ pub const CREATURE_RENDER_DELAY: Duration = Duration::from_millis(220);
 /// Longest a creature is extrapolated along its velocity past its newest sample.
 const MAX_EXTRAPOLATION: Duration = Duration::from_millis(150);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReplicaCreatures {
-    catalog: Arc<OwnedCreatureCatalog>,
-    identity: Option<(WorldId, u64)>,
-    next_creature_id: u64,
-    next_volume_floor: u64,
-    records: BTreeMap<CreatureKey, CreatureOwnershipRecordV4>,
+    records: BTreeMap<u64, CreatureRecord>,
     motion: BTreeMap<u64, MotionTrack>,
     motion_applied: u64,
     revision: u64,
 }
 
 impl ReplicaCreatures {
-    pub fn new(catalog: Arc<OwnedCreatureCatalog>) -> Self {
-        Self {
-            catalog,
-            identity: None,
-            next_creature_id: 1,
-            next_volume_floor: 1,
-            records: BTreeMap::new(),
-            motion: BTreeMap::new(),
-            motion_applied: 0,
-            revision: 0,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Drops every record and identity, keeping the catalog. A full baseline
-    /// replaces the world, so previous creatures must not survive it.
+    /// Drops every creature. A full baseline replaces the world, so previous
+    /// creatures must not survive it.
     pub fn reset(&mut self) {
-        self.identity = None;
-        self.next_creature_id = 1;
-        self.next_volume_floor = 1;
         self.records.clear();
         self.motion.clear();
         self.revision = self.revision.saturating_add(1);
     }
 
-    /// Pins the world identity before any record arrives (baseline/handshake).
-    pub fn bind_world(&mut self, world_id: WorldId, epoch: u64) {
-        self.identity = Some((world_id, epoch));
-    }
-
-    pub fn records(&self) -> impl Iterator<Item = &CreatureOwnershipRecordV4> {
+    /// Creatures sorted by id.
+    pub fn records(&self) -> impl Iterator<Item = &CreatureRecord> {
         self.records.values()
     }
 
-    pub fn get(&self, key: &CreatureKey) -> Option<&CreatureOwnershipRecordV4> {
-        self.records.get(key)
+    pub fn get(&self, creature_id: u64) -> Option<&CreatureRecord> {
+        self.records.get(&creature_id)
     }
 
     pub fn len(&self) -> usize {
@@ -133,43 +98,39 @@ impl ReplicaCreatures {
         self.records.is_empty()
     }
 
-    /// Bumps on every applied lifecycle change so renderers can poll cheaply.
+    /// Bumps on every spawn and despawn so renderers can poll cheaply.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    pub fn has_lifecycle_ops(tx: &TopologyTransaction) -> bool {
-        tx.ops.iter().any(|op| {
-            matches!(
-                op,
-                TopologyOp::CreatureLifecycle { .. } | TopologyOp::CreatureLifecycleBulk { .. }
-            )
-        })
+    /// Installs a creature. Idempotent: a repeated spawn replaces the record and
+    /// drops its motion, so a join list and the live stream can never disagree.
+    pub fn spawn(&mut self, spawn: &CreatureSpawn) -> Result<(), ReplicaCreatureError> {
+        spall_protocol::Record::validate(spawn).map_err(|_| ReplicaCreatureError::Invalid)?;
+        let id = spawn.creature.creature_id;
+        self.records.insert(id, spawn.creature.clone());
+        self.motion.remove(&id);
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Removes a creature. `false` if the replica did not hold it.
+    pub fn despawn(&mut self, creature_id: u64) -> bool {
+        self.motion.remove(&creature_id);
+        let held = self.records.remove(&creature_id).is_some();
+        if held {
+            self.revision = self.revision.saturating_add(1);
+        }
+        held
     }
 
     /// Applies a presentation frame. Entries for creatures this replica does not
-    /// hold, from another world epoch, or not newer than the one already applied
-    /// are ignored. Returns how many entries were applied.
-    pub fn apply_motion(
-        &mut self,
-        frame: &spall_protocol::CreatureMotionFrame,
-        now: Instant,
-    ) -> usize {
-        if let Some((_, epoch)) = self.identity
-            && frame.world_epoch != epoch
-        {
-            return 0;
-        }
+    /// hold, or not newer than the one already applied, are ignored. Returns how
+    /// many entries were applied.
+    pub fn apply_motion(&mut self, frame: &CreatureMotionFrame, now: Instant) -> usize {
         let mut applied = 0;
         for entry in &frame.entries {
-            let Some(record) = self
-                .records
-                .values()
-                .find(|r| r.state.key.creature_id.get() == entry.creature_id)
-            else {
-                continue;
-            };
-            if record.state.lifecycle != spall_protocol::CreatureLifecycleState::Alive {
+            if !self.records.contains_key(&entry.creature_id) {
                 continue;
             }
             let sample = MotionSample {
@@ -182,29 +143,41 @@ impl ReplicaCreatures {
                 clip_phase_tick: entry.clip_phase_tick,
             };
             match self.motion.get_mut(&entry.creature_id) {
-                Some(track) if frame.server_tick <= track.current.server_tick => continue,
+                Some(track)
+                    if track
+                        .samples
+                        .back()
+                        .is_some_and(|newest| frame.server_tick <= newest.server_tick) =>
+                {
+                    continue;
+                }
                 // The server only moves a creature every few ticks but sends its pose
                 // more often. An unchanged pose must not become a new keyframe, or the
                 // presented motion would hold, jump and hold. Keep the arrival time of
                 // the sample that introduced the pose.
                 Some(track)
-                    if track.current.translation_m == sample.translation_m
-                        && track.current.rotation_xyzw == sample.rotation_xyzw
-                        && track.current.locomotion_tag == sample.locomotion_tag =>
+                    if track.samples.back().is_some_and(|newest| {
+                        newest.translation_m == sample.translation_m
+                            && newest.rotation_xyzw == sample.rotation_xyzw
+                            && newest.locomotion_tag == sample.locomotion_tag
+                    }) =>
                 {
-                    track.current.server_tick = sample.server_tick;
+                    if let Some(newest) = track.samples.back_mut() {
+                        newest.server_tick = sample.server_tick;
+                    }
                     continue;
                 }
                 Some(track) => {
-                    track.previous = Some(track.current);
-                    track.current = sample;
+                    if track.samples.len() == MAX_MOTION_SAMPLES {
+                        track.samples.pop_front();
+                    }
+                    track.samples.push_back(sample);
                 }
                 None => {
                     self.motion.insert(
                         entry.creature_id,
                         MotionTrack {
-                            previous: None,
-                            current: sample,
+                            samples: VecDeque::from([sample]),
                         },
                     );
                 }
@@ -217,31 +190,37 @@ impl ReplicaCreatures {
 
     /// The pose to draw for `record` at `now`: interpolated between the two
     /// newest samples, held or briefly extrapolated past the newest, and the
-    /// record's own root when no motion has arrived yet.
-    pub fn presentation(
-        &self,
-        record: &CreatureOwnershipRecordV4,
-        now: Instant,
-    ) -> CreaturePresentation {
-        let state = &record.state;
+    /// record's own pose when no motion has arrived yet.
+    pub fn presentation(&self, record: &CreatureRecord, now: Instant) -> CreaturePresentation {
         let fallback = CreaturePresentation {
-            translation_m: state.root_translation_m,
-            rotation_xyzw: state.root_rotation_xyzw,
-            locomotion_tag: state.locomotion_tag,
-            clip_phase_tick: state.clip_phase_tick as f64,
+            translation_m: record.translation_m,
+            rotation_xyzw: record.rotation_xyzw,
+            locomotion_tag: record.locomotion_tag,
+            clip_phase_tick: record.clip_phase_tick as f64,
         };
-        let Some(track) = self.motion.get(&state.key.creature_id.get()) else {
+        let Some(track) = self.motion.get(&record.creature_id) else {
+            return fallback;
+        };
+        let (Some(&oldest), Some(&newest)) = (track.samples.front(), track.samples.back()) else {
             return fallback;
         };
         let render_at = now.checked_sub(CREATURE_RENDER_DELAY).unwrap_or(now);
-        let current = track.current;
         let phase_at = |sample: &MotionSample, at: Instant| {
             sample.clip_phase_tick as f64
                 + at.saturating_duration_since(sample.at).as_secs_f64() * 60.0
         };
-        if let Some(previous) = track.previous
-            && render_at < current.at
-        {
+        if render_at < oldest.at {
+            // Older than anything kept: hold the oldest pose.
+            return CreaturePresentation {
+                translation_m: oldest.translation_m,
+                rotation_xyzw: oldest.rotation_xyzw,
+                locomotion_tag: oldest.locomotion_tag,
+                clip_phase_tick: oldest.clip_phase_tick as f64,
+            };
+        }
+        if let Some(index) = track.samples.iter().position(|s| s.at > render_at) {
+            // Between the two samples that bracket the render time.
+            let (previous, current) = (track.samples[index - 1], track.samples[index]);
             let span = current
                 .at
                 .saturating_duration_since(previous.at)
@@ -267,6 +246,7 @@ impl ReplicaCreatures {
                 clip_phase_tick: phase_at(&previous, render_at),
             };
         }
+        let current = newest;
         let ahead = render_at
             .saturating_duration_since(current.at)
             .min(MAX_EXTRAPOLATION)
@@ -284,13 +264,13 @@ impl ReplicaCreatures {
     }
 
     /// Largest horizontal distance any creature is presented from where its
-    /// ownership record placed it. A rough "did anything move" measure.
+    /// spawn record placed it. A rough "did anything move" measure.
     pub fn max_displacement_m(&self, now: Instant) -> f64 {
         self.records
             .values()
             .map(|record| {
                 let presented = self.presentation(record, now).translation_m;
-                let root = record.state.root_translation_m;
+                let root = record.translation_m;
                 (presented[0] - root[0]).hypot(presented[2] - root[2])
             })
             .fold(0.0, f64::max)
@@ -299,164 +279,6 @@ impl ReplicaCreatures {
     /// Motion entries applied so far.
     pub fn motion_entries_applied(&self) -> u64 {
         self.motion_applied
-    }
-
-    /// Installs one server-captured record at join time. Idempotent: an equal
-    /// or newer record is kept, an older sync never rewinds a record the
-    /// ordered transaction stream already advanced.
-    pub fn install_sync(
-        &mut self,
-        sync: &spall_protocol::CreatureSync,
-    ) -> Result<(), ReplicaCreatureError> {
-        let key = sync.record.state.key;
-        match self.identity {
-            Some((world, epoch)) => {
-                if key.world_id != world || key.world_epoch.get() != epoch {
-                    return Err(ReplicaCreatureError::World);
-                }
-            }
-            None => self.identity = Some((key.world_id, key.world_epoch.get())),
-        }
-        self.catalog
-            .with_view(|catalog| sync.record.validate(catalog))??;
-        if let Some(existing) = self.records.get(&key) {
-            if existing.state.state_revision >= sync.record.state.state_revision {
-                return Ok(());
-            }
-        } else if self.records.values().any(|other| {
-            other.parts.iter().any(|part| {
-                sync.record
-                    .parts
-                    .iter()
-                    .any(|new| new.source_volume_id == part.source_volume_id)
-            })
-        }) {
-            return Err(ReplicaCreatureError::NotMonotone);
-        }
-        self.next_creature_id = self.next_creature_id.max(sync.allocator.next_creature_id);
-        self.next_volume_floor = self.next_volume_floor.max(sync.next_volume_id);
-        self.records.insert(key, sync.record.clone());
-        self.revision = self.revision.saturating_add(1);
-        Ok(())
-    }
-
-    /// Applies every lifecycle op of an actor-only transaction, all or nothing.
-    /// `volume_floor` is the lowest source volume id the replica's geometry has
-    /// not already used.
-    pub fn apply_transaction(
-        &mut self,
-        tx: &TopologyTransaction,
-        volume_floor: u64,
-    ) -> Result<(), ReplicaCreatureError> {
-        let mut staged: BTreeMap<CreatureKey, CreatureOwnershipRecordV4> = BTreeMap::new();
-        let mut identity = self.identity;
-        let mut next_creature_id = self.next_creature_id;
-        let mut next_volume_floor = self.next_volume_floor.max(volume_floor);
-        let mut applied = 0_u64;
-        for op in &tx.ops {
-            let commit = match op {
-                TopologyOp::CreatureLifecycle { commit } => commit,
-                TopologyOp::CreatureLifecycleBulk { .. } => {
-                    return Err(ReplicaCreatureError::BulkUnsupported);
-                }
-                _ => continue,
-            };
-            let (key, first_volume) = match &commit.change.operation {
-                CreatureLifecycleOperationV4::Birth { after }
-                | CreatureLifecycleOperationV4::Death { after } => (
-                    after.state.key,
-                    after.parts.first().map(|part| part.source_volume_id),
-                ),
-            };
-            match identity {
-                Some((world, epoch)) => {
-                    if key.world_id != world || key.world_epoch.get() != epoch {
-                        return Err(ReplicaCreatureError::World);
-                    }
-                }
-                None => identity = Some((key.world_id, key.world_epoch.get())),
-            }
-            let is_birth = matches!(
-                commit.change.operation,
-                CreatureLifecycleOperationV4::Birth { .. }
-            );
-            let current = staged.get(&key).or_else(|| self.records.get(&key));
-            let allocator_next = if is_birth {
-                if key.creature_id.get() < next_creature_id {
-                    return Err(ReplicaCreatureError::NotMonotone);
-                }
-                key.creature_id.get()
-            } else {
-                next_creature_id
-            };
-            let context_volume = if is_birth {
-                let start = first_volume.map_or(0, VolumeId::get);
-                if start < next_volume_floor {
-                    return Err(ReplicaCreatureError::NotMonotone);
-                }
-                start
-            } else {
-                let used = current
-                    .map(|record| {
-                        record
-                            .parts
-                            .iter()
-                            .map(|part| part.source_volume_id.get())
-                            .max()
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0);
-                next_volume_floor.max(used.saturating_add(1))
-            };
-            let existing_keys: Vec<CreatureKey> =
-                self.records.keys().chain(staged.keys()).copied().collect();
-            let existing_owner_keys: Vec<u128> = self
-                .records
-                .values()
-                .chain(staged.values())
-                .map(|record| record.owner_key)
-                .collect();
-            let existing_source_volumes: Vec<VolumeId> = self
-                .records
-                .values()
-                .chain(staged.values())
-                .flat_map(|record| record.parts.iter().map(|part| part.source_volume_id))
-                .collect();
-            let candidate = self.catalog.with_view(|catalog| {
-                commit_reduce(
-                    commit,
-                    current,
-                    CreatureLifecycleContextV1 {
-                        transaction_id: tx.transaction_id,
-                        operation_ordinal: commit.change.operation_ordinal,
-                        replay_receipt: None,
-                        allocator: CreatureAllocatorSnapshotV1 {
-                            schema: STORE_SCHEMA_VERSION_U16,
-                            world_id: key.world_id,
-                            world_epoch: key.world_epoch.get(),
-                            next_creature_id: allocator_next,
-                        },
-                        next_volume_id: context_volume,
-                        death_witness: None,
-                        existing_keys: &existing_keys,
-                        existing_owner_keys: &existing_owner_keys,
-                        existing_source_volumes: &existing_source_volumes,
-                    },
-                    catalog,
-                )
-            })??;
-            next_creature_id = next_creature_id.max(candidate.next_creature_id);
-            next_volume_floor = next_volume_floor.max(candidate.next_volume_id);
-            staged.insert(key, candidate.record);
-            applied += 1;
-        }
-        // Everything validated: publish together.
-        self.identity = identity;
-        self.next_creature_id = next_creature_id;
-        self.next_volume_floor = next_volume_floor;
-        self.records.extend(staged);
-        self.revision = self.revision.saturating_add(applied);
-        Ok(())
     }
 }
 
@@ -473,15 +295,6 @@ fn nlerp(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
         return a;
     }
     out.map(|v| v / length)
-}
-
-fn commit_reduce(
-    commit: &CreatureLifecycleCommitV4,
-    current: Option<&CreatureOwnershipRecordV4>,
-    context: CreatureLifecycleContextV1<'_>,
-    catalog: &spall_protocol::CreatureValidationCatalog<'_>,
-) -> Result<spall_protocol::CreatureLifecycleCandidateV1, CreatureOwnershipError> {
-    commit.validate_and_reduce(current, context, catalog)
 }
 
 #[cfg(test)]

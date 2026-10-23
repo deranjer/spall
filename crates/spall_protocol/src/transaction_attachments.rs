@@ -11,17 +11,11 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 use spall_core::{EntityId, TransactionId, VolumeId};
 
-use crate::lifecycle_bulk::LifecycleAttachmentWork;
-use crate::{
-    BaselineOwner, BaselineWorld, CreatureLifecycleBulkPayloadV4, Hash32, TopologyOp,
-    TopologyTransaction,
-};
+use crate::{BaselineOwner, BaselineWorld, Hash32, TopologyOp, TopologyTransaction};
 
 pub const MAX_TRANSACTION_ATTACHMENT_BYTES: usize = crate::limits::MAX_ASSEMBLED_TRANSFER;
 pub const MAX_TRANSACTION_GEOMETRY_DECODED_BYTES: usize =
     crate::limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED;
-pub const MAX_TRANSACTION_LIFECYCLE_DECODED_BYTES: usize =
-    crate::creature_owner::MAX_CREATURE_OWNER_SET_BYTES;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransactionAttachmentSetV1 {
@@ -35,10 +29,6 @@ pub enum TransactionAttachmentV1 {
     Geometry {
         transfer_id: u64,
         world: BaselineWorld,
-    },
-    CreatureLifecycle {
-        transfer_id: u64,
-        payload: Box<CreatureLifecycleBulkPayloadV4>,
     },
 }
 
@@ -54,7 +44,6 @@ pub struct ValidatedTransactionAttachmentSetV1 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedTransactionAttachmentV1 {
     Geometry(BaselineWorld),
-    CreatureLifecycle(Box<CreatureLifecycleBulkPayloadV4>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -75,8 +64,6 @@ pub enum TransactionAttachmentError {
     DuplicateOrExtra,
     #[error("baseline payload is invalid: {0}")]
     Baseline(String),
-    #[error("lifecycle payload is invalid: {0}")]
-    Lifecycle(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,7 +96,6 @@ impl TransactionAttachmentSetV1 {
         let mut output = Vec::new();
         append_bounded(&mut output, &prefix)?;
         let mut geometry_budget = MAX_TRANSACTION_GEOMETRY_DECODED_BYTES;
-        let mut lifecycle_budget = MAX_TRANSACTION_LIFECYCLE_DECODED_BYTES;
         for attachment in &self.attachments {
             let (id, kind, bytes) = match attachment {
                 TransactionAttachmentV1::Geometry { transfer_id, world } => {
@@ -145,25 +131,6 @@ impl TransactionAttachmentSetV1 {
                         .ok_or(TransactionAttachmentError::CompressedBudget)?;
                     let bytes = encode_zstd_bounded(&raw, compressed_remaining)?;
                     (*transfer_id, 0u8, bytes)
-                }
-                TransactionAttachmentV1::CreatureLifecycle {
-                    transfer_id,
-                    payload,
-                } => {
-                    let raw_size = payload
-                        .decoded_size_for_attachment_set()
-                        .map_err(|e| TransactionAttachmentError::Lifecycle(e.to_string()))?;
-                    lifecycle_budget = lifecycle_budget
-                        .checked_sub(raw_size)
-                        .ok_or(TransactionAttachmentError::DecodedBudget)?;
-                    let compressed_remaining = MAX_TRANSACTION_ATTACHMENT_BYTES
-                        .checked_sub(output.len())
-                        .and_then(|remaining| remaining.checked_sub(32))
-                        .ok_or(TransactionAttachmentError::CompressedBudget)?;
-                    let bytes = payload
-                        .encode_compressed_with_limit(compressed_remaining)
-                        .map_err(|e| TransactionAttachmentError::Lifecycle(e.to_string()))?;
-                    (*transfer_id, 1u8, bytes)
                 }
             };
             append_u64(&mut output, id)?;
@@ -229,7 +196,6 @@ pub fn decode_for_transaction(
     let mut candidate = BTreeMap::new();
     let mut compressed_remaining = MAX_TRANSACTION_ATTACHMENT_BYTES;
     let mut geometry_remaining = MAX_TRANSACTION_GEOMETRY_DECODED_BYTES;
-    let mut lifecycle_work = LifecycleAttachmentWork::capacity();
     for _ in 0..prefix.count {
         let id: u64 = take(&mut rest)?;
         let kind: u8 = take(&mut rest)?;
@@ -259,20 +225,6 @@ pub fn decode_for_transaction(
                 )?;
                 validate_geometry_group(transaction, id, &world)?;
                 ValidatedTransactionAttachmentV1::Geometry(world)
-            }
-            1 => {
-                let marker = lifecycle_marker(transaction, id)?;
-                let (payload, decoded_size) = crate::lifecycle_bulk::CreatureLifecycleBulkPayloadV4::decode_compressed_with_budget(
-                    payload_bytes,
-                    transaction.transaction_id,
-                    marker.operation_ordinal,
-                    marker.commit_hash,
-                    lifecycle_work.decoded_bytes,
-                    &mut lifecycle_work,
-                )
-                .map_err(|e| TransactionAttachmentError::Lifecycle(e.to_string()))?;
-                let _ = decoded_size;
-                ValidatedTransactionAttachmentV1::CreatureLifecycle(Box::new(payload))
             }
             _ => return Err(TransactionAttachmentError::Correlation),
         };
@@ -305,11 +257,9 @@ fn validate_typed_set(
         return Err(TransactionAttachmentError::Count);
     }
     let mut seen = BTreeSet::new();
-    let mut lifecycle_work = LifecycleAttachmentWork::capacity();
     for attachment in &set.attachments {
         let (id, kind) = match attachment {
             TransactionAttachmentV1::Geometry { transfer_id, .. } => (*transfer_id, 0),
-            TransactionAttachmentV1::CreatureLifecycle { transfer_id, .. } => (*transfer_id, 1),
         };
         if !expected.contains_key(&id) || !seen.insert(id) {
             return Err(TransactionAttachmentError::DuplicateOrExtra);
@@ -324,23 +274,6 @@ fn validate_typed_set(
                     MAX_TRANSACTION_GEOMETRY_DECODED_BYTES,
                 )?;
                 validate_geometry_group(transaction, id, world)?;
-            }
-            TransactionAttachmentV1::CreatureLifecycle { payload, .. } => {
-                let marker = lifecycle_marker(transaction, id)?;
-                if payload.schema != crate::WIRE_SCHEMA_VERSION
-                    || payload.transaction_id != transaction.transaction_id
-                    || payload.operation_ordinal != marker.operation_ordinal
-                    || payload.commit_hash != marker.commit_hash
-                {
-                    return Err(TransactionAttachmentError::Correlation);
-                }
-                lifecycle_work
-                    .charge(
-                        payload
-                            .work_for_attachment_set()
-                            .map_err(|e| TransactionAttachmentError::Lifecycle(e.to_string()))?,
-                    )
-                    .map_err(|e| TransactionAttachmentError::Lifecycle(e.to_string()))?;
             }
         }
     }
@@ -362,14 +295,6 @@ fn expected_markers(
                     return Err(TransactionAttachmentError::Correlation);
                 }
             }
-            TopologyOp::CreatureLifecycleBulk { transfer_id, .. } => {
-                if *transfer_id == 0 {
-                    return Err(TransactionAttachmentError::Correlation);
-                }
-                if expected.insert(*transfer_id, 1).is_some() {
-                    return Err(TransactionAttachmentError::Correlation);
-                }
-            }
             _ => {}
         }
     }
@@ -377,36 +302,6 @@ fn expected_markers(
         return Err(TransactionAttachmentError::Count);
     }
     Ok(expected)
-}
-
-fn lifecycle_marker(
-    transaction: &TopologyTransaction,
-    transfer_id: u64,
-) -> Result<LifecycleMarker, TransactionAttachmentError> {
-    transaction
-        .ops
-        .iter()
-        .find_map(|op| match op {
-            TopologyOp::CreatureLifecycleBulk {
-                operation_ordinal,
-                payload_schema,
-                commit_hash,
-                transfer_id: marker_id,
-            } if *marker_id == transfer_id && *payload_schema == crate::WIRE_SCHEMA_VERSION => {
-                Some(LifecycleMarker {
-                    operation_ordinal: *operation_ordinal,
-                    commit_hash: *commit_hash,
-                })
-            }
-            _ => None,
-        })
-        .ok_or(TransactionAttachmentError::Correlation)
-}
-
-#[derive(Clone, Copy)]
-struct LifecycleMarker {
-    operation_ordinal: u32,
-    commit_hash: Hash32,
 }
 
 fn validate_geometry_group(

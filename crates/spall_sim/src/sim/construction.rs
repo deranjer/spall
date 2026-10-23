@@ -37,8 +37,6 @@ impl Simulation {
             creatures: None,
             tick: Tick::ZERO,
             next_control_seq: 1,
-            creature_presentation: std::collections::BTreeMap::new(),
-            creature_move_timing: CreatureMoveTiming::default(),
             next_damage_seq: 0,
             column_water: None,
             column_water_worker: false,
@@ -107,8 +105,6 @@ impl Simulation {
             creatures: None,
             tick,
             next_control_seq: 1,
-            creature_presentation: std::collections::BTreeMap::new(),
-            creature_move_timing: CreatureMoveTiming::default(),
             next_damage_seq: 0,
             // Column water is installed after recovery by the caller.
             column_water: None,
@@ -150,12 +146,6 @@ impl Simulation {
     /// Players are not carried over; the caller re-adds them. Staged edits of
     /// the old world are dropped.
     pub fn replace_world(&mut self, fresh: Simulation) -> Result<(), crate::world::WorldError> {
-        if fresh.creatures.is_some() {
-            return Err(crate::world::WorldError::CreatureIdentityReplacement);
-        }
-        if let Some(creatures) = &self.creatures {
-            creatures.preview_reset_epoch()?;
-        }
         let (entity, volume, transaction, journal_seq) = self.world.registry().counters();
         let Simulation {
             mut world,
@@ -175,9 +165,8 @@ impl Simulation {
             journal_seq.max(f_journal_seq),
         )?;
         if let Some(creatures) = &mut self.creatures {
-            creatures.reset_epoch()?;
+            creatures.clear();
         }
-        self.creature_presentation.clear();
         let off_thread = self.pipeline.stages_off_thread();
         let old_world = std::mem::replace(&mut self.world, world);
         let old_pipeline = std::mem::replace(&mut self.pipeline, pipeline);

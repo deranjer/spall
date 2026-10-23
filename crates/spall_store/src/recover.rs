@@ -309,10 +309,7 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
         out
     };
 
-    let creatures = load_creatures(conn, tick)?;
-    crate::creature_checkpoint::validate_section(creatures.as_ref(), &meta, &bodies, &bricks)?;
     Ok(Checkpoint {
-        creatures,
         vegetation: load_vegetation(conn, tick)?,
         column_water: load_column_water(conn, tick)?,
         weather: load_weather(conn, tick)?,
@@ -473,37 +470,4 @@ fn load_weather(
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
     }
     Ok(state)
-}
-
-fn load_creatures(
-    conn: &Connection,
-    tick: i64,
-) -> Result<Option<crate::StoredCreaturesV1>, StoreError> {
-    let len: Option<i64> = conn
-        .query_row(
-            "SELECT length(state) FROM checkpoint_creatures WHERE tick=?",
-            [tick],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if !len.is_some_and(|n| {
-        n > 0 && n as u64 <= crate::creature_checkpoint::MAX_STORED_CREATURE_BYTES as u64
-    }) {
-        return Err(StoreError::Corrupt(
-            "missing or oversized creature checkpoint row".into(),
-        ));
-    }
-    let (host, blob, crc): (bool, Vec<u8>, Vec<u8>) = conn.query_row(
-        "SELECT has_host,state,crc FROM checkpoint_creatures WHERE tick=?",
-        [tick],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    if crc.as_slice() != crc16(&blob).as_slice() {
-        return Err(StoreError::Corrupt("creature checkpoint checksum".into()));
-    }
-    let section = crate::creature_checkpoint::decode_section(&blob)?;
-    if host != section.is_some() {
-        return Err(StoreError::Corrupt("creature checkpoint host flag".into()));
-    }
-    Ok(section)
 }

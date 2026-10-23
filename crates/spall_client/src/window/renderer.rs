@@ -1,10 +1,18 @@
 use super::*;
+use crate::season_colour::{Greenery, SeasonalMaterials, season_weights};
 
 pub(crate) struct WorldRenderer {
     pub(super) weather_state: Option<spall_protocol::WeatherState>,
+    seasonal: SeasonalMaterials,
+    seasonal_at: Instant,
     pub(super) weather_presentation: crate::weather::WeatherPresentation,
     weather_render_at: Instant,
     pub(super) weather_exposure: f32,
+    /// The drawn camera eye is under water (set by the caller each frame).
+    pub(super) eye_submerged: bool,
+    /// Eased 0..1 submersion and the shared wind strength, for weather audio.
+    pub(super) weather_submerge: f32,
+    pub(super) weather_wind: f32,
     pub(super) weather_effects_enabled: bool,
     pub(super) ground_snow_enabled: bool,
     pub(super) snow_frames: Vec<std::sync::Arc<spall_protocol::SnowSurfaceFrame>>,
@@ -40,6 +48,8 @@ pub(crate) struct WorldRenderer {
     /// `debug_water_instances` is this clipped to the terrain window.
     /// The hammer crosshair and its label; `None` hides it (cursor not captured).
     crosshair: Option<CrosshairView>,
+    /// The endurance bar; `None` while endurance is full.
+    endurance: Option<EnduranceView>,
     debug_water_source: Vec<Instance>,
     water_window: Option<[f64; 3]>,
     /// Rectangles of the water field uploaded this frame (for the frame CSV).
@@ -240,6 +250,10 @@ impl WorldRenderer {
         finish(false, rect_count);
     }
 
+    pub(crate) fn set_endurance(&mut self, view: Option<EnduranceView>) {
+        self.endurance = view;
+    }
+
     pub(crate) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
         self.crosshair = view;
     }
@@ -260,6 +274,7 @@ impl WorldRenderer {
         window: Arc<Window>,
         environment: Environment,
         materials: &[spall_render::Material],
+        material_kinds: &[Option<Greenery>],
         uncapped: bool,
         day_cycle_enabled: bool,
     ) -> Result<Self, ClientError> {
@@ -378,6 +393,13 @@ impl WorldRenderer {
                 0.0,
             ));
         }
+        let mut kinds = material_kinds.to_vec();
+        kinds.resize(
+            render_materials.len() - spall_ecology::living::PALETTE.len(),
+            None,
+        );
+        kinds.extend((0..spall_ecology::living::PALETTE.len()).map(Greenery::of_palette));
+        let seasonal = SeasonalMaterials::new(render_materials.clone(), kinds);
         let scene = GameRenderer::new(
             &device,
             &queue,
@@ -393,9 +415,14 @@ impl WorldRenderer {
             environment,
             day_cycle_enabled,
             weather_state: None,
+            seasonal,
+            seasonal_at: Instant::now(),
             weather_presentation: crate::weather::WeatherPresentation::new(),
             weather_render_at: Instant::now(),
             weather_exposure: 1.0,
+            eye_submerged: false,
+            weather_submerge: 0.0,
+            weather_wind: 0.0,
             weather_effects_enabled: true,
             ground_snow_enabled: true,
             reduced_weather_flashes: false,
@@ -418,6 +445,7 @@ impl WorldRenderer {
             vegetation_job: None,
             vegetation_seq: 0,
             crosshair: None,
+            endurance: None,
             debug_water_source: Vec::new(),
             water_window: None,
             water_rects_frame: 0,
@@ -743,10 +771,14 @@ impl WorldRenderer {
         if std::env::var_os("SPALL_NO_FOG").is_some() {
             self.scene.set_fog_range(0.0, 0.0);
         } else {
-            self.scene.set_fog_range(
+            // Snow weather pulls the fog in and whitens it (last frame's visibility).
+            let (start, end, whiteout) = crate::weather::weather_fog(
+                self.scene.weather_lighting().visibility,
                 fog_radius * FOG_START_FRACTION,
                 fog_radius * FOG_END_FRACTION,
             );
+            self.scene.set_fog_range(start, end);
+            self.scene.set_fog_whiteout(whiteout);
         }
         while let Ok((id, instances)) = self.vegetation_worker.rx.try_recv() {
             if self.vegetation_job == Some(id) {
@@ -819,6 +851,14 @@ impl WorldRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("spall-interactive-encoder"),
             });
+        let seasonal_dt = self.seasonal_at.elapsed().as_secs_f32().min(0.25);
+        self.seasonal_at = Instant::now();
+        if let Some(state) = &self.weather_state {
+            let target = season_weights(state.start_season, state.clock_ms, state.season_ms);
+            if let Some(table) = self.seasonal.update(target, seasonal_dt) {
+                self.scene.update_materials(&self.queue, &table);
+            }
+        }
         if let Some((eye, look_dir)) = cam {
             let mut camera = Camera::looking_along(
                 *eye,
@@ -832,6 +872,7 @@ impl WorldRenderer {
                 .set_enabled(self.weather_effects_enabled);
             self.weather_presentation
                 .set_reduced_flashes(self.reduced_weather_flashes);
+            self.weather_presentation.set_submerged(self.eye_submerged);
             let weather_now = Instant::now();
             let weather_dt = weather_now
                 .duration_since(self.weather_render_at)
@@ -851,6 +892,8 @@ impl WorldRenderer {
                 self.scene
                     .set_weather_particles(frame.particles, frame.lighting)
                     .map_err(|error| ClientError::Render(error.to_string()))?;
+                self.weather_submerge = self.weather_presentation.submerge();
+                self.weather_wind = self.weather_presentation.wind_strength();
             } else {
                 self.scene
                     .set_weather_particles(&[], spall_render::WeatherLighting::default())
@@ -863,40 +906,44 @@ impl WorldRenderer {
             let snow_key = (
                 self.snow_generation.unwrap_or(0),
                 terrain_stamp,
-                camera.position.to_array().map(|v| (v / 8.0).floor() as i64),
+                camera.position.to_array().map(|v| (v / 2.0).floor() as i64),
                 self.ground_snow_enabled,
             );
             let snow_toggled = self.snow_upload_key.map(|k| k.3) != Some(snow_key.3);
             let snow_settled = self
                 .snow_rebuilt_at
                 .is_none_or(|at| at.elapsed() >= SNOW_REBUILD_INTERVAL);
-            if self.snow_upload_key != Some(snow_key) && (snow_toggled || snow_settled) {
+            let snow_due =
+                self.snow_upload_key != Some(snow_key) || self.snow_presentation.pending();
+            if snow_due && (snow_toggled || snow_settled) {
                 self.snow_rebuilt_at = Some(Instant::now());
                 if self.ground_snow_enabled
                     && let Some((_, terrain)) = &self.vegetation_terrain
                 {
                     self.snow_presentation
                         .set_radius_m(view_radius_m().min(SNOW_MAX_RADIUS_M));
-                    let snow_started = Instant::now();
-                    let (patches, tracks) = self.snow_presentation.update(
+                    let update = self.snow_presentation.update(
                         &self.snow_frames,
                         terrain,
                         camera.position.to_array(),
+                        SNOW_BUILD_BUDGET,
                     );
-                    let snow_ms = snow_started.elapsed().as_secs_f32() * 1000.0;
-                    if snow_ms > 8.0 {
+                    let stats = self.snow_presentation.stats();
+                    if stats.last_build_ms > 8.0 {
                         tracing::info!(
-                            snow_ms,
-                            patches = patches.len(),
-                            "ground snow rebuild exceeded one 120 Hz frame"
+                            build_ms = stats.last_build_ms,
+                            tiles = stats.last_rebuilt_tiles,
+                            "ground snow mesh slice exceeded one 120 Hz frame"
                         );
                     }
                     self.scene
-                        .set_snow_patches(&self.device, &self.queue, patches, tracks)
+                        .update_snow_meshes(&self.device, &update.upserts, &update.removed)
                         .map_err(|error| ClientError::Render(error.to_string()))?;
                 } else {
+                    let removed = self.snow_presentation.resident_keys();
+                    self.snow_presentation = crate::snow::SnowPresentation::new();
                     self.scene
-                        .set_snow_patches(&self.device, &self.queue, &[], &[])
+                        .update_snow_meshes(&self.device, &[], &removed)
                         .map_err(|error| ClientError::Render(error.to_string()))?;
                 }
                 self.snow_upload_key = Some(snow_key);
@@ -911,14 +958,20 @@ impl WorldRenderer {
                     .map(|mark| (mark.contact_cell, mark.offset_mm, mark.strength_q8))
                     .collect();
                 tracing::info!(
+                    camera = ?camera.position.to_array(),
                     frames = snow.frames_considered,
                     faces = snow.rendered_faces,
-                    patches = snow.patches,
+                    tiles = snow.tiles,
+                    fine_tiles = snow.fine_tiles,
+                    triangles = snow.triangles,
+                    pending = snow.pending_tiles,
+                    build_ms = snow.last_build_ms,
                     tracks = snow.footprints,
+                    carved_quads = snow.carved_quads,
                     max_depth_mm = snow.max_depth_mm,
-                    capped = snow.cap_limited_surfaces,
-                    stale = snow.revision_mismatches,
                     hidden = snow.hidden_or_unknown_faces,
+                    stale = snow.stale_faces,
+                    nearest_m = snow.nearest_frame_m,
                     enabled = self.ground_snow_enabled,
                     ?track_contacts,
                     "snow capture presentation"
@@ -1027,6 +1080,9 @@ impl WorldRenderer {
         }
         if let Some(frame) = &self.book_frame {
             draw_book(frame, &self.book_textures, &self.item_icons, self.ui_size());
+        }
+        if let Some(bar) = self.endurance {
+            draw_endurance(bar);
         }
         self.yakui.finish();
         if let Some(preset) = selected_environment {

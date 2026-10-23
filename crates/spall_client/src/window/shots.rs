@@ -13,7 +13,13 @@ pub enum ShotStep {
     /// Land and look from the player.
     Walk,
     /// Hold actual player input for a bounded walking/rendering measurement.
-    Move { seconds: f32, movement: [f32; 3] },
+    Move {
+        seconds: f32,
+        movement: [f32; 3],
+        sprint: bool,
+    },
+    /// Third-person view on or off, as `F8` does.
+    ThirdPerson(bool),
     /// Toggle the admin menu.
     Menu,
     /// Copy the debug report, as `F9` does.
@@ -21,7 +27,12 @@ pub enum ShotStep {
     /// Ask the server for an admin world reset.
     Reset,
     /// Select authoritative weather through the same admin path as F10.
-    Weather(Option<spall_protocol::WeatherKind>),
+    Weather(
+        Option<spall_protocol::WeatherKind>,
+        Option<spall_protocol::SnowTier>,
+    ),
+    /// Re-anchor the season clock (`season:winter`), 0 spring .. 3 winter.
+    Season(u8),
     /// End a capture tour and hand the running window to the player.
     Play,
     /// Pause without a screenshot.
@@ -53,19 +64,26 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
             "reset" => Ok(ShotStep::Reset),
             "play" => Ok(ShotStep::Play),
             _ if step.starts_with("weather:") => {
-                use spall_protocol::WeatherKind::*;
-                let kind = match &step[8..] {
-                    "auto" => None,
-                    "clear" => Some(Clear),
-                    "rain" => Some(Rain),
-                    "storm" => Some(Storm),
-                    "snow" => Some(Snow),
-                    "wind" => Some(HighWind),
-                    "blizzard" => Some(Blizzard),
+                use spall_protocol::{SnowTier, WeatherKind::*};
+                let (kind, tier) = match &step[8..] {
+                    "auto" => (None, None),
+                    "clear" => (Some(Clear), None),
+                    "rain" => (Some(Rain), None),
+                    "storm" => (Some(Storm), None),
+                    "snow" | "snow-medium" => (Some(Snow), Some(SnowTier::Medium)),
+                    "snow-light" => (Some(Snow), Some(SnowTier::Light)),
+                    "snow-heavy" => (Some(Snow), Some(SnowTier::Heavy)),
+                    "wind" => (Some(HighWind), None),
+                    "blizzard" => (Some(Blizzard), None),
                     _ => return Err(format!("unknown weather `{step}`")),
                 };
-                Ok(ShotStep::Weather(kind))
+                Ok(ShotStep::Weather(kind, tier))
             }
+            _ if step.starts_with("season:") => ["spring", "summer", "autumn", "winter"]
+                .iter()
+                .position(|s| *s == &step[7..])
+                .map(|i| ShotStep::Season(i as u8))
+                .ok_or_else(|| format!("unknown season `{step}`")),
             _ if step.starts_with("move:") => {
                 let v = step[5..]
                     .split(',')
@@ -73,7 +91,7 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| format!("bad move `{step}`"))?;
                 match v.as_slice() {
-                    [seconds, x, z]
+                    [seconds, x, z] | [seconds, x, z, _]
                         if seconds.is_finite()
                             && *seconds > 0.
                             && *seconds <= 120.
@@ -85,6 +103,7 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
                         Ok(ShotStep::Move {
                             seconds: *seconds,
                             movement: [*x, 0., *z],
+                            sprint: v.get(3).is_some_and(|s| *s != 0.),
                         })
                     }
                     _ => Err(format!(
@@ -105,6 +124,8 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
             _ if step.starts_with("env:") => EnvironmentPreset::from_key(&step[4..])
                 .map(ShotStep::Environment)
                 .ok_or_else(|| format!("unknown environment `{step}`")),
+            "third:on" => Ok(ShotStep::ThirdPerson(true)),
+            "third:off" => Ok(ShotStep::ThirdPerson(false)),
             "sky:on" => Ok(ShotStep::Skylight(true)),
             "sky:off" => Ok(ShotStep::Skylight(false)),
             "bounce:on" => Ok(ShotStep::Bounce(true)),
@@ -142,13 +163,26 @@ mod tests {
         assert_eq!(
             parse_shots("weather:auto;weather:rain;weather:snow;weather:blizzard;play").unwrap(),
             vec![
-                ShotStep::Weather(None),
-                ShotStep::Weather(Some(spall_protocol::WeatherKind::Rain)),
-                ShotStep::Weather(Some(spall_protocol::WeatherKind::Snow)),
-                ShotStep::Weather(Some(spall_protocol::WeatherKind::Blizzard)),
+                ShotStep::Weather(None, None),
+                ShotStep::Weather(Some(spall_protocol::WeatherKind::Rain), None),
+                ShotStep::Weather(
+                    Some(spall_protocol::WeatherKind::Snow),
+                    Some(spall_protocol::SnowTier::Medium)
+                ),
+                ShotStep::Weather(Some(spall_protocol::WeatherKind::Blizzard), None),
                 ShotStep::Play,
             ]
         );
         assert!(parse_shots("weather:garbage").is_err());
+        assert_eq!(
+            parse_shots("weather:snow-heavy;season:winter").unwrap(),
+            vec![
+                ShotStep::Weather(
+                    Some(spall_protocol::WeatherKind::Snow),
+                    Some(spall_protocol::SnowTier::Heavy)
+                ),
+                ShotStep::Season(3),
+            ]
+        );
     }
 }

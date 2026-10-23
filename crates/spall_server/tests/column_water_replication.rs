@@ -139,7 +139,6 @@ fn client_receives_column_water_late_joiner_converges_and_reset_reseeds() {
             target: ScriptTarget::Terrain,
         }],
         movement_script: Vec::new(),
-        creature_catalog: None,
         late_join: true,
         baseline_scene: BaselineScene::Walk,
         run_ticks: 400,

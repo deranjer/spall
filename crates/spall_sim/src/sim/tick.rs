@@ -6,7 +6,7 @@ impl Simulation {
     /// Advances one server tick: run the edit pipeline, then step physics and
     /// refresh extracted body state.
     pub fn tick(&mut self) -> Result<TickReport, TickError> {
-        self.tick_with_creature_rules_inner(None, VecDeque::new())
+        self.tick_inner(VecDeque::new())
     }
 
     /// Advances a server tick using transfer IDs reserved by the server's
@@ -20,27 +20,16 @@ impl Simulation {
             id.0 == 0
                 || id.0 & ((1_u64 << 61) - 1) == 0
                 || id.0 & spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT == 0
-                || id.0 & (spall_protocol::WORLD_RESET_TRANSFER_ID_BIT | (1_u64 << 61)) != 0
+                || id.0 & spall_protocol::WORLD_RESET_TRANSFER_ID_BIT != 0
                 || !seen.insert(id.0)
         }) {
             return Err(CommitError::InvalidBulkTransferIds.into());
         }
-        self.tick_with_creature_rules_inner(None, transfer_ids.into())
+        self.tick_inner(transfer_ids.into())
     }
 
-    /// Runs the optional statically linked game scheduling policy against a
-    /// bounded immutable host snapshot. Returned intents are proposals only;
-    /// this slice does not apply actor movement or lifecycle changes.
-    pub fn tick_with_creature_rules(
+    fn tick_inner(
         &mut self,
-        rules: &dyn crate::creatures::CreatureSchedulingRules,
-    ) -> Result<TickReport, TickError> {
-        self.tick_with_creature_rules_inner(Some(rules), VecDeque::new())
-    }
-
-    pub(super) fn tick_with_creature_rules_inner(
-        &mut self,
-        rules: Option<&dyn crate::creatures::CreatureSchedulingRules>,
         mut transfer_ids: VecDeque<spall_protocol::TransferId>,
     ) -> Result<TickReport, TickError> {
         self.tick = self
@@ -104,22 +93,18 @@ impl Simulation {
         drop(water_span);
         let vegetation_span = crate::prof::Span::start("tick.vegetation");
         self.advance_vegetation(&report)?;
+        drop(vegetation_span);
+        let weather_span = crate::prof::Span::start("tick.weather");
         self.advance_weather();
+        drop(weather_span);
+        let snow_span = crate::prof::Span::start("tick.snow");
         self.snow
             .advance(&self.weather, self.tick.get())
             .map_err(TickError::Snow)?;
+        drop(snow_span);
+        let snow_refresh_span = crate::prof::Span::start("tick.snow_refresh");
         self.refresh_snow_from_report(&report);
-        drop(vegetation_span);
-        if let (Some(creatures), Some(rules)) = (&mut self.creatures, rules) {
-            let terrain_revision = self.world.terrain().volume.next_revision().get();
-            let water_frame_revision = self.column_water.as_ref().map(|water| water.frame().seq);
-            report.creature_schedule = Some(creatures.schedule(
-                self.tick.get(),
-                terrain_revision,
-                water_frame_revision,
-                rules,
-            ));
-        }
+        drop(snow_refresh_span);
         // Bodies float: buoyancy and drag from the column water, before the
         // physics step that integrates them.
         if let Some(water) = &self.column_water {
