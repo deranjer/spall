@@ -138,7 +138,6 @@ mod tests {
                 inventory_revision: request.request_id,
                 outcome: spall_protocol::ProgressionOutcome::Inventory,
                 inventory: Vec::new(),
-                sites: Vec::new(),
             }
         }));
         let session = sess(1, 1);

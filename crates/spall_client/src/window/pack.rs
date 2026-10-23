@@ -6,7 +6,7 @@
 
 use super::*;
 use glam::Quat;
-use spall_protocol::{InventoryEntry, ProgressionOperation, ProgressionRequest, SiteEntry};
+use spall_protocol::{InventoryEntry, ProgressionOperation, ProgressionRequest};
 
 /// Seconds to unroll the tarp (and kneel), or to roll it back up.
 const UNROLL_S: f32 = 0.45;
@@ -30,8 +30,6 @@ const REFRESH: Duration = Duration::from_millis(1500);
 const HOVER_LIFT_M: f32 = 0.04;
 /// The cursor picks the nearest item within this many logical pixels.
 const HOVER_RADIUS_PX: f32 = 70.0;
-/// Pegs around the camp's boundary while the pack is open.
-const RING_PEGS: usize = 48;
 
 /// Where the pack was opened: the player's feet and facing.
 #[derive(Debug, Clone, Copy)]
@@ -43,7 +41,7 @@ struct Anchor {
 /// A label to draw over one item stack (or the empty tarp).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PackLabel {
-    pub(super) target: Option<PackTarget>,
+    pub(super) item: Option<u16>,
     pub(super) at: Vec3,
     pub(super) text: String,
 }
@@ -65,11 +63,7 @@ pub(super) struct Pack {
     inventory: Option<Vec<InventoryEntry>>,
     requested_at: Option<Instant>,
     next_request_id: u64,
-    pub(super) hovered: Option<PackTarget>,
-    /// The player's placed structures, from the newest progression answer.
-    sites: Vec<SiteEntry>,
-    /// Ground points of the pegs around the camp (see [`Pack::set_ring`]).
-    ring: Vec<Vec3>,
+    pub(super) hovered: Option<u16>,
 }
 
 impl Pack {
@@ -88,8 +82,6 @@ impl Pack {
             requested_at: None,
             next_request_id,
             hovered: None,
-            sites: Vec::new(),
-            ring: Vec::new(),
         }
     }
 
@@ -151,7 +143,6 @@ impl Pack {
         }
         if let Some(reply) = reply {
             self.inventory = Some(reply.inventory);
-            self.take_sites(reply.sites);
         }
         if self
             .requested_at
@@ -282,7 +273,7 @@ impl Pack {
             if centre.z < roll_z {
                 continue;
             }
-            let lift = if self.hovered == Some(PackTarget::Item(entry.item_id)) {
+            let lift = if self.hovered == Some(entry.item_id) {
                 HOVER_LIFT_M
             } else {
                 0.0
@@ -318,24 +309,6 @@ impl Pack {
                 }
             }
         }
-        if self.open && self.amount >= 0.5 {
-            out.extend(ring_instances(&self.ring, twine, stone));
-            // Hovering "make camp here" marks out where the fire pit goes.
-            if self.hovered == Some(PackTarget::MakeCamp)
-                && let Some(spot) = self.camp_spot()
-            {
-                for i in 0..12 {
-                    let angle = i as f32 / 12.0 * std::f32::consts::TAU;
-                    let at = spot + Vec3::new(angle.cos(), 0.0, angle.sin()) * 0.55;
-                    out.push(CubeInstance::new(
-                        (at + Vec3::Y * 0.04).to_array(),
-                        stone,
-                        [0.1, 0.08, 0.1],
-                        Quat::from_rotation_y(angle).to_array(),
-                    ));
-                }
-            }
-        }
         out
     }
 
@@ -351,8 +324,7 @@ impl Pack {
     }
 
     /// One label per laid-out stack, above it in world space; a note on the
-    /// tarp when the pack is empty or more stacks exist than fit; and the
-    /// camp: how far the fire is, or an offer to make camp here.
+    /// tarp when the pack is empty or more stacks exist than fit.
     pub(super) fn labels(&self, view: &dyn PackView) -> Vec<PackLabel> {
         let Some(anchor) = self.anchor.filter(|_| self.open && self.amount >= 1.0) else {
             return Vec::new();
@@ -363,6 +335,13 @@ impl Pack {
         let rotation = Quat::from_rotation_y(-anchor.yaw);
         let origin = tarp_centre(anchor);
         let world = |local: Vec3| origin + rotation * local;
+        if inventory.is_empty() {
+            return vec![PackLabel {
+                item: None,
+                at: world(Vec3::Y * 0.05),
+                text: "Nothing in the pack".to_owned(),
+            }];
+        }
         let mut labels: Vec<_> = self
             .laid_out()
             .into_iter()
@@ -372,7 +351,7 @@ impl Pack {
                 let shown = entry.count.min(MAX_COPIES) as f32;
                 let name = view.item_name(entry.item_id).unwrap_or("Unknown item");
                 PackLabel {
-                    target: Some(PackTarget::Item(entry.item_id)),
+                    item: Some(entry.item_id),
                     at: world(slot_centre(slot) + Vec3::Y * (height * shown + 0.06)),
                     text: if entry.count == 1 {
                         name.to_owned()
@@ -382,170 +361,16 @@ impl Pack {
                 }
             })
             .collect();
-        if inventory.is_empty() {
-            labels.push(PackLabel {
-                target: None,
-                at: world(Vec3::Y * 0.05),
-                text: "Nothing in the pack".to_owned(),
-            });
-        }
         let hidden = inventory.len().saturating_sub(COLUMNS * ROWS);
         if hidden > 0 {
             labels.push(PackLabel {
-                target: None,
+                item: None,
                 at: world(Vec3::new(0.0, 0.02, TARP_D_M * 0.5 + 0.05)),
                 text: format!("+{hidden} more"),
             });
         }
-        if let Some((centre, radius)) = self.camp(view) {
-            let distance = (centre - anchor.feet).with_y(0.0).length();
-            let text = if distance <= radius {
-                format!("In camp, {distance:.0} m from the fire")
-            } else {
-                format!("Outside your camp, {distance:.0} m from the fire")
-            };
-            labels.push(PackLabel {
-                target: None,
-                at: world(Vec3::new(-TARP_W_M * 0.5 + 0.2, 0.02, TARP_D_M * 0.5)),
-                text,
-            });
-        } else if let Some(camp) = view.camp_tool() {
-            let have = |item: u16| {
-                inventory
-                    .iter()
-                    .find(|entry| entry.item_id == item)
-                    .map_or(0, |entry| entry.count)
-            };
-            let affordable = camp.cost.iter().all(|&(item, count)| have(item) >= count);
-            labels.push(PackLabel {
-                target: affordable.then_some(PackTarget::MakeCamp),
-                at: self.camp_spot().unwrap_or(origin) + Vec3::Y * 0.1,
-                text: if affordable {
-                    format!("Make camp here ({})", camp.cost_text)
-                } else {
-                    format!("Making camp needs {}", camp.cost_text)
-                },
-            });
-        }
         labels
     }
-
-    /// Takes the player's sites from a progression answer.
-    fn take_sites(&mut self, sites: Vec<SiteEntry>) {
-        if self.sites != sites {
-            self.ring.clear();
-        }
-        self.sites = sites;
-    }
-
-    /// The player's camp: its fire's centre in world metres and its radius.
-    pub(super) fn camp(&self, view: &dyn PackView) -> Option<(Vec3, f32)> {
-        self.sites.iter().find_map(|site| {
-            let radius = view.camp_radius_m(site.kind)?;
-            let [x, y, z] = site.cell.map(|c| c as f32 * CELL_M);
-            Some((Vec3::new(x + CELL_M * 0.5, y, z + CELL_M * 0.5), radius))
-        })
-    }
-
-    /// Where "make camp here" builds the fire pit: on the ground just past
-    /// the tarp's far edge.
-    pub(super) fn camp_spot(&self) -> Option<Vec3> {
-        let anchor = self.anchor?;
-        Some(tarp_centre(anchor) + forward(anchor.yaw) * (TARP_D_M * 0.5 + 0.9))
-    }
-
-    /// Whether the ring around the camp still needs its ground points.
-    pub(super) fn needs_ring(&self, view: &dyn PackView) -> bool {
-        self.open && self.ring.is_empty() && self.camp(view).is_some()
-    }
-
-    /// The camp's boundary on the ground; `ground(x, z)` is the height of the
-    /// ground there, if known.
-    pub(super) fn set_ring(
-        &mut self,
-        view: &dyn PackView,
-        ground: impl Fn(f32, f32) -> Option<f32>,
-    ) {
-        let Some((centre, radius)) = self.camp(view) else {
-            return;
-        };
-        self.ring = (0..RING_PEGS)
-            .map(|i| {
-                let angle = i as f32 / RING_PEGS as f32 * std::f32::consts::TAU;
-                let x = centre.x + radius * angle.cos();
-                let z = centre.z + radius * angle.sin();
-                Vec3::new(x, ground(x, z).unwrap_or(centre.y), z)
-            })
-            .collect();
-    }
-
-    /// [`Pack::set_ring`] on the client's replica of the terrain: each peg
-    /// stands on the highest solid cell within a few metres of the fire's
-    /// height.
-    pub(super) fn set_ring_on(&mut self, view: &dyn PackView, terrain: &Volume) {
-        let Some((centre, _)) = self.camp(view) else {
-            return;
-        };
-        let top = ((centre.y + 8.0) / CELL_M).floor() as i64;
-        let bottom = ((centre.y - 16.0) / CELL_M).floor() as i64;
-        self.set_ring(view, |x, z| {
-            let (cx, cz) = ((x / CELL_M).floor() as i64, (z / CELL_M).floor() as i64);
-            (bottom..=top).rev().find_map(|y| {
-                matches!(
-                    terrain.sample(GlobalCell::new(cx, y, cz)),
-                    Ok(Sample::Filled(_))
-                )
-                .then_some((y + 1) as f32 * CELL_M)
-            })
-        });
-    }
-
-    /// Asks for the inventory again on the next frame (after a build).
-    pub(super) fn refresh_soon(&mut self) {
-        self.requested_at = None;
-    }
-}
-
-/// What a label over the pack can be clicked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PackTarget {
-    Item(u16),
-    MakeCamp,
-}
-
-/// Pegs with a stone at their foot around the camp, joined by twine.
-fn ring_instances(ring: &[Vec3], twine: u32, stone: u32) -> Vec<CubeInstance> {
-    const PEG_M: f32 = 0.45;
-    let mut out = Vec::new();
-    for (i, &foot) in ring.iter().enumerate() {
-        out.push(CubeInstance::new(
-            (foot + Vec3::Y * (PEG_M * 0.5)).to_array(),
-            twine,
-            [0.05, PEG_M, 0.05],
-            CubeInstance::IDENTITY_ROTATION,
-        ));
-        out.push(CubeInstance::new(
-            (foot + Vec3::Y * 0.04).to_array(),
-            stone,
-            [0.14, 0.08, 0.12],
-            Quat::from_rotation_y(i as f32).to_array(),
-        ));
-        let next = ring[(i + 1) % ring.len()];
-        let (a, b) = (
-            foot + Vec3::Y * (PEG_M - 0.06),
-            next + Vec3::Y * (PEG_M - 0.06),
-        );
-        let span = b - a;
-        if span.length() > 0.01 {
-            out.push(CubeInstance::new(
-                ((a + b) * 0.5).to_array(),
-                twine,
-                [span.length(), 0.015, 0.015],
-                Quat::from_rotation_arc(Vec3::X, span.normalize()).to_array(),
-            ));
-        }
-    }
-    out
 }
 
 /// Standing eye height above the feet, as the camera uses.
@@ -604,20 +429,17 @@ fn jitter(item: u16, copy: u32) -> Vec3 {
     Vec3::new(hash(1) * 0.025, hash(2) * 0.025, hash(3) * 0.35)
 }
 
-/// The clickable label nearest the cursor within reach, if any.
-pub(super) fn hovered_target(
-    labels: &[(Option<PackTarget>, [f32; 2])],
-    cursor: [f32; 2],
-) -> Option<PackTarget> {
+/// The label nearest the cursor within reach, if any.
+pub(super) fn hovered_item(labels: &[(Option<u16>, [f32; 2])], cursor: [f32; 2]) -> Option<u16> {
     labels
         .iter()
-        .filter_map(|&(target, at)| {
-            let target = target?;
+        .filter_map(|&(item, at)| {
+            let item = item?;
             let distance = ((at[0] - cursor[0]).powi(2) + (at[1] - cursor[1]).powi(2)).sqrt();
-            (distance <= HOVER_RADIUS_PX).then_some((target, distance))
+            (distance <= HOVER_RADIUS_PX).then_some((item, distance))
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(target, _)| target)
+        .map(|(item, _)| item)
 }
 
 #[cfg(test)]
@@ -625,7 +447,7 @@ mod tests {
     use super::*;
 
     #[derive(Debug)]
-    struct TestView(Vec<CubeInstance>, bool);
+    struct TestView(Vec<CubeInstance>);
 
     impl PackView for TestView {
         fn catalog_version(&self) -> u32 {
@@ -643,41 +465,15 @@ mod tests {
         fn trim_materials(&self) -> [u32; 2] {
             [8, 9]
         }
-        fn camp_radius_m(&self, site_kind: u16) -> Option<f32> {
-            (site_kind == 1).then_some(15.0)
-        }
-        fn camp_tool(&self) -> Option<CampTool> {
-            self.1.then_some(CampTool {
-                tool: 5,
-                cost: &[(1, 4)],
-                cost_text: "4 logs",
-            })
-        }
     }
 
     fn log_view() -> TestView {
-        TestView(
-            vec![CubeInstance::new(
-                [0.0, 0.05, 0.0],
-                3,
-                [0.4, 0.1, 0.1],
-                CubeInstance::IDENTITY_ROTATION,
-            )],
-            false,
-        )
-    }
-
-    fn camp_view() -> TestView {
-        TestView(log_view().0, true)
-    }
-
-    fn fire_pit(cell: [i64; 3]) -> SiteEntry {
-        SiteEntry {
-            site_id: 1,
-            kind: 1,
-            cell,
-            facing: 0,
-        }
+        TestView(vec![CubeInstance::new(
+            [0.0, 0.05, 0.0],
+            3,
+            [0.4, 0.1, 0.1],
+            CubeInstance::IDENTITY_ROTATION,
+        )])
     }
 
     fn opened(inventory: Vec<InventoryEntry>) -> Pack {
@@ -789,7 +585,7 @@ mod tests {
         let empty = opened(Vec::new());
         let labels = empty.labels(&view);
         assert_eq!(labels.len(), 1);
-        assert_eq!(labels[0].target, None);
+        assert_eq!(labels[0].item, None);
 
         let many = opened(
             (1..=15)
@@ -829,7 +625,6 @@ mod tests {
                 item_id: 1,
                 count: 5,
             }],
-            sites: Vec::new(),
         };
         pack.sync_inventory(Some(reply), 1, now + REFRESH);
         assert_eq!(pack.laid_out().len(), 1);
@@ -838,94 +633,12 @@ mod tests {
     #[test]
     fn hover_picks_the_nearest_item_within_reach() {
         let labels = [
-            (Some(PackTarget::Item(1)), [100.0, 100.0]),
-            (Some(PackTarget::MakeCamp), [160.0, 100.0]),
+            (Some(1), [100.0, 100.0]),
+            (Some(2), [160.0, 100.0]),
             (None, [130.0, 100.0]),
         ];
-        assert_eq!(
-            hovered_target(&labels, [120.0, 100.0]),
-            Some(PackTarget::Item(1))
-        );
-        assert_eq!(
-            hovered_target(&labels, [150.0, 110.0]),
-            Some(PackTarget::MakeCamp)
-        );
-        assert_eq!(hovered_target(&labels, [400.0, 400.0]), None);
-    }
-
-    #[test]
-    fn without_a_camp_the_tarp_offers_one_only_when_it_is_affordable() {
-        let view = camp_view();
-        let poor = opened(vec![InventoryEntry {
-            item_id: 1,
-            count: 3,
-        }]);
-        let offer = poor.labels(&view).pop().unwrap();
-        assert_eq!(
-            (offer.target, offer.text.as_str()),
-            (None, "Making camp needs 4 logs")
-        );
-        let rich = opened(vec![InventoryEntry {
-            item_id: 1,
-            count: 4,
-        }]);
-        let offer = rich.labels(&view).pop().unwrap();
-        assert_eq!(offer.target, Some(PackTarget::MakeCamp));
-        // The offer stands where the fire pit would go, past the tarp.
-        let ahead = (offer.at - Vec3::new(10.0, 5.0, -3.0)).dot(forward(0.0));
-        assert!(ahead > TARP_NEAR_M + TARP_D_M, "{ahead} m ahead");
-        // No offer from a game without a camp tool.
-        assert!(
-            rich.labels(&log_view())
-                .iter()
-                .all(|l| l.target != Some(PackTarget::MakeCamp))
-        );
-    }
-
-    #[test]
-    fn with_a_camp_the_tarp_says_how_far_the_fire_is_and_rings_the_camp() {
-        let view = camp_view();
-        let mut pack = opened(Vec::new());
-        // The pack opened at (10, 5, -3); the fire is 6 m east of it.
-        let fire = [
-            (16.0 / CELL_M) as i64,
-            (5.0 / CELL_M) as i64,
-            (-3.0 / CELL_M) as i64,
-        ];
-        pack.take_sites(vec![fire_pit(fire)]);
-        let texts: Vec<_> = pack.labels(&view).into_iter().map(|l| l.text).collect();
-        assert!(
-            texts.contains(&"In camp, 6 m from the fire".to_owned()),
-            "{texts:?}"
-        );
-        assert!(!texts.iter().any(|t| t.contains("Make camp")));
-
-        assert!(pack.needs_ring(&view));
-        pack.set_ring(&view, |_, _| Some(4.5));
-        assert!(!pack.needs_ring(&view));
-        let (centre, radius) = pack.camp(&view).unwrap();
-        let pegs: Vec<_> = pack
-            .instances(&view)
-            .into_iter()
-            .filter(|c| c.material == 8 && c.size[1] > 0.4)
-            .collect();
-        assert_eq!(pegs.len(), RING_PEGS);
-        for peg in pegs {
-            let foot = Vec3::from_array(peg.offset) - Vec3::Y * (peg.size[1] * 0.5);
-            assert!(((foot - centre).with_y(0.0).length() - radius).abs() < 0.01);
-            assert!(
-                (foot.y - 4.5).abs() < 1e-4,
-                "stands on the ground it was given"
-            );
-        }
-
-        // Moving the camp asks for a new ring.
-        pack.take_sites(vec![fire_pit([400, 20, 0])]);
-        assert!(pack.needs_ring(&view));
-        let far: Vec<_> = pack.labels(&view).into_iter().map(|l| l.text).collect();
-        assert!(
-            far.iter().any(|t| t.starts_with("Outside your camp")),
-            "{far:?}"
-        );
+        assert_eq!(hovered_item(&labels, [120.0, 100.0]), Some(1));
+        assert_eq!(hovered_item(&labels, [150.0, 110.0]), Some(2));
+        assert_eq!(hovered_item(&labels, [400.0, 400.0]), None);
     }
 }

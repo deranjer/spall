@@ -80,7 +80,6 @@ fn response(inventory: &mut Inventory, request: ProgressionRequest) -> Progressi
                 count: stack.count,
             })
             .collect(),
-        sites: Vec::new(),
     }
 }
 

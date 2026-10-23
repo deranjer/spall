@@ -156,17 +156,6 @@ pub struct InventoryEntry {
     pub count: u32,
 }
 
-/// One game-owned structure the player placed (a camp's fire pit, a rack):
-/// a stable game ID, the game's kind code, its anchor terrain cell and its
-/// facing in quarter turns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SiteEntry {
-    pub site_id: u64,
-    pub kind: u16,
-    pub cell: [i64; 3],
-    pub facing: u8,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProgressionOutcome {
     Inventory,
@@ -183,8 +172,6 @@ pub struct ProgressionResponse {
     pub inventory_revision: u64,
     pub outcome: ProgressionOutcome,
     pub inventory: Vec<InventoryEntry>,
-    /// The player's placed structures, sorted by unique nonzero `site_id`.
-    pub sites: Vec<SiteEntry>,
 }
 
 impl Record for ProgressionResponse {
@@ -209,21 +196,6 @@ impl Record for ProgressionResponse {
                 ));
             }
             previous = entry.item_id;
-        }
-        if self.sites.len() > 64 {
-            return Err(RecordError::OutOfRange {
-                field: "ProgressionResponse.sites",
-                detail: "more than 64 sites",
-            });
-        }
-        let mut previous = 0;
-        for site in &self.sites {
-            if site.site_id <= previous || site.facing > 3 {
-                return Err(RecordError::Inconsistent(
-                    "sites must have sorted unique nonzero IDs and a quarter-turn facing",
-                ));
-            }
-            previous = site.site_id;
         }
         Ok(())
     }

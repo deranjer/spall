@@ -194,6 +194,5 @@ pub(super) fn progression_rejected(
         inventory_revision: request.expected_inventory_revision,
         outcome: spall_protocol::ProgressionOutcome::Rejected(code),
         inventory: Vec::new(),
-        sites: Vec::new(),
     }
 }

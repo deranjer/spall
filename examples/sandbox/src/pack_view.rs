@@ -1,7 +1,7 @@
 //! What the sandbox's items look like laid out on the pack's tarp (Tab):
 //! names and small cube models built from manifest materials.
 
-use spall_client::window::{CampTool, PackView};
+use spall_client::window::PackView;
 use spall_render::CubeInstance;
 
 use crate::game::{RECIPE_CATALOG_VERSION, items, materials};
@@ -104,22 +104,6 @@ impl PackView for SandboxPackView {
 
     fn trim_materials(&self) -> [u32; 2] {
         [u32::from(materials::CLAY.0), u32::from(materials::STONE.0)]
-    }
-
-    fn camp_radius_m(&self, site_kind: u16) -> Option<f32> {
-        (site_kind == crate::camp::site_kinds::FIRE_PIT).then_some(crate::camp::CAMP_RADIUS_M)
-    }
-
-    fn camp_tool(&self) -> Option<CampTool> {
-        const COST: [(u16, u32); 1] = [(
-            crate::camp::FIRE_PIT_COST[0].item.0,
-            crate::camp::FIRE_PIT_COST[0].count,
-        )];
-        Some(CampTool {
-            tool: crate::game::tool_ids::FIRE_PIT,
-            cost: &COST,
-            cost_text: "4 stones",
-        })
     }
 }
 

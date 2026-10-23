@@ -23,7 +23,7 @@ pub mod residency_pass;
 pub mod serve;
 pub mod transfer_ids;
 
-pub use action_catalog::{BuildRequest, StructureBuilder, ToolCatalog, ToolCatalogError, ToolRule};
+pub use action_catalog::{ToolCatalog, ToolCatalogError, ToolRule};
 pub use baseline::{
     BaselineError, BaselineTransfer, brick_repair_patch, capture_transfer, chunk_payload,
     logical_brick_repair_patch, logical_capture_transfer, logical_world_baseline,

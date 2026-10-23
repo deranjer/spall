@@ -66,7 +66,6 @@ use crate::persist::{self, PersistConfig};
 use crate::persist_pipeline::{PersistPipeline, PipelineConfig};
 
 mod actions;
-mod builds;
 mod config;
 mod connection;
 mod fanout;
@@ -80,7 +79,6 @@ mod tick_loop;
 mod workers;
 
 use self::actions::*;
-use self::builds::*;
 pub use self::config::*;
 use self::connection::*;
 use self::fanout::*;

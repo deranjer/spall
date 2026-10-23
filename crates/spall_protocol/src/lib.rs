@@ -107,7 +107,7 @@ pub use records::{
     ClaimedTarget, ControlSeq, DurableThrough, InputFrame, InputSeq, InterestEpoch, InventoryEntry,
     MotionSnapshot, ProgressionOperation, ProgressionOutcome, ProgressionRejectCode,
     ProgressionRequest, ProgressionResponse, RecentInput, Record, RecordError, RepairKey,
-    RepairRequest, RequestId, SPLIT_BULK_TRANSFER_ID_BIT, SiteEntry, SnapshotSeq, TopologyOp,
+    RepairRequest, RequestId, SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq, TopologyOp,
     TopologyTransaction, TransferId, VolumeHash, WIRE_SCHEMA_VERSION, WORLD_RESET_TRANSFER_ID_BIT,
     WireTag,
 };

@@ -59,39 +59,13 @@ it back up, and walking or jumping gets up and goes. The world keeps running.
 - **Not yet:** crafting on the cloth, moving items, belt slots, sounds, and a tarp
   that follows uneven ground (it lies flat at the player's feet height).
 
-## Built: camps (ENG-245)
-
-A camp is a claimed area 15 m around the player's fire pit. Structures are real
-voxels, placed by the server **cell by cell**.
-
-- **Making camp.** With no camp, the open pack offers "Make camp here (4 stones)"
-  on the ground just past the tarp; hovering it marks out the fire pit, and a click
-  builds it there. Without 4 stones the tag only says what it needs. The fire pit is
-  a ring of 12 stone voxels with crossed wood and a glowing ember (the lamp
-  material) on top, 1.25 m across. One camp per player.
-- **In the world.** While the pack is open in a world with your camp, 48 pegs
-  joined by twine stand on the ground around its boundary, and the tarp says how
-  far the fire is ("In camp, 6 m from the fire", or "Outside your camp, ...").
-- **How builds work.** The game marks build tools in its `ToolCatalog`
-  (`with_build_tools`). A build action is validated like a single-cell placement
-  (server raycast, reach); then the game's `StructureBuilder` returns the cells and
-  charges the cost, or refuses with a reason. The server places 2 cells per tick as
-  ordinary replicated single-cell placements (the vegetation pattern), skipping any
-  cell that is no longer empty, so a fire pit takes about a second and no new
-  topology operation exists on the wire or in the journal.
-- **Sites.** The sandbox keeps each player's sites in memory, like slot
-  inventories, and returns them in every `ProgressionResponse`. On servers with
-  player credentials builds are refused for now; durable sites are ENG-247.
-
 ## Planned
 
 - **Sounds** for the body states and inventory (list below). None is integrated yet.
 - **Belt:** 4 to 6 worn quick slots, visible on the player body, switched without a menu.
 - **Pack crafting:** craft on the cloth from the laid-out items; other players see
   you kneeling.
-- **Camp storage (ENG-246):** log racks and stone piles built in the camp; storing
-  from the pack places the item's voxels on them, and cutting them gives the item
-  back.
+- **Camp storage:** racks, woodpiles and shelves as destructible world geometry.
 - **Wrist cord and journal:** the day count and exact readouts for players who want
   numbers.
 

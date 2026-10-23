@@ -11,7 +11,7 @@ use spall_protocol::{
 use crate::game::{self, Inventory, ItemStack};
 
 const STORE_SCHEMA_VERSION: i64 = 1;
-const RESPONSE_SCHEMA_VERSION: i64 = 2;
+const RESPONSE_SCHEMA_VERSION: i64 = 1;
 const REQUEST_CACHE_LIMIT: i64 = 128;
 
 #[derive(Debug, thiserror::Error)]
@@ -435,7 +435,6 @@ fn inventory_response(
                 count: stack.count,
             })
             .collect(),
-        sites: Vec::new(),
     }
 }
 
