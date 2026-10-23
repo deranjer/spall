@@ -6,6 +6,7 @@ pub mod body_state;
 pub mod breathing;
 pub mod catalogue;
 pub mod column_surface;
+pub mod creature_sounds;
 pub mod day_night;
 pub mod ecology_demo;
 pub mod footsteps;

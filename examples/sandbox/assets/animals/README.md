@@ -1,7 +1,7 @@
 # Sandbox articulated animals
 
-Five authored SPVX 1.1 animals the sandbox spawns as live creatures: trout,
-crow, deer, bear (grizzly) and leopard (snow leopard). Each file has raw
+Six authored SPVX 1.1 animals the sandbox spawns as live creatures: trout,
+crow, deer, bear (grizzly), leopard (snow leopard) and wolf (grey wolf). Each file has raw
 canonical `META`/`MTRL`/`PALT`/`PART`/`VOXL`/`ANIM`/`HASH` chunks; there is no
 `STRC` or `LAYR`. Geometry is sparse part-local topology at SPVX cell-size code
 `1` (6.25 cm), with unit rest scale and integer-cell pivots. Animations
@@ -43,6 +43,7 @@ Facing +X, +Y up, +Z to the animal's left. Sizes are the generated rest bounds
 | Deer | `5a871003-2026-4001-8000-000000000003` | 33 × 32 × 9 | 2.0 m long, 1.1 m at the shoulder | 2,023 | 13 |
 | Bear | `5a871004-2026-4001-8000-000000000004` | 44 × 22 × 13 | 2.75 m long, 1.3 m at the hump | 6,578 | 12 |
 | Leopard | `5a871005-2026-4001-8000-000000000005` | 39 × 13 × 7 | 1.2 m body plus 0.8 m tail, 0.75 m tall | 1,112 | 13 |
+| Wolf | `5a871006-2026-4001-8000-000000000006` | 32 × 16 × 7 | 2.0 m nose to tail tip, 0.85 m at the shoulder | 747 | 12 |
 
 ## Parts and clips
 
@@ -57,6 +58,7 @@ All clips loop at 60 ticks/s.
 | Deer | torso (root), neck, head with ears, antlers, tail, 8 leg parts | `idle`, `walk`, `run`, `graze`, `alert`, `sleep` (bedded) |
 | Bear | torso with hump (root), neck, head, tail, 8 leg parts with clawed paws | `idle`, `walk`, `run`, `swipe`, `eat`, `stand` (rears up) |
 | Leopard | torso (root), neck, head, two-part tail, 8 leg parts | `idle`, `walk`, `stalk`, `pounce`, `run` |
+| Wolf | torso (root), neck, head with muzzle and pointed ears, bushy tail, 8 leg parts | `idle`, `walk` (trot), `run`, `stalk`, `bite`, `eat`, `howl` |
 
 The live game plays `idle` and each species' move clip (`walk`, `flap` or
 `swim`). The other clips are authored for the animal behavior work (ENG-226)

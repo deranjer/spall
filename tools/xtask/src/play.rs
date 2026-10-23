@@ -68,15 +68,15 @@ pub struct PlayArgs {
     /// `--editor-scene` file, else daylight.
     #[arg(long)]
     environment: Option<String>,
-    /// Run without vsync, limited to this many frames per second (throughput
-    /// measurement). Play presents with vsync by default: without it the GPU
-    /// queue can starve the whole desktop (mouse clicks, alt+tab) while a large
-    /// world loads, and a software frame cap did not prevent that (724862ad,
-    /// regressed by 014d6100 on 2026-10-20).
+    /// Run without vsync, limited to this many frames per second. DANGER: on
+    /// large worlds this has frozen the whole PC, once badly enough to need a
+    /// hard reboot (2026-10-22), with CPU and GPU far from busy. To see how
+    /// fast a scene could run, play with vsync and read the "headroom" figure
+    /// in the window title instead.
     #[arg(long)]
     fps_cap: Option<u32>,
-    /// Run without vsync and without any frame cap (throughput measurement
-    /// only; can freeze the desktop on large worlds).
+    /// Run without vsync and without any frame cap. Same danger as
+    /// `--fps-cap`.
     #[arg(long)]
     uncapped: bool,
     /// Accepted for older scripts: play uses vsync by default.
@@ -339,6 +339,10 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         (false, cap) => cap,
     };
     if let Some(cap) = no_vsync_cap {
+        eprintln!(
+            "xtask play: WARNING: running without vsync. On large worlds this has frozen              the whole PC, once needing a hard reboot (2026-10-22). Play with vsync and              read the window title's \"headroom\" figure instead. Starting in 10 s;              press Ctrl+C to cancel."
+        );
+        std::thread::sleep(std::time::Duration::from_secs(10));
         client_cmd.arg("--uncapped");
         client_cmd.env("SPALL_MAX_FPS", cap.to_string());
     }
