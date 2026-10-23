@@ -335,3 +335,46 @@ fn a_discharge_spring_adds_exactly_its_rate_and_survives_a_save() {
     old.version = 3;
     assert!(old.validate().is_err());
 }
+
+/// Far water steps one slice in 2, 4 or 8, and its springs run in step with
+/// it: at the full rate a far spring piled water up faster than its region
+/// could carry it away, so far rivers ran deeper and spread further.
+#[test]
+fn a_far_spring_runs_in_slow_motion_with_its_water() {
+    use spall_sim::column_water::Discharge;
+    let run = |far: bool| {
+        let mut setup = ColumnWaterSetup::new(0, 32, Vec::new());
+        setup.discharges = vec![Discharge {
+            cell: GlobalCell::new(5, 2, 7),
+            flow_cells3_s: 12.0,
+        }];
+        setup.config.throttle_from_cells = [100.0, 200.0, 400.0];
+        let terrain = basin();
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+        water.set_focus(&[if far { [5000.0, 5000.0] } else { [8.0, 2.0] }]);
+        for _ in 0..600 {
+            water.tick(&terrain, &[], &[], 1.0 / 60.0).unwrap();
+        }
+        let frame = water.frame();
+        let depth = water.world().spans_in_column(5, 7)[0].depth;
+        (frame.spring_added_m3, frame.volume_m3, depth)
+    };
+    let (near_added, near_volume, near_depth) = run(false);
+    let (far_added, far_volume, far_depth) = run(true);
+    assert!((near_volume - near_added).abs() < 1e-6);
+    assert!(
+        (far_volume - far_added).abs() < 1e-6,
+        "nothing lost or made"
+    );
+    // Stepped one slice in 8, the far spring adds an eighth (give or take the
+    // slice the run stops on).
+    let ratio = far_added / near_added;
+    assert!(
+        (0.1..0.15).contains(&ratio),
+        "far spring ran at {ratio} of the rate"
+    );
+    assert!(
+        far_depth <= near_depth + 0.05,
+        "no mound at the far spring: {far_depth} cells against {near_depth} near"
+    );
+}

@@ -216,6 +216,47 @@ fn flow_across_a_border_wakes_a_sleeping_region() {
     );
 }
 
+/// A trickle spread along a whole border, each pipe under the sleep flow, still
+/// wakes the region downhill: left asleep, its first column took the water and
+/// passed none on, and the region uphill filled behind it as a flat pool with a
+/// straight wall (seen in play as a slab of water standing on a slope).
+#[test]
+fn a_wide_trickle_into_a_sleeping_region_flows_on_instead_of_damming() {
+    // Ground falling towards +x, about 0.12 cells per column, across three regions.
+    let terrain = Flat::new(|x, y, _| (y as f64) < (95 - x) as f64 * 0.12);
+    let config = ColumnConfig {
+        sleep_flow: 0.5,
+        ..ColumnConfig::default()
+    };
+    let mut world = ColumnWorld::with_terrain(terrain, config);
+    world.allocate_rect(0, 0, 95, 31);
+    // A spring line at the top: 8 cells^3/s over 32 columns.
+    let springs: Vec<GlobalCell> = (0..32)
+        .map(|z| GlobalCell::new(2, world.spans_in_column(2, z)[0].floor_y, z))
+        .collect();
+    for _ in 0..(60.0 / DT) as u32 {
+        for &s in &springs {
+            world.add_flow(s, 0.25 * DT).unwrap();
+        }
+        world.step(DT);
+    }
+    let surface = |x: i64| {
+        let s = world.spans_in_column(x, 16)[0];
+        s.floor_y as f64 + s.depth
+    };
+    assert!(
+        world.column_volume(40, 16) > 0.0,
+        "the water ran on past the first columns downhill"
+    );
+    // The water follows the ground: no step of half a metre at the border.
+    assert!(
+        surface(31) - surface(34) < 2.0,
+        "a dam at the border: surface {} against {}",
+        surface(31),
+        surface(34)
+    );
+}
+
 /// A non-resident neighbour is a closed wall: water neither drains into it nor
 /// stops being counted. When it returns, both sides exchange.
 #[test]
