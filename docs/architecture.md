@@ -574,11 +574,14 @@ and drains are placed on the 1 m cell they fall in (`ColumnWorld::world_cell`),
 and an edit refreshes the 1 m region it falls in. Clients are unchanged: each
 1 m region is published as the 16 terrain regions under it, each terrain column
 drawn against its own voxels (its own floor, dry where its terrain stands above
-the water) with the surface blended between 1 m columns. A 1 m cell closed by a
+the water) with its height and current blended bilinearly between 1 m columns. A 1 m cell closed by a
 solid terrain cell at the water's height holds no water (about 2% of the
 planned volume of the 1 km world, all at shores), but the frames draw the water
-on into its open terrain columns from the wet side, stopping at any wall, so
-the waterline is the true shore. In this mode the sea is held at its level (a
+on into its open terrain columns from the wet side, stopping at any wall and
+at any column more than a cell below the wet neighbour's floor (a hole or a
+drop), so the waterline is the true shore. A canal cut fills at about the same
+pace as at 0.25 m (a 2 m gap from a 2.5 m deep pool: water 13 m past it in 7.7 s
+against 7.8 s). In this mode the sea is held at its level (a
 river ends where it meets it) and inland water open to the sky evaporates
 1.45e-4 cells a second (about 4 cm per game day), which balances the springs on
 the 1 km natural world; far water evaporates in slow motion as its springs run.
@@ -586,7 +589,8 @@ The canonical water state carries the column width, sea level and evaporation
 (wire version 20), so a 1 m world saves and restores at its width. The sandbox
 server starts 1 m water settled: the first start of a world runs it with no
 player until its regions stop changing (about 10 minutes for 1 km) and caches
-the state in `<world>/water-cache`; later starts load it. A save carries the
+the state in `<world>/water-cache`; later starts load it, and the loaded water is woken once so its rivers run on
+(a restore leaves water at rest and asleep). A save carries the
 water, not the solver's tuning: after recovering a save the server restores the
 water again with its scene's config (a generated world's sleep flow and far
 throttle). Measured headless (1 km natural seed 1, all cores,
