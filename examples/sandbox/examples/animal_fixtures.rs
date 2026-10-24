@@ -20,6 +20,8 @@ mod leopard;
 mod player;
 #[path = "animal_fixtures/trout.rs"]
 mod trout;
+#[path = "animal_fixtures/wolf.rs"]
+mod wolf;
 
 const OUT: &str = "examples/sandbox/assets/animals";
 const CHARACTERS: &str = "examples/sandbox/assets/characters";
@@ -594,6 +596,7 @@ fn run() -> Result<(), String> {
         deer::deer(),
         bear::bear(),
         leopard::leopard(),
+        wolf::wolf(),
         player::player(),
     ];
     let mut uuids = BTreeSet::new();

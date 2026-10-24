@@ -38,6 +38,8 @@ pub struct BiomeAudioConfig {
     /// More bird recordings. Each birdsong burst plays one of these, or the
     /// biome's own birdsong track, chosen at random (see [`with_birdsong`]).
     pub birdsong_pool: Vec<PathBuf>,
+    /// Sounds creatures make, heard from where they are.
+    pub creatures: crate::creature_sounds::CreatureSoundConfig,
     pub footsteps: crate::footsteps::FootstepConfig,
     pub breathing: crate::breathing::BreathingConfig,
 }
@@ -58,6 +60,8 @@ pub struct WeatherLayer {
 pub const DEFAULT_RANGE_M: f32 = 45.0;
 /// Most ambience layers mixed at once.
 const MAX_LAYERS: usize = 4;
+/// Most panned one-shots (creature sounds) playing at once; more are dropped.
+const MAX_VOICES: usize = 8;
 /// Time constant of a layer's volume approaching its target, so a layer fades
 /// in and out over a few seconds instead of switching.
 const LAYER_RAMP: Duration = Duration::from_millis(1200);
@@ -404,11 +408,20 @@ pub fn validate_loop_boundary(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A one-shot for the audio worker.
+enum Shot {
+    /// Weather (thunder): one bounded voice, at full gain.
+    Weather(PathBuf),
+    /// A sound heard from somewhere, at a loudness and pan (-1 left to 1
+    /// right) fixed when it starts.
+    Panned { path: PathBuf, gain: f32, pan: f32 },
+}
+
 /// Sends desired tracks to a worker that owns the audio device and both sinks.
 #[derive(Clone)]
 pub struct AmbienceAudio {
     tx: SyncSender<Vec<(PathBuf, f32)>>,
-    one_shots: SyncSender<PathBuf>,
+    one_shots: SyncSender<Shot>,
     gain: Arc<AtomicU32>,
 }
 
@@ -423,7 +436,7 @@ impl AmbienceAudio {
             .filter(|value| value.is_finite())
             .map_or(gain, |value| value.clamp(0.0, 1.0));
         let (tx, rx) = mpsc::sync_channel(1);
-        let (one_shots, shot_rx) = mpsc::sync_channel(4);
+        let (one_shots, shot_rx) = mpsc::sync_channel(16);
         let gain = Arc::new(AtomicU32::new(gain.to_bits()));
         let worker_gain = Arc::clone(&gain);
         thread::Builder::new()
@@ -451,9 +464,43 @@ impl AmbienceAudio {
             .store(safe_gain(gain).to_bits(), Ordering::Relaxed);
     }
 
-    pub fn play_once(&self, path: PathBuf) -> Result<(), TrySendError<PathBuf>> {
-        self.one_shots.try_send(path)
+    /// Plays a weather one-shot unless one is already playing. Returns false
+    /// when the worker is busy or gone.
+    pub fn play_once(&self, path: PathBuf) -> bool {
+        self.one_shots.try_send(Shot::Weather(path)).is_ok()
     }
+
+    /// Plays a sound once at `gain` (0..=1) and `pan` (-1 left to 1 right),
+    /// unless [`MAX_VOICES`] are already playing. Returns false when the
+    /// worker is busy or gone.
+    pub fn play_panned(&self, path: PathBuf, gain: f32, pan: f32) -> bool {
+        self.one_shots
+            .try_send(Shot::Panned { path, gain, pan })
+            .is_ok()
+    }
+}
+
+/// The recording at `path` as stereo, panned with an equal-power law.
+fn panned(
+    path: &std::path::Path,
+    pan: f32,
+) -> Result<rodio::source::ChannelVolume<Decoder<std::io::BufReader<std::fs::File>>>, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let source = Decoder::try_from(file).map_err(|error| error.to_string())?;
+    let (left, right) = pan_gains(pan);
+    Ok(rodio::source::ChannelVolume::new(source, vec![left, right]))
+}
+
+/// Left and right channel gains for `pan` (-1 left to 1 right): equal power,
+/// so a sound keeps its loudness as it moves across.
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let pan = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+    (angle.cos(), angle.sin())
 }
 
 fn safe_gain(gain: f32) -> f32 {
@@ -480,7 +527,7 @@ fn ramp(volume: f32, target: f32, dt: Duration) -> f32 {
 
 fn run_audio(
     rx: mpsc::Receiver<Vec<(PathBuf, f32)>>,
-    shot_rx: mpsc::Receiver<PathBuf>,
+    shot_rx: mpsc::Receiver<Shot>,
     gain: Arc<AtomicU32>,
 ) {
     let stream = match OutputStreamBuilder::open_default_stream() {
@@ -491,6 +538,7 @@ fn run_audio(
         }
     };
     let thunder = Sink::connect_new(stream.mixer());
+    let mut voices: Vec<(Sink, f32)> = Vec::new();
     let mut layers: Vec<Layer> = Vec::new();
     let mut last_update = Instant::now();
 
@@ -548,8 +596,26 @@ fn run_audio(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
-        // One bounded one-shot voice. Do not build an unbounded thunder queue.
-        while let Ok(path) = shot_rx.try_recv() {
+        // One bounded weather voice, and at most MAX_VOICES panned ones. Do
+        // not build an unbounded queue.
+        voices.retain(|(sink, _)| !sink.empty());
+        while let Ok(shot) = shot_rx.try_recv() {
+            let path = match shot {
+                Shot::Weather(path) => path,
+                Shot::Panned { path, gain, pan } => {
+                    if voices.len() < MAX_VOICES {
+                        match panned(&path, pan) {
+                            Ok(source) => {
+                                let sink = Sink::connect_new(stream.mixer());
+                                sink.append(source);
+                                voices.push((sink, safe_gain(gain)));
+                            }
+                            Err(error) => tracing::warn!(%error, ?path, "sound unavailable"),
+                        }
+                    }
+                    continue;
+                }
+            };
             if thunder.empty() {
                 match std::fs::File::open(path)
                     .map_err(|e| e.to_string())
@@ -565,6 +631,9 @@ fn run_audio(
         }
         let gain = f32::from_bits(gain.load(Ordering::Relaxed));
         thunder.set_volume(gain);
+        for (sink, loudness) in &voices {
+            sink.set_volume(gain * loudness);
+        }
         let now = Instant::now();
         let dt = now.saturating_duration_since(last_update);
         last_update = now;
@@ -582,6 +651,17 @@ fn run_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panning_keeps_power_and_sends_each_side_its_own_channel() {
+        for pan in [-1.0, -0.4, 0.0, 0.7, 1.0, f32::NAN] {
+            let (left, right) = pan_gains(pan);
+            assert!((left * left + right * right - 1.0).abs() < 1.0e-5);
+        }
+        let (left, right) = pan_gains(1.0);
+        assert!(left.abs() < 1.0e-6 && (right - 1.0).abs() < 1.0e-6);
+        assert_eq!(pan_gains(0.0).0, pan_gains(0.0).1);
+    }
 
     #[test]
     fn volume_rejects_nonfinite_and_clamps() {

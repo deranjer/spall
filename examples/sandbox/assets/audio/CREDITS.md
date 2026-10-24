@@ -46,3 +46,12 @@ These recordings were selected from local user-approved downloads. Runtime copie
 | birds/blackbird.ogg | richwise (whole preview) | [Original recording](https://freesound.org/people/richwise/sounds/811988/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | birds/robin.ogg | Sacha.Julien (0-145 s) | [Original recording](https://freesound.org/people/Sacha.Julien/sounds/725201/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | birds/blackcap.ogg | Sacha.Julien (0-56 s) | [Original recording](https://freesound.org/people/Sacha.Julien/sounds/725333/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-howl.ogg | betchkal (28.8-38.5 s, the second howl) | [Original recording](https://freesound.org/people/betchkal/sounds/500646/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-chorus-sanctuary.ogg | Paresh (1-14 s) | [Original recording](https://freesound.org/people/Paresh/sounds/158780/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-chorus.ogg | Kingcornz (0.6-7.2 s) | [Original recording](https://freesound.org/people/Kingcornz/sounds/378334/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-growl.ogg | qubodup (4-9 s) | [Original recording](https://freesound.org/people/qubodup/sounds/122183/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-bite.ogg | qubodup (4.6-6.2 s) | [Original recording](https://freesound.org/people/qubodup/sounds/823544/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-bark.ogg | exe2be (whole preview) | [Original recording](https://freesound.org/people/exe2be/sounds/535457/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-bark-pack.ogg | Mrthenoronha (0-3 s) | [Original recording](https://freesound.org/people/Mrthenoronha/sounds/420451/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-yips.ogg | buzzatsea (13-18.2 s) | [Original recording](https://freesound.org/people/buzzatsea/sounds/711262/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| animals/wolf-steps.ogg | melle_teich (0-3 s) | [Original recording](https://freesound.org/people/melle_teich/sounds/628400/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |

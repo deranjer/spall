@@ -73,6 +73,10 @@ pub const fn contact_damage_config() -> spall_sim::ContactDamageConfig {
 /// (ENG-240).
 pub const BEAR_SWIPE_DAMAGE: u16 = 60;
 
+/// Health one wolf bite removes (ENG-243); a pack gives up after three bites,
+/// so a hunt alone does not kill a player at full health.
+pub const WOLF_BITE_DAMAGE: u16 = 20;
+
 const _: () = assert!(
     BEAR_SWIPE_DAMAGE < spall_sim::PLAYER_MAX_HEALTH
         && 2 * BEAR_SWIPE_DAMAGE >= spall_sim::PLAYER_MAX_HEALTH

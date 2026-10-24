@@ -247,14 +247,16 @@ impl AnimalVisual {
     }
 
     /// Each part's cells as offsets from the part's joint, metres, with their
-    /// mapped material; parent-before-child part order.
-    pub fn part_cells(&self) -> impl Iterator<Item = impl Iterator<Item = (Vec3, MaterialId)>> {
+    /// mapped material and tint; parent-before-child part order.
+    pub fn part_cells(
+        &self,
+    ) -> impl Iterator<Item = impl Iterator<Item = (Vec3, MaterialId, Option<[u8; 3]>)>> {
         let edge = self.cell_edge_m;
         self.parts.iter().map(move |geometry| {
             geometry
                 .cells
                 .iter()
-                .map(move |cell| (cell_offset(cell, edge), cell.material))
+                .map(move |cell| (cell_offset(cell, edge), cell.material, cell.tint))
         })
     }
 

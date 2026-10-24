@@ -621,20 +621,20 @@ fn wade(
     step
 }
 
-fn creature_at(sim: &Simulation, id: u64) -> Option<[f64; 3]> {
+pub(super) fn creature_at(sim: &Simulation, id: u64) -> Option<[f64; 3]> {
     sim.creature_poses()
         .into_iter()
         .find(|pose| pose.creature_id == id)
         .map(|pose| pose.translation_m)
 }
 
-fn horizontal(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(super) fn horizontal(a: [f64; 3], b: [f64; 3]) -> f64 {
     (a[0] - b[0]).hypot(a[2] - b[2])
 }
 
 /// A step toward `target` at `speed_m_s`, turning at most `max_turn` and
 /// stopping `short_m` before it.
-fn toward(
+pub(super) fn toward(
     walker: &Walker,
     here: [f64; 3],
     target: [f64; 3],

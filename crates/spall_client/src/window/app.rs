@@ -12,7 +12,7 @@ pub(super) struct InteractiveApp {
     /// Material index of the debug overlay colour (one past the manifest).
     pub(super) debug_material: u32,
     pub(super) uncapped: bool,
-    ambience: Option<AmbienceAudio>,
+    pub(super) ambience: Option<AmbienceAudio>,
     pub(super) biome_audio: BiomeAudioConfig,
     pub(super) creature_view: Option<std::sync::Arc<dyn CreatureView>>,
     pub(super) player_view: Option<std::sync::Arc<dyn PlayerView>>,
@@ -20,6 +20,8 @@ pub(super) struct InteractiveApp {
     pub(super) third_person: bool,
     /// Render-table index of the player view's first tint material.
     pub(super) player_tint_base: u32,
+    /// First render-table index of the creature view's tinted materials.
+    pub(super) creature_tint_base: u32,
     /// Last drawn creature cubes and remote players. A frame that finds the
     /// replica lock busy reuses them instead of dropping them for a frame.
     pub(super) last_creature_cubes: Vec<spall_render::CubeInstance>,
@@ -44,6 +46,8 @@ pub(super) struct InteractiveApp {
     /// One stride counter per walking player (`0` is the local player).
     pub(super) footstep_trackers: HashMap<u64, crate::footsteps::FootstepTracker>,
     pub(super) footstep_at: Option<Instant>,
+    /// Each creature's last tag, to start its sounds when it changes.
+    pub(super) creature_sounds: crate::creature_sounds::CreatureSoundTracker,
     pub(super) footstep_log: bool,
     pub(super) breathing: Option<crate::breathing::BreathingAudio>,
     pub(super) breathing_state: crate::breathing::BreathingState,
@@ -268,6 +272,7 @@ impl InteractiveApp {
             player_view: options.player_view,
             third_person: false,
             player_tint_base: 0,
+            creature_tint_base: 0,
             last_creature_cubes: Vec::new(),
             last_remote_players: Vec::new(),
             third_person_distance_m: super::camera::THIRD_PERSON_DISTANCE_M,
@@ -290,6 +295,9 @@ impl InteractiveApp {
             footstep_volume: 0.5,
             footstep_trackers: HashMap::new(),
             footstep_at: None,
+            creature_sounds: crate::creature_sounds::CreatureSoundTracker::new(
+                std::process::id().into(),
+            ),
             footstep_log: std::env::var_os("SPALL_FOOTSTEP_LOG").is_some(),
             breathing,
             breathing_state: crate::breathing::BreathingState::Calm,

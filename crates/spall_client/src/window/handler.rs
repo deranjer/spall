@@ -246,6 +246,7 @@ impl ApplicationHandler for InteractiveApp {
                 let now = Instant::now();
                 self.update_ambience();
                 self.update_footsteps(now);
+                self.update_creature_sounds(now);
                 self.update_endurance();
                 let handler_started = now;
                 self.advance_script(now, event_loop);
@@ -482,6 +483,7 @@ impl ApplicationHandler for InteractiveApp {
                             view.instances(
                                 replica.creatures(),
                                 replica.now_tick_estimate(),
+                                self.creature_tint_base,
                                 Instant::now(),
                                 cull.as_ref(),
                             )

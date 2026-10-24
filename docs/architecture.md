@@ -474,7 +474,10 @@ active region farther than 160, 320 or 640 m from the nearest player steps one
 step in 2, 4 or 8; on the others it rests: it exchanges water with its
 neighbours through its edge, as a sleeping region does, but does not
 redistribute, so far water runs in slow motion and no water is made or lost.
-The time a region rested is its debt (`region_owed_s`); once a region is near
+A spring in a region that rested adds nothing that slice, so it runs in slow
+motion with its water; at the full rate it piled water up around itself (1.36
+cells deep against 0.48 near) and far rivers ran deeper and wider than near
+ones. The time a region rested is its debt (`region_owed_s`); once a region is near
 again it spends up to 24 substeps a step, nearest and largest debt first, four
 regions a step, stepped alone for up to 4 s of its debt, until it has caught up.
 A region that is quiet for its sleep count still sleeps (counted in steps it was
@@ -535,6 +538,71 @@ for 508 s, a step about 1 ms (before 14-40), the water 1.9-2.5 s behind real tim
 (before 5-8 s). Flows under 0.5 cells^3/s (8 mL/s through the busiest pipe) stop
 being stepped until something disturbs them, so the slowest creeping on slopes
 and in channels freezes; rivers (1-100) keep running. Not looked at in game.
+
+That threshold also decided when a sleeping region woke: only when one pipe
+into it carried more than 0.5 cells^3/s. A river reaching a sleeping region
+over many border pipes, each under that, never woke it; the region's first
+column took the water (it is a pipe end) and passed none on, and the region
+upstream filled behind it as a flat pool with a straight wall, the "slab"
+seen in play at night on a 1 km world. A sleeping region now also wakes when a
+border column stands half a cell above or below the column next to it inside
+the region (`BORDER_WAKE_HEAD`). Measured headless with
+`examples/water_long_probe.rs` (natural seed 1, 1 km, a player standing at
+(374, 388) m): before, after 500 s of a loop flight new walls of 1-1.9 m stood
+along whole region edges in sleeping regions, one at the player's region of
+that session; after, none. The fix has a cost: the springs' rivers now run all
+the way down and reach the sea at about 480 s, which then wakes sea regions
+near the mouth, so active regions standing still went from 70 to 657 at 900 s
+(a water step 3.3 ms to 14 ms; the same run without drains is identical, so the
+drains are not the cause). Before the fix this happened later, as the
+dams gave way (in the session above drains first took water at 1,597 s, and
+active regions climbed from 145 to 1,137). Deep water is still judged quiet
+by flux, which a sea or lake a few metres deep exceeds at a crawl (ENG-185):
+judging it by speed (flux per cell of depth) cut the active regions at 900 s
+to 366, but left a 3 m pool asleep tilted by 1.4 cm; counting speed only once
+the water is level cut them to 511. Neither is in. The generated water also
+starts out of rest in places (at seeding, 173 columns stand over a metre above
+an open neighbour: lakes over dry cave pockets, river reaches seeded as
+stair-steps), held only by sleep until something wakes it.
+
+Water at 1 m columns (`SPALL_WATER_COARSE=1` on the server, off by default
+while it is compared in play; `ColumnConfig::column_cells`). One column covers
+4 x 4 terrain cells and keeps their 0.25 m vertical resolution; a 1 m cell is
+solid if any terrain cell in it is (`CoarseVolumeTerrain`), so a wall one cell
+thick holds water and a channel narrower than about 1 m carries none. Springs
+and drains are placed on the 1 m cell they fall in (`ColumnWorld::world_cell`),
+and an edit refreshes the 1 m region it falls in. Clients are unchanged: each
+1 m region is published as the 16 terrain regions under it, each terrain column
+drawn against its own voxels (its own floor, dry where its terrain stands above
+the water) with its height and current blended bilinearly between 1 m columns. A 1 m cell closed by a
+solid terrain cell at the water's height holds no water (about 2% of the
+planned volume of the 1 km world, all at shores), but the frames draw the water
+on into its open terrain columns from the wet side, stopping at any wall and
+at any column more than a cell below the wet neighbour's floor (a hole or a
+drop), so the waterline is the true shore. A 1 m region's frames are rebuilt only when a
+signature of its depths and of the ring around it changed, a region is rebuilt
+with its neighbours (their edges blend with it), and a far region's frames
+refresh at its throttle pace (its changes wait, never dropped); on the settled
+1 km world on 8 threads this took frame building from about 5.8 to 2.0 ms a
+step, and the whole water step from about 8.5 to 5 ms. A canal cut fills at about the same
+pace as at 0.25 m (a 2 m gap from a 2.5 m deep pool: water 13 m past it in 7.7 s
+against 7.8 s). In this mode the sea is held at its level (a
+river ends where it meets it) and inland water open to the sky evaporates
+1.45e-4 cells a second (about 4 cm per game day), which balances the springs on
+the 1 km natural world; far water evaporates in slow motion as its springs run.
+The canonical water state carries the column width, sea level and evaporation
+(wire version 20), so a 1 m world saves and restores at its width. The sandbox
+server starts 1 m water settled: the first start of a world runs it with no
+player until its regions stop changing (about 10 minutes for 1 km) and caches
+the state in `<world>/water-cache`; later starts load it, and the loaded water is woken once so its rivers run on
+(a restore leaves water at rest and asleep). A save carries the
+water, not the solver's tuning: after recovering a save the server restores the
+water again with its scene's config (a generated world's sleep flow and far
+throttle). Measured headless (1 km natural seed 1, all cores,
+settle then 900 s standing): the water settles after 1,600 s of water time
+instead of 3,300 s, keeps 162-172 active regions, and a whole water step takes
+4.2-6.6 ms against about 19 ms at 0.25 m. Report:
+`docs/reports/2026-10-23-water-direction-decision.md`.
 
 ENG-122 worker observability and transport profiling sections (2026-10-04, removed grid solver): see [reports/history-architecture.md](reports/history-architecture.md).
 

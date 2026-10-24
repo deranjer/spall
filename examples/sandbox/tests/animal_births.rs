@@ -282,7 +282,7 @@ fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
     let mut cubes = 0;
     for _ in 0..200 {
         cubes = view
-            .instances(creatures, 0.0, std::time::Instant::now(), None)
+            .instances(creatures, 0.0, 0, std::time::Instant::now(), None)
             .len();
     }
     let per_call = started.elapsed() / 200;
@@ -377,7 +377,7 @@ fn drawing_the_one_km_herd_each_frame() {
         let mut cubes = 0;
         for _ in 0..frames {
             cubes = view
-                .instances(&creatures, 0.0, std::time::Instant::now(), cull.as_ref())
+                .instances(&creatures, 0.0, 0, std::time::Instant::now(), cull.as_ref())
                 .len();
         }
         let per_call = started.elapsed() / frames;

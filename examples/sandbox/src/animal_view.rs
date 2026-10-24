@@ -12,6 +12,7 @@ use std::time::Instant;
 use glam::{Mat3, Quat, Vec3};
 use spall_client::replica_creatures::ReplicaCreatures;
 use spall_client::window::{CreatureCull, CreatureView};
+use spall_core::MaterialId;
 use spall_render::CubeInstance;
 
 use crate::animal_visual::{AnimalVisual, MAX_ANIMAL_VISUAL_CELLS, PartFrame, material_mapping};
@@ -20,6 +21,9 @@ use crate::animals::{AnimalError, LOCOMOTION_IDLE, locomotion_clip, species};
 #[derive(Debug)]
 pub struct AnimalView {
     species: Vec<SpeciesDraw>,
+    /// Distinct `(material, tint)` pairs the species paint with: animals are
+    /// drawn in their palette colours, not their materials' own.
+    tints: Vec<(MaterialId, [u8; 3])>,
     started: Instant,
 }
 
@@ -37,9 +41,10 @@ struct ClipPoses {
 struct SpeciesDraw {
     key: &'static str,
     clips: Vec<ClipPoses>,
-    /// Every cell's offset from its part's joint (metres) and material, in
-    /// part order; part `i` owns `cells[part_ends[i - 1]..part_ends[i]]`.
-    cells: Vec<(Vec3, u32)>,
+    /// Every cell's offset from its part's joint (metres), material and index
+    /// into the view's tints (if painted), in part order; part `i` owns
+    /// `cells[part_ends[i - 1]..part_ends[i]]`.
+    cells: Vec<(Vec3, u32, Option<u32>)>,
     part_ends: Vec<usize>,
     edge_m: f32,
     /// Farthest any cell reaches from the root, over every posed tick, metres.
@@ -47,16 +52,19 @@ struct SpeciesDraw {
 }
 
 impl SpeciesDraw {
-    fn new(key: &'static str, visual: &AnimalVisual) -> Self {
+    fn new(key: &'static str, visual: &AnimalVisual, tints: &[(MaterialId, [u8; 3])]) -> Self {
         let edge_m = visual.cell_edge_m();
         let mut cells = Vec::with_capacity(visual.cell_count());
         let mut part_ends = Vec::with_capacity(visual.part_count());
         let mut part_reach = Vec::with_capacity(visual.part_count());
         for part in visual.part_cells() {
             let mut reach = 0.0_f32;
-            for (offset, material) in part {
+            for (offset, material, tint) in part {
                 reach = reach.max(offset.length());
-                cells.push((offset, u32::from(material.0)));
+                let tint = tint
+                    .and_then(|tint| tints.iter().position(|t| *t == (material, tint)))
+                    .map(|i| i as u32);
+                cells.push((offset, u32::from(material.0), tint));
             }
             part_ends.push(cells.len());
             part_reach.push(reach);
@@ -122,7 +130,14 @@ impl SpeciesDraw {
         clip.valid[tick].then(|| &clip.frames[tick * parts..(tick + 1) * parts])
     }
 
-    fn emit(&self, pose: &[PartFrame], root_q: Quat, root_t: Vec3, out: &mut Vec<CubeInstance>) {
+    fn emit(
+        &self,
+        pose: &[PartFrame],
+        root_q: Quat,
+        root_t: Vec3,
+        tint_base: u32,
+        out: &mut Vec<CubeInstance>,
+    ) {
         let size = [self.edge_m; 3];
         let mut start = 0;
         for (frame, &end) in pose.iter().zip(&self.part_ends) {
@@ -135,10 +150,10 @@ impl SpeciesDraw {
             let basis = Mat3::from_quat(rotation);
             let origin = root_t + root_q * frame.translation_m;
             let rotation = rotation.to_array();
-            out.extend(self.cells[range].iter().map(|&(offset, material)| {
+            out.extend(self.cells[range].iter().map(|&(offset, material, tint)| {
                 CubeInstance::new(
                     (origin + basis * offset).to_array(),
-                    material,
+                    tint.map_or(material, |i| tint_base + i),
                     size,
                     rotation,
                 )
@@ -171,27 +186,47 @@ fn in_view(cull: &CreatureCull, centre_m: [f64; 3], radius_m: f32) -> bool {
 impl AnimalView {
     pub fn new() -> Result<Self, AnimalError> {
         let mapping = material_mapping(&crate::game::manifest());
-        let species = species()?
-            .into_iter()
-            .map(|s| {
-                let key = s.key;
-                AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
-                    .map(|visual| SpeciesDraw::new(key, &visual))
-                    .map_err(|e| AnimalError::Asset(key, e.to_string()))
-            })
-            .collect::<Result<_, _>>()?;
+        let mut tints: Vec<(MaterialId, [u8; 3])> = Vec::new();
+        let mut assets = Vec::new();
+        for s in species()? {
+            let key = s.key;
+            for run in s.asset.runs.iter().filter(|run| run.tint_slot != 0) {
+                let Some(&material) =
+                    mapping.get(&s.asset.material_keys[usize::from(run.material_slot) - 1])
+                else {
+                    return Err(AnimalError::Asset(key, "unmapped material".into()));
+                };
+                let pair = (material, s.asset.tints_srgb[usize::from(run.tint_slot) - 1]);
+                if !tints.contains(&pair) {
+                    tints.push(pair);
+                }
+            }
+            let visual = AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
+                .map_err(|e| AnimalError::Asset(key, e.to_string()))?;
+            assets.push((key, visual));
+        }
+        let species = assets
+            .iter()
+            .map(|(key, visual)| SpeciesDraw::new(key, visual, &tints))
+            .collect();
         Ok(Self {
             species,
+            tints,
             started: Instant::now(),
         })
     }
 }
 
 impl CreatureView for AnimalView {
+    fn tints(&self) -> Vec<(MaterialId, [u8; 3])> {
+        self.tints.clone()
+    }
+
     fn instances(
         &self,
         creatures: &ReplicaCreatures,
         _tick: f64,
+        tint_base: u32,
         now: Instant,
         cull: Option<&CreatureCull>,
     ) -> Vec<CubeInstance> {
@@ -233,7 +268,7 @@ impl CreatureView for AnimalView {
                 .sum::<usize>(),
         );
         for (draw, pose, root_q, root_t) in posed {
-            draw.emit(pose, root_q, root_t, &mut out);
+            draw.emit(pose, root_q, root_t, tint_base, &mut out);
         }
         out
     }
@@ -259,9 +294,10 @@ mod tests {
     fn tabled_poses_draw_the_same_cubes_as_sampling_the_clip() {
         let root_q = Quat::from_rotation_y(0.7);
         let root_t = Vec3::new(10.0, 2.0, -5.0);
+        let tints = AnimalView::new().unwrap().tints;
         let mut table_bytes = 0;
         for (key, visual) in visuals() {
-            let draw = SpeciesDraw::new(key, &visual);
+            let draw = SpeciesDraw::new(key, &visual, &tints);
             table_bytes += draw.clips.iter().map(|c| c.frames.len()).sum::<usize>()
                 * std::mem::size_of::<PartFrame>();
             for (clip, duration) in visual.clips() {
@@ -270,14 +306,18 @@ mod tests {
                     let mut drawn = Vec::new();
                     // A fractional phase within the tick draws that tick.
                     let pose = draw.pose(clip, f64::from(tick) + 0.4).unwrap();
-                    draw.emit(pose, root_q, root_t, &mut drawn);
+                    draw.emit(pose, root_q, root_t, 1000, &mut drawn);
                     assert_eq!(drawn.len(), sampled.len(), "{key} {clip} {tick}");
                     for (cube, cell) in drawn.iter().zip(&sampled) {
                         let centre = root_t + root_q * cell.center;
                         let rotation = root_q * cell.rotation;
+                        let material = cell
+                            .tint_srgb
+                            .and_then(|t| tints.iter().position(|x| *x == (cell.material, t)))
+                            .map_or(u32::from(cell.material.0), |i| 1000 + i as u32);
                         assert!(
                             Vec3::from_array(cube.offset).distance(centre) < 1e-4
-                                && cube.material == u32::from(cell.material.0)
+                                && cube.material == material
                                 && cube.size == cell.size.to_array()
                                 && Quat::from_array(cube.rotation).dot(rotation).abs() > 0.99999,
                             "{key} {clip} {tick}: {cube:?} vs {cell:?}"
@@ -317,5 +357,21 @@ mod tests {
         let at = [20.0 * angle.sin(), 0.0, 3.0 - 20.0 * angle.cos()];
         assert!(in_view(&cull, at, 1.0), "body over the edge");
         assert!(!in_view(&cull, at, 0.5), "body clear of the edge");
+    }
+
+    /// Every palette colour of every species has a material, so no animal
+    /// falls back to its material's own colour (fur is wood, which is brown).
+    #[test]
+    fn every_palette_colour_has_a_material() {
+        let view = AnimalView::new().unwrap();
+        for s in species().unwrap() {
+            for tint in &s.asset.tints_srgb {
+                assert!(
+                    view.tints.iter().any(|(_, t)| t == tint),
+                    "{} colour {tint:?} has no material",
+                    s.key
+                );
+            }
+        }
     }
 }

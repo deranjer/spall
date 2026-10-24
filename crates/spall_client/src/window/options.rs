@@ -70,12 +70,18 @@ pub struct CreatureCull {
 /// Turns replicated creatures into cubes to draw this frame.
 /// The engine owns replication; the game owns what a species looks like.
 pub trait CreatureView: Send + Sync + std::fmt::Debug {
+    /// Manifest materials re-coloured to an sRGB tint, as for
+    /// [`PlayerView::tints`]: item `i` is material index `tint_base + i` in
+    /// [`Self::instances`].
+    fn tints(&self) -> Vec<(spall_core::MaterialId, [u8; 3])>;
+
     /// `tick` is the estimated present server tick, fractional, for animation.
     /// `cull` is `None` when the camera is not known yet: draw everything.
     fn instances(
         &self,
         creatures: &crate::replica_creatures::ReplicaCreatures,
         tick: f64,
+        tint_base: u32,
         now: Instant,
         cull: Option<&CreatureCull>,
     ) -> Vec<CubeInstance>;

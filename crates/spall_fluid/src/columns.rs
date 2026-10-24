@@ -26,6 +26,11 @@ use spall_voxel::Volume;
 
 use crate::{DomainSpec, SolidBoundary};
 
+mod allocation;
+mod coarse;
+pub use coarse::{COARSE_CELLS, CoarseVolumeTerrain};
+mod water;
+
 /// Edge length of one column cell in metres.
 pub const CELL_SIZE_M: f64 = 0.25;
 /// Columns per region edge. Matches the brick footprint.
@@ -103,6 +108,13 @@ pub struct ColumnConfig {
     /// region costs; it becomes a real region the moment anything touches it
     /// (an edit, a spring or drain, a neighbour that starts moving, a restore).
     pub lazy_ocean: bool,
+    /// Terrain cells per column edge (1: a column per terrain cell). With 4,
+    /// a column covers 4 x 4 terrain cells (1 m) and its spans keep the
+    /// terrain's vertical resolution; heads stay in vertical cells, so a span's
+    /// stored `volume` is its depth and a volume moved is divided by the column
+    /// area. Callers give wide column x/z (see `CoarseVolumeTerrain` and
+    /// `ColumnWorld::world_cell`).
+    pub column_cells: u32,
 }
 
 impl Default for ColumnConfig {
@@ -132,6 +144,7 @@ impl Default for ColumnConfig {
             steady_wake_rel: 0.1,
             steady_wake_sigmas: 6.0,
             lazy_ocean: false,
+            column_cells: 1,
         }
     }
 }
@@ -337,6 +350,15 @@ struct Region {
     steady_ref: Vec<(u32, f32, f32)>,
 }
 
+/// A sleeping region wakes when water in one of its border spans stands this
+/// far (cells) above or below the span next to it inside the region. A live
+/// pipe from an active neighbour moves water into (or out of) that border span,
+/// but the interior is not stepped: before this check a river reaching a
+/// sleeping region over many pipes, each under the sleep flow, filled its
+/// first column and never woke it, and the region upstream filled behind it
+/// as a flat pool with a straight wall.
+const BORDER_WAKE_HEAD: f32 = 0.5;
+
 /// A region of still sea kept as a record (see [`ColumnConfig::lazy_ocean`]).
 struct Dormant {
     /// Per column: the floor y and the height of the span the sea fills.
@@ -489,6 +511,49 @@ fn column_xz(key: RegionKey, local: usize) -> (i64, i64) {
     )
 }
 
+/// How many steps a region at `key` takes one in, from its distance to the
+/// nearest focus point (see [`ColumnConfig::throttle_from_cells`]): 1, 2, 4
+/// or 8, and 1 with no focus or the bands off.
+fn pace_at(focus: &[[f64; 2]], bands: [f32; 3], key: RegionKey) -> u64 {
+    if bands[0] <= 0.0 || focus.is_empty() {
+        return 1;
+    }
+    let centre = [
+        f64::from(key.0) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
+        f64::from(key.1) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
+    ];
+    let distance = focus
+        .iter()
+        .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
+        .fold(f64::INFINITY, f64::min);
+    if distance >= f64::from(bands[2]) {
+        8
+    } else if distance >= f64::from(bands[1]) {
+        4
+    } else if distance >= f64::from(bands[0]) {
+        2
+    } else {
+        1
+    }
+}
+
+/// The open vertical runs `(floor y, one past the top)` of each of a region's
+/// columns (`lx + 32 * lz`), bottom to top.
+pub fn open_runs(terrain: &RegionTerrain, y_lo: i32, y_hi: i32) -> Vec<Vec<(i32, i32)>> {
+    let (mut spans, mut col_start) = (Vec::new(), Vec::new());
+    extract_columns(terrain, y_lo, y_hi, &mut spans, &mut col_start);
+    col_start.push(spans.len() as u32);
+    col_start
+        .windows(2)
+        .map(|w| {
+            spans[w[0] as usize..w[1] as usize]
+                .iter()
+                .map(|s| (s.y0, s.y1))
+                .collect()
+        })
+        .collect()
+}
+
 fn extract_columns(
     terrain: &RegionTerrain,
     y_lo: i32,
@@ -639,8 +704,14 @@ impl ColumnWorld {
     pub fn set_focus(&mut self, points_m: &[[f64; 2]]) {
         self.focus = points_m
             .iter()
-            .map(|p| [p[0] / CELL_SIZE_M, p[1] / CELL_SIZE_M])
+            .map(|p| [p[0] / self.column_m(), p[1] / self.column_m()])
             .collect();
+    }
+
+    /// Width of one column in metres: a terrain cell, or more with
+    /// [`ColumnConfig::column_cells`]. Heights stay in terrain cells.
+    pub fn column_m(&self) -> f64 {
+        CELL_SIZE_M * f64::from(self.config.column_cells)
     }
 
     /// Seconds a region's water is behind real time because it rested.
@@ -677,6 +748,41 @@ impl ColumnWorld {
             .iter()
             .filter(|r| r.active && !r.frozen && r.resting)
             .count()
+    }
+
+    /// How many steps the region at `key` takes one in now, from its distance
+    /// to the nearest focus point: 1, 2, 4 or 8 (see
+    /// [`ColumnConfig::throttle_from_cells`]).
+    pub fn region_pace(&self, key: RegionKey) -> u64 {
+        pace_at(&self.focus, self.config.throttle_from_cells, key)
+    }
+
+    /// Whether the region holding column `(x, z)` rested in the last step (far
+    /// from every focus point, see [`ColumnConfig::throttle_from_cells`]).
+    pub fn is_column_resting(&self, x: i64, z: i64) -> bool {
+        self.slot_of.get(&region_of(x, z)).is_some_and(|&s| {
+            let r = &self.regions[s as usize];
+            r.active && !r.frozen && r.resting
+        })
+    }
+
+    /// Whether span `s`, at the edge of the sleeping region `region`, stands
+    /// over [`BORDER_WAKE_HEAD`] above or below a span inside that region it
+    /// is piped to (see the constant).
+    fn border_out_of_level(&self, s: usize, region: u32) -> bool {
+        let hs = self.effective_head(s);
+        let (a, b) = (self.adj_start[s] as usize, self.adj_start[s + 1] as usize);
+        self.adj[a..b].iter().any(|&entry| {
+            let p = &self.pipes[(entry >> 1) as usize];
+            if p.ra != region || p.rb != region {
+                return false;
+            }
+            let t = if entry & 1 == 1 { p.b } else { p.a } as usize;
+            let ht = self.effective_head(t);
+            let lo = p.lo as f32;
+            Self::wetted_area(p, hs, ht) >= self.config.min_film_depth
+                && (hs.max(lo) - ht.max(lo)).abs() > BORDER_WAKE_HEAD
+        })
     }
 
     /// Whether a region takes part in the step being run.
@@ -795,8 +901,8 @@ impl ColumnWorld {
     /// film).
     fn wet_span_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<usize> {
         let (cx, cz) = (
-            (x_m / CELL_SIZE_M).floor() as i64,
-            (z_m / CELL_SIZE_M).floor() as i64,
+            (x_m / self.column_m()).floor() as i64,
+            (z_m / self.column_m()).floor() as i64,
         );
         let y_cell = y_m / CELL_SIZE_M;
         for i in self.column_range(cx, cz)? {
@@ -850,7 +956,9 @@ impl ColumnWorld {
         }
         let speed = |axis: usize| {
             let through = |(q, area): (f32, f32)| if area > 0.0 { q / area } else { 0.0 };
+            // A pipe is a column wide: its face is that width times the area.
             0.5 * (through(faces[axis][0]) + through(faces[axis][1])) * CELL_SIZE_M as f32
+                / self.config.column_cells as f32
         };
         [speed(0), speed(1)]
     }
@@ -906,1477 +1014,6 @@ impl ColumnWorld {
             head_y: f64::from(floor_y) + depth,
         });
         true
-    }
-
-    // ---- allocation and terrain -------------------------------------------
-
-    /// Allocates the given regions (those that are resident) and re-reads every
-    /// key in `refresh`, remapping its water column by column. New regions start
-    /// asleep; refreshed ones wake with their neighbours.
-    fn allocate(&mut self, add: &[RegionKey], refresh: &BTreeSet<RegionKey>) -> RemapReport {
-        if !self.dormant.is_empty() {
-            let touched: Vec<RegionKey> = add
-                .iter()
-                .chain(refresh.iter())
-                .copied()
-                .filter(|k| self.dormant.contains_key(k))
-                .collect();
-            self.revive(&touched);
-        }
-        self.allocate_inner(add, refresh)
-    }
-
-    /// Turns dormant sea regions into real ones, asleep, holding the water
-    /// they were recorded with. The terrain is read now, so an edited column
-    /// takes its water into the span that holds the old floor cell and the
-    /// region wakes to even it out; water with no span to go to is unplaced,
-    /// never dropped.
-    fn revive(&mut self, keys: &[RegionKey]) {
-        let mut revived = Vec::new();
-        for k in keys {
-            if let Some(d) = self.dormant.remove(k) {
-                self.dormant_volume -= d.volume;
-                revived.push((*k, d));
-            }
-        }
-        if revived.is_empty() {
-            return;
-        }
-        let want: Vec<RegionKey> = revived.iter().map(|(k, _)| *k).collect();
-        self.allocate_inner(&want, &BTreeSet::new());
-        for (key, d) in revived {
-            let Some(&slot) = self.slot_of.get(&key) else {
-                // Terrain not resident: keep it as it was.
-                self.dormant_volume += d.volume;
-                self.dormant.insert(key, d);
-                continue;
-            };
-            let mut moved = false;
-            for c in 0..REGION_COLUMNS {
-                let v = d.column_volume(c);
-                if v <= 0.0 {
-                    continue;
-                }
-                let ci = slot as usize * REGION_COLUMNS + c;
-                let y0 = i64::from(d.cols[c].0);
-                let found =
-                    (self.col_start[ci] as usize..self.col_start[ci + 1] as usize).find(|&i| {
-                        (i64::from(self.spans[i].y0)..i64::from(self.spans[i].y1)).contains(&y0)
-                    });
-                match found {
-                    Some(i) => {
-                        moved |= self.spans[i].y0 != d.cols[c].0
-                            || self.spans[i].y1 - self.spans[i].y0 != d.cols[c].1;
-                        self.volume[i] += v;
-                    }
-                    None => {
-                        moved = true;
-                        self.unplaced += v;
-                    }
-                }
-            }
-            if moved {
-                self.dirty.insert(key);
-                self.wake_slot_and_neighbours(slot as usize);
-            }
-        }
-        self.lists_dirty = true;
-    }
-
-    /// Revives the dormant region holding column `(x, z)`, if it is one.
-    fn revive_at(&mut self, x: i64, z: i64) {
-        if !self.dormant.is_empty() {
-            self.revive(&[region_of(x, z)]);
-        }
-    }
-
-    /// Revives every dormant region next to a region that is moving: the
-    /// disturbance can cross the border, so the neighbour must be real. Revived
-    /// regions start asleep; the flow into them wakes them in turn, so a wave
-    /// pulls in only the regions it actually reaches.
-    fn revive_beside_activity(&mut self) {
-        let mut next: Vec<RegionKey> = Vec::new();
-        for r in &self.regions {
-            if !r.active || r.frozen {
-                continue;
-            }
-            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                let k = (r.key.0 + dx, r.key.1 + dz);
-                if self.dormant.contains_key(&k) {
-                    next.push(k);
-                }
-            }
-        }
-        next.sort_unstable();
-        next.dedup();
-        self.revive(&next);
-    }
-
-    /// The dormant regions among the columns being seeded: regions wholly under
-    /// one flat sea level with all eight neighbours the same, whose terrain has
-    /// an open surface at that level over every column.
-    fn find_dormant(&self, columns: &[(i64, i64, i64, i64)]) -> HashMap<RegionKey, Dormant> {
-        // Per region: columns seen, lowest and highest sea top.
-        let mut seen: HashMap<RegionKey, (u32, i64, i64)> = HashMap::new();
-        for &(x, z, _, top) in columns {
-            let e = seen.entry(region_of(x, z)).or_insert((0, top, top));
-            e.0 += 1;
-            e.1 = e.1.min(top);
-            e.2 = e.2.max(top);
-        }
-        let uniform = |k: RegionKey| {
-            seen.get(&k)
-                .filter(|e| e.0 as usize == REGION_COLUMNS && e.1 == e.2)
-                .map(|e| e.1)
-        };
-        let mut interior: Vec<(RegionKey, i64)> = seen
-            .keys()
-            .filter_map(|&k| {
-                let top = uniform(k)?;
-                for dx in -1..=1 {
-                    for dz in -1..=1 {
-                        if uniform((k.0 + dx, k.1 + dz)) != Some(top) {
-                            return None;
-                        }
-                    }
-                }
-                Some((k, top))
-            })
-            .collect();
-        if interior.is_empty() {
-            return HashMap::new();
-        }
-        interior.sort_unstable();
-        let mut beds: HashMap<RegionKey, Vec<i32>> = interior
-            .iter()
-            .map(|&(k, _)| (k, vec![i32::MIN; REGION_COLUMNS]))
-            .collect();
-        for &(x, z, bed, _) in columns {
-            if let Some(b) = beds.get_mut(&region_of(x, z)) {
-                let local =
-                    (x.rem_euclid(REGION_EDGE) + REGION_EDGE * z.rem_euclid(REGION_EDGE)) as usize;
-                b[local] = bed as i32;
-            }
-        }
-        let (y_lo, y_hi) = self.terrain.y_range();
-        let mut found = HashMap::new();
-        // A bounded batch at a time: each check holds one region's solid mask.
-        for chunk in interior.chunks(64) {
-            let checked: Vec<Option<Dormant>> = chunk
-                .par_iter()
-                .map(|&(k, top)| {
-                    let terrain = self.terrain.region(k)?;
-                    let mut spans = Vec::new();
-                    let mut col_start = Vec::new();
-                    extract_columns(&terrain, y_lo, y_hi, &mut spans, &mut col_start);
-                    let mut cols = Vec::with_capacity(REGION_COLUMNS);
-                    let mut volume = 0.0;
-                    for c in 0..REGION_COLUMNS {
-                        let end = col_start.get(c + 1).map_or(spans.len(), |&e| e as usize);
-                        let bed = beds[&k][c];
-                        if bed == i32::MIN {
-                            return None;
-                        }
-                        let at = i64::from(bed) + 1;
-                        let s = spans[col_start[c] as usize..end]
-                            .iter()
-                            .find(|s| (i64::from(s.y0)..i64::from(s.y1)).contains(&at))?;
-                        // An open surface at the sea level: not under a roof.
-                        if top >= i64::from(s.y1) || top < i64::from(s.y0) {
-                            return None;
-                        }
-                        cols.push((s.y0, s.y1 - s.y0));
-                        volume += ((top + 1) as f64 - f64::from(s.y0)).clamp(0.0, s.capacity());
-                    }
-                    Some(Dormant { cols, top, volume })
-                })
-                .collect();
-            for (&(k, _), d) in chunk.iter().zip(checked) {
-                if let Some(d) = d {
-                    found.insert(k, d);
-                }
-            }
-        }
-        found
-    }
-
-    /// The wet spans of a dormant region, `(column, floor y, volume, height)`.
-    fn dormant_spans(&self, key: RegionKey, min_volume: f64) -> Option<Vec<(u16, i32, f64, i32)>> {
-        let d = self.dormant.get(&key)?;
-        Some(
-            (0..REGION_COLUMNS)
-                .filter_map(|c| {
-                    let v = d.column_volume(c);
-                    (v > min_volume).then(|| (c as u16, d.cols[c].0, v, d.cols[c].1))
-                })
-                .collect(),
-        )
-    }
-
-    fn allocate_inner(&mut self, add: &[RegionKey], refresh: &BTreeSet<RegionKey>) -> RemapReport {
-        // Every region's solid mask is loaded before any is built: half a MiB
-        // each at 128 m of height, so thousands of ocean regions held 2.5 GiB at
-        // once. In sorted batches the slots come out in the same order and only
-        // one batch of masks is alive.
-        const BATCH: usize = 256;
-        let wanted: BTreeSet<RegionKey> = add.iter().copied().collect();
-        if wanted.len() <= BATCH {
-            return self.allocate_batch(add, refresh);
-        }
-        let keys: Vec<RegionKey> = wanted.into_iter().collect();
-        let mut report = RemapReport::default();
-        for (n, chunk) in keys.chunks(BATCH).enumerate() {
-            let none = BTreeSet::new();
-            let done = self.allocate_batch(chunk, if n == 0 { refresh } else { &none });
-            report.columns_changed += done.columns_changed;
-            report.relocated_volume += done.relocated_volume;
-            report.unplaced_volume += done.unplaced_volume;
-        }
-        report
-    }
-
-    fn allocate_batch(&mut self, add: &[RegionKey], refresh: &BTreeSet<RegionKey>) -> RemapReport {
-        let (y_lo, y_hi) = self.terrain.y_range();
-        let mut fresh: HashMap<RegionKey, RegionTerrain> = HashMap::new();
-        let wanted: Vec<RegionKey> = add
-            .iter()
-            .copied()
-            .filter(|k| !self.slot_of.contains_key(k))
-            .chain(refresh.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let loaded: Vec<(RegionKey, Option<RegionTerrain>)> = wanted
-            .par_iter()
-            .map(|&k| (k, self.terrain.region(k)))
-            .collect();
-        let mut keys: BTreeSet<RegionKey> = self.regions.iter().map(|r| r.key).collect();
-        let mut frozen_now = BTreeSet::new();
-        for (k, t) in loaded {
-            match t {
-                Some(t) => {
-                    keys.insert(k);
-                    fresh.insert(k, t);
-                }
-                None if self.slot_of.contains_key(&k) => {
-                    frozen_now.insert(k);
-                }
-                None => {
-                    self.waiting.insert(k);
-                }
-            }
-        }
-        if fresh.is_empty() && frozen_now.is_empty() {
-            return RemapReport::default();
-        }
-        if refresh.is_empty() && frozen_now.is_empty() {
-            self.append_regions(fresh);
-            return RemapReport::default();
-        }
-
-        let old_regions = std::mem::take(&mut self.regions);
-        let old_slot = std::mem::take(&mut self.slot_of);
-        let old_col = std::mem::take(&mut self.col_start);
-        let old_spans = std::mem::take(&mut self.spans);
-        let old_vol = std::mem::take(&mut self.volume);
-        let old_head = std::mem::take(&mut self.head);
-        let old_pipes = std::mem::take(&mut self.pipes);
-        let old_q = std::mem::take(&mut self.q);
-        let key_of_spans = |regions: &[Region], col: &[u32], spans: &[Span]| {
-            let mut v = vec![0u64; spans.len()];
-            for (slot, r) in regions.iter().enumerate() {
-                for c in 0..REGION_COLUMNS {
-                    let (x, z) = column_xz(r.key, c);
-                    let ci = slot * REGION_COLUMNS + c;
-                    for s in col[ci] as usize..col[ci + 1] as usize {
-                        v[s] = span_key(x, z, spans[s].y0);
-                    }
-                }
-            }
-            v
-        };
-        let mut report = RemapReport::default();
-        let mut pending: Vec<(i64, i64, f64, f64)> = Vec::new();
-        let mut regions: Vec<Region> = Vec::with_capacity(keys.len());
-        let mut col_start: Vec<u32> = Vec::with_capacity(keys.len() * REGION_COLUMNS + 1);
-        let mut spans: Vec<Span> = Vec::new();
-        let mut volume: Vec<f64> = Vec::new();
-        let mut head: Vec<f32> = Vec::new();
-        let mut slot_of = HashMap::new();
-
-        for key in keys {
-            let slot = regions.len() as u32;
-            let base = spans.len();
-            let old = old_slot.get(&key).map(|&s| s as usize);
-            let col_base = col_start.len();
-            let mut region = match old {
-                Some(s) => old_regions[s].clone(),
-                None => Region {
-                    key,
-                    span_start: 0,
-                    span_end: 0,
-                    pipes: Vec::new(),
-                    active: false,
-                    quiet_steps: 0,
-                    ring_done: false,
-                    frozen: false,
-                    resting: false,
-                    period: 1,
-                    owed_s: 0.0,
-                    steady: false,
-                    steady_steps: 0,
-                    steady_time: 0.0,
-                    steady_ledger: 0.0,
-                    steady_snap: Vec::new(),
-                    steady_qsum: Vec::new(),
-                    steady_qsq: Vec::new(),
-                    steady_ref: Vec::new(),
-                },
-            };
-            region.pipes = Vec::new();
-            if frozen_now.contains(&key) {
-                region.frozen = true;
-            }
-            match (old, fresh.get(&key)) {
-                (Some(old), Some(terrain)) => {
-                    // Re-read terrain for an existing region: remap per column.
-                    extract_columns(terrain, y_lo, y_hi, &mut spans, &mut col_start);
-                    volume.resize(spans.len(), 0.0);
-                    head.extend(spans[base..].iter().map(|s| s.y1 as f32));
-                    for c in 0..REGION_COLUMNS {
-                        let ci = old * REGION_COLUMNS + c;
-                        let o = old_col[ci] as usize..old_col[ci + 1] as usize;
-                        let n_end = if c + 1 < REGION_COLUMNS {
-                            col_start[col_base + c + 1] as usize
-                        } else {
-                            spans.len()
-                        };
-                        let n = col_start[col_base + c] as usize..n_end;
-                        if o.len() == n.len()
-                            && o.clone()
-                                .zip(n.clone())
-                                .all(|(a, b)| old_spans[a] == spans[b])
-                        {
-                            for (a, b) in o.zip(n) {
-                                volume[b] = old_vol[a];
-                                head[b] = old_head[a];
-                            }
-                            continue;
-                        }
-                        report.columns_changed += 1;
-                        let (x, z) = column_xz(key, c);
-                        let (excess, top_y) =
-                            remap_column(&old_spans, &old_vol, o, &spans, &mut volume, n.clone());
-                        if excess > 0.0 {
-                            report.relocated_volume += excess;
-                            match nearest_span(&spans, n, top_y) {
-                                Some(t) => volume[t] += excess,
-                                None => pending.push((x, z, top_y, excess)),
-                            }
-                        }
-                    }
-                    region.active = true;
-                    region.quiet_steps = 0;
-                    region.ring_done = false;
-                    region.frozen = false;
-                }
-                (Some(old), None) => {
-                    // Unchanged region: copy its block.
-                    let ci = old * REGION_COLUMNS;
-                    let s0 = old_col[ci] as usize;
-                    let s1 = old_col[ci + REGION_COLUMNS] as usize;
-                    for c in 0..REGION_COLUMNS {
-                        col_start.push(spans.len() as u32 + old_col[ci + c] - s0 as u32);
-                    }
-                    spans.extend_from_slice(&old_spans[s0..s1]);
-                    volume.extend_from_slice(&old_vol[s0..s1]);
-                    head.extend_from_slice(&old_head[s0..s1]);
-                }
-                (None, Some(terrain)) => {
-                    extract_columns(terrain, y_lo, y_hi, &mut spans, &mut col_start);
-                    volume.resize(spans.len(), 0.0);
-                    head.extend(spans[base..].iter().map(|s| s.y1 as f32));
-                }
-                (None, None) => unreachable!("a new region always has terrain"),
-            }
-            region.span_start = base as u32;
-            region.span_end = spans.len() as u32;
-            slot_of.insert(key, slot);
-            regions.push(region);
-        }
-        col_start.push(spans.len() as u32);
-
-        self.regions = regions;
-        self.slot_of = slot_of;
-        self.col_start = col_start;
-        self.spans = spans;
-        self.volume = volume;
-        self.head = head;
-
-        // Columns that became solid hand their water to a neighbour column.
-        for (x, z, y, excess) in pending {
-            let mut target = None;
-            for (dx, dz) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
-                if let Some(r) = self.column_range(x + dx, z + dz)
-                    && let Some(t) = nearest_span(&self.spans, r, y)
-                {
-                    target = Some(t);
-                    break;
-                }
-            }
-            match target {
-                Some(t) => self.volume[t] += excess,
-                None => {
-                    self.unplaced += excess;
-                    report.unplaced_volume += excess;
-                }
-            }
-        }
-
-        // Rebuild pipes and keep the flow of every pipe that still exists. Only
-        // regions whose terrain changed, and the owners of pipes running into
-        // them, are rebuilt; every other pipe is carried over with its indices
-        // shifted to the new span and slot layout.
-        let touched: BTreeSet<RegionKey> = fresh
-            .keys()
-            .copied()
-            .chain(frozen_now.iter().copied())
-            .collect();
-        let carried = self.carry_pipes(
-            &touched,
-            &old_regions,
-            &old_slot,
-            &old_col,
-            &old_spans,
-            &old_pipes,
-            &old_q,
-        );
-        if !carried {
-            let mut old_flow: HashMap<(u64, u64), f32> = HashMap::new();
-            if old_q.iter().any(|q| *q != 0.0) {
-                let keys_old = key_of_spans(&old_regions, &old_col, &old_spans);
-                for (p, q) in old_pipes.iter().zip(&old_q) {
-                    if *q != 0.0 {
-                        old_flow.insert((keys_old[p.a as usize], keys_old[p.b as usize]), *q);
-                    }
-                }
-            }
-
-            self.build_pipes();
-            self.q = vec![0.0; self.pipes.len()];
-            if !old_flow.is_empty() {
-                let keys_now = key_of_spans(&self.regions, &self.col_start, &self.spans);
-                for (i, p) in self.pipes.iter().enumerate() {
-                    if let Some(q) = old_flow.get(&(keys_now[p.a as usize], keys_now[p.b as usize]))
-                    {
-                        self.q[i] = *q;
-                    }
-                }
-            }
-        }
-        self.eff = vec![0.0; self.spans.len()];
-        self.scale = vec![1.0; self.spans.len()];
-
-        // A refreshed region and its neighbours wake.
-        for &k in refresh {
-            if let Some(&s) = self.slot_of.get(&k) {
-                self.wake_slot_and_neighbours(s as usize);
-            }
-        }
-        self.lists_dirty = true;
-        self.release_unplaced();
-        report
-    }
-
-    /// Pipes whose `a` end is in region `slot` (towards its +x and +z
-    /// neighbours), restricted to neighbour slots `accept` allows.
-    fn pipes_from(&self, slot: usize, accept: impl Fn(u32) -> bool) -> Vec<Pipe> {
-        let mut pipes = Vec::new();
-        let r = &self.regions[slot];
-        if r.frozen {
-            return pipes;
-        }
-        let key = r.key;
-        for lz in 0..REGION_EDGE {
-            for lx in 0..REGION_EDGE {
-                let (x, z) = (
-                    i64::from(key.0) * REGION_EDGE + lx,
-                    i64::from(key.1) * REGION_EDGE + lz,
-                );
-                let ca = slot * REGION_COLUMNS + (lx + REGION_EDGE * lz) as usize;
-                for (axis, (ox, oz)) in [(1i64, 0i64), (0, 1)].into_iter().enumerate() {
-                    let nb = region_of(x + ox, z + oz);
-                    let Some(&ns) = self.slot_of.get(&nb) else {
-                        continue;
-                    };
-                    if self.regions[ns as usize].frozen || !accept(ns) {
-                        continue;
-                    }
-                    let cb = ns as usize * REGION_COLUMNS
-                        + ((x + ox).rem_euclid(REGION_EDGE)
-                            + REGION_EDGE * (z + oz).rem_euclid(REGION_EDGE))
-                            as usize;
-                    for a in self.col_start[ca] as usize..self.col_start[ca + 1] as usize {
-                        for b in self.col_start[cb] as usize..self.col_start[cb + 1] as usize {
-                            let lo = self.spans[a].y0.max(self.spans[b].y0);
-                            let hi = self.spans[a].y1.min(self.spans[b].y1);
-                            if hi > lo {
-                                pipes.push(Pipe {
-                                    a: a as u32,
-                                    b: b as u32,
-                                    lo,
-                                    hi,
-                                    ra: slot as u32,
-                                    rb: ns,
-                                    axis: axis as u8,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        pipes
-    }
-
-    /// Rebuilds every pipe from the current spans. Each region's pipes are
-    /// built independently and joined in slot order, so the result is
-    /// deterministic.
-    fn build_pipes(&mut self) {
-        let this = &*self;
-        let per_region: Vec<Vec<Pipe>> = (0..this.regions.len())
-            .into_par_iter()
-            .map(|slot| this.pipes_from(slot, |_| true))
-            .collect();
-        self.pipes = per_region.into_iter().flatten().collect();
-        self.finish_pipes();
-    }
-
-    /// Fills each region's pipe list and the span adjacency from `self.pipes`.
-    fn finish_pipes(&mut self) {
-        for r in &mut self.regions {
-            r.pipes.clear();
-        }
-        for (i, p) in self.pipes.iter().enumerate() {
-            self.regions[p.ra as usize].pipes.push(i as u32);
-            if p.rb != p.ra {
-                self.regions[p.rb as usize].pipes.push(i as u32);
-            }
-        }
-        self.rebuild_adjacency();
-    }
-
-    /// Rebuilds `pipes` and `q` after the span layout was reassembled, reusing
-    /// the old pipes of every region that is untouched (`touched` holds the
-    /// regions with new terrain or a changed frozen flag). A pipe belongs to
-    /// the region at its `a` end, which looks towards +x and +z, so the owners
-    /// to rebuild are the touched regions and their -x and -z neighbours.
-    /// Returns false, changing nothing, if the old pipes are not grouped by
-    /// owner (they are not after appended regions); the caller then rebuilds
-    /// everything.
-    #[allow(clippy::too_many_arguments)]
-    fn carry_pipes(
-        &mut self,
-        touched: &BTreeSet<RegionKey>,
-        old_regions: &[Region],
-        old_slot: &HashMap<RegionKey, u32>,
-        old_col: &[u32],
-        old_spans: &[Span],
-        old_pipes: &[Pipe],
-        old_q: &[f32],
-    ) -> bool {
-        if old_q.len() != old_pipes.len() {
-            return false;
-        }
-        // Old pipes by owner. They are grouped by owner unless regions were
-        // appended since the last full build; then a counting sort groups them.
-        let grouped = !old_pipes.windows(2).any(|w| w[0].ra > w[1].ra);
-        let mut starts = vec![0usize; old_regions.len() + 1];
-        for p in old_pipes {
-            starts[p.ra as usize + 1] += 1;
-        }
-        for i in 0..old_regions.len() {
-            starts[i + 1] += starts[i];
-        }
-        let order: Vec<u32> = if grouped {
-            Vec::new()
-        } else {
-            let mut cursor = starts.clone();
-            let mut order = vec![0u32; old_pipes.len()];
-            for (i, p) in old_pipes.iter().enumerate() {
-                order[cursor[p.ra as usize]] = i as u32;
-                cursor[p.ra as usize] += 1;
-            }
-            order
-        };
-        let new_of_old: Vec<u32> = old_regions
-            .iter()
-            .map(|r| self.slot_of.get(&r.key).copied().unwrap_or(u32::MAX))
-            .collect();
-        let delta: Vec<i64> = old_regions
-            .iter()
-            .zip(&new_of_old)
-            .map(|(r, &n)| {
-                if n == u32::MAX {
-                    0
-                } else {
-                    i64::from(self.regions[n as usize].span_start) - i64::from(r.span_start)
-                }
-            })
-            .collect();
-        let owner_dirty: Vec<bool> = self
-            .regions
-            .iter()
-            .map(|r| {
-                let (kx, kz) = r.key;
-                touched.contains(&r.key)
-                    || touched.contains(&(kx + 1, kz))
-                    || touched.contains(&(kx, kz + 1))
-            })
-            .collect();
-        // The span a pipe end sits in, by column position and floor.
-        let key_in = |regions: &[Region], col: &[u32], spans: &[Span], idx: u32| {
-            let ci = col.partition_point(|&c| c <= idx) - 1;
-            let (x, z) = column_xz(regions[ci / REGION_COLUMNS].key, ci % REGION_COLUMNS);
-            span_key(x, z, spans[idx as usize].y0)
-        };
-        // Flow of the pipes about to be rebuilt, by the spans they join.
-        let mut old_flow: HashMap<(u64, u64), f32> = HashMap::new();
-        for (so, r) in old_regions.iter().enumerate() {
-            let rebuilt = self
-                .slot_of
-                .get(&r.key)
-                .is_none_or(|&n| owner_dirty[n as usize]);
-            if !rebuilt {
-                continue;
-            }
-            let range = starts[so]..starts[so + 1];
-            let ids: Vec<usize> = if grouped {
-                range.collect()
-            } else {
-                order[range].iter().map(|&i| i as usize).collect()
-            };
-            for pi in ids {
-                if old_q[pi] != 0.0 {
-                    let p = old_pipes[pi];
-                    old_flow.insert(
-                        (
-                            key_in(old_regions, old_col, old_spans, p.a),
-                            key_in(old_regions, old_col, old_spans, p.b),
-                        ),
-                        old_q[pi],
-                    );
-                }
-            }
-        }
-        let this = &*self;
-        // Pipes (with their flow) of the owners being rebuilt.
-        let rebuilt: Vec<Option<(Vec<Pipe>, Vec<f32>)>> = (0..this.regions.len())
-            .into_par_iter()
-            .map(|slot| {
-                if !owner_dirty[slot] {
-                    return None;
-                }
-                let pipes = this.pipes_from(slot, |_| true);
-                let q = if old_flow.is_empty() {
-                    vec![0.0; pipes.len()]
-                } else {
-                    pipes
-                        .iter()
-                        .map(|p| {
-                            let k = (
-                                key_in(&this.regions, &this.col_start, &this.spans, p.a),
-                                key_in(&this.regions, &this.col_start, &this.spans, p.b),
-                            );
-                            old_flow.get(&k).copied().unwrap_or(0.0)
-                        })
-                        .collect()
-                };
-                Some((pipes, q))
-            })
-            .collect();
-        let lens: Vec<usize> = (0..this.regions.len())
-            .map(|slot| match &rebuilt[slot] {
-                Some((pipes, _)) => pipes.len(),
-                None => {
-                    let so = old_slot[&this.regions[slot].key] as usize;
-                    starts[so + 1] - starts[so]
-                }
-            })
-            .collect();
-        let total: usize = lens.iter().sum();
-        let blank = Pipe {
-            a: 0,
-            b: 0,
-            lo: 0,
-            hi: 0,
-            ra: 0,
-            rb: 0,
-            axis: 0,
-        };
-        let mut pipes = vec![blank; total];
-        let mut q = vec![0.0f32; total];
-        // One disjoint output slice per owner, filled in parallel.
-        let mut slices: Vec<(&mut [Pipe], &mut [f32])> = Vec::with_capacity(lens.len());
-        let (mut rest_p, mut rest_q) = (pipes.as_mut_slice(), q.as_mut_slice());
-        for &len in &lens {
-            let (hp, tp) = rest_p.split_at_mut(len);
-            let (hq, tq) = rest_q.split_at_mut(len);
-            slices.push((hp, hq));
-            (rest_p, rest_q) = (tp, tq);
-        }
-        let carry = |p: &Pipe| Pipe {
-            a: (i64::from(p.a) + delta[p.ra as usize]) as u32,
-            b: (i64::from(p.b) + delta[p.rb as usize]) as u32,
-            lo: p.lo,
-            hi: p.hi,
-            ra: new_of_old[p.ra as usize],
-            rb: new_of_old[p.rb as usize],
-            axis: p.axis,
-        };
-        slices
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(slot, (out_p, out_q))| {
-                if let Some((fresh_p, fresh_q)) = &rebuilt[slot] {
-                    out_p.copy_from_slice(fresh_p);
-                    out_q.copy_from_slice(fresh_q);
-                    return;
-                }
-                let so = old_slot[&this.regions[slot].key] as usize;
-                let range = starts[so]..starts[so + 1];
-                if grouped {
-                    for (k, i) in range.enumerate() {
-                        out_p[k] = carry(&old_pipes[i]);
-                        out_q[k] = old_q[i];
-                    }
-                } else {
-                    for (k, &i) in order[range].iter().enumerate() {
-                        out_p[k] = carry(&old_pipes[i as usize]);
-                        out_q[k] = old_q[i as usize];
-                    }
-                }
-            });
-        self.pipes = pipes;
-        self.q = q;
-        self.finish_pipes();
-        true
-    }
-
-    /// Span-to-pipe adjacency in compressed rows, ordered by pipe index.
-    fn rebuild_adjacency(&mut self) {
-        let n = self.spans.len();
-        let mut start = vec![0u32; n + 1];
-        for p in &self.pipes {
-            start[p.a as usize + 1] += 1;
-            start[p.b as usize + 1] += 1;
-        }
-        for i in 0..n {
-            start[i + 1] += start[i];
-        }
-        let mut cursor = start.clone();
-        let mut adj = vec![0u32; start[n] as usize];
-        for (i, p) in self.pipes.iter().enumerate() {
-            adj[cursor[p.a as usize] as usize] = (i as u32) << 1 | 1;
-            cursor[p.a as usize] += 1;
-            adj[cursor[p.b as usize] as usize] = (i as u32) << 1;
-            cursor[p.b as usize] += 1;
-        }
-        self.adj_start = start;
-        self.adj = adj;
-    }
-
-    /// Adds brand-new regions without disturbing existing spans, pipes or
-    /// flows: new slots and pipes are appended, so every existing index stays.
-    fn append_regions(&mut self, fresh: HashMap<RegionKey, RegionTerrain>) {
-        let (y_lo, y_hi) = self.terrain.y_range();
-        let mut new_keys: Vec<RegionKey> = fresh.keys().copied().collect();
-        new_keys.sort_unstable();
-        let first_new = self.regions.len() as u32;
-        self.col_start.pop();
-        for key in new_keys {
-            let slot = self.regions.len() as u32;
-            let base = self.spans.len();
-            extract_columns(
-                &fresh[&key],
-                y_lo,
-                y_hi,
-                &mut self.spans,
-                &mut self.col_start,
-            );
-            self.volume.resize(self.spans.len(), 0.0);
-            self.head
-                .extend(self.spans[base..].iter().map(|s| s.y1 as f32));
-            self.slot_of.insert(key, slot);
-            self.regions.push(Region {
-                key,
-                span_start: base as u32,
-                span_end: self.spans.len() as u32,
-                pipes: Vec::new(),
-                active: false,
-                quiet_steps: 0,
-                ring_done: false,
-                frozen: false,
-                resting: false,
-                period: 1,
-                owed_s: 0.0,
-                steady: false,
-                steady_steps: 0,
-                steady_time: 0.0,
-                steady_ledger: 0.0,
-                steady_snap: Vec::new(),
-                steady_qsum: Vec::new(),
-                steady_qsq: Vec::new(),
-                steady_ref: Vec::new(),
-            });
-        }
-        self.col_start.push(self.spans.len() as u32);
-
-        // Existing regions whose +x/+z neighbour is new also gain pipes.
-        let mut existing = BTreeSet::new();
-        for slot in first_new..self.regions.len() as u32 {
-            let key = self.regions[slot as usize].key;
-            for (dx, dz) in [(-1, 0), (0, -1)] {
-                if let Some(&e) = self.slot_of.get(&(key.0 + dx, key.1 + dz))
-                    && e < first_new
-                {
-                    existing.insert(e);
-                }
-            }
-        }
-        let mut tasks: Vec<(u32, bool)> = (first_new..self.regions.len() as u32)
-            .map(|s| (s, false))
-            .collect();
-        tasks.extend(existing.into_iter().map(|e| (e, true)));
-        let this = &*self;
-        let built: Vec<Vec<Pipe>> = tasks
-            .par_iter()
-            .map(|&(slot, only_new)| {
-                this.pipes_from(slot as usize, |ns| !only_new || ns >= first_new)
-            })
-            .collect();
-        for p in built.into_iter().flatten() {
-            let i = self.pipes.len() as u32;
-            self.regions[p.ra as usize].pipes.push(i);
-            if p.rb != p.ra {
-                self.regions[p.rb as usize].pipes.push(i);
-            }
-            self.pipes.push(p);
-        }
-        self.q.resize(self.pipes.len(), 0.0);
-        self.eff.resize(self.spans.len(), 0.0);
-        self.scale.resize(self.spans.len(), 1.0);
-        self.rebuild_adjacency();
-        self.lists_dirty = true;
-    }
-
-    fn wake_slot(&mut self, s: usize) -> bool {
-        let r = &mut self.regions[s];
-        r.quiet_steps = 0;
-        r.steady_steps = 0;
-        r.steady_snap.clear();
-        r.steady_qsum.clear();
-        r.steady_qsq.clear();
-        if r.frozen || r.active {
-            return false;
-        }
-        let was_steady = r.steady;
-        r.steady = false;
-        r.steady_ref.clear();
-        r.active = true;
-        if was_steady {
-            self.settle_ledger(s);
-        }
-        self.lists_dirty = true;
-        true
-    }
-
-    /// Puts a woken region's ledger into its fullest span: in a steady state the
-    /// water that entered and left net to about zero, so what is left is small.
-    fn settle_ledger(&mut self, slot: usize) {
-        let r = &mut self.regions[slot];
-        let ledger = std::mem::take(&mut r.steady_ledger);
-        if ledger == 0.0 {
-            return;
-        }
-        let (lo, hi) = (r.span_start as usize, r.span_end as usize);
-        let mut best = lo;
-        for i in lo..hi {
-            if self.volume[i] > self.volume[best] {
-                best = i;
-            }
-        }
-        let after = self.volume[best] + ledger;
-        if after >= 0.0 {
-            self.volume[best] = after;
-        } else {
-            // Not enough water in the region to give: the rest was never there.
-            self.volume[best] = 0.0;
-            self.unplaced += after;
-        }
-    }
-
-    fn wake_slot_and_neighbours(&mut self, s: usize) {
-        let key = self.regions[s].key;
-        self.wake_slot(s);
-        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            if let Some(&n) = self.slot_of.get(&(key.0 + dx, key.1 + dz)) {
-                self.wake_slot(n as usize);
-            }
-        }
-    }
-
-    /// Wakes the region holding column `(x, z)`.
-    pub fn wake_column(&mut self, x: i64, z: i64) {
-        self.revive_at(x, z);
-        if let Some(&s) = self.slot_of.get(&region_of(x, z)) {
-            self.wake_slot(s as usize);
-        }
-    }
-
-    pub fn wake_all(&mut self) {
-        for s in 0..self.regions.len() {
-            self.wake_slot(s);
-        }
-    }
-
-    /// Allocates every region touching the rectangle of columns (inclusive).
-    pub fn allocate_rect(&mut self, x0: i64, z0: i64, x1: i64, z1: i64) {
-        let (lo, hi) = (region_of(x0, z0), region_of(x1, z1));
-        let keys: Vec<_> = (lo.1..=hi.1)
-            .flat_map(|rz| (lo.0..=hi.0).map(move |rx| (rx, rz)))
-            .collect();
-        self.allocate(&keys, &BTreeSet::new());
-    }
-
-    /// Tells the world that these regions' terrain has become resident. Waiting
-    /// neighbours of water are allocated and both sides wake, so water crosses
-    /// the former frozen boundary.
-    pub fn notify_resident(&mut self, keys: &[RegionKey]) {
-        let mut refresh = BTreeSet::new();
-        let mut add = Vec::new();
-        for &k in keys {
-            if self.slot_of.contains_key(&k) || self.dormant.contains_key(&k) {
-                refresh.insert(k);
-            } else if self.waiting.remove(&k) {
-                add.push(k);
-            }
-        }
-        if !add.is_empty() || !refresh.is_empty() {
-            self.allocate(&add, &refresh);
-            for k in add {
-                if let Some(&s) = self.slot_of.get(&k) {
-                    self.wake_slot_and_neighbours(s as usize);
-                }
-            }
-        }
-    }
-
-    /// Marks regions' terrain as non-resident: frozen, closed boundary. Their
-    /// water is kept and counted but does not move.
-    pub fn freeze_regions(&mut self, keys: &[RegionKey]) {
-        let mut changed = false;
-        for k in keys {
-            if let Some(&s) = self.slot_of.get(k) {
-                let r = &mut self.regions[s as usize];
-                if !r.frozen {
-                    r.frozen = true;
-                    r.active = false;
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.build_pipes();
-            self.q = vec![0.0; self.pipes.len()];
-            self.lists_dirty = true;
-        }
-    }
-
-    /// Re-reads the terrain of the given regions after a committed edit, remaps
-    /// their water (volume conserved) and wakes them and their neighbours.
-    pub fn refresh_regions(&mut self, keys: &[RegionKey]) -> RemapReport {
-        let set: BTreeSet<_> = keys
-            .iter()
-            .copied()
-            .filter(|k| self.slot_of.contains_key(k) || self.dormant.contains_key(k))
-            .collect();
-        self.allocate(&[], &set)
-    }
-
-    /// Swaps in a new terrain source and refreshes `changed` regions.
-    pub fn replace_terrain(
-        &mut self,
-        terrain: Arc<dyn TerrainSource>,
-        changed: &[RegionKey],
-    ) -> RemapReport {
-        self.terrain = terrain;
-        self.dense = None;
-        self.refresh_regions(changed)
-    }
-
-    /// Dense worlds: re-derives spans from a new committed boundary.
-    pub fn apply_boundary(&mut self, boundary: &SolidBoundary) -> Result<RemapReport, ColumnError> {
-        let Some((spec, old)) = self.dense.clone() else {
-            return Err(ColumnError::DomainMismatch);
-        };
-        if boundary.spec() != spec {
-            return Err(ColumnError::DomainMismatch);
-        }
-        if boundary.solid == *old {
-            return Ok(RemapReport::default());
-        }
-        let [nx, ny, nz] = spec.dimensions().map(|d| d as usize);
-        let o = spec.origin();
-        let mut changed = BTreeSet::new();
-        for cz in 0..nz {
-            for cx in 0..nx {
-                if (0..ny).any(|y| {
-                    let i = cx + nx * (y + ny * cz);
-                    boundary.solid[i] != old[i]
-                }) {
-                    changed.insert(region_of(o.x + cx as i64, o.z + cz as i64));
-                }
-            }
-        }
-        let terrain = BoundaryTerrain::new(boundary);
-        self.dense = Some((spec, terrain.solid.clone()));
-        self.terrain = Arc::new(terrain);
-        let keys: Vec<_> = changed.into_iter().collect();
-        Ok(self.refresh_regions(&keys))
-    }
-
-    // ---- water -------------------------------------------------------------
-
-    /// Sets every span in the column to the depth reached by an absolute water
-    /// level `level_y` (global cell units): spans below it fill, spans above it
-    /// stay dry. Wakes the region. The region must be allocated.
-    pub fn fill_column_to(&mut self, x: i64, z: i64, level_y: f64) {
-        self.revive_at(x, z);
-        if let Some(range) = self.column_range(x, z) {
-            for i in range {
-                let s = self.spans[i];
-                self.volume[i] = (level_y - f64::from(s.y0)).clamp(0.0, s.capacity());
-            }
-            self.wake_column(x, z);
-        }
-    }
-
-    /// Adds a spring's flow to the span containing `cell`. In a steady region
-    /// the flow joins the region's ledger instead and wakes nothing: the
-    /// spring's water is part of the steady balance.
-    pub fn add_flow(&mut self, cell: GlobalCell, volume: f64) -> Result<(), ColumnError> {
-        if !volume.is_finite() || volume < 0.0 {
-            return Err(ColumnError::InvalidAmount);
-        }
-        self.revive_at(cell.x, cell.z);
-        let slot = self.slot_of.get(&region_of(cell.x, cell.z)).copied();
-        if let Some(slot) = slot
-            && self.regions[slot as usize].steady
-        {
-            self.span_at(cell).ok_or(ColumnError::NotOpen(cell))?;
-            self.regions[slot as usize].steady_ledger += volume;
-            return Ok(());
-        }
-        self.add_water(cell, volume)
-    }
-
-    /// Adds water to the span containing `cell` (a source) and wakes its region.
-    pub fn add_water(&mut self, cell: GlobalCell, volume: f64) -> Result<(), ColumnError> {
-        if !volume.is_finite() || volume < 0.0 {
-            return Err(ColumnError::InvalidAmount);
-        }
-        self.revive_at(cell.x, cell.z);
-        let i = self.span_at(cell).ok_or(ColumnError::NotOpen(cell))?;
-        self.volume[i] += volume;
-        self.wake_column(cell.x, cell.z);
-        Ok(())
-    }
-
-    fn span_at(&self, cell: GlobalCell) -> Option<usize> {
-        let y = cell.y;
-        self.column_range(cell.x, cell.z)?
-            .find(|&i| (i64::from(self.spans[i].y0)..i64::from(self.spans[i].y1)).contains(&y))
-    }
-
-    /// Seeds water at rest from a list of full cells (e.g. a worldgen water
-    /// plan): allocates their regions, adds one cell^3 each, and leaves every
-    /// region asleep. Cells in solid or non-resident terrain are returned.
-    pub fn seed_cells(&mut self, cells: &[GlobalCell]) -> Vec<GlobalCell> {
-        let keys: BTreeSet<RegionKey> = cells.iter().map(|c| region_of(c.x, c.z)).collect();
-        let keys: Vec<_> = keys.into_iter().collect();
-        self.allocate(&keys, &BTreeSet::new());
-        let mut rejected = Vec::new();
-        for &c in cells {
-            match self.span_at(c) {
-                Some(i) => self.volume[i] += 1.0,
-                None => rejected.push(c),
-            }
-        }
-        for r in &mut self.regions {
-            r.active = false;
-            r.quiet_steps = r.quiet_steps.max(self.config.sleep_steps);
-        }
-        self.ensure_rings();
-        for r in &mut self.regions {
-            r.active = false;
-        }
-        self.lists_dirty = true;
-        rejected
-    }
-
-    /// Seeds water at rest from per-column levels, `(x, z, bed, top)`: the span
-    /// that starts just above the terrain surface `bed` fills up to and
-    /// including cell `top`. Spans below it (caves under a lake) stay dry.
-    /// Allocates the regions and leaves every region asleep. Columns with no
-    /// open span above their bed are returned, not dropped silently.
-    pub fn seed_levels(&mut self, columns: &[(i64, i64, i64, i64)]) -> Vec<(i64, i64, i64, i64)> {
-        if self.config.lazy_ocean {
-            for (k, d) in self.find_dormant(columns) {
-                self.dormant_volume += d.volume;
-                self.dormant.insert(k, d);
-            }
-        }
-        let keys: BTreeSet<RegionKey> = columns
-            .iter()
-            .map(|c| region_of(c.0, c.1))
-            .filter(|k| !self.dormant.contains_key(k))
-            .collect();
-        let keys: Vec<_> = keys.into_iter().collect();
-        self.allocate(&keys, &BTreeSet::new());
-        let mut rejected = Vec::new();
-        for &(x, z, bed, top) in columns {
-            if !self.dormant.is_empty() && self.dormant.contains_key(&region_of(x, z)) {
-                continue;
-            }
-            match self.span_at(GlobalCell::new(x, bed + 1, z)) {
-                Some(i) => {
-                    let s = self.spans[i];
-                    self.volume[i] =
-                        (((top + 1) as f64) - f64::from(s.y0)).clamp(0.0, s.capacity());
-                }
-                None => rejected.push((x, z, bed, top)),
-            }
-        }
-        for r in &mut self.regions {
-            r.active = false;
-            r.quiet_steps = r.quiet_steps.max(self.config.sleep_steps);
-        }
-        self.ensure_rings();
-        for r in &mut self.regions {
-            r.active = false;
-        }
-        self.lists_dirty = true;
-        rejected
-    }
-
-    /// Allocates the neighbours of every region that holds water, so water can
-    /// always flow into an allocated region.
-    fn ensure_rings(&mut self) {
-        let mut add: BTreeSet<RegionKey> = BTreeSet::new();
-        let mut marked = Vec::new();
-        for (s, r) in self.regions.iter().enumerate() {
-            if r.ring_done {
-                continue;
-            }
-            let wet = self.volume[r.span_start as usize..r.span_end as usize]
-                .iter()
-                .any(|&v| v > 1.0e-6);
-            if !wet {
-                continue;
-            }
-            marked.push(s);
-            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                let k = (r.key.0 + dx, r.key.1 + dz);
-                if !self.slot_of.contains_key(&k) && !self.dormant.contains_key(&k) {
-                    add.insert(k);
-                }
-            }
-        }
-        for s in marked {
-            self.regions[s].ring_done = true;
-        }
-        if !add.is_empty() {
-            let keys: Vec<_> = add.into_iter().collect();
-            self.allocate(&keys, &BTreeSet::new());
-        }
-    }
-
-    /// Total water including overfill and the unplaced ledger, cells^3.
-    pub fn total_volume(&self) -> f64 {
-        let ledgers: f64 = self.regions.iter().map(|r| r.steady_ledger).sum();
-        chunked_sum(&self.volume, |_, v| *v) + self.unplaced + ledgers + self.dormant_volume
-    }
-
-    pub fn total_volume_m3(&self) -> f64 {
-        self.total_volume() * CELL_SIZE_M.powi(3)
-    }
-
-    /// Water in one column (all spans), cells^3.
-    pub fn column_volume(&self, x: i64, z: i64) -> f64 {
-        if let Some(d) = self.dormant.get(&region_of(x, z)) {
-            let local =
-                (x.rem_euclid(REGION_EDGE) + REGION_EDGE * z.rem_euclid(REGION_EDGE)) as usize;
-            return d.column_volume(local);
-        }
-        self.column_range(x, z)
-            .map(|r| r.map(|i| self.volume[i]).sum())
-            .unwrap_or(0.0)
-    }
-
-    pub fn unplaced_volume(&self) -> f64 {
-        self.unplaced
-    }
-
-    /// Water volume above its span's capacity across the world, cells^3.
-    pub fn overfill_volume(&self) -> f64 {
-        chunked_sum(&self.volume, |i, v| {
-            (*v - self.spans[i].capacity()).max(0.0)
-        })
-    }
-
-    fn effective_heads(&self) -> Vec<f32> {
-        (0..self.volume.len())
-            .map(|i| self.effective_head(i))
-            .collect()
-    }
-
-    /// Wetted area of a pipe given the two heads, in cells.
-    fn wetted_area(p: &Pipe, ha: f32, hb: f32) -> f32 {
-        (ha.max(hb) - p.lo as f32).clamp(0.0, (p.hi - p.lo) as f32)
-    }
-
-    /// Largest head difference across any wetted pipe: zero at true rest.
-    pub fn max_wetted_head_difference(&self) -> f32 {
-        let h = self.effective_heads();
-        let film = self.config.min_film_depth;
-        self.pipes
-            .iter()
-            .filter_map(|p| {
-                let (ha, hb) = (h[p.a as usize], h[p.b as usize]);
-                (Self::wetted_area(p, ha, hb) >= film)
-                    .then(|| (ha.max(p.lo as f32) - hb.max(p.lo as f32)).abs())
-            })
-            .fold(0.0, f32::max)
-    }
-
-    pub fn max_abs_flow(&self) -> f32 {
-        self.q.iter().fold(0.0, |m, q| m.max(q.abs()))
-    }
-
-    /// Largest pipe speed `|q| / A` in m/s over all pipes.
-    pub fn peak_speed_m_s(&self) -> f32 {
-        let h = self.effective_heads();
-        let film = self.config.min_film_depth;
-        let mut peak = 0.0f32;
-        for (p, q) in self.pipes.iter().zip(&self.q) {
-            let a = Self::wetted_area(p, h[p.a as usize], h[p.b as usize]);
-            if a >= film {
-                peak = peak.max(q.abs() / a);
-            }
-        }
-        peak * CELL_SIZE_M as f32
-    }
-
-    fn release_unplaced(&mut self) {
-        if self.unplaced > 0.0 && !self.volume.is_empty() {
-            let key = |k: usize| f64::from(self.spans[k].y0) + self.volume[k];
-            let mut best = 0;
-            for i in 1..self.volume.len() {
-                if key(i) < key(best) {
-                    best = i;
-                }
-            }
-            self.volume[best] += self.unplaced;
-            self.unplaced = 0.0;
-            let region = self
-                .regions
-                .partition_point(|r| (r.span_end as usize) <= best);
-            if region < self.regions.len() {
-                self.wake_slot(region);
-            }
-        }
-    }
-
-    /// Fills the span cell `cell` sits in up to the top of that cell, if it is
-    /// open (a spring). Returns the volume added, or `None` if the cell is not
-    /// open.
-    pub fn fill_cell(&mut self, cell: GlobalCell) -> Option<f64> {
-        self.revive_at(cell.x, cell.z);
-        let i = self.span_at(cell)?;
-        let want = (cell.y + 1 - i64::from(self.spans[i].y0)) as f64;
-        let added = (want - self.volume[i]).max(0.0);
-        if added > 0.0 {
-            self.volume[i] += added;
-            self.dirty.insert(region_of(cell.x, cell.z));
-            self.wake_column(cell.x, cell.z);
-        }
-        Some(added)
-    }
-
-    /// Removes the water that stands in `cell` (up to one cell^3) from its span
-    /// (a drain). Returns the volume removed, or `None` if the cell is not open.
-    pub fn drain_cell(&mut self, cell: GlobalCell) -> Option<f64> {
-        self.revive_at(cell.x, cell.z);
-        let i = self.span_at(cell)?;
-        let in_cell =
-            (self.volume[i] - (cell.y - i64::from(self.spans[i].y0)) as f64).clamp(0.0, 1.0);
-        if in_cell > 0.0 {
-            self.volume[i] -= in_cell;
-            self.dirty.insert(region_of(cell.x, cell.z));
-            self.wake_column(cell.x, cell.z);
-        }
-        Some(in_cell)
-    }
-
-    /// Regions whose water changed since the last call, in key order.
-    pub fn take_dirty_regions(&mut self) -> Vec<RegionKey> {
-        std::mem::take(&mut self.dirty).into_iter().collect()
-    }
-
-    /// Marks every allocated region as changed (a full baseline is wanted).
-    pub fn mark_all_dirty(&mut self) {
-        self.dirty.extend(self.regions.iter().map(|r| r.key));
-        self.dirty.extend(self.dormant.keys().copied());
-    }
-
-    /// Allocated region keys in slot order, then the dormant sea regions
-    /// (which hold water and report it like any other) in key order.
-    pub fn region_keys(&self) -> Vec<RegionKey> {
-        let mut keys: Vec<RegionKey> = self.regions.iter().map(|r| r.key).collect();
-        let mut dormant: Vec<RegionKey> = self.dormant.keys().copied().collect();
-        dormant.sort_unstable();
-        keys.extend(dormant);
-        keys
-    }
-
-    /// How many sea regions are held as records instead of solver regions.
-    pub fn dormant_region_count(&self) -> usize {
-        self.dormant.len()
-    }
-
-    /// Water volume ledger of the world that is not inside any span: only the
-    /// unplaced remainder; spans hold the rest.
-    /// The wet spans of a region as `(local column, floor y, volume)`, keeping
-    /// only spans holding more than `min_volume`.
-    pub fn region_wet_spans(&self, key: RegionKey, min_volume: f64) -> Vec<(u16, i32, f64)> {
-        let Some(&slot) = self.slot_of.get(&key) else {
-            return self
-                .dormant_spans(key, min_volume)
-                .map(|v| v.into_iter().map(|(c, y0, vol, _)| (c, y0, vol)).collect())
-                .unwrap_or_default();
-        };
-        let mut out = Vec::new();
-        for c in 0..REGION_COLUMNS {
-            let ci = slot as usize * REGION_COLUMNS + c;
-            for i in self.col_start[ci] as usize..self.col_start[ci + 1] as usize {
-                if self.volume[i] > min_volume {
-                    out.push((c as u16, self.spans[i].y0, self.volume[i]));
-                }
-            }
-        }
-        out
-    }
-
-    /// [`Self::region_wet_spans`] with each span's height in cells and the
-    /// horizontal velocity `[x, z]` (m/s) of its water, as [`Self::flow_at_m`]
-    /// reports it: `(column, floor y, volume, height, flow)`.
-    pub fn region_wet_spans_with_flow(
-        &self,
-        key: RegionKey,
-        min_volume: f64,
-    ) -> Vec<(u16, i32, f64, i32, [f32; 2])> {
-        let Some(&slot) = self.slot_of.get(&key) else {
-            return self
-                .dormant_spans(key, min_volume)
-                .map(|v| {
-                    v.into_iter()
-                        .map(|(c, y0, vol, h)| (c, y0, vol, h, [0.0; 2]))
-                        .collect()
-                })
-                .unwrap_or_default();
-        };
-        let mut out = Vec::new();
-        for c in 0..REGION_COLUMNS {
-            let ci = slot as usize * REGION_COLUMNS + c;
-            for i in self.col_start[ci] as usize..self.col_start[ci + 1] as usize {
-                if self.volume[i] > min_volume {
-                    let span = self.spans[i];
-                    out.push((
-                        c as u16,
-                        span.y0,
-                        self.volume[i],
-                        span.y1 - span.y0,
-                        self.span_flow(i),
-                    ));
-                }
-            }
-        }
-        out
-    }
-
-    /// Height of the span in `(key, column)` whose floor is `y0`, if any.
-    pub fn span_height(&self, key: RegionKey, column: u16, y0: i32) -> Option<i32> {
-        let slot = *self.slot_of.get(&key)? as usize;
-        let ci = slot * REGION_COLUMNS + usize::from(column);
-        (self.col_start[ci] as usize..self.col_start[ci + 1] as usize)
-            .find(|&i| self.spans[i].y0 == y0)
-            .map(|i| self.spans[i].y1 - y0)
-    }
-
-    /// Restores one span's volume by `(region, column, floor y)`; the region
-    /// must be allocated. Returns false if terrain has no such span (the
-    /// caller reports it; water is never silently dropped).
-    pub fn restore_span(&mut self, key: RegionKey, column: u16, y0: i32, volume: f64) -> bool {
-        self.revive(&[key]);
-        let Some(&slot) = self.slot_of.get(&key) else {
-            return false;
-        };
-        let ci = slot as usize * REGION_COLUMNS + usize::from(column);
-        match (self.col_start[ci] as usize..self.col_start[ci + 1] as usize)
-            .find(|&i| self.spans[i].y0 == y0)
-        {
-            Some(i) => {
-                self.volume[i] = volume;
-                self.dirty.insert(key);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Allocates the given regions without adding water (restore). Regions
-    /// that are not resident are skipped and returned.
-    pub fn allocate_regions(&mut self, keys: &[RegionKey]) -> Vec<RegionKey> {
-        self.allocate(keys, &BTreeSet::new());
-        keys.iter()
-            .copied()
-            .filter(|k| !self.slot_of.contains_key(k))
-            .collect()
-    }
-
-    /// Puts every region to sleep: restored or seeded water is at rest.
-    pub fn sleep_all(&mut self) {
-        for r in &mut self.regions {
-            r.active = false;
-            r.steady = false;
-            r.steady_snap.clear();
-            r.steady_qsum.clear();
-            r.steady_qsq.clear();
-            r.steady_ref.clear();
-            r.quiet_steps = self.config.sleep_steps;
-        }
-        self.lists_dirty = true;
-        self.ensure_rings();
-        for r in &mut self.regions {
-            r.active = false;
-        }
-        self.lists_dirty = true;
-    }
-
-    /// Adds volume to the unplaced ledger (restore).
-    pub fn add_unplaced(&mut self, volume: f64) {
-        self.unplaced += volume;
     }
 
     // ---- stepping ------------------------------------------------------------
@@ -2526,24 +1163,7 @@ impl ColumnWorld {
         let mut changed = false;
         for (slot, r) in self.regions.iter_mut().enumerate() {
             let (period, rest) = if on && r.active && !r.frozen {
-                let centre = [
-                    f64::from(r.key.0) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
-                    f64::from(r.key.1) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
-                ];
-                let distance = self
-                    .focus
-                    .iter()
-                    .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
-                    .fold(f64::INFINITY, f64::min);
-                let period = if distance >= f64::from(bands[2]) {
-                    8u64
-                } else if distance >= f64::from(bands[1]) {
-                    4
-                } else if distance >= f64::from(bands[0]) {
-                    2
-                } else {
-                    1
-                };
+                let period = pace_at(&self.focus, bands, r.key);
                 // Regions of a period all step on the same steps, and the periods
                 // nest, so two neighbours step together whenever the slower of
                 // them does and the water between them moves at its pace.
@@ -2639,12 +1259,14 @@ impl ColumnWorld {
             let mut wake = BTreeSet::new();
             for &pi in &self.act_pipes {
                 let p = self.pipes[pi as usize];
-                if self.q[pi as usize].abs() > cfg.sleep_flow {
-                    for r in [p.ra, p.rb] {
-                        let reg = &self.regions[r as usize];
-                        if !reg.active && !reg.steady {
-                            wake.insert(r as usize);
-                        }
+                let fast = self.q[pi as usize].abs() > cfg.sleep_flow;
+                for (s, r) in [(p.a, p.ra), (p.b, p.rb)] {
+                    let reg = &self.regions[r as usize];
+                    if !reg.active
+                        && !reg.steady
+                        && (fast || self.border_out_of_level(s as usize, r))
+                    {
+                        wake.insert(r as usize);
                     }
                 }
             }
@@ -2712,6 +1334,7 @@ impl ColumnWorld {
             peak: 0.0,
             wake: BTreeSet::new(),
         };
+        let this = &*self;
         let (pipes, q, eff, regions) = (&self.pipes, &self.q, &self.eff, &self.regions);
         // Fixed-size chunks: a parallel fold would split into thousands of tasks,
         // each allocating and merging a vector the size of every allocated region.
@@ -2729,12 +1352,13 @@ impl ColumnWorld {
                     if area >= cfg.min_film_depth {
                         acc.peak = acc.peak.max(qa / area);
                     }
-                    if qa > cfg.sleep_flow {
-                        for r in [p.ra, p.rb] {
-                            let reg = &regions[r as usize];
-                            if !reg.active && !reg.steady {
-                                acc.wake.insert(r);
-                            }
+                    for (s, r) in [(p.a, p.ra), (p.b, p.rb)] {
+                        let reg = &regions[r as usize];
+                        if !reg.active
+                            && !reg.steady
+                            && (qa > cfg.sleep_flow || this.border_out_of_level(s as usize, r))
+                        {
+                            acc.wake.insert(r);
                         }
                     }
                     // A steady region wakes at once if a boundary flow jumps from its
@@ -2770,7 +1394,7 @@ impl ColumnWorld {
         let max_q = acc.max_q;
         let wake: Vec<usize> = acc.wake.into_iter().map(|r| r as usize).collect();
         metrics.max_abs_flow = max_q.iter().fold(0.0, |m, q| m.max(*q));
-        metrics.peak_speed_m_s = acc.peak * CELL_SIZE_M as f32;
+        metrics.peak_speed_m_s = acc.peak * CELL_SIZE_M as f32 / cfg.column_cells as f32;
         // Steady flow: a region that keeps carrying water but whose span volumes
         // have not moved over a window stops being stepped, holding its mean flows.
         if cfg.steady_steps > 0 {
@@ -3023,7 +1647,12 @@ impl ColumnWorld {
         let (pipes, eff) = (&self.pipes, &self.eff);
 
         // Areas move slowly between substeps, so the hint carries a 25% margin.
-        let dt = max_dt.min(cfg.cfl / (cfg.gravity * self.a_hint * 1.25).sqrt());
+        // A wave crosses a wider column in proportionally more time.
+        let width = cfg.column_cells as f32;
+        let dt = max_dt.min(width * cfg.cfl / (cfg.gravity * self.a_hint * 1.25).sqrt());
+        // Flows are volumes per second; a span's volume is its depth over the
+        // column's area (1 at terrain resolution).
+        let per_area = 1.0 / f64::from(cfg.column_cells * cfg.column_cells);
 
         // Flow update with damping; thin films carry nothing. Each pipe appears
         // once in `act_pipes`, so the writes are disjoint.
@@ -3072,7 +1701,8 @@ impl ColumnWorld {
                     (if entry & 1 == 1 { flow } else { -flow }).max(0.0)
                 })
                 .sum::<f64>()
-                * f64::from(dt);
+                * f64::from(dt)
+                * per_area;
             let scale = if out > volume[i] {
                 volume[i].max(0.0) / out
             } else {
@@ -3117,7 +1747,8 @@ impl ColumnWorld {
                     if entry & 1 == 1 { -flow } else { flow }
                 })
                 .sum::<f64>()
-                * f64::from(dt);
+                * f64::from(dt)
+                * per_area;
             // SAFETY: one read-modify-write per distinct span index; `volume` is
             // not read through any other path in this pass.
             unsafe { vol_ptr.write(i, (vol_ptr.read(i) + delta).max(0.0)) }
@@ -3142,7 +1773,8 @@ impl ColumnWorld {
                             if entry & 1 == 1 { -flow } else { flow }
                         })
                         .sum::<f64>()
-                        * f64::from(dt);
+                        * f64::from(dt)
+                        * per_area;
                     (region, delta)
                 })
                 .collect();
