@@ -254,6 +254,28 @@ pub(super) fn draw_endurance(view: EnduranceView) {
 
 /// Mean, percentiles and worst of the recent frames' handler time, and how many
 /// ran long, as a few lines.
+/// The frame rate this machine could reach without vsync, read with vsync on:
+/// the frame's own CPU work (vsync waits excluded) against the scene's GPU
+/// time, whichever is slower. CPU and GPU overlap, so this is an estimate.
+/// Measuring it this way avoids running without vsync, which froze this
+/// project's main development PC (2026-10-22).
+pub(super) fn headroom(
+    work_ms: &std::collections::VecDeque<f32>,
+    scene_gpu_ms: Option<f64>,
+) -> Option<String> {
+    if work_ms.is_empty() {
+        return None;
+    }
+    let cpu = work_ms.iter().sum::<f32>() / work_ms.len() as f32;
+    let gpu = scene_gpu_ms.map(|ms| ms as f32);
+    let bound = gpu.map_or(cpu, |gpu| cpu.max(gpu)).max(0.01);
+    let gpu = gpu.map_or("n/a".to_owned(), |ms| format!("{ms:.1} ms"));
+    Some(format!(
+        "headroom ~{:.0} fps (CPU {cpu:.1} ms, GPU {gpu} per frame)",
+        1000.0 / bound
+    ))
+}
+
 pub(super) fn frame_summary(history: &std::collections::VecDeque<f32>) -> Vec<String> {
     if history.is_empty() {
         return Vec::new();
@@ -541,5 +563,22 @@ mod tests {
         assert!(lines[0].contains("worst 40.0"), "{}", lines[0]);
         assert!(lines[1].contains("over 8 ms 2.0%"), "{}", lines[1]);
         assert!(lines[1].contains("over 33 ms 1.00%"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn headroom_is_bound_by_the_slower_of_cpu_work_and_scene_gpu() {
+        assert!(headroom(&std::collections::VecDeque::new(), Some(1.0)).is_none());
+        let work: std::collections::VecDeque<f32> = [4.0, 6.0].into_iter().collect();
+        // CPU 5 ms is the bound: 200 fps, whatever vsync holds the frame to.
+        let line = headroom(&work, Some(1.2)).unwrap();
+        assert!(line.starts_with("headroom ~200 fps"), "{line}");
+        assert!(line.contains("CPU 5.0 ms, GPU 1.2 ms"), "{line}");
+        // A slower GPU bounds it instead.
+        assert!(
+            headroom(&work, Some(10.0))
+                .unwrap()
+                .starts_with("headroom ~100 fps")
+        );
+        assert!(headroom(&work, None).unwrap().contains("GPU n/a"));
     }
 }

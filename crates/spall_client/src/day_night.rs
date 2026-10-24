@@ -1,49 +1,21 @@
-//! Deterministic presentation clock derived from the authoritative server tick.
+//! Presentation lighting for the tick-derived clock.
 //!
-//! A Spall day is 72,000 60 Hz simulation ticks (20 real minutes). The lunar
-//! cycle lasts eight Spall days and starts at full moon. No separate client
-//! wall clock is used, so connected players see the same celestial state.
+//! The tick -> time-of-day mapping lives in [`spall_core::time_of_day`] so
+//! server systems and client lighting agree on when it is night. No separate
+//! client wall clock is used, so connected players see the same celestial state.
 
 use glam::Vec3;
+use spall_core::time_of_day::{DayNightState, state_at_tick};
 use spall_render::Environment;
 
-pub const DAY_CYCLE_TICKS: u64 = 72_000;
-pub const LUNAR_CYCLE_DAYS: u64 = 8;
 const TAU: f32 = std::f32::consts::TAU;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DayNightState {
-    pub day_index: u64,
-    /// 0 = 06:00 sunrise, .25 = noon, .5 = 18:00 sunset, .75 = midnight.
-    pub day_fraction: f32,
-    /// [0,1), new moon at 0, full moon at 0.5.
-    pub lunar_phase: f32,
-    pub hour: u8,
-    pub minute: u8,
-}
-
-pub fn state_at_tick(server_tick: u64) -> DayNightState {
-    let day_index = server_tick / DAY_CYCLE_TICKS;
-    let within_day = server_tick % DAY_CYCLE_TICKS;
-    let day_fraction = within_day as f32 / DAY_CYCLE_TICKS as f32;
-    let lunar_phase =
-        (0.5 + (day_index % LUNAR_CYCLE_DAYS) as f32 / LUNAR_CYCLE_DAYS as f32).fract();
-    let minutes_after_six = (day_fraction * 1_440.0).floor() as u32;
-    let total_minutes = (360 + minutes_after_six) % 1_440;
-    DayNightState {
-        day_index,
-        day_fraction,
-        lunar_phase,
-        hour: (total_minutes / 60) as u8,
-        minute: (total_minutes % 60) as u8,
-    }
-}
 
 #[allow(clippy::field_reassign_with_default)]
 pub fn environment_at_tick(server_tick: u64) -> (Environment, DayNightState) {
     let state = state_at_tick(server_tick);
     let sun_angle = state.day_fraction * TAU;
-    let (sin_sun, cos_sun) = sun_angle.sin_cos();
+    let sin_sun = state.sun_height();
+    let cos_sun = sun_angle.cos();
     let sun_position = Vec3::new(cos_sun, sin_sun, 0.0);
     let day_light = smoothstep(-0.16, 0.22, sin_sun);
     let twilight = (1.0 - (sin_sun.abs() * 6.0).clamp(0.0, 1.0)).powi(2);
@@ -116,6 +88,7 @@ fn mix_rgb(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spall_core::time_of_day::DAY_CYCLE_TICKS;
 
     #[test]
     fn twenty_minute_cycle_has_minecraft_like_landmarks_and_wraps() {
@@ -135,15 +108,6 @@ mod tests {
         assert!(noon_env.sun_dir.y < -0.99 && noon_env.sun_intensity > 4.9);
         assert!(night_env.sun_dir.y > 0.99 && night_env.sun_intensity < 0.01);
         assert!(night_env.sky.iter().all(|light| *light >= 0.075));
-    }
-
-    #[test]
-    fn lunar_phase_waxes_and_wanes_over_eight_days() {
-        let ticks_per_day = DAY_CYCLE_TICKS;
-        assert!((state_at_tick(0).lunar_phase - 0.5).abs() < 1e-6); // full
-        assert!((state_at_tick(ticks_per_day).lunar_phase - 0.625).abs() < 1e-6);
-        assert!((state_at_tick(ticks_per_day * 4).lunar_phase).abs() < 1e-6); // new
-        assert!((state_at_tick(ticks_per_day * 8).lunar_phase - 0.5).abs() < 1e-6);
     }
 
     #[test]

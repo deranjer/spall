@@ -12,7 +12,7 @@ pub(super) struct InteractiveApp {
     /// Material index of the debug overlay colour (one past the manifest).
     pub(super) debug_material: u32,
     pub(super) uncapped: bool,
-    ambience: Option<AmbienceAudio>,
+    pub(super) ambience: Option<AmbienceAudio>,
     pub(super) biome_audio: BiomeAudioConfig,
     pub(super) creature_view: Option<std::sync::Arc<dyn CreatureView>>,
     pub(super) player_view: Option<std::sync::Arc<dyn PlayerView>>,
@@ -20,6 +20,8 @@ pub(super) struct InteractiveApp {
     pub(super) third_person: bool,
     /// Render-table index of the player view's first tint material.
     pub(super) player_tint_base: u32,
+    /// First render-table index of the creature view's tinted materials.
+    pub(super) creature_tint_base: u32,
     /// Last drawn creature cubes and remote players. A frame that finds the
     /// replica lock busy reuses them instead of dropping them for a frame.
     pub(super) last_creature_cubes: Vec<spall_render::CubeInstance>,
@@ -31,6 +33,9 @@ pub(super) struct InteractiveApp {
     ambience_field: Option<spall_ecology::cover::CoverField>,
     ambience_grid: Option<spall_ecology::cover::CoverGrid>,
     ambience_check_at: Instant,
+    /// Distance to the nearest bird creature, for birdsong volume.
+    nearest_bird_m: Option<f64>,
+    birdsong_gate: crate::audio::BirdsongGate,
     /// Ambience layers last sent to the audio thread, volumes in twentieths.
     ambience_layers: Vec<(PathBuf, u8)>,
     ambience_mix_at: Option<Instant>,
@@ -41,6 +46,8 @@ pub(super) struct InteractiveApp {
     /// One stride counter per walking player (`0` is the local player).
     pub(super) footstep_trackers: HashMap<u64, crate::footsteps::FootstepTracker>,
     pub(super) footstep_at: Option<Instant>,
+    /// Each creature's last tag, to start its sounds when it changes.
+    pub(super) creature_sounds: crate::creature_sounds::CreatureSoundTracker,
     pub(super) footstep_log: bool,
     pub(super) breathing: Option<crate::breathing::BreathingAudio>,
     pub(super) breathing_state: crate::breathing::BreathingState,
@@ -64,6 +71,9 @@ pub(super) struct InteractiveApp {
     pub(super) body_state: BodyState,
     /// Admin-menu previews of looks for stats the game does not model yet.
     pub(super) body_preview: BodyPreview,
+    /// This client's authoritative health, last read from the replica; shown
+    /// as the injury look.
+    pub(super) player_health: Option<spall_protocol::PlayerHealth>,
     pub(super) body_state_at: Option<Instant>,
     /// Clock for the screen grade's heartbeat pulse.
     pub(super) body_epoch: Instant,
@@ -130,6 +140,9 @@ pub(super) struct InteractiveApp {
     pub(super) frame_history: std::collections::VecDeque<f32>,
     /// Swapchain acquire and queue submit time of the same frames (ms).
     pub(super) frame_waits: std::collections::VecDeque<(f32, f32)>,
+    /// Handler time of the same frames minus the swapchain acquire and
+    /// present waits, where vsync blocks (ms): the frame's own CPU work.
+    pub(super) frame_work: std::collections::VecDeque<f32>,
     /// The last line the HUD printed, kept for the debug report.
     pub(super) last_hud_line: String,
     /// What the last "copy debug report" did, shown in the menu for a while.
@@ -261,6 +274,7 @@ impl InteractiveApp {
             player_view: options.player_view,
             third_person: false,
             player_tint_base: 0,
+            creature_tint_base: 0,
             last_creature_cubes: Vec::new(),
             last_remote_players: Vec::new(),
             third_person_distance_m: super::camera::THIRD_PERSON_DISTANCE_M,
@@ -268,6 +282,13 @@ impl InteractiveApp {
             ambience_field: None,
             ambience_grid: None,
             ambience_check_at: Instant::now() - Duration::from_secs(1),
+            nearest_bird_m: None,
+            birdsong_gate: crate::audio::BirdsongGate::new(
+                Instant::now(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64),
+            ),
             ambience_layers: Vec::new(),
             ambience_mix_at: None,
             weather_audio: AmbienceAudio::start(0.3),
@@ -276,6 +297,9 @@ impl InteractiveApp {
             footstep_volume: 0.5,
             footstep_trackers: HashMap::new(),
             footstep_at: None,
+            creature_sounds: crate::creature_sounds::CreatureSoundTracker::new(
+                std::process::id().into(),
+            ),
             footstep_log: std::env::var_os("SPALL_FOOTSTEP_LOG").is_some(),
             breathing,
             breathing_state: crate::breathing::BreathingState::Calm,
@@ -296,6 +320,7 @@ impl InteractiveApp {
             weather_exposure: 1.0,
             body_state: BodyState::default(),
             body_preview: BodyPreview::default(),
+            player_health: None,
             body_state_at: None,
             body_epoch: Instant::now(),
             weather_submerge: 0.0,
@@ -332,6 +357,7 @@ impl InteractiveApp {
             pending_mesh_detail_only: Vec::new(),
             frame_history: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
             frame_waits: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
+            frame_work: std::collections::VecDeque::with_capacity(FRAME_HISTORY),
             last_hud_line: String::new(),
             report_status: None,
             copy_report_key: false,
@@ -377,6 +403,24 @@ impl InteractiveApp {
         self.ambience_check_at = Instant::now();
         if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
             self.latest_weather = replica.weather().cloned();
+            // Distance to the nearest bird, for how loud birdsong plays.
+            let listener = self
+                .session
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(|view| view.predicted.position_m);
+            self.nearest_bird_m = listener.and_then(|at| {
+                replica
+                    .creatures()
+                    .records()
+                    .filter(|record| self.biome_audio.bird_species.contains(&record.species))
+                    .map(|record| {
+                        let [x, y, z] = record.translation_m;
+                        ((x - at[0]).powi(2) + (y - at[1]).powi(2) + (z - at[2]).powi(2)).sqrt()
+                    })
+                    .min_by(f64::total_cmp)
+            });
         }
         // Weather ducks each ambience layer (water far less, see `ambience_mix`).
         let weather_duck = if self.nature_preview.is_some() {
@@ -495,6 +539,14 @@ impl InteractiveApp {
         if !due && self.nature_preview.is_none() {
             return;
         }
+        let birdsong = if self
+            .birdsong_gate
+            .singing(Instant::now(), crate::audio::bird_near(self.nearest_bird_m))
+        {
+            crate::audio::birdsong_level(self.nearest_bird_m)
+        } else {
+            0.0
+        };
         let mix: Vec<(PathBuf, f32)> = if let Some(index) = self.nature_preview {
             self.biome_audio
                 .tracks
@@ -510,6 +562,7 @@ impl InteractiveApp {
                     let grid = self.ambience_grid.as_ref()?;
                     Some(crate::audio::ambience_mix(
                         weather_duck,
+                        birdsong,
                         field,
                         grid,
                         position,

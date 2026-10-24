@@ -6,6 +6,7 @@ use std::time::Instant;
 use glam::{Quat, Vec3};
 use spall_client::replica_creatures::ReplicaCreatures;
 use spall_client::window::CreatureView;
+use spall_core::MaterialId;
 use spall_render::CubeInstance;
 
 use crate::animal_visual::{AnimalVisual, MAX_ANIMAL_VISUAL_CELLS, material_mapping};
@@ -14,33 +15,52 @@ use crate::animals::{AnimalError, LOCOMOTION_IDLE, locomotion_clip, species};
 #[derive(Debug)]
 pub struct AnimalView {
     visuals: Vec<(&'static str, AnimalVisual)>,
+    /// Distinct `(material, tint)` pairs the species paint with: animals are
+    /// drawn in their palette colours, not their materials' own.
+    tints: Vec<(MaterialId, [u8; 3])>,
     started: Instant,
 }
 
 impl AnimalView {
     pub fn new() -> Result<Self, AnimalError> {
         let mapping = material_mapping(&crate::game::manifest());
-        let visuals = species()?
-            .into_iter()
-            .map(|s| {
-                let key = s.key;
-                AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
-                    .map(|visual| (key, visual))
-                    .map_err(|e| AnimalError::Asset(key, e.to_string()))
-            })
-            .collect::<Result<_, _>>()?;
+        let mut tints = Vec::new();
+        let mut visuals = Vec::new();
+        for s in species()? {
+            let key = s.key;
+            for run in s.asset.runs.iter().filter(|run| run.tint_slot != 0) {
+                let Some(&material) =
+                    mapping.get(&s.asset.material_keys[usize::from(run.material_slot) - 1])
+                else {
+                    return Err(AnimalError::Asset(key, "unmapped material".into()));
+                };
+                let pair = (material, s.asset.tints_srgb[usize::from(run.tint_slot) - 1]);
+                if !tints.contains(&pair) {
+                    tints.push(pair);
+                }
+            }
+            let visual = AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
+                .map_err(|e| AnimalError::Asset(key, e.to_string()))?;
+            visuals.push((key, visual));
+        }
         Ok(Self {
             visuals,
+            tints,
             started: Instant::now(),
         })
     }
 }
 
 impl CreatureView for AnimalView {
+    fn tints(&self) -> Vec<(MaterialId, [u8; 3])> {
+        self.tints.clone()
+    }
+
     fn instances(
         &self,
         creatures: &ReplicaCreatures,
         _tick: f64,
+        tint_base: u32,
         now: Instant,
     ) -> Vec<CubeInstance> {
         let mut out = Vec::new();
@@ -72,14 +92,39 @@ impl CreatureView for AnimalView {
                 presented.translation_m[2] as f32,
             );
             out.extend(cells.iter().map(|cell| {
+                let material = cell
+                    .tint_srgb
+                    .and_then(|tint| self.tints.iter().position(|t| *t == (cell.material, tint)))
+                    .map_or(u32::from(cell.material.0), |i| tint_base + i as u32);
                 CubeInstance::new(
                     (root_t + root_q * cell.center).to_array(),
-                    u32::from(cell.material.0),
+                    material,
                     cell.size.to_array(),
                     (root_q * cell.rotation).to_array(),
                 )
             }));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every palette colour of every species has a material, so no animal
+    /// falls back to its material's own colour (fur is wood, which is brown).
+    #[test]
+    fn every_palette_colour_has_a_material() {
+        let view = AnimalView::new().unwrap();
+        for s in species().unwrap() {
+            for tint in &s.asset.tints_srgb {
+                assert!(
+                    view.tints.iter().any(|(_, t)| t == tint),
+                    "{} colour {tint:?} has no material",
+                    s.key
+                );
+            }
+        }
     }
 }

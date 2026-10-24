@@ -57,6 +57,7 @@ pub enum WireTag {
     CreatureSpawn = 26,
     CreatureMotionFrame = 27,
     CreatureDespawn = 28,
+    PlayerHealth = 29,
 }
 
 impl WireTag {
@@ -88,6 +89,7 @@ impl WireTag {
             26 => Self::CreatureSpawn,
             27 => Self::CreatureMotionFrame,
             28 => Self::CreatureDespawn,
+            29 => Self::PlayerHealth,
             _ => return None,
         })
     }
@@ -922,6 +924,29 @@ impl Record for DurableThrough {
     const TAG: WireTag = WireTag::DurableThrough;
 
     fn validate(&self) -> Result<(), RecordError> {
+        Ok(())
+    }
+}
+
+/// `PlayerHealth` (ENG-223): the receiving client's own authoritative health,
+/// sent when it changes and once when the session goes live. A death shows as
+/// a jump back to `max_health` together with the respawn teleport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerHealth {
+    pub health: u16,
+    pub max_health: u16,
+}
+
+impl Record for PlayerHealth {
+    const TAG: WireTag = WireTag::PlayerHealth;
+
+    fn validate(&self) -> Result<(), RecordError> {
+        if self.health == 0 || self.health > self.max_health {
+            return Err(RecordError::OutOfRange {
+                field: "health",
+                detail: "must be 1..=max_health",
+            });
+        }
         Ok(())
     }
 }

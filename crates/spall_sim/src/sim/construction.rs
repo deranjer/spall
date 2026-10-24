@@ -35,6 +35,8 @@ impl Simulation {
             journal: JournalSink::new(),
             retiring: Retiring::default(),
             creatures: None,
+            carcasses: Vec::new(),
+            player_health: Default::default(),
             tick: Tick::ZERO,
             next_control_seq: 1,
             next_damage_seq: 0,
@@ -103,6 +105,8 @@ impl Simulation {
             journal: JournalSink::new(),
             retiring: Retiring::default(),
             creatures: None,
+            carcasses: Vec::new(),
+            player_health: Default::default(),
             tick,
             next_control_seq: 1,
             next_damage_seq: 0,
@@ -167,6 +171,7 @@ impl Simulation {
         if let Some(creatures) = &mut self.creatures {
             creatures.clear();
         }
+        self.carcasses.clear();
         let off_thread = self.pipeline.stages_off_thread();
         let old_world = std::mem::replace(&mut self.world, world);
         let old_pipeline = std::mem::replace(&mut self.pipeline, pipeline);

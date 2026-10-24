@@ -44,7 +44,11 @@ despawns the record, announced with the usual `CreatureDespawn`, and writes the
 carcass: each posed source voxel maps to the 0.25 m terrain cell its centre
 falls in, the whole shape drops onto the ground below, and only empty cells are
 filled, as single-cell `Place` transactions with server request ids (the same
-path vegetation growth uses). The first cell carries the strike's request id,
+path vegetation growth uses). Cells go in by layers of support: first those
+touching solid terrain, then those touching that layer, and so on, each layer
+queued only once the previous one has committed (`advance_carcasses`, every
+tick), so no cell ever lands unsupported and splits off as a body. Cells that
+cannot reach the ground through face contact are left out. The first cell carries the strike's request id,
 so the swing commits like a normal edit. The carcass is ordinary terrain:
 editable and replicated. The game supplies the posed voxels
 through `HostConfig::creature_shape`.

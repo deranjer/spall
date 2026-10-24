@@ -123,8 +123,10 @@ leave small puddles but never a wall, and it must be accounted, not deleted.
   every `|q|` and every per-step volume change is under a threshold. Sleeping
   regions cost nothing per tick.
 - **Wake** a region on: a terrain edit inside it or touching its border
-  columns; a neighbour region sending non-zero flow across the shared border; a
-  source/sink being enabled; a body interaction (later).
+  columns; a neighbour region sending flow across the shared border, either
+  over the sleep flow through one pipe or enough, however slowly, to leave a
+  border column half a cell above or below the column inside it
+  (`BORDER_WAKE_HEAD`); a source/sink being enabled; a body interaction (later).
 - **Streaming.** A non-resident neighbour region is a frozen, *closed*
   boundary. It is never a drain, never empty space and never a permanent wall.
   When it becomes resident, both sides wake and exchange normally. Do not guess

@@ -90,6 +90,16 @@ pub struct ColumnWaterState {
     pub gated_rate: u8,
     /// Springs with a fixed discharge.
     pub discharges: Vec<DischargeRecord>,
+    /// Terrain cells per water column edge (1 at terrain resolution, 4 for 1 m
+    /// columns): region keys, columns and span volumes are in that world's
+    /// cells, so a save restores only at the width it was written at.
+    pub column_cells: u8,
+    /// The sea's surface (global y) held fixed, if it is.
+    pub sea_level_y: Option<i32>,
+    /// Evaporation, 2^-32 cells of depth per second, from water open to the sky
+    /// whose surface is above `evaporation_above_y`.
+    pub evaporation_fixed: u64,
+    pub evaporation_above_y: i32,
 }
 
 impl ColumnWaterState {
@@ -106,6 +116,9 @@ impl ColumnWaterState {
         }
         if self.frame_seq == 0 || self.gated_rate > 3 {
             return Err(bad("sequence or rate"));
+        }
+        if self.column_cells == 0 || 32 % self.column_cells != 0 {
+            return Err(bad("column width"));
         }
         if self.y_lo >= self.y_hi
             || self.y_lo.rem_euclid(32) != 0
@@ -196,6 +209,10 @@ impl ColumnWaterDelta {
             sinks: Vec::new(),
             gated_rate: self.gated_rate,
             discharges: Vec::new(),
+            column_cells: 1,
+            sea_level_y: None,
+            evaporation_fixed: 0,
+            evaporation_above_y: 0,
         };
         shell.validate_inner(true)
     }
@@ -273,6 +290,10 @@ mod tests {
             sinks: Vec::new(),
             gated_rate: 0,
             discharges: Vec::new(),
+            column_cells: 1,
+            sea_level_y: None,
+            evaporation_fixed: 0,
+            evaporation_above_y: 0,
         }
     }
 

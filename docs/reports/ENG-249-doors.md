@@ -57,7 +57,7 @@ resolution; `InteractiveOptions.door` is set by sandbox-client; `CABIN_DOOR`
 is used by the material manifest, importer, tool catalog and client options.
 The generator is an example, not a production runtime config or harness feature.
 
-Wire version 18 -> 19 for the new action discriminant. Save/SPVOX versions are
+Wire version 20 -> 21 (18 -> 19 when written, rebased onto main's 20) for the new action discriminant. Save/SPVOX versions are
 unchanged. No proportionality exceptions or allowlist additions.
 
 Limits: quarter-metre, identity-transform doors turn instantly from +X to +Z;

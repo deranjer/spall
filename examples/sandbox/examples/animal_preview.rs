@@ -62,6 +62,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             bytes: include_bytes!("../assets/animals/leopard.spvox"),
         },
         Specimen {
+            name: "wolf",
+            clips: &["idle", "walk", "run", "stalk", "bite", "eat", "howl"],
+            bytes: include_bytes!("../assets/animals/wolf.spvox"),
+        },
+        Specimen {
             name: "player",
             clips: &["idle", "walk", "run", "swim"],
             bytes: include_bytes!("../assets/characters/player.spvox"),

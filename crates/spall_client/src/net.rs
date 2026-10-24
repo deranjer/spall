@@ -45,7 +45,7 @@ use crate::predict::{
     BodyMotion, ClientBodyCollision, ClientPhysics, PlayerMovementSummary, PredictedPlayer,
     WindowStats,
 };
-use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
+use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld, lock};
 use crate::residency::ClientResidencyPass;
 use crate::tick_accumulator::TickAccumulator;
 
@@ -1951,10 +1951,10 @@ async fn run_async(
                         }
                     }
                     Ok(Some(WireRecord::CreatureMotionFrame(frame))) => {
-                        replica
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .apply_creature_motion(&frame, std::time::Instant::now());
+                        lock(&replica).apply_creature_motion(&frame, std::time::Instant::now());
+                    }
+                    Ok(Some(WireRecord::PlayerHealth(health))) => {
+                        lock(&replica).apply_player_health(health);
                     }
                     Ok(Some(WireRecord::CreatureSpawn(spawn))) => {
                         if let Err(error) = replica
@@ -1966,10 +1966,7 @@ async fn run_async(
                         }
                     }
                     Ok(Some(WireRecord::CreatureDespawn(despawn))) => {
-                        replica
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .apply_creature_despawn(&despawn);
+                        lock(&replica).apply_creature_despawn(&despawn);
                     }
                     Ok(Some(WireRecord::SnowSurfaceFrame(frame))) => {
                         if frame.effective_tick < weather_floor {

@@ -31,6 +31,11 @@ CREATE TABLE checkpoint_weather (
     state BLOB NOT NULL,
     crc BLOB NOT NULL
 );
+CREATE TABLE checkpoint_players (
+    tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
+    state BLOB NOT NULL,
+    crc BLOB NOT NULL
+);
 CREATE TABLE checkpoint_snow (
     tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
     state BLOB NOT NULL,
@@ -133,6 +138,7 @@ pub(crate) fn validate_schema_layout(conn: &Connection) -> Result<(), StoreError
     const REQUIRED: &[(&str, &[&str])] = &[
         ("checkpoint_vegetation", &["tick", "state", "crc"]),
         ("checkpoint_weather", &["tick", "state", "crc"]),
+        ("checkpoint_players", &["tick", "state", "crc"]),
         ("checkpoint_snow", &["tick", "state", "crc"]),
         ("checkpoint_column_water", &["tick", "state", "crc"]),
         ("world", &["id", "meta"]),

@@ -24,7 +24,12 @@ pub(super) fn run_creatures(
         }
         Err(error) => return Err(format!("creature roster update failed: {error}")),
     }
-    service.run_motion(sim)?;
+    // Creatures one killed this tick leave every client like any despawn.
+    let killed = service.run_motion(sim)?;
+    if !killed.is_empty() {
+        lj.fan_out_creature_records(killed.into_wire_records(), clients_for_sim);
+    }
+    publish_player_health(sim, lj, clients_for_sim);
     // Presentation frames at 20 Hz, to live sessions only, limited to
     // creatures near that session's player.
     if sim

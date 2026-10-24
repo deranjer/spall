@@ -1,7 +1,8 @@
 //! Creature spawns and despawns reach two real QUIC clients: one that is
 //! connected when they happen (ordered stream) and one that joins later (join
 //! list). Both replicas must hold identical creatures, before and after a world
-//! reset.
+//! reset. A creature's hit on both players reaches each client as its own
+//! `PlayerHealth` (ENG-223/240).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -13,7 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use spall_client::{BaselineScene, ClientNetConfig, ReplicaReadyHook, run_replication_client};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
 use spall_protocol::CreatureRecord;
-use spall_server::creature_service::{CreatureDirector, CreatureIdPlan, CreatureService};
+use spall_server::creature_service::{
+    CreatureAction, CreatureDirector, CreatureIdPlan, CreatureService,
+};
 use spall_server::{CustomWorld, Scene, ServeConfig, serve};
 use spall_sim::Simulation;
 
@@ -21,6 +24,9 @@ const SERVER_TICKS: u64 = 1200; // 20 seconds at 60 Hz.
 const BIRTH_TICKS: [u64; 2] = [20, 120];
 const DESPAWN_TICK: u64 = 200;
 const RESET_TICK: u64 = 600;
+/// Creature 2 hits both players, standing beside it, for [`HIT_DAMAGE`].
+const HIT_TICK: u64 = 400;
+const HIT_DAMAGE: u16 = 30;
 
 fn unique_dir() -> PathBuf {
     let nanos = SystemTime::now()
@@ -79,11 +85,24 @@ impl CreatureDirector for TestDirector {
         vec![CreatureRecord {
             creature_id,
             species: "deer".into(),
-            translation_m: [8.0 + creature_id as f64, 2.0, 8.0],
+            translation_m: [2.0 + creature_id as f64, 2.0, 4.0],
             rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
             locomotion_tag: 0,
             clip_phase_tick: 0,
         }]
+    }
+
+    fn motion(&mut self, tick: u64, _sim: &Simulation) -> Vec<CreatureAction> {
+        if tick != HIT_TICK {
+            return Vec::new();
+        }
+        (0..2)
+            .map(|slot| CreatureAction::HitPlayer {
+                creature_id: 2,
+                player: spall_core::player_entity_for(slot),
+                damage: HIT_DAMAGE,
+            })
+            .collect()
     }
 
     fn despawns(&mut self, tick: u64, _sim: &Simulation) -> Vec<u64> {
@@ -114,6 +133,12 @@ impl ReplicaHandle {
             .records()
             .map(|r| (r.creature_id, r.clone()))
             .collect()
+    }
+
+    fn health(&self) -> Option<u16> {
+        let replica = self.0.lock().unwrap().clone()?;
+        let health = replica.lock().unwrap().player_health()?;
+        Some(health.health)
     }
 }
 
@@ -172,7 +197,8 @@ fn present_and_late_joining_clients_converge_on_the_authoritative_creatures() {
     server_cfg.harness.summary_json = Some(dir.join("server.summary.json"));
     server_cfg.harness.fingerprint_out = Some(fingerprint_path.clone());
     server_cfg.harness.addr_out = Some(addr_path.clone());
-    server_cfg.server.custom_world = Some(CustomWorld::new(vec![[4.0, 0.7, 8.0]], || {
+    // On the 6 m floor beside creature 2 (x = 4), within a creature's 3 m reach.
+    server_cfg.server.custom_world = Some(CustomWorld::new(vec![[4.0, 0.7, 5.0]], || {
         spall_sim::fixtures::flat_terrain_setup()
     }));
     server_cfg.server.admin_commands = true;
@@ -222,6 +248,25 @@ fn present_and_late_joining_clients_converge_on_the_authoritative_creatures() {
             "replicas did not converge: first={:?} late={:?}",
             ids(&a),
             ids(&b)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // The hit reaches each client as its own health, before the reset.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let hurt = Some(spall_sim::PLAYER_MAX_HEALTH - HIT_DAMAGE);
+    while first.health() != hurt || late.health() != hurt {
+        assert!(
+            ids(&first.creatures()) != [3, 4],
+            "the reset passed before both clients saw the hit: first={:?} late={:?}",
+            first.health(),
+            late.health()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "health did not arrive: first={:?} late={:?}",
+            first.health(),
+            late.health()
         );
         thread::sleep(Duration::from_millis(50));
     }

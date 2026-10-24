@@ -20,53 +20,74 @@ const CLAW: u16 = 6;
 const UPPER: [u32; 4] = [5, 6, 7, 8];
 const LOWER: [u32; 4] = [9, 10, 11, 12];
 
-/// A grizzly about 2.2 m nose to rump and 1.15 m at the hump, facing +X. The
+/// The grizzly is built this much larger than its sketched proportions below:
+/// every shape, part offset and root translation is scaled, joint angles are
+/// not.
+const SCALE: f64 = 1.15;
+fn sf(v: [f64; 3]) -> [f64; 3] {
+    v.map(|c| c * SCALE)
+}
+fn sr(r: f64) -> f64 {
+    r * SCALE
+}
+fn si(v: [i32; 3]) -> [i32; 3] {
+    v.map(|c| (f64::from(c) * SCALE).round() as i32)
+}
+
+/// A grizzly about 2.5 m nose to rump and 1.3 m at the hump, facing +X. The
 /// torso is the root; legs hinge about Z at shoulder/hip and elbow/hock, a
-/// positive angle swinging the hanging limb forward. Paws stand 11 cells below
-/// the root.
+/// positive angle swinging the hanging limb forward. Paws stand about 13 cells
+/// below the root.
 pub(super) fn bear() -> Animal {
-    let coat = |[_, y, _]: [i32; 3]| ("wood", if y >= 5 { GRIZZLE } else { FUR });
-    let mut torso = part(1, 0, "torso", [0, 0, 0]);
-    ellipsoid(&mut torso, [0.0, 0.0, 0.0], [13.0, 6.0, 6.0], &coat);
-    ellipsoid(&mut torso, [6.0, 4.0, 0.0], [5.0, 3.5, 4.5], &coat);
-    ellipsoid(&mut torso, [-8.0, 0.5, 0.0], [6.0, 6.0, 6.0], &coat);
+    let coat = |[_, y, _]: [i32; 3]| ("wood", if y >= 6 { GRIZZLE } else { FUR });
+    let mut torso = part(1, 0, "torso", si([0, 0, 0]));
+    ellipsoid(&mut torso, sf([0.0, 0.0, 0.0]), sf([13.0, 6.0, 6.0]), &coat);
+    ellipsoid(&mut torso, sf([6.0, 4.0, 0.0]), sf([5.0, 3.5, 4.5]), &coat);
+    ellipsoid(&mut torso, sf([-8.0, 0.5, 0.0]), sf([6.0, 6.0, 6.0]), &coat);
 
-    let mut neck = part(2, 1, "neck", [11, 2, 0]);
-    limb(&mut neck, [0.0, 0.0, 0.0], [3.0, 0.5, 0.0], 4.5, 3.8, &coat);
+    let mut neck = part(2, 1, "neck", si([11, 2, 0]));
+    limb(
+        &mut neck,
+        sf([0.0, 0.0, 0.0]),
+        sf([3.0, 0.5, 0.0]),
+        sr(4.5),
+        sr(3.8),
+        &coat,
+    );
 
-    let mut head = part(3, 2, "head", [3, 0, 0]);
+    let mut head = part(3, 2, "head", si([3, 0, 0]));
     ellipsoid(
         &mut head,
-        [2.0, 0.5, 0.0],
-        [3.5, 3.2, 3.2],
+        sf([2.0, 0.5, 0.0]),
+        sf([3.5, 3.2, 3.2]),
         &flat("wood", FUR),
     );
     limb(
         &mut head,
-        [4.0, -0.5, 0.0],
-        [7.5, -1.0, 0.0],
-        2.0,
-        1.5,
+        sf([4.0, -0.5, 0.0]),
+        sf([7.5, -1.0, 0.0]),
+        sr(2.0),
+        sr(1.5),
         &flat("wood", MUZZLE),
     );
     for at in [[8, -1, 0], [9, -1, 0], [8, 0, 0]] {
-        paint(&mut head, at, ("stone", NOSE));
+        paint(&mut head, si(at), ("stone", NOSE));
     }
     for side in [-1.0, 1.0] {
         ellipsoid(
             &mut head,
-            [0.5, 3.5, side * 2.3],
-            [0.9, 1.1, 0.8],
+            sf([0.5, 3.5, side * 2.3]),
+            sf([0.9, 1.1, 0.8]),
             &flat("wood", LEGS),
         );
-        paint(&mut head, [4, 1, side as i32 * 2], ("stone", NOSE));
+        paint(&mut head, si([4, 1, side as i32 * 2]), ("stone", NOSE));
     }
 
-    let mut tail = part(4, 1, "tail", [-13, 2, 0]);
+    let mut tail = part(4, 1, "tail", si([-13, 2, 0]));
     ellipsoid(
         &mut tail,
-        [-0.5, 0.0, 0.0],
-        [1.3, 1.2, 1.2],
+        sf([-0.5, 0.0, 0.0]),
+        sf([1.3, 1.2, 1.2]),
         &flat("wood", FUR),
     );
 
@@ -80,13 +101,13 @@ pub(super) fn bear() -> Animal {
     .into_iter()
     .enumerate()
     {
-        let mut upper = part(UPPER[i], 1, name, [x, -2, z]);
+        let mut upper = part(UPPER[i], 1, name, si([x, -2, z]));
         limb(
             &mut upper,
-            [0.0, 0.0, 0.0],
-            [0.0, -4.0, 0.0],
-            3.2,
-            2.4,
+            sf([0.0, 0.0, 0.0]),
+            sf([0.0, -4.0, 0.0]),
+            sr(3.2),
+            sr(2.4),
             &flat("wood", LEGS),
         );
         legs.push(upper);
@@ -100,23 +121,23 @@ pub(super) fn bear() -> Animal {
     .into_iter()
     .enumerate()
     {
-        let mut lower = part(LOWER[i], UPPER[i], name, [0, -4, 0]);
+        let mut lower = part(LOWER[i], UPPER[i], name, si([0, -4, 0]));
         limb(
             &mut lower,
-            [0.0, 0.0, 0.0],
-            [0.0, -3.5, 0.0],
-            2.2,
-            2.0,
+            sf([0.0, 0.0, 0.0]),
+            sf([0.0, -3.5, 0.0]),
+            sr(2.2),
+            sr(2.0),
             &flat("wood", LEGS),
         );
         ellipsoid(
             &mut lower,
-            [1.0, -4.5, 0.0],
-            [2.6, 1.2, 2.2],
+            sf([1.0, -4.5, 0.0]),
+            sf([2.6, 1.2, 2.2]),
             &flat("wood", LEGS),
         );
         for z in -1..=1 {
-            paint(&mut lower, [4, -5, z], ("stone", CLAW));
+            paint(&mut lower, si([4, -5, z]), ("stone", CLAW));
         }
         legs.push(lower);
     }
@@ -273,6 +294,15 @@ pub(super) fn bear() -> Animal {
         ],
     );
 
+    let mut clips = vec![idle, walk, run, swipe, eat, stand];
+    for key in clips
+        .iter_mut()
+        .flat_map(|clip| &mut clip.tracks)
+        .flat_map(|track| &mut track.keys)
+    {
+        key.translation = key.translation.map(si);
+    }
+
     let legs_all: Vec<u32> = UPPER.iter().chain(&LOWER).copied().collect();
     Animal {
         name: "Bear",
@@ -293,7 +323,7 @@ pub(super) fn bear() -> Animal {
             0x00, 0x04,
         ],
         parts: [vec![torso, neck, head, tail], legs].concat(),
-        clips: vec![idle, walk, run, swipe, eat, stand],
-        extent: [-14, 23, -11, 7, -6, 6],
+        clips,
+        extent: [-17, 26, -13, 8, -6, 6],
     }
 }
