@@ -549,6 +549,85 @@ impl Core {
                 }
             }
         }
+        // A wide column with any solid terrain cell at the water's height is
+        // dry, so the water would stop up to a column short of the shore. Draw
+        // it on to the true shore: from each wet neighbour, fill this column's
+        // terrain columns that are open at that surface, spreading only between
+        // open neighbours, so a wall one cell thick still keeps the far side dry.
+        let wet: std::collections::HashSet<u16> = self
+            .world
+            .region_wet_spans(key, DRY_VOLUME)
+            .into_iter()
+            .map(|(c, _, _)| c)
+            .collect();
+        for column in 0..(edge * edge) as u16 {
+            if wet.contains(&column) {
+                continue;
+            }
+            let (wx, wz) = (i64::from(column) % edge, i64::from(column) / edge);
+            let (gx, gz) = (i64::from(key.0) * edge + wx, i64::from(key.1) * edge + wz);
+            let sub = (wx / per + n * (wz / per)) as usize;
+            let Some(sub_runs) = runs[sub] else {
+                continue;
+            };
+            for (ox, oz) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                let surfaces: Vec<f64> = self
+                    .world
+                    .spans_in_column(gx + ox, gz + oz)
+                    .iter()
+                    .filter(|s| s.volume > DRY_VOLUME)
+                    .map(|s| s.floor_y as f64 + s.depth)
+                    .collect();
+                for top in surfaces {
+                    let run_at = |dx: i64, dz: i64| {
+                        let (fx, fz) = ((wx % per) * n + dx, (wz % per) * n + dz);
+                        let fcol = (fx + edge * fz) as usize;
+                        sub_runs[fcol]
+                            .iter()
+                            .copied()
+                            .find(|&(y0, y1)| f64::from(y0) < top && top <= f64::from(y1))
+                            .map(|run| (fcol, run))
+                    };
+                    // Seeds: the terrain columns on the side facing the neighbour.
+                    let mut open = vec![false; (n * n) as usize];
+                    let mut stack: Vec<(i64, i64)> = (0..n)
+                        .map(|t| match (ox, oz) {
+                            (-1, _) => (0, t),
+                            (1, _) => (n - 1, t),
+                            (_, -1) => (t, 0),
+                            _ => (t, n - 1),
+                        })
+                        .collect();
+                    while let Some((dx, dz)) = stack.pop() {
+                        let i = (dx + n * dz) as usize;
+                        if open[i] {
+                            continue;
+                        }
+                        let Some((fcol, (y0, y1))) = run_at(dx, dz) else {
+                            continue;
+                        };
+                        open[i] = true;
+                        let depth_q = ((top - f64::from(y0)) * FRAME_DEPTH_SCALE)
+                            .round()
+                            .min(f64::from(u16::MAX)) as u16;
+                        if depth_q > 0 {
+                            spans[sub].push(FrameSpan {
+                                column: fcol as u16,
+                                floor_y: y0,
+                                ceiling_y: y1,
+                                depth_q,
+                                flow: [0; 2],
+                            });
+                        }
+                        for (ex, ez) in [(dx - 1, dz), (dx + 1, dz), (dx, dz - 1), (dx, dz + 1)] {
+                            if (0..n).contains(&ex) && (0..n).contains(&ez) {
+                                stack.push((ex, ez));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         subs.into_iter()
             .zip(spans)
             .map(|(fkey, mut spans)| {

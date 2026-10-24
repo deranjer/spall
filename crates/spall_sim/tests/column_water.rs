@@ -502,6 +502,37 @@ mod wide_columns {
         );
     }
 
+    /// The wide column holding the dam (terrain x 60..64) is dry: a solid
+    /// cell at the water's height closes it. The water is still drawn up to the
+    /// wall in the terrain columns on the pool side, and not past it.
+    #[test]
+    fn frames_draw_the_water_on_to_the_true_shore_but_not_past_a_wall() {
+        let terrain = terrain(true);
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup()).unwrap();
+        tick(&mut water, &terrain, 5.0);
+        assert!(
+            water
+                .world()
+                .spans_in_column(15, 4)
+                .iter()
+                .all(|s| s.volume < 1e-6)
+        );
+        let frame = water.frame();
+        let region = frame
+            .regions
+            .get(&(1, 0))
+            .expect("the pool's region east of x = 32");
+        let wet = |x: i64, z: i64| {
+            region
+                .spans
+                .iter()
+                .any(|s| i64::from(s.column) == x % 32 + 32 * z && s.depth_q > 0)
+        };
+        assert!(wet(60, 16) && wet(61, 16), "drawn up to the dam");
+        assert!(!wet(62, 16), "the dam itself is dry");
+        assert!(!wet(63, 16), "and so is the far side");
+    }
+
     /// Flowing water slopes between wide columns: the frames blend each
     /// terrain column's surface between its wide column and the neighbours,
     /// so it does not step a metre at a time.
