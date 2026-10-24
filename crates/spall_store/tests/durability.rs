@@ -885,6 +885,10 @@ fn missing_or_corrupt_column_water_checkpoint_never_restores_a_silent_dry_world(
                 sinks: vec![],
                 gated_rate: 0,
                 discharges: vec![],
+                column_cells: 1,
+                sea_level_y: None,
+                evaporation_fixed: 0,
+                evaporation_above_y: 0,
             });
             writer.publish_checkpoint(&cp).unwrap();
         }

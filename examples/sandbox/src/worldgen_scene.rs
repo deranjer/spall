@@ -214,8 +214,7 @@ pub fn column_water_setup(
         // `SPALL_WATER_COARSE=1`: 1 m water columns, with the sea
         // held at its level and evaporation balancing the springs. A coarse
         // pipe is four terrain pipes wide, so the same speed carries four times
-        // the flow; distances are in coarse columns. Not saved (see
-        // `take_journal_delta`).
+        // the flow; distances are in coarse columns.
         let n = spall_fluid::columns::COARSE_CELLS as f32;
         setup.config.column_cells = n as u32;
         setup.config.sleep_flow *= n;

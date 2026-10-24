@@ -590,6 +590,56 @@ mod wide_columns {
         );
     }
 
+    /// A 1 m world saves at its width with its sea and evaporation, restores
+    /// from that alone, and journals what changes after.
+    #[test]
+    fn a_wide_world_saves_and_restores_at_its_width() {
+        let terrain = terrain(true);
+        let mut setup = setup();
+        setup.sea_level_y = Some(4.0);
+        setup.evaporation_cells_per_s = 1.0e-4;
+        setup.evaporation_above_y = 5.0;
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+        tick(&mut water, &terrain, 2.0);
+        let state = water.canonical_state();
+        assert_eq!(state.column_cells, 4);
+        state.validate().unwrap();
+        let mut restored = AuthoritativeColumnWater::restore(
+            &terrain,
+            &state,
+            spall_fluid::columns::ColumnConfig::default(),
+        )
+        .unwrap();
+        let (a, b) = (water.frame().volume_m3, restored.frame().volume_m3);
+        assert!((a - b).abs() < 1e-6, "{a} against {b}");
+        assert_eq!(restored.setup().config.column_cells, 4);
+        assert_eq!(restored.setup().sea_level_y, Some(4.0));
+        assert!((restored.setup().evaporation_cells_per_s - 1.0e-4).abs() < 1e-9);
+        let sample = restored
+            .water_sample_at_m(5.0, 1.0, 5.0)
+            .expect("the pool came back");
+        assert!((sample.surface_y - 3.0).abs() < 0.05);
+        // Water that moves after the restore is journalled.
+        let mut changed = false;
+        let mut terrain = terrain;
+        let mut plan = EditPlan::new(terrain.id());
+        for z in 60..68 {
+            for y in 2..24 {
+                plan.set(GlobalCell::new(62, y, z), MaterialId::AIR);
+            }
+        }
+        terrain.apply_edit(&plan).unwrap();
+        let edited = [BrickCoord::new(1, 0, 1), BrickCoord::new(1, 0, 2)];
+        restored.tick(&terrain, &edited, &[], 1.0 / 60.0).unwrap();
+        for _ in 0..120 {
+            restored.tick(&terrain, &[], &[], 1.0 / 60.0).unwrap();
+            changed |= restored
+                .take_journal_delta()
+                .is_some_and(|d| !d.regions.is_empty());
+        }
+        assert!(changed, "a 1 m world is journalled");
+    }
+
     #[test]
     fn a_spring_adds_its_rate_and_nothing_is_lost() {
         let terrain = terrain(true);

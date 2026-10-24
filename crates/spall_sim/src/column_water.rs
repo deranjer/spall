@@ -1333,11 +1333,6 @@ impl AuthoritativeColumnWater {
     /// water has moved. Resting water journals nothing. With a worker, a step
     /// in flight defers the delta to a later tick.
     pub fn take_journal_delta(&mut self) -> Option<ColumnWaterDelta> {
-        // Wide columns are not journalled yet (the save format is per
-        // terrain column); such a world is ephemeral.
-        if wide(&self.shared.setup) > 1 {
-            return None;
-        }
         self.journal_wait_ticks = self.journal_wait_ticks.saturating_add(1);
         let mut core = match self.shared.core.try_lock() {
             Ok(core) => core,
@@ -1417,6 +1412,10 @@ impl AuthoritativeColumnWater {
                     flow_fixed: spall_protocol::column_water::discharge_to_fixed(d.flow_cells3_s),
                 })
                 .collect(),
+            column_cells: setup.config.column_cells as u8,
+            sea_level_y: setup.sea_level_y.map(|y| y as i32),
+            evaporation_fixed: volume_to_fixed(setup.evaporation_cells_per_s),
+            evaporation_above_y: setup.evaporation_above_y as i32,
         }
     }
 
@@ -1438,7 +1437,13 @@ impl AuthoritativeColumnWater {
                 .collect()
         };
         let mut setup = ColumnWaterSetup::new(state.y_lo, state.y_hi, Vec::new());
+        // Keys, columns and volumes are in the saved world's cells.
+        let mut config = config;
+        config.column_cells = u32::from(state.column_cells);
         setup.config = config;
+        setup.sea_level_y = state.sea_level_y.map(f64::from);
+        setup.evaporation_cells_per_s = volume_from_fixed(state.evaporation_fixed);
+        setup.evaporation_above_y = f64::from(state.evaporation_above_y);
         setup.sources = cells(&state.sources);
         setup.gated_sources = state.gated_sources.each_ref().map(|v| cells(v));
         setup.sinks = cells(&state.sinks);

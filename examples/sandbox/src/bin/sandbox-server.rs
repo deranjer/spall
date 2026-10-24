@@ -549,12 +549,6 @@ fn run_serve(args: Args) -> ExitCode {
         }
     };
 
-    if args.save && sandbox::worldgen_scene::water_coarse() {
-        eprintln!(
-            "sandbox-server: SPALL_WATER_COARSE=1 water is not saved yet: run without --save"
-        );
-        return ExitCode::from(2);
-    }
     let save = args.save.then(|| args.world.join("world.db"));
     if let Some(db) = &save
         && let Some(parent) = db.parent()
