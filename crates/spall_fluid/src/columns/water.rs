@@ -1,6 +1,8 @@
 //! Adding, removing, seeding and reading water in a [`ColumnWorld`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+
+use rayon::prelude::*;
 
 use super::*;
 
@@ -32,7 +34,7 @@ impl ColumnWorld {
             && self.regions[slot as usize].steady
         {
             self.span_at(cell).ok_or(ColumnError::NotOpen(cell))?;
-            self.regions[slot as usize].steady_ledger += volume;
+            self.regions[slot as usize].steady_ledger += volume / self.column_area();
             return Ok(());
         }
         self.add_water(cell, volume)
@@ -45,7 +47,7 @@ impl ColumnWorld {
         }
         self.revive_at(cell.x, cell.z);
         let i = self.span_at(cell).ok_or(ColumnError::NotOpen(cell))?;
-        self.volume[i] += volume;
+        self.volume[i] += volume / self.column_area();
         self.wake_column(cell.x, cell.z);
         Ok(())
     }
@@ -60,13 +62,18 @@ impl ColumnWorld {
     /// plan): allocates their regions, adds one cell^3 each, and leaves every
     /// region asleep. Cells in solid or non-resident terrain are returned.
     pub fn seed_cells(&mut self, cells: &[GlobalCell]) -> Vec<GlobalCell> {
-        let keys: BTreeSet<RegionKey> = cells.iter().map(|c| region_of(c.x, c.z)).collect();
+        let n = i64::from(self.config.column_cells);
+        let keys: BTreeSet<RegionKey> = cells
+            .iter()
+            .map(|c| region_of(c.x.div_euclid(n), c.z.div_euclid(n)))
+            .collect();
         let keys: Vec<_> = keys.into_iter().collect();
         self.allocate(&keys, &BTreeSet::new());
         let mut rejected = Vec::new();
+        let per_cell = 1.0 / self.column_area();
         for &c in cells {
-            match self.span_at(c) {
-                Some(i) => self.volume[i] += 1.0,
+            match self.world_cell(c).and_then(|w| self.span_at(w)) {
+                Some(i) => self.volume[i] += per_cell,
                 None => rejected.push(c),
             }
         }
@@ -88,6 +95,9 @@ impl ColumnWorld {
     /// Allocates the regions and leaves every region asleep. Columns with no
     /// open span above their bed are returned, not dropped silently.
     pub fn seed_levels(&mut self, columns: &[(i64, i64, i64, i64)]) -> Vec<(i64, i64, i64, i64)> {
+        if self.config.column_cells > 1 {
+            return self.seed_levels_wide(columns);
+        }
         if self.config.lazy_ocean {
             for (k, d) in self.find_dormant(columns) {
                 self.dormant_volume += d.volume;
@@ -127,6 +137,50 @@ impl ColumnWorld {
         rejected
     }
 
+    /// [`Self::seed_levels`] with wider columns: each column takes the highest
+    /// planned surface among the terrain columns it covers, in the span holding
+    /// that cell. Terrain columns whose column has no open span there (a solid
+    /// cell closes it) are returned.
+    fn seed_levels_wide(&mut self, columns: &[(i64, i64, i64, i64)]) -> Vec<(i64, i64, i64, i64)> {
+        let n = i64::from(self.config.column_cells);
+        let mut tops: HashMap<(i64, i64), i64> = HashMap::new();
+        for &(x, z, _, top) in columns {
+            let e = tops
+                .entry((x.div_euclid(n), z.div_euclid(n)))
+                .or_insert(top);
+            *e = (*e).max(top);
+        }
+        let keys: BTreeSet<RegionKey> = tops.keys().map(|&(x, z)| region_of(x, z)).collect();
+        let keys: Vec<_> = keys.into_iter().collect();
+        self.allocate(&keys, &BTreeSet::new());
+        let mut closed = std::collections::HashSet::new();
+        for (&(x, z), &top) in &tops {
+            match self.span_at(GlobalCell::new(x, top, z)) {
+                Some(i) => {
+                    let s = self.spans[i];
+                    self.volume[i] = ((top + 1) as f64 - f64::from(s.y0)).clamp(0.0, s.capacity());
+                }
+                None => {
+                    closed.insert((x, z));
+                }
+            }
+        }
+        for r in &mut self.regions {
+            r.active = false;
+            r.quiet_steps = r.quiet_steps.max(self.config.sleep_steps);
+        }
+        self.ensure_rings();
+        for r in &mut self.regions {
+            r.active = false;
+        }
+        self.lists_dirty = true;
+        columns
+            .iter()
+            .copied()
+            .filter(|c| closed.contains(&(c.0.div_euclid(n), c.1.div_euclid(n))))
+            .collect()
+    }
+
     /// Allocates the neighbours of every region that holds water, so water can
     /// always flow into an allocated region.
     pub(super) fn ensure_rings(&mut self) {
@@ -160,9 +214,15 @@ impl ColumnWorld {
     }
 
     /// Total water including overfill and the unplaced ledger, cells^3.
+    /// Terrain cells^2 one column covers (see [`ColumnConfig::column_cells`]).
+    pub(super) fn column_area(&self) -> f64 {
+        f64::from(self.config.column_cells * self.config.column_cells)
+    }
+
     pub fn total_volume(&self) -> f64 {
         let ledgers: f64 = self.regions.iter().map(|r| r.steady_ledger).sum();
-        chunked_sum(&self.volume, |_, v| *v) + self.unplaced + ledgers + self.dormant_volume
+        (chunked_sum(&self.volume, |_, v| *v) + self.unplaced + ledgers + self.dormant_volume)
+            * self.column_area()
     }
 
     pub fn total_volume_m3(&self) -> f64 {
@@ -177,7 +237,7 @@ impl ColumnWorld {
             return d.column_volume(local);
         }
         self.column_range(x, z)
-            .map(|r| r.map(|i| self.volume[i]).sum())
+            .map(|r| r.map(|i| self.volume[i]).sum::<f64>() * self.column_area())
             .unwrap_or(0.0)
     }
 
@@ -232,7 +292,23 @@ impl ColumnWorld {
                 peak = peak.max(q.abs() / a);
             }
         }
-        peak * CELL_SIZE_M as f32
+        peak * CELL_SIZE_M as f32 / self.config.column_cells as f32
+    }
+
+    /// The cell of this world that terrain cell `c` falls in: itself at terrain
+    /// resolution; with wider columns, the column holding it at the same height,
+    /// or the floor of the first open span above if a solid cell closes it.
+    pub fn world_cell(&self, c: GlobalCell) -> Option<GlobalCell> {
+        let n = i64::from(self.config.column_cells);
+        if n == 1 {
+            return Some(c);
+        }
+        let (x, z) = (c.x.div_euclid(n), c.z.div_euclid(n));
+        let range = self.column_range(x, z)?;
+        let span = range
+            .map(|i| self.spans[i])
+            .find(|s| c.y < i64::from(s.y1))?;
+        Some(GlobalCell::new(x, c.y.max(i64::from(span.y0)), z))
     }
 
     pub(super) fn release_unplaced(&mut self) {
@@ -268,7 +344,7 @@ impl ColumnWorld {
             self.dirty.insert(region_of(cell.x, cell.z));
             self.wake_column(cell.x, cell.z);
         }
-        Some(added)
+        Some(added * self.column_area())
     }
 
     /// Removes the water that stands in `cell` (up to one cell^3) from its span
@@ -283,7 +359,7 @@ impl ColumnWorld {
             self.dirty.insert(region_of(cell.x, cell.z));
             self.wake_column(cell.x, cell.z);
         }
-        Some(in_cell)
+        Some(in_cell * self.column_area())
     }
 
     /// Regions whose water changed since the last call, in key order.
@@ -434,5 +510,76 @@ impl ColumnWorld {
     /// Adds volume to the unplaced ledger (restore).
     pub fn add_unplaced(&mut self, volume: f64) {
         self.unplaced += volume;
+    }
+
+    /// The sea as an infinite body at a fixed level: every span the last step
+    /// touched whose floor is below `top - 4` and whose surface stands within
+    /// half a cell above `top` is cut back to `top`, so a river reaching the sea
+    /// ends there instead of raising it and waking it far out. Returns the
+    /// volume removed.
+    pub fn hold_sea_level(&mut self, top: f64) -> f64 {
+        let mut removed = 0.0;
+        for &i in &self.act_spans {
+            let i = i as usize;
+            let span = self.spans[i];
+            let floor = f64::from(span.y0);
+            if !span.sky || floor >= top - 4.0 {
+                continue;
+            }
+            let surface = floor + self.volume[i];
+            if surface > top && surface <= top + 0.5 {
+                removed += surface - top;
+                self.volume[i] = top - floor;
+            }
+        }
+        removed * self.column_area()
+    }
+
+    /// Evaporation: removes `depth` cells from every wet span open to the sky
+    /// whose surface stands above `above_y`, in every allocated region, asleep
+    /// or not (the sea below `above_y` and dormant sea records are left). Every
+    /// column of a body loses the same depth, so water at rest stays level and
+    /// nothing has to wake. Regions where a span dried out are marked changed.
+    /// Returns the volume removed and the wet columns it was taken from.
+    pub fn evaporate(&mut self, depth: f64, above_y: f64) -> (f64, usize) {
+        let spans = &self.spans;
+        let (removed, wet, dried): (f64, usize, Vec<u32>) = self
+            .volume
+            .par_chunks_mut(1 << 16)
+            .enumerate()
+            .map(|(chunk, vols)| {
+                let base = chunk << 16;
+                let (mut removed, mut wet, mut dried) = (0.0, 0usize, Vec::new());
+                for (k, v) in vols.iter_mut().enumerate() {
+                    let span = spans[base + k];
+                    if *v <= 0.0 || !span.sky || f64::from(span.y0) + *v <= above_y {
+                        continue;
+                    }
+                    wet += 1;
+                    let take = depth.min(*v);
+                    *v -= take;
+                    removed += take;
+                    if *v <= 0.0 {
+                        dried.push((base + k) as u32);
+                    }
+                }
+                (removed, wet, dried)
+            })
+            .reduce(
+                || (0.0, 0, Vec::new()),
+                |mut a, b| {
+                    a.0 += b.0;
+                    a.1 += b.1;
+                    a.2.extend(b.2);
+                    a
+                },
+            );
+        for i in dried {
+            let slot = self.regions.partition_point(|r| r.span_end <= i);
+            if let Some(r) = self.regions.get(slot) {
+                self.dirty.insert(r.key);
+            }
+        }
+        (removed * self.column_area(), wet)
     }
 }

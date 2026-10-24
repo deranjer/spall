@@ -27,6 +27,8 @@ use spall_voxel::Volume;
 use crate::{DomainSpec, SolidBoundary};
 
 mod allocation;
+mod coarse;
+pub use coarse::{COARSE_CELLS, CoarseVolumeTerrain};
 mod water;
 
 /// Edge length of one column cell in metres.
@@ -106,6 +108,13 @@ pub struct ColumnConfig {
     /// region costs; it becomes a real region the moment anything touches it
     /// (an edit, a spring or drain, a neighbour that starts moving, a restore).
     pub lazy_ocean: bool,
+    /// Terrain cells per column edge (1: a column per terrain cell). With 4,
+    /// a column covers 4 x 4 terrain cells (1 m) and its spans keep the
+    /// terrain's vertical resolution; heads stay in vertical cells, so a span's
+    /// stored `volume` is its depth and a volume moved is divided by the column
+    /// area. Callers give wide column x/z (see `CoarseVolumeTerrain` and
+    /// `ColumnWorld::world_cell`).
+    pub column_cells: u32,
 }
 
 impl Default for ColumnConfig {
@@ -135,6 +144,7 @@ impl Default for ColumnConfig {
             steady_wake_rel: 0.1,
             steady_wake_sigmas: 6.0,
             lazy_ocean: false,
+            column_cells: 1,
         }
     }
 }
@@ -501,6 +511,23 @@ fn column_xz(key: RegionKey, local: usize) -> (i64, i64) {
     )
 }
 
+/// The open vertical runs `(floor y, one past the top)` of each of a region's
+/// columns (`lx + 32 * lz`), bottom to top.
+pub fn open_runs(terrain: &RegionTerrain, y_lo: i32, y_hi: i32) -> Vec<Vec<(i32, i32)>> {
+    let (mut spans, mut col_start) = (Vec::new(), Vec::new());
+    extract_columns(terrain, y_lo, y_hi, &mut spans, &mut col_start);
+    col_start.push(spans.len() as u32);
+    col_start
+        .windows(2)
+        .map(|w| {
+            spans[w[0] as usize..w[1] as usize]
+                .iter()
+                .map(|s| (s.y0, s.y1))
+                .collect()
+        })
+        .collect()
+}
+
 fn extract_columns(
     terrain: &RegionTerrain,
     y_lo: i32,
@@ -651,8 +678,14 @@ impl ColumnWorld {
     pub fn set_focus(&mut self, points_m: &[[f64; 2]]) {
         self.focus = points_m
             .iter()
-            .map(|p| [p[0] / CELL_SIZE_M, p[1] / CELL_SIZE_M])
+            .map(|p| [p[0] / self.column_m(), p[1] / self.column_m()])
             .collect();
+    }
+
+    /// Width of one column in metres: a terrain cell, or more with
+    /// [`ColumnConfig::column_cells`]. Heights stay in terrain cells.
+    pub fn column_m(&self) -> f64 {
+        CELL_SIZE_M * f64::from(self.config.column_cells)
     }
 
     /// Seconds a region's water is behind real time because it rested.
@@ -835,8 +868,8 @@ impl ColumnWorld {
     /// film).
     fn wet_span_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<usize> {
         let (cx, cz) = (
-            (x_m / CELL_SIZE_M).floor() as i64,
-            (z_m / CELL_SIZE_M).floor() as i64,
+            (x_m / self.column_m()).floor() as i64,
+            (z_m / self.column_m()).floor() as i64,
         );
         let y_cell = y_m / CELL_SIZE_M;
         for i in self.column_range(cx, cz)? {
@@ -890,7 +923,9 @@ impl ColumnWorld {
         }
         let speed = |axis: usize| {
             let through = |(q, area): (f32, f32)| if area > 0.0 { q / area } else { 0.0 };
+            // A pipe is a column wide: its face is that width times the area.
             0.5 * (through(faces[axis][0]) + through(faces[axis][1])) * CELL_SIZE_M as f32
+                / self.config.column_cells as f32
         };
         [speed(0), speed(1)]
     }
@@ -1343,7 +1378,7 @@ impl ColumnWorld {
         let max_q = acc.max_q;
         let wake: Vec<usize> = acc.wake.into_iter().map(|r| r as usize).collect();
         metrics.max_abs_flow = max_q.iter().fold(0.0, |m, q| m.max(*q));
-        metrics.peak_speed_m_s = acc.peak * CELL_SIZE_M as f32;
+        metrics.peak_speed_m_s = acc.peak * CELL_SIZE_M as f32 / cfg.column_cells as f32;
         // Steady flow: a region that keeps carrying water but whose span volumes
         // have not moved over a window stops being stepped, holding its mean flows.
         if cfg.steady_steps > 0 {
@@ -1596,7 +1631,12 @@ impl ColumnWorld {
         let (pipes, eff) = (&self.pipes, &self.eff);
 
         // Areas move slowly between substeps, so the hint carries a 25% margin.
-        let dt = max_dt.min(cfg.cfl / (cfg.gravity * self.a_hint * 1.25).sqrt());
+        // A wave crosses a wider column in proportionally more time.
+        let width = cfg.column_cells as f32;
+        let dt = max_dt.min(width * cfg.cfl / (cfg.gravity * self.a_hint * 1.25).sqrt());
+        // Flows are volumes per second; a span's volume is its depth over the
+        // column's area (1 at terrain resolution).
+        let per_area = 1.0 / f64::from(cfg.column_cells * cfg.column_cells);
 
         // Flow update with damping; thin films carry nothing. Each pipe appears
         // once in `act_pipes`, so the writes are disjoint.
@@ -1645,7 +1685,8 @@ impl ColumnWorld {
                     (if entry & 1 == 1 { flow } else { -flow }).max(0.0)
                 })
                 .sum::<f64>()
-                * f64::from(dt);
+                * f64::from(dt)
+                * per_area;
             let scale = if out > volume[i] {
                 volume[i].max(0.0) / out
             } else {
@@ -1690,7 +1731,8 @@ impl ColumnWorld {
                     if entry & 1 == 1 { -flow } else { flow }
                 })
                 .sum::<f64>()
-                * f64::from(dt);
+                * f64::from(dt)
+                * per_area;
             // SAFETY: one read-modify-write per distinct span index; `volume` is
             // not read through any other path in this pass.
             unsafe { vol_ptr.write(i, (vol_ptr.read(i) + delta).max(0.0)) }
@@ -1715,7 +1757,8 @@ impl ColumnWorld {
                             if entry & 1 == 1 { -flow } else { flow }
                         })
                         .sum::<f64>()
-                        * f64::from(dt);
+                        * f64::from(dt)
+                        * per_area;
                     (region, delta)
                 })
                 .collect();
