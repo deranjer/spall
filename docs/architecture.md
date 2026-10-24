@@ -574,3 +574,18 @@ are replicated records, and positions travel in `CreatureMotionFrame`s; see
 [protocol](protocol.md#creatures). Players and bodies do not collide with
 animals. Worlds with animals cannot be saved. The design and the planned hunting
 path are in [animal lifecycle](animal-lifecycle.md).
+
+## Cabin interactions
+
+The sandbox ships `fixtures/cabin`, an editor project with a fixed SPVOX shell,
+four player starts, and separate bed, table, bench, lamp and door assets. The
+scene importer places these into normal destructible terrain. Furniture is
+modular for authoring; it has no runtime pickup behavior.
+
+Quarter-metre doors use `spall_voxel::doors` to find a visible nearby hinge and
+plan a +X-to-+Z panel turn. The hinge material records open/closed state. E sends
+an interaction request; the server selects the door from its authoritative
+player position. Ordinary staged geometry commits preserve damage, reject
+obstructed turns, update collision, and replicate/journal the resulting cells.
+The conservative swing box is checked for players and debris both when preparing
+and validating a commit. Breaking the hinge disables the interaction.

@@ -3,6 +3,8 @@ use super::*;
 /// Interactive window options beyond the network and content configuration.
 #[derive(Debug, Clone, Default)]
 pub struct InteractiveOptions {
+    /// Game door palette and dimensions for proximity prompts.
+    pub door: Option<spall_voxel::doors::DoorSpec>,
     /// Present without vsync (rendering-throughput measurement only).
     pub uncapped: bool,
     /// A scripted tour: each step runs, then the frame is saved to

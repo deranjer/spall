@@ -18,6 +18,10 @@ See [water handoff](docs/water-agent-handoff.md) for the design.
 
 The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It creates versioned RON project/scene documents and canonical `.spvox` voxel assets, and never adds egui to the game runtime dependency graph. On Windows, `tools/package-portable.ps1` builds a portable editor + sandbox folder; use File > Generate World to choose a seed, world size, and starting season, preview the map, then launch it in the FPS-HUD-enabled sandbox.
 
+A furnished, destructible timber cabin with four interior player starts is playable with
+`cargo xtask play --editor-scene fixtures/cabin`. The reusable SPVOX building and
+regeneration instructions are in [fixtures/cabin](fixtures/cabin/README.md).
+
 Animated animal source fixtures (trout, crow and deer) have a bounded renderer
 preview: `cargo run -p sandbox --features client --example animal-preview -- --bounded`.
 It writes pose captures under `.local/animal-preview`. Live deer and crows can be

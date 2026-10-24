@@ -355,6 +355,8 @@ pub enum ActionKind {
     Cut = 0,
     /// Add material with a sphere brush.
     Place = 1,
+    /// Use a nearby world object; validated against the authoritative player.
+    Interact = 2,
 }
 
 /// What the client claims it is aiming at.

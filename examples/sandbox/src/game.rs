@@ -844,13 +844,33 @@ pub fn terrain_palette() -> spall_worldgen::WorldgenPalette {
 /// restore with unchanged meaning. Clients and servers built with a different
 /// palette do not match the handshake hash.
 pub fn manifest() -> MaterialManifest {
-    extend_with_variants(
+    let previous = extend_with_variants(
         &manifest_v5_terrain(),
         crate::appearance::extension_variants(),
     )
-    .expect("sandbox palette extensions extend the terrain manifest")
+    .expect("sandbox palette");
+    let mut entries = previous.entries().to_vec();
+    for (id, name) in [
+        (CABIN_DOOR.closed_hinge, "door.hinge.closed"),
+        (CABIN_DOOR.open_hinge, "door.hinge.open"),
+        (CABIN_DOOR.panel, "door.panel"),
+    ] {
+        entries.push(def(id, name, 650.0, [0.42, 0.24, 0.10].map(srgb_to_linear)));
+    }
+    entries.sort_by_key(|entry| entry.id);
+    MaterialManifest::validated(entries)
+        .and_then(|m| m.superseding_extension(&previous))
+        .expect("sandbox door materials")
 }
 
+/// The first modular door: 1.5 x 2.5 m, hinged at its local lower-left cell.
+pub const CABIN_DOOR: spall_voxel::doors::DoorSpec = spall_voxel::doors::DoorSpec {
+    closed_hinge: MaterialId(218),
+    open_hinge: MaterialId(219),
+    panel: MaterialId(220),
+    width: 6,
+    height: 10,
+};
 /// Server policy for the example's network-visible tools. The server owns the
 /// hit test and applies these rules; a client-selected material is never trusted.
 pub fn tool_catalog() -> spall_server::ToolCatalog {
@@ -858,6 +878,12 @@ pub fn tool_catalog() -> spall_server::ToolCatalog {
     ToolCatalog::new(
         GAME_RULES_VERSION,
         [
+            ToolRule {
+                id: 5,
+                kind: spall_sim::EditKind::Door(CABIN_DOOR),
+                max_radius_cells: 0,
+                reach_m: 3.0,
+            },
             ToolRule {
                 id: tool_ids::DIG,
                 kind: EditKind::Cut,

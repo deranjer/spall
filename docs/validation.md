@@ -1,5 +1,20 @@
 # Validation and operating contract
 
+Cabin content and interaction checks:
+
+- `cargo run -p spall_editor --example cabin` regenerates and reopens the project.
+- `cargo test -p sandbox --test cabin` checks player traversal, support,
+  proximity/occlusion, occupied swings, damage preservation and journal replay.
+- `cargo test -p spall_server --lib door_tests` checks authoritative proximity
+  and rejects spoofed remote claims and the wrong action kind.
+- `cargo test -p sandbox --features client --test cabin_doors_network` exercises
+  two real QUIC clients, late joining, duplicate requests and exact convergence.
+- `cargo xtask play --editor-scene fixtures/cabin` opens the playable cabin.
+  Capture the mouse, approach the door and press E to open/close it. The E label
+  follows the door in the view; it disappears beyond reach or behind walls.
+  Furniture placements can be edited independently in Spall Editor.
+
+
 Historical grid-water validation (ENG-122 closeout, water default, canal viewer, windowed comparison; removed in ENG-169): see [reports/history-validation.md](reports/history-validation.md).
 
 These commands and fixtures are **planned interfaces**. T00 implements

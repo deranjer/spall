@@ -1,5 +1,12 @@
 # Multiplayer, persistence, and recovery contract
 
+Cabin doors use `ActionKind::Interact` in the existing `ActionRequest` (wire
+version 19). The sandbox door tool is 5. The server ignores claimed aim for this
+tool and requires a visible door within 3 m of the authoritative player's eye.
+Request deduplication and ordinary topology transactions carry the turn; no
+separate door-state record exists. Hinge materials and panel cell runs also
+replay through the existing journal. The save version is unchanged.
+
 This is a proposed version-1 contract. T01 turns these records into tested DTOs before dependent tasks use them. User requirements: multiplayer and full-world destruction are essential.
 
 ## Authority and transport
@@ -308,7 +315,7 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 17): one wire version for the handshake and every record, bumped on
+`PROTOCOL_VERSION` (currently 19): one wire version for the handshake and every record, bumped on
 any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 7, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
