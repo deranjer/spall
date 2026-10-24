@@ -113,6 +113,7 @@ fn run_session(
             residency: None,
             residency_disk_path: None,
             creatures: None,
+            creature_shape: None,
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,

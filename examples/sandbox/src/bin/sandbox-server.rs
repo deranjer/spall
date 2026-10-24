@@ -473,6 +473,18 @@ fn run_serve(args: Args) -> ExitCode {
                 } else {
                     generated
                 };
+                // 1 m water starts settled: settle once per world, then load it.
+                let generated = if sandbox::worldgen_scene::water_coarse() {
+                    generated.settle_water(
+                        &args.world.join("water-cache"),
+                        &format!(
+                            "{preset}-{}-{}-{}",
+                            args.seed, args.worldgen_size, args.season
+                        ),
+                    )
+                } else {
+                    generated
+                };
                 let world = generated.world();
                 tracing::info!(
                     preset = %preset,
@@ -566,19 +578,33 @@ fn run_serve(args: Args) -> ExitCode {
         let anchors: Vec<[f64; 3]> = anchors.into_iter().take(1).collect();
         match sandbox::animals::AnimalDirector::new(
             anchors,
-            // Deer, crows, trout (none until live water placement), bears, snow leopards.
+            // Deer, crows, trout (only in deep enough live water), bears, snow
+            // leopards, and a pack of four wolves per 16.
             &[
                 args.animals,
                 args.animals / 2,
-                0,
+                args.animals.div_ceil(4),
                 args.animals.div_ceil(8),
                 args.animals.div_ceil(8),
+                args.animals.div_ceil(16) * 4,
             ],
             args.seed,
         ) {
             Ok(director) => Some(spall_server::creature_service::CreatureService::new(
                 Box::new(director),
             )),
+            Err(error) => {
+                eprintln!("sandbox-server: --animals: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    // A hammer strike kills an animal and leaves its voxels as a carcass.
+    let creature_shape = if creatures.is_some() {
+        match sandbox::animal_visual::creature_shape() {
+            Ok(shape) => Some(shape),
             Err(error) => {
                 eprintln!("sandbox-server: --animals: {error}");
                 return ExitCode::from(2);
@@ -699,6 +725,7 @@ fn run_serve(args: Args) -> ExitCode {
             ),
             residency_disk_path,
             creatures,
+            creature_shape,
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),

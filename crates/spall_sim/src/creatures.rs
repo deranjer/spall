@@ -6,10 +6,16 @@
 //! against terrain when the game asks it to move. Spawning and despawning are
 //! explicit, and ids are never reused, so a replica can ignore motion for an id
 //! it does not hold.
+//!
+//! The game may install a [`CreatureShape`]: the posed voxels of a creature.
+//! The server uses it to tell what a tool strike hits and, when a creature
+//! dies, to leave a carcass of those voxels in the terrain
+//! (`creature_death.rs`).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use spall_core::{CreatureAllocator, CreatureId};
+use spall_core::{CreatureAllocator, CreatureId, MaterialId};
 use spall_protocol::CreatureRecord;
 
 const MAX_CREATURE_HOST_RECORDS: usize = 1_024;
@@ -32,6 +38,42 @@ pub enum CreatureSpawnError {
     Capacity,
 }
 
+/// One posed source voxel of a creature, in world space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreatureVoxel {
+    /// Cell centre, world metres.
+    pub centre_m: [f64; 3],
+    /// Source cell edge length, metres.
+    pub edge_m: f32,
+    /// A material of the world's manifest.
+    pub material: MaterialId,
+}
+
+type ShapeFn = dyn Fn(&CreatureRecord) -> Vec<CreatureVoxel> + Send + Sync;
+
+/// Game-owned function returning a creature's voxels at its record's pose
+/// (root pose, clip and clip phase). An unknown species returns no voxels.
+#[derive(Clone)]
+pub struct CreatureShape(Arc<ShapeFn>);
+
+impl CreatureShape {
+    pub fn new(
+        shape: impl Fn(&CreatureRecord) -> Vec<CreatureVoxel> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(shape))
+    }
+
+    pub(crate) fn voxels(&self, record: &CreatureRecord) -> Vec<CreatureVoxel> {
+        (self.0)(record)
+    }
+}
+
+impl std::fmt::Debug for CreatureShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatureShape").finish_non_exhaustive()
+    }
+}
+
 /// A creature's authoritative state.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Creature {
@@ -45,6 +87,7 @@ pub(crate) struct Creature {
 pub(crate) struct CreatureHost {
     allocator: CreatureAllocator,
     creatures: BTreeMap<u64, Creature>,
+    shape: Option<CreatureShape>,
 }
 
 impl CreatureHost {
@@ -96,6 +139,14 @@ impl CreatureHost {
 
     pub(crate) fn get_mut(&mut self, creature_id: u64) -> Option<&mut Creature> {
         self.creatures.get_mut(&creature_id)
+    }
+
+    pub(crate) fn set_shape(&mut self, shape: CreatureShape) {
+        self.shape = Some(shape);
+    }
+
+    pub(crate) fn shape(&self) -> Option<&CreatureShape> {
+        self.shape.as_ref()
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Creature> {

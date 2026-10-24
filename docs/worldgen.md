@@ -145,8 +145,10 @@ Playing the first showcase exposed three problems, fixed in `spall_client`:
 Measured in a real `cargo xtask play --worldgen showcase --uncapped --release`
 session (frame time, not vsync-limited): 6-7 ms at the heaviest view (221k
 instances, ~140 fps), 1.5-4 ms elsewhere. **Note:** with vsync on, a window that
-is occluded or in the background is throttled by Windows to about 4 fps; use
-`--uncapped` to measure.
+is occluded or in the background is throttled by Windows to about 4 fps. To
+measure, keep vsync on and read the window title's "headroom" figure (CPU work
+without the vsync wait against scene GPU time): `--uncapped`/`--fps-cap` froze
+the development PC on the 1 km world, once needing a hard reboot (2026-10-22).
 
 **Hammer.** A crosshair marks the screen centre (white with a target in
 reach, red without), a cyan wireframe shows the cells a swing would break, and

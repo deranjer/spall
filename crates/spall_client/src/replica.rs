@@ -215,6 +215,8 @@ pub struct ReplicaWorld {
     catalogue_deferred: Vec<TopologyTransaction>,
     weather: Option<spall_protocol::WeatherState>,
     weather_epoch_floor: u64,
+    /// ENG-223: this client's own authoritative health, for a later HUD.
+    player_health: Option<spall_protocol::PlayerHealth>,
     /// Shared so the renderer can take a snapshot without copying every frame
     /// while holding the replica lock the network and prediction threads need.
     snow: BTreeMap<(i32, i32, i32), std::sync::Arc<spall_protocol::SnowSurfaceFrame>>,
@@ -224,6 +226,14 @@ pub struct ReplicaWorld {
     snow_epoch_floor: u64,
     snow_sequence_floor: u64,
     snow_generation: u64,
+}
+
+/// Locks a shared replica, recovering it from a panicked holder (the network
+/// thread keeps applying records rather than dying with it).
+pub(crate) fn lock(
+    replica: &std::sync::Mutex<ReplicaWorld>,
+) -> std::sync::MutexGuard<'_, ReplicaWorld> {
+    replica.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl ReplicaWorld {
@@ -268,6 +278,7 @@ impl ReplicaWorld {
             catalogue_pending: None,
             catalogue_deferred: Vec::new(),
             weather: None,
+            player_health: None,
             weather_epoch_floor: 0,
             snow: BTreeMap::new(),
             snow_focus: (0, 0),
@@ -309,6 +320,7 @@ impl ReplicaWorld {
             catalogue_pending: None,
             catalogue_deferred: Vec::new(),
             weather: None,
+            player_health: None,
             weather_epoch_floor: 0,
             snow: BTreeMap::new(),
             snow_focus: (0, 0),
@@ -474,6 +486,21 @@ impl ReplicaWorld {
     /// `apply_snow_frame`'s eviction.
     pub fn set_snow_focus(&mut self, tile_x: i32, tile_z: i32) {
         self.snow_focus = (tile_x, tile_z);
+    }
+
+    /// Records the server's latest health for this client's own player.
+    pub fn apply_player_health(&mut self, health: spall_protocol::PlayerHealth) {
+        tracing::info!(
+            health = health.health,
+            max_health = health.max_health,
+            "player health"
+        );
+        self.player_health = Some(health);
+    }
+
+    /// This client's own health as last sent by the server, if any yet.
+    pub fn player_health(&self) -> Option<spall_protocol::PlayerHealth> {
+        self.player_health
     }
 
     /// Installs one atomic terrain snow tile/Y replacement. This stream has

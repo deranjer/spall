@@ -627,6 +627,7 @@ mod tests {
             bodies: vec![],
             column_water: None,
             weather: None,
+            players: Vec::new(),
             bricks: vec![],
         }
     }

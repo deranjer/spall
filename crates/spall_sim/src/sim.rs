@@ -35,6 +35,9 @@ pub use creature_motion::{
     CreatureMoveOutcome, CreatureMoveRequest, CreaturePose, CreatureWalkOutcome,
     CreatureWalkRequest,
 };
+#[path = "creature_death.rs"]
+mod creature_death;
+pub use creature_death::{CreatureKill, CreatureKillError};
 
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a
@@ -159,6 +162,12 @@ pub struct Simulation {
     retiring: Retiring,
     /// Empty unless the owning application explicitly installs a creature host.
     creatures: Option<crate::creatures::CreatureHost>,
+    /// Carcasses still being placed, one supported layer at a time.
+    carcasses: Vec<creature_death::PendingCarcass>,
+    /// Last known health of every authenticated account whose capsule is not
+    /// currently bound (ENG-223). Live bound capsules hold their own health;
+    /// checkpoints carry both.
+    player_health: std::collections::HashMap<spall_protocol::PlayerId, u16>,
 }
 
 /// Frees a large value on a background thread. Dropping a full-size world (hundreds of thousands

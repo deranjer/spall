@@ -72,10 +72,11 @@ pub use records::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, BaselineAck, BaselineBegin,
     BaselineEnd, BaselinePart, BaselineRegion, BrickRevision, ClaimedTarget, ControlSeq,
     DurableThrough, InputFrame, InputSeq, InterestEpoch, InventoryEntry, MotionSnapshot,
-    ProgressionOperation, ProgressionOutcome, ProgressionRejectCode, ProgressionRequest,
-    ProgressionResponse, RecentInput, Record, RecordError, RepairKey, RepairRequest, RequestId,
-    SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq, TopologyOp, TopologyTransaction, TransferId,
-    VolumeHash, WIRE_SCHEMA_VERSION, WORLD_RESET_TRANSFER_ID_BIT, WireTag,
+    PlayerHealth, ProgressionOperation, ProgressionOutcome, ProgressionRejectCode,
+    ProgressionRequest, ProgressionResponse, RecentInput, Record, RecordError, RepairKey,
+    RepairRequest, RequestId, SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq, TopologyOp,
+    TopologyTransaction, TransferId, VolumeHash, WIRE_SCHEMA_VERSION, WORLD_RESET_TRANSFER_ID_BIT,
+    WireTag,
 };
 pub use session::{
     GenerationExhausted, PlayerId, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,

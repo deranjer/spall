@@ -279,6 +279,14 @@ fn capture_checkpoint_internal(
             .unwrap_or_default(),
         column_water: sim.column_water().map(|w| w.canonical_state()),
         weather: Some(sim.weather_state().clone()),
+        players: sim
+            .player_health_records()
+            .into_iter()
+            .map(|(id, health)| spall_store::StoredPlayerHealth {
+                player_id: id.0,
+                health,
+            })
+            .collect(),
         snow: Some(
             sim.snow_state_bytes()
                 .map_err(|_| PersistError::BadField("snow capture"))?,
@@ -817,6 +825,13 @@ pub fn restore_with_terrain_collider_mode(
         .map_err(|_| PersistError::BadField("vegetation recovery"))?;
     sim.validate_weather_clock_source()
         .map_err(|_| PersistError::BadField("weather clock source"))?;
+    sim.restore_player_health(
+        cp.players
+            .iter()
+            .map(|p| (spall_protocol::PlayerId(p.player_id), p.health))
+            .collect(),
+    )
+    .map_err(|_| PersistError::BadField("player health"))?;
     if let Some(state) = &column_water_state {
         sim.restore_column_water(
             state,

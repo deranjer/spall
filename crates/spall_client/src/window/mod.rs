@@ -57,6 +57,7 @@ mod app;
 mod bodies;
 mod book;
 mod camera;
+mod creature_sound_update;
 mod endurance;
 mod footstep_update;
 mod gpu_timer;
@@ -241,6 +242,15 @@ pub fn run_interactive_window_with_options(
             render_materials.push(tinted);
         }
     }
+    // And for the game's creatures.
+    let creature_tint_base = render_materials.len() as u32;
+    if let Some(view) = &options.creature_view {
+        for (material, tint) in view.tints() {
+            let mut tinted = render_materials[usize::from(material.0)].jitter(0.0);
+            tinted.base_color = tint.map(srgb_to_linear);
+            render_materials.push(tinted);
+        }
+    }
 
     // A user event (rather than a plain `()` event loop) so the network
     // thread ending — a failed connect, or the server closing the session —
@@ -271,6 +281,7 @@ pub fn run_interactive_window_with_options(
         .collect();
     app.material_names = material_names;
     app.player_tint_base = player_tint_base;
+    app.creature_tint_base = creature_tint_base;
 
     let net_thread = std::thread::Builder::new()
         .name("spall-client-net".into())

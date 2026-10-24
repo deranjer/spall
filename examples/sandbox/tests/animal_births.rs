@@ -197,36 +197,64 @@ fn deer_wander_and_crows_circle_under_the_swept_motion_path() {
 }
 
 #[test]
-fn bears_and_snow_leopards_spawn_and_walk_on_their_own_capsules() {
-    let mut sim = simulation();
-    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[0, 0, 0, 2, 2], 13)
+/// Bears walk the meadow around their anchor; snow leopards are born on the
+/// mountain beside it (a 10 m plateau with a cliff) and their wandering keeps
+/// them on it, both on their own capsules.
+fn bears_walk_the_lowland_and_snow_leopards_stay_on_the_mountain() {
+    // 32 m x 12 m: lowland (top face 0.5 m) for x < 16 m, plateau (10.25 m) beyond.
+    let mut sim = terrain_simulation(128, 48, 72, 64, 40);
+    let director = AnimalDirector::new(vec![[6.0, 0.5, 6.0]], &[0, 0, 0, 2, 2], 13)
         .unwrap()
-        .with_radius_m(0.0, 3.0);
+        .with_radius_m(0.0, 5.0);
     let service = CreatureService::new(Box::new(director));
     let mut start = std::collections::BTreeMap::new();
-    for tick in 0..1500 {
-        sim.tick().unwrap();
-        service.run_tick(&mut sim).unwrap();
-        service.run_motion(&mut sim).unwrap();
+    let mut leopard_low = Vec::new();
+    for tick in 0..3000 {
+        step(&mut sim, &service);
         if tick == 60 {
-            for alive in sim.creature_poses() {
+            for alive in sim.creature_records() {
                 start.insert(alive.creature_id, alive.translation_m);
             }
         }
+        for leopard in sim.creature_records() {
+            let at = leopard.translation_m;
+            // Within a body length of the cliff counts as on the mountain.
+            if leopard.species == "snow_leopard" && at[0] < 16.0 - 1.5 {
+                leopard_low.push((tick, at));
+            }
+        }
     }
+    let records = sim.creature_records();
     assert_eq!(start.len(), 4, "2 bears and 2 snow leopards alive");
-    let moved: Vec<f64> = sim
-        .creature_poses()
+    for creature in &records {
+        let born = start[&creature.creature_id];
+        if creature.species == "snow_leopard" {
+            assert!(born[1] > 10.0, "a snow leopard was born low: {born:?}");
+        } else {
+            assert!(born[1] < 2.0, "a bear was born on the mountain: {born:?}");
+        }
+    }
+    assert!(
+        leopard_low.is_empty(),
+        "snow leopards left the mountain: {:?}",
+        &leopard_low[..leopard_low.len().min(4)]
+    );
+    let moved: Vec<(String, f64)> = records
         .iter()
         .map(|alive| {
             let from = start[&alive.creature_id];
-            (alive.translation_m[0] - from[0]).hypot(alive.translation_m[2] - from[2])
+            (
+                alive.species.clone(),
+                (alive.translation_m[0] - from[0]).hypot(alive.translation_m[2] - from[2]),
+            )
         })
         .collect();
-    assert!(
-        moved.iter().filter(|d| **d > 0.5).count() >= 2,
-        "bears and leopards barely moved: {moved:?}"
-    );
+    for species in ["bear", "snow_leopard"] {
+        assert!(
+            moved.iter().any(|(s, d)| s == species && *d > 0.5),
+            "{species} barely moved: {moved:?}"
+        );
+    }
 }
 
 #[test]
@@ -254,7 +282,7 @@ fn drawing_animals_each_frame_is_cheap_enough_for_an_uncapped_window() {
     let mut cubes = 0;
     for _ in 0..200 {
         cubes = view
-            .instances(creatures, 0.0, std::time::Instant::now())
+            .instances(creatures, 0.0, 0, std::time::Instant::now())
             .len();
     }
     let per_call = started.elapsed() / 200;
@@ -349,5 +377,355 @@ fn players_walk_through_creatures_instead_of_being_blocked_by_them() {
         "player stopped at x={:.2} short of the deer at x={:.2} (travelled {travelled:.2} m)",
         end[0],
         deer[0]
+    );
+}
+
+/// One deer alone near the floor's centre, settled, with a player standing
+/// `offset_x` metres from it along X. Returns the deer's id and position.
+fn deer_with_player_at(offset_x: f64) -> (Simulation, CreatureService, u64, [f64; 3], [f64; 3]) {
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE};
+
+    let mut sim = simulation();
+    let director = AnimalDirector::new(vec![[3.0, 1.0, 3.0]], &[1], 9)
+        .unwrap()
+        .with_radius_m(0.0, 0.5);
+    let service = CreatureService::new(Box::new(director));
+    for _ in 0..30 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+    }
+    let deer = sim.creature_poses()[0];
+    let player_at = [deer.translation_m[0] - offset_x, 0.6, deer.translation_m[2]];
+    sim.add_player(EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap(), player_at);
+    (
+        sim,
+        service,
+        deer.creature_id,
+        deer.translation_m,
+        player_at,
+    )
+}
+
+fn deer_record(sim: &Simulation, id: u64) -> spall_protocol::CreatureRecord {
+    sim.creature_records()
+        .into_iter()
+        .find(|c| c.creature_id == id)
+        .unwrap()
+}
+
+fn horizontal(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (a[0] - b[0]).hypot(a[2] - b[2])
+}
+
+#[test]
+fn a_deer_bolts_at_a_run_from_a_player_close_by() {
+    let (mut sim, service, id, start, player) = deer_with_player_at(3.0);
+    for _ in 0..24 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+    }
+    let deer = deer_record(&sim, id);
+    assert_eq!(deer.locomotion_tag, sandbox::animals::LOCOMOTION_RUN);
+    let gained = horizontal(deer.translation_m, player) - horizontal(start, player);
+    // Three moves at 7.5 m/s are 3 m; turning away from the player costs some.
+    assert!(gained > 1.5, "deer only gained {gained:.2} m on the player");
+}
+
+#[test]
+fn a_deer_watches_a_player_at_a_distance_then_leaves() {
+    let (mut sim, service, id, start, _) = deer_with_player_at(20.0);
+    for _ in 0..16 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+    }
+    let deer = deer_record(&sim, id);
+    assert_eq!(deer.locomotion_tag, sandbox::animals::LOCOMOTION_ALERT);
+    assert!(
+        horizontal(deer.translation_m, start) < 0.05,
+        "an alert deer stands still"
+    );
+    // A player who stays inside the notice distance is fled from once the deer
+    // has watched for a few seconds.
+    let ran = (0..240).any(|_| {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        deer_record(&sim, id).locomotion_tag == sandbox::animals::LOCOMOTION_RUN
+    });
+    assert!(ran, "the deer never fled the watching player");
+}
+
+#[test]
+fn a_deer_ignores_a_far_player() {
+    let (mut sim, service, id, _, _) = deer_with_player_at(60.0);
+    for _ in 0..600 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        let tag = deer_record(&sim, id).locomotion_tag;
+        assert!(
+            tag != sandbox::animals::LOCOMOTION_ALERT && tag != sandbox::animals::LOCOMOTION_RUN,
+            "deer reacted to a player 60 m away"
+        );
+    }
+}
+
+/// A deer resting on grass in a generated world sometimes stops to graze, and
+/// each bite clears the grass under its muzzle through the server's
+/// destroyed-cover record: the same record a dig makes, saved and sent to
+/// clients in the vegetation frame. A player close by ends the meal at a run.
+#[test]
+fn a_grazing_deer_eats_the_grass_under_its_muzzle() {
+    use sandbox::animals::{LOCOMOTION_GRAZE, LOCOMOTION_RUN};
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE};
+    use spall_voxel::Sample;
+
+    let scene = sandbox::worldgen_scene::generate("showcase", 4, 256).unwrap();
+    let mut config = SimulationConfig::new(scene.world_setup());
+    config.vegetation = Some(scene.vegetation().clone());
+    let mut sim = Simulation::new(config).unwrap();
+    sim.initialize_creature_host().unwrap();
+    let grass = |sim: &Simulation, x: i64, z: i64| {
+        (0..200_i64)
+            .rev()
+            .find_map(|y| {
+                match sim
+                    .world()
+                    .terrain()
+                    .volume
+                    .sample(spall_core::GlobalCell::new(x, y, z))
+                {
+                    Ok(Sample::Filled(material)) => Some((y, material)),
+                    _ => None,
+                }
+            })
+            .filter(|&(_, material)| {
+                sandbox::appearance::base_material(material) == spall_core::MaterialId(10)
+            })
+    };
+    // Flat open grass, the same height all around, for the herd to start on.
+    let (gx, gy, gz) = (32..224_i64)
+        .flat_map(|x| (32..224_i64).map(move |z| (x, z)))
+        .find_map(|(x, z)| {
+            let (y, _) = grass(&sim, x, z)?;
+            (-4..=4_i64)
+                .flat_map(|dx| (-4..=4_i64).map(move |dz| (dx, dz)))
+                .all(|(dx, dz)| grass(&sim, x + dx, z + dz).is_some_and(|(h, _)| h == y))
+                .then_some((x, y, z))
+        })
+        .expect("the showcase world has a flat meadow");
+    let anchor = [
+        gx as f64 * 0.25 + 0.125,
+        (gy + 1) as f64 * 0.25,
+        gz as f64 * 0.25 + 0.125,
+    ];
+    let director = AnimalDirector::new(vec![anchor], &[3], 17)
+        .unwrap()
+        .with_radius_m(0.0, 2.0);
+    let service = CreatureService::new(Box::new(director));
+    assert!(sim.vegetation_state().unwrap().cleared.is_empty());
+    // (column centre x, z, the grazing deer's root and rotation at the bite)
+    let mut bites: Vec<(f64, f64, [f64; 3], [f32; 4])> = Vec::new();
+    for _ in 0..3600 {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        for c in &sim.vegetation_state().unwrap().cleared {
+            let (cx, cz) = (f64::from(c.x) * 0.25 + 0.125, f64::from(c.z) * 0.25 + 0.125);
+            if bites.iter().any(|&(x, z, _, _)| (x, z) == (cx, cz)) {
+                continue;
+            }
+            // Only a grazing deer eats; the nearest one took this bite.
+            let deer = sim
+                .creature_records()
+                .into_iter()
+                .filter(|d| d.locomotion_tag == LOCOMOTION_GRAZE)
+                .min_by(|a, b| {
+                    let d = |r: &spall_protocol::CreatureRecord| {
+                        (r.translation_m[0] - cx).hypot(r.translation_m[2] - cz)
+                    };
+                    d(a).total_cmp(&d(b))
+                })
+                .expect("grass was cleared with no deer grazing");
+            bites.push((cx, cz, deer.translation_m, deer.rotation_xyzw));
+        }
+    }
+    assert!(bites.len() >= 2, "deer hardly grazed: {bites:?}");
+    for &(cx, cz, root, [_, sin, _, cos]) in &bites {
+        let yaw = 2.0 * f64::from(sin).atan2(f64::from(cos));
+        let (dx, dz) = (cx - root[0], cz - root[2]);
+        let ahead = dx * yaw.cos() - dz * yaw.sin();
+        assert!(
+            dx.hypot(dz) < 1.5 && ahead > 0.3,
+            "bite at ({cx:.2}, {cz:.2}) is not under the muzzle of a deer at {root:?} facing {yaw:.2}"
+        );
+    }
+    // Clients draw cover from the vegetation frame, which carries the record.
+    let state = sim.vegetation_state().unwrap();
+    assert_eq!(sim.vegetation_visual().unwrap().cleared, state.cleared);
+
+    // Wait for a deer to graze again, then walk a player up to it: it runs.
+    let grazing = (0..3600)
+        .find_map(|_| {
+            sim.tick().unwrap();
+            service.run_tick(&mut sim).unwrap();
+            service.run_motion(&mut sim).unwrap();
+            sim.creature_records()
+                .into_iter()
+                .find(|d| d.locomotion_tag == LOCOMOTION_GRAZE)
+        })
+        .expect("a deer grazes again");
+    let at = grazing.translation_m;
+    sim.add_player(
+        EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap(),
+        [at[0] + 3.0, at[1] + 0.5, at[2]],
+    );
+    let ran = (0..24).any(|_| {
+        sim.tick().unwrap();
+        service.run_tick(&mut sim).unwrap();
+        service.run_motion(&mut sim).unwrap();
+        sim.creature_records()
+            .iter()
+            .any(|d| d.creature_id == grazing.creature_id && d.locomotion_tag == LOCOMOTION_RUN)
+    });
+    assert!(ran, "a player beside a grazing deer did not make it flee");
+}
+
+/// A stone world `width` x `depth` cells: a 2-cell floor, raised to
+/// `plateau_top` (inclusive cell) from `plateau_x` on in x, with resident air
+/// above both up to `height` so downward ground queries find the surface.
+fn terrain_simulation(
+    width: i64,
+    depth: i64,
+    height: i64,
+    plateau_x: i64,
+    plateau_top: i64,
+) -> Simulation {
+    use spall_core::{GlobalCell, MaterialId};
+    use spall_voxel::EditPlan;
+
+    let mut setup = fixtures::flat_terrain_setup();
+    let id = setup.terrain.id();
+    let mut volume = spall_voxel::Volume::new(id, spall_core::CellSizeCode::Quarter);
+    let mut fill = |a: [i64; 3], b: [i64; 3], material: MaterialId| {
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(a[0], a[1], a[2]),
+                GlobalCell::new(b[0], b[1], b[2]),
+                material,
+            ))
+            .unwrap();
+    };
+    fill([0, 0, 0], [width - 1, 1, depth - 1], fixtures::STONE);
+    if plateau_x < width {
+        fill(
+            [plateau_x, 0, 0],
+            [width - 1, plateau_top, depth - 1],
+            fixtures::STONE,
+        );
+        fill(
+            [plateau_x, plateau_top + 1, 0],
+            [width - 1, height - 1, depth - 1],
+            MaterialId::AIR,
+        );
+    }
+    fill(
+        [0, 2, 0],
+        [plateau_x.min(width) - 1, height - 1, depth - 1],
+        MaterialId::AIR,
+    );
+    setup.terrain = volume;
+    setup.terrain_collider_region = (
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(width - 1, height - 1, depth - 1),
+    );
+    setup.materials = sandbox::game::manifest();
+    let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
+    sim.initialize_creature_host().unwrap();
+    sim
+}
+
+fn step(sim: &mut Simulation, service: &CreatureService) {
+    sim.tick().unwrap();
+    service.run_tick(sim).unwrap();
+    service.run_motion(sim).unwrap();
+}
+
+/// Circling crows over a wide flat field now and then come down, hop and peck
+/// on the ground, and climb back to their circle; a player walking up to a
+/// grounded crow sends it up early.
+#[test]
+fn crows_land_hop_and_peck_then_take_off_and_flee_a_near_player() {
+    use sandbox::animals::{
+        LOCOMOTION_HOP, LOCOMOTION_LAND, LOCOMOTION_MOVE, LOCOMOTION_PECK, LOCOMOTION_TAKEOFF,
+    };
+    use spall_core::{EntityId, PLAYER_ENTITY_BASE};
+
+    // 48 m square, 16 m of air over a floor whose top face is at 0.5 m.
+    let mut sim = terrain_simulation(192, 192, 64, 192, 0);
+    let director = AnimalDirector::new(vec![[24.0, 0.5, 24.0]], &[0, 3], 23)
+        .unwrap()
+        .with_radius_m(0.0, 2.0);
+    let service = CreatureService::new(Box::new(director));
+    let grounded = |y: f64| y < 0.5 + 0.6;
+    // Per crow: the stages seen in order (landing, on the ground, taking off,
+    // circling high again).
+    let mut stage: std::collections::BTreeMap<u64, u8> = Default::default();
+    let mut full_cycle = None;
+    for _ in 0..30_000 {
+        step(&mut sim, &service);
+        for crow in sim.creature_records() {
+            let s = stage.entry(crow.creature_id).or_default();
+            let y = crow.translation_m[1];
+            *s = match (*s, crow.locomotion_tag) {
+                (0, LOCOMOTION_LAND) => 1,
+                (1, LOCOMOTION_HOP | LOCOMOTION_PECK) if grounded(y) => 2,
+                (2, LOCOMOTION_TAKEOFF) => 3,
+                (3, LOCOMOTION_MOVE) if y > 2.5 => 4,
+                (s, _) => s,
+            };
+            if *s == 4 {
+                full_cycle = Some(crow.creature_id);
+            }
+        }
+        if full_cycle.is_some() {
+            break;
+        }
+    }
+    assert!(
+        full_cycle.is_some(),
+        "no crow landed, pecked and flew again: stages {stage:?}"
+    );
+
+    // Wait until a crow is on the ground, then put a player 4 m from it.
+    let crow = (0..30_000)
+        .find_map(|_| {
+            step(&mut sim, &service);
+            sim.creature_records().into_iter().find(|c| {
+                matches!(c.locomotion_tag, LOCOMOTION_HOP | LOCOMOTION_PECK)
+                    && grounded(c.translation_m[1])
+            })
+        })
+        .expect("a crow lands again");
+    let at = crow.translation_m;
+    sim.add_player(
+        EntityId::new(PLAYER_ENTITY_BASE + 1).unwrap(),
+        [at[0] + 4.0, 0.6, at[2]],
+    );
+    for _ in 0..60 {
+        step(&mut sim, &service);
+    }
+    let now = sim
+        .creature_records()
+        .into_iter()
+        .find(|c| c.creature_id == crow.creature_id)
+        .unwrap();
+    assert_eq!(now.locomotion_tag, LOCOMOTION_TAKEOFF, "{now:?}");
+    assert!(
+        now.translation_m[1] > at[1] + 1.0,
+        "the spooked crow did not climb: {now:?}"
     );
 }

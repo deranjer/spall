@@ -216,6 +216,94 @@ fn flow_across_a_border_wakes_a_sleeping_region() {
     );
 }
 
+/// A trickle spread along a whole border, each pipe under the sleep flow, still
+/// wakes the region downhill: left asleep, its first column took the water and
+/// passed none on, and the region uphill filled behind it as a flat pool with a
+/// straight wall (seen in play as a slab of water standing on a slope).
+#[test]
+fn a_wide_trickle_into_a_sleeping_region_flows_on_instead_of_damming() {
+    // Ground falling towards +x, about 0.12 cells per column, across three regions.
+    let terrain = Flat::new(|x, y, _| (y as f64) < (95 - x) as f64 * 0.12);
+    let config = ColumnConfig {
+        sleep_flow: 0.5,
+        ..ColumnConfig::default()
+    };
+    let mut world = ColumnWorld::with_terrain(terrain, config);
+    world.allocate_rect(0, 0, 95, 31);
+    // A spring line at the top: 8 cells^3/s over 32 columns.
+    let springs: Vec<GlobalCell> = (0..32)
+        .map(|z| GlobalCell::new(2, world.spans_in_column(2, z)[0].floor_y, z))
+        .collect();
+    for _ in 0..(60.0 / DT) as u32 {
+        for &s in &springs {
+            world.add_flow(s, 0.25 * DT).unwrap();
+        }
+        world.step(DT);
+    }
+    let surface = |x: i64| {
+        let s = world.spans_in_column(x, 16)[0];
+        s.floor_y as f64 + s.depth
+    };
+    assert!(
+        world.column_volume(40, 16) > 0.0,
+        "the water ran on past the first columns downhill"
+    );
+    // The water follows the ground: no step of half a metre at the border.
+    assert!(
+        surface(31) - surface(34) < 2.0,
+        "a dam at the border: surface {} against {}",
+        surface(31),
+        surface(34)
+    );
+}
+
+/// Evaporation takes the same depth from every column of still water, so a
+/// pool at rest stays level and asleep; water at or below the cut-off (the
+/// sea) keeps its level.
+#[test]
+fn evaporation_lowers_still_water_evenly_without_waking_it() {
+    let terrain = Flat::new(|x, _, z| {
+        (9..=64).contains(&x) && (4..=20).contains(&z) && (x == 9 || x == 64 || z == 4 || z == 20)
+    });
+    let mut world = ColumnWorld::with_terrain(terrain, ColumnConfig::default());
+    world.seed_cells(&pool_cells(10, 64, 5, 20, 4));
+    let start = world.total_volume();
+    let (removed, wet) = world.evaporate(0.25, 1.0);
+    assert_eq!(wet, 54 * 15, "every wet column open to the sky");
+    assert!((removed - 0.25 * wet as f64).abs() < 1e-9);
+    assert!((start - removed - world.total_volume()).abs() < 1e-9);
+    assert_eq!(world.active_region_count(), 0, "nothing woke");
+    run(&mut world, 2.0);
+    assert_eq!(world.active_region_count(), 0, "and nothing moves");
+    let surface = |x: i64| {
+        let s = world.spans_in_column(x, 12)[0];
+        s.floor_y as f64 + s.depth
+    };
+    assert!((surface(11) - 4.75).abs() < 1e-9 && (surface(60) - 4.75).abs() < 1e-9);
+    // Water whose surface is at or under the cut-off is the sea: untouched.
+    assert_eq!(world.evaporate(0.25, 5.0), (0.0, 0));
+}
+
+/// Far water runs in slow motion, and so does its evaporation: far beyond the
+/// last throttle band a region loses an eighth of the depth.
+#[test]
+fn far_water_evaporates_in_slow_motion() {
+    let terrain = Flat::new(|x, _, z| {
+        (9..=64).contains(&x) && (4..=20).contains(&z) && (x == 9 || x == 64 || z == 4 || z == 20)
+    });
+    let config = ColumnConfig {
+        throttle_from_cells: [100.0, 200.0, 400.0],
+        ..ColumnConfig::default()
+    };
+    let mut world = ColumnWorld::with_terrain(terrain, config);
+    world.seed_cells(&pool_cells(10, 64, 5, 20, 4));
+    let (near, wet) = world.evaporate(0.25, 1.0);
+    world.set_focus(&[[5000.0, 5000.0]]);
+    let (far, _) = world.evaporate(0.25, 1.0);
+    assert!((near - 0.25 * wet as f64).abs() < 1e-9);
+    assert!((far - near / 8.0).abs() < 1e-9, "{far} against {near}");
+}
+
 /// A non-resident neighbour is a closed wall: water neither drains into it nor
 /// stops being counted. When it returns, both sides exchange.
 #[test]

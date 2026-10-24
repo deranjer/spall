@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use spall_client::audio::{BiomeAudioConfig, WeatherLayer};
 use spall_client::breathing::{BreathingConfig, BreathingRow, BreathingState};
+use spall_client::creature_sounds::{CreatureCue, CreatureSoundConfig};
 use spall_client::footsteps::{FootstepConfig, FootstepSurface};
 use spall_core::MaterialId;
 use spall_protocol::WeatherKind;
@@ -273,8 +274,124 @@ pub fn config() -> BiomeAudioConfig {
                 )
             })
             .collect(),
+        birdsong_tracks: TRACK_NAMES
+            .iter()
+            .map(|name| {
+                matches!(
+                    *name,
+                    "meadow-pipit.ogg" | "alpine-chiffchaff.ogg" | "temperate-forest.ogg"
+                )
+            })
+            .collect(),
+        bird_species: vec!["crow".to_owned()],
+        creatures: creatures(&root),
         footsteps: footsteps(&root),
         breathing: breathing(&root),
+    }
+}
+
+/// Wolf sounds (ENG-243), user-approved recordings under `animals/`: species,
+/// locomotion tag, recordings, chorus recordings, range (m), gain, repeat
+/// while held (s), chance.
+#[allow(clippy::type_complexity)]
+const WOLF_CUES: [(u8, &[&str], &[&str], f32, f32, Option<(f32, f32)>, f32); 7] = {
+    use crate::animals::*;
+    [
+        // The first wolf howls alone; the rest of the pack joins in chorus.
+        // Heard as far as creature motion reaches a client.
+        (
+            LOCOMOTION_HOWL,
+            &["wolf-howl.ogg"],
+            &["wolf-chorus.ogg", "wolf-chorus-sanctuary.ogg"],
+            320.0,
+            0.9,
+            None,
+            1.0,
+        ),
+        (
+            LOCOMOTION_CHASE,
+            &["wolf-growl.ogg"],
+            &[],
+            25.0,
+            0.8,
+            None,
+            1.0,
+        ),
+        (
+            LOCOMOTION_POUNCE,
+            &["wolf-bite.ogg"],
+            &[],
+            15.0,
+            0.9,
+            None,
+            1.0,
+        ),
+        // Not every wolf of a pack barks when it backs off.
+        (
+            LOCOMOTION_SHY,
+            &["wolf-bark.ogg", "wolf-bark-pack.ogg"],
+            &[],
+            60.0,
+            0.7,
+            None,
+            0.5,
+        ),
+        // Now and then a resting wolf yips.
+        (
+            LOCOMOTION_IDLE,
+            &["wolf-yips.ogg"],
+            &[],
+            30.0,
+            0.5,
+            Some((20.0, 60.0)),
+            0.1,
+        ),
+        // Padding steps, the length of the recording apart.
+        (
+            LOCOMOTION_MOVE,
+            &["wolf-steps.ogg"],
+            &[],
+            10.0,
+            0.35,
+            Some((3.0, 3.0)),
+            1.0,
+        ),
+        (
+            LOCOMOTION_STALK,
+            &["wolf-steps.ogg"],
+            &[],
+            10.0,
+            0.25,
+            Some((3.0, 3.0)),
+            1.0,
+        ),
+    ]
+};
+
+/// The creature sound table with each recording resolved against `root`.
+pub fn creatures(root: &Path) -> CreatureSoundConfig {
+    let files = |names: &[&str]| -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|name| root.join("animals").join(name))
+            .collect()
+    };
+    CreatureSoundConfig {
+        cues: WOLF_CUES
+            .iter()
+            .map(
+                |&(tag, sounds, chorus, range_m, gain, repeat_s, chance)| CreatureCue {
+                    species: "wolf".to_owned(),
+                    tag,
+                    sounds: files(sounds),
+                    chorus: files(chorus),
+                    range_m,
+                    gain,
+                    repeat_s,
+                    chance,
+                },
+            )
+            .collect(),
     }
 }
 
@@ -387,6 +504,23 @@ mod tests {
     }
 
     #[test]
+    fn every_creature_cue_names_a_shipped_recording_and_a_tag_wolves_send() {
+        let config = creatures(&source_audio_root());
+        for cue in &config.cues {
+            assert!(!cue.sounds.is_empty());
+            for path in cue.sounds.iter().chain(&cue.chorus) {
+                assert!(path.is_file(), "missing {}", path.display());
+            }
+            assert!(
+                crate::animals::locomotion_clip(&cue.species, cue.tag).is_some(),
+                "{} never sends tag {}",
+                cue.species,
+                cue.tag
+            );
+        }
+    }
+
+    #[test]
     fn footstep_table_resolves_shipped_recordings() {
         let config = footsteps(&source_audio_root());
         for surface in &config.surfaces {
@@ -444,7 +578,7 @@ mod tests {
     fn every_approved_runtime_asset_decodes_without_an_audio_device() {
         let root = source_audio_root();
         let mut checked = 0;
-        for category in ["biomes", "weather", "foley", "player"] {
+        for category in ["biomes", "weather", "foley", "player", "animals"] {
             for entry in std::fs::read_dir(root.join(category)).unwrap() {
                 let path = entry.unwrap().path();
                 assert_eq!(
@@ -456,7 +590,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 39, "all 39 user-approved recordings are packaged");
+        assert_eq!(checked, 48, "all 48 user-approved recordings are packaged");
     }
 
     #[test]

@@ -74,12 +74,13 @@ pub use contact_damage::{
     ContactDamageConfig, ContactDamageMaterialProfile, ContactDamagePlan, ContactDamagePolicy,
     ContactEvent, PlannedDamage,
 };
-pub use creatures::{CreatureHostInitError, CreatureSpawnError};
+pub use creatures::{CreatureHostInitError, CreatureShape, CreatureSpawnError, CreatureVoxel};
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};
 pub use player::{
-    HELD_INPUT_TIMEOUT_TICKS, Player, transaction_world_box, transaction_world_boxes,
+    HELD_INPUT_TIMEOUT_TICKS, PLAYER_MAX_HEALTH, Player, PlayerDamage, transaction_world_box,
+    transaction_world_boxes,
 };
 pub use playground::{
     DropSchedule, DropZone, PLAYGROUND_DEBRIS_COUNT, PLAYGROUND_PLINKO_COUNT,
@@ -95,9 +96,10 @@ pub use replication::{
 pub use schedule::EditTiming;
 pub use schedule::{EditPipeline, RegionKey, TickReport};
 pub use sim::{
-    CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, CreatureMoveOutcome, CreatureMoveRequest,
-    CreaturePose, CreatureWalkOutcome, CreatureWalkRequest, SERVER_REQUEST_ID_BAND, Simulation,
-    SimulationConfig, TICK_DT_S, TickError,
+    CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, CreatureKill, CreatureKillError,
+    CreatureMoveOutcome, CreatureMoveRequest, CreaturePose, CreatureWalkOutcome,
+    CreatureWalkRequest, SERVER_REQUEST_ID_BAND, Simulation, SimulationConfig, TICK_DT_S,
+    TickError,
 };
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit, warm_index_reuses};
 pub use transfer::{ChildBody, PlanChildError, plan_child};

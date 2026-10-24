@@ -29,6 +29,14 @@ pub struct BiomeAudioConfig {
     /// Which `tracks` are running water (streams, shores). Weather ducks them
     /// far less than other ambience and they win a mix slot over other layers.
     pub water_tracks: Vec<bool>,
+    /// Which `tracks` are mostly birdsong. They play quietly unless a bird
+    /// is near (see [`birdsong_level`]), so a looping song does not follow
+    /// the player across a whole biome.
+    pub birdsong_tracks: Vec<bool>,
+    /// Creature species that count as birds for [`birdsong_level`].
+    pub bird_species: Vec<String>,
+    /// Sounds creatures make, heard from where they are.
+    pub creatures: crate::creature_sounds::CreatureSoundConfig,
     pub footsteps: crate::footsteps::FootstepConfig,
     pub breathing: crate::breathing::BreathingConfig,
 }
@@ -49,9 +57,92 @@ pub struct WeatherLayer {
 pub const DEFAULT_RANGE_M: f32 = 45.0;
 /// Most ambience layers mixed at once.
 const MAX_LAYERS: usize = 4;
+/// Most panned one-shots (creature sounds) playing at once; more are dropped.
+const MAX_VOICES: usize = 8;
 /// Time constant of a layer's volume approaching its target, so a layer fades
 /// in and out over a few seconds instead of switching.
 const LAYER_RAMP: Duration = Duration::from_millis(1200);
+
+/// Birdsong tracks play at this fraction with no bird near.
+const BIRDSONG_FLOOR: f32 = 0.15;
+/// A bird this close lifts birdsong to full volume...
+const BIRD_NEAR_M: f64 = 15.0;
+/// ...fading back to [`BIRDSONG_FLOOR`] by this distance.
+const BIRD_FAR_M: f64 = 60.0;
+
+/// Gain for birdsong tracks given the distance to the nearest bird, if any:
+/// faint everywhere, full when a bird is close.
+pub fn birdsong_level(nearest_bird_m: Option<f64>) -> f32 {
+    let near = nearest_bird_m.map_or(0.0, |distance| {
+        ((BIRD_FAR_M - distance) / (BIRD_FAR_M - BIRD_NEAR_M)).clamp(0.0, 1.0) as f32
+    });
+    BIRDSONG_FLOOR + (1.0 - BIRDSONG_FLOOR) * near
+}
+
+/// How long a birdsong burst lasts, and the rest between bursts with no bird
+/// near and with one near, seconds (min, max).
+const SONG_S: (f32, f32) = (3.0, 8.0);
+const REST_FAR_S: (f32, f32) = (40.0, 120.0);
+const REST_NEAR_S: (f32, f32) = (4.0, 15.0);
+
+/// Birdsong comes and goes: short bursts with long silences, the silences
+/// much shorter while a bird is near. The looping birdsong tracks are only
+/// audible during a burst (each fades over the layer ramp).
+#[derive(Debug, Clone)]
+pub struct BirdsongGate {
+    singing: bool,
+    until: Instant,
+    rng: u64,
+}
+
+impl BirdsongGate {
+    /// Starts resting; `seed` varies the schedule between clients.
+    pub fn new(now: Instant, seed: u64) -> Self {
+        let mut gate = Self {
+            singing: false,
+            until: now,
+            rng: seed ^ 0x9E37_79B9_7F4A_7C15,
+        };
+        gate.until = now + gate.span(REST_NEAR_S);
+        gate
+    }
+
+    /// Whether birdsong is audible at `now`, advancing the schedule. A bird
+    /// coming near cuts a long rest short.
+    pub fn singing(&mut self, now: Instant, bird_near: bool) -> bool {
+        if bird_near && !self.singing {
+            let cap = now + Duration::from_secs_f32(REST_NEAR_S.1);
+            self.until = self.until.min(cap);
+        }
+        if now >= self.until {
+            self.singing = !self.singing;
+            let span = if self.singing {
+                SONG_S
+            } else if bird_near {
+                REST_NEAR_S
+            } else {
+                REST_FAR_S
+            };
+            self.until = now + self.span(span);
+        }
+        self.singing
+    }
+
+    fn span(&mut self, (min, max): (f32, f32)) -> Duration {
+        // splitmix64: deterministic and dependency-free.
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let unit = ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32;
+        Duration::from_secs_f32(min + (max - min) * unit)
+    }
+}
+
+/// Whether a bird at this distance counts as near for [`BirdsongGate`].
+pub fn bird_near(nearest_bird_m: Option<f64>) -> bool {
+    nearest_bird_m.is_some_and(|distance| distance < BIRD_FAR_M)
+}
 
 /// Resolves a world-space listener position into the replicated climate field.
 /// Bounds are checked before `CoverGrid::at`, whose public lookup otherwise
@@ -102,6 +193,13 @@ impl BiomeAudioConfig {
             .collect()
     }
 
+    pub fn is_birdsong(&self, biome: u8) -> bool {
+        self.birdsong_tracks
+            .get(usize::from(biome))
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub fn is_water(&self, biome: u8) -> bool {
         self.water_tracks
             .get(usize::from(biome))
@@ -134,6 +232,7 @@ const MAX_SEARCH_M: f64 = 130.0;
 /// other layers so a full mix never drops a nearby stream for a quieter bird.
 pub fn ambience_mix(
     weather_duck: f32,
+    birdsong: f32,
     field: &spall_ecology::cover::CoverField,
     grid: &spall_ecology::cover::CoverGrid,
     position_m: [f64; 3],
@@ -200,6 +299,11 @@ pub fn ambience_mix(
             weather_duck
         };
         let volume = volume * duck.clamp(0.0, 1.0);
+        let volume = if config.is_birdsong(biome) {
+            volume * birdsong.clamp(0.0, 1.0)
+        } else {
+            volume
+        };
         match layers.iter_mut().find(|(existing, _, _)| existing == path) {
             Some(entry) => {
                 entry.1 = entry.1.max(volume);
@@ -255,11 +359,20 @@ pub fn validate_loop_boundary(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A one-shot for the audio worker.
+enum Shot {
+    /// Weather (thunder): one bounded voice, at full gain.
+    Weather(PathBuf),
+    /// A sound heard from somewhere, at a loudness and pan (-1 left to 1
+    /// right) fixed when it starts.
+    Panned { path: PathBuf, gain: f32, pan: f32 },
+}
+
 /// Sends desired tracks to a worker that owns the audio device and both sinks.
 #[derive(Clone)]
 pub struct AmbienceAudio {
     tx: SyncSender<Vec<(PathBuf, f32)>>,
-    one_shots: SyncSender<PathBuf>,
+    one_shots: SyncSender<Shot>,
     gain: Arc<AtomicU32>,
 }
 
@@ -274,7 +387,7 @@ impl AmbienceAudio {
             .filter(|value| value.is_finite())
             .map_or(gain, |value| value.clamp(0.0, 1.0));
         let (tx, rx) = mpsc::sync_channel(1);
-        let (one_shots, shot_rx) = mpsc::sync_channel(4);
+        let (one_shots, shot_rx) = mpsc::sync_channel(16);
         let gain = Arc::new(AtomicU32::new(gain.to_bits()));
         let worker_gain = Arc::clone(&gain);
         thread::Builder::new()
@@ -302,9 +415,43 @@ impl AmbienceAudio {
             .store(safe_gain(gain).to_bits(), Ordering::Relaxed);
     }
 
-    pub fn play_once(&self, path: PathBuf) -> Result<(), TrySendError<PathBuf>> {
-        self.one_shots.try_send(path)
+    /// Plays a weather one-shot unless one is already playing. Returns false
+    /// when the worker is busy or gone.
+    pub fn play_once(&self, path: PathBuf) -> bool {
+        self.one_shots.try_send(Shot::Weather(path)).is_ok()
     }
+
+    /// Plays a sound once at `gain` (0..=1) and `pan` (-1 left to 1 right),
+    /// unless [`MAX_VOICES`] are already playing. Returns false when the
+    /// worker is busy or gone.
+    pub fn play_panned(&self, path: PathBuf, gain: f32, pan: f32) -> bool {
+        self.one_shots
+            .try_send(Shot::Panned { path, gain, pan })
+            .is_ok()
+    }
+}
+
+/// The recording at `path` as stereo, panned with an equal-power law.
+fn panned(
+    path: &std::path::Path,
+    pan: f32,
+) -> Result<rodio::source::ChannelVolume<Decoder<std::io::BufReader<std::fs::File>>>, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let source = Decoder::try_from(file).map_err(|error| error.to_string())?;
+    let (left, right) = pan_gains(pan);
+    Ok(rodio::source::ChannelVolume::new(source, vec![left, right]))
+}
+
+/// Left and right channel gains for `pan` (-1 left to 1 right): equal power,
+/// so a sound keeps its loudness as it moves across.
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let pan = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+    (angle.cos(), angle.sin())
 }
 
 fn safe_gain(gain: f32) -> f32 {
@@ -331,7 +478,7 @@ fn ramp(volume: f32, target: f32, dt: Duration) -> f32 {
 
 fn run_audio(
     rx: mpsc::Receiver<Vec<(PathBuf, f32)>>,
-    shot_rx: mpsc::Receiver<PathBuf>,
+    shot_rx: mpsc::Receiver<Shot>,
     gain: Arc<AtomicU32>,
 ) {
     let stream = match OutputStreamBuilder::open_default_stream() {
@@ -342,6 +489,7 @@ fn run_audio(
         }
     };
     let thunder = Sink::connect_new(stream.mixer());
+    let mut voices: Vec<(Sink, f32)> = Vec::new();
     let mut layers: Vec<Layer> = Vec::new();
     let mut last_update = Instant::now();
 
@@ -399,8 +547,26 @@ fn run_audio(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
-        // One bounded one-shot voice. Do not build an unbounded thunder queue.
-        while let Ok(path) = shot_rx.try_recv() {
+        // One bounded weather voice, and at most MAX_VOICES panned ones. Do
+        // not build an unbounded queue.
+        voices.retain(|(sink, _)| !sink.empty());
+        while let Ok(shot) = shot_rx.try_recv() {
+            let path = match shot {
+                Shot::Weather(path) => path,
+                Shot::Panned { path, gain, pan } => {
+                    if voices.len() < MAX_VOICES {
+                        match panned(&path, pan) {
+                            Ok(source) => {
+                                let sink = Sink::connect_new(stream.mixer());
+                                sink.append(source);
+                                voices.push((sink, safe_gain(gain)));
+                            }
+                            Err(error) => tracing::warn!(%error, ?path, "sound unavailable"),
+                        }
+                    }
+                    continue;
+                }
+            };
             if thunder.empty() {
                 match std::fs::File::open(path)
                     .map_err(|e| e.to_string())
@@ -416,6 +582,9 @@ fn run_audio(
         }
         let gain = f32::from_bits(gain.load(Ordering::Relaxed));
         thunder.set_volume(gain);
+        for (sink, loudness) in &voices {
+            sink.set_volume(gain * loudness);
+        }
         let now = Instant::now();
         let dt = now.saturating_duration_since(last_update);
         last_update = now;
@@ -433,6 +602,17 @@ fn run_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panning_keeps_power_and_sends_each_side_its_own_channel() {
+        for pan in [-1.0, -0.4, 0.0, 0.7, 1.0, f32::NAN] {
+            let (left, right) = pan_gains(pan);
+            assert!((left * left + right * right - 1.0).abs() < 1.0e-5);
+        }
+        let (left, right) = pan_gains(1.0);
+        assert!(left.abs() < 1.0e-6 && (right - 1.0).abs() < 1.0e-6);
+        assert_eq!(pan_gains(0.0).0, pan_gains(0.0).1);
+    }
 
     #[test]
     fn volume_rejects_nonfinite_and_clamps() {
@@ -511,7 +691,7 @@ mod tests {
             ..Default::default()
         };
         let volume_of = |x: f64, name: &str| {
-            ambience_mix(1.0, &field, &grid, [x, 10.0, 100.0], &config)
+            ambience_mix(1.0, 1.0, &field, &grid, [x, 10.0, 100.0], &config)
                 .into_iter()
                 .find(|(path, _)| path.to_str() == Some(name))
                 .map_or(0.0, |(_, v)| v)
@@ -537,7 +717,7 @@ mod tests {
             ..Default::default()
         };
         let at = |config: &BiomeAudioConfig, duck: f32| {
-            ambience_mix(duck, &field, &grid, [61.0, 10.0, 100.0], config)
+            ambience_mix(duck, 1.0, &field, &grid, [61.0, 10.0, 100.0], config)
         };
         let get = |mix: &[(PathBuf, f32)], name: &str| {
             mix.iter()
@@ -582,5 +762,32 @@ mod tests {
             rle: vec![1, 0],
         };
         assert!(malformed.expand().is_err());
+    }
+
+    #[test]
+    fn birdsong_is_faint_without_a_bird_and_full_beside_one() {
+        let floor = birdsong_level(None);
+        assert!(floor > 0.0 && floor < 0.3, "{floor}");
+        assert_eq!(birdsong_level(Some(200.0)), floor);
+        assert!(birdsong_level(Some(40.0)) > floor);
+        assert!((birdsong_level(Some(10.0)) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn birdsong_comes_in_bursts_with_long_rests_unless_a_bird_is_near() {
+        let start = Instant::now();
+        let mut gate = BirdsongGate::new(start, 7);
+        let count = |gate: &mut BirdsongGate, near: bool, from: Instant| {
+            (0..1200)
+                .filter(|i| gate.singing(from + Duration::from_millis(250) * *i, near))
+                .count()
+        };
+        // Five minutes alone: mostly silent.
+        let alone = count(&mut gate, false, start);
+        assert!(alone > 0 && alone < 1200 / 4, "{alone}");
+        // Five minutes beside a bird: far more song, still not constant.
+        let later = start + Duration::from_secs(300);
+        let near = count(&mut gate, true, later);
+        assert!(near > alone * 2 && near < 1200, "{near} vs {alone}");
     }
 }

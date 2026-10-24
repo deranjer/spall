@@ -104,6 +104,31 @@ impl Simulation {
     pub fn vegetation_climate_is_natural(&self) -> Option<bool> {
         self.vegetation.as_ref().map(|v| v.columns.is_natural())
     }
+    /// An animal eats the ground cover in column `(x, z)` (cells): the column
+    /// is recorded as destroyed, as an edit that reaches the surface records
+    /// it, so it is saved, regrows and reaches clients in the next vegetation
+    /// frame. `false` (nothing eaten) without vegetation, outside the world, or
+    /// where the column's cover is already gone or regrowing.
+    pub fn graze_cover(&mut self, x: i64, z: i64) -> bool {
+        let Some(v) = &mut self.vegetation else {
+            return false;
+        };
+        let (Ok(cx), Ok(cz)) = (u16::try_from(x), u16::try_from(z)) else {
+            return false;
+        };
+        if u32::from(cx) >= v.state.size
+            || u32::from(cz) >= v.state.size
+            || v.state
+                .cleared
+                .binary_search_by_key(&(cx, cz), |c| (c.x, c.z))
+                .is_ok()
+        {
+            return false;
+        }
+        v.state.clear_cover(x, z);
+        v.dirty = true;
+        true
+    }
     pub fn vegetation_state(&self) -> Option<&LivingState> {
         self.vegetation.as_ref().map(|v| &v.state)
     }
