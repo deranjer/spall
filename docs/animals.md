@@ -84,6 +84,16 @@ mountain near) does not keep the others from spawning. Each walking species has 
 own pace and foot capsule, sized to fit inside its body; placement envelopes and
 foot height are measured from the asset's idle and walk poses.
 
+The client (`examples/sandbox/src/animal_view.rs`) poses every clip once per
+whole tick at startup, as part placements rather than cells (about 0.6 MB for
+all five species), so a frame only places each cell at its creature's root.
+Clip phases are rounded down to whole ticks (60 per second). Creatures outside
+a cone around the camera's view, or farther than the view distance, are not
+drawn; the cone's apex sits 3 m behind the camera and each creature is tested
+by the farthest any of its cells reaches in any pose, so bodies at the screen
+edge stay drawn. The 1 km herd (48 animals, about 75,000 cubes) costs about
+0.5 ms per frame unculled in a release build, down from about 2.5-3.5 ms.
+
 Deer notice players: one within 28 m makes a deer stop and watch it (`alert`
 clip); one within 14 m, or sprinting inside 28 m, makes it bolt at 7.5 m/s
 (`run` clip), faster than a sprinting player. A deer that watched for a few
@@ -317,9 +327,13 @@ s; steps repeat every 3 s while walking or stalking.
 
 ### Ambient birdsong (to vary the biome beds)
 
-The meadow pipit, alpine chiffchaff and temperate forest beds now play only in
-short bursts (more often near a crow). A pool of different songs, picked at
-random per burst, would stop one bird repeating. Specific CC0 candidates
+Birdsong plays only in short bursts (3-8 s, every 40-120 s, or every 4-15 s
+with a crow within 60 m), where a birdsong biome (meadow, alpine, temperate
+forest) is in earshot or a crow is near. Each burst picks at random between the
+biome's own track and a pool in `assets/audio/birds/`: blackbird (isolated),
+robin (Madeira forest, first 2:25) and blackcap (first 56 s), all CC0 and
+credited in `CREDITS.md`. A recording keeps playing silently between bursts, so
+the next burst resumes on a different phrase. Further CC0 candidates
 (Freesound's CC0 filter; not yet auditioned):
 
 | Bird | Candidates |

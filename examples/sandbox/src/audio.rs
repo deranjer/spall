@@ -284,6 +284,10 @@ pub fn config() -> BiomeAudioConfig {
             })
             .collect(),
         bird_species: vec!["crow".to_owned()],
+        birdsong_pool: ["blackbird.ogg", "robin.ogg", "blackcap.ogg"]
+            .iter()
+            .map(|name| root.join("birds").join(name))
+            .collect(),
         creatures: creatures(&root),
         footsteps: footsteps(&root),
         breathing: breathing(&root),
@@ -452,6 +456,16 @@ mod tests {
                 "missing runtime ambience {}",
                 path.display()
             );
+        }
+    }
+
+    #[test]
+    fn every_birdsong_recording_exists_and_decodes() {
+        let pool = config().birdsong_pool;
+        assert!(!pool.is_empty());
+        for path in pool {
+            spall_client::audio::validate_asset(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         }
     }
 

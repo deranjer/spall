@@ -52,6 +52,23 @@ pub trait PlayerView: Send + Sync + std::fmt::Debug {
     fn instances(&self, players: &[PlayerBody], tint_base: u32, now: Instant) -> Vec<CubeInstance>;
 }
 
+/// What this frame's camera can see, for skipping creatures before posing them.
+/// Conservative: a cone that contains the whole view frustum, its apex pulled
+/// back so small camera moves within the frame stay inside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreatureCull {
+    /// Cone apex, world metres.
+    pub apex_m: [f64; 3],
+    /// Unit view direction.
+    pub forward: [f32; 3],
+    /// Half-angle of the cone, radians.
+    pub half_angle_rad: f32,
+    /// The camera's own position, world metres.
+    pub eye_m: [f64; 3],
+    /// Horizontal distance from `eye_m` past which nothing is drawn, metres.
+    pub max_distance_m: f32,
+}
+
 /// Turns replicated creatures into cubes to draw this frame.
 /// The engine owns replication; the game owns what a species looks like.
 pub trait CreatureView: Send + Sync + std::fmt::Debug {
@@ -61,11 +78,13 @@ pub trait CreatureView: Send + Sync + std::fmt::Debug {
     fn tints(&self) -> Vec<(spall_core::MaterialId, [u8; 3])>;
 
     /// `tick` is the estimated present server tick, fractional, for animation.
+    /// `cull` is `None` when the camera is not known yet: draw everything.
     fn instances(
         &self,
         creatures: &crate::replica_creatures::ReplicaCreatures,
         tick: f64,
         tint_base: u32,
         now: Instant,
+        cull: Option<&CreatureCull>,
     ) -> Vec<CubeInstance>;
 }

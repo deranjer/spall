@@ -239,9 +239,72 @@ impl AnimalVisual {
         self.compose(&poses)
     }
 
+    /// Sample a named source clip into one [`PartFrame`] per part, in
+    /// [`Self::part_cells`] order: the pose without its cells.
+    pub fn sample_part_frames(&self, clip: &str, tick: f64) -> Result<Vec<PartFrame>> {
+        let poses = spall_asset::sample_clip(&self.asset, clip, tick)?;
+        self.part_frames(&poses)
+    }
+
+    /// Each part's cells as offsets from the part's joint, metres, with their
+    /// mapped material and tint; parent-before-child part order.
+    pub fn part_cells(
+        &self,
+    ) -> impl Iterator<Item = impl Iterator<Item = (Vec3, MaterialId, Option<[u8; 3]>)>> {
+        let edge = self.cell_edge_m;
+        self.parts.iter().map(move |geometry| {
+            geometry
+                .cells
+                .iter()
+                .map(move |cell| (cell_offset(cell, edge), cell.material, cell.tint))
+        })
+    }
+
+    /// Edge length of every cell, metres.
+    pub fn cell_edge_m(&self) -> f32 {
+        self.cell_edge_m
+    }
+
+    /// Every clip's name and duration in ticks.
+    pub fn clips(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.asset
+            .clips
+            .iter()
+            .map(|clip| (clip.name.as_str(), clip.duration_ticks))
+    }
+
     /// Compose caller-supplied parent-relative poses. Exact part coverage is
     /// required so missing or stale pose references cannot silently default.
     pub fn compose(&self, poses: &BTreeMap<u32, PartPose>) -> Result<Vec<AnimalCell>> {
+        let frames = self.part_frames(poses)?;
+        let mut output = Vec::with_capacity(self.cell_count);
+        for (geometry, frame) in self.parts.iter().zip(&frames) {
+            if !frame.visible {
+                continue;
+            }
+            for cell in &geometry.cells {
+                let center =
+                    frame.translation_m + frame.rotation * cell_offset(cell, self.cell_edge_m);
+                if !center.is_finite() {
+                    return invalid("transformed cell center is non-finite");
+                }
+                output.push(AnimalCell {
+                    part_id: geometry.part.id,
+                    material: cell.material,
+                    material_slot: cell.material_slot,
+                    tint_slot: cell.tint_slot,
+                    tint_srgb: cell.tint,
+                    center,
+                    size: Vec3::splat(self.cell_edge_m),
+                    rotation: frame.rotation,
+                });
+            }
+        }
+        Ok(output)
+    }
+
+    /// The hierarchy half of [`Self::compose`]: each part's composed placement.
+    pub fn part_frames(&self, poses: &BTreeMap<u32, PartPose>) -> Result<Vec<PartFrame>> {
         if poses.len() != self.parts.len()
             || self
                 .parts
@@ -251,6 +314,7 @@ impl AnimalVisual {
             return invalid("pose map must contain exactly one entry per part");
         }
         let mut world = BTreeMap::<u32, (Transform, bool)>::new();
+        let mut frames = Vec::with_capacity(self.parts.len());
         for geometry in &self.parts {
             let part = &geometry.part;
             let pose = poses
@@ -272,6 +336,7 @@ impl AnimalVisual {
             {
                 return invalid("composed transform is non-finite or non-unit");
             }
+            let visible = parent_visible && pose.visible;
             world.insert(
                 part.id,
                 (
@@ -280,43 +345,36 @@ impl AnimalVisual {
                         rotation,
                         scale: Vec3::ONE,
                     },
-                    parent_visible && pose.visible,
+                    visible,
                 ),
             );
+            frames.push(PartFrame {
+                translation_m: (translation - self.pivot_cells) * self.cell_edge_m,
+                rotation,
+                visible,
+            });
         }
-
-        let mut output = Vec::with_capacity(self.cell_count);
-        for geometry in &self.parts {
-            let (transform, visible) = world[&geometry.part.id];
-            if !visible {
-                continue;
-            }
-            for cell in &geometry.cells {
-                let local_center = Vec3::new(
-                    cell.at[0] as f32 + 0.5,
-                    cell.at[1] as f32 + 0.5,
-                    cell.at[2] as f32 + 0.5,
-                );
-                let center = ((transform.translation + transform.rotation * local_center)
-                    - self.pivot_cells)
-                    * self.cell_edge_m;
-                if !center.is_finite() {
-                    return invalid("transformed cell center is non-finite");
-                }
-                output.push(AnimalCell {
-                    part_id: geometry.part.id,
-                    material: cell.material,
-                    material_slot: cell.material_slot,
-                    tint_slot: cell.tint_slot,
-                    tint_srgb: cell.tint,
-                    center,
-                    size: Vec3::splat(self.cell_edge_m),
-                    rotation: transform.rotation,
-                });
-            }
-        }
-        Ok(output)
+        Ok(frames)
     }
+}
+
+/// One part's composed placement in a pose: a cell at offset `o` from
+/// [`AnimalVisual::part_cells`] has its centre at `translation_m + rotation * o`
+/// (asset-pivot-relative metres) and is oriented by `rotation`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartFrame {
+    pub translation_m: Vec3,
+    pub rotation: Quat,
+    /// The part and all its ancestors are shown.
+    pub visible: bool,
+}
+
+fn cell_offset(cell: &LocalCell, edge_m: f32) -> Vec3 {
+    Vec3::new(
+        cell.at[0] as f32 + 0.5,
+        cell.at[1] as f32 + 0.5,
+        cell.at[2] as f32 + 0.5,
+    ) * edge_m
 }
 
 /// The server's view of every species' posed voxels (ENG-237): what a strike

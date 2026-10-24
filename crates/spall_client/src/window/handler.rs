@@ -471,11 +471,27 @@ impl ApplicationHandler for InteractiveApp {
                         self.last_creature_cubes = if replica.creatures().is_empty() {
                             Vec::new()
                         } else {
+                            let feet =
+                                (*self.session.view.lock().unwrap_or_else(|e| e.into_inner()))
+                                    .map(|v| v.predicted.position_m);
+                            let aspect = self.window.as_ref().map_or(16.0 / 9.0, |w| {
+                                let size = w.inner_size();
+                                size.width as f32 / size.height.max(1) as f32
+                            });
+                            let cull = creature_cull(
+                                self.fly_eye,
+                                feet,
+                                Vec3::from_array(view_dir_from(self.yaw, self.pitch)),
+                                (self.third_person && self.player_view.is_some())
+                                    .then_some(self.third_person_distance_m),
+                                aspect,
+                            );
                             view.instances(
                                 replica.creatures(),
                                 replica.now_tick_estimate(),
                                 self.creature_tint_base,
                                 Instant::now(),
+                                cull.as_ref(),
                             )
                         };
                     }

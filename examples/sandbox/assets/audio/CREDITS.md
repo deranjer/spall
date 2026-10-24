@@ -43,6 +43,9 @@ These recordings were selected from local user-approved downloads. Runtime copie
 | player/breathing-exerted.ogg | Nox_Sound (4.7 s loop) | [Original recording](https://freesound.org/people/Nox_Sound/sounds/554907/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | player/breathing-exhausted.ogg | AbuNijmeh (21 s loop) | [Original recording](https://freesound.org/people/AbuNijmeh/sounds/319103/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | player/breathing-accent.ogg | BehanSean (single 2.4 s breath) | [Original recording](https://freesound.org/people/BehanSean/sounds/422342/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| birds/blackbird.ogg | richwise (whole preview) | [Original recording](https://freesound.org/people/richwise/sounds/811988/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| birds/robin.ogg | Sacha.Julien (0-145 s) | [Original recording](https://freesound.org/people/Sacha.Julien/sounds/725201/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| birds/blackcap.ogg | Sacha.Julien (0-56 s) | [Original recording](https://freesound.org/people/Sacha.Julien/sounds/725333/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | animals/wolf-howl.ogg | betchkal (28.8-38.5 s, the second howl) | [Original recording](https://freesound.org/people/betchkal/sounds/500646/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | animals/wolf-chorus-sanctuary.ogg | Paresh (1-14 s) | [Original recording](https://freesound.org/people/Paresh/sounds/158780/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | animals/wolf-chorus.ogg | Kingcornz (0.6-7.2 s) | [Original recording](https://freesound.org/people/Kingcornz/sounds/378334/) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
