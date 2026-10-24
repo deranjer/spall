@@ -247,6 +247,12 @@ struct Core {
     /// the regions it touched).
     fine: Option<FineTerrain>,
     fine_runs: HashMap<RegionKey, Arc<ColumnRuns>>,
+    /// With wide columns: the signature each water region's frames were last
+    /// drawn from (see `Core::region_frames`), the far regions whose changed
+    /// water waits for its turn to be drawn, and the count of frame builds.
+    drawn: HashMap<RegionKey, u64>,
+    deferred_frames: BTreeSet<RegionKey>,
+    frame_turn: u64,
 }
 
 /// What the fluid step publishes for the tick thread to read without waiting
@@ -413,6 +419,9 @@ type FineTerrain = Arc<VolumeTerrain<Arc<Volume>>>;
 /// region (`lx + 32 * lz`).
 type ColumnRuns = Vec<Vec<(i32, i32)>>;
 
+/// The frames a water region's terrain regions are drawn with (`None`: dry).
+type RegionFrames = Vec<(RegionKey, Option<RegionFrame>)>;
+
 /// The water's terrain source, and with wide columns the terrain at its own
 /// resolution as well.
 fn terrain_source(
@@ -486,28 +495,31 @@ impl Core {
     /// every metre), it takes the open run of its own column that the surface
     /// falls in as its floor, and it is dry where its terrain stands above the
     /// surface (so the water's bottom is never a wide column's raised floor).
-    fn region_frames(&self, key: RegionKey) -> Vec<(RegionKey, Option<RegionFrame>)> {
+    ///
+    /// With wide columns the frames are drawn from the region's wet spans and
+    /// the ring of columns around it, so a signature of their depths at the
+    /// resolution clients get (1/128 cells) says whether they could have
+    /// changed: when it matches `last`, nothing is
+    /// built (`None`). The signature comes back either way.
+    fn region_frames(&self, key: RegionKey, last: Option<u64>) -> (u64, Option<RegionFrames>) {
+        use std::hash::{Hash, Hasher};
         let n = i64::from(self.world.config().column_cells);
         if n == 1 {
-            return vec![(key, self.region_frame(key))];
+            return (0, Some(vec![(key, self.region_frame(key))]));
         }
         let edge = spall_fluid::columns::REGION_EDGE;
         let per = edge / n;
-        // The surface of the wet span of wide column (x, z) within a cell of
-        // height `h`: a neighbour across a fall or a wall does not blend.
+        let mut signature = std::collections::hash_map::DefaultHasher::new();
+        let quantized = |depth: f64| (depth * FRAME_DEPTH_SCALE).round() as i64;
         // The region's wet spans, read once, and their surfaces and currents
         // by column; the ring of columns just outside the region likewise.
-        let wet_spans = self.world.region_wet_spans_with_flow(key, DRY_VOLUME);
+        // The signature reads depths only: a current is worked out from every
+        // pipe of its span, and it changes with the depths around it.
+        for (column, floor_y, volume) in self.world.region_wet_spans(key, DRY_VOLUME) {
+            (column, floor_y, quantized(volume)).hash(&mut signature);
+        }
         // (surface, current, floor) of each wet span.
         type Surfaces = Vec<(f64, [f32; 2], f64)>;
-        let mut by_column: HashMap<u16, Surfaces> = HashMap::new();
-        for &(column, floor_y, volume, height, flow) in &wet_spans {
-            by_column.entry(column).or_default().push((
-                f64::from(floor_y) + volume.min(f64::from(height)),
-                flow,
-                f64::from(floor_y),
-            ));
-        }
         let (x0, z0) = (i64::from(key.0) * edge, i64::from(key.1) * edge);
         let column_m = self.world.column_m();
         let mut ring: HashMap<(i64, i64), Surfaces> = HashMap::new();
@@ -521,27 +533,45 @@ impl Core {
                 if ring.contains_key(&(x, z)) {
                     continue;
                 }
+                // Currents are read below, only if the frames are built.
                 let surfaces: Surfaces = self
                     .world
                     .spans_in_column(x, z)
                     .iter()
                     .filter(|s| s.volume > DRY_VOLUME)
-                    .map(|s| {
-                        let top = s.floor_y as f64 + s.depth;
-                        let flow = self
-                            .world
-                            .flow_at_m(
-                                (x as f64 + 0.5) * column_m,
-                                (s.floor_y as f64 + 0.5 * s.depth) * CELL_SIZE_M,
-                                (z as f64 + 0.5) * column_m,
-                            )
-                            .unwrap_or([0.0; 2]);
-                        (top, flow, s.floor_y as f64)
-                    })
+                    .map(|s| (s.floor_y as f64 + s.depth, [0.0; 2], s.floor_y as f64))
                     .collect();
+                for &(top, _, floor) in &surfaces {
+                    (x, z, quantized(top), floor as i64).hash(&mut signature);
+                }
                 if !surfaces.is_empty() {
                     ring.insert((x, z), surfaces);
                 }
+            }
+        }
+        let signature = signature.finish();
+        if last == Some(signature) {
+            return (signature, None);
+        }
+        let wet_spans = self.world.region_wet_spans_with_flow(key, DRY_VOLUME);
+        let mut by_column: HashMap<u16, Surfaces> = HashMap::new();
+        for &(column, floor_y, volume, height, flow) in &wet_spans {
+            by_column.entry(column).or_default().push((
+                f64::from(floor_y) + volume.min(f64::from(height)),
+                flow,
+                f64::from(floor_y),
+            ));
+        }
+        for (&(x, z), surfaces) in ring.iter_mut() {
+            for entry in surfaces.iter_mut() {
+                entry.1 = self
+                    .world
+                    .flow_at_m(
+                        (x as f64 + 0.5) * column_m,
+                        (entry.2 + 0.5 * (entry.0 - entry.2)) * CELL_SIZE_M,
+                        (z as f64 + 0.5) * column_m,
+                    )
+                    .unwrap_or([0.0; 2]);
             }
         }
         let surfaces_at = |x: i64, z: i64| -> &[(f64, [f32; 2], f64)] {
@@ -713,7 +743,8 @@ impl Core {
                 }
             }
         }
-        subs.into_iter()
+        let frames = subs
+            .into_iter()
             .zip(spans)
             .map(|(fkey, mut spans)| {
                 spans.sort_by_key(|s| (s.column, s.floor_y));
@@ -723,7 +754,8 @@ impl Core {
                     (!spans.is_empty()).then_some(RegionFrame { key: fkey, spans }),
                 )
             })
-            .collect()
+            .collect();
+        (signature, Some(frames))
     }
 
     fn region_frame(&self, key: RegionKey) -> Option<RegionFrame> {
@@ -758,16 +790,63 @@ impl Core {
         previous: &Arc<ColumnWaterFrame>,
         keys: Option<Vec<RegionKey>>,
     ) -> Option<(Arc<ColumnWaterFrame>, usize)> {
-        let keys = keys.unwrap_or_else(|| self.world.region_keys());
+        let full = keys.is_none();
+        let mut keys = keys.unwrap_or_else(|| self.world.region_keys());
+        if self.world.config().column_cells > 1 && !full {
+            // Far water runs in slow motion, one step in its pace, and its
+            // frames refresh at that pace too: a far region's change waits for
+            // its turn (held, never dropped).
+            self.frame_turn = self.frame_turn.wrapping_add(1);
+            let turn = self.frame_turn;
+            let waiting = std::mem::take(&mut self.deferred_frames);
+            let mut due = Vec::new();
+            for key in keys.into_iter().chain(waiting) {
+                if turn.is_multiple_of(self.world.region_pace(key)) {
+                    due.push(key);
+                } else {
+                    self.deferred_frames.insert(key);
+                }
+            }
+            due.sort_unstable();
+            due.dedup();
+            keys = due;
+        }
+        if self.world.config().column_cells > 1 {
+            // A region is drawn against the ring around it (blending, the shore
+            // fill), so its neighbours' frames may change with it; those whose
+            // signature did not are skipped.
+            let mut around: BTreeSet<RegionKey> = keys.iter().copied().collect();
+            for &(x, z) in &keys {
+                for k in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                    if self.world.is_region_allocated(k) {
+                        around.insert(k);
+                    }
+                }
+            }
+            keys = around.into_iter().collect();
+        }
         self.cache_fine_runs(&keys);
         let mut changed = Vec::new();
         let span_rf = crate::prof::Span::start("water.frames.regions");
         // Each region's frame reads the world only; build them in parallel.
         use rayon::prelude::*;
-        let built: Vec<(RegionKey, Option<RegionFrame>)> = keys
+        type Built = (
+            RegionKey,
+            u64,
+            Option<Vec<(RegionKey, Option<RegionFrame>)>>,
+        );
+        let results: Vec<Built> = keys
             .par_iter()
-            .flat_map_iter(|&key| self.region_frames(key))
+            .map(|&key| {
+                let (signature, frames) = self.region_frames(key, self.drawn.get(&key).copied());
+                (key, signature, frames)
+            })
             .collect();
+        let mut built = Vec::new();
+        for (key, signature, frames) in results {
+            self.drawn.insert(key, signature);
+            built.extend(frames.into_iter().flatten());
+        }
         for (key, new) in built {
             let old = self.regions.get(&key);
             if new.as_ref() != old.map(|r| r.as_ref()) {
@@ -896,6 +975,9 @@ impl Shared {
                     .collect();
                 for k in stale {
                     core.fine_runs.remove(&k);
+                }
+                for k in change.edited.iter().chain(&change.reloaded) {
+                    core.drawn.remove(k);
                 }
                 core.fine = change.fine;
             }
@@ -1158,6 +1240,9 @@ impl AuthoritativeColumnWater {
                 evaporating_s: 0.0,
                 fine,
                 fine_runs: HashMap::new(),
+                drawn: HashMap::new(),
+                deferred_frames: BTreeSet::new(),
+                frame_turn: 0,
             }),
             owed: Mutex::new(Owed {
                 seconds: 0.0,

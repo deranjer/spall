@@ -750,6 +750,13 @@ impl ColumnWorld {
             .count()
     }
 
+    /// How many steps the region at `key` takes one in now, from its distance
+    /// to the nearest focus point: 1, 2, 4 or 8 (see
+    /// [`ColumnConfig::throttle_from_cells`]).
+    pub fn region_pace(&self, key: RegionKey) -> u64 {
+        pace_at(&self.focus, self.config.throttle_from_cells, key)
+    }
+
     /// Whether the region holding column `(x, z)` rested in the last step (far
     /// from every focus point, see [`ColumnConfig::throttle_from_cells`]).
     pub fn is_column_resting(&self, x: i64, z: i64) -> bool {

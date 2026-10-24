@@ -4,7 +4,8 @@
 //! unsupported anywhere. `NOSPRINGS=1` drops springs and drains, `NOSINKS=1`
 //! drains only, `SINKS=1` lists the drains, `SETTLE=max_seconds` first runs the
 //! water with no player until its regions stop changing, and
-//! `SPALL_WATER_COARSE=1` runs it at 1 m columns.
+//! `SPALL_WATER_COARSE=1` runs it at 1 m columns. `SETTLED_CACHE=<dir>` starts
+//! from the server's settled-water cache in that folder.
 //! `cargo run --release -p sandbox --example water_long_probe -- PRESET SEED SIZE SECONDS X_M Z_M`
 use std::time::Instant;
 
@@ -96,7 +97,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0);
     let t = Instant::now();
-    let scene = worldgen_scene::generate(&preset, seed, size)?;
+    let mut scene = worldgen_scene::generate(&preset, seed, size)?;
+    // `SETTLED_CACHE=<dir>`: start from the settled water the server caches
+    // there (settling and caching it first if missing), as play does.
+    if let Ok(dir) = std::env::var("SETTLED_CACHE") {
+        scene = scene.settle_water(
+            std::path::Path::new(&dir),
+            &format!("{preset}-{seed}-{size}-summer"),
+        );
+    }
     eprintln!("worldgen {:.1}s", t.elapsed().as_secs_f64());
     let mut setup = scene.column_water_setup().cloned().ok_or("no water")?;
     // `NOSPRINGS=1`: no spring discharges or drains, only the seeded water.
@@ -212,6 +221,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let mut last = Instant::now();
     let mut steps = 0u64;
+    // Time per stage of the water tick (`spall_sim::prof` spans), per interval.
+    let mut stages: std::collections::BTreeMap<&'static str, f64> = Default::default();
     // Per interval: time in the solver steps, substeps, spans stepped, regions
     // resting and caught up (summed over steps).
     let (mut solve, mut subs, mut spans, mut resting, mut caught) =
@@ -221,6 +232,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             water.set_focus(&[at(tick as f64 * dt)]);
         }
         let m = water.tick(&scene.world().terrain, &[], &[], dt)?;
+        for (name, took) in spall_sim::prof::drain() {
+            *stages.entry(name).or_insert(0.0) += took.as_secs_f64();
+        }
         steps += u64::from(m.steps);
         solve += m.step_duration.as_secs_f64();
         if let Some(st) = m.step {
@@ -249,6 +263,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 m.skipped_s,
                 water.diag_summary(),
             );
+            let per: Vec<String> = stages
+                .iter()
+                .map(|(name, t)| format!("{name} {:.2}", t * 1e3 / n))
+                .collect();
+            eprintln!("stages, ms per step: {}", per.join(", "));
+            stages.clear();
             eprintln!(
                 "springs +{:.0} m3, drains, evaporation and the held sea -{:.0} m3",
                 water.frame().spring_added_m3,

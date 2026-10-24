@@ -579,7 +579,12 @@ solid terrain cell at the water's height holds no water (about 2% of the
 planned volume of the 1 km world, all at shores), but the frames draw the water
 on into its open terrain columns from the wet side, stopping at any wall and
 at any column more than a cell below the wet neighbour's floor (a hole or a
-drop), so the waterline is the true shore. A canal cut fills at about the same
+drop), so the waterline is the true shore. A 1 m region's frames are rebuilt only when a
+signature of its depths and of the ring around it changed, a region is rebuilt
+with its neighbours (their edges blend with it), and a far region's frames
+refresh at its throttle pace (its changes wait, never dropped); on the settled
+1 km world on 8 threads this took frame building from about 5.8 to 2.0 ms a
+step, and the whole water step from about 8.5 to 5 ms. A canal cut fills at about the same
 pace as at 0.25 m (a 2 m gap from a 2.5 m deep pool: water 13 m past it in 7.7 s
 against 7.8 s). In this mode the sea is held at its level (a
 river ends where it meets it) and inland water open to the sky evaporates

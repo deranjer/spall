@@ -570,6 +570,67 @@ mod wide_columns {
         assert!(!wet(20, 20), "nor the post");
     }
 
+    /// A region is drawn against its neighbours' water too: when the water
+    /// region east of it fills, its own dry border columns are drawn wet up to
+    /// a wall, although nothing in it changed.
+    #[test]
+    fn a_region_redraws_its_shore_when_the_region_beside_it_fills() {
+        // Two water regions (terrain x 0..128 and 128..256) and a wall at
+        // terrain x = 124, all the way up, closing the wide column (31, z) of
+        // the west one: no pipe joins the regions, so nothing in the west one
+        // moves.
+        let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        for bz in 0..4 {
+            for bx in 0..8 {
+                terrain
+                    .insert_brick(
+                        BrickCoord::new(bx, 0, bz),
+                        Brick::uniform(MaterialId::AIR, Revision(1)),
+                    )
+                    .unwrap();
+            }
+        }
+        let mut plan = EditPlan::new(terrain.id());
+        for z in 0..128 {
+            for y in 0..32 {
+                for x in 0..256 {
+                    let rim = x == 0 || z == 0 || x == 255 || z == 127;
+                    if y < 2 || (rim && y < 28) || x == 124 {
+                        plan.set(GlobalCell::new(x, y, z), STONE);
+                    }
+                }
+            }
+        }
+        terrain.apply_edit(&plan).unwrap();
+        let mut setup = ColumnWaterSetup::new(0, 32, Vec::new());
+        setup.config.column_cells = 4;
+        setup.discharges = vec![spall_sim::column_water::Discharge {
+            cell: GlobalCell::new(200, 2, 64),
+            flow_cells3_s: 4000.0,
+        }];
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+        let wet = |water: &AuthoritativeColumnWater, x: i64| {
+            water
+                .frame()
+                .regions
+                .get(&((x / 32) as i32, 2))
+                .is_some_and(|r| {
+                    r.spans
+                        .iter()
+                        .any(|s| i64::from(s.column) == x % 32 + 32 * 2 && s.depth_q > 0)
+                })
+        };
+        tick(&mut water, &terrain, 1.0);
+        assert!(!wet(&water, 126), "dry before the east fills");
+        tick(&mut water, &terrain, 40.0);
+        assert!(wet(&water, 130), "the east region filled");
+        assert!(
+            wet(&water, 126),
+            "the west region's border drawn up to the wall"
+        );
+        assert!(!wet(&water, 124) && !wet(&water, 123), "and not past it");
+    }
+
     /// Flowing water slopes between wide columns: the frames blend each
     /// terrain column's surface between its wide column and the neighbours,
     /// so it does not step a metre at a time.
@@ -686,6 +747,27 @@ mod wide_columns {
                 .is_some_and(|d| !d.regions.is_empty());
         }
         assert!(changed, "a 1 m world is journalled");
+    }
+
+    /// Far water's frames refresh at its pace, and a change waits for its turn
+    /// rather than being lost: a spring far from the player still shows.
+    #[test]
+    fn far_water_is_drawn_at_its_pace() {
+        let terrain = terrain(true);
+        let mut setup = setup();
+        setup.initial_levels.clear();
+        setup.config.throttle_from_cells = [10.0, 20.0, 40.0];
+        setup.discharges = vec![Discharge {
+            cell: GlobalCell::new(10, 2, 10),
+            flow_cells3_s: 64.0,
+        }];
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+        water.set_focus(&[[5000.0, 5000.0]]);
+        tick(&mut water, &terrain, 10.0);
+        assert!(
+            water.water_sample_at_m(2.6, 0.6, 2.6).is_some(),
+            "the far spring's water is drawn"
+        );
     }
 
     #[test]
