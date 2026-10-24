@@ -542,7 +542,16 @@ impl ColumnWorld {
     /// nothing has to wake. Regions where a span dried out are marked changed.
     /// Returns the volume removed and the wet columns it was taken from.
     pub fn evaporate(&mut self, depth: f64, above_y: f64) -> (f64, usize) {
-        let spans = &self.spans;
+        // Far water runs in slow motion (see `ColumnConfig::throttle_from_cells`),
+        // and so does its evaporation: a region far from every focus point loses
+        // a half, a quarter or an eighth, as its springs add.
+        let bands = self.config.throttle_from_cells;
+        let share: Vec<f64> = self
+            .regions
+            .iter()
+            .map(|r| 1.0 / super::pace_at(&self.focus, bands, r.key) as f64)
+            .collect();
+        let (spans, regions) = (&self.spans, &self.regions);
         let (removed, wet, dried): (f64, usize, Vec<u32>) = self
             .volume
             .par_chunks_mut(1 << 16)
@@ -550,17 +559,23 @@ impl ColumnWorld {
             .map(|(chunk, vols)| {
                 let base = chunk << 16;
                 let (mut removed, mut wet, mut dried) = (0.0, 0usize, Vec::new());
+                // Regions hold consecutive spans in slot order.
+                let mut slot = regions.partition_point(|r| (r.span_end as usize) <= base);
                 for (k, v) in vols.iter_mut().enumerate() {
-                    let span = spans[base + k];
+                    let i = base + k;
+                    while slot < regions.len() && regions[slot].span_end as usize <= i {
+                        slot += 1;
+                    }
+                    let span = spans[i];
                     if *v <= 0.0 || !span.sky || f64::from(span.y0) + *v <= above_y {
                         continue;
                     }
                     wet += 1;
-                    let take = depth.min(*v);
+                    let take = (depth * share.get(slot).copied().unwrap_or(1.0)).min(*v);
                     *v -= take;
                     removed += take;
                     if *v <= 0.0 {
-                        dried.push((base + k) as u32);
+                        dried.push(i as u32);
                     }
                 }
                 (removed, wet, dried)

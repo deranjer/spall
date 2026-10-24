@@ -511,6 +511,32 @@ fn column_xz(key: RegionKey, local: usize) -> (i64, i64) {
     )
 }
 
+/// How many steps a region at `key` takes one in, from its distance to the
+/// nearest focus point (see [`ColumnConfig::throttle_from_cells`]): 1, 2, 4
+/// or 8, and 1 with no focus or the bands off.
+fn pace_at(focus: &[[f64; 2]], bands: [f32; 3], key: RegionKey) -> u64 {
+    if bands[0] <= 0.0 || focus.is_empty() {
+        return 1;
+    }
+    let centre = [
+        f64::from(key.0) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
+        f64::from(key.1) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
+    ];
+    let distance = focus
+        .iter()
+        .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
+        .fold(f64::INFINITY, f64::min);
+    if distance >= f64::from(bands[2]) {
+        8
+    } else if distance >= f64::from(bands[1]) {
+        4
+    } else if distance >= f64::from(bands[0]) {
+        2
+    } else {
+        1
+    }
+}
+
 /// The open vertical runs `(floor y, one past the top)` of each of a region's
 /// columns (`lx + 32 * lz`), bottom to top.
 pub fn open_runs(terrain: &RegionTerrain, y_lo: i32, y_hi: i32) -> Vec<Vec<(i32, i32)>> {
@@ -1130,24 +1156,7 @@ impl ColumnWorld {
         let mut changed = false;
         for (slot, r) in self.regions.iter_mut().enumerate() {
             let (period, rest) = if on && r.active && !r.frozen {
-                let centre = [
-                    f64::from(r.key.0) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
-                    f64::from(r.key.1) * REGION_EDGE as f64 + 0.5 * REGION_EDGE as f64,
-                ];
-                let distance = self
-                    .focus
-                    .iter()
-                    .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
-                    .fold(f64::INFINITY, f64::min);
-                let period = if distance >= f64::from(bands[2]) {
-                    8u64
-                } else if distance >= f64::from(bands[1]) {
-                    4
-                } else if distance >= f64::from(bands[0]) {
-                    2
-                } else {
-                    1
-                };
+                let period = pace_at(&self.focus, bands, r.key);
                 // Regions of a period all step on the same steps, and the periods
                 // nest, so two neighbours step together whenever the slower of
                 // them does and the water between them moves at its pace.
