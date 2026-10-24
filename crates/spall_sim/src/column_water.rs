@@ -90,6 +90,10 @@ pub struct ColumnWaterSetup {
     /// A fixed amount of simulated time, never wall time: the result is
     /// deterministic. 0 starts at rest.
     pub prewarm_s: f64,
+    /// Water to start from instead of the planned levels (a settled world, see
+    /// the sandbox's `settle_water`): restored exactly, with this setup's
+    /// solver config. The springs, drains and width are the state's.
+    pub initial_state: Option<ColumnWaterState>,
     /// Evaporation, cells of depth per second, from water open to the sky whose
     /// surface is above `evaporation_above_y` (a global y in cells; the sea
     /// below it keeps its level). 0 turns it off. Springs and evaporation
@@ -118,6 +122,7 @@ impl ColumnWaterSetup {
             discharges: Vec::new(),
             gated_rate: 0,
             prewarm_s: 0.0,
+            initial_state: None,
             evaporation_cells_per_s: 0.0,
             evaporation_above_y: 0.0,
             sea_level_y: None,
@@ -965,6 +970,9 @@ fn water_pool_threads() -> usize {
 impl AuthoritativeColumnWater {
     pub fn new(terrain: &Volume, setup: ColumnWaterSetup) -> Result<Self, ColumnWaterError> {
         check_setup(&setup)?;
+        if let Some(state) = &setup.initial_state {
+            return Self::restore(terrain, state, setup.config);
+        }
         let mut world =
             ColumnWorld::with_terrain(terrain_source(terrain, &setup).0, sliced(setup.config));
         let rejected = world.seed_cells(&setup.initial_cells);

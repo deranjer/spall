@@ -233,7 +233,120 @@ pub fn water_coarse() -> bool {
     std::env::var("SPALL_WATER_COARSE").is_ok_and(|v| v == "1")
 }
 
+/// Water seconds a settle may run before giving up on its regions going still.
+const SETTLE_MAX_S: f64 = 4000.0;
+
 impl GeneratedScene {
+    /// Starts the water settled instead of at the planned levels, which are not
+    /// at rest (rivers are seeded above their running depth and run off for
+    /// about half an hour of water time). The first time, the water runs with
+    /// no player (nothing throttled) until its active and wet regions stop
+    /// changing, about 10 minutes for a 1 km world at 1 m columns, and the result
+    /// is cached in `cache_dir` under `key` plus the solver settings; later
+    /// starts load it. Any failure to read or write the cache is reported and
+    /// falls back to settling or to the planned levels.
+    pub fn settle_water(mut self, cache_dir: &std::path::Path, key: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let Some(setup) = self.column_water.clone() else {
+            return self;
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!(
+            "{:?} {:?} {:?} {}",
+            setup.config,
+            setup.sea_level_y,
+            setup.evaporation_cells_per_s,
+            spall_protocol::WIRE_SCHEMA_VERSION
+        )
+        .hash(&mut hasher);
+        self.world.version.hash(&mut hasher);
+        let path = cache_dir.join(format!("water-{key}-{:016x}.bin", hasher.finish()));
+        let state = match std::fs::read(&path) {
+            Ok(bytes) => match spall_store::dto::decode::<spall_protocol::ColumnWaterState>(&bytes)
+            {
+                Ok(state) => {
+                    eprintln!(
+                        "sandbox-server: settled water loaded from {}",
+                        path.display()
+                    );
+                    Some(state)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "sandbox-server: settled water cache {} unreadable ({error}); settling again",
+                        path.display()
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        let state = state.or_else(|| {
+            let started = std::time::Instant::now();
+            let mut water = match spall_sim::column_water::AuthoritativeColumnWater::new(
+                &self.world.terrain,
+                setup.clone(),
+            ) {
+                Ok(water) => water,
+                Err(error) => {
+                    eprintln!("sandbox-server: cannot settle the water: {error}");
+                    return None;
+                }
+            };
+            water.set_focus(&[]);
+            let dt = 1.0 / 60.0;
+            let (mut previous, mut calm, mut t) = ((0usize, 0usize), 0u32, 0.0);
+            while t < SETTLE_MAX_S {
+                let mut metrics = None;
+                for _ in 0..6000 {
+                    match water.tick(&self.world.terrain, &[], &[], dt) {
+                        Ok(m) => metrics = Some(m),
+                        Err(error) => {
+                            eprintln!("sandbox-server: settling stopped: {error}");
+                            return None;
+                        }
+                    }
+                }
+                t += 100.0;
+                let m = metrics?;
+                let now = (m.active_regions, m.allocated_regions);
+                // Still: no region newly wet, and the active ones within 3% (or
+                // three regions, for small worlds) of the last check.
+                let still = now.1 == previous.1
+                    && now.0.abs_diff(previous.0) as f64 <= (0.03 * previous.0 as f64).max(3.0);
+                calm = if still { calm + 1 } else { 0 };
+                eprintln!(
+                    "sandbox-server: settling water: {t:.0} s of water time in {:.0} s, {} active regions",
+                    started.elapsed().as_secs_f64(),
+                    now.0
+                );
+                previous = now;
+                if calm >= 2 {
+                    break;
+                }
+            }
+            let state = water.canonical_state();
+            let written = std::fs::create_dir_all(cache_dir)
+                .map_err(|e| e.to_string())
+                .and_then(|()| spall_store::dto::encode(&state).map_err(|e| e.to_string()))
+                .and_then(|bytes| {
+                    let tmp = path.with_extension("tmp");
+                    std::fs::write(&tmp, bytes)
+                        .and_then(|()| std::fs::rename(&tmp, &path))
+                        .map_err(|e| e.to_string())
+                });
+            match written {
+                Ok(()) => eprintln!("sandbox-server: settled water cached at {}", path.display()),
+                Err(error) => eprintln!("sandbox-server: settled water not cached: {error}"),
+            }
+            Some(state)
+        });
+        if let (Some(state), Some(water)) = (state, self.column_water.as_mut()) {
+            water.initial_state = Some(state);
+        }
+        self
+    }
+
     pub fn vegetation(&self) -> &spall_ecology::living::LivingState {
         &self.vegetation
     }
