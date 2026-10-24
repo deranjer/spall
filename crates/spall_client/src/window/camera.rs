@@ -209,6 +209,52 @@ pub(super) fn srgb_to_linear(channel: u8) -> f32 {
     }
 }
 
+/// How far behind the estimated eye the creature cull cone starts, metres. The
+/// eye is estimated before the frame's camera is (from the newest prediction,
+/// not the smoothed follow), so this covers that gap and a frame of fast
+/// flying: pulling the apex back `s` keeps everything within `s·sin(half
+/// angle)` of the estimate inside the cone.
+const CREATURE_CULL_SLACK_M: f32 = 3.0;
+
+/// The creature cull for a frame, from what is known before the camera is
+/// built: the fly camera, or the predicted feet; the look direction; the
+/// third-person distance when the camera sits behind the player.
+pub(super) fn creature_cull(
+    fly_eye: Option<Vec3>,
+    feet_m: Option<[f64; 3]>,
+    dir: Vec3,
+    third_person_m: Option<f32>,
+    aspect: f32,
+) -> Option<CreatureCull> {
+    let eye = fly_eye.or_else(|| {
+        feet_m.map(|feet| {
+            let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
+            let eye = Vec3::new(
+                feet[0] as f32,
+                (feet[1] + eye_height_m) as f32,
+                feet[2] as f32,
+            );
+            match third_person_m {
+                Some(distance) if fly_eye.is_none() => third_person_eye(eye, dir, distance),
+                _ => eye,
+            }
+        })
+    })?;
+    let dir = dir.try_normalize()?;
+    // A cone around the frustum's corner rays contains the whole frustum.
+    let tan_half_y = (CAMERA_FOV_Y_DEG.to_radians() * 0.5).tan();
+    let half_angle_rad = (tan_half_y * (1.0 + aspect.max(1e-3).powi(2)).sqrt()).atan();
+    let apex = eye - dir * CREATURE_CULL_SLACK_M;
+    let to_f64 = |v: Vec3| [f64::from(v.x), f64::from(v.y), f64::from(v.z)];
+    Some(CreatureCull {
+        apex_m: to_f64(apex),
+        forward: dir.to_array(),
+        half_angle_rad,
+        eye_m: to_f64(eye),
+        max_distance_m: view_radius_m() + CREATURE_CULL_SLACK_M,
+    })
+}
+
 /// Vertical field of view of the game camera.
 pub(super) const CAMERA_FOV_Y_DEG: f32 = 75.0;
 pub(super) const CAMERA_Z_NEAR_M: f32 = 0.05;

@@ -1,31 +1,193 @@
-//! Client-side drawing of replicated animals: samples the authored SPVX clip
-//! for each replicated record at its presented pose and emits lit cubes.
+//! Client-side drawing of replicated animals: places each replicated record's
+//! authored SPVX pose at its presented root and emits lit cubes.
+//!
+//! Every clip is posed once per whole tick at startup (animation runs at
+//! 60 ticks/s, so the client never needs finer phases): a table of part
+//! placements, not cells, so it stays small. A frame then culls creatures the
+//! camera cannot see and, for the rest, does one matrix-vector product per
+//! cell.
 
 use std::time::Instant;
 
-use glam::{Quat, Vec3};
+use glam::{Mat3, Quat, Vec3};
 use spall_client::replica_creatures::ReplicaCreatures;
-use spall_client::window::CreatureView;
+use spall_client::window::{CreatureCull, CreatureView};
 use spall_core::MaterialId;
 use spall_render::CubeInstance;
 
-use crate::animal_visual::{AnimalVisual, MAX_ANIMAL_VISUAL_CELLS, material_mapping};
+use crate::animal_visual::{AnimalVisual, MAX_ANIMAL_VISUAL_CELLS, PartFrame, material_mapping};
 use crate::animals::{AnimalError, LOCOMOTION_IDLE, locomotion_clip, species};
 
 #[derive(Debug)]
 pub struct AnimalView {
-    visuals: Vec<(&'static str, AnimalVisual)>,
+    species: Vec<SpeciesDraw>,
     /// Distinct `(material, tint)` pairs the species paint with: animals are
     /// drawn in their palette colours, not their materials' own.
     tints: Vec<(MaterialId, [u8; 3])>,
     started: Instant,
 }
 
+/// One clip posed at every whole tick: `frames[tick * parts + part]`.
+#[derive(Debug)]
+struct ClipPoses {
+    name: String,
+    duration: usize,
+    frames: Vec<PartFrame>,
+    /// Ticks the asset could not be posed at; drawn as nothing, as before.
+    valid: Vec<bool>,
+}
+
+#[derive(Debug)]
+struct SpeciesDraw {
+    key: &'static str,
+    clips: Vec<ClipPoses>,
+    /// Every cell's offset from its part's joint (metres), material and index
+    /// into the view's tints (if painted), in part order; part `i` owns
+    /// `cells[part_ends[i - 1]..part_ends[i]]`.
+    cells: Vec<(Vec3, u32, Option<u32>)>,
+    part_ends: Vec<usize>,
+    edge_m: f32,
+    /// Farthest any cell reaches from the root, over every posed tick, metres.
+    radius_m: f32,
+}
+
+impl SpeciesDraw {
+    fn new(key: &'static str, visual: &AnimalVisual, tints: &[(MaterialId, [u8; 3])]) -> Self {
+        let edge_m = visual.cell_edge_m();
+        let mut cells = Vec::with_capacity(visual.cell_count());
+        let mut part_ends = Vec::with_capacity(visual.part_count());
+        let mut part_reach = Vec::with_capacity(visual.part_count());
+        for part in visual.part_cells() {
+            let mut reach = 0.0_f32;
+            for (offset, material, tint) in part {
+                reach = reach.max(offset.length());
+                let tint = tint
+                    .and_then(|tint| tints.iter().position(|t| *t == (material, tint)))
+                    .map(|i| i as u32);
+                cells.push((offset, u32::from(material.0), tint));
+            }
+            part_ends.push(cells.len());
+            part_reach.push(reach);
+        }
+        // A cell's corner is half a diagonal past its centre.
+        let corner = edge_m * 3.0_f32.sqrt() * 0.5;
+        let mut radius_m = 0.0_f32;
+        let parts = part_ends.len();
+        let clips = visual
+            .clips()
+            .map(|(name, duration)| {
+                let duration = duration.max(1) as usize;
+                let mut frames = Vec::with_capacity(duration * parts);
+                let mut valid = Vec::with_capacity(duration);
+                for tick in 0..duration {
+                    match visual.sample_part_frames(name, tick as f64) {
+                        Ok(posed) if posed.len() == parts => {
+                            for (frame, reach) in posed.iter().zip(&part_reach) {
+                                if frame.visible {
+                                    radius_m =
+                                        radius_m.max(frame.translation_m.length() + reach + corner);
+                                }
+                            }
+                            frames.extend(posed);
+                            valid.push(true);
+                        }
+                        _ => {
+                            frames.extend(std::iter::repeat_n(
+                                PartFrame {
+                                    translation_m: Vec3::ZERO,
+                                    rotation: Quat::IDENTITY,
+                                    visible: false,
+                                },
+                                parts,
+                            ));
+                            valid.push(false);
+                        }
+                    }
+                }
+                ClipPoses {
+                    name: name.to_owned(),
+                    duration,
+                    frames,
+                    valid,
+                }
+            })
+            .collect();
+        Self {
+            key,
+            clips,
+            cells,
+            part_ends,
+            edge_m,
+            radius_m,
+        }
+    }
+
+    /// Part placements of `clip` at `phase` ticks, wrapped into the clip.
+    fn pose(&self, clip: &str, phase: f64) -> Option<&[PartFrame]> {
+        let clip = self.clips.iter().find(|c| c.name == clip)?;
+        let tick = (phase.rem_euclid(clip.duration as f64).floor() as usize) % clip.duration;
+        let parts = self.part_ends.len();
+        clip.valid[tick].then(|| &clip.frames[tick * parts..(tick + 1) * parts])
+    }
+
+    fn emit(
+        &self,
+        pose: &[PartFrame],
+        root_q: Quat,
+        root_t: Vec3,
+        tint_base: u32,
+        out: &mut Vec<CubeInstance>,
+    ) {
+        let size = [self.edge_m; 3];
+        let mut start = 0;
+        for (frame, &end) in pose.iter().zip(&self.part_ends) {
+            let range = start..end;
+            start = end;
+            if !frame.visible {
+                continue;
+            }
+            let rotation = (root_q * frame.rotation).normalize();
+            let basis = Mat3::from_quat(rotation);
+            let origin = root_t + root_q * frame.translation_m;
+            let rotation = rotation.to_array();
+            out.extend(self.cells[range].iter().map(|&(offset, material, tint)| {
+                CubeInstance::new(
+                    (origin + basis * offset).to_array(),
+                    tint.map_or(material, |i| tint_base + i),
+                    size,
+                    rotation,
+                )
+            }));
+        }
+    }
+}
+
+/// Whether any of a creature whose cells lie within `radius_m` of `centre_m`
+/// can be in view.
+fn in_view(cull: &CreatureCull, centre_m: [f64; 3], radius_m: f32) -> bool {
+    let radius = f64::from(radius_m);
+    let horizontal = (centre_m[0] - cull.eye_m[0]).hypot(centre_m[2] - cull.eye_m[2]);
+    if horizontal > f64::from(cull.max_distance_m) + radius {
+        return false;
+    }
+    let to = Vec3::new(
+        (centre_m[0] - cull.apex_m[0]) as f32,
+        (centre_m[1] - cull.apex_m[1]) as f32,
+        (centre_m[2] - cull.apex_m[2]) as f32,
+    );
+    let distance = to.length();
+    if distance <= radius_m {
+        return true;
+    }
+    let cos = (to.dot(Vec3::from_array(cull.forward)) / distance).clamp(-1.0, 1.0);
+    cos.acos() <= cull.half_angle_rad + (radius_m / distance).asin()
+}
+
 impl AnimalView {
     pub fn new() -> Result<Self, AnimalError> {
         let mapping = material_mapping(&crate::game::manifest());
-        let mut tints = Vec::new();
-        let mut visuals = Vec::new();
+        let mut tints: Vec<(MaterialId, [u8; 3])> = Vec::new();
+        let mut assets = Vec::new();
         for s in species()? {
             let key = s.key;
             for run in s.asset.runs.iter().filter(|run| run.tint_slot != 0) {
@@ -41,10 +203,14 @@ impl AnimalView {
             }
             let visual = AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS)
                 .map_err(|e| AnimalError::Asset(key, e.to_string()))?;
-            visuals.push((key, visual));
+            assets.push((key, visual));
         }
+        let species = assets
+            .iter()
+            .map(|(key, visual)| SpeciesDraw::new(key, visual, &tints))
+            .collect();
         Ok(Self {
-            visuals,
+            species,
             tints,
             started: Instant::now(),
         })
@@ -62,17 +228,19 @@ impl CreatureView for AnimalView {
         _tick: f64,
         tint_base: u32,
         now: Instant,
+        cull: Option<&CreatureCull>,
     ) -> Vec<CubeInstance> {
-        let mut out = Vec::new();
+        // Pose first, then write every cube into one allocation.
+        let mut posed = Vec::new();
         for record in creatures.records() {
-            let Some((species_key, visual)) =
-                self.visuals.iter().find(|(key, _)| *key == record.species)
-            else {
+            let Some(draw) = self.species.iter().find(|s| s.key == record.species) else {
                 continue;
             };
             let presented = creatures.presentation(record, now);
-            let clip = locomotion_clip(species_key, presented.locomotion_tag).unwrap_or("idle");
-            let duration = f64::from(visual.clip_duration(clip).unwrap_or(1).max(1));
+            if cull.is_some_and(|cull| !in_view(cull, presented.translation_m, draw.radius_m)) {
+                continue;
+            }
+            let clip = locomotion_clip(draw.key, presented.locomotion_tag).unwrap_or("idle");
             // Resting animals idle on a local clock, offset per creature so a herd
             // does not breathe in step.
             let phase = if presented.locomotion_tag == LOCOMOTION_IDLE {
@@ -81,7 +249,7 @@ impl CreatureView for AnimalView {
             } else {
                 presented.clip_phase_tick
             };
-            let Ok(cells) = visual.sample(clip, phase.rem_euclid(duration)) else {
+            let Some(pose) = draw.pose(clip, phase) else {
                 continue;
             };
             let [x, y, z, w] = presented.rotation_xyzw;
@@ -91,18 +259,16 @@ impl CreatureView for AnimalView {
                 presented.translation_m[1] as f32,
                 presented.translation_m[2] as f32,
             );
-            out.extend(cells.iter().map(|cell| {
-                let material = cell
-                    .tint_srgb
-                    .and_then(|tint| self.tints.iter().position(|t| *t == (cell.material, tint)))
-                    .map_or(u32::from(cell.material.0), |i| tint_base + i as u32);
-                CubeInstance::new(
-                    (root_t + root_q * cell.center).to_array(),
-                    material,
-                    cell.size.to_array(),
-                    (root_q * cell.rotation).to_array(),
-                )
-            }));
+            posed.push((draw, pose, root_q, root_t));
+        }
+        let mut out = Vec::with_capacity(
+            posed
+                .iter()
+                .map(|(draw, ..)| draw.cells.len())
+                .sum::<usize>(),
+        );
+        for (draw, pose, root_q, root_t) in posed {
+            draw.emit(pose, root_q, root_t, tint_base, &mut out);
         }
         out
     }
@@ -111,6 +277,87 @@ impl CreatureView for AnimalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn visuals() -> Vec<(&'static str, AnimalVisual)> {
+        let mapping = material_mapping(&crate::game::manifest());
+        species()
+            .unwrap()
+            .into_iter()
+            .map(|s| {
+                let visual = AnimalVisual::new(s.asset, &mapping, MAX_ANIMAL_VISUAL_CELLS);
+                (s.key, visual.unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tabled_poses_draw_the_same_cubes_as_sampling_the_clip() {
+        let root_q = Quat::from_rotation_y(0.7);
+        let root_t = Vec3::new(10.0, 2.0, -5.0);
+        let tints = AnimalView::new().unwrap().tints;
+        let mut table_bytes = 0;
+        for (key, visual) in visuals() {
+            let draw = SpeciesDraw::new(key, &visual, &tints);
+            table_bytes += draw.clips.iter().map(|c| c.frames.len()).sum::<usize>()
+                * std::mem::size_of::<PartFrame>();
+            for (clip, duration) in visual.clips() {
+                for tick in [0, duration / 3, duration.saturating_sub(1)] {
+                    let sampled = visual.sample(clip, f64::from(tick)).unwrap();
+                    let mut drawn = Vec::new();
+                    // A fractional phase within the tick draws that tick.
+                    let pose = draw.pose(clip, f64::from(tick) + 0.4).unwrap();
+                    draw.emit(pose, root_q, root_t, 1000, &mut drawn);
+                    assert_eq!(drawn.len(), sampled.len(), "{key} {clip} {tick}");
+                    for (cube, cell) in drawn.iter().zip(&sampled) {
+                        let centre = root_t + root_q * cell.center;
+                        let rotation = root_q * cell.rotation;
+                        let material = cell
+                            .tint_srgb
+                            .and_then(|t| tints.iter().position(|x| *x == (cell.material, t)))
+                            .map_or(u32::from(cell.material.0), |i| 1000 + i as u32);
+                        assert!(
+                            Vec3::from_array(cube.offset).distance(centre) < 1e-4
+                                && cube.material == material
+                                && cube.size == cell.size.to_array()
+                                && Quat::from_array(cube.rotation).dot(rotation).abs() > 0.99999,
+                            "{key} {clip} {tick}: {cube:?} vs {cell:?}"
+                        );
+                    }
+                    assert!(
+                        sampled
+                            .iter()
+                            .all(|cell| cell.center.length() <= draw.radius_m),
+                        "{key} {clip} {tick}: a cell lies outside the cull radius"
+                    );
+                }
+            }
+        }
+        eprintln!("pose tables: {table_bytes} bytes for every species");
+        assert!(table_bytes < 4 << 20, "{table_bytes} bytes");
+    }
+
+    #[test]
+    fn creatures_behind_or_beyond_the_view_are_culled_but_edges_are_kept() {
+        let cull = CreatureCull {
+            apex_m: [0.0, 0.0, 3.0],
+            forward: [0.0, 0.0, -1.0],
+            half_angle_rad: 1.0,
+            eye_m: [0.0, 0.0, 0.0],
+            max_distance_m: 80.0,
+        };
+        assert!(in_view(&cull, [0.0, 0.0, -20.0], 1.0), "straight ahead");
+        assert!(!in_view(&cull, [0.0, 0.0, 20.0], 1.0), "behind");
+        assert!(
+            !in_view(&cull, [0.0, 0.0, -90.0], 1.0),
+            "past the view radius"
+        );
+        assert!(in_view(&cull, [0.0, 0.0, 1.0], 1.0), "at the eye");
+        // Centre just outside the cone's edge, with the body reaching into it.
+        let angle = 1.0_f64 + 0.04;
+        let at = [20.0 * angle.sin(), 0.0, 3.0 - 20.0 * angle.cos()];
+        assert!(in_view(&cull, at, 1.0), "body over the edge");
+        assert!(!in_view(&cull, at, 0.5), "body clear of the edge");
+    }
 
     /// Every palette colour of every species has a material, so no animal
     /// falls back to its material's own colour (fur is wood, which is brown).

@@ -35,6 +35,9 @@ pub struct BiomeAudioConfig {
     pub birdsong_tracks: Vec<bool>,
     /// Creature species that count as birds for [`birdsong_level`].
     pub bird_species: Vec<String>,
+    /// More bird recordings. Each birdsong burst plays one of these, or the
+    /// biome's own birdsong track, chosen at random (see [`with_birdsong`]).
+    pub birdsong_pool: Vec<PathBuf>,
     /// Sounds creatures make, heard from where they are.
     pub creatures: crate::creature_sounds::CreatureSoundConfig,
     pub footsteps: crate::footsteps::FootstepConfig,
@@ -93,6 +96,8 @@ pub struct BirdsongGate {
     singing: bool,
     until: Instant,
     rng: u64,
+    /// Drawn when a burst starts; picks which recording it plays.
+    draw: u64,
 }
 
 impl BirdsongGate {
@@ -102,6 +107,7 @@ impl BirdsongGate {
             singing: false,
             until: now,
             rng: seed ^ 0x9E37_79B9_7F4A_7C15,
+            draw: 0,
         };
         gate.until = now + gate.span(REST_NEAR_S);
         gate
@@ -116,6 +122,9 @@ impl BirdsongGate {
         }
         if now >= self.until {
             self.singing = !self.singing;
+            if self.singing {
+                self.draw = self.next();
+            }
             let span = if self.singing {
                 SONG_S
             } else if bird_near {
@@ -128,15 +137,61 @@ impl BirdsongGate {
         self.singing
     }
 
-    fn span(&mut self, (min, max): (f32, f32)) -> Duration {
+    /// Which of `choices` recordings the current burst plays.
+    pub fn pick(&self, choices: usize) -> usize {
+        (self.draw % choices.max(1) as u64) as usize
+    }
+
+    fn next(&mut self) -> u64 {
         // splitmix64: deterministic and dependency-free.
         self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.rng;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let unit = ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32;
+        z ^ (z >> 31)
+    }
+
+    fn span(&mut self, (min, max): (f32, f32)) -> Duration {
+        let unit = (self.next() >> 40) as f32 / (1u64 << 24) as f32;
         Duration::from_secs_f32(min + (max - min) * unit)
     }
+}
+
+/// Applies birdsong to a biome `mix` built at full birdsong volume. Birds sing
+/// where a birdsong track is in earshot, or anywhere a bird is near
+/// (`near_gain`, 0 when none). Outside a burst every birdsong track is silent;
+/// during one, the burst's pick plays at `level`: the biome's own birdsong
+/// track, or one recording from [`BiomeAudioConfig::birdsong_pool`].
+pub fn with_birdsong(
+    mut mix: Vec<(PathBuf, f32)>,
+    config: &BiomeAudioConfig,
+    gate: &BirdsongGate,
+    singing: bool,
+    level: f32,
+    near_gain: f32,
+) -> Vec<(PathBuf, f32)> {
+    let habitat = mix
+        .iter()
+        .filter(|(path, _)| config.is_birdsong_path(path))
+        .map(|(_, volume)| *volume)
+        .fold(0.0_f32, f32::max);
+    let reach = habitat.max(near_gain);
+    let pool = config.birdsong_pool.len();
+    let pick = gate.pick(pool + usize::from(habitat > 0.0));
+    let bed = singing && pick == pool;
+    for (path, volume) in &mut mix {
+        if config.is_birdsong_path(path) {
+            *volume *= if bed { level } else { 0.0 };
+        }
+    }
+    mix.retain(|(_, volume)| *volume >= 0.02);
+    if singing && pick < pool && reach * level >= 0.02 {
+        if mix.len() >= MAX_LAYERS {
+            mix.pop();
+        }
+        mix.insert(0, (config.birdsong_pool[pick].clone(), reach * level));
+    }
+    mix
 }
 
 /// Whether a bird at this distance counts as near for [`BirdsongGate`].
@@ -193,11 +248,11 @@ impl BiomeAudioConfig {
             .collect()
     }
 
-    pub fn is_birdsong(&self, biome: u8) -> bool {
-        self.birdsong_tracks
-            .get(usize::from(biome))
-            .copied()
-            .unwrap_or(false)
+    fn is_birdsong_path(&self, path: &std::path::Path) -> bool {
+        self.tracks
+            .iter()
+            .zip(&self.birdsong_tracks)
+            .any(|(track, &bird)| bird && track.as_deref() == Some(path))
     }
 
     pub fn is_water(&self, biome: u8) -> bool {
@@ -232,7 +287,6 @@ const MAX_SEARCH_M: f64 = 130.0;
 /// other layers so a full mix never drops a nearby stream for a quieter bird.
 pub fn ambience_mix(
     weather_duck: f32,
-    birdsong: f32,
     field: &spall_ecology::cover::CoverField,
     grid: &spall_ecology::cover::CoverGrid,
     position_m: [f64; 3],
@@ -299,11 +353,6 @@ pub fn ambience_mix(
             weather_duck
         };
         let volume = volume * duck.clamp(0.0, 1.0);
-        let volume = if config.is_birdsong(biome) {
-            volume * birdsong.clamp(0.0, 1.0)
-        } else {
-            volume
-        };
         match layers.iter_mut().find(|(existing, _, _)| existing == path) {
             Some(entry) => {
                 entry.1 = entry.1.max(volume);
@@ -691,7 +740,7 @@ mod tests {
             ..Default::default()
         };
         let volume_of = |x: f64, name: &str| {
-            ambience_mix(1.0, 1.0, &field, &grid, [x, 10.0, 100.0], &config)
+            ambience_mix(1.0, &field, &grid, [x, 10.0, 100.0], &config)
                 .into_iter()
                 .find(|(path, _)| path.to_str() == Some(name))
                 .map_or(0.0, |(_, v)| v)
@@ -717,7 +766,7 @@ mod tests {
             ..Default::default()
         };
         let at = |config: &BiomeAudioConfig, duck: f32| {
-            ambience_mix(duck, 1.0, &field, &grid, [61.0, 10.0, 100.0], config)
+            ambience_mix(duck, &field, &grid, [61.0, 10.0, 100.0], config)
         };
         let get = |mix: &[(PathBuf, f32)], name: &str| {
             mix.iter()
@@ -789,5 +838,61 @@ mod tests {
         let later = start + Duration::from_secs(300);
         let near = count(&mut gate, true, later);
         assert!(near > alone * 2 && near < 1200, "{near} vs {alone}");
+    }
+
+    #[test]
+    fn a_burst_plays_the_biome_bird_or_a_pool_recording_and_nothing_between() {
+        let config = BiomeAudioConfig {
+            tracks: vec![Some("pipit.ogg".into()), Some("wind.ogg".into())],
+            birdsong_tracks: vec![true, false],
+            birdsong_pool: vec!["robin.ogg".into(), "blackcap.ogg".into()],
+            ..Default::default()
+        };
+        let base = vec![("pipit.ogg".into(), 0.8), ("wind.ogg".into(), 0.5)];
+        let names = |mix: &[(PathBuf, f32)]| -> Vec<String> {
+            mix.iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect()
+        };
+        let start = Instant::now();
+        let mut gate = BirdsongGate::new(start, 3);
+        // Between bursts: only the wind.
+        assert_eq!(
+            names(&with_birdsong(
+                base.clone(),
+                &config,
+                &gate,
+                false,
+                1.0,
+                0.0
+            )),
+            ["wind.ogg"]
+        );
+        // Over many bursts every recording, and the pipit, gets a turn.
+        let mut heard = std::collections::BTreeSet::new();
+        let mut at = start;
+        for _ in 0..4000 {
+            at += Duration::from_millis(500);
+            if gate.singing(at, true) {
+                let mix = with_birdsong(base.clone(), &config, &gate, true, 1.0, 0.0);
+                let birds: Vec<_> = names(&mix)
+                    .into_iter()
+                    .filter(|n| n != "wind.ogg")
+                    .collect();
+                assert_eq!(birds.len(), 1, "{mix:?}");
+                heard.insert(birds[0].clone());
+            }
+        }
+        assert_eq!(heard.len(), 3, "{heard:?}");
+        // No birdsong habitat and no bird near: silence even in a burst.
+        let quiet = with_birdsong(
+            vec![("wind.ogg".into(), 0.5)],
+            &config,
+            &gate,
+            true,
+            1.0,
+            0.0,
+        );
+        assert_eq!(names(&quiet), ["wind.ogg"]);
     }
 }

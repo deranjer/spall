@@ -246,6 +246,12 @@ impl ApplicationHandler for InteractiveApp {
                         self.open_book();
                         return;
                     }
+                    KeyCode::KeyE
+                        if held && !event.repeat && self.cursor_locked && !self.admin_menu_open =>
+                    {
+                        self.door_pending = true;
+                        return;
+                    }
                     KeyCode::KeyT if held && !event.repeat => {
                         self.torch_pending = true;
                         return;
@@ -557,11 +563,27 @@ impl ApplicationHandler for InteractiveApp {
                         self.last_creature_cubes = if replica.creatures().is_empty() {
                             Vec::new()
                         } else {
+                            let feet =
+                                (*self.session.view.lock().unwrap_or_else(|e| e.into_inner()))
+                                    .map(|v| v.predicted.position_m);
+                            let aspect = self.window.as_ref().map_or(16.0 / 9.0, |w| {
+                                let size = w.inner_size();
+                                size.width as f32 / size.height.max(1) as f32
+                            });
+                            let cull = creature_cull(
+                                self.fly_eye,
+                                feet,
+                                Vec3::from_array(view_dir_from(self.yaw, self.pitch)),
+                                (self.third_person && self.player_view.is_some())
+                                    .then_some(self.third_person_distance_m),
+                                aspect,
+                            );
                             view.instances(
                                 replica.creatures(),
                                 replica.now_tick_estimate(),
                                 self.creature_tint_base,
                                 Instant::now(),
+                                cull.as_ref(),
                             )
                         };
                     }
@@ -806,6 +828,39 @@ impl ApplicationHandler for InteractiveApp {
                             renderer
                                 .scene
                                 .set_overlay(&renderer.device, &renderer.queue, &overlay);
+                        }
+                        let nearby_door = if !self.admin_menu_open && self.fly_eye.is_none() {
+                            cam.and_then(|(eye, _)| {
+                                self.door_spec.and_then(|spec| {
+                                    let replica = self.session.replica.get()?.try_lock().ok()?;
+                                    spall_voxel::doors::nearby_door(
+                                        replica.terrain_volume()?,
+                                        eye.to_array().map(f64::from),
+                                        spec,
+                                        3.0,
+                                    )
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        renderer.set_door(nearby_door);
+                        if self.door_pending {
+                            self.door_pending = false;
+                            if nearby_door.is_some()
+                                && let Some((eye, dir)) = cam
+                            {
+                                let id = self.next_action_id;
+                                self.next_action_id += 1;
+                                self.session.push_action(tool_request(
+                                    id,
+                                    5,
+                                    spall_protocol::ActionKind::Interact,
+                                    eye,
+                                    dir,
+                                    0,
+                                ));
+                            }
                         }
                         renderer.set_endurance(self.endurance_view);
                         renderer.set_crosshair(

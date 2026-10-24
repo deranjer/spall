@@ -769,6 +769,7 @@ fn run_interactive(args: Args) -> ExitCode {
         progression,
         environment,
         spall_client::InteractiveOptions {
+            door: Some(sandbox::game::CABIN_DOOR),
             uncapped: args.uncapped,
             shots,
             shots_dir: args.shots_dir.clone(),

@@ -20,6 +20,7 @@ pub(super) fn dev_intent_from_request(
     let kind = match req.action {
         ActionKind::Cut => EditKind::Cut,
         ActionKind::Place => EditKind::Place(spall_voxel::fixtures::STONE),
+        ActionKind::Interact => return None,
     };
     Some(EditIntent {
         request_id: req.request_id,
@@ -153,6 +154,36 @@ pub(super) fn resolve_intent_with_catalog(
         .get(req.tool)
         .ok_or(ActionReject::UnknownTool(req.tool))?;
 
+    if let EditKind::Door(door_spec) = spec.kind {
+        if req.action != ActionKind::Interact {
+            return Err(ActionReject::ToolActionMismatch);
+        }
+        let player = world
+            .player(session_player_entity(session))
+            .ok_or(ActionReject::Unsupported("interaction requires a player"))?;
+        let mut eye = player.state.position_m;
+        eye[1] += f64::from(player.params.total_height_m()) * 0.9;
+        let door =
+            spall_voxel::doors::nearby_door(&world.terrain().volume, eye, door_spec, spec.reach_m)
+                .ok_or(ActionReject::NoAuthoritativeHit)?;
+        let h = BRUSH_UNIT / 2;
+        return Ok(EditIntent {
+            request_id: req.request_id,
+            actor: player.entity,
+            target: EditTarget::Terrain,
+            kind: spec.kind,
+            brush: SphereBrush::new(
+                BrushPoint::from_units(
+                    door.hinge.x * BRUSH_UNIT + h,
+                    door.hinge.y * BRUSH_UNIT + h,
+                    door.hinge.z * BRUSH_UNIT + h,
+                ),
+                0,
+            )
+            .expect("single hinge"),
+            explosion: None,
+        });
+    }
     let action_fits = matches!(
         (req.action, spec.kind),
         (ActionKind::Cut, EditKind::Cut) | (ActionKind::Place, EditKind::Place(_))
@@ -207,6 +238,7 @@ pub(super) fn resolve_intent_with_catalog(
     let base = match spec.kind {
         EditKind::Cut => hit.cell,
         EditKind::Place(_) => hit.placement_cell,
+        EditKind::Door(_) => unreachable!("door handled above"),
     };
     let h = BRUSH_UNIT / 2;
     let centre = BrushPoint::from_units(
@@ -626,5 +658,91 @@ mod tests {
             }
         }
         assert_eq!(other_ok, MAX_ACTIONS_PER_CLIENT_PER_TICK);
+    }
+}
+
+#[cfg(test)]
+mod door_tests {
+    use super::*;
+    #[test]
+    fn interaction_uses_authoritative_player_reach_not_claimed_aim() {
+        let spec = spall_voxel::doors::DoorSpec {
+            closed_hinge: spall_core::MaterialId(300),
+            open_hinge: spall_core::MaterialId(301),
+            panel: spall_core::MaterialId(302),
+            width: 6,
+            height: 10,
+        };
+        let mut setup = spall_sim::fixtures::walk_arena_setup();
+        let mut entries = setup.materials.entries().to_vec();
+        for (id, name) in [
+            (spec.closed_hinge, "test.closed"),
+            (spec.open_hinge, "test.open"),
+            (spec.panel, "test.panel"),
+        ] {
+            let mut m = entries
+                .iter()
+                .find(|m| m.id == spall_core::MaterialId(1))
+                .unwrap()
+                .clone();
+            m.id = id;
+            m.name = name.into();
+            entries.push(m);
+        }
+        entries.sort_by_key(|m| m.id);
+        setup.materials = spall_core::MaterialManifest::validated(entries).unwrap();
+        let mut plan = spall_voxel::EditPlan::filled_box(
+            setup.terrain.id(),
+            GlobalCell::new(8, 4, 8),
+            GlobalCell::new(13, 13, 8),
+            spec.panel,
+        );
+        plan.set(GlobalCell::new(8, 4, 8), spec.closed_hinge);
+        setup.terrain.apply_edit(&plan).unwrap();
+        let mut world = SimWorld::new(setup).unwrap();
+        let session = SessionId::from_parts(SlotId(0), 1);
+        let player = session_player_entity(session);
+        let catalog = ToolCatalog::new(
+            1,
+            [crate::ToolRule {
+                id: 5,
+                kind: EditKind::Door(spec),
+                max_radius_cells: 0,
+                reach_m: 3.0,
+            }],
+        )
+        .unwrap();
+        let req = ActionRequest {
+            request_id: RequestId(99),
+            input_seq: spall_protocol::InputSeq(1),
+            action: ActionKind::Interact,
+            tool: 5,
+            aim_origin_m: [2.75, 2.6, 4.5],
+            aim_dir: [0.0, 0.0, -1.0],
+            claimed_target: ClaimedTarget::Terrain,
+            claimed_brush: SphereBrush::new(BrushPoint::from_units(0, 0, 0), 0).unwrap(),
+        };
+        assert!(resolve_intent_with_catalog(&world, session, &req, &catalog).is_err());
+        world.add_player(
+            player,
+            [2.75, 1.0, 10.0],
+            spall_physics::CharacterParams::DEFAULT,
+        );
+        assert!(
+            resolve_intent_with_catalog(&world, session, &req, &catalog).is_err(),
+            "spoofed nearby aim cannot interact remotely"
+        );
+        world.remove_player(player);
+        world.add_player(
+            player,
+            [2.75, 1.0, 4.5],
+            spall_physics::CharacterParams::DEFAULT,
+        );
+        let intent = resolve_intent_with_catalog(&world, session, &req, &catalog).unwrap();
+        assert_eq!(intent.kind, EditKind::Door(spec));
+        assert_eq!(intent.brush.centre.x.div_euclid(BRUSH_UNIT), 8);
+        let mut cut = req;
+        cut.action = ActionKind::Cut;
+        assert!(resolve_intent_with_catalog(&world, session, &cut, &catalog).is_err());
     }
 }

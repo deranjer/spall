@@ -137,6 +137,9 @@ pub fn material_mapping() -> BTreeMap<String, MaterialId> {
     [
         ("stone.granite", materials::STONE),
         ("wood.oak", materials::WOOD),
+        ("door.hinge.closed", crate::game::CABIN_DOOR.closed_hinge),
+        ("door.hinge.open", crate::game::CABIN_DOOR.open_hinge),
+        ("door.panel", crate::game::CABIN_DOOR.panel),
         ("foliage.oak", MaterialId(18)),
         ("sandstone", MaterialId(13)),
         ("slate", MaterialId(14)),
