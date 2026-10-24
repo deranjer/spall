@@ -574,14 +574,34 @@ and drains are placed on the 1 m cell they fall in (`ColumnWorld::world_cell`),
 and an edit refreshes the 1 m region it falls in. Clients are unchanged: each
 1 m region is published as the 16 terrain regions under it, each terrain column
 drawn against its own voxels (its own floor, dry where its terrain stands above
-the water) with the surface blended between 1 m columns. In this mode the sea
-is held at its level (a river ends where it meets it) and inland water open to
-the sky evaporates 1.45e-4 cells a second (about 4 cm per game day), which
-balances the springs on the 1 km natural world. It is not saved yet: the
-server refuses `--save` with it. Measured headless (1 km natural seed 1, all
-cores, settle then 900 s standing): the water settles after 1,600 s of water
-time instead of 3,300 s, keeps 162-172 active regions, and a whole water step
-takes 4.2-6.6 ms against about 19 ms at 0.25 m. Report:
+the water) with its height and current blended bilinearly between 1 m columns. A 1 m cell closed by a
+solid terrain cell at the water's height holds no water (about 2% of the
+planned volume of the 1 km world, all at shores), but the frames draw the water
+on into its open terrain columns from the wet side, stopping at any wall and
+at any column more than a cell below the wet neighbour's floor (a hole or a
+drop), so the waterline is the true shore. A 1 m region's frames are rebuilt only when a
+signature of its depths and of the ring around it changed, a region is rebuilt
+with its neighbours (their edges blend with it), and a far region's frames
+refresh at its throttle pace (its changes wait, never dropped); on the settled
+1 km world on 8 threads this took frame building from about 5.8 to 2.0 ms a
+step, and the whole water step from about 8.5 to 5 ms. A canal cut fills at about the same
+pace as at 0.25 m (a 2 m gap from a 2.5 m deep pool: water 13 m past it in 7.7 s
+against 7.8 s). In this mode the sea is held at its level (a
+river ends where it meets it) and inland water open to the sky evaporates
+1.45e-4 cells a second (about 4 cm per game day), which balances the springs on
+the 1 km natural world; far water evaporates in slow motion as its springs run.
+The canonical water state carries the column width, sea level and evaporation
+(wire version 20), so a 1 m world saves and restores at its width. The sandbox
+server starts 1 m water settled: the first start of a world runs it with no
+player until its regions stop changing (about 10 minutes for 1 km) and caches
+the state in `<world>/water-cache`; later starts load it, and the loaded water is woken once so its rivers run on
+(a restore leaves water at rest and asleep). A save carries the
+water, not the solver's tuning: after recovering a save the server restores the
+water again with its scene's config (a generated world's sleep flow and far
+throttle). Measured headless (1 km natural seed 1, all cores,
+settle then 900 s standing): the water settles after 1,600 s of water time
+instead of 3,300 s, keeps 162-172 active regions, and a whole water step takes
+4.2-6.6 ms against about 19 ms at 0.25 m. Report:
 `docs/reports/2026-10-23-water-direction-decision.md`.
 
 ENG-122 worker observability and transport profiling sections (2026-10-04, removed grid solver): see [reports/history-architecture.md](reports/history-architecture.md).

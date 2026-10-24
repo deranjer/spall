@@ -473,6 +473,18 @@ fn run_serve(args: Args) -> ExitCode {
                 } else {
                     generated
                 };
+                // 1 m water starts settled: settle once per world, then load it.
+                let generated = if sandbox::worldgen_scene::water_coarse() {
+                    generated.settle_water(
+                        &args.world.join("water-cache"),
+                        &format!(
+                            "{preset}-{}-{}-{}",
+                            args.seed, args.worldgen_size, args.season
+                        ),
+                    )
+                } else {
+                    generated
+                };
                 let world = generated.world();
                 tracing::info!(
                     preset = %preset,
@@ -549,12 +561,6 @@ fn run_serve(args: Args) -> ExitCode {
         }
     };
 
-    if args.save && sandbox::worldgen_scene::water_coarse() {
-        eprintln!(
-            "sandbox-server: SPALL_WATER_COARSE=1 water is not saved yet: run without --save"
-        );
-        return ExitCode::from(2);
-    }
     let save = args.save.then(|| args.world.join("world.db"));
     if let Some(db) = &save
         && let Some(parent) = db.parent()

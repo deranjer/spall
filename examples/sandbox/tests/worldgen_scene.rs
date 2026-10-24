@@ -671,3 +671,43 @@ fn vegetation_installs_against_the_worlds_own_preset() {
         );
     }
 }
+
+/// The water starts settled: the first start settles it and caches the state,
+/// later starts load the cache, and the water runs from that state.
+#[test]
+fn settled_water_is_cached_and_reloaded() {
+    let dir = std::env::temp_dir().join(format!("spall-settle-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let scene = worldgen_scene::generate("natural", 2, 512).unwrap();
+    let first = scene.settle_water(&dir, "natural-2-512");
+    let settled = first
+        .column_water_setup()
+        .and_then(|s| s.initial_state.clone())
+        .expect("settled");
+    let cached: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(cached.len(), 1, "one cache file");
+    let again = worldgen_scene::generate("natural", 2, 512)
+        .unwrap()
+        .settle_water(&dir, "natural-2-512");
+    assert_eq!(
+        again
+            .column_water_setup()
+            .and_then(|s| s.initial_state.as_ref()),
+        Some(&settled),
+        "loaded the same state"
+    );
+    let water = spall_sim::column_water::AuthoritativeColumnWater::new(
+        &again.world().terrain,
+        again.column_water_setup().unwrap().clone(),
+    )
+    .unwrap();
+    let expected: f64 = settled
+        .regions
+        .iter()
+        .flat_map(|r| &r.spans)
+        .map(|s| spall_protocol::column_water::volume_from_fixed(s.volume))
+        .sum::<f64>()
+        * 0.25f64.powi(3);
+    assert!((water.frame().volume_m3 - expected).abs() < 1e-3 * expected.max(1.0));
+    let _ = std::fs::remove_dir_all(&dir);
+}

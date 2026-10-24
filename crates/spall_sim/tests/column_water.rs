@@ -502,6 +502,135 @@ mod wide_columns {
         );
     }
 
+    /// The wide column holding the dam (terrain x 60..64) is dry: a solid
+    /// cell at the water's height closes it. The water is still drawn up to the
+    /// wall in the terrain columns on the pool side, and not past it.
+    #[test]
+    fn frames_draw_the_water_on_to_the_true_shore_but_not_past_a_wall() {
+        let terrain = terrain(true);
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup()).unwrap();
+        tick(&mut water, &terrain, 5.0);
+        assert!(
+            water
+                .world()
+                .spans_in_column(15, 4)
+                .iter()
+                .all(|s| s.volume < 1e-6)
+        );
+        let frame = water.frame();
+        let region = frame
+            .regions
+            .get(&(1, 0))
+            .expect("the pool's region east of x = 32");
+        let wet = |x: i64, z: i64| {
+            region
+                .spans
+                .iter()
+                .any(|s| i64::from(s.column) == x % 32 + 32 * z && s.depth_q > 0)
+        };
+        assert!(wet(60, 16) && wet(61, 16), "drawn up to the dam");
+        assert!(!wet(62, 16), "the dam itself is dry");
+        assert!(!wet(63, 16), "and so is the far side");
+    }
+
+    /// The shoreline fill stops at the pool's edge: a terrain column whose
+    /// floor drops well below the pool's is a hole the solver holds no water
+    /// in, and is not drawn full of water standing up out of the lake.
+    #[test]
+    fn frames_do_not_draw_water_down_a_hole_beside_the_pool() {
+        // A post at terrain (20, 20) closes the wide column (5, 5) at the
+        // water's height; terrain column (22, 22) beside it is dug down to y = 0.
+        let mut terrain = terrain_with(true, |x, y, z| x == 20 && z == 20 && y < 14);
+        let mut plan = EditPlan::new(terrain.id());
+        plan.set(GlobalCell::new(22, 0, 22), MaterialId::AIR);
+        plan.set(GlobalCell::new(22, 1, 22), MaterialId::AIR);
+        terrain.apply_edit(&plan).unwrap();
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup()).unwrap();
+        tick(&mut water, &terrain, 5.0);
+        assert!(
+            water
+                .world()
+                .spans_in_column(5, 5)
+                .iter()
+                .all(|s| s.volume < 1e-6)
+        );
+        let frame = water.frame();
+        let region = frame
+            .regions
+            .get(&(0, 0))
+            .expect("the pool's corner region");
+        let wet = |x: i64, z: i64| {
+            region
+                .spans
+                .iter()
+                .any(|s| i64::from(s.column) == x + 32 * z && s.depth_q > 0)
+        };
+        assert!(wet(21, 21), "the pool's edge is drawn");
+        assert!(!wet(22, 22), "the hole is not");
+        assert!(!wet(20, 20), "nor the post");
+    }
+
+    /// A region is drawn against its neighbours' water too: when the water
+    /// region east of it fills, its own dry border columns are drawn wet up to
+    /// a wall, although nothing in it changed.
+    #[test]
+    fn a_region_redraws_its_shore_when_the_region_beside_it_fills() {
+        // Two water regions (terrain x 0..128 and 128..256) and a wall at
+        // terrain x = 124, all the way up, closing the wide column (31, z) of
+        // the west one: no pipe joins the regions, so nothing in the west one
+        // moves.
+        let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        for bz in 0..4 {
+            for bx in 0..8 {
+                terrain
+                    .insert_brick(
+                        BrickCoord::new(bx, 0, bz),
+                        Brick::uniform(MaterialId::AIR, Revision(1)),
+                    )
+                    .unwrap();
+            }
+        }
+        let mut plan = EditPlan::new(terrain.id());
+        for z in 0..128 {
+            for y in 0..32 {
+                for x in 0..256 {
+                    let rim = x == 0 || z == 0 || x == 255 || z == 127;
+                    if y < 2 || (rim && y < 28) || x == 124 {
+                        plan.set(GlobalCell::new(x, y, z), STONE);
+                    }
+                }
+            }
+        }
+        terrain.apply_edit(&plan).unwrap();
+        let mut setup = ColumnWaterSetup::new(0, 32, Vec::new());
+        setup.config.column_cells = 4;
+        setup.discharges = vec![spall_sim::column_water::Discharge {
+            cell: GlobalCell::new(200, 2, 64),
+            flow_cells3_s: 4000.0,
+        }];
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+        let wet = |water: &AuthoritativeColumnWater, x: i64| {
+            water
+                .frame()
+                .regions
+                .get(&((x / 32) as i32, 2))
+                .is_some_and(|r| {
+                    r.spans
+                        .iter()
+                        .any(|s| i64::from(s.column) == x % 32 + 32 * 2 && s.depth_q > 0)
+                })
+        };
+        tick(&mut water, &terrain, 1.0);
+        assert!(!wet(&water, 126), "dry before the east fills");
+        tick(&mut water, &terrain, 40.0);
+        assert!(wet(&water, 130), "the east region filled");
+        assert!(
+            wet(&water, 126),
+            "the west region's border drawn up to the wall"
+        );
+        assert!(!wet(&water, 124) && !wet(&water, 123), "and not past it");
+    }
+
     /// Flowing water slopes between wide columns: the frames blend each
     /// terrain column's surface between its wide column and the neighbours,
     /// so it does not step a metre at a time.
@@ -556,6 +685,88 @@ mod wide_columns {
         assert!(
             fine_step < 0.5 * wide_step,
             "terrain columns step {fine_step}, wide columns {wide_step}"
+        );
+    }
+
+    fn setup_from_state(state: &spall_protocol::ColumnWaterState) -> ColumnWaterSetup {
+        let mut setup = ColumnWaterSetup::new(state.y_lo, state.y_hi, Vec::new());
+        setup.initial_state = Some(state.clone());
+        setup
+    }
+
+    /// A 1 m world saves at its width with its sea and evaporation, restores
+    /// from that alone, and journals what changes after.
+    #[test]
+    fn a_wide_world_saves_and_restores_at_its_width() {
+        let terrain = terrain(true);
+        let mut setup = setup();
+        setup.sea_level_y = Some(4.0);
+        setup.evaporation_cells_per_s = 1.0e-4;
+        setup.evaporation_above_y = 5.0;
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+        tick(&mut water, &terrain, 2.0);
+        let state = water.canonical_state();
+        assert_eq!(state.column_cells, 4);
+        state.validate().unwrap();
+        let mut restored = AuthoritativeColumnWater::restore(
+            &terrain,
+            &state,
+            spall_fluid::columns::ColumnConfig::default(),
+        )
+        .unwrap();
+        // Started from the saved state (a settled world), the water is awake.
+        let mut start = setup_from_state(&state);
+        start.config.column_cells = 4;
+        let started = AuthoritativeColumnWater::new(&terrain, start).unwrap();
+        assert!(started.world().active_region_count() > 0, "woken to run on");
+        let (a, b) = (water.frame().volume_m3, restored.frame().volume_m3);
+        assert!((a - b).abs() < 1e-6, "{a} against {b}");
+        assert_eq!(restored.setup().config.column_cells, 4);
+        assert_eq!(restored.setup().sea_level_y, Some(4.0));
+        assert!((restored.setup().evaporation_cells_per_s - 1.0e-4).abs() < 1e-9);
+        let sample = restored
+            .water_sample_at_m(5.0, 1.0, 5.0)
+            .expect("the pool came back");
+        assert!((sample.surface_y - 3.0).abs() < 0.05);
+        // Water that moves after the restore is journalled.
+        let mut changed = false;
+        let mut terrain = terrain;
+        let mut plan = EditPlan::new(terrain.id());
+        for z in 60..68 {
+            for y in 2..24 {
+                plan.set(GlobalCell::new(62, y, z), MaterialId::AIR);
+            }
+        }
+        terrain.apply_edit(&plan).unwrap();
+        let edited = [BrickCoord::new(1, 0, 1), BrickCoord::new(1, 0, 2)];
+        restored.tick(&terrain, &edited, &[], 1.0 / 60.0).unwrap();
+        for _ in 0..120 {
+            restored.tick(&terrain, &[], &[], 1.0 / 60.0).unwrap();
+            changed |= restored
+                .take_journal_delta()
+                .is_some_and(|d| !d.regions.is_empty());
+        }
+        assert!(changed, "a 1 m world is journalled");
+    }
+
+    /// Far water's frames refresh at its pace, and a change waits for its turn
+    /// rather than being lost: a spring far from the player still shows.
+    #[test]
+    fn far_water_is_drawn_at_its_pace() {
+        let terrain = terrain(true);
+        let mut setup = setup();
+        setup.initial_levels.clear();
+        setup.config.throttle_from_cells = [10.0, 20.0, 40.0];
+        setup.discharges = vec![Discharge {
+            cell: GlobalCell::new(10, 2, 10),
+            flow_cells3_s: 64.0,
+        }];
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+        water.set_focus(&[[5000.0, 5000.0]]);
+        tick(&mut water, &terrain, 10.0);
+        assert!(
+            water.water_sample_at_m(2.6, 0.6, 2.6).is_some(),
+            "the far spring's water is drawn"
         );
     }
 

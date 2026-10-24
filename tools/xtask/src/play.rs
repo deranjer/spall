@@ -23,6 +23,9 @@ use clap::Args;
 use crate::session::{ChildGuard, random_hex_32, wait_for_addr, write_file};
 use crate::{XtaskError, run_cargo, sandbox_binary_profile, workspace_root};
 
+/// How long `xtask play` waits for the server to bind by default, ms.
+const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 300_000;
+
 /// `cargo xtask play` — launches a server and an interactive window against
 /// it, for a hands-on local play session.
 #[derive(Debug, Args)]
@@ -107,7 +110,7 @@ pub struct PlayArgs {
     #[arg(long, hide = true)]
     portable: bool,
     /// How long to wait for the server to bind before giving up.
-    #[arg(long, default_value_t = 300_000)]
+    #[arg(long, default_value_t = DEFAULT_STARTUP_TIMEOUT_MS)]
     startup_timeout_ms: u64,
     /// Output directory for the generated join token, fingerprint, and
     /// process logs. A unique directory under `.local/runs` is created if
@@ -280,29 +283,39 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     guard.push("server".into(), server_child);
 
     eprintln!("xtask play: waiting for sandbox-server to bind...");
-    let bound: SocketAddr = wait_for_addr(
-        &addr_file,
-        &mut guard,
-        Duration::from_millis(args.startup_timeout_ms),
-    )
-    .map_err(|error| {
-        let diagnostic = fs::read_to_string(&server_stderr).unwrap_or_default();
-        let tail = diagnostic
-            .lines()
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        XtaskError::Capability(format!(
-            "{error}\n{tail}\nDiagnostics: {}",
-            output.display()
-        ))
-    })?
-    .parse()
-    .map_err(|_| XtaskError::Capability("server wrote an unparseable bound address".into()))?;
+    // 1 m water settles before the server binds the first time a world is
+    // played (about 10 minutes for 1 km); give it time unless told otherwise.
+    let coarse_water = std::env::var("SPALL_WATER_COARSE").is_ok_and(|v| v == "1");
+    let startup_ms = if coarse_water && args.startup_timeout_ms == DEFAULT_STARTUP_TIMEOUT_MS {
+        eprintln!(
+            "xtask play: SPALL_WATER_COARSE=1: the first start of a world settles its water first; waiting up to 30 minutes"
+        );
+        30 * 60 * 1000
+    } else {
+        args.startup_timeout_ms
+    };
+    let bound: SocketAddr =
+        wait_for_addr(&addr_file, &mut guard, Duration::from_millis(startup_ms))
+            .map_err(|error| {
+                let diagnostic = fs::read_to_string(&server_stderr).unwrap_or_default();
+                let tail = diagnostic
+                    .lines()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                XtaskError::Capability(format!(
+                    "{error}\n{tail}\nDiagnostics: {}",
+                    output.display()
+                ))
+            })?
+            .parse()
+            .map_err(|_| {
+                XtaskError::Capability("server wrote an unparseable bound address".into())
+            })?;
     eprintln!(
         "xtask play: server listening on {bound} (scene={}, ticks={}); opening the window \
          (WASD to move, mouse to look, Space to jump, Escape releases the cursor)...",

@@ -284,6 +284,26 @@ fn evaporation_lowers_still_water_evenly_without_waking_it() {
     assert_eq!(world.evaporate(0.25, 5.0), (0.0, 0));
 }
 
+/// Far water runs in slow motion, and so does its evaporation: far beyond the
+/// last throttle band a region loses an eighth of the depth.
+#[test]
+fn far_water_evaporates_in_slow_motion() {
+    let terrain = Flat::new(|x, _, z| {
+        (9..=64).contains(&x) && (4..=20).contains(&z) && (x == 9 || x == 64 || z == 4 || z == 20)
+    });
+    let config = ColumnConfig {
+        throttle_from_cells: [100.0, 200.0, 400.0],
+        ..ColumnConfig::default()
+    };
+    let mut world = ColumnWorld::with_terrain(terrain, config);
+    world.seed_cells(&pool_cells(10, 64, 5, 20, 4));
+    let (near, wet) = world.evaporate(0.25, 1.0);
+    world.set_focus(&[[5000.0, 5000.0]]);
+    let (far, _) = world.evaporate(0.25, 1.0);
+    assert!((near - 0.25 * wet as f64).abs() < 1e-9);
+    assert!((far - near / 8.0).abs() < 1e-9, "{far} against {near}");
+}
+
 /// A non-resident neighbour is a closed wall: water neither drains into it nor
 /// stops being counted. When it returns, both sides exchange.
 #[test]

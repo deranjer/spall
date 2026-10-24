@@ -117,6 +117,17 @@ pub(super) fn setup_persistence_with_game_content(
                     terrain_collider_mode,
                 )
                 .map_err(|e| e.to_string())?;
+                // A save carries the water, not the solver's tuning: a recovered
+                // world takes its scene's (a generated world's sleep flow and far
+                // throttle). Restoring resets the water to rest, as recovery did.
+                let tuning = custom_world
+                    .and_then(|c| c.column_water_setup())
+                    .map(|setup| setup.config);
+                let state = sim.column_water().map(|w| w.canonical_state());
+                if let (Some(config), Some(state)) = (tuning, state) {
+                    sim.restore_column_water(&state, config)
+                        .map_err(|e| format!("column water retune after recovery: {e}"))?;
+                }
                 sim.set_column_water_worker(true);
                 (sim, seq, 0, retained_transfer_ids)
             }
@@ -444,6 +455,52 @@ mod tests {
         let conn = rusqlite::Connection::open(db).unwrap();
         conn.query_row("SELECT COUNT(*) FROM checkpoints", [], |r| r.get(0))
             .unwrap()
+    }
+
+    /// A save carries the water but not the solver's tuning: a recovered
+    /// custom world takes its scene's water config again, not the default.
+    #[test]
+    fn a_recovered_world_takes_its_scenes_water_tuning() {
+        let db = scratch_db("water_tuning");
+        let mut water = spall_sim::column_water::ColumnWaterSetup::new(0, 32, Vec::new());
+        water.config.sleep_flow = 0.5;
+        let world = CustomWorld::new(
+            vec![[2.0, 1.0, 2.0]],
+            spall_sim::fixtures::flat_terrain_setup,
+        )
+        .with_column_water(water);
+        let open = || {
+            setup_persistence_with_game_content(
+                Some(&db),
+                Scene::Custom,
+                Some(&world),
+                &persist_cfg(),
+                None,
+                TerrainColliderMode::default(),
+                spall_sim::fixtures::stone_manifest(),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let first = open();
+        assert_eq!(
+            first.sim.column_water().unwrap().setup().config.sleep_flow,
+            0.5
+        );
+        drop(first);
+        let recovered = open();
+        assert_eq!(
+            recovered
+                .sim
+                .column_water()
+                .unwrap()
+                .setup()
+                .config
+                .sleep_flow,
+            0.5,
+            "the scene's tuning after recovery"
+        );
     }
 
     #[test]
