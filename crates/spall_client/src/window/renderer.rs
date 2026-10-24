@@ -48,6 +48,7 @@ pub(crate) struct WorldRenderer {
     /// `debug_water_instances` is this clipped to the terrain window.
     /// The hammer crosshair and its label; `None` hides it (cursor not captured).
     crosshair: Option<CrosshairView>,
+    door: Option<spall_voxel::doors::Door>,
     /// The endurance bar; `None` while endurance is full.
     endurance: Option<EnduranceView>,
     debug_water_source: Vec<Instance>,
@@ -250,6 +251,10 @@ impl WorldRenderer {
         self.endurance = view;
     }
 
+    pub(crate) fn set_door(&mut self, door: Option<spall_voxel::doors::Door>) {
+        self.door = door;
+    }
+
     pub(crate) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
         self.crosshair = view;
     }
@@ -424,6 +429,7 @@ impl WorldRenderer {
             vegetation_job: None,
             vegetation_seq: 0,
             crosshair: None,
+            door: None,
             endurance: None,
             debug_water_source: Vec::new(),
             water_window: None,
@@ -1019,6 +1025,33 @@ impl WorldRenderer {
         }
         if let Some(crosshair) = &self.crosshair {
             draw_crosshair(crosshair);
+        }
+        if let (Some(door), Some((eye, dir))) = (self.door, cam) {
+            let camera = Camera::looking_along(
+                *eye,
+                *dir,
+                CAMERA_FOV_Y_DEG.to_radians(),
+                self.aspect.max(1e-4),
+            );
+            if let Some([x, y]) =
+                camera.project(Vec3::from_array(door.center_m().map(|v| v as f32)))
+                && x.abs() < 0.9
+                && y.abs() < 0.9
+            {
+                let scale = self.yakui.scale_factor();
+                let mut pad = yakui::widgets::Pad::all(0.0);
+                pad.left = (x + 1.0) * 0.5 * self.surface_config.width as f32 / scale;
+                pad.top = (1.0 - y) * 0.5 * self.surface_config.height as f32 / scale;
+                yakui::align(yakui::Alignment::TOP_LEFT, || {
+                    yakui::pad(pad, || {
+                        yakui::colored_box_container(PANEL_BG.with_alpha(0.8), || {
+                            yakui::pad(yakui::widgets::Pad::balanced(8.0, 5.0), || {
+                                yakui::text(18.0, if door.open { "E  Close" } else { "E  Open" });
+                            });
+                        });
+                    });
+                });
+            }
         }
         draw_body_reminders(&self.body_icons, &self.body_reminders);
         if let Some(bar) = self.endurance {

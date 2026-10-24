@@ -117,6 +117,8 @@ pub enum CommitError {
     Replication(#[from] crate::replication::ReplicationError),
     #[error("prepared commit state changed before publication")]
     PreparedStateChanged,
+    #[error("door swing is occupied")]
+    DoorOccupied,
     #[error("prepared physics fence could not be captured: {0}")]
     PhysicsFence(String),
     #[error("bulk split requires a server-reserved transfer ID")]
@@ -138,6 +140,7 @@ pub enum CommitError {
 /// An owned geometry candidate. It contains no whole-world or physics clone;
 /// the captured fence describes exactly the live state it read.
 pub(crate) struct PreparedGeometryCommit {
+    door: Option<spall_voxel::doors::Door>,
     pub(crate) fence: crate::world::GeometryCommitFence,
     pub(crate) token: spall_jobs::JobToken,
     pub(crate) registry: IdRegistry,
@@ -275,6 +278,23 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
     let parent = world
         .volume_body(vid)
         .ok_or(CommitError::UnknownVolume(vid))?;
+    let door = if let crate::EditKind::Door(spec) = staged.kind {
+        let c = staged.brush.centre;
+        let hinge = spall_core::GlobalCell::new(
+            c.x.div_euclid(spall_core::BRUSH_UNIT),
+            c.y.div_euclid(spall_core::BRUSH_UNIT),
+            c.z.div_euclid(spall_core::BRUSH_UNIT),
+        );
+        Some(
+            spall_voxel::doors::Door::at(&parent.volume, hinge, spec)
+                .ok_or(CommitError::DoorOccupied)?,
+        )
+    } else {
+        None
+    };
+    if let Some(door) = door {
+        check_door_clear(world, door)?;
+    }
     let stamp_before_commit = parent.volume.state_stamp();
     let cell_size = parent.volume.cell_size();
     let parent_phys = parent.phys;
@@ -561,12 +581,31 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
     // that remove every detached cell from the source. A replica applies these
     // in order to reproduce the exact committed geometry.
     let encoding = crate::prof::Span::start("commit.encoding");
-    let brush_op = TopologyOp::IntegerBrush {
-        volume: vid,
-        brush: staged.brush,
-        material: staged.kind.write_material(),
+    let edit_ops: Vec<TopologyOp> = if matches!(staged.kind, crate::EditKind::Door(_)) {
+        // Coalesce duplicate writes so each cell is published exactly once.
+        let cells: std::collections::BTreeMap<_, _> = staged
+            .plan
+            .writes
+            .iter()
+            .map(|w| ((w.cell.z, w.cell.y, w.cell.x), w.material))
+            .collect();
+        cells
+            .into_iter()
+            .map(|((z, y, x), material)| TopologyOp::CellRun {
+                volume: vid,
+                start: spall_core::GlobalCell::new(x, y, z),
+                len: 1,
+                material,
+            })
+            .collect()
+    } else {
+        vec![TopologyOp::IntegerBrush {
+            volume: vid,
+            brush: staged.brush,
+            material: staged.kind.write_material(),
+        }]
     };
-    let mut ops = vec![brush_op.clone()];
+    let mut ops = edit_ops.clone();
     for (((entity, child_vid), _), fill) in child_ids
         .iter()
         .zip(&staged.memberships)
@@ -616,7 +655,7 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
         loop {
             match build_split_baseline_ops(
                 vid,
-                brush_op.clone(),
+                edit_ops.clone(),
                 parent_owner,
                 &parent_candidate,
                 &affected,
@@ -749,6 +788,7 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
 
     Ok(PrepareGeometryOutcome::Ready(Box::new(
         PreparedGeometryCommit {
+            door,
             fence,
             token: staged.token.clone(),
             registry: reg,
@@ -787,6 +827,9 @@ pub(crate) fn validate_prepared_geometry(
         || prepared.journal_seq.0 <= journal.cursor()
     {
         return Err(CommitError::PreparedStateChanged);
+    }
+    if let Some(door) = prepared.door {
+        check_door_clear(world, door)?;
     }
     Ok(ValidatedGeometryCommit { prepared })
 }
@@ -828,6 +871,7 @@ pub(crate) fn publish_validated_geometry_without_journal(
         input_stamp,
         post_index,
         removed_materials,
+        door: _,
         fence: _,
         token: _,
     } = validated.prepared;
@@ -966,7 +1010,7 @@ enum SplitEncoding {
 #[allow(clippy::too_many_arguments)]
 fn build_split_baseline_ops(
     source: VolumeId,
-    brush_op: TopologyOp,
+    edit_ops: Vec<TopologyOp>,
     parent_owner: CanonicalOwner,
     parent_candidate: &Volume,
     affected: &[BrickCoord],
@@ -1008,7 +1052,7 @@ fn build_split_baseline_ops(
             .iter()
             .all(|(_, blob)| blob.len() <= MAX_SPLIT_BASELINE_BLOB)
     {
-        let mut ops = vec![brush_op];
+        let mut ops = edit_ops;
         let mut it = volumes.into_iter();
         for ((entity, child_vid), _child) in child_ids.iter().zip(children) {
             let (_, blob) = it.next().expect("one blob per child");
@@ -1031,7 +1075,7 @@ fn build_split_baseline_ops(
     let transfer_id = transfer_ids
         .pop_front()
         .ok_or(CommitError::MissingBulkTransferId)?;
-    let mut ops = vec![brush_op];
+    let mut ops = edit_ops;
     for ((entity, child_vid), _child) in child_ids.iter().zip(children) {
         ops.push(TopologyOp::SplitOffBulkBaseline {
             source,
@@ -1147,3 +1191,26 @@ pub const NO_TRANSFER: TransferId = TransferId(0);
 #[cfg(test)]
 #[path = "commit_review.rs"]
 mod commit_review;
+
+fn check_door_clear(world: &SimWorld, door: spall_voxel::doors::Door) -> Result<(), CommitError> {
+    if world.players().any(|p| {
+        door.overlaps_player(
+            p.state.position_m,
+            f64::from(p.params.radius_m),
+            f64::from(p.params.total_height_m()),
+        )
+    }) {
+        return Err(CommitError::DoorOccupied);
+    }
+    let (lo, hi) = door.swing_bounds_m();
+    if world.bodies().any(|body| {
+        let (center, radius) = body.world_bounding_sphere();
+        let distance: f64 = (0..3)
+            .map(|i| (center[i] - center[i].clamp(lo[i], hi[i])).powi(2))
+            .sum();
+        distance < radius * radius
+    }) {
+        return Err(CommitError::DoorOccupied);
+    }
+    Ok(())
+}

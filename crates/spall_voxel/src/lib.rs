@@ -57,3 +57,5 @@ pub use transform::RigidXform;
 pub use volume::{
     AccessError, BrickBounds, BrickState, Residency, RevisionResumeError, Sample, Volume,
 };
+
+pub mod doors;

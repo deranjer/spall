@@ -16,6 +16,8 @@ pub enum EditKind {
     Cut,
     /// Add `material` inside the brush.
     Place(MaterialId),
+    /// Turn a voxel door around its authored hinge.
+    Door(spall_voxel::doors::DoorSpec),
 }
 
 impl EditKind {
@@ -24,6 +26,7 @@ impl EditKind {
         match self {
             EditKind::Cut => MaterialId::AIR,
             EditKind::Place(m) => m,
+            EditKind::Door(spec) => spec.panel,
         }
     }
 }

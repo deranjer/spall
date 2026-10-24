@@ -180,6 +180,8 @@ pub(super) struct InteractiveApp {
     pub(super) hammer_pending: bool,
     /// `T` was pressed and the torch has not been sent yet.
     pub(super) torch_pending: bool,
+    pub(super) door_spec: Option<spall_voxel::doors::DoorSpec>,
+    pub(super) door_pending: bool,
     pub(super) last_hammer_at: Option<Instant>,
     pub(super) hammer_radius: i64,
     pub(super) next_action_id: u64,
@@ -372,6 +374,8 @@ impl InteractiveApp {
             hammer_held: false,
             hammer_pending: false,
             torch_pending: false,
+            door_pending: false,
+            door_spec: options.door,
             last_hammer_at: None,
             hammer_radius: HAMMER_RADIUS_DEFAULT,
             next_action_id: HAMMER_REQUEST_BASE,
@@ -1070,6 +1074,7 @@ impl InteractiveApp {
         self.hammer_held = false;
         self.hammer_pending = false;
         self.torch_pending = false;
+        self.door_pending = false;
         self.held.clear_on_focus_loss(&self.session.input);
     }
 

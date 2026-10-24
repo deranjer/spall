@@ -185,6 +185,12 @@ impl ApplicationHandler for InteractiveApp {
                         self.recentre_view();
                         return;
                     }
+                    KeyCode::KeyE
+                        if held && !event.repeat && self.cursor_locked && !self.admin_menu_open =>
+                    {
+                        self.door_pending = true;
+                        return;
+                    }
                     KeyCode::KeyT if held && !event.repeat => {
                         self.torch_pending = true;
                         return;
@@ -700,6 +706,39 @@ impl ApplicationHandler for InteractiveApp {
                             renderer
                                 .scene
                                 .set_overlay(&renderer.device, &renderer.queue, &overlay);
+                        }
+                        let nearby_door = if !self.admin_menu_open && self.fly_eye.is_none() {
+                            cam.and_then(|(eye, _)| {
+                                self.door_spec.and_then(|spec| {
+                                    let replica = self.session.replica.get()?.try_lock().ok()?;
+                                    spall_voxel::doors::nearby_door(
+                                        replica.terrain_volume()?,
+                                        eye.to_array().map(f64::from),
+                                        spec,
+                                        3.0,
+                                    )
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        renderer.set_door(nearby_door);
+                        if self.door_pending {
+                            self.door_pending = false;
+                            if nearby_door.is_some()
+                                && let Some((eye, dir)) = cam
+                            {
+                                let id = self.next_action_id;
+                                self.next_action_id += 1;
+                                self.session.push_action(tool_request(
+                                    id,
+                                    5,
+                                    spall_protocol::ActionKind::Interact,
+                                    eye,
+                                    dir,
+                                    0,
+                                ));
+                            }
                         }
                         renderer.set_endurance(self.endurance_view);
                         renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(

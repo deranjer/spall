@@ -165,6 +165,8 @@ impl StagedEdit {
 pub enum StageError {
     #[error("brush covers no cell in the target volume")]
     EmptyBrush,
+    #[error("door cannot turn: {0}")]
+    DoorBlocked(&'static str),
     #[error("edit touches brick {0:?} outside the volume bounds")]
     OutOfBounds(BrickCoord),
     #[error("structural analysis was interrupted: {0}")]
@@ -204,7 +206,20 @@ pub(crate) fn stage_edit_owned(mut input: StageInput) -> Result<StagedEdit, Stag
 
 fn stage_with(input: &StageInput, warm: Option<StructureIndex>) -> Result<StagedEdit, StageError> {
     let _total = crate::prof::Span::start("stage.total");
-    let plan = EditPlan::sphere(input.volume_id, input.brush, input.kind.write_material());
+    let plan = if let EditKind::Door(spec) = input.kind {
+        let c = input.brush.centre;
+        let hinge = spall_core::GlobalCell::new(
+            c.x.div_euclid(spall_core::BRUSH_UNIT),
+            c.y.div_euclid(spall_core::BRUSH_UNIT),
+            c.z.div_euclid(spall_core::BRUSH_UNIT),
+        );
+        spall_voxel::doors::Door::at(&input.volume, hinge, spec)
+            .ok_or(StageError::DoorBlocked("missing hinge"))?
+            .plan(&input.volume)
+            .map_err(StageError::DoorBlocked)?
+    } else {
+        EditPlan::sphere(input.volume_id, input.brush, input.kind.write_material())
+    };
     if plan.writes.is_empty() {
         return Err(StageError::EmptyBrush);
     }
