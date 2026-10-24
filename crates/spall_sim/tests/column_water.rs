@@ -533,6 +533,43 @@ mod wide_columns {
         assert!(!wet(63, 16), "and so is the far side");
     }
 
+    /// The shoreline fill stops at the pool's edge: a terrain column whose
+    /// floor drops well below the pool's is a hole the solver holds no water
+    /// in, and is not drawn full of water standing up out of the lake.
+    #[test]
+    fn frames_do_not_draw_water_down_a_hole_beside_the_pool() {
+        // A post at terrain (20, 20) closes the wide column (5, 5) at the
+        // water's height; terrain column (22, 22) beside it is dug down to y = 0.
+        let mut terrain = terrain_with(true, |x, y, z| x == 20 && z == 20 && y < 14);
+        let mut plan = EditPlan::new(terrain.id());
+        plan.set(GlobalCell::new(22, 0, 22), MaterialId::AIR);
+        plan.set(GlobalCell::new(22, 1, 22), MaterialId::AIR);
+        terrain.apply_edit(&plan).unwrap();
+        let mut water = AuthoritativeColumnWater::new(&terrain, setup()).unwrap();
+        tick(&mut water, &terrain, 5.0);
+        assert!(
+            water
+                .world()
+                .spans_in_column(5, 5)
+                .iter()
+                .all(|s| s.volume < 1e-6)
+        );
+        let frame = water.frame();
+        let region = frame
+            .regions
+            .get(&(0, 0))
+            .expect("the pool's corner region");
+        let wet = |x: i64, z: i64| {
+            region
+                .spans
+                .iter()
+                .any(|s| i64::from(s.column) == x + 32 * z && s.depth_q > 0)
+        };
+        assert!(wet(21, 21), "the pool's edge is drawn");
+        assert!(!wet(22, 22), "the hole is not");
+        assert!(!wet(20, 20), "nor the post");
+    }
+
     /// Flowing water slopes between wide columns: the frames blend each
     /// terrain column's surface between its wide column and the neighbours,
     /// so it does not step a metre at a time.
@@ -590,6 +627,12 @@ mod wide_columns {
         );
     }
 
+    fn setup_from_state(state: &spall_protocol::ColumnWaterState) -> ColumnWaterSetup {
+        let mut setup = ColumnWaterSetup::new(state.y_lo, state.y_hi, Vec::new());
+        setup.initial_state = Some(state.clone());
+        setup
+    }
+
     /// A 1 m world saves at its width with its sea and evaporation, restores
     /// from that alone, and journals what changes after.
     #[test]
@@ -610,6 +653,11 @@ mod wide_columns {
             spall_fluid::columns::ColumnConfig::default(),
         )
         .unwrap();
+        // Started from the saved state (a settled world), the water is awake.
+        let mut start = setup_from_state(&state);
+        start.config.column_cells = 4;
+        let started = AuthoritativeColumnWater::new(&terrain, start).unwrap();
+        assert!(started.world().active_region_count() > 0, "woken to run on");
         let (a, b) = (water.frame().volume_m3, restored.frame().volume_m3);
         assert!((a - b).abs() < 1e-6, "{a} against {b}");
         assert_eq!(restored.setup().config.column_cells, 4);

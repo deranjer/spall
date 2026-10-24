@@ -105,6 +105,11 @@ pub struct ColumnWaterSetup {
     pub sea_level_y: Option<f64>,
 }
 
+/// How far (cells) below a wet neighbour's own floor the frames may draw water
+/// on into a wide column the solver holds dry, to reach the true shore (see
+/// `Core::region_frames`): the pool's edge, never a hole or drop under it.
+const SHORE_BELOW: f64 = 1.0;
+
 /// Fluid seconds between evaporation passes: one pass walks every span.
 const EVAPORATE_EVERY_S: f64 = 10.0;
 
@@ -490,39 +495,56 @@ impl Core {
         let per = edge / n;
         // The surface of the wet span of wide column (x, z) within a cell of
         // height `h`: a neighbour across a fall or a wall does not blend.
-        // The region's wet spans, read once, and their surfaces by column; a
-        // column outside the region (the ring around it) is looked up alone.
+        // The region's wet spans, read once, and their surfaces and currents
+        // by column; the ring of columns just outside the region likewise.
         let wet_spans = self.world.region_wet_spans_with_flow(key, DRY_VOLUME);
-        let mut by_column: HashMap<u16, Vec<f64>> = HashMap::new();
-        for &(column, floor_y, volume, height, _) in &wet_spans {
-            by_column
-                .entry(column)
-                .or_default()
-                .push(f64::from(floor_y) + volume.min(f64::from(height)));
+        // (surface, current, floor) of each wet span.
+        type Surfaces = Vec<(f64, [f32; 2], f64)>;
+        let mut by_column: HashMap<u16, Surfaces> = HashMap::new();
+        for &(column, floor_y, volume, height, flow) in &wet_spans {
+            by_column.entry(column).or_default().push((
+                f64::from(floor_y) + volume.min(f64::from(height)),
+                flow,
+                f64::from(floor_y),
+            ));
         }
         let (x0, z0) = (i64::from(key.0) * edge, i64::from(key.1) * edge);
-        // The ring of columns just outside the region, read once.
-        let mut ring: HashMap<(i64, i64), Vec<f64>> = HashMap::new();
-        for t in 0..edge {
+        let column_m = self.world.column_m();
+        let mut ring: HashMap<(i64, i64), Surfaces> = HashMap::new();
+        for t in -1..=edge {
             for (x, z) in [
                 (x0 - 1, z0 + t),
                 (x0 + edge, z0 + t),
                 (x0 + t, z0 - 1),
                 (x0 + t, z0 + edge),
             ] {
-                let surfaces: Vec<f64> = self
+                if ring.contains_key(&(x, z)) {
+                    continue;
+                }
+                let surfaces: Surfaces = self
                     .world
                     .spans_in_column(x, z)
                     .iter()
                     .filter(|s| s.volume > DRY_VOLUME)
-                    .map(|s| s.floor_y as f64 + s.depth)
+                    .map(|s| {
+                        let top = s.floor_y as f64 + s.depth;
+                        let flow = self
+                            .world
+                            .flow_at_m(
+                                (x as f64 + 0.5) * column_m,
+                                (s.floor_y as f64 + 0.5 * s.depth) * CELL_SIZE_M,
+                                (z as f64 + 0.5) * column_m,
+                            )
+                            .unwrap_or([0.0; 2]);
+                        (top, flow, s.floor_y as f64)
+                    })
                     .collect();
                 if !surfaces.is_empty() {
                     ring.insert((x, z), surfaces);
                 }
             }
         }
-        let surfaces_at = |x: i64, z: i64| -> &[f64] {
+        let surfaces_at = |x: i64, z: i64| -> &[(f64, [f32; 2], f64)] {
             let (lx, lz) = (x - x0, z - z0);
             let found = if (0..edge).contains(&lx) && (0..edge).contains(&lz) {
                 by_column.get(&((lx + edge * lz) as u16))
@@ -531,37 +553,62 @@ impl Core {
             };
             found.map_or(&[], Vec::as_slice)
         };
-        let near_surface = |x: i64, z: i64, h: f64| -> Option<f64> {
+        // The water of column (x, z) level with height `h` (within a cell): a
+        // neighbour across a fall or a wall does not blend.
+        let near = |x: i64, z: i64, h: f64| -> Option<(f64, [f32; 2])> {
             surfaces_at(x, z)
                 .iter()
-                .copied()
-                .filter(|t| (t - h).abs() < 1.0)
-                .min_by(|a, b| (a - h).abs().total_cmp(&(b - h).abs()))
+                .filter(|t| (t.0 - h).abs() < 1.0)
+                .min_by(|a, b| (a.0 - h).abs().total_cmp(&(b.0 - h).abs()))
+                .map(|t| (t.0, t.1))
         };
         let subs: Vec<RegionKey> = self.frame_keys(key);
         let runs: Vec<Option<&Arc<ColumnRuns>>> =
             subs.iter().map(|k| self.fine_runs.get(k)).collect();
         let mut spans: Vec<Vec<FrameSpan>> = vec![Vec::new(); subs.len()];
         for &(column, floor_y, volume, height, flow) in &wet_spans {
-            let surface = f64::from(floor_y) + volume.min(f64::from(height));
+            let here = (f64::from(floor_y) + volume.min(f64::from(height)), flow);
             let (wx, wz) = (i64::from(column) % edge, i64::from(column) / edge);
             let (gx, gz) = (i64::from(key.0) * edge + wx, i64::from(key.1) * edge + wz);
-            let west = near_surface(gx - 1, gz, surface).unwrap_or(surface);
-            let east = near_surface(gx + 1, gz, surface).unwrap_or(surface);
-            let north = near_surface(gx, gz - 1, surface).unwrap_or(surface);
-            let south = near_surface(gx, gz + 1, surface).unwrap_or(surface);
             let sub = (wx / per + n * (wz / per)) as usize;
-            let flow = quantize_flow(flow);
+            // Each quarter of the column blends bilinearly between this column
+            // and the three around that corner, so neighbouring columns agree
+            // along their shared edges in height and in current.
+            let mut corner = [[here; 3]; 4];
+            for (q, (sx, sz)) in [(-1i64, -1i64), (1, -1), (-1, 1), (1, 1)]
+                .into_iter()
+                .enumerate()
+            {
+                let along_x = near(gx + sx, gz, here.0).unwrap_or(here);
+                let along_z = near(gx, gz + sz, here.0).unwrap_or(here);
+                let diagonal = near(gx + sx, gz + sz, here.0).unwrap_or((
+                    along_x.0 + along_z.0 - here.0,
+                    [
+                        along_x.1[0] + along_z.1[0] - here.1[0],
+                        along_x.1[1] + along_z.1[1] - here.1[1],
+                    ],
+                ));
+                corner[q] = [along_x, along_z, diagonal];
+            }
             for dz in 0..n {
                 for dx in 0..n {
                     // Offset of this terrain column's centre from the wide
                     // column's, in wide columns (-0.375..0.375 for n = 4).
                     let u = (dx as f64 + 0.5) / n as f64 - 0.5;
                     let v = (dz as f64 + 0.5) / n as f64 - 0.5;
-                    let along_x = if u < 0.0 { west } else { east };
-                    let along_z = if v < 0.0 { north } else { south };
+                    let q = usize::from(u > 0.0) + 2 * usize::from(v > 0.0);
+                    let [along_x, along_z, diagonal] = corner[q];
+                    let (a, b) = (u.abs(), v.abs());
+                    let w = [(1.0 - a) * (1.0 - b), a * (1.0 - b), (1.0 - a) * b, a * b];
                     let top =
-                        surface + u.abs() * (along_x - surface) + v.abs() * (along_z - surface);
+                        w[0] * here.0 + w[1] * along_x.0 + w[2] * along_z.0 + w[3] * diagonal.0;
+                    let blend = |i: usize| {
+                        (w[0] as f32) * here.1[i]
+                            + (w[1] as f32) * along_x.1[i]
+                            + (w[2] as f32) * along_z.1[i]
+                            + (w[3] as f32) * diagonal.1[i]
+                    };
+                    let flow = quantize_flow([blend(0), blend(1)]);
                     let (fx, fz) = ((wx % per) * n + dx, (wz % per) * n + dz);
                     let fcol = (fx + edge * fz) as usize;
                     // The terrain column's own open run holding the surface.
@@ -607,14 +654,23 @@ impl Core {
                 continue;
             };
             for (ox, oz) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
-                for &top in surfaces_at(gx + ox, gz + oz) {
+                for &(top, _, their_floor) in surfaces_at(gx + ox, gz + oz) {
                     let run_at = |dx: i64, dz: i64| {
                         let (fx, fz) = ((wx % per) * n + dx, (wz % per) * n + dz);
                         let fcol = (fx + edge * fz) as usize;
+                        // The pool's edge only: a terrain column well below the
+                        // neighbour's own floor is a hole or a drop the solver
+                        // holds no water in, and drawing it would stand a sheet of
+                        // water up out of the lake.
                         sub_runs[fcol]
                             .iter()
                             .copied()
-                            .find(|&(y0, y1)| f64::from(y0) < top && top <= f64::from(y1))
+                            .find(|&(y0, y1)| {
+                                let floor = f64::from(y0);
+                                floor < top
+                                    && floor >= their_floor - SHORE_BELOW
+                                    && top <= f64::from(y1)
+                            })
                             .map(|run| (fcol, run))
                     };
                     // Seeds: the terrain columns on the side facing the neighbour.
@@ -995,7 +1051,12 @@ impl AuthoritativeColumnWater {
     pub fn new(terrain: &Volume, setup: ColumnWaterSetup) -> Result<Self, ColumnWaterError> {
         check_setup(&setup)?;
         if let Some(state) = &setup.initial_state {
-            return Self::restore(terrain, state, setup.config);
+            // A settled world is restored at rest and asleep; its rivers were
+            // running when it was saved. Wake it all once so they pick their
+            // flow up at once; the still water falls asleep again in a second.
+            let water = Self::restore(terrain, state, setup.config)?;
+            lock(&water.shared.core).world.wake_all();
+            return Ok(water);
         }
         let mut world =
             ColumnWorld::with_terrain(terrain_source(terrain, &setup).0, sliced(setup.config));
