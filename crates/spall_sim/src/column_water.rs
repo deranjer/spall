@@ -490,12 +490,51 @@ impl Core {
         let per = edge / n;
         // The surface of the wet span of wide column (x, z) within a cell of
         // height `h`: a neighbour across a fall or a wall does not blend.
+        // The region's wet spans, read once, and their surfaces by column; a
+        // column outside the region (the ring around it) is looked up alone.
+        let wet_spans = self.world.region_wet_spans_with_flow(key, DRY_VOLUME);
+        let mut by_column: HashMap<u16, Vec<f64>> = HashMap::new();
+        for &(column, floor_y, volume, height, _) in &wet_spans {
+            by_column
+                .entry(column)
+                .or_default()
+                .push(f64::from(floor_y) + volume.min(f64::from(height)));
+        }
+        let (x0, z0) = (i64::from(key.0) * edge, i64::from(key.1) * edge);
+        // The ring of columns just outside the region, read once.
+        let mut ring: HashMap<(i64, i64), Vec<f64>> = HashMap::new();
+        for t in 0..edge {
+            for (x, z) in [
+                (x0 - 1, z0 + t),
+                (x0 + edge, z0 + t),
+                (x0 + t, z0 - 1),
+                (x0 + t, z0 + edge),
+            ] {
+                let surfaces: Vec<f64> = self
+                    .world
+                    .spans_in_column(x, z)
+                    .iter()
+                    .filter(|s| s.volume > DRY_VOLUME)
+                    .map(|s| s.floor_y as f64 + s.depth)
+                    .collect();
+                if !surfaces.is_empty() {
+                    ring.insert((x, z), surfaces);
+                }
+            }
+        }
+        let surfaces_at = |x: i64, z: i64| -> &[f64] {
+            let (lx, lz) = (x - x0, z - z0);
+            let found = if (0..edge).contains(&lx) && (0..edge).contains(&lz) {
+                by_column.get(&((lx + edge * lz) as u16))
+            } else {
+                ring.get(&(x, z))
+            };
+            found.map_or(&[], Vec::as_slice)
+        };
         let near_surface = |x: i64, z: i64, h: f64| -> Option<f64> {
-            self.world
-                .spans_in_column(x, z)
+            surfaces_at(x, z)
                 .iter()
-                .filter(|s| s.volume > DRY_VOLUME)
-                .map(|s| s.floor_y as f64 + s.depth)
+                .copied()
                 .filter(|t| (t - h).abs() < 1.0)
                 .min_by(|a, b| (a - h).abs().total_cmp(&(b - h).abs()))
         };
@@ -503,9 +542,7 @@ impl Core {
         let runs: Vec<Option<&Arc<ColumnRuns>>> =
             subs.iter().map(|k| self.fine_runs.get(k)).collect();
         let mut spans: Vec<Vec<FrameSpan>> = vec![Vec::new(); subs.len()];
-        for (column, floor_y, volume, height, flow) in
-            self.world.region_wet_spans_with_flow(key, DRY_VOLUME)
-        {
+        for &(column, floor_y, volume, height, flow) in &wet_spans {
             let surface = f64::from(floor_y) + volume.min(f64::from(height));
             let (wx, wz) = (i64::from(column) % edge, i64::from(column) / edge);
             let (gx, gz) = (i64::from(key.0) * edge + wx, i64::from(key.1) * edge + wz);
@@ -559,14 +596,8 @@ impl Core {
         // it on to the true shore: from each wet neighbour, fill this column's
         // terrain columns that are open at that surface, spreading only between
         // open neighbours, so a wall one cell thick still keeps the far side dry.
-        let wet: std::collections::HashSet<u16> = self
-            .world
-            .region_wet_spans(key, DRY_VOLUME)
-            .into_iter()
-            .map(|(c, _, _)| c)
-            .collect();
         for column in 0..(edge * edge) as u16 {
-            if wet.contains(&column) {
+            if by_column.contains_key(&column) {
                 continue;
             }
             let (wx, wz) = (i64::from(column) % edge, i64::from(column) / edge);
@@ -576,14 +607,7 @@ impl Core {
                 continue;
             };
             for (ox, oz) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
-                let surfaces: Vec<f64> = self
-                    .world
-                    .spans_in_column(gx + ox, gz + oz)
-                    .iter()
-                    .filter(|s| s.volume > DRY_VOLUME)
-                    .map(|s| s.floor_y as f64 + s.depth)
-                    .collect();
-                for top in surfaces {
+                for &top in surfaces_at(gx + ox, gz + oz) {
                     let run_at = |dx: i64, dz: i64| {
                         let (fx, fz) = ((wx % per) * n + dx, (wz % per) * n + dz);
                         let fcol = (fx + edge * fz) as usize;
