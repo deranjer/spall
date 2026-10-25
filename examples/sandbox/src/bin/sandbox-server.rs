@@ -520,7 +520,17 @@ fn run_serve(args: Args) -> ExitCode {
                 } else {
                     Vec::new()
                 };
-                custom_world = Some(generated.into_custom_world().with_initial_bodies(floaters));
+                let scattered = generated.scatter_items(
+                    args.seed,
+                    &sandbox::world_scatter::ScatterSettings::default(),
+                );
+                tracing::info!(items = scattered.len(), "scattered world items");
+                custom_world = Some(
+                    generated
+                        .into_custom_world()
+                        .with_initial_bodies(floaters)
+                        .with_world_items(scattered),
+                );
                 Scene::Custom
             }
             Err(error) => {
