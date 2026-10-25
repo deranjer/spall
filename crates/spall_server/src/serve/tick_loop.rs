@@ -590,17 +590,7 @@ pub(super) async fn serve_async(
             let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
             let mut progression_admitted: HashMap<u64, u32> = HashMap::new();
             if let Some(worker) = progression_worker.as_ref() {
-                for _ in 0..64 {
-                    match worker.completed.try_recv() {
-                        Ok(done) => send_to(
-                            &clients_for_sim,
-                            done.session,
-                            Outbound::Progression(Arc::new(done.response)),
-                        ),
-                        Err(std::sync::mpsc::TryRecvError::Empty)
-                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                    }
-                }
+                worker.send_completed(&clients_for_sim);
             }
             let mut drained = 0usize;
             while drained < MAX_INBOUND_PER_TICK {

@@ -1907,11 +1907,7 @@ async fn run_async(
                         lock(&replica).apply_player_health(health);
                     }
                     Ok(Some(WireRecord::CreatureSpawn(spawn))) => {
-                        if let Err(error) = replica
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .apply_creature_spawn(&spawn)
-                        {
+                        if let Err(error) = lock(&replica).apply_creature_spawn(&spawn) {
                             eprintln!("spall-client: rejected creature spawn: {error}");
                         }
                     }
