@@ -100,14 +100,14 @@ impl Door {
             }
         }
         // Conservative rectangular sweep, including both endpoint positions. The
-        // source plane and its handle layer on the swing side hold the door itself.
+        // source plane and the handle cells this turn vacates are the door itself.
         for z in 0..self.spec.width {
             for x in 0..self.spec.width {
                 for y in 0..self.spec.height {
                     let cell =
                         GlobalCell::new(self.hinge.x + x, self.hinge.y + y, self.hinge.z + z);
-                    let source = if self.open { x <= 1 } else { z <= 1 };
-                    if source {
+                    let source = if self.open { x == 0 } else { z == 0 };
+                    if source || vacated.contains(&cell) {
                         continue;
                     }
                     if !matches!(volume.sample(cell), Ok(Sample::Empty { .. })) {
@@ -251,6 +251,15 @@ mod tests {
         put(&mut v, 10, 4, 20, SPEC.closed_hinge);
         put(&mut v, 14, 8, 19, SPEC.panel);
         put(&mut v, 9, 8, 24, MaterialId(1));
+        assert!(turn(&mut v, hinge).is_err());
+    }
+    #[test]
+    fn terrain_against_the_swing_face_still_blocks_the_turn() {
+        let mut v = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        let hinge = GlobalCell::new(10, 4, 20);
+        put(&mut v, 10, 4, 20, SPEC.closed_hinge);
+        // Foreign solid right beside the closed leaf, inside the swing.
+        put(&mut v, 13, 6, 21, MaterialId(1));
         assert!(turn(&mut v, hinge).is_err());
     }
 }
