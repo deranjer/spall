@@ -102,9 +102,15 @@ fn shipped_manifests_are_frozen() {
         assert_eq!(variant.id.0, 100 + offset as u16);
         assert_eq!(v3.get(variant.id).unwrap().name, variant.name);
     }
-    // No extensions are committed yet, so the current manifest is v5.
+    // No extensions are committed yet, so the current manifest is v5 plus the
+    // three cabin door materials (ENG-249), with every v5 entry unchanged.
     assert!(appearance::extension_variants().is_empty());
-    assert_eq!(hash_bytes(&game::manifest()), V5);
+    let v5 = game::manifest_v5_terrain();
+    let current = game::manifest();
+    assert_eq!(current.entries().len(), v5.entries().len() + 3);
+    for entry in v5.entries() {
+        assert_eq!(current.get(entry.id), Some(entry));
+    }
 }
 
 #[test]

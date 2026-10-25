@@ -120,7 +120,7 @@ pub fn contact_damage_profiles() -> Vec<(MaterialId, spall_sim::ContactDamageMat
 }
 
 /// Version of the sandbox's stable recipe definitions.
-pub const RECIPE_CATALOG_VERSION: u32 = 1;
+pub const RECIPE_CATALOG_VERSION: u32 = 2;
 
 /// Stable game item identity, independent of display names or source order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -136,12 +136,17 @@ pub mod items {
     pub const WOOD_PLANK: ItemId = ItemId(2);
     pub const STONE_CHUNK: ItemId = ItemId(3);
     pub const STONE_BLOCK: ItemId = ItemId(4);
+    pub const STICK: ItemId = ItemId(5);
+    /// A fire pit ready to set down (placing it is not built yet).
+    pub const FIRE_PIT: ItemId = ItemId(6);
 }
 
 pub mod recipe_ids {
     use super::RecipeId;
     pub const SAW_PLANKS: RecipeId = RecipeId(1);
     pub const SHAPE_STONE: RecipeId = RecipeId(2);
+    pub const SPLIT_STICKS: RecipeId = RecipeId(3);
+    pub const BUILD_FIRE_PIT: RecipeId = RecipeId(4);
 }
 
 /// A positive count of one stable game item.
@@ -620,6 +625,34 @@ pub fn recipe_catalog() -> RecipeCatalog {
                     count: 1,
                 }],
             },
+            Recipe {
+                id: recipe_ids::SPLIT_STICKS,
+                ingredients: vec![ItemStack {
+                    item: items::WOOD_LOG,
+                    count: 1,
+                }],
+                outputs: vec![ItemStack {
+                    item: items::STICK,
+                    count: 6,
+                }],
+            },
+            Recipe {
+                id: recipe_ids::BUILD_FIRE_PIT,
+                ingredients: vec![
+                    ItemStack {
+                        item: items::STONE_CHUNK,
+                        count: 6,
+                    },
+                    ItemStack {
+                        item: items::STICK,
+                        count: 6,
+                    },
+                ],
+                outputs: vec![ItemStack {
+                    item: items::FIRE_PIT,
+                    count: 1,
+                }],
+            },
         ],
     )
     .expect("sandbox recipes have unique IDs and positive stacks")
@@ -853,8 +886,8 @@ pub fn terrain_palette() -> spall_worldgen::WorldgenPalette {
 }
 
 /// The sandbox world's validated material manifest: [`manifest_v5_terrain`] plus
-/// every appearance variant in `appearance_extensions.rs` (none yet, so it
-/// equals v5). Extending the palette appends variants under new ids, so it
+/// every appearance variant in `appearance_extensions.rs` (none yet) and the
+/// cabin door materials. Extending the palette appends variants under new ids, so it
 /// extends this manifest chain and worlds saved under any earlier manifest still
 /// restore with unchanged meaning. Clients and servers built with a different
 /// palette do not match the handshake hash.

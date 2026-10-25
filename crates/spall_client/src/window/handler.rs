@@ -97,8 +97,15 @@ impl ApplicationHandler for InteractiveApp {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if !self.cursor_locked && !ui_consumed => {
+            } if !self.cursor_locked && !ui_consumed && !self.inventory_ui_open() => {
                 self.set_cursor_locked(true);
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } if self.book.is_open() && !ui_consumed => {
+                self.book_button(state == ElementState::Pressed);
             }
             WindowEvent::MouseInput {
                 state,
@@ -121,14 +128,60 @@ impl ApplicationHandler for InteractiveApp {
                     );
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_px = Some([position.x as f32, position.y as f32]);
+            }
             WindowEvent::KeyboardInput { event, .. } => {
-                if ui_consumed {
-                    return;
-                }
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
+                // Yakui sinks Tab for its focus navigation even with no
+                // widget focused; Tab is the pack's key.
+                if ui_consumed && code != KeyCode::Tab {
+                    return;
+                }
                 let held = event.state == ElementState::Pressed;
+                // Tab or Esc packs up; walking or jumping gets going.
+                if held
+                    && !event.repeat
+                    && self.pack.is_open()
+                    && matches!(
+                        code,
+                        KeyCode::Tab
+                            | KeyCode::Escape
+                            | KeyCode::KeyW
+                            | KeyCode::KeyA
+                            | KeyCode::KeyS
+                            | KeyCode::KeyD
+                            | KeyCode::Space
+                    )
+                {
+                    self.close_pack();
+                    if matches!(code, KeyCode::Tab | KeyCode::Escape) {
+                        return;
+                    }
+                }
+                // B or Esc closes the book; Tab swaps to the pack; walking
+                // or jumping gets going.
+                if held
+                    && !event.repeat
+                    && self.book.is_open()
+                    && matches!(
+                        code,
+                        KeyCode::KeyB
+                            | KeyCode::Escape
+                            | KeyCode::KeyW
+                            | KeyCode::KeyA
+                            | KeyCode::KeyS
+                            | KeyCode::KeyD
+                            | KeyCode::Space
+                    )
+                {
+                    self.close_book();
+                    if matches!(code, KeyCode::KeyB | KeyCode::Escape) {
+                        return;
+                    }
+                }
                 match code {
                     KeyCode::KeyW => self.held.forward = held,
                     KeyCode::KeyS => self.held.back = held,
@@ -183,6 +236,14 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     KeyCode::KeyR if held && !event.repeat => {
                         self.recentre_view();
+                        return;
+                    }
+                    KeyCode::Tab if held && !event.repeat => {
+                        self.open_pack();
+                        return;
+                    }
+                    KeyCode::KeyB if held && !event.repeat => {
+                        self.open_book();
                         return;
                     }
                     KeyCode::KeyE
@@ -257,6 +318,36 @@ impl ApplicationHandler for InteractiveApp {
                 let handler_started = now;
                 self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);
+                let pack_dt = self.pack_frame_at.replace(now).map_or(0.0, |at| {
+                    now.saturating_duration_since(at).as_secs_f32().min(0.1)
+                });
+                self.pack.advance(pack_dt);
+                self.book.advance(pack_dt);
+                if let Some(pack_view) = &self.pack_view
+                    && (self.pack.is_open() || self.book.is_open())
+                {
+                    let reply = self
+                        .session
+                        .progression_reply
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    if let Some(reply) = reply {
+                        let (outcome, retry) = self.inventory.take_reply(reply);
+                        if let Some(outcome) = outcome {
+                            self.book.crafted(&outcome, pack_view.as_ref());
+                        }
+                        if let Some(request) = retry {
+                            self.session.push_progression(request);
+                        }
+                    }
+                    self.book.reconcile(pack_view.as_ref(), &self.inventory);
+                    if let Some(request) =
+                        self.inventory.due_request(pack_view.catalog_version(), now)
+                    {
+                        self.session.push_progression(request);
+                    }
+                }
 
                 // Drain the background worker's result, if a fresh one has
                 // landed since the last frame (never blocks — `try_recv`).
@@ -351,6 +442,7 @@ impl ApplicationHandler for InteractiveApp {
                 // The cells the hammer would break (last frame's target).
                 if let Some((cell, _)) = self.hammer_target
                     && !self.admin_menu_open
+                    && !self.inventory_ui_shown()
                 {
                     overlay.extend(hammer_outline(
                         cell,
@@ -642,6 +734,20 @@ impl ApplicationHandler for InteractiveApp {
                                 (followed, look_dir)
                             }
                         });
+                        let screen = renderer.ui_size();
+                        let scale = renderer.ui_scale();
+                        let cursor = self.cursor_px.map(|[x, y]| [x / scale, y / scale]);
+                        let stacks = self.inventory.stacks();
+                        renderer.pack_frame = self.pack_view.as_ref().and_then(|pack_view| {
+                            if let Some(cursor) = cursor {
+                                self.pack.hover(screen, cursor, stacks);
+                            }
+                            self.pack.frame(pack_view.as_ref(), screen, stacks)
+                        });
+                        renderer.book_frame = self.pack_view.as_ref().and_then(|pack_view| {
+                            self.book.pointer(screen, cursor.unwrap_or([-1.0; 2]));
+                            self.book.frame(pack_view.as_ref(), &self.inventory)
+                        });
                         self.hammer_target = match cam {
                             Some((eye, dir)) => {
                                 match self.session.replica.get().and_then(|r| r.try_lock().ok()) {
@@ -757,8 +863,12 @@ impl ApplicationHandler for InteractiveApp {
                             }
                         }
                         renderer.set_endurance(self.endurance_view);
-                        renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(
-                            || CrosshairView {
+                        renderer.set_crosshair(
+                            (!self.admin_menu_open
+                                && !self.pack.is_shown()
+                                && !self.book.is_shown()
+                                && cam.is_some())
+                            .then(|| CrosshairView {
                                 in_reach: self.hammer_target.is_some(),
                                 label: match self.hammer_target {
                                     // A click only captures the mouse until it is.
@@ -766,18 +876,18 @@ impl ApplicationHandler for InteractiveApp {
                                         "click to capture the mouse, then click to break".to_owned()
                                     }
                                     Some((_, material)) => format!(
-                                            "hammer r{}  {}",
-                                            self.hammer_radius,
-                                            self.material_names
-                                                .get(&material.0)
-                                                .map_or("?", String::as_str)
-                                        ),
+                                        "hammer r{}  {}",
+                                        self.hammer_radius,
+                                        self.material_names
+                                            .get(&material.0)
+                                            .map_or("?", String::as_str)
+                                    ),
                                     None => {
                                         format!("hammer r{}  out of reach", self.hammer_radius)
                                     }
                                 },
-                            },
-                        ));
+                            }),
+                        );
                         if let Some((eye, dir)) = cam
                             && self.cursor_locked
                             && hammer_due(

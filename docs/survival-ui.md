@@ -40,15 +40,74 @@ rightmost. The icons are `crates/spall_client/assets/hud/*.png`, drawn by
 When survival stats become server-authoritative, they replace these inputs; the
 grade mapping stays.
 
+## Built: the pack (Tab)
+
+`Tab` slides a weathered canvas tarp up over the screen, dims the world a little,
+and lays the inventory out on it. It is UI only: nothing is drawn in the world,
+the camera does not move, and the world keeps running behind it. Each stack shows
+the item's painted icon, a charcoal count ("×12") and its name; the stack under
+the cursor grows slightly and its name darkens. Text scales with the tarp. `Tab` or
+`Esc` packs it away again, and walking or jumping closes it.
+
+- **Inventory.** The server keeps the inventory as stable item IDs. While the pack
+  is open the client asks for it (`ProgressionRequest::InspectInventory`) every
+  1.5 s, so harvests show up without reopening.
+- **Engine and game.** The engine draws the tarp
+  (`crates/spall_client/assets/hud/tarp.png`, drawn by `make_tarp.py`), lays out up
+  to 12 stacks (4 by 3; more show a "+N more" note) and loads icons on first sight.
+  The game's `spall_client::window::PackView` gives each item ID a name and PNG
+  icon. The sandbox's icons are `examples/sandbox/assets/items/*.png`, drawn by
+  `make_items.py`.
+- **Not yet:** crafting on the cloth, moving items, belt slots, and sounds.
+
+## Built: the blueprint book (B)
+
+`B` slides an open leather journal over the screen. Its pages hold a blue
+blueprint card for each of the game's recipes: what it makes, a small drawing of
+where its materials go, and each material as have / need (red when short).
+Clicking a card turns to the crafting cloth: the blueprint on the left page, a
+canvas cloth on the right, and a strip of the pack's materials under it.
+
+Blueprints are not a grid. Each lists **slots**: a position on the cloth, the item
+it takes and the item's drawn size, and the blueprint is seen either **from above**
+or **from the side** (side views draw a ground line). Empty slots show as faint
+outlines of their item. Drag a material onto the cloth and it snaps into the
+nearest empty slot that takes it (within the slot's half size plus 8% of the
+cloth); the slot it would snap into is lit while dragging, and a drop with no home
+goes back to the pack. Drag a laid material to move it, or click it to take it
+back. When every slot is filled, **Craft** lights up and asks the server for one
+batch (`ProgressionOperation::Craft`). On success the cloth clears and says what
+was made; a refusal keeps the cloth and says why. A craft beaten by a harvest
+(stale inventory revision) is retried once. `B` or `Esc` closes the book, `Tab`
+swaps to the pack, and walking closes it.
+
+The sandbox's blueprints:
+
+| Blueprint | View | Lay out | Makes |
+| --- | --- | --- | --- |
+| Planks | Side | a log on the ground | 4 planks |
+| Stone block | Side | two stones stacked on two | 1 stone block |
+| Sticks | Above | a log | 6 sticks |
+| Fire pit | Above | six sticks in the centre, six stones in a ring round them | 1 fire pit |
+
+Sticks and the fire pit are new items (recipe catalogue version 2). A fire pit
+sits in the pack; setting one down in the world is not built yet.
+
+- **Engine and game.** The engine draws the book and cloth
+  (`crates/spall_client/assets/hud/book.png` and `cloth.png`, drawn by
+  `make_book.py`), lays out up to 12 blueprints, snaps materials and sends the
+  craft. The game's `PackView::blueprints` gives each blueprint's recipe, output,
+  view and slots; the sandbox checks each against its server recipe.
+- **Shared inventory.** The pack and the book read one `InventoryFeed`, refreshed
+  every 1.5 s while either is open.
+- **Not yet:** more than 12 blueprints (paging), rotated items on the cloth,
+  blueprints learned in play, placing a fire pit, sounds.
+
 ## Planned
 
 - **Sounds** for the body states and inventory (list below). None is integrated yet.
 - **Belt:** 4 to 6 worn quick slots, visible on the player body, switched without a menu.
-- **Pack:** kneel and unroll a tarp on the ground in front of you, with items as
-  their real voxel models. Crafting happens on a cloth; the world never pauses, and
-  other players see you kneeling. The tarp and items are client-side render only:
-  the server keeps the inventory as a list of stable item IDs.
-- **Camp storage:** racks, woodpiles and shelves as destructible world geometry.
+- **Camp:** being rethought; a first cut (a claimed area around a fire pit) was tried and taken out.
 - **Wrist cord and journal:** the day count and exact readouts for players who want
   numbers.
 
@@ -83,7 +142,7 @@ those searches. Accepted files go into `examples/sandbox/assets/audio/` and
 | Cue | Use | Candidates |
 | --- | --- | --- |
 | Tarp unroll | Opening the pack | [craigsmith tent/tarp whoosh](https://freesound.org/people/craigsmith/sounds/481896/), [search](https://freesound.org/search/?q=tarp&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |
-| Pack open / close | Kneel, roll the tarp back up | [Fission9 inventory open](https://freesound.org/people/Fission9/sounds/568992/), [Fission9 inventory close](https://freesound.org/people/Fission9/sounds/568991/) |
+| Pack open / close | Tarp slides in and away | [Fission9 inventory open](https://freesound.org/people/Fission9/sounds/568992/), [Fission9 inventory close](https://freesound.org/people/Fission9/sounds/568991/) |
 | Fabric handling | Moving items on the tarp | [dynamique fabric rubbing](https://freesound.org/people/dynamique/sounds/554561/) |
 | Pouch | Belt slot grab | [Canakinsound coin pouch](https://freesound.org/people/Canakinsound/sounds/722039/) |
 | Wood stick | Picking up sticks or logs | [gashasound wood stick](https://freesound.org/people/gashasound/sounds/470914/), [search](https://freesound.org/search/?q=stick+wood&f=license%3A%22Creative+Commons+0%22&s=Rating+highest+first) |

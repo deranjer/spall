@@ -1,6 +1,7 @@
 //! Native render-window host and the client-side replica. GPU voxel extraction
 //! and transport wiring are added by later tasks.
 
+mod action_requests;
 pub mod audio;
 pub mod body_state;
 pub mod breathing;

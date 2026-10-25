@@ -16,6 +16,8 @@ pub mod editor_scene;
 /// into engine [`spall_sim::EditIntent`]s. The engine never imports this.
 pub mod game;
 #[cfg(feature = "client")]
+pub mod pack_view;
+#[cfg(feature = "client")]
 pub mod player_view;
 pub mod progression_store;
 pub mod worldgen_scene;

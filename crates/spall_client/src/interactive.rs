@@ -323,6 +323,11 @@ pub struct InteractiveSession {
     pub admin_queue: Mutex<Vec<spall_protocol::AdminRequest>>,
     /// The server's answer to the most recent admin command.
     pub admin_status: Mutex<Option<spall_protocol::AdminStatus>>,
+    /// Inventory requests from the pack (Tab) waiting for the network thread.
+    pub progression_queue: Mutex<Vec<spall_protocol::ProgressionRequest>>,
+    /// The newest progression answer. Every answer, even a rejection, carries
+    /// the complete inventory.
+    pub progression_reply: Mutex<Option<spall_protocol::ProgressionResponse>>,
     pub vegetation: Mutex<Option<Arc<spall_ecology::living::VisualFrame>>>,
     /// The replicated column water as a camera-centred height field the
     /// renderer draws (ENG-168): fed by the network thread, drained by the
@@ -440,6 +445,8 @@ impl InteractiveSession {
             action_queue: Mutex::new(Vec::new()),
             admin_queue: Mutex::new(Vec::new()),
             admin_status: Mutex::new(None),
+            progression_queue: Mutex::new(Vec::new()),
+            progression_reply: Mutex::new(None),
             vegetation: Mutex::new(None),
             column_surface: Mutex::new(crate::column_surface::ColumnSurface::new()),
             world_resets: std::sync::atomic::AtomicU64::new(0),
@@ -456,6 +463,15 @@ impl InteractiveSession {
         };
         *self.admin_status.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.admin_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request);
+    }
+
+    /// Queues a progression request (the pack's inventory refresh) for the
+    /// network thread to send.
+    pub fn push_progression(&self, request: spall_protocol::ProgressionRequest) {
+        self.progression_queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(request);
