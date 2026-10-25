@@ -11,19 +11,19 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
     ("Mouse", "Look (left click captures the cursor)"),
     (
         "Left click",
-        "Hammer: break voxels where you aim (hold to repeat)",
+        "Use the tool in hand (hold to repeat); the admin hammer breaks voxels",
     ),
     ("T", "Torch: place a light where you aim"),
     (
         "Tab",
-        "Pack: lay out what you carry (Tab, Esc or walk to pack up)",
+        "Pack: lay out what you carry; click a tool to hold it (Tab, Esc or walk to pack up)",
     ),
     (
         "B",
         "Blueprint book: pick a blueprint, lay its pattern on the cloth, Craft",
     ),
     ("E", "Pick up a nearby item, or open / close a door"),
-    ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
+    ("Wheel", "Admin hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),
     ("Shift", "Sprint (walking) / fly faster (flying)"),
@@ -60,6 +60,8 @@ pub(crate) struct AdminMenuView {
     pub body: BodyState,
     pub body_preview: BodyPreview,
     pub flying: bool,
+    /// The admin hammer is in hand.
+    pub hammer_on: bool,
     /// Server's reply to the last admin command, or "waiting" while pending.
     pub admin_status: Option<String>,
     /// One-line summary of the replicated water, if any has arrived.
@@ -98,6 +100,7 @@ pub(crate) struct AdminMenuActions {
     pub toggle_ground_snow: bool,
     pub toggle_weather_flashes: bool,
     pub toggle_flight: bool,
+    pub toggle_hammer: bool,
     pub reset_world: bool,
     pub recentre: bool,
     pub close: bool,
@@ -369,6 +372,20 @@ pub(super) fn admin_menu_panel(
                             actions.recentre |= yakui::button("Recentre view").clicked;
                         });
                     });
+
+                    section("Tools");
+                    yakui::row(|| {
+                        let label = if view.hammer_on {
+                            "Hammer: in hand"
+                        } else {
+                            "Hammer: put away"
+                        };
+                        actions.toggle_hammer |= yakui::button(label).clicked;
+                    });
+                    muted(
+                        12.0,
+                        "Admin hammer: left click breaks voxels, the wheel sets its radius. The server refuses it unless admin commands are on.",
+                    );
 
                     section("World");
                     yakui::row(|| {

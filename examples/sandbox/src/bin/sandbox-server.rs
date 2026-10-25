@@ -757,6 +757,7 @@ fn run_serve(args: Args) -> ExitCode {
             creatures,
             creature_shape,
             item_pickup: None,
+            tool_hooks: None,
             fires: None,
             contact_damage: args
                 .contact_damage
@@ -832,10 +833,16 @@ fn run_serve(args: Args) -> ExitCode {
         sandbox::game::PlayerInventories::default(),
     ));
     // E-key world item pickup (ENG-257) fills the same pack crafting reads.
-    config.server.item_pickup = Some(match durable_progression.clone() {
-        Some(store) => sandbox::world_items::durable_pickup(store),
-        None => sandbox::world_items::in_memory_pickup(player_inventories.clone()),
-    });
+    let pack = match durable_progression.clone() {
+        Some(store) => sandbox::world_items::PackStore::Durable(store),
+        None => sandbox::world_items::PackStore::InMemory(player_inventories.clone()),
+    };
+    config.server.item_pickup = Some(sandbox::world_items::pickup(pack.clone()));
+    // Tool rules (ENG-259..261): the hammer only for admins, other tools only
+    // from the pack, and their drops into it.
+    config.server.tool_hooks = Some(spall_server::ToolHooks::new(
+        sandbox::tools::SandboxToolRules::new(pack),
+    ));
     // Fire pits set down and fed from the same pack (ENG-266).
     config.server.fires = Some(match durable_progression.clone() {
         Some(store) => sandbox::fires::durable_fires(store),

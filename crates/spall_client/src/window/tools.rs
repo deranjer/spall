@@ -161,10 +161,19 @@ pub(super) fn hammer_outline(cell: GlobalCell, radius_cells: i64, material: u32)
     out
 }
 
+/// How often a held button swings a picked-up tool (a shovel stroke).
+pub(super) const TOOL_REPEAT: Duration = Duration::from_millis(350);
+
 /// Whether a swing is due: a fresh click always is; a held button repeats
-/// once [`HAMMER_REPEAT`] has passed since the last one.
-pub(super) fn hammer_due(pending: bool, held: bool, last: Option<Instant>, now: Instant) -> bool {
-    pending || (held && last.is_none_or(|at| now.saturating_duration_since(at) >= HAMMER_REPEAT))
+/// once `repeat` has passed since the last one.
+pub(super) fn swing_due(
+    pending: bool,
+    held: bool,
+    last: Option<Instant>,
+    now: Instant,
+    repeat: Duration,
+) -> bool {
+    pending || (held && last.is_none_or(|at| now.saturating_duration_since(at) >= repeat))
 }
 
 #[cfg(test)]
@@ -291,22 +300,24 @@ mod tests {
     }
 
     #[test]
-    fn hammer_swings_on_click_then_repeats_only_while_held() {
+    fn a_swing_goes_on_click_then_repeats_only_while_held() {
         let t0 = Instant::now();
-        assert!(!hammer_due(false, false, None, t0));
-        assert!(
-            hammer_due(true, false, None, t0),
-            "a fresh click always swings"
-        );
-        assert!(
-            hammer_due(false, true, None, t0),
-            "held with no swing yet swings"
-        );
-        assert!(!hammer_due(false, true, Some(t0), t0 + HAMMER_REPEAT / 2));
-        assert!(hammer_due(false, true, Some(t0), t0 + HAMMER_REPEAT));
-        assert!(
-            !hammer_due(false, false, Some(t0), t0 + HAMMER_REPEAT * 4),
-            "released: no repeat"
-        );
+        for repeat in [HAMMER_REPEAT, TOOL_REPEAT] {
+            assert!(!swing_due(false, false, None, t0, repeat));
+            assert!(
+                swing_due(true, false, None, t0, repeat),
+                "a fresh click always swings"
+            );
+            assert!(
+                swing_due(false, true, None, t0, repeat),
+                "held with no swing yet swings"
+            );
+            assert!(!swing_due(false, true, Some(t0), t0 + repeat / 2, repeat));
+            assert!(swing_due(false, true, Some(t0), t0 + repeat, repeat));
+            assert!(
+                !swing_due(false, false, Some(t0), t0 + repeat * 4, repeat),
+                "released: no repeat"
+            );
+        }
     }
 }

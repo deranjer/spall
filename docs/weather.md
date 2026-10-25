@@ -118,6 +118,11 @@ surfaces and clears the source, preventing floating snow. Moving-body accumulati
 is deferred. Warm weather melts gradually; fresh snow fills footprints. No melt
 or rainfall mass is injected into the water solver in this phase.
 
+Shovelling (ENG-260) clears the layer: `Simulation::clear_snow` drops the shovelled
+faces from their cohorts and exposes them again at zero depth, so they replicate
+like any changed layer and fill again with fresh snowfall. More than 0.15 m of
+snow over a world item buries it (no pickup) until it is shovelled off.
+
 ## Footprints
 
 Derive footfalls from server-validated grounded movement and distance/stride,

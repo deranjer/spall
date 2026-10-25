@@ -72,6 +72,9 @@ pub struct HostConfig {
     /// The game's pack for E-key world item pickup (ENG-257). `None`: items
     /// are still replicated and drawn, but nothing can be picked up.
     pub item_pickup: Option<ItemPickup>,
+    /// The game's tool rules (ENG-259): who may swing which tool. `None`:
+    /// every catalog tool is open to every player.
+    pub tool_hooks: Option<ToolHooks>,
     /// The game's fire rules (ENG-266): setting a fire pit down from the pack
     /// and feeding fires with E. `None`: fires still burn, replicate and warm,
     /// but none can be set down or fed.
@@ -253,6 +256,7 @@ impl ServeConfig {
                 creatures: None,
                 creature_shape: None,
                 item_pickup: None,
+                tool_hooks: None,
                 fires: None,
                 contact_damage: None,
                 dormancy: None,

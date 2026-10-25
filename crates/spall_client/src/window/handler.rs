@@ -135,7 +135,9 @@ impl ApplicationHandler for InteractiveApp {
                 self.hammer_held = state == ElementState::Pressed;
                 self.hammer_pending |= self.hammer_held;
             }
-            WindowEvent::MouseWheel { delta, .. } if self.cursor_locked && !ui_consumed => {
+            WindowEvent::MouseWheel { delta, .. }
+                if self.cursor_locked && self.hammer_on && !ui_consumed =>
+            {
                 let steps = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y.round() as i64,
                     winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 40.0).round() as i64,
@@ -802,7 +804,13 @@ impl ApplicationHandler for InteractiveApp {
                             if let Some(cursor) = cursor {
                                 self.pack.hover(screen, cursor, stacks);
                             }
-                            self.pack.frame(pack_view.as_ref(), screen, stacks)
+                            let mut frame = self.pack.frame(pack_view.as_ref(), screen, stacks)?;
+                            for slot in &mut frame.slots {
+                                if Some(slot.item_id) == self.held_item {
+                                    slot.name.push_str(" (in hand)");
+                                }
+                            }
+                            Some(frame)
                         });
                         renderer.esc_menu = self.esc.open.then(|| self.esc.view(&self.keys));
                         renderer.compass_yaw =
@@ -814,7 +822,7 @@ impl ApplicationHandler for InteractiveApp {
                             self.book.frame(pack_view.as_ref(), &self.inventory)
                         });
                         self.hammer_target = match cam {
-                            Some((eye, dir)) => {
+                            Some((eye, dir)) if self.hammer_on => {
                                 match self.session.replica.get().and_then(|r| r.try_lock().ok()) {
                                     Some(replica) => replica
                                         .terrain_volume()
@@ -945,6 +953,26 @@ impl ApplicationHandler for InteractiveApp {
                             ));
                         }
                         renderer.set_endurance(self.endurance_view);
+                        // A held item that has left the pack is no longer in hand.
+                        if let Some(item) = self.held_item
+                            && self.inventory.stacks().is_some()
+                            && self.inventory.count(item) == 0
+                        {
+                            self.held_item = None;
+                        }
+                        let held_tool = self.held_item.and_then(|item| {
+                            Some((item, self.pack_view.as_ref()?.item_tool(item)?))
+                        });
+                        let held_name = held_tool.map_or_else(
+                            || "empty hands".to_owned(),
+                            |(item, _)| {
+                                self.pack_view
+                                    .as_ref()
+                                    .and_then(|view| view.item_name(item))
+                                    .unwrap_or("tool")
+                                    .to_lowercase()
+                            },
+                        );
                         renderer.set_crosshair(
                             (!self.admin_menu_open
                                 && !self.esc.open
@@ -959,6 +987,7 @@ impl ApplicationHandler for InteractiveApp {
                                     _ if !self.cursor_locked => {
                                         "click to capture the mouse, then click to break".to_owned()
                                     }
+                                    _ if !self.hammer_on => held_name.clone(),
                                     Some((_, material)) => format!(
                                         "hammer r{}  {}",
                                         self.hammer_radius,
@@ -974,11 +1003,13 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         if let Some((eye, dir)) = cam
                             && self.cursor_locked
-                            && hammer_due(
+                            && self.hammer_on
+                            && swing_due(
                                 self.hammer_pending,
                                 self.hammer_held,
                                 self.last_hammer_at,
                                 render_now,
+                                HAMMER_REPEAT,
                             )
                         {
                             self.hammer_pending = false;
@@ -1007,6 +1038,37 @@ impl ApplicationHandler for InteractiveApp {
                                 dir,
                                 self.hammer_radius,
                             ));
+                        }
+                        // Off the hammer: left click swings the tool in hand;
+                        // empty-handed, a click does nothing.
+                        if !self.hammer_on {
+                            match (cam, held_tool) {
+                                (Some((eye, dir)), Some((_, tool)))
+                                    if self.cursor_locked
+                                        && swing_due(
+                                            self.hammer_pending,
+                                            self.hammer_held,
+                                            self.last_hammer_at,
+                                            render_now,
+                                            TOOL_REPEAT,
+                                        ) =>
+                                {
+                                    self.last_hammer_at = Some(render_now);
+                                    let id = self.next_action_id;
+                                    self.next_action_id += 1;
+                                    // The server sets the stroke's radius.
+                                    self.session.push_action(tool_request(
+                                        id,
+                                        tool,
+                                        spall_protocol::ActionKind::Cut,
+                                        eye,
+                                        dir,
+                                        0,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            self.hammer_pending = false;
                         }
                         if self.torch_pending {
                             self.torch_pending = false;
@@ -1094,6 +1156,7 @@ impl ApplicationHandler for InteractiveApp {
                                     .map(|(text, _)| text.clone()),
                                 frame_summary(&self.frame_history),
                             );
+                            menu.hammer_on = self.hammer_on;
                             menu.weather = self
                                 .latest_weather
                                 .as_ref()
@@ -1221,6 +1284,10 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 if menu_actions.toggle_flight {
                     self.toggle_flight();
+                }
+                if menu_actions.toggle_hammer {
+                    self.hammer_on = !self.hammer_on;
+                    self.hammer_pending = false;
                 }
                 if menu_actions.toggle_sky_visibility {
                     self.toggle_sky_visibility();

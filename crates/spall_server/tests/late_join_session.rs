@@ -80,6 +80,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
             creatures: None,
             creature_shape: None,
             item_pickup: None,
+            tool_hooks: None,
             fires: None,
             contact_damage: None,
             dormancy: None,

@@ -150,7 +150,9 @@ measure, keep vsync on and read the window title's "headroom" figure (CPU work
 without the vsync wait against scene GPU time): `--uncapped`/`--fps-cap` froze
 the development PC on the 1 km world, once needing a hard reboot (2026-10-22).
 
-**Hammer.** A crosshair marks the screen centre (white with a target in
+**Hammer.** The hammer is an admin tool (ENG-259): it is put away until the
+admin menu (F10, Tools) puts it in hand, and the sandbox server refuses its
+swings unless it runs with `--allow-admin-commands`. A crosshair marks the screen centre (white with a target in
 reach, red without), a cyan wireframe shows the cells a swing would break, and
 a label shows the radius and the material under the crosshair (or "click to
 capture the mouse" until the cursor is captured). The target is found each frame
