@@ -667,6 +667,22 @@ four player starts, and separate bed, table, bench, lamp and door assets. The
 scene importer places these into normal destructible terrain. Furniture is
 modular for authoring; it has no runtime pickup behavior.
 
+World items (ENG-257) are separate from terrain: `spall_sim::Simulation` holds
+each item's stable id, game item kind and pose, creates and removes them only on
+the owning thread between ticks, and queues the change for the server to send
+as a `WorldItemUpdate` after the tick (join lists seed late joiners). Items own
+no voxels and have no physics. E sends `ActionKind::Interact`; the server picks
+the nearest item its own player can see within 3 m and asks the game's
+`ItemPickup` callback to put it in the pack, removing it only when the game
+accepts. The sandbox's pack is the ENG-244 inventory (in memory, or the durable
+progression database with player credentials), limited to 12 distinct kinds.
+New custom worlds get items from `CustomWorld::with_world_items`; the sandbox's
+editor-scene loader reads them from `<project>/items.ron` (the cabin has a
+shovel and the note). Items are saved in checkpoints. The client draws each item
+from `PackView::item_model` (sandbox placeholder cubes in
+`pack_view::placeholder_model` until SPVOX item models exist) and labels the
+nearest one `E  Pick up <name>`, ahead of a door prompt.
+
 Quarter-metre doors use `spall_voxel::doors` to find a visible nearby hinge and
 plan a +X-to-+Z panel turn. The hinge material records open/closed state. E sends
 an interaction request; the server selects the door from its authoritative

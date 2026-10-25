@@ -13,6 +13,24 @@ Cabin content and interaction checks:
   Capture the mouse, approach the door and press E to open/close it. The E label
   follows the door in the view; it disappears beyond reach or behind walls.
   Furniture placements can be edited independently in Spall Editor.
+  The shovel lies on the floor and the note on the table; within 3 m the label
+  reads `E  Pick up Shovel` / `E  Pick up Note`, E removes the item and Tab
+  shows it in the pack.
+
+World item checks (ENG-257):
+
+- `cargo test -p spall_server --lib serve::items` checks pickup from the
+  authoritative player (bogus aim and out-of-reach requests do nothing), one
+  winner for two players and a duplicate, and a full pack leaving the item.
+- `cargo test -p spall_sim --lib world_items` checks id allocation, restore
+  validation and update splitting.
+- `cargo test -p spall_server --test world_item_persistence` and
+  `cargo test -p spall_store --test durability` check save and load.
+- `cargo test -p sandbox --lib world_items progression_store` checks the
+  12-slot pack, in memory and durable.
+- `cargo test -p sandbox --features client --test world_items` checks cabin item
+  placement and, over real QUIC, a simultaneous pickup by two clients (one
+  joined late) and a third client joining afterwards.
 
 
 Historical grid-water validation (ENG-122 closeout, water default, canal viewer, windowed comparison; removed in ENG-169): see [reports/history-validation.md](reports/history-validation.md).
