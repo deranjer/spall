@@ -46,7 +46,9 @@ const FIRE_EFFECT_RANGE_M: f64 = 64.0;
 /// view yet) every fire animates.
 fn fire_effect_in_range(fire: &WorldItem, eye: Option<[f64; 3]>) -> bool {
     eye.is_none_or(|eye| {
-        let d: f64 = (0..3).map(|i| (fire.translation_m[i] - eye[i]).powi(2)).sum();
+        let d: f64 = (0..3)
+            .map(|i| (fire.translation_m[i] - eye[i]).powi(2))
+            .sum();
         d <= FIRE_EFFECT_RANGE_M * FIRE_EFFECT_RANGE_M
     })
 }
