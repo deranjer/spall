@@ -727,6 +727,11 @@ The game's pack callback (`HostConfig::item_pickup`) runs on the owning thread:
 on success the item leaves the world and the status is `Queued`; on refusal
 (the sandbox's full 12-slot pack) the status is `Rejected` with the game's
 reason and the item stays. Requests are serial, so an item reaches one pack.
+A successful pickup's `Queued` goes in the simulation's admission ledger, the
+one edit and door retries replay from (`Simulation::action_status`). A retry
+with the same request id is therefore answered from there and never reaches a
+door beside the item. That ledger is keyed by request id alone, as it is for
+edits and doors, so it also covers a reconnect retry on a new session.
 
 Save version 9 adds the `checkpoint_world_items` row: the items and the id
 counter. Items are checkpointed, not journaled. With the durable progression

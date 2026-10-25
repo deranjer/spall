@@ -57,11 +57,14 @@ mod network {
     use spall_client::{
         BaselineScene, ClientNetConfig, InteractiveSession, run_replication_client_with_manifest,
     };
-    use spall_core::{BrushPoint, SphereBrush};
+    use spall_core::{BrushPoint, MaterialId, SphereBrush};
     use spall_net::{Fingerprint, JoinToken, TransportConfig};
     use spall_protocol::{ActionKind, ActionRequest, ClaimedTarget, InputSeq, RequestId};
-    use spall_server::{CustomWorld, Scene, ServeConfig};
+    use spall_server::{CustomWorld, InitialWorldItem, Scene, ServeConfig};
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
@@ -89,6 +92,19 @@ mod network {
         kinds
     }
 
+    /// The cabin door's hinge cell material on `replica`.
+    fn hinge(replica: &Arc<Mutex<ReplicaWorld>>) -> Option<MaterialId> {
+        let r = replica.lock().unwrap();
+        match r
+            .terrain_volume()?
+            .sample(GlobalCell::new(37, 4, 24))
+            .ok()?
+        {
+            Sample::Filled(m) => Some(m),
+            _ => None,
+        }
+    }
+
     fn interact(id: u64) -> ActionRequest {
         ActionRequest {
             request_id: RequestId(id),
@@ -103,60 +119,77 @@ mod network {
         }
     }
 
-    /// Two players beside the cabin shovel, one joining late, both press E at
-    /// once: exactly one pack gains it, the world loses it on every client,
-    /// and a client joining afterwards never sees it.
-    #[test]
-    fn pickup_goes_to_one_pack_and_replicates_to_late_joiners() {
-        let dir = std::env::temp_dir().join(format!("spall-world-items-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let scene = Arc::new(cabin());
-        let items = scene.world_items.clone();
-        let token = JoinToken::generate().unwrap();
-        let mut cfg = ServeConfig::headless("127.0.0.1:0".parse().unwrap(), Scene::Custom, token);
-        let build = scene.clone();
-        cfg.server.custom_world = Some(
-            CustomWorld::new(
-                vec![[9.0, 1.0, 9.5], [8.5, 1.0, 10.5], [10.125, 1.0, 8.5]],
-                move || build.world_setup(),
+    /// A cabin server with in-memory packs, and clients that connect to it.
+    struct Cabin {
+        dir: PathBuf,
+        token: JoinToken,
+        addr: SocketAddr,
+        fingerprint: Fingerprint,
+        server: JoinHandle<spall_server::ServeSummary>,
+        inventories: Arc<Mutex<game::PlayerInventories>>,
+    }
+
+    struct Client {
+        session: Arc<InteractiveSession>,
+        thread: JoinHandle<spall_client::ClientSummary>,
+        replica: Arc<Mutex<ReplicaWorld>>,
+    }
+
+    impl Cabin {
+        fn start(name: &str, spawns: Vec<[f64; 3]>, items: Vec<InitialWorldItem>) -> Self {
+            let dir = std::env::temp_dir().join(format!("spall-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let scene = Arc::new(cabin());
+            let token = JoinToken::generate().unwrap();
+            let mut cfg =
+                ServeConfig::headless("127.0.0.1:0".parse().unwrap(), Scene::Custom, token);
+            cfg.server.max_clients = spawns.len();
+            cfg.server.custom_world =
+                Some(CustomWorld::new(spawns, move || scene.world_setup()).with_world_items(items));
+            let inventories = Arc::new(Mutex::new(game::PlayerInventories::default()));
+            cfg.server.item_pickup = Some(in_memory_pickup(inventories.clone()));
+            cfg.server.paced = true;
+            cfg.server.log_json = dir.join("server.jsonl");
+            cfg.server.transport = TransportConfig::for_tests();
+            cfg.harness.max_ticks = 900;
+            cfg.harness.min_clients = 1;
+            cfg.harness.quiescence_ticks = 0;
+            cfg.harness.startup_timeout = Duration::from_secs(20);
+            cfg.harness.fingerprint_out = Some(dir.join("fingerprint"));
+            cfg.harness.addr_out = Some(dir.join("addr"));
+            let server = std::thread::spawn(move || {
+                spall_server::serve_with_game_content(cfg, game::tool_catalog(), game::manifest())
+                    .expect("item server")
+            });
+            let fingerprint = Fingerprint::from_hex(
+                until("fingerprint", || {
+                    std::fs::read_to_string(dir.join("fingerprint")).ok()
+                })
+                .trim(),
             )
-            .with_world_items(items),
-        );
-        let inventories = Arc::new(Mutex::new(game::PlayerInventories::default()));
-        cfg.server.item_pickup = Some(in_memory_pickup(inventories.clone()));
-        cfg.server.paced = true;
-        cfg.server.max_clients = 3;
-        cfg.server.log_json = dir.join("server.jsonl");
-        cfg.server.transport = TransportConfig::for_tests();
-        cfg.harness.max_ticks = 900;
-        cfg.harness.min_clients = 1;
-        cfg.harness.quiescence_ticks = 0;
-        cfg.harness.startup_timeout = Duration::from_secs(20);
-        cfg.harness.fingerprint_out = Some(dir.join("fingerprint"));
-        cfg.harness.addr_out = Some(dir.join("addr"));
-        let server = std::thread::spawn(move || {
-            spall_server::serve_with_game_content(cfg, game::tool_catalog(), game::manifest())
-                .expect("item server")
-        });
-        let fingerprint = Fingerprint::from_hex(
-            until("fingerprint", || {
-                std::fs::read_to_string(dir.join("fingerprint")).ok()
-            })
-            .trim(),
-        )
-        .unwrap();
-        let addr = until("addr", || std::fs::read_to_string(dir.join("addr")).ok())
-            .trim()
-            .parse()
             .unwrap();
-        let connect = |name: &str| {
+            let addr = until("addr", || std::fs::read_to_string(dir.join("addr")).ok())
+                .trim()
+                .parse()
+                .unwrap();
+            Self {
+                dir,
+                token,
+                addr,
+                fingerprint,
+                server,
+                inventories,
+            }
+        }
+
+        fn connect(&self, name: &str) -> Client {
             let session = InteractiveSession::new();
             let slot = Arc::new(Mutex::new(None));
             let ready = slot.clone();
             let cfg = ClientNetConfig {
-                connect_addr: addr,
-                server_fingerprint: fingerprint,
-                join_token: token,
+                connect_addr: self.addr,
+                server_fingerprint: self.fingerprint,
+                join_token: self.token,
                 script: Vec::new(),
                 movement_script: Vec::new(),
                 late_join: true,
@@ -164,7 +197,7 @@ mod network {
                 run_ticks: 880,
                 idle_grace: Duration::from_secs(20),
                 overall_timeout: Duration::from_secs(30),
-                log_json: dir.join(format!("{name}.jsonl")),
+                log_json: self.dir.join(format!("{name}.jsonl")),
                 summary_json: None,
                 transport: TransportConfig::for_tests(),
                 client_residency: None,
@@ -175,48 +208,112 @@ mod network {
                 client_authoritative: false,
                 admin_script: Vec::new(),
             };
-            let client = std::thread::spawn(move || {
+            let thread = std::thread::spawn(move || {
                 run_replication_client_with_manifest(cfg, game::manifest()).expect("item client")
             });
             let replica = until("replica", || slot.lock().unwrap().clone());
-            (session, client, replica)
-        };
-        let (shovel, note) = (game::items::SHOVEL.0, game::items::NOTE.0);
-        let (first, client1, replica1) = connect("first");
-        until("first sees both items", || {
-            (kinds(&replica1) == [shovel, note]).then_some(())
-        });
-        let (second, client2, replica2) = connect("second");
-        until("late joiner sees both items", || {
-            (kinds(&replica2) == [shovel, note]).then_some(())
-        });
-        // Both reach for the shovel at once; the note is out of reach.
-        first.push_action(interact(2_000_000));
-        second.push_action(interact(2_000_000));
-        until("the shovel leaves both worlds", || {
-            (kinds(&replica1) == [note] && kinds(&replica2) == [note]).then_some(())
-        });
-        // A repeat changes nothing.
-        first.push_action(interact(2_000_001));
-        std::thread::sleep(Duration::from_millis(300));
-        let held = |slot| {
-            let inventories = inventories.lock().unwrap();
+            Client {
+                session,
+                thread,
+                replica,
+            }
+        }
+
+        /// How many of `item` the pack in `slot` holds.
+        fn held(&self, slot: u32, item: game::ItemId) -> u32 {
+            let inventories = self.inventories.lock().unwrap();
             inventories
                 .get(slot)
-                .map_or(0, |inventory| inventory.count(game::items::SHOVEL))
-        };
-        assert_eq!(held(0) + held(1), 1, "exactly one pack has the shovel");
-        let (third, client3, replica3) = connect("third");
-        until("a later joiner sees only the note", || {
-            (kinds(&replica3) == [note]).then_some(())
+                .map_or(0, |inventory| inventory.count(item))
+        }
+
+        fn stop(self, clients: Vec<Client>) {
+            for client in &clients {
+                client.session.request_stop();
+            }
+            for client in clients {
+                client.thread.join().unwrap();
+            }
+            self.server.join().unwrap();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Two players beside the cabin shovel, one joining late, both press E at
+    /// once: exactly one pack gains it, the world loses it on every client,
+    /// and a client joining afterwards never sees it.
+    #[test]
+    fn pickup_goes_to_one_pack_and_replicates_to_late_joiners() {
+        let cabin = Cabin::start(
+            "world-items",
+            vec![[9.0, 1.0, 9.5], [8.5, 1.0, 10.5], [10.125, 1.0, 8.5]],
+            super::cabin().world_items,
+        );
+        let (shovel, note) = (game::items::SHOVEL.0, game::items::NOTE.0);
+        let first = cabin.connect("first");
+        until("first sees both items", || {
+            (kinds(&first.replica) == [shovel, note]).then_some(())
         });
-        for session in [&first, &second, &third] {
-            session.request_stop();
-        }
-        for client in [client1, client2, client3] {
-            client.join().unwrap();
-        }
-        server.join().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        let second = cabin.connect("second");
+        until("late joiner sees both items", || {
+            (kinds(&second.replica) == [shovel, note]).then_some(())
+        });
+        // Both reach for the shovel at once; the note is out of reach.
+        first.session.push_action(interact(2_000_000));
+        second.session.push_action(interact(2_000_000));
+        until("the shovel leaves both worlds", || {
+            (kinds(&first.replica) == [note] && kinds(&second.replica) == [note]).then_some(())
+        });
+        // A repeat changes nothing.
+        first.session.push_action(interact(2_000_001));
+        std::thread::sleep(Duration::from_millis(300));
+        let held = cabin.held(0, game::items::SHOVEL) + cabin.held(1, game::items::SHOVEL);
+        assert_eq!(held, 1, "exactly one pack has the shovel");
+        let third = cabin.connect("third");
+        until("a later joiner sees only the note", || {
+            (kinds(&third.replica) == [note]).then_some(())
+        });
+        cabin.stop(vec![first, second, third]);
+    }
+
+    /// A shovel lying beside the closed cabin door: E takes the shovel, and a
+    /// retry of that same request (same id) is answered from the admission
+    /// ledger instead of falling through to the door. A fresh press then opens
+    /// the door, so the door was in reach all along.
+    #[test]
+    fn a_retried_pickup_beside_a_closed_door_leaves_it_closed() {
+        let shovel = game::items::SHOVEL;
+        let cabin = Cabin::start(
+            "item-door-retry",
+            vec![[10.125, 1.0, 8.5]],
+            vec![InitialWorldItem {
+                kind: shovel.0,
+                translation_m: [10.125, 1.0, 9.5],
+                yaw_rad: 0.0,
+            }],
+        );
+        let client = cabin.connect("player");
+        let (closed, open) = (game::CABIN_DOOR.closed_hinge, game::CABIN_DOOR.open_hinge);
+        until("the shovel and a closed door", || {
+            (kinds(&client.replica) == [shovel.0] && hinge(&client.replica) == Some(closed))
+                .then_some(())
+        });
+        client.session.push_action(interact(2_000_000));
+        until("the shovel is picked up", || {
+            kinds(&client.replica).is_empty().then_some(())
+        });
+        assert_eq!(cabin.held(0, shovel), 1);
+        client.session.push_action(interact(2_000_000));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            hinge(&client.replica),
+            Some(closed),
+            "the retry left the door"
+        );
+        client.session.push_action(interact(2_000_001));
+        until("a new press opens the door", || {
+            (hinge(&client.replica) == Some(open)).then_some(())
+        });
+        cabin.stop(vec![client]);
     }
 }

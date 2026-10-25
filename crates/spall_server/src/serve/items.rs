@@ -52,7 +52,10 @@ impl std::fmt::Debug for ItemPickup {
 /// carries on (a nearby door). Otherwise the answer: `Queued` once the item is
 /// in the pack and gone from the world, or the game's refusal with the item
 /// left where it was. Requests are handled one at a time on the owning
-/// thread, so an item goes to exactly one player.
+/// thread, so an item goes to exactly one player. A pickup's `Queued` goes in
+/// the simulation's admission ledger, the one door and edit retries replay
+/// from, so a retry of the same request id is answered from there and never
+/// reaches a door the item was lying beside.
 pub(super) fn pick_up_item(
     sim: &mut Simulation,
     session: SessionId,
@@ -67,7 +70,11 @@ pub(super) fn pick_up_item(
     let mut eye = player.state.position_m;
     eye[1] += f64::from(player.params.total_height_m()) * 0.9;
     let item = sim.nearest_world_item(eye, spall_sim::world_items::ITEM_PICKUP_REACH_M)?;
-    let outcome = match pickup.grant(session, principal, &item) {
+    let status = |outcome| ActionStatus {
+        request_id: req.request_id,
+        outcome,
+    };
+    Some(match pickup.grant(session, principal, &item) {
         Ok(()) => {
             sim.remove_world_item(item.item_id)
                 .expect("the item was found this call");
@@ -77,15 +84,13 @@ pub(super) fn pick_up_item(
                 kind = item.kind,
                 "world item picked up"
             );
-            ActionOutcome::Queued
+            let queued = status(ActionOutcome::Queued);
+            sim.record_action_status(queued.clone());
+            queued
         }
-        Err(reason) => ActionOutcome::Rejected {
+        Err(reason) => status(ActionOutcome::Rejected {
             reason: reason.to_string(),
-        },
-    };
-    Some(ActionStatus {
-        request_id: req.request_id,
-        outcome,
+        }),
     })
 }
 
@@ -206,6 +211,8 @@ mod tests {
         let status = pick_up_item(&mut sim, near, &request(3, ActionKind::Interact), &pickup)
             .expect("in reach");
         assert_eq!(status.outcome, ActionOutcome::Queued);
+        // Recorded where the tick loop looks for retries before a door.
+        assert_eq!(replay_admitted_status(&sim, RequestId(3)), Some(status));
         assert_eq!(*granted.lock().unwrap(), vec![(1, item.item_id)]);
         assert!(!sim.world_items().any(|i| i.item_id == item.item_id));
         let changes = sim.take_world_item_changes();
@@ -251,5 +258,7 @@ mod tests {
         );
         assert!(granted.lock().unwrap().is_empty());
         assert_eq!(sim.world_items().collect::<Vec<_>>(), vec![&item]);
+        // A refusal reserves nothing: the item is still there to refuse again.
+        assert_eq!(replay_admitted_status(&sim, RequestId(1)), None);
     }
 }

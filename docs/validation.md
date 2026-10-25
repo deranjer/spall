@@ -30,7 +30,10 @@ World item checks (ENG-257):
   12-slot pack, in memory and durable.
 - `cargo test -p sandbox --features client --test world_items` checks cabin item
   placement and, over real QUIC, a simultaneous pickup by two clients (one
-  joined late) and a third client joining afterwards.
+  joined late), a third client joining afterwards, and a retried pickup
+  request beside the closed cabin door leaving the door closed.
+- `cargo test -p sandbox --features client --lib pack_view` checks that every
+  pickup kind draws its decoded SPVOX model, hand-sized and lying flat.
 
 
 Historical grid-water validation (ENG-122 closeout, water default, canal viewer, windowed comparison; removed in ENG-169): see [reports/history-validation.md](reports/history-validation.md).

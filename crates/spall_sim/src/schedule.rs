@@ -255,6 +255,14 @@ impl EditPipeline {
         self.statuses.get(&request_id.0)
     }
 
+    /// Records the answer to a request the host settled without an edit (a
+    /// world item pickup), so a retry replays it through
+    /// [`Self::action_status`] like any admitted request. An already admitted
+    /// id keeps its status.
+    pub fn record_status(&mut self, status: ActionStatus) {
+        self.statuses.entry(status.request_id.0).or_insert(status);
+    }
+
     /// `true` when nothing is pending, in flight, or awaiting install.
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty() && self.inflight.is_empty() && self.scheduler.is_drained()
