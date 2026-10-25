@@ -316,7 +316,7 @@ minimal debug view draws nearby replicated terrain and detached bodies; its
 prediction collision world mirrors both, with detached-body poses remaining
 server-driven. F3 shows the local capsule bounds as 1.25 cm wire-like strokes
 rather than voxel-sized markers. It is not the G2 renderer.
-The window releases the cursor with Escape or focus loss, and focus loss clears
+Escape closes an open pack, book, note or admin menu first; otherwise it opens the Esc menu (ENG-270: Resume, Quit, and every keybind, click one then press the new key; clashes are refused; saved to `%APPDATA%\Spall\client-settings.json`, or `~/.config/spall/` elsewhere). Focus loss releases the cursor, and focus loss clears
 all held actions so a missing OS key-up cannot continue a walk or jump. The
 historical PR #109 record reports a hands-on run of `cargo xtask play --release
 --scene g1 --ticks 18000` in which the investigated frame-pacing jitter was no
