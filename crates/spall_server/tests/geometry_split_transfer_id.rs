@@ -84,6 +84,7 @@ fn config(
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,
+            day_clock: Default::default(),
             custom_world: None,
         },
         harness: HarnessConfig {
@@ -120,6 +121,7 @@ fn client_handshake() -> Handshake {
         cell_size_codes: vec![spall_core::CellSizeCode::Quarter],
         session: SessionId::from_parts(SlotId(0), 1),
         limits: NegotiatedLimits::DEFAULT,
+        day_clock: spall_core::time_of_day::DayClock::default(),
     }
 }
 

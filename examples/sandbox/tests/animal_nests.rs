@@ -7,7 +7,7 @@
 
 use sandbox::animals::{AnimalDirector, LOCOMOTION_ROOST};
 use sandbox::game::materials::WOOD;
-use spall_core::time_of_day::{DAY_CYCLE_TICKS, state_at_tick};
+use spall_core::time_of_day::{DAY_CYCLE_TICKS, DayClock};
 use spall_core::{
     BRUSH_UNIT, BrushPoint, CellSizeCode, EntityId, GlobalCell, MaterialId, PLAYER_ENTITY_BASE,
     SphereBrush,
@@ -203,7 +203,7 @@ fn a_crow_builds_a_nest_of_terrain_cells_and_rebuilds_it_when_cut() {
 fn a_crow_roosts_in_its_nest_at_night() {
     // 21:00: the sun is down for every crow's bedtime lag.
     let night = DAY_CYCLE_TICKS * 5 / 8;
-    assert!(state_at_tick(night).sun_height() < 0.0);
+    assert!(DayClock::default().state_at(night).sun_height() < 0.0);
     let mut sim = simulation();
     let service = crow_service(night);
     // With no nest yet it builds one first, then settles into it.

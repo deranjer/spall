@@ -133,6 +133,7 @@ pub fn demo_handshake(manifest_tag: &[u8]) -> Handshake {
         cell_size_codes: vec![CellSizeCode::Quarter],
         session: spall_protocol::SessionId::from_parts(spall_protocol::SlotId(0), 1),
         limits: NegotiatedLimits::DEFAULT,
+        day_clock: spall_core::time_of_day::DayClock::default(),
     }
 }
 

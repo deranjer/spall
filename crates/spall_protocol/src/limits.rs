@@ -124,3 +124,11 @@ pub(crate) fn check_count(
         Ok(())
     }
 }
+
+/// How many settled action answers the server's retry ledger keeps before it
+/// forgets the oldest. A retry older than the window is a new request.
+pub const MAX_RETAINED_ACTION_STATUSES: usize = 64 * 1024;
+
+/// How many of one player's recent request ids the server remembers, to answer
+/// a reliable retry (also after a reconnect) from the ledger.
+pub const MAX_RETAINED_REQUESTS_PER_PLAYER: usize = 1024;

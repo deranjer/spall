@@ -30,7 +30,7 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
     ("F", "Toggle flight"),
     ("R", "Recentre the view on your player"),
     ("F10", "Open / close this menu"),
-    ("Esc", "Release the cursor"),
+    ("Esc", "Menu: keybinds (click to rebind) and quit"),
     ("F1", "Toggle terrain"),
     ("F2", "Toggle detached bodies"),
     ("F3", "Toggle capsule markers"),

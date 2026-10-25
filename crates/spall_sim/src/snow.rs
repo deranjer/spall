@@ -143,6 +143,31 @@ impl SnowState {
         self.tiles.contains_key(&key)
     }
 
+    /// Depth (Q16 metres, as replicated) of the snow on the upward face of the
+    /// solid cell `(x, y, z)`; `0` if none. Reads the stored depth without
+    /// catching the cohort up (cohorts catch up a few tiles per tick), so it
+    /// can trail the depth a fresh frame would carry by a little.
+    pub fn depth_q16_at(&self, x: i64, y: i64, z: i64) -> u16 {
+        let tile = i64::from(SNOW_TILE_CELLS);
+        let (Ok(tile_x), Ok(tile_z), Ok(top_y)) = (
+            i32::try_from(x.div_euclid(tile)),
+            i32::try_from(z.div_euclid(tile)),
+            i32::try_from(y),
+        ) else {
+            return 0;
+        };
+        let Some(cohorts) = self.tiles.get(&(tile_x, tile_z, top_y)) else {
+            return 0;
+        };
+        let face = (z.rem_euclid(tile) * tile + x.rem_euclid(tile)) as usize;
+        cohorts
+            .iter()
+            .find(|c| (c.mask[face / 64] >> (face % 64)) & 1 == 1)
+            .map_or(0, |c| {
+                (c.depth_q32 >> 16).min(u64::from(SNOW_MAX_DEPTH_Q16)) as u16
+            })
+    }
+
     pub fn tile_keys(&self) -> Vec<(i32, i32, i32)> {
         self.tiles.keys().copied().collect()
     }

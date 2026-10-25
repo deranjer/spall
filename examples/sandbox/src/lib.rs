@@ -22,6 +22,7 @@ pub mod player_view;
 pub mod progression_store;
 pub mod tools;
 pub mod world_items;
+pub mod world_scatter;
 pub mod worldgen_scene;
 
 pub fn init_tracing() {

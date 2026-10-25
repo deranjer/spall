@@ -54,7 +54,7 @@ pub(super) async fn serve_async(
         std::fs::rename(&tmp, path)?;
     }
 
-    let handshake = server_handshake(&materials, asset_manifest_hash);
+    let handshake = server_handshake(&materials, asset_manifest_hash, config.server.day_clock);
     let credential_registry_file = config.server.credential_registry_file.clone();
     if credential_registry_file.is_some() && player_credentials.is_none() {
         return Err(ServeError::Configuration(
@@ -462,8 +462,9 @@ pub(super) async fn serve_async(
         // The session that staged each still-pending request, so the tick-report
         // outcome (`action_statuses`) can be routed back to only that client
         // instead of every connected client.
-        let mut submitted_by: HashMap<RequestId, (SessionId, Option<spall_protocol::PlayerId>)> =
-            HashMap::new();
+        // Keyed by ledger id (see `request_ids`); the value ends with the client's id.
+        let mut submitted_by: HashMap<RequestId, SubmittedBy> = HashMap::new();
+        let mut request_ids = RequestIds::default();
         let mut player_principals: HashMap<u64, spall_protocol::PlayerId> = HashMap::new();
         let mut commit_latency = CommitLatency::default();
 
@@ -697,7 +698,8 @@ pub(super) async fn serve_async(
                         // reconnect may legitimately retry the same reliable
                         // request on its replacement session. Replaying this
                         // status must not restage or re-apply the edit.
-                        if let Some(status) = replay_admitted_status(&sim, req.request_id) {
+                        let account = player_principals.get(&session.raw()).copied();
+                        if let Some(status) = request_ids.replay(&sim, session, account, &req) {
                             send_to(
                                 &clients_for_sim,
                                 session,
@@ -720,14 +722,26 @@ pub(super) async fn serve_async(
                             actions_throttled += 1;
                             continue;
                         }
-                        if try_pick_up(&mut sim, session, &req, &item_pickup, &clients_for_sim) {
+                        // From here the simulation sees the ledger id and answers
+                        // go out under `client_request_id`.
+                        let client_request_id = req.request_id;
+                        let mut req = req;
+                        req.request_id = request_ids.assign(session, account, client_request_id);
+                        if try_pick_up(
+                            &mut sim,
+                            session,
+                            &req,
+                            &item_pickup,
+                            &clients_for_sim,
+                            client_request_id,
+                        ) {
                             continue;
                         }
                         let principal = player_principals.get(&session.raw()).copied();
                         if let Err(refused) =
                             permit_tool(&tool_hooks, session, principal, &req, admin_commands)
                         {
-                            reject(&clients_for_sim, session, req.request_id, &refused.reason());
+                            reject(&clients_for_sim, session, client_request_id, &refused.reason());
                             rejected_total += 1;
                             continue;
                         }
@@ -774,13 +788,16 @@ pub(super) async fn serve_async(
                         };
                         match resolved {
                             Ok(submitted) => match submitted {
-                                Ok(status) => {
+                                Ok(mut status) => {
                                     submitted_at
                                         .entry(req.request_id)
                                         .or_insert_with(std::time::Instant::now);
-                                    submitted_by
-                                        .entry(req.request_id)
-                                        .or_insert((session, principal));
+                                    submitted_by.entry(req.request_id).or_insert((
+                                        session,
+                                        account,
+                                        client_request_id,
+                                    ));
+                                    status.request_id = client_request_id;
                                     actions_staged += 1;
                                     send_to(
                                         &clients_for_sim,
@@ -795,14 +812,14 @@ pub(super) async fn serve_async(
                                     reject(
                                         &clients_for_sim,
                                         session,
-                                        req.request_id,
+                                        client_request_id,
                                         &intent_rejection_reason(&e),
                                     );
                                     rejected_total += 1;
                                 }
                             },
                             Err(rej) => {
-                                reject(&clients_for_sim, session, req.request_id, &rej.reason());
+                                reject(&clients_for_sim, session, client_request_id, &rej.reason());
                                 rejected_total += 1;
                             }
                         }
@@ -973,7 +990,7 @@ pub(super) async fn serve_async(
                                     // commit (the new world has a new pipeline). Say so, so the
                                     // client retries it instead of waiting for a receipt that
                                     // cannot come.
-                                    for (request, (session, _)) in submitted_by.drain() {
+                                    for (_, (session, _, request)) in submitted_by.drain() {
                                         reject(
                                             &clients_for_sim,
                                             session,
@@ -1272,13 +1289,14 @@ pub(super) async fn serve_async(
                 committed_total += 1;
                 apply_tool_effects(&mut sim, &tool_hooks, *rid, committed);
                 if !committed.removed_materials.is_empty()
-                    && let Some((session, player_id)) = submitted_by.get(rid).copied()
+                    && let Some((session, player_id, client_request_id)) =
+                        submitted_by.get(rid).copied()
                 {
                     let encoded = outbox_encoder.as_mut().and_then(|encoder| {
                         encoder(
                             session,
                             player_id,
-                            *rid,
+                            client_request_id,
                             committed.journal_seq,
                             &committed.removed_materials,
                         )
@@ -1289,7 +1307,7 @@ pub(super) async fn serve_async(
                         match worker.submit.try_send(CommittedEditWork {
                             session,
                             player_id,
-                            request_id: *rid,
+                            request_id: client_request_id,
                             removed: committed.removed_materials.clone(),
                         }) {
                             Ok(()) => {}
@@ -1382,25 +1400,7 @@ pub(super) async fn serve_async(
             {
                 return SimResult::error(error, ticks_run);
             }
-            for status in action_statuses(&report) {
-                if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
-                    rejected_total += 1;
-                }
-                // A tick-resolved outcome (commit or deterministic staging
-                // rejection) belongs to whichever session staged it — route it
-                // there only. `submitted_by` is best-effort bookkeeping (cleared
-                // here on first resolution); an untracked request (there
-                // shouldn't be one) falls back to the old broadcast so a status
-                // is never silently dropped.
-                match submitted_by.remove(&status.request_id) {
-                    Some((session, _player_id)) => send_to(
-                        &clients_for_sim,
-                        session,
-                        Outbound::Status(Arc::new(status)),
-                    ),
-                    None => broadcast(&clients_for_sim, Outbound::Status(Arc::new(status))),
-                }
-            }
+            rejected_total += route_tick_statuses(&report, &mut submitted_by, &clients_for_sim);
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never
             // interest-filtered).

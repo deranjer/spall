@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use spall_client::window::{Blueprint, BlueprintSlot, BlueprintView, ItemVoxel, PackView};
+use spall_client::window::{Blueprint, BlueprintSlot, BlueprintView, ItemUse, ItemVoxel, PackView};
 use spall_core::MaterialId;
 
 use crate::game::{ItemId, RECIPE_CATALOG_VERSION, items, recipe_ids};
@@ -118,6 +118,14 @@ impl PackView for SandboxPackView {
         &self.blueprints
     }
 
+    fn item_use(&self, item_id: u16) -> ItemUse {
+        match crate::game::ItemId(item_id) {
+            items::COMPASS => ItemUse::Compass,
+            items::NOTE => ItemUse::Note(note_text(tower_heading_deg())),
+            _ => ItemUse::None,
+        }
+    }
+
     fn item_model(&self, item_id: u16) -> &[ItemVoxel] {
         self.models.models.get(&item_id).map_or(&[], Vec::as_slice)
     }
@@ -133,6 +141,28 @@ impl PackView for SandboxPackView {
             _ => None,
         }
     }
+}
+
+/// Compass heading, degrees clockwise from north (north 0, east 90), of the
+/// tower as seen from the cabin. ENG-251 places the cabin at the south edge and
+/// the tower at the north edge of the Winter Crossing scenario and should return
+/// the bearing computed from those placements here.
+// TODO(ENG-251): replace this placeholder with the computed bearing.
+const PLACEHOLDER_TOWER_HEADING_DEG: f32 = 12.0;
+
+pub fn tower_heading_deg() -> f32 {
+    PLACEHOLDER_TOWER_HEADING_DEG
+}
+
+/// What the cabin note says for a tower at `heading_deg` from the cabin.
+pub fn note_text(heading_deg: f32) -> String {
+    let heading = heading_deg.rem_euclid(360.0).round() as u32 % 360;
+    format!(
+        "The tower is at {heading:03} degrees
+from the cabin.
+The compass always points north.
+Keep the tower at {heading:03} and walk."
+    )
 }
 
 /// The SPVOX model of each kind that can lie in the world.
@@ -371,6 +401,21 @@ pub fn placeholder_model(item: ItemId) -> &'static [ItemVoxel] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_note_gives_the_tower_heading_and_the_compass_and_note_are_usable() {
+        assert!(note_text(12.0).contains("012 degrees"));
+        assert!(note_text(0.0).contains("000 degrees"));
+        assert!(note_text(359.6).contains("000 degrees"), "rounds past 359");
+        assert!(note_text(-90.0).contains("270 degrees"), "wraps");
+        let view = SandboxPackView::new();
+        assert_eq!(view.item_use(items::COMPASS.0), ItemUse::Compass);
+        assert_eq!(
+            view.item_use(items::NOTE.0),
+            ItemUse::Note(note_text(tower_heading_deg()))
+        );
+        assert_eq!(view.item_use(items::STICK.0), ItemUse::None);
+    }
 
     /// Every item the game can award or craft has a name and an icon that
     /// decodes.

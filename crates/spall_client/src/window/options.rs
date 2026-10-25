@@ -52,6 +52,10 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
     fn item_model(&self, _item_id: u16) -> &[ItemVoxel] {
         &[]
     }
+    /// What clicking this item's stack in the pack does.
+    fn item_use(&self, _item_id: u16) -> ItemUse {
+        ItemUse::None
+    }
     /// Tinted copies of manifest materials that [`ItemVoxel::tint`] indexes.
     fn item_tints(&self) -> Vec<(spall_core::MaterialId, [u8; 3])> {
         Vec::new()
@@ -62,6 +66,17 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
     fn item_tool(&self, _item_id: u16) -> Option<u16> {
         None
     }
+}
+
+/// What using an item from the pack does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemUse {
+    None,
+    /// Hold it (or put it away): a compass drawn lower right whose needle
+    /// follows world north (-Z).
+    Compass,
+    /// Read a paper note showing this text, one line per newline.
+    Note(String),
 }
 
 /// One cube of a world item's model.
