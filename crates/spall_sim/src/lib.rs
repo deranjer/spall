@@ -59,6 +59,7 @@ pub mod snow;
 pub mod snow_query;
 pub mod stage;
 pub mod transfer;
+pub mod warmth;
 pub mod world;
 pub mod world_items;
 

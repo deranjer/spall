@@ -210,6 +210,7 @@ impl Retiring {
     }
 }
 
+mod body_heat;
 mod construction;
 mod contact_dormancy;
 mod edit_queries;
