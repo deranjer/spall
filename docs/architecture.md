@@ -198,6 +198,23 @@ drain, edge blur, and the injury reminder icon from one bear swipe down), which 
 respawn restores full health. Game creatures hurt players through the director's
 `CreatureAction::HitPlayer`, which the server refuses beyond 3 m of the creature's root (ENG-240).
 
+ENG-264/265 warmth and wetness: each capsule also carries a runtime `warmth::BodyHeat` (warmth 1
+warm to 0 freezing, wetness 0 dry to 1 soaked; not saved, and a respawn or reconnect starts warm
+and dry). Once a second, at the end of `Simulation::tick`, `spall_sim::warmth` gathers each
+player's exposure: the weather's temperature, colder at night (-8 C at midnight) and a little warmer
+at noon; wind chill in the open by weather kind (a blizzard is the coldest); shelter; water depth
+over the feet from the column water; rain unless roofed; and `world_items::heat_at` at the chest.
+Shelter is coarse: solid cells within 8 m straight overhead, and how many of 8 horizontal 4 m rays
+from the chest meet a wall, so a cave or a dug hole counts and open ground does not. Wetness rises
+toward depth / 1.5 m (wading wets a little, falling in soaks) and dries over minutes, faster near a
+fire. Felt temperature (air, minus wind chill and up to 8 C for being soaked, plus shelter and fire)
+sets the warmth target; below warmth 0.2 the cold hurts through `damage_player`, up to 0.5 health
+a second. All the numbers are in the tuning block at the top of `warmth.rs`. With these numbers a
+winter night in the open is lethal, a fire or full shelter prevents damage, and only a winter
+night or a daytime blizzard in the open (or being soaked) gets cold enough to hurt. The server
+sends warmth and wetness in the owning session's `PlayerHealth` record, and the client's
+`body_state` eases its cold (lost warmth) and wet looks toward them.
+
 The interactive launcher also has an explicit testing-only escape hatch:
 `--client-authoritative`. In that mode `ClientPhysics` promotes replicated body
 colliders to locally stepped dynamic bodies, computes mass/COM/inertia from the
@@ -708,9 +725,8 @@ so retries never place or feed twice. The sandbox's numbers are all in
 are used first), and a fire at 1800 s takes no more. Engine-side numbers (reach,
 footprint, heat, blizzard rate) are in `spall_sim::world_items`.
 `spall_sim::world_items::heat_at(items, position)` sums lit fires' warming in
-degrees of felt temperature, 30 at the centre falling as `1 - (d/4 m)^2` to 0 at 4 m; the client's
-presented cold (`body_state`) adds it from the replicated fires, and server
-warmth (ENG-264) is to call it with `Simulation::world_items`. The client draws
+degrees of felt temperature, 30 at the centre falling as `1 - (d/4 m)^2` to 0 at 4 m; server
+warmth (ENG-264, below) measures it at the player's chest. The client draws
 a fire from `PackView::item_model` plus, while lit, `PackView::lit_model` (the
 sandbox's lamp-material glow blocks, until ENG-267), and each lit fire is a
 real-time `PointLight` competing with torch voxels for the nearest slots.

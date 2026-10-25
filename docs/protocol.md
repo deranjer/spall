@@ -707,6 +707,10 @@ account (`PlayerId`) the world has seen. Unauthenticated sessions have no stable
 always start at full health. Health is checkpointed, not journaled, so a crash can lose health
 changes since the last checkpoint.
 
+Protocol 24 (ENG-264/265) adds `warmth_q8` (255 warm, 0 freezing) and `wetness_q8` (0 dry, 255
+soaked) to `PlayerHealth`. The server recomputes them once a second and sends the record when any
+field changes, so a body that is cooling or drying costs at most one small record a second.
+
 ### ENG-257 - World items
 
 A world item is a server-owned thing lying in the world: a stable `item_id`
