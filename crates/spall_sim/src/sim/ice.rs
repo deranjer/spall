@@ -36,6 +36,8 @@ pub(crate) struct IceRuntime {
     near_refreshed: Option<u64>,
     /// Each visited region's frame and the tick it was first seen unchanged.
     seen: HashMap<spall_fluid::columns::RegionKey, (Arc<RegionFrame>, u64)>,
+    /// A settled region whose plan found the solver busy, tried again next tick.
+    retry: Option<spall_fluid::columns::RegionKey>,
     /// Later support layers of the region being frozen.
     layers: VecDeque<Vec<BoxReplace>>,
     in_flight: Vec<RequestId>,
@@ -56,6 +58,7 @@ impl IceRuntime {
             near_next: 0,
             near_refreshed: None,
             seen: HashMap::new(),
+            retry: None,
             layers: VecDeque::new(),
             in_flight: Vec::new(),
             player_edits: HashMap::new(),
@@ -249,7 +252,9 @@ impl Simulation {
                 .collect();
             ice.near_next = 0;
         }
-        let key = if tick % 2 == 0 && !ice.near.is_empty() {
+        let key = if let Some(key) = ice.retry.take().filter(|_| winter) {
+            key
+        } else if tick % 2 == 0 && !ice.near.is_empty() {
             let key = ice.near[ice.near_next % ice.near.len()];
             ice.near_next += 1;
             key
@@ -281,7 +286,10 @@ impl Simulation {
             if tick.saturating_sub(since) < settle_ticks {
                 return;
             }
-            let layers = self.plan_region_ice(&ice.settings, &region);
+            let Some(layers) = self.plan_region_ice(&ice.settings, &region) else {
+                ice.retry = Some(key);
+                return;
+            };
             ice.layers.extend(layers);
             if let Some(layer) = ice.layers.pop_front() {
                 self.submit_ice_layer(ice, layer);
@@ -335,53 +343,87 @@ impl Simulation {
         }
     }
 
-    /// The ice for one settled water region, in support layers. Reads the
-    /// solver's exact surface (never waiting for a step in flight: a busy
-    /// solver means no ice this visit).
+    /// The ice for one settled water region, in support layers, or `None`
+    /// when the solver is busy. At terrain resolution the published frame
+    /// holds each column's exact water (depth to 1/128 cell); with wide columns
+    /// the frame is blended, so the solver's own spans are read, without ever
+    /// waiting for a step in flight.
     fn plan_region_ice(
         &self,
         settings: &IceSettings,
         region: &RegionFrame,
-    ) -> Vec<Vec<BoxReplace>> {
-        let Some(water) = &self.column_water else {
-            return Vec::new();
-        };
-        let Some(world) = water.try_world() else {
-            return Vec::new();
+    ) -> Option<Vec<Vec<BoxReplace>>> {
+        let water = self.column_water.as_ref()?;
+        let n = i64::from(water.setup().config.column_cells.max(1));
+        let y_hi = i64::from(water.setup().y_hi);
+        let world = if n > 1 {
+            Some(water.try_world()?)
+        } else {
+            None
         };
         let cell_m = self.world.terrain().cell_size().metres();
-        let n = i64::from(world.config().column_cells.max(1));
         let edge = spall_fluid::columns::REGION_EDGE;
         let (x0, z0) = (
             i64::from(region.key.0) * edge,
             i64::from(region.key.1) * edge,
         );
         let players: Vec<[f64; 3]> = self.world.players().map(|p| p.state.position_m).collect();
-        let mut wide: HashMap<(i64, i64), Option<(i64, i64)>> = HashMap::new();
+        // Ice bottom and cells from water `depth` cells deep over `floor`.
+        let plan_for = |floor: i64, depth: f64| {
+            let cells = settings.thickness_cells(depth * cell_m);
+            (cells > 0).then(|| (((floor as f64 + depth) - 1e-9).ceil() as i64, cells))
+        };
+        let mut wide: HashMap<(i64, i64), Option<Option<(i64, i64)>>> = HashMap::new();
         let mut columns = Vec::new();
-        for span in &region.spans {
+        for (i, span) in region.spans.iter().enumerate() {
+            // Only the column's top span, and only if it is open to the sky.
+            if region
+                .spans
+                .get(i + 1)
+                .is_some_and(|next| next.column == span.column)
+            {
+                continue;
+            }
             let (fx, fz) = (
                 x0 + i64::from(span.column) % edge,
                 z0 + i64::from(span.column) / edge,
             );
-            let (wx, wz) = (fx.div_euclid(n), fz.div_euclid(n));
-            // Per solver column: ice bottom and cells, from its top sky span.
-            let plan = *wide.entry((wx, wz)).or_insert_with(|| {
-                if world.is_region_active(spall_fluid::columns::region_of(wx, wz)) {
-                    return None;
+            // The water the frame draws in this terrain column, if open to the
+            // sky. The frame rounds depth to 1/128 cell; at most half of that
+            // can end up under the ice, too thin to publish or flow.
+            let drawn = || {
+                (i64::from(span.ceiling_y) >= y_hi)
+                    .then(|| {
+                        let depth = (f64::from(span.depth_q) - 0.5)
+                            / crate::column_water::FRAME_DEPTH_SCALE;
+                        plan_for(i64::from(span.floor_y), depth)
+                    })
+                    .flatten()
+            };
+            let plan = match &world {
+                None => drawn(),
+                Some(world) => {
+                    let (wx, wz) = (fx.div_euclid(n), fz.div_euclid(n));
+                    // `None`: the solver holds no water here and the frame only
+                    // draws the pool on to its true shore, so nothing can be
+                    // displaced and the drawn water decides.
+                    let solver = *wide.entry((wx, wz)).or_insert_with(|| {
+                        let spans = world.spans_in_column(wx, wz);
+                        if spans.iter().all(|s| s.volume <= 1e-6) {
+                            return None;
+                        }
+                        if world.is_region_active(spall_fluid::columns::region_of(wx, wz)) {
+                            return Some(None);
+                        }
+                        let top = spans.last().expect("a wet span");
+                        if !top.sky || top.volume <= 1e-6 || top.overfill > 0.0 {
+                            return Some(None);
+                        }
+                        Some(plan_for(top.floor_y, top.depth))
+                    });
+                    solver.unwrap_or_else(drawn)
                 }
-                let spans = world.spans_in_column(wx, wz);
-                let top = spans.last()?;
-                if !top.sky || top.volume <= 1e-6 || top.overfill > 0.0 {
-                    return None;
-                }
-                let cells = settings.thickness_cells(top.depth * cell_m);
-                if cells == 0 {
-                    return None;
-                }
-                let surface = top.floor_y as f64 + top.depth;
-                Some(((surface - 1e-9).ceil() as i64, cells))
-            });
+            };
             let Some((bottom_y, cells)) = plan else {
                 continue;
             };
@@ -401,14 +443,14 @@ impl Simulation {
         }
         drop(world);
         if columns.is_empty() {
-            return Vec::new();
+            return Some(Vec::new());
         }
-        plan_freeze(
+        Some(plan_freeze(
             &self.world.terrain().volume,
             &columns,
             [x0, z0, x0 + edge - 1, z0 + edge - 1],
             settings.ice,
-        )
+        ))
     }
 
     /// One box clearing every ice and cracked cell just above this region's

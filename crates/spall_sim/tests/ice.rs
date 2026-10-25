@@ -16,14 +16,22 @@ const SURFACE: i64 = 7;
 /// 64 x 32 x 16 basin with walls; the west half (x < 32) has its floor at
 /// y = 4 (0.75 m of water), the east half at y = 1 (1.5 m). One level pool.
 fn simulation(ice: IceSettings) -> Simulation {
+    simulation_with_columns(ice, 1)
+}
+
+/// [`simulation`] with water columns `column_cells` terrain cells wide.
+fn simulation_with_columns(ice: IceSettings, column_cells: u32) -> Simulation {
     let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
-    for bx in 0..2 {
-        terrain
-            .insert_brick(
-                BrickCoord::new(bx, 0, 0),
-                Brick::uniform(MaterialId::AIR, Revision(1)),
-            )
-            .unwrap();
+    // A whole 1 m water region (4 x 4 bricks) is resident, so wide columns run.
+    for bz in 0..4 {
+        for bx in 0..4 {
+            terrain
+                .insert_brick(
+                    BrickCoord::new(bx, 0, bz),
+                    Brick::uniform(MaterialId::AIR, Revision(1)),
+                )
+                .unwrap();
+        }
     }
     let mut plan = EditPlan::new(terrain.id());
     let mut water = Vec::new();
@@ -52,7 +60,15 @@ fn simulation(ice: IceSettings) -> Simulation {
     world.terrain_collider_region = (GlobalCell::new(0, 0, 0), GlobalCell::new(63, 31, 15));
     world.anchor = AnchorPlane::at(0);
     let mut config = SimulationConfig::new(world);
-    config.column_water = Some(ColumnWaterSetup::new(0, 32, water));
+    if column_cells > 1 {
+        // Seed only wide columns clear of the walls; the frames draw the rest
+        // of the pool on to the walls.
+        let n = i64::from(column_cells);
+        water.retain(|c| (n..64 - n).contains(&c.x) && (n..16 - n).contains(&c.z));
+    }
+    let mut setup = ColumnWaterSetup::new(0, 32, water);
+    setup.config.column_cells = column_cells;
+    config.column_water = Some(setup);
     let mut sim = Simulation::new(config).unwrap();
     sim.set_weather_seed(7);
     sim.set_ice(ice);
@@ -89,9 +105,13 @@ fn ice_cells(sim: &Simulation) -> usize {
 
 /// Ticks until the shallow half has frozen and the edits are done.
 fn freeze(sim: &mut Simulation) {
+    freeze_at_least(sim, 30 * 14);
+}
+
+fn freeze_at_least(sim: &mut Simulation, cells: usize) {
     for _ in 0..600 {
         sim.tick().unwrap();
-        if ice_cells(sim) >= 30 * 14 && sim.is_idle() {
+        if ice_cells(sim) >= cells && sim.is_idle() {
             return;
         }
     }
@@ -143,6 +163,42 @@ fn only_settled_shallow_water_freezes_in_winter_and_no_water_moves() {
         sim.tick().unwrap();
     }
     assert_eq!(ice_cells(&sim), 0, "the ice melted in spring");
+}
+
+#[test]
+fn wide_columns_freeze_on_the_solver_surface_and_the_drawn_shore() {
+    let mut sim = simulation_with_columns(settings(), 4);
+    let volume = sim.column_water().unwrap().frame().volume_m3;
+    assert!(volume > 0.0);
+    sim.set_season(3).unwrap();
+    // The solver holds water in wide columns x 4..60, z 4..12; the frames draw
+    // it on to the walls.
+    freeze_at_least(&mut sim, 28 * 8);
+    for _ in 0..120 {
+        sim.tick().unwrap();
+    }
+    assert_eq!(sim.world().body_count(), 0, "no ice split off as a loose body");
+    for x in 4..32 {
+        for z in 4..12 {
+            assert_eq!(material(&sim, x, SURFACE, z), Some(ICE), "shallow ({x},{z})");
+            assert_eq!(material(&sim, x, SURFACE - 1, z), None, "water stays below");
+        }
+    }
+    let shore = (1..4)
+        .flat_map(|x| (4..12).map(move |z| (x, z)))
+        .filter(|&(x, z)| material(&sim, x, SURFACE, z) == Some(ICE))
+        .count();
+    assert!(shore > 0, "the drawn shore froze too");
+    for x in 36..60 {
+        for z in 4..12 {
+            assert_eq!(material(&sim, x, SURFACE, z), None, "deep ({x},{z})");
+        }
+    }
+    for _ in 0..240 {
+        sim.tick().unwrap();
+    }
+    let after = sim.column_water().unwrap().frame().volume_m3;
+    assert!((after - volume).abs() < 1e-9, "volume {volume} -> {after}");
 }
 
 const PLAYER: u64 = (1 << 48) + 1;
@@ -235,3 +291,4 @@ fn cracking_replays_identically_in_the_same_binary() {
     assert_eq!(a, b);
     assert_eq!(a.len(), 2);
 }
+
