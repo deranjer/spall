@@ -56,6 +56,12 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
     fn item_tints(&self) -> Vec<(spall_core::MaterialId, [u8; 3])> {
         Vec::new()
     }
+    /// The game tool id an item is used as when held (a shovel), or `None`
+    /// for an item that is not a tool. Clicking such an item in the pack
+    /// puts it in hand; left click then swings it.
+    fn item_tool(&self, _item_id: u16) -> Option<u16> {
+        None
+    }
 }
 
 /// One cube of a world item's model.

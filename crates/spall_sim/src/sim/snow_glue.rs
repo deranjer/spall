@@ -311,6 +311,56 @@ impl Simulation {
         }
     }
 
+    /// Thin-snow depth, metres, on the terrain top face a point rests on
+    /// (within half a metre below it); `0` where no snow layer is stored.
+    pub fn snow_depth_m_at(&mut self, point_m: [f64; 3]) -> f64 {
+        const CELL_M: f64 = 0.25;
+        let x = (point_m[0] / CELL_M).floor() as i32;
+        let z = (point_m[2] / CELL_M).floor() as i32;
+        // A resting point sits on a cell top: round, so a hair below it still
+        // names the cell it rests on.
+        let top = (point_m[1] / CELL_M).round() as i32 - 1;
+        (top - 2..=top)
+            .rev()
+            .find_map(|y| self.snow.depth_q16_at([x, y, z]))
+            .map_or(0.0, |q16| f64::from(q16) / 65_536.0)
+    }
+
+    /// Shovels the thin snow off every stored top face within `radius_m`
+    /// (horizontally, and within `radius_m` of the height) of `centre_m`:
+    /// those faces restart at zero depth and the change replicates like any
+    /// other snow update. Returns the number of layers changed.
+    pub fn clear_snow(&mut self, centre_m: [f64; 3], radius_m: f64) -> usize {
+        const CELL_M: f64 = 0.25;
+        let tile_m = CELL_M * f64::from(spall_protocol::SNOW_TILE_CELLS);
+        let tiles = |c: f64| {
+            ((c - radius_m) / tile_m).floor() as i32..=((c + radius_m) / tile_m).floor() as i32
+        };
+        let tick = self.tick.get();
+        let mut changed = 0;
+        for tile_x in tiles(centre_m[0]) {
+            for tile_z in tiles(centre_m[2]) {
+                for key in self.snow.tile_layers(tile_x, tile_z) {
+                    let top_m = f64::from(key.2 + 1) * CELL_M;
+                    if (top_m - centre_m[1]).abs() > radius_m + CELL_M {
+                        continue;
+                    }
+                    let mut faces = [0u64; 4];
+                    for face in 0..256usize {
+                        let (fx, fz) = (face % 16, face / 16);
+                        let x = (f64::from(tile_x) * tile_m) + (fx as f64 + 0.5) * CELL_M;
+                        let z = (f64::from(tile_z) * tile_m) + (fz as f64 + 0.5) * CELL_M;
+                        if (x - centre_m[0]).hypot(z - centre_m[2]) <= radius_m {
+                            faces[face / 64] |= 1u64 << (face % 64);
+                        }
+                    }
+                    changed += usize::from(self.snow.clear_faces(key, faces, tick));
+                }
+            }
+        }
+        changed
+    }
+
     pub(super) fn stamp_snow_candidates(&mut self) {
         let cell_m = 0.25;
         let terrain = &self.world.terrain().volume;

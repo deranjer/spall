@@ -674,6 +674,10 @@ pub mod tool_ids {
     pub const PLACE_DIRT: u16 = 3;
     /// The torch: places the emissive lamp where the player aims.
     pub const PLACE_LAMP: u16 = 4;
+    /// Opens and closes doors (`ActionKind::Interact`).
+    pub const DOOR: u16 = 5;
+    /// The shovel (ENG-260), usable only with one in the pack.
+    pub const SHOVEL: u16 = 6;
 }
 
 fn def(id: MaterialId, name: &str, density: f32, albedo: [f32; 3]) -> MaterialDef {
@@ -943,7 +947,7 @@ pub fn tool_catalog() -> spall_server::ToolCatalog {
         GAME_RULES_VERSION,
         [
             ToolRule {
-                id: 5,
+                id: tool_ids::DOOR,
                 kind: spall_sim::EditKind::Door(CABIN_DOOR),
                 max_radius_cells: 0,
                 reach_m: 3.0,
@@ -980,6 +984,14 @@ pub fn tool_catalog() -> spall_server::ToolCatalog {
                 kind: EditKind::Place(materials::LAMP),
                 max_radius_cells: 0,
                 reach_m: 12.0,
+            },
+            // The shovel: arm's reach. `crate::tools` sets each stroke's
+            // radius from the struck material, within this cap.
+            ToolRule {
+                id: tool_ids::SHOVEL,
+                kind: EditKind::Cut,
+                max_radius_cells: 2,
+                reach_m: 3.0,
             },
         ],
     )

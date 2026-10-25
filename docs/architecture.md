@@ -698,9 +698,30 @@ only notion of admin is `HostConfig::admin_commands` (the sandbox's
 `--allow-admin-commands`, which `cargo xtask play` passes), handed to the rules as
 `ToolUse::admin`. The development `--dev-unvalidated-actions` path skips the rules.
 
+For a cut, the server then finds its own hit and asks `ToolRules::swing` what
+the strike does to the struck material (and to any thin snow lying on it): an
+ordinary cut with a game-chosen radius, still capped by the catalog, or
+`SwingEffect::ClearSnow`, which zeroes the snow layer round the struck point
+(`Simulation::clear_snow`) without cutting anything and answers `Queued` at once.
+When a tool cut commits, the tick loop hands it to `ToolRules::committed`; the
+game puts awards in its pack and returns the item kinds the server spawns as
+world items on the ground at the cut.
+
 In the sandbox, players start empty-handed. The hammer (`DIG`) is an admin tool
 (ENG-259): the server refuses its swings unless admin commands are on, and the
 client keeps it put away until the admin menu (F10, Tools) puts it in hand.
+Other tools are pack items: clicking one in the pack (Tab) puts it in hand
+(`PackView::item_tool`), and left click swings it. The shovel (ENG-260, tool 6,
+reach 3 m) needs a shovel in the pack. A stroke first shovels off any thin snow
+deeper than 2 cm within 0.75 m; then it cuts snow and soil at radius 2 (33 cells,
+one stroke every 350 ms while held) and stone at radius 0 (one cell), and refuses
+wood, bedrock and built materials. One soil stroke in 8 and one stone stroke in
+2 turns up a stone (a repeatable roll per request), put in the pack or left at
+the dig when the pack is full.
+
+A world item under more than 0.15 m of thin snow
+(`spall_sim::world_items::ITEM_BURIED_SNOW_M`) is buried: its pickup is refused
+with "buried under snow" until someone shovels the snow off it.
 
 Quarter-metre doors use `spall_voxel::doors` to find a visible nearby hinge and
 plan a +X-to-+Z panel turn. The hinge material records open/closed state. E sends

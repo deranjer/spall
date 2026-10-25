@@ -50,8 +50,10 @@ impl std::fmt::Debug for ItemPickup {
 /// authoritative eye; the client's aim is ignored. `None` when the request is
 /// not a pickup (another action, no player, no item in reach), so the caller
 /// carries on (a nearby door). Otherwise the answer: `Queued` once the item is
-/// in the pack and gone from the world, or the game's refusal with the item
-/// left where it was. Requests are handled one at a time on the owning
+/// in the pack and gone from the world, or a refusal with the item left where
+/// it was: the game's (a full pack), or "buried under snow" when more than
+/// [`spall_sim::world_items::ITEM_BURIED_SNOW_M`] of thin snow lies on it.
+/// Requests are handled one at a time on the owning
 /// thread, so an item goes to exactly one player. A pickup's `Queued` goes in
 /// the simulation's admission ledger, the one door and edit retries replay
 /// from, so a retry of the same request id is answered from there and never
@@ -74,6 +76,11 @@ pub(super) fn pick_up_item(
         request_id: req.request_id,
         outcome,
     };
+    if sim.snow_depth_m_at(item.translation_m) > spall_sim::world_items::ITEM_BURIED_SNOW_M {
+        return Some(status(ActionOutcome::Rejected {
+            reason: "buried under snow".into(),
+        }));
+    }
     Some(match pickup.grant(session, principal, &item) {
         Ok(()) => {
             sim.remove_world_item(item.item_id)

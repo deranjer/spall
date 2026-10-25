@@ -16,7 +16,7 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
     ("T", "Torch: place a light where you aim"),
     (
         "Tab",
-        "Pack: lay out what you carry (Tab, Esc or walk to pack up)",
+        "Pack: lay out what you carry; click a tool to hold it (Tab, Esc or walk to pack up)",
     ),
     (
         "B",

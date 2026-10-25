@@ -321,7 +321,11 @@ pub(super) async fn serve_async(
         .item_pickup
         .clone()
         .filter(|_| !dev_unvalidated_actions);
-    let tool_hooks = config.server.tool_hooks.clone();
+    let tool_hooks = config
+        .server
+        .tool_hooks
+        .clone()
+        .filter(|_| !dev_unvalidated_actions);
     let creature_shape = config.server.creature_shape.clone();
     let contact_damage_cfg = config.server.contact_damage;
     let contact_damage_profiles = damage_profiles;
@@ -720,11 +724,8 @@ pub(super) async fn serve_async(
                             continue;
                         }
                         let principal = player_principals.get(&session.raw()).copied();
-                        if let Err(refused) = (!dev_unvalidated_actions)
-                            .then(|| {
-                                permit_tool(&tool_hooks, session, principal, &req, admin_commands)
-                            })
-                            .unwrap_or(Ok(()))
+                        if let Err(refused) =
+                            permit_tool(&tool_hooks, session, principal, &req, admin_commands)
                         {
                             reject(&clients_for_sim, session, req.request_id, &refused.reason());
                             rejected_total += 1;
@@ -751,13 +752,25 @@ pub(super) async fn serve_async(
                                     .ok_or(ActionReject::Unsupported("unsupported target"))
                                     .map(|intent| sim.submit(intent))
                             }
-                            None => resolve_intent_with_catalog(
-                                sim.world(),
+                            None => match resolve_swing(
+                                &mut sim,
                                 session,
+                                principal,
                                 &req,
                                 &action_catalog,
-                            )
-                            .map(|intent| sim.submit(intent)),
+                                &tool_hooks,
+                            ) {
+                                Ok(Swing::Edit(intent)) => Ok(sim.submit(intent)),
+                                Ok(Swing::Done(status)) => {
+                                    send_to(
+                                        &clients_for_sim,
+                                        session,
+                                        Outbound::Status(Arc::new(status)),
+                                    );
+                                    continue;
+                                }
+                                Err(rej) => Err(rej),
+                            },
                         };
                         match resolved {
                             Ok(submitted) => match submitted {
@@ -765,10 +778,9 @@ pub(super) async fn serve_async(
                                     submitted_at
                                         .entry(req.request_id)
                                         .or_insert_with(std::time::Instant::now);
-                                    submitted_by.entry(req.request_id).or_insert((
-                                        session,
-                                        player_principals.get(&session.raw()).copied(),
-                                    ));
+                                    submitted_by
+                                        .entry(req.request_id)
+                                        .or_insert((session, principal));
                                     actions_staged += 1;
                                     send_to(
                                         &clients_for_sim,
@@ -1258,6 +1270,7 @@ pub(super) async fn serve_async(
             let span_serve_commit_fanout = spall_sim::prof::Span::start("serve.commit_fanout");
             for (rid, committed) in &report.committed {
                 committed_total += 1;
+                apply_tool_effects(&mut sim, &tool_hooks, *rid, committed);
                 if !committed.removed_materials.is_empty()
                     && let Some((session, player_id)) = submitted_by.get(rid).copied()
                 {

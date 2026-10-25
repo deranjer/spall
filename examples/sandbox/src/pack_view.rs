@@ -125,6 +125,13 @@ impl PackView for SandboxPackView {
     fn item_tints(&self) -> Vec<(MaterialId, [u8; 3])> {
         self.models.tints.clone()
     }
+
+    fn item_tool(&self, item_id: u16) -> Option<u16> {
+        match crate::game::ItemId(item_id) {
+            items::SHOVEL => Some(crate::game::tool_ids::SHOVEL),
+            _ => None,
+        }
+    }
 }
 
 /// The SPVOX model of each kind that can lie in the world.

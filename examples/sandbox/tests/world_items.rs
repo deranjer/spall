@@ -52,7 +52,7 @@ fn cabin_items_rest_on_a_surface_inside_the_cabin() {
 #[cfg(feature = "client")]
 mod network {
     use super::*;
-    use sandbox::world_items::in_memory_pickup;
+    use sandbox::world_items::{PackStore, pickup};
     use spall_client::replica::ReplicaWorld;
     use spall_client::{
         BaselineScene, ClientNetConfig, InteractiveSession, run_replication_client_with_manifest,
@@ -147,7 +147,7 @@ mod network {
             cfg.server.custom_world =
                 Some(CustomWorld::new(spawns, move || scene.world_setup()).with_world_items(items));
             let inventories = Arc::new(Mutex::new(game::PlayerInventories::default()));
-            cfg.server.item_pickup = Some(in_memory_pickup(inventories.clone()));
+            cfg.server.item_pickup = Some(pickup(PackStore::InMemory(inventories.clone())));
             cfg.server.paced = true;
             cfg.server.log_json = dir.join("server.jsonl");
             cfg.server.transport = TransportConfig::for_tests();
