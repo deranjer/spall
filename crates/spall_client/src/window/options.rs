@@ -53,9 +53,12 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
         &[]
     }
     /// Cubes drawn on top of [`Self::item_model`] while a fire of this kind
-    /// burns (ENG-266), in the same item-local metres. Empty draws nothing.
-    fn lit_model(&self, _item_id: u16) -> &[ItemVoxel] {
-        &[]
+    /// burns (ENG-266), in the same item-local metres, for a fire with
+    /// `fuel_s` left at `time_s` (a steadily running clock, for animation).
+    /// `seed` is the fire's id, to tell fires apart. Empty draws nothing, and
+    /// should stay a small fixed number of cubes (ENG-267).
+    fn lit_model(&self, _item_id: u16, _fuel_s: f32, _time_s: f32, _seed: u64) -> Vec<ItemVoxel> {
+        Vec::new()
     }
     /// What clicking this item's stack in the pack does.
     fn item_use(&self, _item_id: u16) -> ItemUse {

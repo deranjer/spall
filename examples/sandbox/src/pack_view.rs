@@ -122,11 +122,16 @@ impl PackView for SandboxPackView {
         self.models.models.get(&item_id).map_or(&[], Vec::as_slice)
     }
 
-    fn lit_model(&self, item_id: u16) -> &[ItemVoxel] {
+    fn lit_model(&self, item_id: u16, fuel_s: f32, time_s: f32, seed: u64) -> Vec<ItemVoxel> {
         if ItemId(item_id) == items::FIRE_PIT {
-            FIRE_GLOW
+            crate::fire_flame::flame_voxels(
+                fuel_s,
+                time_s,
+                crate::fire_flame::seed_phase(seed),
+                self.models.flame_palette,
+            )
         } else {
-            &[]
+            Vec::new()
         }
     }
 
@@ -141,23 +146,6 @@ impl PackView for SandboxPackView {
         self.models.tints.clone()
     }
 }
-
-/// A burning fire pit's flame for now: the torch's glowing lamp blocks, a
-/// larger one under a smaller one, among the sticks. ENG-267 replaces it.
-const FIRE_GLOW: &[ItemVoxel] = &[
-    ItemVoxel {
-        center: [0.0, 0.12, 0.0],
-        size: [0.2, 0.2, 0.2],
-        material: crate::game::materials::LAMP.0 as u32,
-        tint: None,
-    },
-    ItemVoxel {
-        center: [0.0, 0.3, 0.0],
-        size: [0.1, 0.16, 0.1],
-        material: crate::game::materials::LAMP.0 as u32,
-        tint: None,
-    },
-];
 
 /// A fire pit as its blueprint lays it out: six stones in a ring round
 /// sticks crossed in the middle, built from the stone and stick models.
@@ -248,6 +236,8 @@ struct ItemModels {
     models: HashMap<u16, Vec<ItemVoxel>>,
     /// `(material, sRGB tint)` pairs that [`ItemVoxel::tint`] indexes.
     tints: Vec<(MaterialId, [u8; 3])>,
+    /// Index of [`crate::fire_flame::FLAME_PALETTE`]'s first entry in `tints`.
+    flame_palette: u16,
     /// Kinds whose asset failed and draw [`placeholder_model`] instead.
     fallbacks: Vec<u16>,
 }
@@ -280,6 +270,8 @@ impl ItemModels {
             &out.models[&items::STICK.0],
         );
         out.models.insert(items::FIRE_PIT.0, pit);
+        out.flame_palette = u16::try_from(out.tints.len()).expect("few item tints");
+        out.tints.extend(crate::fire_flame::FLAME_PALETTE);
         out
     }
 
@@ -470,14 +462,16 @@ mod tests {
             view.item_model(items::FIRE_PIT.0).len(),
             6 * stones + 3 * sticks
         );
-        let lamp = u32::from(crate::game::materials::LAMP.0);
+        let tints = view.item_tints().len();
+        let flame = view.lit_model(items::FIRE_PIT.0, 180.0, 1.0, 7);
+        assert!(!flame.is_empty());
         assert!(
-            view.lit_model(items::FIRE_PIT.0)
+            flame
                 .iter()
-                .all(|v| v.material == lamp)
+                .all(|v| v.tint.is_some_and(|t| usize::from(t) < tints))
         );
-        assert!(!view.lit_model(items::FIRE_PIT.0).is_empty());
-        assert!(view.lit_model(items::STICK.0).is_empty());
+        assert!(view.lit_model(items::FIRE_PIT.0, 0.0, 1.0, 7).is_empty());
+        assert!(view.lit_model(items::STICK.0, 180.0, 1.0, 7).is_empty());
     }
 
     /// Every kind that can lie in the world has a name for the E prompt and a
