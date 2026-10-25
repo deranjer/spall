@@ -1,6 +1,7 @@
 //! How the local player's body state looks on screen. This is presentation,
 //! not gameplay: cold and wetness are eased from signals the client already
-//! has (the replicated weather, shelter, the replicated water surface), and
+//! has (the replicated weather, shelter, the replicated water surface, the
+//! replicated fires), and
 //! nothing here is sent to the server or decides an outcome. Injury comes from
 //! the server's authoritative health (ENG-223); when the other survival stats
 //! become server-authoritative they replace their inputs the same way.
@@ -17,6 +18,9 @@ pub struct BodyConditions {
     pub precipitation: f32,
     /// The body is in water.
     pub submerged: bool,
+    /// Warming from nearby lit fires, degrees Celsius of felt temperature
+    /// (`spall_sim::world_items::heat_at`).
+    pub fire_heat_c: f32,
 }
 
 /// Felt cold and wetness, each 0..=1, eased over time so stepping under a
@@ -59,7 +63,12 @@ impl BodyState {
         };
         self.wet = ease(self.wet, wet_target, dt_s, wet_tau_s);
 
-        let felt = air - self.wet * WET_CHILL_C - exposure * WIND_CHILL_C;
+        let fire = if conditions.fire_heat_c.is_finite() {
+            conditions.fire_heat_c.max(0.0)
+        } else {
+            0.0
+        };
+        let felt = air - self.wet * WET_CHILL_C - exposure * WIND_CHILL_C + fire;
         let cold_target = ((COLD_START_C - felt) / COLD_SPAN_C).clamp(0.0, 1.0);
         // Chill sets in slower than it lifts beside a fire.
         let cold_tau_s = if cold_target > self.cold { 20.0 } else { 10.0 };
@@ -237,6 +246,7 @@ mod tests {
         exposure: 1.0,
         precipitation: 0.0,
         submerged: false,
+        fire_heat_c: 0.0,
     };
 
     fn run(state: &mut BodyState, conditions: BodyConditions, seconds: u32) {
@@ -319,6 +329,28 @@ mod tests {
             screen_grade(&state, &BodyPreview::default(), 0.0).frost,
             0.0
         );
+    }
+
+    #[test]
+    fn a_fire_close_by_keeps_the_cold_off_and_one_out_of_reach_does_not() {
+        let fire = spall_protocol::WorldItem {
+            item_id: 1,
+            kind: 6,
+            translation_m: [0.0, 0.0, 0.0],
+            yaw_rad: 0.0,
+            fire_fuel_s: Some(120.0),
+        };
+        let night = |at: [f64; 3]| BodyConditions {
+            air_temperature_c: -10.0,
+            fire_heat_c: spall_sim::world_items::heat_at(&[fire], at),
+            ..MILD
+        };
+        let mut beside = BodyState::default();
+        run(&mut beside, night([1.0, 1.0, 0.0]), 180);
+        let mut away = BodyState::default();
+        run(&mut away, night([20.0, 1.0, 0.0]), 180);
+        assert!(beside.cold < 0.2, "{beside:?}");
+        assert!(away.cold > 0.8, "{away:?}");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::session::SessionId;
 
 /// The one wire version. Client and server ship together, so every record, capability and
 /// handshake shares this number; any layout change bumps it. Pre-release: no per-record versions.
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;
 
 /// Fixed simulation and snapshot rates (Hz).
 pub const SERVER_TICK_HZ: u16 = 60;

@@ -69,7 +69,7 @@ fn render(
         .update_terrain_meshes(&ctx.device, &meshes, &[])
         .expect("upload terrain meshes");
     let eye = glam::Vec3::new(center_m[0] as f32, center_m[1] as f32, center_m[2] as f32);
-    let lights = emitter_point_lights(&emitters, &materials, eye);
+    let lights = emitter_point_lights(&emitters, &materials, &[], eye);
     println!(
         "{} terrain chunks, {} emitter cells, {} point lights",
         meshes.len(),

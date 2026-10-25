@@ -121,6 +121,7 @@ impl PackView for SandboxPackView {
     fn item_use(&self, item_id: u16) -> ItemUse {
         match crate::game::ItemId(item_id) {
             items::COMPASS => ItemUse::Compass,
+            items::FIRE_PIT => ItemUse::Place,
             items::NOTE => ItemUse::Note(note_text(tower_heading_deg())),
             _ => ItemUse::None,
         }
@@ -130,9 +131,56 @@ impl PackView for SandboxPackView {
         self.models.models.get(&item_id).map_or(&[], Vec::as_slice)
     }
 
+    fn lit_model(&self, item_id: u16, fuel_s: f32, time_s: f32, seed: u64) -> Vec<ItemVoxel> {
+        if ItemId(item_id) == items::FIRE_PIT {
+            crate::fire_flame::flame_voxels(
+                fuel_s,
+                time_s,
+                crate::fire_flame::seed_phase(seed),
+                self.models.flame_palette,
+            )
+        } else {
+            Vec::new()
+        }
+    }
+
     fn item_tints(&self) -> Vec<(MaterialId, [u8; 3])> {
         self.models.tints.clone()
     }
+}
+
+/// A fire pit as its blueprint lays it out: six stones in a ring round
+/// sticks crossed in the middle, built from the stone and stick models.
+fn fire_pit_model(stone: &[ItemVoxel], stick: &[ItemVoxel]) -> Vec<ItemVoxel> {
+    let mut out = Vec::new();
+    for i in 0..6 {
+        let a = i as f32 / 6.0 * std::f32::consts::TAU;
+        let (x, z) = (0.34 * a.cos(), 0.34 * a.sin());
+        out.extend(stone.iter().map(|v| ItemVoxel {
+            center: [v.center[0] + x, v.center[1], v.center[2] + z],
+            ..*v
+        }));
+    }
+    // Two sticks along X, one across them along Z, a little higher.
+    for (dz, across) in [(-0.06, false), (0.06, false), (0.0, true)] {
+        out.extend(stick.iter().map(|v| {
+            let [x, y, z] = v.center;
+            let [sx, sy, sz] = v.size;
+            if across {
+                ItemVoxel {
+                    center: [z, y + sy, x],
+                    size: [sz, sy, sx],
+                    ..*v
+                }
+            } else {
+                ItemVoxel {
+                    center: [x, y, z + dz],
+                    ..*v
+                }
+            }
+        }));
+    }
+    out
 }
 
 /// Compass heading, degrees clockwise from north (north 0, east 90), of the
@@ -212,6 +260,8 @@ struct ItemModels {
     models: HashMap<u16, Vec<ItemVoxel>>,
     /// `(material, sRGB tint)` pairs that [`ItemVoxel::tint`] indexes.
     tints: Vec<(MaterialId, [u8; 3])>,
+    /// Index of [`crate::fire_flame::FLAME_PALETTE`]'s first entry in `tints`.
+    flame_palette: u16,
     /// Kinds whose asset failed and draw [`placeholder_model`] instead.
     fallbacks: Vec<u16>,
 }
@@ -239,6 +289,13 @@ impl ItemModels {
             };
             out.models.insert(item.0, model);
         }
+        let pit = fire_pit_model(
+            &out.models[&items::STONE_CHUNK.0],
+            &out.models[&items::STICK.0],
+        );
+        out.models.insert(items::FIRE_PIT.0, pit);
+        out.flame_palette = u16::try_from(out.tints.len()).expect("few item tints");
+        out.tints.extend(crate::fire_flame::FLAME_PALETTE);
         out
     }
 
@@ -429,6 +486,31 @@ mod tests {
         }
         assert_eq!(view.item_name(999), None);
         assert!(view.item_icon_png(999).is_none());
+    }
+
+    /// A fire pit is set down from the pack, is drawn as stones round sticks,
+    /// and glows only while it burns.
+    #[test]
+    fn a_fire_pit_is_placed_from_the_pack_and_glows_when_lit() {
+        let view = SandboxPackView::new();
+        assert_eq!(view.item_use(items::FIRE_PIT.0), ItemUse::Place);
+        assert_eq!(view.item_use(items::STICK.0), ItemUse::None);
+        let stones = view.item_model(items::STONE_CHUNK.0).len();
+        let sticks = view.item_model(items::STICK.0).len();
+        assert_eq!(
+            view.item_model(items::FIRE_PIT.0).len(),
+            6 * stones + 3 * sticks
+        );
+        let tints = view.item_tints().len();
+        let flame = view.lit_model(items::FIRE_PIT.0, 180.0, 1.0, 7);
+        assert!(!flame.is_empty());
+        assert!(
+            flame
+                .iter()
+                .all(|v| v.tint.is_some_and(|t| usize::from(t) < tints))
+        );
+        assert!(view.lit_model(items::FIRE_PIT.0, 0.0, 1.0, 7).is_empty());
+        assert!(view.lit_model(items::STICK.0, 180.0, 1.0, 7).is_empty());
     }
 
     /// Every kind that can lie in the world has a name for the E prompt and a
