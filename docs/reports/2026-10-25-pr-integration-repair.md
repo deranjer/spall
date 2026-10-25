@@ -71,3 +71,35 @@ These are measured CPU correctness/build results, not performance or visual
 acceptance. No GPU capture or hands-on playtest ran. Existing feature limitations
 in the PRs remain. Hosted CI runs separately. Next integration choices are the
 now-ready open PRs; ENG-251 remains the scenario assembly follow-up.
+
+## PR #247 follow-up after #242, #244 and #246 merged
+
+Main advanced to `148e6ff3`. Merged it into #247 and resolved the three
+`CustomWorld` conflicts in `serve/scene.rs` by retaining both ice settings
+and the winter weather profile, their defaults and their existing builders.
+The combined simulation retains warmth, tools, weather and ice.
+
+Current main also inherited a 2,531-line tick loop against a 2,527-line cap.
+In a separate moves-only commit, moved the existing 56-line `SimResult::error`
+implementation unchanged into `serve/config.rs`. The tick loop is now 2,475
+lines; the allowlist was not enlarged.
+
+Validation on the combined branch:
+
+- `cargo fmt --check`: pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass,
+  including a final rerun after the move.
+- `cargo test -p spall_sim -p spall_server --lib`: simulation 138 passed / 6
+  ignored; server 117 passed / 1 ignored. The server suite passed again after
+  the move with `cargo test -p spall_server --lib`.
+- `cargo test -p spall_sim --test ice`: 6 passed.
+- `cargo test -p spall_server --test ice_persistence`: 1 passed.
+- `cargo test -p sandbox --features client --test appearance --test appearance_evolution`:
+  4 and 5 passed.
+- `cargo run -p xtask -- proportionality`: pass; existing store fault-module
+  warning remains.
+
+No new API, module, crate, feature, config field or protocol record. No version
+bump: inherits wire 25 and save 10 from main. No proportionality exception.
+No new performance measurement or visual playtest. Hosted CI is separate.
+Next unblocked work is review/landing of #247, then scenario assembly ENG-251.
