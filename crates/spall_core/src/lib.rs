@@ -47,7 +47,7 @@ pub const PROCESS_METADATA_VERSION: u32 = 1;
 /// ecology/vegetation state. Pre-release there is no
 /// migration: any change to a persisted layout bumps this, and a save written by another value
 /// is refused as incompatible. Lives in `spall_core` so crates below `spall_store` can stamp it.
-pub const STORE_SCHEMA_VERSION: u32 = 8;
+pub const STORE_SCHEMA_VERSION: u32 = 10;
 /// [`STORE_SCHEMA_VERSION`] for `u16` record headers.
 pub const STORE_SCHEMA_VERSION_U16: u16 = STORE_SCHEMA_VERSION as u16;
 

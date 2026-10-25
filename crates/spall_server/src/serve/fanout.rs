@@ -196,3 +196,33 @@ pub(super) fn progression_rejected(
         inventory: Vec::new(),
     }
 }
+
+/// Sends each outcome the tick resolved (a commit or a deterministic staging
+/// rejection) to the session that staged it, under the id its client chose.
+/// `submitted_by` is best-effort bookkeeping, cleared on first resolution; an
+/// untracked request (there shouldn't be one) falls back to a broadcast so a
+/// status is never silently dropped. Returns how many were rejections.
+pub(super) fn route_tick_statuses(
+    report: &spall_sim::TickReport,
+    submitted_by: &mut HashMap<RequestId, SubmittedBy>,
+    clients: &ClientMap,
+) -> u64 {
+    let mut rejected = 0;
+    for status in action_statuses(report) {
+        if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
+            rejected += 1;
+        }
+        match submitted_by.remove(&status.request_id) {
+            Some((session, _, client_request_id)) => send_to(
+                clients,
+                session,
+                Outbound::Status(Arc::new(ActionStatus {
+                    request_id: client_request_id,
+                    ..status
+                })),
+            ),
+            None => broadcast(clients, Outbound::Status(Arc::new(status))),
+        }
+    }
+    rejected
+}

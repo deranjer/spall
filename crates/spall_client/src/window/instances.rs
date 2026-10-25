@@ -564,10 +564,12 @@ pub(super) const TORCH_CONSIDER_M: f32 = 60.0;
 /// whose material emits, as a warm light at its centre, the
 /// [`spall_render::MAX_POINT_LIGHTS`] nearest `eye` first. The lighting cache
 /// cannot resolve an emitter smaller than about a metre, so a lone torch voxel
-/// lights its surroundings through these instead.
+/// lights its surroundings through these instead. `extra` lights (lit fires)
+/// compete for the same nearest slots.
 pub fn emitter_point_lights(
     instances: &[Instance],
     materials: &[spall_render::Material],
+    extra: &[spall_render::PointLight],
     eye: Vec3,
 ) -> Vec<spall_render::PointLight> {
     let mut found: Vec<(f32, spall_render::PointLight)> = instances
@@ -592,6 +594,10 @@ pub fn emitter_point_lights(
                 )
             })
         })
+        .chain(extra.iter().map(|light| {
+            let d2 = (Vec3::from_array(light.position) - eye).length_squared();
+            (d2, *light)
+        }))
         .filter(|(d2, _)| *d2 <= TORCH_CONSIDER_M * TORCH_CONSIDER_M)
         .collect();
     found.sort_by(|a, b| a.0.total_cmp(&b.0));

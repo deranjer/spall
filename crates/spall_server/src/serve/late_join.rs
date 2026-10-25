@@ -179,18 +179,20 @@ impl LateJoin {
         }
     }
 
-    /// Initial catch-up queue for a joining client: the creatures held right
-    /// now, ahead of every spawn and transaction committed after this instant.
+    /// Initial catch-up queue for a joining client: the creatures and world
+    /// items held right now, ahead of every spawn and transaction committed
+    /// after this instant.
     pub(super) fn creature_seed(&self, sim: &Simulation) -> VecDeque<QueuedItem> {
         let mut queue = VecDeque::new();
-        let Some(service) = self.creatures.as_ref() else {
-            return queue;
-        };
-        let records: Vec<WireRecord> = service
-            .join_records(sim)
+        let (_, items) = sim.world_item_state();
+        let mut records: Vec<WireRecord> = spall_sim::world_items::updates(items, Vec::new())
             .into_iter()
-            .map(WireRecord::CreatureSpawn)
+            .map(WireRecord::WorldItemUpdate)
             .collect();
+        if let Some(service) = self.creatures.as_ref() {
+            let spawns = service.join_records(sim).into_iter();
+            records.extend(spawns.map(WireRecord::CreatureSpawn));
+        }
         if !records.is_empty() {
             queue.push_back(QueuedItem::Records(Arc::new(records)));
         }

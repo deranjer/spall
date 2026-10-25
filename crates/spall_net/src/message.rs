@@ -52,6 +52,7 @@ pub enum WireRecord {
     CreatureMotionFrame(spall_protocol::CreatureMotionFrame),
     CreatureDespawn(spall_protocol::CreatureDespawn),
     PlayerHealth(spall_protocol::PlayerHealth),
+    WorldItemUpdate(spall_protocol::WorldItemUpdate),
 }
 
 impl WireRecord {
@@ -83,6 +84,7 @@ impl WireRecord {
             Self::CreatureMotionFrame(_) => WireTag::CreatureMotionFrame,
             Self::CreatureDespawn(_) => WireTag::CreatureDespawn,
             Self::PlayerHealth(_) => WireTag::PlayerHealth,
+            Self::WorldItemUpdate(_) => WireTag::WorldItemUpdate,
         }
     }
 
@@ -115,6 +117,7 @@ impl WireRecord {
             Self::CreatureMotionFrame(r) => encode_control(r),
             Self::CreatureDespawn(r) => encode_control(r),
             Self::PlayerHealth(r) => encode_control(r),
+            Self::WorldItemUpdate(r) => encode_control(r),
         }
     }
 
@@ -156,6 +159,7 @@ impl WireRecord {
             WireTag::CreatureMotionFrame => Self::CreatureMotionFrame(decode_control(bytes)?),
             WireTag::CreatureDespawn => Self::CreatureDespawn(decode_control(bytes)?),
             WireTag::PlayerHealth => Self::PlayerHealth(decode_control(bytes)?),
+            WireTag::WorldItemUpdate => Self::WorldItemUpdate(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,

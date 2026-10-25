@@ -88,6 +88,13 @@ impl Simulation {
         self.pipeline.action_status(request_id)
     }
 
+    /// Records the answer to a request the host settled itself (a world item
+    /// pickup) in the same admission ledger, so [`Self::action_status`]
+    /// replays it for a retry instead of the retry acting again.
+    pub fn record_action_status(&mut self, status: ActionStatus) {
+        self.pipeline.record_status(status);
+    }
+
     /// Admits an edit intent for staging, or replays the stored status for a
     /// duplicate request id.
     ///

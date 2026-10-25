@@ -80,6 +80,7 @@ fn current_schema_missing_auxiliary_tables_reject_without_mutation() {
         "checkpoint_vegetation",
         "checkpoint_weather",
         "checkpoint_players",
+        "checkpoint_world_items",
         "game_outbox",
     ] {
         let scratch = Scratch::new(&format!("missing-{missing}"));
@@ -183,6 +184,16 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
             player_id: [3; 16],
             health: 42,
         }],
+        world_items: spall_store::StoredWorldItems {
+            next_id: 8,
+            items: vec![spall_protocol::WorldItem {
+                item_id: 7,
+                kind: 3,
+                translation_m: [1.5, 2.0, -3.25],
+                yaw_rad: 0.75,
+                fire_fuel_s: Some(95.5),
+            }],
+        },
         snow: None,
         bricks: vec![
             StoredBrick {

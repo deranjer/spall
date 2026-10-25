@@ -13,6 +13,46 @@ Cabin content and interaction checks:
   Capture the mouse, approach the door and press E to open/close it. The E label
   follows the door in the view; it disappears beyond reach or behind walls.
   Furniture placements can be edited independently in Spall Editor.
+  The shovel lies on the floor and the note on the table; within 3 m the label
+  reads `E  Pick up Shovel` / `E  Pick up Note`, E removes the item and Tab
+  shows it in the pack.
+
+World item checks (ENG-257):
+
+- `cargo test -p spall_server --lib serve::items` checks pickup from the
+  authoritative player (bogus aim and out-of-reach requests do nothing), one
+  winner for two players and a duplicate, and a full pack leaving the item.
+- `cargo test -p spall_sim --lib world_items` checks id allocation, restore
+  validation and update splitting.
+- `cargo test -p spall_server --test world_item_persistence` and
+  `cargo test -p spall_store --test durability` check save and load.
+- `cargo test -p sandbox --lib world_items progression_store` checks the
+  12-slot pack, in memory and durable.
+- `cargo test -p sandbox --features client --test world_items` checks cabin item
+  placement and, over real QUIC, a simultaneous pickup by two clients (one
+  joined late), a third client joining afterwards, and a retried pickup
+  request beside the closed cabin door leaving the door closed.
+- `cargo test -p sandbox --features client --lib pack_view` checks that every
+  pickup kind draws its decoded SPVOX model, hand-sized and lying flat.
+
+Fire checks (ENG-266):
+
+- `cargo test -p spall_sim --lib world_items` checks burn time per second of
+  fuel, going out once at zero, refuelling relighting, heat falloff, and where
+  a fire may rest (refused inside terrain, against a wall or out of reach).
+- `cargo test -p spall_server --lib serve::fires` checks placing from the
+  authoritative player (once per request id, refused without ground or a pit in
+  the pack) and E feeding a burnt-out fire alight.
+- `cargo test -p sandbox --lib fires progression_store` checks the sandbox's
+  fuel rules and the durable pack.
+- `cargo test -p sandbox --features client --test world_items` also runs a real
+  QUIC fire: set down from the pack, burnt out, fed alight with E, and seen
+  burning by a client joining afterwards.
+- `cargo test -p spall_client --lib body_state` checks that a nearby fire keeps
+  the presented cold off at night.
+- Playtest (not automated): in the cabin with a crafted fire pit, Tab, click
+  the pit: it lands lit in front, glows and lights the room; E beside it reads
+  `E  Add fuel`.
 
 
 Historical grid-water validation (ENG-122 closeout, water default, canal viewer, windowed comparison; removed in ENG-169): see [reports/history-validation.md](reports/history-validation.md).
@@ -295,7 +335,7 @@ minimal debug view draws nearby replicated terrain and detached bodies; its
 prediction collision world mirrors both, with detached-body poses remaining
 server-driven. F3 shows the local capsule bounds as 1.25 cm wire-like strokes
 rather than voxel-sized markers. It is not the G2 renderer.
-The window releases the cursor with Escape or focus loss, and focus loss clears
+Escape closes an open pack, book, note or admin menu first; otherwise it opens the Esc menu (ENG-270: Resume, Quit, and every keybind, click one then press the new key; clashes are refused; saved to `%APPDATA%\Spall\client-settings.json`, or `~/.config/spall/` elsewhere). Focus loss releases the cursor, and focus loss clears
 all held actions so a missing OS key-up cannot continue a walk or jump. The
 historical PR #109 record reports a hands-on run of `cargo xtask play --release
 --scene g1 --ticks 18000` in which the investigated frame-pacing jitter was no
@@ -309,6 +349,8 @@ scene, then moved to their emitter on activation. `spall_sim::playground` tests
 pin both cadences and prove each staged body's mass equals the sum of its
 quarter-metre voxels at the current material density. Full moving-body crush
 outcomes remain follow-up.
+
+ENG-262: clicking a compass in the open pack holds it (a screen-space dial lower right whose needle points to world north, -Z; clicking it again puts it away), and clicking a note shows a paper with the tower's compass heading from the cabin. The text comes from the game's `PackView::item_use`; the sandbox's heading is a placeholder until ENG-251 supplies the bearing. Not checked in a live window.
 
 For isolated physics UAT, `cargo xtask play --scene playground --late-join
 --client-authoritative` makes the interactive client authoritative for player

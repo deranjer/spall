@@ -705,6 +705,52 @@ four player starts, and separate bed, table, bench, lamp and door assets. The
 scene importer places these into normal destructible terrain. Furniture is
 modular for authoring; it has no runtime pickup behavior.
 
+World items (ENG-257) are separate from terrain: `spall_sim::Simulation` holds
+each item's stable id, game item kind and pose, creates and removes them only on
+the owning thread between ticks, and queues the change for the server to send
+as a `WorldItemUpdate` after the tick (join lists seed late joiners). Items own
+no voxels and have no physics. E sends `ActionKind::Interact`; the server picks
+the nearest item its own player can see within 3 m and asks the game's
+`ItemPickup` callback to put it in the pack, removing it only when the game
+accepts. The sandbox's pack is the ENG-244 inventory (in memory, or the durable
+progression database with player credentials), limited to 12 distinct kinds.
+New custom worlds get items from `CustomWorld::with_world_items`; the sandbox's
+editor-scene loader reads them from `<project>/items.ron` (the cabin has a
+shovel and the note). Items are saved in checkpoints. The client draws each item
+from `PackView::item_model`, tinted through `PackView::item_tints`. The sandbox
+decodes the ENG-254 `fixtures/items/assets/*.spvox` models once at startup
+(the compass with its needle), lays each on its largest face, and scales the
+compass and note down to life size. A model that fails to load is logged as an
+error and drawn as `pack_view::placeholder_model` cubes. The client also labels the
+nearest one `E  Pick up <name>`, ahead of a door prompt.
+
+Fires (ENG-266) are world items with fuel (`WorldItem::fire_fuel_s`), not
+terrain cells or a separate entity, so they reuse item replication, join lists
+and checkpoints. `Simulation::tick` burns every lit fire a second of fuel per
+second (`BLIZZARD_BURN_RATE`, 2x, for a fire with no solid cell within 8 m above
+it during a blizzard); one that runs out goes out at fuel 0 and stays as an unlit
+pit. A fire is re-announced only when it goes out or is fed, so a client's fuel
+is as of the last change. Clicking a stack in the open pack asks
+`PackView::item_use`; `ItemUse::Place` sends `ActionKind::PlaceItem` with the
+item kind. The server finds the spot with `spall_sim::world_items::fire_spot`
+from its own player's eye and the aim direction: the top face of solid ground
+the aim meets within 3 m, else the ground 1.2 m ahead, with open air over a
+0.6 m footprint 0.75 m high. Only then does the game's `FireRules::place` take
+the pit from the pack and give the starting fuel. E (`Interact`) whose nearest
+visible item is a fire calls `FireRules::refuel` (fuel from the pack) instead of
+pickup; adding fuel relights an unlit pit. Successes go in the admission ledger,
+so retries never place or feed twice. The sandbox's numbers are all in
+`sandbox::fires`: a pit starts with 180 s, a stick adds 180 s, a log 600 s (logs
+are used first), and a fire at 1800 s takes no more. Engine-side numbers (reach,
+footprint, heat, blizzard rate) are in `spall_sim::world_items`.
+`spall_sim::world_items::heat_at(items, position)` sums lit fires' warming in
+degrees of felt temperature, 30 at the centre falling as `1 - (d/4 m)^2` to 0 at 4 m; the client's
+presented cold (`body_state`) adds it from the replicated fires, and server
+warmth (ENG-264) is to call it with `Simulation::world_items`. The client draws
+a fire from `PackView::item_model` plus, while lit, `PackView::lit_model` (the
+sandbox's lamp-material glow blocks, until ENG-267), and each lit fire is a
+real-time `PointLight` competing with torch voxels for the nearest slots.
+
 Quarter-metre doors use `spall_voxel::doors` to find a visible nearby hinge and
 plan a +X-to-+Z panel turn. The hinge material records open/closed state. E sends
 an interaction request; the server selects the door from its authoritative

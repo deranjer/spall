@@ -20,7 +20,10 @@ The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It c
 
 A furnished, destructible timber cabin with four interior player starts is playable with
 `cargo xtask play --editor-scene fixtures/cabin`. The reusable SPVOX building and
-regeneration instructions are in [fixtures/cabin](fixtures/cabin/README.md).
+regeneration instructions are in [fixtures/cabin](fixtures/cabin/README.md). A shovel
+and a note lie inside; press E near one to pick it up into the pack (Tab). A fire
+pit crafted in the blueprint book (B) is set down lit by clicking it in the pack;
+E beside it adds a log or stick from the pack.
 
 Animated animal source fixtures (trout, crow and deer) have a bounded renderer
 preview: `cargo run -p sandbox --features client --example animal-preview -- --bounded`.

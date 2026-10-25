@@ -162,6 +162,23 @@ pub struct StoredPlayerHealth {
     pub health: u16,
 }
 
+/// The world items lying in the world (ENG-257) and the id the next one gets,
+/// so a recovered world never reuses an item id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredWorldItems {
+    pub next_id: u64,
+    pub items: Vec<spall_protocol::WorldItem>,
+}
+
+impl Default for StoredWorldItems {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            items: Vec::new(),
+        }
+    }
+}
+
 /// A coherent, immutable saved simulation snapshot at one tick, plus the
 /// journal cursor it is consistent with. Publishing this and its cursor in one
 /// DB transaction is the checkpoint-publication contract.
@@ -179,6 +196,7 @@ pub struct Checkpoint {
     /// Health of every authenticated account the world has seen, sorted by
     /// account. Unauthenticated sessions have no stable identity to key by.
     pub players: Vec<StoredPlayerHealth>,
+    pub world_items: StoredWorldItems,
     pub tick: u64,
     /// Highest journal sequence this checkpoint already includes. Recovery
     /// replays the durable journal suffix strictly after this.
@@ -732,6 +750,7 @@ mod tests {
             column_water: None,
             weather: None,
             players: Vec::new(),
+            world_items: Default::default(),
             snow: None,
             tick: 120,
             journal_cursor: 5,

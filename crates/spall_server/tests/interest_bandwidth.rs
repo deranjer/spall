@@ -75,6 +75,8 @@ fn base_config(
             residency_disk_path: None,
             creatures: None,
             creature_shape: None,
+            item_pickup: None,
+            fires: None,
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,

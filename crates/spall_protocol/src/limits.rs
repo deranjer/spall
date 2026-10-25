@@ -8,6 +8,11 @@
 /// 4-byte protocol header.
 pub const MAX_CONTROL_RECORD: usize = 64 * 1024;
 
+/// Spawns plus removals in one server->client `WorldItemUpdate` (a coarse cap:
+/// a full update still fits [`MAX_CONTROL_RECORD`]). A larger join list is
+/// split across several updates.
+pub const MAX_WORLD_ITEMS_PER_UPDATE: usize = 1024;
+
 /// Maximum bytes in one baseline bulk part payload.
 pub const MAX_BULK_PART: usize = 1024 * 1024;
 
@@ -119,3 +124,11 @@ pub(crate) fn check_count(
         Ok(())
     }
 }
+
+/// How many settled action answers the server's retry ledger keeps before it
+/// forgets the oldest. A retry older than the window is a new request.
+pub const MAX_RETAINED_ACTION_STATUSES: usize = 64 * 1024;
+
+/// How many of one player's recent request ids the server remembers, to answer
+/// a reliable retry (also after a reconnect) from the ledger.
+pub const MAX_RETAINED_REQUESTS_PER_PLAYER: usize = 1024;
