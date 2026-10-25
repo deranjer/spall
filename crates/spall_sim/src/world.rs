@@ -26,7 +26,9 @@ use spall_structure::AnchorPlane;
 use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, EvictedBricks, Volume};
 
 mod buoyancy;
+mod window_changes;
 pub use buoyancy::{BuoyancyCache, BuoyancyReport, WATER_DENSITY_KG_M3};
+use window_changes::{MAX_TERRAIN_CHANGES, TerrainChange, changes_miss_window};
 
 use crate::body::{Body, BodyKind, BodyPose};
 use crate::collider::{ColliderPlan, plan_collider};
@@ -69,45 +71,6 @@ pub enum WorldError {
     #[error("vegetation initialization: {0}")]
     VegetationInitialization(String),
 }
-
-/// A terrain collider change: the revision it produced and the world box (min, max, metres) it
-/// touched, `None` meaning anywhere.
-type TerrainChange = (u64, Option<([f64; 3], [f64; 3])>);
-
-/// Most terrain collider changes remembered for window invalidation.
-const MAX_TERRAIN_CHANGES: usize = 4096;
-
-/// Whether every terrain collider change after `built_revision` up to `current_revision` is
-/// recorded in `changes` and lies outside the collision window centred at `centre` (world
-/// metres). A change that is unrecorded, or recorded as "anywhere", or older than the log
-/// reaches, answers `false`: the window must be rebuilt.
-fn changes_miss_window(
-    changes: &VecDeque<TerrainChange>,
-    floor: u64,
-    built_revision: u64,
-    current_revision: u64,
-    centre: [f64; 3],
-) -> bool {
-    if built_revision < floor || built_revision > current_revision {
-        return false;
-    }
-    let reach = f64::from(spall_physics::WINDOW_RADIUS_M) + 1.0;
-    let mut seen = 0u64;
-    for (revision, region) in changes.iter().filter(|(r, _)| *r > built_revision) {
-        let Some((lo, hi)) = region else {
-            return false;
-        };
-        let overlaps = (0..3).all(|a| lo[a] <= centre[a] + reach && hi[a] >= centre[a] - reach);
-        if overlaps {
-            return false;
-        }
-        debug_assert!(*revision <= current_revision);
-        seen += 1;
-    }
-    // Every revision in between must have been recorded; a bump made elsewhere is unknown.
-    seen == current_revision - built_revision
-}
-
 /// A detached body being reinstated from a persisted checkpoint record.
 #[derive(Debug, Clone)]
 pub struct RestoredBody {
