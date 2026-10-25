@@ -48,8 +48,12 @@ Fire checks (ENG-266):
 - `cargo test -p sandbox --features client --test world_items` also runs a real
   QUIC fire: set down from the pack, burnt out, fed alight with E, and seen
   burning by a client joining afterwards.
-- `cargo test -p spall_client --lib body_state` checks that a nearby fire keeps
-  the presented cold off at night.
+- `cargo test -p spall_sim --lib -- warmth body_heat` checks that a winter night in the open drains
+  health while a fire, a roofed hut or an open pit prevents it, that a winter blizzard by day (noon
+  and sunrise) never hurts a dry player in the open, that a blizzard and being wet are
+  colder, that deeper water wets more, and that wetness dries, faster by a fire.
+- `cargo test -p spall_client --lib body_state` checks that the server's warmth and wetness show
+  as cold and wet looks without snapping.
 - Playtest (not automated): in the cabin with a crafted fire pit, Tab, click
   the pit: it lands lit in front, glows and lights the room; E beside it reads
   `E  Add fuel`.

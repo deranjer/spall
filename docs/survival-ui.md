@@ -17,28 +17,29 @@ edge blur and edge frost. `ScreenGrade::IDENTITY` leaves the image unchanged, an
 debug views (F4) ignore it. `GameRenderer::set_screen_grade` sets it per frame.
 
 `spall_client::body_state` drives it. This is **presentation only**: nothing is sent
-to the server or decides an outcome.
+to the server or decides an outcome. Cold, wetness and injury come from the server's
+authoritative `PlayerHealth` record (ENG-223, ENG-264/265).
 
 | State | Driven by | On screen |
 | --- | --- | --- |
-| Cold | Replicated air temperature, minus wind chill in the open and chill from being wet | Edge frost creeps in, colour drains and cools toward blue |
-| Wet | Rain or storm at the player, scaled by open sky (snow counts 30%); waist-deep water soaks within about a second; drying takes a few minutes, faster when warm | Slight dark, cool vignette and tint |
+| Cold | Lost warmth from the server (`spall_sim::warmth`): air temperature and time of day, wind chill in the open, shelter, wetness and nearby fires | Edge frost creeps in, colour drains and cools toward blue |
+| Wet | Wetness from the server: water depth over the feet (1.5 m soaks), rain without a roof (snow counts 10%); drying takes a few minutes, faster when warm or by a fire | Slight dark, cool vignette and tint |
 | Injury *(preview)* | Admin menu only until ENG-223 health lands | Colour drains, dark-red vignette with a slow, soft heartbeat (48 to 78 bpm as injury rises), slight edge blur |
 | Thirst *(preview)* | Admin menu only | Edge blur, slight desaturation |
 | Exhaustion *(preview)* | Admin menu only | Dark vignette, slight blur |
 | Hunger *(preview)* | Admin menu only | Mild desaturation only; hunger is mainly sound and hand tremble |
 
 To see the effects in a game, open the admin menu (F10). The **Body** section shows
-live cold/wet and has steppers for the preview looks. Force Snow or Blizzard weather
-to see frost build over about a minute, or swim to get soaked.
+live cold/wet and has steppers for the preview looks. Set the season to winter and force a
+Blizzard, then stand in the open to see frost build over about a minute; swim to get soaked.
 
 **Reminder icons:** any state at 70% or more also shows a tinted, hand-drawn icon in
 the lower-right corner. It fades in between 70% and 80%; the most urgent state sits
 rightmost. The icons are `crates/spall_client/assets/hud/*.png`, drawn by
 `make_icons.py` in the same folder (needs Pillow).
 
-When survival stats become server-authoritative, they replace these inputs; the
-grade mapping stays.
+Cold and wet are server-authoritative now (ENG-264/265); thirst, exhaustion and hunger will replace
+their preview inputs the same way, and the grade mapping stays.
 
 ## Built: the pack (Tab)
 

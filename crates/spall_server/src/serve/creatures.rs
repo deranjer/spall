@@ -29,7 +29,6 @@ pub(super) fn run_creatures(
     if !killed.is_empty() {
         lj.fan_out_creature_records(killed.into_wire_records(), clients_for_sim);
     }
-    publish_player_health(sim, lj, clients_for_sim);
     // Presentation frames at 20 Hz, to live sessions only, limited to
     // creatures near that session's player.
     if sim

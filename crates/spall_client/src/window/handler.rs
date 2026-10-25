@@ -1083,50 +1083,16 @@ impl ApplicationHandler for InteractiveApp {
                         if let Some(path) = self.pending_capture.take() {
                             renderer.screenshot_request = Some(path);
                         }
-                        // Body state: eased from the weather, shelter and
-                        // water the client already sees, then shown as a
+                        // Body state: the server's warmth and wetness, eased
+                        // between its once-a-second updates, then shown as a
                         // full-screen grade (presentation only).
                         let body_now = Instant::now();
                         let body_dt = self
                             .body_state_at
                             .map_or(0.0, |at| body_now.duration_since(at).as_secs_f32());
                         self.body_state_at = Some(body_now);
-                        let submerged = fresh_view.is_some_and(|v| {
-                            let [x, y, z] = v.predicted.position_m;
-                            // Waist height: wading ankle-deep does not soak you.
-                            let waist = y + 0.9;
-                            self.session
-                                .column_surface
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .surface_at_m(x, waist, z)
-                                .is_some_and(|surface| surface > waist)
-                        });
-                        let conditions = BodyConditions {
-                            air_temperature_c: self
-                                .latest_weather
-                                .as_ref()
-                                .map_or(15.0, |w| f32::from(w.temperature_centi_c) / 100.0),
-                            exposure: self.weather_exposure,
-                            precipitation: self.latest_weather.as_ref().map_or(0.0, |w| {
-                                let amount = f32::from(w.precipitation_q16) / f32::from(u16::MAX);
-                                match w.kind {
-                                    spall_protocol::WeatherKind::Rain
-                                    | spall_protocol::WeatherKind::Storm => amount,
-                                    // Snow mostly brushes off.
-                                    spall_protocol::WeatherKind::Snow
-                                    | spall_protocol::WeatherKind::Blizzard => 0.3 * amount,
-                                    _ => 0.0,
-                                }
-                            }),
-                            submerged,
-                            // Chest height, from the fires the replica holds.
-                            fire_heat_c: fresh_view.map_or(0.0, |v| {
-                                let [x, y, z] = v.predicted.position_m;
-                                spall_sim::world_items::heat_at(&self.last_fires, [x, y + 1.2, z])
-                            }),
-                        };
-                        self.body_state.advance(&conditions, body_dt);
+                        self.body_state
+                            .ease_toward(&BodyState::from_server(self.player_health), body_dt);
                         // Real injury from the server's health, or the admin
                         // preview when that is stronger.
                         let body_looks =

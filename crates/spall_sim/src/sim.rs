@@ -143,6 +143,7 @@ pub struct Simulation {
     pipeline: EditPipeline,
     journal: JournalSink,
     pub(crate) tick: Tick,
+    day_clock: spall_core::time_of_day::DayClock,
     next_control_seq: u64,
     next_damage_seq: u64,
     column_water: Option<crate::column_water::AuthoritativeColumnWater>,
@@ -214,6 +215,7 @@ impl Retiring {
     }
 }
 
+mod body_heat;
 mod construction;
 mod contact_dormancy;
 mod edit_queries;

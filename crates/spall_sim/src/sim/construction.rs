@@ -40,6 +40,7 @@ impl Simulation {
             player_health: Default::default(),
             world_items: Default::default(),
             tick: Tick::ZERO,
+            day_clock: Default::default(),
             next_control_seq: 1,
             next_damage_seq: 0,
             column_water: None,
@@ -116,6 +117,7 @@ impl Simulation {
             player_health: Default::default(),
             world_items: Default::default(),
             tick,
+            day_clock: Default::default(),
             next_control_seq: 1,
             next_damage_seq: 0,
             // Column water is installed after recovery by the caller.

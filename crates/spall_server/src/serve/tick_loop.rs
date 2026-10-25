@@ -339,6 +339,7 @@ pub(super) async fn serve_async(
     let progression_worker = progression_handler.map(ProgressionWorker::spawn);
     let committed_edit_worker = commit_handler.map(CommittedEditWorker::spawn);
 
+    let day_clock = config.server.day_clock;
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
         let setup_started = std::time::Instant::now();
         // Open the world database (T16). If it already holds a checkpoint,
@@ -371,6 +372,7 @@ pub(super) async fn serve_async(
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
+        sim.set_day_clock(day_clock);
         if creature_service.is_some() {
             if save.is_some() {
                 return SimResult::error(
@@ -1400,6 +1402,8 @@ pub(super) async fn serve_async(
             {
                 return SimResult::error(error, ticks_run);
             }
+            // Publish health after this tick's creature damage.
+            publish_player_health(&sim, &mut lj, &clients_for_sim);
             rejected_total += route_tick_statuses(&report, &mut submitted_by, &clients_for_sim);
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never
