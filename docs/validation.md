@@ -331,6 +331,8 @@ pin both cadences and prove each staged body's mass equals the sum of its
 quarter-metre voxels at the current material density. Full moving-body crush
 outcomes remain follow-up.
 
+ENG-262: clicking a compass in the open pack holds it (a screen-space dial lower right whose needle points to world north, -Z; clicking it again puts it away), and clicking a note shows a paper with the tower's compass heading from the cabin. The text comes from the game's `PackView::item_use`; the sandbox's heading is a placeholder until ENG-251 supplies the bearing. Not checked in a live window.
+
 For isolated physics UAT, `cargo xtask play --scene playground --late-join
 --client-authoritative` makes the interactive client authoritative for player
 and detached-body runtime motion. It locally releases both emitter populations,
