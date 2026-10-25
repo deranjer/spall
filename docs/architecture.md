@@ -663,8 +663,9 @@ same sky. The sandbox server sets it from `--day-minutes` (default 20) and
 sky the clients see; their per-animal bedtime stagger scales with the day (one
 Spall hour). The defaults reproduce the fixed 72,000-tick day from sunrise. The
 clock is a startup setting, not saved world state; ticks still restart on a
-server restart. A Winter Crossing scenario would use about `--day-minutes 10` to
-`12` with `--start-hour 15.5`.
+server restart. The Winter Crossing scenario (`--scenario-winter`) defaults to an
+11-minute day starting at 15.5, so a crossing spans a night; `--day-minutes` and
+`--start-hour` still override it.
 
 #### Snow and blizzard slow walking (ENG-252)
 
@@ -794,7 +795,7 @@ accepts. The sandbox's pack is the ENG-244 inventory (in memory, or the durable
 progression database with player credentials), limited to 12 distinct kinds.
 New custom worlds get items from `CustomWorld::with_world_items`; the sandbox's
 editor-scene loader reads them from `<project>/items.ron` (the cabin has a
-shovel and the note). Items are saved in checkpoints. The client draws each item
+shovel, the compass and the note). Items are saved in checkpoints. The client draws each item
 from `PackView::item_model`, tinted through `PackView::item_tints`. The sandbox
 decodes the ENG-254 `fixtures/items/assets/*.spvox` models once at startup
 (the compass with its needle), lays each on its largest face, and scales the
@@ -802,6 +803,51 @@ compass and note down to life size. A model that fails to load is logged as an
 error and drawn as `pack_view::placeholder_model` cubes. The client also labels the
 nearest one `E  Pick up <name>`, ahead of a door prompt.
 
+## Winter Crossing scenario (ENG-251)
+
+`sandbox-server --worldgen <preset> --scenario-winter` turns on the whole
+scenario: the ENG-269 weather profile and animals (see weather.md), the
+scenario's day pacing (above), and the following. Everything game-specific is in
+`sandbox::winter_crossing`; nothing is persisted (animals already need an
+ephemeral world).
+
+- **Layout** (`winter_crossing::layout`). The cabin, tower and shed are the
+  `fixtures/{cabin,tower,shed}` editor projects, loaded as
+  `editor_scene::Prefab`s without their lawn. Between terrain generation and
+  plant growth (`worldgen_scene::generate_with`), each gets a site from a
+  deterministic search of the columns: the cabin in a band near the south edge
+  (+Z, 80-92 % of the map), the tower near the north edge (6-18 %, aiming due
+  north of the cabin), the shed within 8 % of the map of the point halfway
+  between them. A site's pad (the building plus 0.75 m) must be dry, at least
+  2 m from water, clear of the border and cave mouths, and within 3 m of
+  relief; the flattest site wins, then the nearest the band's target. A band
+  with no valid site grows by half its size each way, up to three times; a
+  world with none fails to start. The pad is levelled with earth to its highest
+  ground, cleared of terrain above, ramped down 1 in 2 on every side, and kept
+  clear of plants. On `natural` seed 1 at 1 km the search and stamping take
+  about 0.5 s.
+- **Spawns and items.** Players start at the cabin's four authored starts
+  (by connection slot), so a death respawns them there too. The cabin's
+  `items.ron` (shovel, compass, note) and an axe at the shed's `axe_spawn`
+  marker are added to the world items.
+- **Rules** (`winter_crossing::rules::ScenarioRules`, an engine `TickRules`
+  installed as `HostConfig::game_tick`). After each tick the server calls the
+  game's rules with the live sessions; they may change the simulation and
+  return `GameEvent`s (protocol 26) for one session or all. The scenario sends
+  each new session the objective (with the tower heading in tenths of a degree),
+  watches `Player::deaths` (bumped by `Simulation::damage_player` on a kill) to
+  tell a player it died and to re-spawn every cabin item with nothing of its
+  kind within 1 m of its spot, and broadcasts the win the first time any
+  player's feet are in the tower's `win_zone` disc (1 m radius, 0.25 m below
+  to 1 m above the platform). A session joining after the win gets it with the
+  objective.
+- **HUD.** The interactive client queues received events on
+  `InteractiveSession::game_events` (`take_game_events`); the window drains
+  them each frame into the game's `GameHud`, which answers with an objective
+  line or a banner (`winter_crossing::hud::ScenarioHud`: "You died" for 6 s,
+  the win screen for 20 s). The same drain is where event sounds will hook in.
+  The HUD keeps the heading from the objective, and the cabin note
+  (`pack_view::note_text`) reads it from there.
 ## Tools
 
 The game's tool catalog (`ToolCatalog`) says what each tool id does, its reach

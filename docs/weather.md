@@ -375,7 +375,8 @@ play on their own `AmbienceAudio` worker, so they never evict ambience layers.
 
 `sandbox-server --worldgen <preset> --scenario-winter` selects a scenario
 profile (requires `--worldgen`; replaces `--season` and `--animals`). Without
-the flag nothing changes.
+the flag nothing changes. The flag also lays out the scenario's buildings, spawns,
+rules and pacing (architecture.md, "Winter Crossing scenario").
 
 - **Weather.** `WeatherProfile::WinterCrossing` (`spall_protocol`) runs 5-minute
   fronts (`WINTER_CROSSING_FRONT_MS`) at a fixed -8 C base whatever the clock

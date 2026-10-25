@@ -2,8 +2,8 @@
 
 A 9 x 9 m granite lookout tower (ENG-255), 22.5 m above the ground to its platform and
 about 24 m to the beacon and rail. It is the goal of the Winter Crossing
-scenario: reach the top. Not yet placed on the 1 km map (ENG-251). Play it alone
-with:
+scenario: reach the top. `--scenario-winter` places it near the north edge of
+the 1 km map (ENG-251; see architecture.md). Play it alone with:
 
 ```powershell
 cargo xtask play --editor-scene fixtures/tower
@@ -56,8 +56,8 @@ terrain effect.
 
 To place the tower elsewhere, take `translation - tower placement` (here
 `(12.5, 23.0, 10.5) - (6.0, 0.5, 6.0) = (6.5, 22.5, 4.5)` m) as the offset from
-the `tower.spvox` entity's translation and add it to the new placement. A later
-scenario ticket reads the entity by name from the scene file.
+the `tower.spvox` entity's translation and add it to the new placement. The scenario
+reads the entity by name (`editor_scene::load_prefab`).
 
 Regenerate with `cargo run -p spall_editor --example tower`; tests:
 `cargo test -p sandbox --features client --test tower`.

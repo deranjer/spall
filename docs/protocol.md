@@ -767,7 +767,7 @@ ordered control stream. The engine only carries it: the game's per-tick rules
 live session or to every live session. There is no limit beyond the record's fixed size and no
 late-join replay; a game that needs a joining player to learn earlier events sends them itself
 when the session first goes live. The Winter Crossing scenario uses it for the objective (with the
-tower heading), a player's own death, and the shared win (see `docs/winter-crossing.md`).
+tower heading), a player's own death, and the shared win (see architecture.md, "Winter Crossing scenario").
 
 ### ENG-206/208 - Ground snow and footprints
 
