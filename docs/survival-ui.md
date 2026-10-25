@@ -48,7 +48,7 @@ the camera does not move, and the world keeps running behind it. Each stack show
 the item's painted icon, a charcoal count ("×12") and its name; the stack under
 the cursor grows slightly and its name darkens. Text scales with the tarp. `Tab` or
 `Esc` packs it away again, and walking or jumping closes it. Clicking a tool (the
-shovel) puts it in hand, marked "(in hand)"; clicking it again puts it away. Left
+shovel or the axe) puts it in hand, marked "(in hand)"; clicking it again puts it away. Left
 click swings the tool in hand; empty-handed, it does nothing.
 
 - **Inventory.** The server keeps the inventory as stable item IDs. While the pack

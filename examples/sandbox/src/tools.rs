@@ -1,11 +1,14 @@
-//! The sandbox's tool rules (ENG-259, ENG-260): which player may swing which
-//! tool, what each tool does to what it strikes, and what a dig turns up.
+//! The sandbox's tool rules (ENG-259..261): which player may swing which
+//! tool, what each tool does to what it strikes, and what a dig or a chop
+//! leaves.
 //!
 //! Players start empty-handed. The hammer (the catalog's `DIG` tool) is an
 //! admin tool: the server accepts its swings only when it grants admin
 //! commands. The shovel works only from a pack that holds one: it clears thin
 //! snow off the surface, digs snow and soil fast, struggles through stone, and
-//! now and then turns up a stone.
+//! now and then turns up a stone. The axe, also from the pack, chops wood: a
+//! trunk it severs topples away from the swing, and chopping a fallen log
+//! splits it into sticks on the ground.
 
 use spall_core::MaterialId;
 use spall_server::{SwingEffect, ToolCut, ToolEffects, ToolRules, ToolStrike, ToolUse};
@@ -34,6 +37,18 @@ pub const SHOVEL_SNOW_RADIUS_M: f64 = 0.75;
 pub const SOIL_STONE_ONE_IN: u64 = 8;
 /// One stroke in this many into stone breaks a stone loose.
 pub const ROCK_STONE_ONE_IN: u64 = 2;
+/// Refusal for an axe swing without an axe in the pack.
+pub const NO_AXE: &str = "you have no axe";
+/// Refusal for an axe swing at anything but wood.
+pub const AXE_ONLY_WOOD: &str = "the axe only cuts wood";
+/// Cut radius of an axe chop: 7 cells.
+pub const AXE_RADIUS_CELLS: i64 = 1;
+/// How fast a trunk the axe severs starts to tip away from the swing.
+pub const AXE_TOPPLE_RAD_S: f32 = 0.8;
+/// Wood cells a chop must remove from a log per stick it yields.
+pub const WOOD_CELLS_PER_STICK: u64 = 2;
+/// Sticks one chop can yield at most.
+pub const MAX_STICKS_PER_CHOP: u64 = 3;
 
 /// How a shovel meets a material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +88,33 @@ fn roll(cut: &ToolCut<'_>, one_in: u64) -> bool {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     (x ^ (x >> 31)).is_multiple_of(one_in)
+}
+
+/// What an axe chop leaves: a standing trunk it severs topples away from the
+/// swing; chopping a fallen log or other loose wood turns the chopped cells
+/// into a few sticks lying where they were.
+fn chop(cut: &ToolCut<'_>) -> ToolEffects {
+    if !cut.on_body {
+        return ToolEffects {
+            topple_rad_s: AXE_TOPPLE_RAD_S,
+            ..ToolEffects::default()
+        };
+    }
+    let wood: u64 = cut
+        .removed
+        .iter()
+        .filter(|(material, _)| base_material(**material) == materials::WOOD)
+        .map(|(_, count)| count)
+        .sum();
+    let sticks = if wood == 0 {
+        0
+    } else {
+        (wood / WOOD_CELLS_PER_STICK).clamp(1, MAX_STICKS_PER_CHOP)
+    };
+    ToolEffects {
+        world_items: vec![items::STICK.0; sticks as usize],
+        ..ToolEffects::default()
+    }
 }
 
 /// The server-side rules for the sandbox's tools.
@@ -115,11 +157,20 @@ impl ToolRules for SandboxToolRules {
         match tool_use.tool {
             tool_ids::DIG if !tool_use.admin => Err(HAMMER_IS_ADMIN_ONLY),
             tool_ids::SHOVEL => self.require(tool_use, items::SHOVEL, NO_SHOVEL),
+            tool_ids::AXE => self.require(tool_use, items::AXE, NO_AXE),
             _ => Ok(()),
         }
     }
 
     fn swing(&mut self, strike: &ToolStrike) -> Result<SwingEffect, &'static str> {
+        if strike.tool == tool_ids::AXE {
+            if base_material(strike.material) != materials::WOOD {
+                return Err(AXE_ONLY_WOOD);
+            }
+            return Ok(SwingEffect::Cut {
+                radius_cells: Some(AXE_RADIUS_CELLS),
+            });
+        }
         if strike.tool != tool_ids::SHOVEL {
             return Ok(SwingEffect::Cut { radius_cells: None });
         }
@@ -138,6 +189,9 @@ impl ToolRules for SandboxToolRules {
     }
 
     fn committed(&mut self, cut: &ToolCut<'_>) -> ToolEffects {
+        if cut.tool == tool_ids::AXE {
+            return chop(cut);
+        }
         if cut.tool != tool_ids::SHOVEL {
             return ToolEffects::default();
         }
@@ -335,5 +389,74 @@ mod tests {
         let (in_pack, left) = dig(&mut rules, materials::STONE, 40);
         assert_eq!(in_pack, 0);
         assert!(left > 0, "every stone lies at the dig");
+    }
+
+    #[test]
+    fn the_axe_chops_only_wood_and_only_from_a_pack_that_holds_one() {
+        let (mut rules, inventories) = rules();
+        assert_eq!(rules.allow(&tool_use(tool_ids::AXE, true)), Err(NO_AXE));
+        inventories
+            .lock()
+            .unwrap()
+            .ensure(0)
+            .grant(items::AXE, 1)
+            .unwrap();
+        assert_eq!(rules.allow(&tool_use(tool_ids::AXE, false)), Ok(()));
+        let axe = |material, on_body| ToolStrike {
+            tool: tool_ids::AXE,
+            material,
+            on_body,
+            snow_depth_m: 0.3,
+        };
+        for on_body in [false, true] {
+            assert_eq!(
+                rules.swing(&axe(materials::WOOD, on_body)),
+                Ok(SwingEffect::Cut {
+                    radius_cells: Some(AXE_RADIUS_CELLS)
+                })
+            );
+        }
+        for not_wood in [materials::STONE, materials::DIRT, materials::SNOW] {
+            assert_eq!(rules.swing(&axe(not_wood, false)), Err(AXE_ONLY_WOOD));
+        }
+    }
+
+    fn chop_cut(removed: &BTreeMap<MaterialId, u64>, on_body: bool) -> ToolEffects {
+        chop(&ToolCut {
+            session: session(),
+            player: None,
+            tool: tool_ids::AXE,
+            request_id: RequestId(5),
+            removed,
+            on_body,
+        })
+    }
+
+    #[test]
+    fn a_severed_trunk_topples_and_a_chopped_log_turns_into_a_few_sticks() {
+        let seven = BTreeMap::from([(materials::WOOD, 7)]);
+        // Standing timber: no sticks, but whatever the chop severs topples.
+        let trunk = chop_cut(&seven, false);
+        assert_eq!(trunk.topple_rad_s, AXE_TOPPLE_RAD_S);
+        assert!(trunk.world_items.is_empty());
+        // A fallen log: a few sticks lie where the chop was, nothing topples.
+        let log = chop_cut(&seven, true);
+        assert_eq!(log.topple_rad_s, 0.0);
+        assert_eq!(log.world_items, vec![items::STICK.0; 3]);
+        let sliver = chop_cut(&BTreeMap::from([(materials::WOOD, 1)]), true);
+        assert_eq!(sliver.world_items, vec![items::STICK.0]);
+        assert!(chop_cut(&BTreeMap::new(), true).world_items.is_empty());
+        // Sticks always lie in the world, never straight into the pack.
+        let (mut rules, inventories) = rules();
+        let effects = rules.committed(&ToolCut {
+            session: session(),
+            player: None,
+            tool: tool_ids::AXE,
+            request_id: RequestId(6),
+            removed: &seven,
+            on_body: true,
+        });
+        assert_eq!(effects.world_items.len(), 3);
+        assert!(inventories.lock().unwrap().get(0).is_none());
     }
 }

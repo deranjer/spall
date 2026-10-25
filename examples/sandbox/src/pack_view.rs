@@ -129,6 +129,7 @@ impl PackView for SandboxPackView {
     fn item_tool(&self, item_id: u16) -> Option<u16> {
         match crate::game::ItemId(item_id) {
             items::SHOVEL => Some(crate::game::tool_ids::SHOVEL),
+            items::AXE => Some(crate::game::tool_ids::AXE),
             _ => None,
         }
     }

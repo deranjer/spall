@@ -678,6 +678,8 @@ pub mod tool_ids {
     pub const DOOR: u16 = 5;
     /// The shovel (ENG-260), usable only with one in the pack.
     pub const SHOVEL: u16 = 6;
+    /// The axe (ENG-261), usable only with one in the pack.
+    pub const AXE: u16 = 7;
 }
 
 fn def(id: MaterialId, name: &str, density: f32, albedo: [f32; 3]) -> MaterialDef {
@@ -991,6 +993,13 @@ pub fn tool_catalog() -> spall_server::ToolCatalog {
                 id: tool_ids::SHOVEL,
                 kind: EditKind::Cut,
                 max_radius_cells: 2,
+                reach_m: 3.0,
+            },
+            // The axe: chops wood one cell-radius at a time (`crate::tools`).
+            ToolRule {
+                id: tool_ids::AXE,
+                kind: EditKind::Cut,
+                max_radius_cells: 1,
                 reach_m: 3.0,
             },
         ],

@@ -1,8 +1,9 @@
-//! Game-ruled tool use (ENG-259, ENG-260): who may swing which tool, what a
+//! Game-ruled tool use (ENG-259..261): who may swing which tool, what a
 //! cutting tool does to the material it strikes, and what a committed tool
 //! cut leaves behind. The tool catalog says what a tool id does; these rules
 //! decide per player and per strike (an admin-only hammer, a shovel only from
-//! the pack, digging fast in dirt and slowly in stone).
+//! the pack, digging fast in dirt and slowly in stone, an axe that fells a
+//! tree away from the swing).
 use super::*;
 use spall_core::MaterialId;
 
@@ -55,10 +56,14 @@ pub struct ToolCut<'a> {
 }
 
 /// What follows a committed tool cut.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolEffects {
     /// Item kinds the server spawns as world items on the ground at the cut.
     pub world_items: Vec<u16>,
+    /// Bodies the cut split off start turning at this rate (rad/s) about the
+    /// horizontal axis that tips their top away from the swinger, so a felled
+    /// tree topples instead of dropping upright. `0` leaves them alone.
+    pub topple_rad_s: f32,
 }
 
 /// The game's tool rules. They run on the authoritative thread between
@@ -89,6 +94,8 @@ struct PendingCut {
     on_body: bool,
     /// Where the authoritative ray struck, world metres.
     point_m: [f64; 3],
+    /// The swing's horizontal heading (unit, or zero for a vertical swing).
+    heading: [f64; 2],
     tick: u64,
 }
 
@@ -248,14 +255,18 @@ pub(super) fn resolve_swing(
             tool: req.tool,
             on_body,
             point_m,
+            heading: DVec3::new(dir.x, 0.0, dir.z)
+                .try_normalize()
+                .map_or([0.0; 2], |h| [h.x, h.z]),
             tick,
         },
     );
     Ok(Swing::Edit(intent))
 }
 
-/// After a tool cut commits: lets the game award it, then spawns the world
-/// items it asks for on the ground at the cut.
+/// After a tool cut commits: lets the game award it, spawns the world items
+/// it asks for on the ground at the cut, and tips any bodies the cut split
+/// off away from the swinger.
 pub(super) fn apply_tool_effects(
     sim: &mut Simulation,
     hooks: &Option<ToolHooks>,
@@ -278,6 +289,20 @@ pub(super) fn apply_tool_effects(
         on_body: cut.on_body,
     });
     drop(hooks);
+    let [hx, hz] = cut.heading;
+    if effects.topple_rad_s > 0.0 && hx.hypot(hz) > 0.0 {
+        // Spin about up x heading: the top moves along the heading.
+        let w = f64::from(effects.topple_rad_s);
+        let spin = [hz * w, 0.0, -hx * w].map(|v| v as f32);
+        let push = [hx * w * 0.3, 0.0, hz * w * 0.3].map(|v| v as f32);
+        for entity in &committed.children {
+            if let Some(phys) = sim.world().body(*entity).map(|body| body.phys) {
+                sim.world_mut()
+                    .physics_mut()
+                    .set_body_velocity(phys, push, spin);
+            }
+        }
+    }
     let ground = ground_below(&sim.world().terrain().volume, cut.point_m);
     for (i, kind) in effects.world_items.into_iter().enumerate() {
         // A few centimetres apart, so a pile reads as several items.
@@ -403,6 +428,7 @@ mod tests {
                 } else {
                     vec![ROCK]
                 },
+                ..ToolEffects::default()
             }
         }
     }
@@ -637,5 +663,183 @@ mod tests {
         let taken = pick_up_item(&mut sim, session, &interact(3), &pickup).expect("in reach");
         assert_eq!(taken.outcome, ActionOutcome::Queued);
         assert!(!sim.world_items().any(|i| i.item_id == item.item_id));
+    }
+
+    /// Cuts terrain at radius 2 and bodies at radius 1; a committed terrain
+    /// cut topples what it split off at `0` rad/s, and a cut into a body drops
+    /// two sticks (kind 5).
+    struct Felling(f32);
+
+    impl ToolRules for Felling {
+        fn allow(&mut self, _: &ToolUse) -> Result<(), &'static str> {
+            Ok(())
+        }
+
+        fn swing(&mut self, strike: &ToolStrike) -> Result<SwingEffect, &'static str> {
+            Ok(SwingEffect::Cut {
+                radius_cells: Some(if strike.on_body { 1 } else { 2 }),
+            })
+        }
+
+        fn committed(&mut self, cut: &ToolCut<'_>) -> ToolEffects {
+            ToolEffects {
+                world_items: if cut.on_body { vec![5, 5] } else { Vec::new() },
+                topple_rad_s: if cut.on_body { 0.0 } else { self.0 },
+            }
+        }
+    }
+
+    /// A flat floor (`y 0..2` cells) with a 0.5 x 0.5 m trunk standing 4 m
+    /// tall at `x, z 10..12` (2.5..3 m), resident air above.
+    fn tree_world() -> Simulation {
+        use spall_voxel::EditPlan;
+        let mut setup = spall_sim::fixtures::flat_terrain_setup();
+        let id = setup.terrain.id();
+        for (a, b, material) in [
+            (
+                GlobalCell::new(0, 10, 0),
+                GlobalCell::new(23, 31, 23),
+                spall_core::MaterialId::AIR,
+            ),
+            (
+                GlobalCell::new(10, 2, 10),
+                GlobalCell::new(11, 17, 11),
+                spall_voxel::fixtures::STONE,
+            ),
+        ] {
+            setup
+                .terrain
+                .apply_edit(&EditPlan::filled_box(id, a, b, material))
+                .unwrap();
+        }
+        setup.terrain_collider_region = (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 31, 23));
+        Simulation::new(spall_sim::SimulationConfig::new(setup)).unwrap()
+    }
+
+    /// Fells the tree with one swing from the west (+X) under `rules`, runs
+    /// `ticks` ticks, and returns the felled body's tilt from upright, degrees.
+    fn fell(rules: Felling, ticks: u32) -> f64 {
+        let hooks = Some(ToolHooks::new(rules));
+        let mut sim = tree_world();
+        let catalog = ToolCatalog::new(
+            1,
+            [crate::ToolRule {
+                id: 7,
+                kind: EditKind::Cut,
+                max_radius_cells: 2,
+                reach_m: 3.0,
+            }],
+        )
+        .unwrap();
+        let swing = ActionRequest {
+            request_id: RequestId(9),
+            aim_origin_m: [1.0, 1.0, 2.75],
+            aim_dir: [1.0, 0.0, 0.0],
+            ..request(7, ActionKind::Cut)
+        };
+        let Ok(Swing::Edit(intent)) =
+            resolve_swing(&mut sim, sess(0, 1), None, &swing, &catalog, &hooks)
+        else {
+            panic!("a cut");
+        };
+        sim.submit(intent).unwrap();
+        let mut felled = None;
+        for _ in 0..ticks {
+            let report = sim.tick().unwrap();
+            for (rid, committed) in &report.committed {
+                apply_tool_effects(&mut sim, &hooks, *rid, committed);
+                felled = felled.or(committed.children.first().copied());
+            }
+        }
+        let body = sim
+            .world()
+            .body(felled.expect("the trunk split off"))
+            .unwrap();
+        let up = body.pose.rotation * DVec3::Y;
+        up.angle_between(DVec3::Y).to_degrees()
+    }
+
+    #[test]
+    fn an_axe_felled_trunk_topples_where_a_hammer_felled_one_drops_upright() {
+        const TICKS: u32 = 180;
+        let dropped = fell(Felling(0.0), TICKS);
+        let toppled = fell(Felling(0.8), TICKS);
+        assert!(dropped < 10.0, "hammer-felled tilt {dropped:.1} degrees");
+        assert!(toppled > 45.0, "axe-felled tilt {toppled:.1} degrees");
+        // Same binary, same swing: the same fall.
+        assert_eq!(fell(Felling(0.8), TICKS), toppled);
+    }
+
+    #[test]
+    fn chopping_a_loose_body_leaves_server_owned_sticks_on_the_ground() {
+        let hooks = Some(ToolHooks::new(Felling(0.0)));
+        let mut sim = bridge_after_cut();
+        let beam = sim
+            .world()
+            .bodies()
+            .find_map(|body| body.entity)
+            .expect("the bridge cut split the beam off");
+        // Let the beam come down, then chop it from above.
+        for _ in 0..240 {
+            sim.tick().unwrap();
+        }
+        // A beam cell (the bridge's beam spans local x 4..20 at y 8, z 1),
+        // wherever the fall left it; the body's origin is not its geometry.
+        let body = sim.world().body(beam).unwrap();
+        assert!(matches!(
+            body.volume.sample(GlobalCell::new(12, 8, 1)),
+            Ok(spall_voxel::Sample::Filled(_))
+        ));
+        let [x, y, z] = body
+            .pose
+            .xform(body.cell_size())
+            .local_cell_to_world_m(DVec3::new(12.5, 8.5, 1.5))
+            .to_array();
+        let chop = ActionRequest {
+            request_id: RequestId(11),
+            aim_origin_m: [x, y + 1.5, z],
+            aim_dir: [0.0, -1.0, 0.0],
+            claimed_target: ClaimedTarget::Body(beam),
+            ..request(7, ActionKind::Cut)
+        };
+        let catalog = ToolCatalog::new(
+            1,
+            [crate::ToolRule {
+                id: 7,
+                kind: EditKind::Cut,
+                max_radius_cells: 2,
+                reach_m: 3.0,
+            }],
+        )
+        .unwrap();
+        let swing = resolve_swing(&mut sim, sess(0, 1), None, &chop, &catalog, &hooks);
+        let Ok(Swing::Edit(intent)) = swing else {
+            panic!("a chop: {swing:?}");
+        };
+        assert_eq!(intent.target, EditTarget::Body(beam));
+        sim.submit(intent).unwrap();
+        sim.take_world_item_changes();
+        let committed = (0..120)
+            .find_map(|_| {
+                let report = sim.tick().unwrap();
+                assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+                report
+                    .committed
+                    .into_iter()
+                    .find(|(rid, _)| *rid == RequestId(11))
+            })
+            .unwrap_or_else(|| panic!("the chop commits: {:?}", sim.action_status(RequestId(11))))
+            .1;
+        apply_tool_effects(&mut sim, &hooks, RequestId(11), &committed);
+        let sticks: Vec<_> = sim.world_items().copied().collect();
+        assert_eq!(sticks.len(), 2);
+        assert!(sticks.iter().all(|s| s.kind == 5));
+        // The server allocated them and announces them like any other item.
+        let announced = sim.take_world_item_changes();
+        assert_eq!(announced[0].spawned.len(), 2);
+        for stick in &sticks {
+            assert!((stick.translation_m[0] - x).abs() < 1.0);
+            assert!(stick.translation_m[1] < y, "on the ground below the log");
+        }
     }
 }

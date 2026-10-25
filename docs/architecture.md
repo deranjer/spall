@@ -705,19 +705,31 @@ ordinary cut with a game-chosen radius, still capped by the catalog, or
 (`Simulation::clear_snow`) without cutting anything and answers `Queued` at once.
 When a tool cut commits, the tick loop hands it to `ToolRules::committed`; the
 game puts awards in its pack and returns the item kinds the server spawns as
-world items on the ground at the cut.
+world items on the ground at the cut, and optionally a topple rate: every body
+the commit split off then gets an angular velocity about the horizontal axis
+that tips its top away from the swing (plus a small push the same way), set
+once on the server's physics body, so the fall replicates like any body motion.
 
 In the sandbox, players start empty-handed. The hammer (`DIG`) is an admin tool
 (ENG-259): the server refuses its swings unless admin commands are on, and the
 client keeps it put away until the admin menu (F10, Tools) puts it in hand.
 Other tools are pack items: clicking one in the pack (Tab) puts it in hand
-(`PackView::item_tool`), and left click swings it. The shovel (ENG-260, tool 6,
+(`PackView::item_tool`), and left click swings it (the server sets the radius).
+The shovel (ENG-260, tool 6,
 reach 3 m) needs a shovel in the pack. A stroke first shovels off any thin snow
 deeper than 2 cm within 0.75 m; then it cuts snow and soil at radius 2 (33 cells,
 one stroke every 350 ms while held) and stone at radius 0 (one cell), and refuses
 wood, bedrock and built materials. One soil stroke in 8 and one stone stroke in
 2 turns up a stone (a repeatable roll per request), put in the pack or left at
 the dig when the pack is full.
+
+The axe (ENG-261, tool 7, reach 3 m) also needs one in the pack and chops only
+wood, seven cells (radius 1) a chop. A chop that severs a standing trunk makes
+the split-off tree topple away from the swing at 0.8 rad/s (a hammer-felled tree
+still drops straight); a chop into a detached wood body (a fallen log) leaves
+one stick per two wood cells removed, up to three, as world items on the ground
+below. Like any cut into a body, a chop whose brush reaches past the body's
+resident bricks is refused.
 
 A world item under more than 0.15 m of thin snow
 (`spall_sim::world_items::ITEM_BURIED_SNOW_M`) is buried: its pickup is refused
