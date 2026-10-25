@@ -598,6 +598,8 @@ pub(crate) fn prepare_geometry_with_transfer_ids(
                 material,
             })
             .collect()
+    } else if matches!(staged.kind, crate::EditKind::Replace(_)) {
+        replace_runs(vid, &staged.plan)
     } else {
         vec![TopologyOp::IntegerBrush {
             volume: vid,
@@ -1191,6 +1193,41 @@ pub const NO_TRANSFER: TransferId = TransferId(0);
 #[cfg(test)]
 #[path = "commit_review.rs"]
 mod commit_review;
+
+/// A box replacement's writes as canonical `+X` cell runs, one per row of
+/// contiguous cells of one material (the plan writes each cell once).
+fn replace_runs(volume: VolumeId, plan: &spall_voxel::EditPlan) -> Vec<TopologyOp> {
+    let cells: std::collections::BTreeMap<_, _> = plan
+        .writes
+        .iter()
+        .map(|w| ((w.cell.z, w.cell.y, w.cell.x), w.material))
+        .collect();
+    let mut runs: Vec<TopologyOp> = Vec::new();
+    for ((z, y, x), material) in cells {
+        if let Some(TopologyOp::CellRun {
+            start,
+            len,
+            material: run_material,
+            ..
+        }) = runs.last_mut()
+            && start.z == z
+            && start.y == y
+            && start.x + i64::from(*len) == x
+            && *run_material == material
+            && *len < spall_protocol::limits::MAX_CELL_RUN_LEN
+        {
+            *len += 1;
+            continue;
+        }
+        runs.push(TopologyOp::CellRun {
+            volume,
+            start: spall_core::GlobalCell::new(x, y, z),
+            len: 1,
+            material,
+        });
+    }
+    runs
+}
 
 fn check_door_clear(world: &SimWorld, door: spall_voxel::doors::Door) -> Result<(), CommitError> {
     if world.players().any(|p| {

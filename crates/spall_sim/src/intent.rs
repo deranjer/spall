@@ -6,7 +6,7 @@
 //! body that space is the body-local frame sampled at accept time
 //! (`docs/architecture.md`). The server still owns whether the intent commits.
 
-use spall_core::{MaterialId, SphereBrush};
+use spall_core::{BRUSH_UNIT, BrushPoint, GlobalCell, MaterialId, SphereBrush};
 use spall_protocol::RequestId;
 
 /// What an intent does to the target volume.
@@ -18,6 +18,9 @@ pub enum EditKind {
     Place(MaterialId),
     /// Turn a voxel door around its authored hinge.
     Door(spall_voxel::doors::DoorSpec),
+    /// Rewrite the cells of a box that hold given materials (server-authored:
+    /// winter ice forming, cracking and breaking, ENG-268).
+    Replace(BoxReplace),
 }
 
 impl EditKind {
@@ -27,7 +30,69 @@ impl EditKind {
             EditKind::Cut => MaterialId::AIR,
             EditKind::Place(m) => m,
             EditKind::Door(spec) => spec.panel,
+            EditKind::Replace(replace) => replace.to,
         }
+    }
+}
+
+/// Every cell of an axis-aligned box whose material is one of `from` becomes
+/// `to` ([`MaterialId::AIR`] in `from` matches resident air). The plan is read
+/// from the volume at staging, so it touches exactly the cells that match then;
+/// a non-resident cell never matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoxReplace {
+    /// Lowest corner of the box (terrain cells).
+    pub min: GlobalCell,
+    /// Cells along x, y and z; each at least 1.
+    pub size: [u8; 3],
+    pub from: [MaterialId; 2],
+    pub to: MaterialId,
+}
+
+impl BoxReplace {
+    /// The cells of the box that match `from` in `volume`, `+X` fastest.
+    pub fn cells(&self, volume: &spall_voxel::Volume) -> Vec<GlobalCell> {
+        let mut cells = Vec::new();
+        for dz in 0..i64::from(self.size[2]) {
+            for dy in 0..i64::from(self.size[1]) {
+                for dx in 0..i64::from(self.size[0]) {
+                    let cell = GlobalCell::new(self.min.x + dx, self.min.y + dy, self.min.z + dz);
+                    let material = match volume.sample(cell) {
+                        Ok(spall_voxel::Sample::Empty { .. }) => MaterialId::AIR,
+                        Ok(spall_voxel::Sample::Filled(m)) => m,
+                        _ => continue,
+                    };
+                    if self.from.contains(&material) && material != self.to {
+                        cells.push(cell);
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    /// The edit plan for `volume` (see [`Self::cells`]).
+    pub fn plan(&self, volume: &spall_voxel::Volume) -> spall_voxel::EditPlan {
+        let mut plan = spall_voxel::EditPlan::new(volume.id());
+        for cell in self.cells(volume) {
+            plan.set(cell, self.to);
+        }
+        plan
+    }
+
+    /// A sphere enclosing the box, for the pipeline's contention region and
+    /// residency bounds.
+    pub fn brush(&self) -> SphereBrush {
+        let half = self.size.map(|s| i64::from(s.max(1)) * BRUSH_UNIT / 2);
+        let centre = BrushPoint::from_units(
+            self.min.x * BRUSH_UNIT + half[0],
+            self.min.y * BRUSH_UNIT + half[1],
+            self.min.z * BRUSH_UNIT + half[2],
+        );
+        let radius = ((half[0].pow(2) + half[1].pow(2) + half[2].pow(2)) as f64)
+            .sqrt()
+            .ceil() as i64;
+        SphereBrush::new(centre, radius).expect("a u8-sized box fits the brush limit")
     }
 }
 

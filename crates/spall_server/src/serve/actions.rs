@@ -239,6 +239,7 @@ pub(super) fn resolve_intent_with_catalog(
         EditKind::Cut => hit.cell,
         EditKind::Place(_) => hit.placement_cell,
         EditKind::Door(_) => unreachable!("door handled above"),
+        EditKind::Replace(_) => return Err(ActionReject::ToolActionMismatch),
     };
     let h = BRUSH_UNIT / 2;
     let centre = BrushPoint::from_units(
