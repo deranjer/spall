@@ -8,6 +8,54 @@
 //! parts that are game balance: how long the season is held and where and how
 //! many animals are born.
 
+//!
+//! ENG-251 adds the scenario itself: the buildings' [`layout`], the server
+//! [`rules`] (objective, death, win) and, for the client, the [`hud`].
+
+#[cfg(feature = "client")]
+pub mod hud;
+pub mod layout;
+pub mod rules;
+
+/// Real minutes in one in-game day under the scenario: a crossing takes about
+/// a day, so it spans a full night.
+pub const DAY_MINUTES: f32 = 11.0;
+/// Hour of the day the scenario starts at: mid-afternoon, so night falls
+/// partway across.
+pub const START_HOUR: f32 = 15.5;
+
+/// Generates the world `preset`, `seed`, `size_cells` in winter with the
+/// scenario's buildings laid out in it (see [`layout`]).
+pub fn generate(
+    preset: &str,
+    seed: u64,
+    size_cells: u32,
+) -> Result<
+    (crate::worldgen_scene::GeneratedScene, layout::Layout),
+    crate::worldgen_scene::WorldgenSceneError,
+> {
+    use crate::worldgen_scene::WorldgenSceneError;
+    let buildings =
+        layout::Buildings::load(&layout::fixtures_dir()).map_err(WorldgenSceneError::Layout)?;
+    let mut laid_out = None;
+    let scene = crate::worldgen_scene::generate_with(
+        preset,
+        seed,
+        size_cells,
+        spall_ecology::living::Season::Winter,
+        |world| {
+            let (layout, kept_clear) = layout::lay_out(world, &buildings)?;
+            laid_out = Some(layout);
+            Ok(kept_clear)
+        },
+    )?;
+    let layout = laid_out.expect("the build step ran");
+    let scene = scene
+        .with_held_season(HELD_SEASON_MS)
+        .with_spawns(layout.spawns.clone());
+    Ok((scene, layout))
+}
+
 /// Length of one season under the profile: about 31 years, so a winter start
 /// stays winter for the life of any world.
 pub const HELD_SEASON_MS: u64 = 1_000_000_000_000;
