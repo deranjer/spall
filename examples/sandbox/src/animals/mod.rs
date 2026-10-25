@@ -376,6 +376,7 @@ struct Cx<'a> {
     id: u64,
     here: [f64; 3],
     tick: u64,
+    clock: spall_core::time_of_day::DayClock,
     /// The nearest player, horizontally.
     threat: Option<players::Threat>,
 }
@@ -443,12 +444,21 @@ pub struct AnimalDirector {
     crows: std::collections::HashMap<u64, birds::Crow>,
     /// Wolf packs and their shared hunt, meal and howl.
     wolves: wolves::Packs,
+    /// Day length and start hour, shared with the clients (the server day clock).
+    clock: spall_core::time_of_day::DayClock,
     last_tick: u64,
     /// Per species: (staged moves, blocked moves, walks started), logged periodically.
     stats: Vec<(u64, u64, u64)>,
 }
 
 impl AnimalDirector {
+    /// Sleep, roost and howl by this day clock instead of the default one, so
+    /// animals agree with the sky the clients draw.
+    pub fn with_day_clock(mut self, clock: spall_core::time_of_day::DayClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// `targets` is the desired count per species, in [`species`] order;
     /// species past the end of the slice get none.
     pub fn new(anchors: Vec<[f64; 3]>, targets: &[u32], seed: u64) -> Result<Self, AnimalError> {
@@ -519,6 +529,7 @@ impl AnimalDirector {
             bears: std::collections::HashMap::new(),
             crows: std::collections::HashMap::new(),
             wolves: wolves::Packs::default(),
+            clock: Default::default(),
             last_tick: 0,
             stats: vec![(0, 0, 0); count],
         })
@@ -814,6 +825,7 @@ impl CreatureDirector for AnimalDirector {
                 id,
                 here,
                 tick,
+                clock: self.clock,
                 threat: players::nearest_threat(&players, here),
             };
             let Step {

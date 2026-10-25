@@ -1041,8 +1041,27 @@ daytime moon visibility. Run
 client integration. Run the focused `spall_render` GPU renderer test to compile
 and exercise the skybox and surface-lighting shaders. Hardware presentation is
 separate; report it as unrun when no target GPU window is available. The clock
-derives from server ticks and intentionally restarts at 06:00 after a server
-restart because simulation ticks are not persisted.
+derives from server ticks and intentionally restarts at the configured start
+hour (06:00 by default) after a server restart because simulation ticks are not
+persisted.
+
+ENG-252 configurable day: `cargo test -p spall_core time_of_day::tests` also covers a
+10-minute day starting 15:30, the default clock matching the 72,000-tick day, and
+invalid clocks; `cargo test -p spall_client day_night::tests` checks the sun and
+label on that clock; `cargo test -p spall_protocol handshake::tests` checks the
+clock is validated but not compared; `cargo test -p spall_net --test transport
+client_receives_the_servers_day_clock` (loopback socket) checks the client gets the
+server's clock; `cargo test -p sandbox --lib sleep_follows_the_configured_day`
+checks the animal schedule follows it. Hands-on sky check with
+`--day-minutes 10 --start-hour 15.5` is unrun.
+
+ENG-252 snow slowdown: `cargo test -p spall_physics ground_scale` and `snow_drag::`
+cover the kernel multiplier and depth/blizzard mapping;
+`cargo test -p spall_client --test snow_prediction` accumulates real snow on a
+`spall_sim::Simulation` floor, walks the server player and a predictor fed the
+replicated snow and weather, and requires equal speeds (within 1e-3 m/s) at the
+expected reduced speed, and full speed on bare ground. Blizzard and the in-window
+feel are unit-tested/unplaytested only.
 
 ### ENG-126 larger world integration
 

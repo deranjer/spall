@@ -2,7 +2,7 @@
 //! Deer lie down and sleep at night, and a player who comes close wakes them.
 
 use sandbox::animals::{AnimalDirector, LOCOMOTION_RUN, LOCOMOTION_SLEEP};
-use spall_core::time_of_day::{DAY_CYCLE_TICKS, state_at_tick};
+use spall_core::time_of_day::{DAY_CYCLE_TICKS, DayClock};
 use spall_core::{EntityId, PLAYER_ENTITY_BASE};
 use spall_server::creature_service::{
     CreatureAction, CreatureActionOutcome, CreatureDirector, CreatureIdPlan, CreatureService,
@@ -50,7 +50,7 @@ fn deer(sim: &Simulation) -> spall_protocol::CreatureRecord {
 
 #[test]
 fn a_deer_sleeps_at_night_until_a_player_walks_up() {
-    assert!(state_at_tick(NIGHT).sun_height() < 0.0);
+    assert!(DayClock::default().state_at(NIGHT).sun_height() < 0.0);
     let mut setup = fixtures::flat_terrain_setup();
     setup.materials = sandbox::game::manifest();
     let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();

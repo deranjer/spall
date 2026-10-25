@@ -87,6 +87,8 @@ pub struct Connection {
     role: Role,
     session: SessionId,
     player_id: Option<PlayerId>,
+    /// The server day clock from its handshake reply (default on the server end).
+    pub(crate) server_day_clock: spall_core::time_of_day::DayClock,
 
     ctrl_send: Mutex<quinn::SendStream>,
     ctrl_recv: Mutex<CtrlRecv>,
@@ -150,6 +152,7 @@ impl Connection {
             role,
             session,
             player_id,
+            server_day_clock: Default::default(),
             ctrl_send: Mutex::new(ctrl_send),
             ctrl_recv: Mutex::new(CtrlRecv {
                 stream: ctrl_recv,
@@ -176,6 +179,11 @@ impl Connection {
     /// principal and must not be used for durable player-owned state.
     pub fn player_id(&self) -> Option<PlayerId> {
         self.player_id
+    }
+
+    /// The day length and start time the server announced in its handshake.
+    pub fn server_day_clock(&self) -> spall_core::time_of_day::DayClock {
+        self.server_day_clock
     }
 
     /// Server or client end.
