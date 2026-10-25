@@ -76,9 +76,18 @@ pub const fn contact_damage_config() -> spall_sim::ContactDamageConfig {
 /// (ENG-240).
 pub const BEAR_SWIPE_DAMAGE: u16 = 60;
 
-/// Health one wolf bite removes (ENG-243); a pack gives up after three bites,
-/// so a hunt alone does not kill a player at full health.
-pub const WOLF_BITE_DAMAGE: u16 = 20;
+/// Health one wolf bite removes (ENG-243, tuned down in ENG-269 from 20: nine
+/// bites kill a player at full health, not five).
+pub const WOLF_BITE_DAMAGE: u16 = 12;
+/// Bites a pack lands on a player before it gives up the hunt. One hunt takes
+/// 36 of 100 health, so a lone player survives a single wolf encounter and it
+/// takes three separate hunts to kill.
+pub const WOLF_HUNT_BITES: u32 = 3;
+
+const _: () = assert!(
+    WOLF_HUNT_BITES as u16 * WOLF_BITE_DAMAGE < spall_sim::PLAYER_MAX_HEALTH / 2
+        && spall_sim::PLAYER_MAX_HEALTH.div_ceil(WOLF_BITE_DAMAGE) >= 4
+);
 
 const _: () = assert!(
     BEAR_SWIPE_DAMAGE < spall_sim::PLAYER_MAX_HEALTH
@@ -1166,6 +1175,17 @@ pub fn spawn_loaded_voxel_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn it_takes_at_least_three_wolf_bites_to_kill_and_one_hunt_never_does() {
+        let max = spall_sim::PLAYER_MAX_HEALTH;
+        let to_kill = max.div_ceil(WOLF_BITE_DAMAGE);
+        assert!(to_kill >= 3, "{to_kill} bites kill a full-health player");
+        assert!(
+            u32::from(WOLF_BITE_DAMAGE) * WOLF_HUNT_BITES < u32::from(max),
+            "one hunt must leave a full-health player alive"
+        );
+    }
 
     #[test]
     fn two_bear_swipes_kill_a_full_health_player_and_one_does_not() {

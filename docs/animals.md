@@ -182,10 +182,11 @@ rests the pack 40 s.
 With no deer near, a hungry pack decides every 20 s whether to hunt the
 nearest player within 40 m: 20 % by day, 50 % at night. It encircles the
 player on a 12 m ring, then runs in at 7 m/s (faster than a sprint); a wolf
-within 1.6 m bites for `WOLF_BITE_DAMAGE` (20 of 100) and darts back out for
-1.5 s. The pack gives up after three bites, 20 s of running in, or a kill, and
-leaves players alone for 3 minutes. Wolves never attack a full-health player
-to death on their own.
+within 1.6 m bites for `WOLF_BITE_DAMAGE` (12 of 100) and darts back out for
+1.5 s. The pack gives up after three bites (`WOLF_HUNT_BITES`, 36 health), 20 s
+of running in, or a kill, and leaves players alone for 6 minutes. Wolves never
+attack a full-health player to death on their own: it takes nine bites, so at
+least three separate hunts.
 
 A player who comes within 8 m of any wolf (14 m sprinting) makes the pack
 react. Usually it backs away at a run for 3 s (`LOCOMOTION_SHY`, with alarm

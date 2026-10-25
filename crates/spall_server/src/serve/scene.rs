@@ -79,6 +79,7 @@ pub struct CustomWorld {
     pub(super) initial_bodies: Vec<InitialBody>,
     pub(super) dam_gate: Option<DamGate>,
     pub(super) vegetation: Option<spall_ecology::living::LivingState>,
+    pub(super) weather_profile: spall_protocol::WeatherProfile,
 }
 
 /// A dynamic body placed in a custom world when it is created: one solid box
@@ -114,6 +115,7 @@ impl CustomWorld {
             initial_bodies: Vec::new(),
             dam_gate: None,
             vegetation: None,
+            weather_profile: spall_protocol::WeatherProfile::Standard,
         }
     }
 
@@ -145,6 +147,13 @@ impl CustomWorld {
 
     pub fn with_vegetation(mut self, vegetation: spall_ecology::living::LivingState) -> Self {
         self.vegetation = Some(vegetation);
+        self
+    }
+
+    /// Chooses the seeded weather schedule (default: the four-season mix).
+    #[must_use]
+    pub fn with_weather_profile(mut self, profile: spall_protocol::WeatherProfile) -> Self {
+        self.weather_profile = profile;
         self
     }
 
@@ -294,6 +303,7 @@ impl Scene {
         // A server's tick must not wait for a lake: the fluid step has its own thread.
         sim_config.column_water_worker = true;
         sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
+        sim_config.weather_profile = custom.map_or(Default::default(), |c| c.weather_profile);
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if let Some(custom) = custom {
             for body in &custom.initial_bodies {

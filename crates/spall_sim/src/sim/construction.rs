@@ -22,6 +22,7 @@ impl Simulation {
             .map_or(0, |s| s.start_season as u8);
         let weather_season_ms = vegetation_setup.as_ref().map_or(900_000, |s| s.season_ms);
         let weather_seed = config.weather_seed;
+        let weather_profile = config.weather_profile;
         let world_span = crate::prof::Span::start("startup.world_and_collision");
         let world = SimWorld::new_with_terrain_collider_mode_and_origin(
             config.world,
@@ -60,6 +61,7 @@ impl Simulation {
             ),
             weather_dirty: true,
             weather_seed,
+            weather_profile,
             snow: crate::snow::SnowState::new(),
             snow_priority_tiles: Vec::new(),
             snow_priority_players: Vec::new(),
@@ -86,6 +88,10 @@ impl Simulation {
             simulation
                 .install_vegetation(state)
                 .map_err(crate::world::WorldError::VegetationInitialization)?;
+        }
+        if weather_profile != spall_protocol::WeatherProfile::Standard {
+            // Re-roll the opening weather under the chosen schedule.
+            simulation.set_weather_seed(weather_seed);
         }
         Ok(simulation)
     }
@@ -127,6 +133,7 @@ impl Simulation {
             ),
             weather_dirty: false,
             weather_seed: 0,
+            weather_profile: spall_protocol::WeatherProfile::Standard,
             snow: crate::snow::SnowState::new(),
             snow_priority_tiles: Vec::new(),
             snow_priority_players: Vec::new(),
@@ -158,6 +165,7 @@ impl Simulation {
             vegetation,
             mut weather,
             weather_seed,
+            weather_profile,
             snow,
             ..
         } = fresh;
@@ -188,6 +196,7 @@ impl Simulation {
         weather.world_epoch = self.weather.world_epoch.saturating_add(1);
         self.weather = weather;
         self.weather_seed = weather_seed;
+        self.weather_profile = weather_profile;
         self.weather_dirty = true;
         let old_snow = std::mem::replace(&mut self.snow, snow);
         self.motion_footprints.clear();

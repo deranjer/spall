@@ -347,6 +347,13 @@ impl GeneratedScene {
         self
     }
 
+    /// Stretches every season to `season_ms`, so the start season never ends.
+    #[must_use]
+    pub fn with_held_season(mut self, season_ms: u64) -> Self {
+        self.vegetation.season_ms = season_ms;
+        self
+    }
+
     pub fn vegetation(&self) -> &spall_ecology::living::LivingState {
         &self.vegetation
     }

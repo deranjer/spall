@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 pub const WEATHER_MAX_CLOCK_MS: u64 = 100_000_000_000_000;
 pub const WEATHER_TRANSITION_MS: u64 = 300_000;
 pub const WEATHER_PROFILE_MS: u64 = 1_800_000;
+/// Length of one weather front under [`WeatherProfile::WinterCrossing`]: a
+/// blizzard (one front) lasts about six in-game hours at the default day length.
+pub const WINTER_CROSSING_FRONT_MS: u64 = 300_000;
 /// Blizzard precipitation, 0.95 as Q0.16.
 pub const BLIZZARD_PRECIPITATION_Q16: u16 = 62_259;
 
@@ -50,6 +53,17 @@ impl SnowTier {
             SnowTier::Heavy => "heavy",
         }
     }
+}
+/// Which seeded weather schedule a world follows. Not persisted: the server
+/// chooses it at startup from its command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeatherProfile {
+    /// Four seasons of mixed 30-minute fronts.
+    #[default]
+    Standard,
+    /// Winter Crossing: always cold, 5-minute fronts, snow most of the time
+    /// (mostly the heavy tiers) and a blizzard in about one front in six.
+    WinterCrossing,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -108,16 +122,35 @@ impl WeatherState {
     /// Pure seeded 30-minute fronts with five-minute ramps. Climate follows the supplied ecology season clock;
     /// snow occurs at <=2 C. Latitude/biome modulation is deferred until climate integration.
     pub fn for_clock(seed: u64, epoch: u64, tick: u64, clock: WeatherClock, revision: u64) -> Self {
-        let bucket = clock.time_ms / WEATHER_PROFILE_MS;
+        Self::for_clock_with(WeatherProfile::Standard, seed, epoch, tick, clock, revision)
+    }
+    /// [`Self::for_clock`] under a chosen schedule.
+    pub fn for_clock_with(
+        profile: WeatherProfile,
+        seed: u64,
+        epoch: u64,
+        tick: u64,
+        clock: WeatherClock,
+        revision: u64,
+    ) -> Self {
+        let front_ms = match profile {
+            WeatherProfile::Standard => WEATHER_PROFILE_MS,
+            WeatherProfile::WinterCrossing => WINTER_CROSSING_FRONT_MS,
+        };
+        let bucket = clock.time_ms / front_ms;
         let roll = mix(seed ^ bucket.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 100;
         let season = (u64::from(clock.start_season) + clock.time_ms / clock.season_ms.max(1)) % 4;
-        let seasonal_c = match season {
-            0 => 8,
-            1 => 22,
-            2 => 10,
+        let seasonal_c = match (profile, season) {
+            (WeatherProfile::WinterCrossing, _) => -8,
+            (_, 0) => 8,
+            (_, 1) => 22,
+            (_, 2) => 10,
             _ => -8,
         };
         let (kind, precip, gust, offset) = match roll {
+            _ if profile == WeatherProfile::WinterCrossing => {
+                winter_crossing_front(seed, bucket, roll)
+            }
             0..=29 => (WeatherKind::Clear, 0, 6554, 0),
             30..=59 => (WeatherKind::Rain, 26214, 9830, 1),
             60..=69 => (WeatherKind::Storm, 58982, 39321, 1),
@@ -159,7 +192,7 @@ impl WeatherState {
             season_ms: clock.season_ms,
             weather_seed: seed,
             transition_id: bucket,
-            transition_start_ms: bucket * WEATHER_PROFILE_MS,
+            transition_start_ms: bucket * front_ms,
             transition_duration_ms: WEATHER_TRANSITION_MS as u32,
             kind,
             override_kind: None,
@@ -172,7 +205,7 @@ impl WeatherState {
             lightning_tick: if lightning_id == 0 {
                 0
             } else {
-                tick.saturating_sub((clock.time_ms % WEATHER_PROFILE_MS) * 60 / 1000)
+                tick.saturating_sub((clock.time_ms % front_ms) * 60 / 1000)
                     .max(1)
             },
         }
@@ -244,7 +277,8 @@ impl WeatherState {
             return Err(WeatherError::Invalid("clock/transition bounds"));
         }
         if self.transition_duration_ms as u64 > WEATHER_TRANSITION_MS
-            || self.transition_id != self.transition_start_ms / WEATHER_PROFILE_MS
+            || (self.transition_id != self.transition_start_ms / WEATHER_PROFILE_MS
+                && self.transition_id != self.transition_start_ms / WINTER_CROSSING_FRONT_MS)
         {
             return Err(WeatherError::Invalid("transition bounds"));
         }
@@ -255,6 +289,23 @@ impl WeatherState {
             return Err(WeatherError::Invalid("lightning pair"));
         }
         Ok(())
+    }
+}
+/// One Winter Crossing front: a blizzard on 18 of 100 rolls, snow on 67 (the
+/// heavy tier 60%, medium 30%, light 10%), then clear spells and high wind.
+fn winter_crossing_front(seed: u64, bucket: u64, roll: u64) -> (WeatherKind, u16, u16, i64) {
+    match roll {
+        0..=17 => (WeatherKind::Blizzard, BLIZZARD_PRECIPITATION_Q16, 55000, -1),
+        18..=84 => {
+            let tier = match mix(seed ^ bucket.rotate_left(29)) % 10 {
+                0 => SnowTier::Light,
+                1..=3 => SnowTier::Medium,
+                _ => SnowTier::Heavy,
+            };
+            (WeatherKind::Snow, tier.precipitation_q16(), 13107, -1)
+        }
+        85..=94 => (WeatherKind::Clear, 0, 6554, 0),
+        _ => (WeatherKind::HighWind, 0, 42000, 0),
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
