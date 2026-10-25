@@ -9,6 +9,8 @@ replay through the existing journal.
 
 World items (ENG-257, wire version 22, save version 9) use the same
 `ActionKind::Interact` request: see [World items](#eng-257---world-items).
+Fires (ENG-266, wire version 23, save version 10) are world items with fuel,
+set down with `ActionKind::PlaceItem`: see [Fires](#eng-266---fires).
 
 This is a proposed version-1 contract. T01 turns these records into tested DTOs before dependent tasks use them. User requirements: multiplayer and full-world destruction are essential.
 
@@ -737,6 +739,21 @@ Save version 9 adds the `checkpoint_world_items` row: the items and the id
 counter. Items are checkpointed, not journaled. With the durable progression
 database, a crash after a pickup but before the next checkpoint restores the
 item in the world while the pack keeps it.
+
+### ENG-266 - Fires
+
+Protocol 23 adds `WorldItem::fire_fuel_s: Option<f32>`: `Some(seconds left)` for
+a fire, lit while above zero, `Some(0.0)` for an unlit pit; it must be finite and
+not negative. A `WorldItemUpdate`'s `spawned` also carries changed items (an id
+the client holds is replaced). The server re-sends a fire when it goes out or is
+fed, not as it burns, so a client's fuel is as of that record; a join list
+carries current fuel. Protocol 23 also adds `ActionKind::PlaceItem` (3): `tool`
+is the pack item kind, `aim_dir` the view direction; the claimed origin and
+brush are ignored. The server places from its own player (see architecture) and
+answers `Queued` or `Rejected` with a reason; a success is in the admission
+ledger. `Interact` whose nearest visible item is a fire feeds it from the pack
+instead of picking it up. There is no new record or limit. Save version 10
+stores the fuel with each item, so a fire's fuel is as of the last checkpoint.
 
 ### ENG-206/208 - Ground snow and footprints
 
