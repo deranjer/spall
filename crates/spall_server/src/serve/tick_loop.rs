@@ -316,6 +316,11 @@ pub(super) async fn serve_async(
     let residency_limits = config.server.residency;
     let residency_disk_path = config.server.residency_disk_path.clone();
     let creature_service = config.server.creatures.clone();
+    let item_pickup = config
+        .server
+        .item_pickup
+        .clone()
+        .filter(|_| !dev_unvalidated_actions);
     let creature_shape = config.server.creature_shape.clone();
     let contact_damage_cfg = config.server.contact_damage;
     let contact_damage_profiles = damage_profiles;
@@ -708,6 +713,9 @@ pub(super) async fn serve_async(
                             );
                             rejected_total += 1;
                             actions_throttled += 1;
+                            continue;
+                        }
+                        if try_pick_up(&mut sim, session, &req, &item_pickup, &clients_for_sim) {
                             continue;
                         }
                         // A strike that meets a creature kills it (ENG-237).
@@ -1387,6 +1395,7 @@ pub(super) async fn serve_async(
                 }
             }
             drop(span_serve_commit_fanout);
+            publish_world_items(&mut sim, &mut lj, &clients_for_sim);
             if let Some(service) = creature_service.as_ref()
                 && let Err(error) = run_creatures(service, &mut sim, &mut lj, &clients_for_sim)
             {

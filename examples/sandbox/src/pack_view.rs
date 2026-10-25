@@ -2,7 +2,7 @@
 //! names and painted icons (`assets/items/*.png`, drawn by `make_items.py`),
 //! and the blueprint book's (B) patterns for the game's recipes.
 
-use spall_client::window::{Blueprint, BlueprintSlot, BlueprintView, PackView};
+use spall_client::window::{Blueprint, BlueprintSlot, BlueprintView, ItemVoxel, PackView};
 
 use crate::game::{RECIPE_CATALOG_VERSION, items, recipe_ids};
 
@@ -88,6 +88,10 @@ impl PackView for SandboxPackView {
             items::STONE_BLOCK => "Stone block",
             items::STICK => "Stick",
             items::FIRE_PIT => "Fire pit",
+            items::SHOVEL => "Shovel",
+            items::AXE => "Axe",
+            items::COMPASS => "Compass",
+            items::NOTE => "Note",
             _ => return None,
         })
     }
@@ -106,6 +110,53 @@ impl PackView for SandboxPackView {
 
     fn blueprints(&self) -> &[Blueprint] {
         &self.blueprints
+    }
+
+    fn item_model(&self, item_id: u16) -> &[ItemVoxel] {
+        placeholder_model(crate::game::ItemId(item_id))
+    }
+}
+
+/// A few coloured cubes per world item kind, lying flat with the origin on the
+/// ground. Stand-ins until the SPVOX item models (ENG-254) replace this one
+/// function.
+pub fn placeholder_model(item: crate::game::ItemId) -> &'static [ItemVoxel] {
+    use crate::game::materials::{DEEP_STONE, LAMP, SNOW, STONE, WOOD};
+    const fn v(center: [f32; 3], size: [f32; 3], material: spall_core::MaterialId) -> ItemVoxel {
+        ItemVoxel {
+            center,
+            size,
+            material: material.0 as u32,
+        }
+    }
+    const CLAY: spall_core::MaterialId = crate::game::materials::CLAY;
+    const SHOVEL: &[ItemVoxel] = &[
+        v([0.0, 0.03, 0.0], [0.8, 0.05, 0.05], WOOD),
+        v([-0.42, 0.03, 0.0], [0.05, 0.05, 0.14], WOOD),
+        v([0.51, 0.02, 0.0], [0.22, 0.03, 0.2], DEEP_STONE),
+    ];
+    const AXE: &[ItemVoxel] = &[
+        v([0.0, 0.03, 0.0], [0.6, 0.05, 0.05], WOOD),
+        v([0.27, 0.04, 0.05], [0.1, 0.07, 0.18], DEEP_STONE),
+    ];
+    const COMPASS: &[ItemVoxel] = &[
+        v([0.0, 0.02, 0.0], [0.12, 0.04, 0.12], CLAY),
+        v([0.0, 0.045, 0.0], [0.09, 0.01, 0.09], SNOW),
+        v([0.0, 0.052, 0.015], [0.015, 0.006, 0.05], LAMP),
+    ];
+    const NOTE: &[ItemVoxel] = &[v([0.0, 0.005, 0.0], [0.2, 0.01, 0.28], SNOW)];
+    const STICK: &[ItemVoxel] = &[v([0.0, 0.02, 0.0], [0.5, 0.04, 0.04], WOOD)];
+    const LOG: &[ItemVoxel] = &[v([0.0, 0.12, 0.0], [0.9, 0.24, 0.24], WOOD)];
+    const ROCK: &[ItemVoxel] = &[v([0.0, 0.08, 0.0], [0.2, 0.16, 0.18], STONE)];
+    match item {
+        items::SHOVEL => SHOVEL,
+        items::AXE => AXE,
+        items::COMPASS => COMPASS,
+        items::NOTE => NOTE,
+        items::STICK => STICK,
+        items::WOOD_LOG => LOG,
+        items::STONE_CHUNK => ROCK,
+        _ => &[],
     }
 }
 
@@ -133,6 +184,18 @@ mod tests {
         }
         assert_eq!(view.item_name(999), None);
         assert!(view.item_icon_png(999).is_none());
+    }
+
+    /// Every kind that can lie in the world has a name for the E prompt and a
+    /// model to draw.
+    #[test]
+    fn every_world_item_kind_has_a_name_and_a_model() {
+        let view = SandboxPackView::new();
+        for key in ["shovel", "axe", "compass", "note", "stick", "log", "stone"] {
+            let item = crate::world_items::item_by_key(key).expect(key);
+            assert!(view.item_name(item.0).is_some(), "{key}");
+            assert!(!view.item_model(item.0).is_empty(), "{key}");
+        }
     }
 
     /// Each blueprint's pattern uses exactly its server recipe's ingredients

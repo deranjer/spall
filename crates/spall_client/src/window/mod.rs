@@ -75,6 +75,7 @@ mod terrain_mesh;
 mod test_support;
 mod tools;
 mod vegetation;
+mod world_items;
 
 use self::admin_menu::*;
 use self::app::*;
@@ -94,6 +95,7 @@ pub use self::shots::*;
 pub use self::terrain_mesh::*;
 pub use self::tools::*;
 use self::vegetation::*;
+use self::world_items::*;
 
 /// Debug-view visible radius (metres) around the player's feet. This
 /// renderer walks the raw volume every rebuild (no meshing/culling beyond a

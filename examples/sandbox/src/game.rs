@@ -139,6 +139,11 @@ pub mod items {
     pub const STICK: ItemId = ItemId(5);
     /// A fire pit ready to set down (placing it is not built yet).
     pub const FIRE_PIT: ItemId = ItemId(6);
+    // Winter Crossing tools and the cabin note (ENG-257), picked up as world items.
+    pub const SHOVEL: ItemId = ItemId(7);
+    pub const AXE: ItemId = ItemId(8);
+    pub const COMPASS: ItemId = ItemId(9);
+    pub const NOTE: ItemId = ItemId(10);
 }
 
 pub mod recipe_ids {

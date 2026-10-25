@@ -287,6 +287,10 @@ fn capture_checkpoint_internal(
                 health,
             })
             .collect(),
+        world_items: {
+            let (next_id, items) = sim.world_item_state();
+            spall_store::StoredWorldItems { next_id, items }
+        },
         snow: Some(
             sim.snow_state_bytes()
                 .map_err(|_| PersistError::BadField("snow capture"))?,
@@ -832,6 +836,8 @@ pub fn restore_with_terrain_collider_mode(
             .collect(),
     )
     .map_err(|_| PersistError::BadField("player health"))?;
+    sim.restore_world_items(cp.world_items.next_id, cp.world_items.items.clone())
+        .map_err(|_| PersistError::BadField("world items"))?;
     if let Some(state) = &column_water_state {
         sim.restore_column_water(
             state,

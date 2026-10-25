@@ -16,7 +16,7 @@ use crate::StoreError;
 use crate::db::crc16;
 use crate::dto::{
     self, BrickPayload, Checkpoint, JournalPayload, JournalRecord, STORE_SCHEMA_VERSION,
-    StoredBody, StoredBrick, StoredPlayerHealth, StoredWorldMeta,
+    StoredBody, StoredBrick, StoredPlayerHealth, StoredWorldItems, StoredWorldMeta,
 };
 use crate::schema::{read_user_version, validate_schema_layout};
 
@@ -314,6 +314,7 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
         column_water: load_column_water(conn, tick)?,
         weather: load_weather(conn, tick)?,
         players: load_players(conn, tick)?,
+        world_items: load_world_items(conn, tick)?,
         snow: load_snow(conn, tick)?,
         tick: tick as u64,
         journal_cursor: journal_cursor as u64,
@@ -433,6 +434,27 @@ fn load_snow(conn: &Connection, tick: i64) -> Result<Option<Vec<u8>>, StoreError
         return Err(StoreError::Corrupt("snow checkpoint byte limit".into()));
     }
     Ok(state)
+}
+
+fn load_world_items(conn: &Connection, tick: i64) -> Result<StoredWorldItems, StoreError> {
+    let row: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT state,crc FROM checkpoint_world_items WHERE tick=?",
+            [tick],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((blob, crc)) = row else {
+        return Err(StoreError::Corrupt(
+            "world items checkpoint row missing".into(),
+        ));
+    };
+    if crc.as_slice() != crc16(&blob).as_slice() {
+        return Err(StoreError::Corrupt(
+            "world items checkpoint checksum mismatch".into(),
+        ));
+    }
+    Ok(dto::decode(&blob)?)
 }
 
 fn load_players(conn: &Connection, tick: i64) -> Result<Vec<StoredPlayerHealth>, StoreError> {

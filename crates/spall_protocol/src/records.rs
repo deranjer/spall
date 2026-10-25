@@ -58,6 +58,7 @@ pub enum WireTag {
     CreatureMotionFrame = 27,
     CreatureDespawn = 28,
     PlayerHealth = 29,
+    WorldItemUpdate = 30,
 }
 
 impl WireTag {
@@ -90,6 +91,7 @@ impl WireTag {
             27 => Self::CreatureMotionFrame,
             28 => Self::CreatureDespawn,
             29 => Self::PlayerHealth,
+            30 => Self::WorldItemUpdate,
             _ => return None,
         })
     }

@@ -48,6 +48,7 @@ use spall_voxel::{Brick, BrickHash, EditPlan, Volume};
 mod motion;
 mod replay;
 mod staged;
+mod world_items;
 use motion::*;
 pub use motion::{BodySampler, MotionTrack};
 use replay::*;
@@ -226,6 +227,8 @@ pub struct ReplicaWorld {
     snow_epoch_floor: u64,
     snow_sequence_floor: u64,
     snow_generation: u64,
+    /// Server-owned items lying in the world (ENG-257), by item id.
+    world_items: std::collections::HashMap<u64, spall_protocol::WorldItem>,
 }
 
 /// Locks a shared replica, recovering it from a panicked holder (the network
@@ -286,6 +289,7 @@ impl ReplicaWorld {
             snow_epoch_floor: 0,
             snow_sequence_floor: 0,
             snow_generation: 0,
+            world_items: Default::default(),
         }
     }
 
@@ -328,6 +332,7 @@ impl ReplicaWorld {
             snow_epoch_floor: 0,
             snow_sequence_floor: 0,
             snow_generation: 0,
+            world_items: Default::default(),
         }
     }
 
@@ -406,6 +411,7 @@ impl ReplicaWorld {
         self.tombstoned = BTreeSet::new();
         self.applied_tx = BTreeMap::new();
         self.creatures.reset();
+        self.world_items.clear();
         self.control_gate = SequenceGate::new();
         self.pending_snapshots = BTreeMap::new();
         // A fresh baseline supersedes any transaction that was held pending a

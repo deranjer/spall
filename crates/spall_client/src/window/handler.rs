@@ -249,7 +249,7 @@ impl ApplicationHandler for InteractiveApp {
                     KeyCode::KeyE
                         if held && !event.repeat && self.cursor_locked && !self.admin_menu_open =>
                     {
-                        self.door_pending = true;
+                        self.interact_pending = true;
                         return;
                     }
                     KeyCode::KeyT if held && !event.repeat => {
@@ -589,6 +589,15 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     overlay.extend_from_slice(&self.last_creature_cubes);
                 }
+                if let Some(view) = &self.pack_view {
+                    if let Some(replica) =
+                        self.session.replica.get().and_then(|r| r.try_lock().ok())
+                    {
+                        self.last_item_cubes =
+                            world_item_instances(replica.world_items(), view.as_ref());
+                    }
+                    overlay.extend_from_slice(&self.last_item_cubes);
+                }
                 let water = self
                     .session
                     .column_surface
@@ -829,27 +838,24 @@ impl ApplicationHandler for InteractiveApp {
                                 .scene
                                 .set_overlay(&renderer.device, &renderer.queue, &overlay);
                         }
-                        let nearby_door = if !self.admin_menu_open && self.fly_eye.is_none() {
+                        let prompt = if !self.admin_menu_open && self.fly_eye.is_none() {
                             cam.and_then(|(eye, _)| {
-                                self.door_spec.and_then(|spec| {
-                                    let replica = self.session.replica.get()?.try_lock().ok()?;
-                                    spall_voxel::doors::nearby_door(
-                                        replica.terrain_volume()?,
-                                        eye.to_array().map(f64::from),
-                                        spec,
-                                        3.0,
-                                    )
-                                })
+                                let replica = self.session.replica.get()?.try_lock().ok()?;
+                                interaction_prompt(
+                                    &replica,
+                                    eye.to_array().map(f64::from),
+                                    self.door_spec,
+                                    self.pack_view.as_deref(),
+                                )
                             })
                         } else {
                             None
                         };
-                        renderer.set_door(nearby_door);
-                        if self.door_pending {
-                            self.door_pending = false;
-                            if nearby_door.is_some()
-                                && let Some((eye, dir)) = cam
-                            {
+                        let prompted = prompt.is_some();
+                        renderer.set_prompt(prompt);
+                        if self.interact_pending {
+                            self.interact_pending = false;
+                            if prompted && let Some((eye, dir)) = cam {
                                 let id = self.next_action_id;
                                 self.next_action_id += 1;
                                 self.session.push_action(tool_request(

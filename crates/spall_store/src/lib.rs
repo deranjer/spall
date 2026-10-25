@@ -41,7 +41,7 @@ pub use db::{DEFAULT_MAX_BATCH_RECORDS, WalCheckpoint, Writer};
 pub use dto::{
     BrickPayload, Checkpoint, DtoError, JournalPayload, JournalRecord, MAX_STORED_BRICK_BYTES,
     OutboxRecord, STORE_SCHEMA_VERSION, StoredBody, StoredBodyKind, StoredBrick,
-    StoredPlayerHealth, StoredPose, StoredWorldMeta,
+    StoredPlayerHealth, StoredPose, StoredWorldItems, StoredWorldMeta,
 };
 pub use fault::{CrashPoint, FaultPlan};
 pub use metrics::WriteMetrics;

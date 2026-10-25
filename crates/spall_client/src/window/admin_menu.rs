@@ -22,7 +22,7 @@ pub(super) const KEYBINDS: &[(&str, &str)] = &[
         "B",
         "Blueprint book: pick a blueprint, lay its pattern on the cloth, Craft",
     ),
-    ("E", "Open / close a nearby door"),
+    ("E", "Pick up a nearby item, or open / close a door"),
     ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),

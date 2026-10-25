@@ -1914,6 +1914,9 @@ async fn run_async(
                     Ok(Some(WireRecord::CreatureDespawn(despawn))) => {
                         lock(&replica).apply_creature_despawn(&despawn);
                     }
+                    Ok(Some(WireRecord::WorldItemUpdate(update))) => {
+                        lock(&replica).apply_world_items(&update);
+                    }
                     Ok(Some(WireRecord::SnowSurfaceFrame(frame))) => {
                         if frame.effective_tick < weather_floor {
                             continue;

@@ -48,7 +48,8 @@ pub(crate) struct WorldRenderer {
     /// `debug_water_instances` is this clipped to the terrain window.
     /// The hammer crosshair and its label; `None` hides it (cursor not captured).
     crosshair: Option<CrosshairView>,
-    door: Option<spall_voxel::doors::Door>,
+    /// The E prompt: where to label and what it says.
+    prompt: Option<([f64; 3], String)>,
     /// The endurance bar; `None` while endurance is full.
     endurance: Option<EnduranceView>,
     debug_water_source: Vec<Instance>,
@@ -260,8 +261,8 @@ impl WorldRenderer {
         self.endurance = view;
     }
 
-    pub(crate) fn set_door(&mut self, door: Option<spall_voxel::doors::Door>) {
-        self.door = door;
+    pub(crate) fn set_prompt(&mut self, prompt: Option<([f64; 3], String)>) {
+        self.prompt = prompt;
     }
 
     pub(crate) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
@@ -455,7 +456,7 @@ impl WorldRenderer {
             vegetation_job: None,
             vegetation_seq: 0,
             crosshair: None,
-            door: None,
+            prompt: None,
             endurance: None,
             debug_water_source: Vec::new(),
             water_window: None,
@@ -1087,15 +1088,14 @@ impl WorldRenderer {
         if let Some(crosshair) = &self.crosshair {
             draw_crosshair(crosshair);
         }
-        if let (Some(door), Some((eye, dir))) = (self.door, cam) {
+        if let (Some((at, label)), Some((eye, dir))) = (&self.prompt, cam) {
             let camera = Camera::looking_along(
                 *eye,
                 *dir,
                 CAMERA_FOV_Y_DEG.to_radians(),
                 self.aspect.max(1e-4),
             );
-            if let Some([x, y]) =
-                camera.project(Vec3::from_array(door.center_m().map(|v| v as f32)))
+            if let Some([x, y]) = camera.project(Vec3::from_array(at.map(|v| v as f32)))
                 && x.abs() < 0.9
                 && y.abs() < 0.9
             {
@@ -1107,7 +1107,7 @@ impl WorldRenderer {
                     yakui::pad(pad, || {
                         yakui::colored_box_container(PANEL_BG.with_alpha(0.8), || {
                             yakui::pad(yakui::widgets::Pad::balanced(8.0, 5.0), || {
-                                yakui::text(18.0, if door.open { "E  Close" } else { "E  Open" });
+                                yakui::text(18.0, label.clone());
                             });
                         });
                     });

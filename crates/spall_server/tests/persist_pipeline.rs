@@ -355,6 +355,7 @@ fn dummy_checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         column_water: None,
         weather: None,
         players: Vec::new(),
+        world_items: Default::default(),
         bricks: vec![],
     }
 }
