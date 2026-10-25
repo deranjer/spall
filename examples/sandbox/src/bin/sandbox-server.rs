@@ -758,6 +758,7 @@ fn run_serve(args: Args) -> ExitCode {
             creature_shape,
             item_pickup: None,
             tool_hooks: None,
+            fires: None,
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),
@@ -842,6 +843,11 @@ fn run_serve(args: Args) -> ExitCode {
     config.server.tool_hooks = Some(spall_server::ToolHooks::new(
         sandbox::tools::SandboxToolRules::new(pack),
     ));
+    // Fire pits set down and fed from the same pack (ENG-266).
+    config.server.fires = Some(match durable_progression.clone() {
+        Some(store) => sandbox::fires::durable_fires(store),
+        None => sandbox::fires::in_memory_fires(player_inventories.clone()),
+    });
     let commit_inventories = player_inventories.clone();
     let commit_store = durable_progression.clone();
     let commit_handler: spall_server::CommittedEditHandler =

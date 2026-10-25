@@ -97,6 +97,7 @@ fn full_world_item_count_and_late_join_bytes() {
         .iter()
         .enumerate()
         .map(|(i, item)| spall_protocol::WorldItem {
+            fire_fuel_s: None,
             item_id: i as u64 + 1,
             kind: item.kind,
             translation_m: item.translation_m,

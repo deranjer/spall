@@ -316,16 +316,12 @@ pub(super) async fn serve_async(
     let residency_limits = config.server.residency;
     let residency_disk_path = config.server.residency_disk_path.clone();
     let creature_service = config.server.creatures.clone();
-    let item_pickup = config
-        .server
-        .item_pickup
-        .clone()
-        .filter(|_| !dev_unvalidated_actions);
     let tool_hooks = config
         .server
         .tool_hooks
         .clone()
         .filter(|_| !dev_unvalidated_actions);
+    let item_hooks = ItemHooks::new(&config.server, dev_unvalidated_actions);
     let creature_shape = config.server.creature_shape.clone();
     let contact_damage_cfg = config.server.contact_damage;
     let contact_damage_profiles = damage_profiles;
@@ -722,24 +718,22 @@ pub(super) async fn serve_async(
                             actions_throttled += 1;
                             continue;
                         }
-                        // From here the simulation sees the ledger id and answers
-                        // go out under `client_request_id`.
+                        // The simulation uses ledger ids; replies use client ids.
                         let client_request_id = req.request_id;
                         let mut req = req;
                         req.request_id = request_ids.assign(session, account, client_request_id);
-                        if try_pick_up(
+                        if try_use_item(
                             &mut sim,
                             session,
                             &req,
-                            &item_pickup,
+                            &item_hooks,
                             &clients_for_sim,
                             client_request_id,
                         ) {
                             continue;
                         }
-                        let principal = player_principals.get(&session.raw()).copied();
                         if let Err(refused) =
-                            permit_tool(&tool_hooks, session, principal, &req, admin_commands)
+                            permit_tool(&tool_hooks, session, account, &req, admin_commands)
                         {
                             reject(
                                 &clients_for_sim,
@@ -774,13 +768,14 @@ pub(super) async fn serve_async(
                             None => match resolve_swing(
                                 &mut sim,
                                 session,
-                                principal,
+                                account,
                                 &req,
                                 &action_catalog,
                                 &tool_hooks,
                             ) {
                                 Ok(Swing::Edit(intent)) => Ok(sim.submit(intent)),
-                                Ok(Swing::Done(status)) => {
+                                Ok(Swing::Done(mut status)) => {
+                                    status.request_id = client_request_id;
                                     send_to(
                                         &clients_for_sim,
                                         session,

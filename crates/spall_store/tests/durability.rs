@@ -191,6 +191,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
                 kind: 3,
                 translation_m: [1.5, 2.0, -3.25],
                 yaw_rad: 0.75,
+                fire_fuel_s: Some(95.5),
             }],
         },
         snow: None,

@@ -75,6 +75,10 @@ pub struct HostConfig {
     /// The game's tool rules (ENG-259): who may swing which tool. `None`:
     /// every catalog tool is open to every player.
     pub tool_hooks: Option<ToolHooks>,
+    /// The game's fire rules (ENG-266): setting a fire pit down from the pack
+    /// and feeding fires with E. `None`: fires still burn, replicate and warm,
+    /// but none can be set down or fed.
+    pub fires: Option<Fires>,
     /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
     /// damage pass. `None` keeps every prior run byte-identical (the pass is
     /// never invoked, exactly like every scene before this increment).
@@ -253,6 +257,7 @@ impl ServeConfig {
                 creature_shape: None,
                 item_pickup: None,
                 tool_hooks: None,
+                fires: None,
                 contact_damage: None,
                 dormancy: None,
                 credential_registry_file: None,

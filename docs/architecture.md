@@ -770,6 +770,32 @@ resident bricks is refused.
 A world item under more than 0.15 m of thin snow
 (`spall_sim::world_items::ITEM_BURIED_SNOW_M`) is buried: its pickup is refused
 with "buried under snow" until someone shovels the snow off it.
+Fires (ENG-266) are world items with fuel (`WorldItem::fire_fuel_s`), not
+terrain cells or a separate entity, so they reuse item replication, join lists
+and checkpoints. `Simulation::tick` burns every lit fire a second of fuel per
+second (`BLIZZARD_BURN_RATE`, 2x, for a fire with no solid cell within 8 m above
+it during a blizzard); one that runs out goes out at fuel 0 and stays as an unlit
+pit. A fire is re-announced only when it goes out or is fed, so a client's fuel
+is as of the last change. Clicking a stack in the open pack asks
+`PackView::item_use`; `ItemUse::Place` sends `ActionKind::PlaceItem` with the
+item kind. The server finds the spot with `spall_sim::world_items::fire_spot`
+from its own player's eye and the aim direction: the top face of solid ground
+the aim meets within 3 m, else the ground 1.2 m ahead, with open air over a
+0.6 m footprint 0.75 m high. Only then does the game's `FireRules::place` take
+the pit from the pack and give the starting fuel. E (`Interact`) whose nearest
+visible item is a fire calls `FireRules::refuel` (fuel from the pack) instead of
+pickup; adding fuel relights an unlit pit. Successes go in the admission ledger,
+so retries never place or feed twice. The sandbox's numbers are all in
+`sandbox::fires`: a pit starts with 180 s, a stick adds 180 s, a log 600 s (logs
+are used first), and a fire at 1800 s takes no more. Engine-side numbers (reach,
+footprint, heat, blizzard rate) are in `spall_sim::world_items`.
+`spall_sim::world_items::heat_at(items, position)` sums lit fires' warming in
+degrees of felt temperature, 30 at the centre falling as `1 - (d/4 m)^2` to 0 at 4 m; the client's
+presented cold (`body_state`) adds it from the replicated fires, and server
+warmth (ENG-264) is to call it with `Simulation::world_items`. The client draws
+a fire from `PackView::item_model` plus, while lit, `PackView::lit_model` (the
+sandbox's lamp-material glow blocks, until ENG-267), and each lit fire is a
+real-time `PointLight` competing with torch voxels for the nearest slots.
 
 Quarter-metre doors use `spall_voxel::doors` to find a visible nearby hinge and
 plan a +X-to-+Z panel turn. The hinge material records open/closed state. E sends

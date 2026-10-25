@@ -633,18 +633,24 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     overlay.extend_from_slice(&self.last_creature_cubes);
                 }
-                if let Some(view) = &self.pack_view {
-                    if let Some(replica) =
-                        self.session.replica.get().and_then(|r| r.try_lock().ok())
-                    {
+                if let Some(replica) = self.session.replica.get().and_then(|r| r.try_lock().ok()) {
+                    let fires = replica.world_items().filter(|i| i.fire_fuel_s.is_some());
+                    self.last_fires = fires.copied().collect();
+                    if let Some(view) = &self.pack_view {
+                        let eye = self.fly_eye.map(|e| e.as_dvec3().to_array()).or_else(|| {
+                            (*self.session.view.lock().unwrap_or_else(|e| e.into_inner()))
+                                .map(|v| v.predicted.position_m)
+                        });
                         self.last_item_cubes = world_item_instances(
                             replica.world_items(),
                             view.as_ref(),
                             self.item_tint_base,
+                            self.body_epoch.elapsed().as_secs_f32(),
+                            eye,
                         );
                     }
-                    overlay.extend_from_slice(&self.last_item_cubes);
                 }
+                overlay.extend_from_slice(&self.last_item_cubes);
                 let water = self
                     .session
                     .column_surface
@@ -832,6 +838,10 @@ impl ApplicationHandler for InteractiveApp {
                             renderer.scene.set_point_lights(&emitter_point_lights(
                                 &self.emitter_instances,
                                 &self.render_materials,
+                                &fire_lights(
+                                    &self.last_fires,
+                                    self.body_epoch.elapsed().as_secs_f32(),
+                                ),
                                 eye,
                             ));
                         }
@@ -925,6 +935,22 @@ impl ApplicationHandler for InteractiveApp {
                                     0,
                                 ));
                             }
+                        }
+                        // A pack item to set down (ENG-266): the server finds
+                        // the spot from its own player along this aim.
+                        if let Some(item) = self.place_pending.take()
+                            && let Some((eye, dir)) = cam
+                        {
+                            let id = self.next_action_id;
+                            self.next_action_id += 1;
+                            self.session.push_action(tool_request(
+                                id,
+                                item,
+                                spall_protocol::ActionKind::PlaceItem,
+                                eye,
+                                dir,
+                                0,
+                            ));
                         }
                         renderer.set_endurance(self.endurance_view);
                         // A held item that has left the pack is no longer in hand.
@@ -1094,6 +1120,11 @@ impl ApplicationHandler for InteractiveApp {
                                 }
                             }),
                             submerged,
+                            // Chest height, from the fires the replica holds.
+                            fire_heat_c: fresh_view.map_or(0.0, |v| {
+                                let [x, y, z] = v.predicted.position_m;
+                                spall_sim::world_items::heat_at(&self.last_fires, [x, y + 1.2, z])
+                            }),
                         };
                         self.body_state.advance(&conditions, body_dt);
                         // Real injury from the server's health, or the admin

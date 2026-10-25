@@ -35,6 +35,25 @@ World item checks (ENG-257):
 - `cargo test -p sandbox --features client --lib pack_view` checks that every
   pickup kind draws its decoded SPVOX model, hand-sized and lying flat.
 
+Fire checks (ENG-266):
+
+- `cargo test -p spall_sim --lib world_items` checks burn time per second of
+  fuel, going out once at zero, refuelling relighting, heat falloff, and where
+  a fire may rest (refused inside terrain, against a wall or out of reach).
+- `cargo test -p spall_server --lib serve::fires` checks placing from the
+  authoritative player (once per request id, refused without ground or a pit in
+  the pack) and E feeding a burnt-out fire alight.
+- `cargo test -p sandbox --lib fires progression_store` checks the sandbox's
+  fuel rules and the durable pack.
+- `cargo test -p sandbox --features client --test world_items` also runs a real
+  QUIC fire: set down from the pack, burnt out, fed alight with E, and seen
+  burning by a client joining afterwards.
+- `cargo test -p spall_client --lib body_state` checks that a nearby fire keeps
+  the presented cold off at night.
+- Playtest (not automated): in the cabin with a crafted fire pit, Tab, click
+  the pit: it lands lit in front, glows and lights the room; E beside it reads
+  `E  Add fuel`.
+
 
 Historical grid-water validation (ENG-122 closeout, water default, canal viewer, windowed comparison; removed in ENG-169): see [reports/history-validation.md](reports/history-validation.md).
 

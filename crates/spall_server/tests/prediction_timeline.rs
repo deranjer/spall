@@ -116,6 +116,7 @@ fn run_session(
             creature_shape: None,
             item_pickup: None,
             tool_hooks: None,
+            fires: None,
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,
