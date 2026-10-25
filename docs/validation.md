@@ -259,6 +259,16 @@ prediction/reconciliation acceptance is CPU tests: `cargo test -p spall_physics
 character::`, `-p spall_sim --test player_movement`, and `-p spall_client --test
 prediction` (predictor vs. a live `spall_sim::Simulation` through an injected
 100 ms link — convergence, floor-removal-no-hover, lost-button-release).
+Ladders (ENG-263) are CPU tests on the `ladder_wall` fixture
+(`spall_physics::fixtures`, a floor, a 4 m wall with a platform on top and a
+ladder column on its face): `cargo test -p spall_physics ladder::` covers
+walking in with W, climbing to and stepping onto the platform, holding with no
+input, S descending to the floor, SPACE sliding at least twice as fast, turning
+away and walking or shuffling off the side detaching, and the manifest flag;
+`cargo test -p spall_client --test ladder_prediction` runs the same climb,
+descend, slide and mount against a live `spall_sim::Simulation` and requires
+the predictor to agree on `climbing` every tick and its replayed ladder steps to
+match the server within 1 mm (same binary only). Not playtested in the window.
 ENG-69 adds interactive window input and deadline-based prediction timing. The
 mover uses a resident-terrain mutation generation instead of hashing and cloning
 the full terrain every iteration, and bounded four-step catch-up instead of a

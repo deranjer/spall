@@ -1643,23 +1643,20 @@ impl SimWorld {
                 continue;
             }
             let physics = &mut self.physics;
-            // The water over the feet (surface and current) decides whether the capsule
-            // swims; the client predicts with the same value (see predict.rs).
-            let water = water_at(
-                player.state.position_m[0],
-                player.state.position_m[1] + 0.05,
-                player.state.position_m[2],
-            );
-            player.state =
-                step_character_in_water(player.state, input, dt_s, water, |pos, desired| {
-                    let local = physics_origin
-                        .to_local_f32(pos)
-                        .expect("player stayed inside the owning physics frame")
-                        .map(f64::from);
-                    physics.sweep_character_pushing_excluding_set(
-                        params, local, desired, dt_s, base, &exclude,
-                    )
-                });
+            // The water over the feet and the ladder in reach; the client predicts with
+            // the same probes (see predict.rs).
+            let (water, ladder) =
+                player.surroundings(water_at, &self.terrain.volume, &self.materials);
+            let sweep = |pos: [f64; 3], desired: [f32; 3]| {
+                let local = physics_origin
+                    .to_local_f32(pos)
+                    .expect("player stayed inside the owning physics frame")
+                    .map(f64::from);
+                physics.sweep_character_pushing_excluding_set(
+                    params, local, desired, dt_s, base, &exclude,
+                )
+            };
+            player.state = step_character_in_water(player.state, input, dt_s, water, ladder, sweep);
 
             // Bounded-fixture safety net: a capsule that leaves the world (bad
             // input math, a floor pulled out from under it with nothing below)

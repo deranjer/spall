@@ -853,6 +853,7 @@ fn state_from_snapshot(snap: &MotionSnapshot) -> CharacterState {
         jump_held_last: false,
         endurance: snap.endurance,
         exhausted: snap.exhausted,
+        climbing: false,
     }
 }
 
@@ -2466,6 +2467,7 @@ async fn run_async(
         let terrain_cache = terrain_cache.clone();
         let interactive = config.interactive.clone();
         let client_authoritative = config.client_authoritative;
+        let climbable = spall_physics::Climbable::from_manifest(&materials);
         tokio::spawn(async move {
             // Busy time spent handling datagrams (excluding the wait for the next one),
             // logged every few seconds: an idle client was found using about 0.7 of a core.
@@ -2530,6 +2532,7 @@ async fn run_async(
                                         let mut player =
                                             PredictedPlayer::new(p.params, st, snap.server_tick);
                                         player.client_authoritative = client_authoritative;
+                                        player.set_climbable(climbable.clone());
                                         if let Some(session) = &interactive {
                                             // Swim against the water the server replicated. The
                                             // predictor samples it through its own handle: the

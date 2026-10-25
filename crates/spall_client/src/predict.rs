@@ -22,7 +22,7 @@ pub use spall_physics::WindowStats;
 use spall_physics::{
     BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterQueryCache,
     CharacterState, OccupancyGrid, PhysicsConfig, PhysicsWorld, Representation,
-    analytic_mass_properties, step_character_in_water,
+    analytic_mass_properties, ladder_contact, step_character_in_water,
 };
 use spall_protocol::InputSeq;
 use spall_voxel::{Sample, Volume};
@@ -1144,6 +1144,9 @@ pub struct PredictedPlayer {
     /// Replicated water surface the character swims against; `None` before any
     /// water has arrived. Must answer like the server's own query.
     water_surface: Option<WaterSampleFn>,
+    /// The manifest's climbable (ladder) materials; empty until set, which
+    /// climbs nothing. Must be the server's manifest's.
+    climbable: spall_physics::Climbable,
     /// Cumulative applied correction vector for presentation only. Authority,
     /// replay, collision and raw correction telemetry remain unchanged.
     pub presentation_correction_total: [f64; 3],
@@ -1239,6 +1242,7 @@ impl PredictedPlayer {
     pub fn new(params: CharacterParams, spawn: CharacterState, spawn_tick: Tick) -> Self {
         Self {
             water_surface: None,
+            climbable: spall_physics::Climbable::default(),
             presentation_correction_total: [0.; 3],
             params,
             predicted: spawn,
@@ -1272,6 +1276,12 @@ impl PredictedPlayer {
     /// [`WaterSampleFn`]); until set, the character walks as on dry land.
     pub fn set_water_surface(&mut self, water: Option<WaterSampleFn>) {
         self.water_surface = water;
+    }
+
+    /// Gives the predictor the world's climbable materials (ENG-263); until set,
+    /// ladders are plain walls to it.
+    pub fn set_climbable(&mut self, climbable: spall_physics::Climbable) {
+        self.climbable = climbable;
     }
 
     /// The surface the kernel sees for a character standing at `state`: the same
@@ -1312,9 +1322,11 @@ impl PredictedPlayer {
     ) -> CharacterState {
         let params = self.params;
         let surface = self.water_at(&self.predicted);
-        self.predicted = step_character_in_water(self.predicted, input, dt_s, surface, |p, d| {
-            phys.sweep(volume, params, p, d, dt_s)
-        });
+        let ladder = ladder_contact(volume, &self.climbable, params, self.predicted.position_m);
+        self.predicted =
+            step_character_in_water(self.predicted, input, dt_s, surface, ladder, |p, d| {
+                phys.sweep(volume, params, p, d, dt_s)
+            });
         self.history.push_back(Record {
             tick: self.next_tick,
             seq,
@@ -1464,6 +1476,9 @@ impl PredictedPlayer {
         let mut authoritative = authoritative;
         if let Some(covered) = self.history.iter().rfind(|r| r.tick <= server_tick) {
             authoritative.jump_held_last = covered.input.wants_jump();
+            // Nor whether the player is on a ladder: this client's own step of the
+            // tick is the best guess, close or not.
+            authoritative.climbing = covered.predicted_after.climbing;
             if covered.predicted_after.distance_m(&authoritative) < 0.1 {
                 authoritative.grounded = covered.predicted_after.grounded;
             }
@@ -1505,7 +1520,8 @@ impl PredictedPlayer {
                 let [x, y, z] = state.position_m;
                 w(x, y + 0.05, z)
             });
-            state = step_character_in_water(state, rec.input, dt, surface, |p, d| {
+            let ladder = ladder_contact(volume, &self.climbable, params, state.position_m);
+            state = step_character_in_water(state, rec.input, dt, surface, ladder, |p, d| {
                 phys.sweep(volume, params, p, d, dt)
             });
             rec.predicted_after = state;
