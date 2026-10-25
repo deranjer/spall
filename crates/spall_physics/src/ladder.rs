@@ -281,7 +281,7 @@ mod tests {
             let params = CharacterParams::DEFAULT;
             let ladder = ladder_contact(&self.volume, &self.climbable, params, state.position_m);
             let world = &mut self.world;
-            step_character_in_water(state, input, DT, None, ladder, |p, d| {
+            step_character_in_water(state, input, DT, None, ladder, 1.0, |p, d| {
                 world.sweep_character(params, p, d, DT)
             })
         }

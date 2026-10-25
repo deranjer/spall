@@ -573,6 +573,41 @@ impl ReplicaWorld {
             .map(|frame| frame.as_ref())
     }
 
+    /// Depth (Q16 metres) of the replicated snow on the top face of the solid
+    /// cell `ground`; 0 if none.
+    pub fn snow_depth_q16_at(&self, ground: GlobalCell) -> u16 {
+        let tile = i64::from(spall_protocol::snow::SNOW_TILE_CELLS);
+        let Ok(top_y) = i32::try_from(ground.y) else {
+            return 0;
+        };
+        let Some(frame) = self.snow_frame(
+            ground.x.div_euclid(tile) as i32,
+            ground.z.div_euclid(tile) as i32,
+            top_y,
+        ) else {
+            return 0;
+        };
+        let face = (ground.z.rem_euclid(tile) * tile + ground.x.rem_euclid(tile)) as usize;
+        frame
+            .surfaces
+            .iter()
+            .find(|surface| (surface.exposed_faces[face / 64] >> (face % 64)) & 1 == 1)
+            .map_or(0, |surface| surface.depth_q16)
+    }
+
+    /// The walk-speed multiplier for a character with its feet at `feet_m`,
+    /// from the replicated snow underfoot and the current weather: the client
+    /// half of what the server passes the character kernel
+    /// (`spall_physics::snow_speed_scale`).
+    pub fn ground_speed_scale(&self, volume: &Volume, feet_m: [f64; 3]) -> f32 {
+        let blizzard = self
+            .weather()
+            .is_some_and(|w| w.kind == spall_protocol::WeatherKind::Blizzard);
+        spall_physics::ground_cell_below(volume, feet_m).map_or(1.0, |(cell, _)| {
+            spall_physics::snow_speed_scale(self.snow_depth_q16_at(cell), blizzard)
+        })
+    }
+
     /// Changes only when an atomic snow frame or full world replacement lands.
     pub fn snow_generation(&self) -> u64 {
         self.snow_generation

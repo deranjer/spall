@@ -79,6 +79,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,
+            day_clock: Default::default(),
             custom_world: None,
         },
         harness: HarnessConfig {
@@ -207,6 +208,7 @@ fn server_persists_and_recovers_across_a_restart() {
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,
+            day_clock: Default::default(),
             custom_world: None,
         },
         harness: HarnessConfig {
@@ -344,6 +346,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,
+            day_clock: Default::default(),
             custom_world: None,
         },
         harness: HarnessConfig {

@@ -78,6 +78,7 @@ fn base_config(
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,
+            day_clock: Default::default(),
             custom_world: None,
         },
         harness: HarnessConfig {

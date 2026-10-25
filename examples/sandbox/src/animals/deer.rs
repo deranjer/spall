@@ -1,6 +1,7 @@
 //! Deer: the shared land walk, fleeing players, cropping the grass under
 //! their mouths now and then while resting, and sleeping through the night.
 
+use spall_core::time_of_day::DayClock;
 use spall_server::creature_service::CreatureAction;
 use spall_sim::Simulation;
 
@@ -19,9 +20,6 @@ const WAKE_M: f64 = 10.0;
 /// ...or a sprinting one this close. Both are inside the awake notice
 /// distance in `players.rs`, so a player can creep up on a sleeping herd.
 const WAKE_SPRINT_M: f64 = 20.0;
-/// Each deer's bedtime and wake time trail sunset and sunrise by up to this
-/// many ticks (one in-game hour), so a herd does not switch in one tick.
-const SLEEP_LAG_TICKS: u64 = 3_000;
 
 /// Deer-only states.
 #[derive(Debug, Clone, Copy)]
@@ -36,11 +34,11 @@ pub(super) enum DeerGait {
 /// Whether deer `id` sleeps at `tick`: the sun is down
 /// ([`spall_core::time_of_day`]) at a time shifted back by a per-deer lag, so
 /// bedtime and waking are staggered across a herd.
-fn sleepy(tick: u64, id: u64) -> bool {
+fn sleepy(clock: DayClock, tick: u64, id: u64) -> bool {
     let mut mix = id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     mix ^= mix >> 29;
-    let lag = mix % SLEEP_LAG_TICKS;
-    tick >= lag && spall_core::time_of_day::state_at_tick(tick - lag).sun_height() < 0.0
+    let lag = mix % clock.hour_ticks();
+    tick >= lag && clock.state_at(tick - lag).sun_height() < 0.0
 }
 
 /// Whether the nearest player is close enough to wake a sleeping deer.
@@ -72,7 +70,7 @@ pub(super) fn step(
     // Morning or a close player ends sleep; a player farther off goes
     // unnoticed. A woken deer then reacts to players like a resting one.
     if matches!(walker.gait, Gait::Deer(DeerGait::Sleep))
-        && (wakes(cx.threat) || !sleepy(tick, cx.id))
+        && (wakes(cx.threat) || !sleepy(cx.clock, tick, cx.id))
     {
         walker.gait = Gait::Rest {
             until: tick + 60 + dir.next() % 240,
@@ -82,7 +80,8 @@ pub(super) fn step(
         dir.react_to_players(walker, cx.threat, tick);
     }
     // A resting or wandering deer lies down where it is at bedtime.
-    if matches!(walker.gait, Gait::Rest { .. } | Gait::Walk { .. }) && sleepy(tick, cx.id) {
+    if matches!(walker.gait, Gait::Rest { .. } | Gait::Walk { .. }) && sleepy(cx.clock, tick, cx.id)
+    {
         walker.gait = Gait::Deer(DeerGait::Sleep);
     }
     if matches!(walker.gait, Gait::Deer(DeerGait::Sleep)) {
@@ -194,14 +193,37 @@ mod tests {
     #[test]
     fn deer_sleep_through_the_night_and_not_by_day() {
         for id in 0..200 {
-            assert!(!sleepy(at(12), id), "deer {id} asleep at noon");
             assert!(
-                !sleepy(at(8), id),
+                !sleepy(DayClock::default(), at(12), id),
+                "deer {id} asleep at noon"
+            );
+            assert!(
+                !sleepy(DayClock::default(), at(8), id),
                 "deer {id} asleep two hours after sunrise"
             );
-            assert!(sleepy(at(0), id), "deer {id} awake at midnight");
-            assert!(sleepy(at(20), id), "deer {id} awake two hours after sunset");
+            assert!(
+                sleepy(DayClock::default(), at(0), id),
+                "deer {id} awake at midnight"
+            );
+            assert!(
+                sleepy(DayClock::default(), at(20), id),
+                "deer {id} awake two hours after sunset"
+            );
         }
+    }
+
+    #[test]
+    fn sleep_follows_the_configured_day() {
+        // A 10-minute day starting at 15:30: awake at the start, asleep when
+        // the server clock reads 03:30 (half a day on), awake again by 11:30.
+        let clock = DayClock::new(36_000, 15.5).unwrap();
+        for id in 0..100 {
+            assert!(!sleepy(clock, 0, id));
+            assert!(sleepy(clock, 18_000, id), "deer {id} awake at 03:30");
+            assert!(!sleepy(clock, 30_000, id), "deer {id} asleep at 11:30");
+        }
+        // The default clock reads noon at the same tick: awake.
+        assert!(!sleepy(DayClock::default(), 18_000, 1));
     }
 
     #[test]
@@ -209,15 +231,19 @@ mod tests {
         // Half an hour after sunset (and sunrise) some deer have switched and
         // some have not.
         let half = HOUR / 2;
-        let asleep = (0..200).filter(|&id| sleepy(at(18) + half, id)).count();
+        let asleep = (0..200)
+            .filter(|&id| sleepy(DayClock::default(), at(18) + half, id))
+            .count();
         assert!(
             (20..180).contains(&asleep),
             "{asleep} of 200 asleep at 18:30"
         );
-        let still = (0..200).filter(|&id| sleepy(at(6) + half, id)).count();
+        let still = (0..200)
+            .filter(|&id| sleepy(DayClock::default(), at(6) + half, id))
+            .count();
         assert!((20..180).contains(&still), "{still} of 200 asleep at 06:30");
         // The first night has its staggered bedtime too: tick 0 is morning.
-        assert!(!sleepy(0, 1));
+        assert!(!sleepy(DayClock::default(), 0, 1));
     }
 
     #[test]

@@ -1406,6 +1406,7 @@ impl SimWorld {
         dt_s: f32,
         invalidation_boxes: &[([f64; 3], [f64; 3])],
         water_at: &dyn Fn(f64, f64, f64) -> Option<spall_physics::WaterSample>,
+        ground_scale_at: &dyn Fn(&spall_voxel::Volume, [f64; 3]) -> f32,
     ) {
         // Depenetration pass (unchanged from before ENG-69 round 18): still
         // sweeps against the real, always-current whole-terrain collider
@@ -1606,10 +1607,11 @@ impl SimWorld {
                 continue;
             }
             let physics = &mut self.physics;
-            // The water over the feet and the ladder in reach; the client predicts with
-            // the same probes (see predict.rs).
+            // The water over the feet, the ladder in reach and the snow underfoot; the
+            // client predicts with the same probes (see predict.rs).
             let (water, ladder) =
                 player.surroundings(water_at, &self.terrain.volume, &self.materials);
+            let ground_scale = ground_scale_at(&self.terrain.volume, player.state.position_m);
             let sweep = |pos: [f64; 3], desired: [f32; 3]| {
                 let local = physics_origin
                     .to_local_f32(pos)
@@ -1619,7 +1621,15 @@ impl SimWorld {
                     params, local, desired, dt_s, base, &exclude,
                 )
             };
-            player.state = step_character_in_water(player.state, input, dt_s, water, ladder, sweep);
+            player.state = step_character_in_water(
+                player.state,
+                input,
+                dt_s,
+                water,
+                ladder,
+                ground_scale,
+                sweep,
+            );
 
             // Bounded-fixture safety net: a capsule that leaves the world (bad
             // input math, a floor pulled out from under it with nothing below)
