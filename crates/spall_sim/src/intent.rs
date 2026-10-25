@@ -37,7 +37,7 @@ impl EditKind {
 
 /// Boxes one [`BoxReplace`] can carry: a freeze batches a region's boxes into
 /// one commit, since every commit has a fixed cost.
-pub const REPLACE_BOXES: usize = 8;
+const REPLACE_BOXES: usize = 8;
 /// Largest extent (cells, per axis) of the bounds of a [`BoxReplace`]'s boxes.
 const REPLACE_SPAN_CELLS: i64 = 64;
 
@@ -86,7 +86,7 @@ impl BoxReplace {
 
     /// Adds a box with the same materials, or returns false when the replace
     /// is full or the box is too far from the others.
-    pub fn try_add(&mut self, min: GlobalCell, size: [u8; 3]) -> bool {
+    fn try_add(&mut self, min: GlobalCell, size: [u8; 3]) -> bool {
         if usize::from(self.count) == REPLACE_BOXES {
             return false;
         }
@@ -113,7 +113,7 @@ impl BoxReplace {
 
     /// Adds every box of `other` (same materials), or returns false and
     /// leaves `self` unchanged when they do not all fit.
-    pub fn try_merge(&mut self, other: &BoxReplace) -> bool {
+    pub(crate) fn try_merge(&mut self, other: &BoxReplace) -> bool {
         if self.from != other.from || self.to != other.to {
             return false;
         }
