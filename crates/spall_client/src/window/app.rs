@@ -23,6 +23,14 @@ pub(super) struct InteractiveApp {
     /// The inventory the pack and book show, and the book's craft.
     pub(super) inventory: InventoryFeed,
     pub(super) pack_frame_at: Option<Instant>,
+    /// Keyboard bindings (ENG-270), loaded from the client settings file.
+    pub(super) keys: KeyBindings,
+    /// The Esc menu.
+    pub(super) esc: EscMenu,
+    /// The compass was picked from the pack and is held (ENG-262).
+    pub(super) held_compass: bool,
+    /// A note being read, its text from the game.
+    pub(super) reading_note: Option<String>,
     /// The cursor, physical pixels, for hovering items in the open pack.
     pub(super) cursor_px: Option<[f32; 2]>,
     pub(super) player_view: Option<std::sync::Arc<dyn PlayerView>>,
@@ -32,9 +40,13 @@ pub(super) struct InteractiveApp {
     pub(super) player_tint_base: u32,
     /// First render-table index of the creature view's tinted materials.
     pub(super) creature_tint_base: u32,
+    /// First render-table index of the pack view's tinted item materials.
+    pub(super) item_tint_base: u32,
     /// Last drawn creature cubes and remote players. A frame that finds the
     /// replica lock busy reuses them instead of dropping them for a frame.
     pub(super) last_creature_cubes: Vec<spall_render::CubeInstance>,
+    /// World item cubes from the last frame the replica was free (ENG-257).
+    pub(super) last_item_cubes: Vec<spall_render::CubeInstance>,
     pub(super) last_remote_players: Vec<super::options::PlayerBody>,
     /// Third-person camera distance (metres): pulled in at once when terrain
     /// is in the way, eased back out, and held when the replica is busy.
@@ -191,7 +203,8 @@ pub(super) struct InteractiveApp {
     /// `T` was pressed and the torch has not been sent yet.
     pub(super) torch_pending: bool,
     pub(super) door_spec: Option<spall_voxel::doors::DoorSpec>,
-    pub(super) door_pending: bool,
+    /// E was pressed: use the prompted item or door.
+    pub(super) interact_pending: bool,
     pub(super) last_hammer_at: Option<Instant>,
     pub(super) hammer_radius: i64,
     pub(super) next_action_id: u64,
@@ -286,12 +299,18 @@ impl InteractiveApp {
             book: Book::new(),
             inventory: InventoryFeed::new(),
             pack_frame_at: None,
+            keys: KeyBindings::load(),
+            esc: EscMenu::default(),
+            held_compass: false,
+            reading_note: None,
             cursor_px: None,
             player_view: options.player_view,
             third_person: false,
             player_tint_base: 0,
             creature_tint_base: 0,
+            item_tint_base: 0,
             last_creature_cubes: Vec::new(),
+            last_item_cubes: Vec::new(),
             last_remote_players: Vec::new(),
             third_person_distance_m: super::camera::THIRD_PERSON_DISTANCE_M,
             third_person_at: None,
@@ -390,7 +409,7 @@ impl InteractiveApp {
             hammer_held: false,
             hammer_pending: false,
             torch_pending: false,
-            door_pending: false,
+            interact_pending: false,
             door_spec: options.door,
             last_hammer_at: None,
             hammer_radius: HAMMER_RADIUS_DEFAULT,
@@ -1092,7 +1111,7 @@ impl InteractiveApp {
         self.hammer_held = false;
         self.hammer_pending = false;
         self.torch_pending = false;
-        self.door_pending = false;
+        self.interact_pending = false;
         self.held.clear_on_focus_loss(&self.session.input);
     }
 
@@ -1128,6 +1147,45 @@ impl InteractiveApp {
         self.book.close();
         self.begin_inventory_ui();
         self.pack.open();
+    }
+
+    /// A click on a stack in the open pack: hold the compass, read a note.
+    pub(super) fn use_pack_item(&mut self, item_id: u16) {
+        let Some(view) = &self.pack_view else { return };
+        match view.item_use(item_id) {
+            ItemUse::None => {}
+            ItemUse::Compass => {
+                self.held_compass = !self.held_compass;
+                self.close_pack();
+            }
+            ItemUse::Note(text) => {
+                self.close_pack();
+                self.clear_held_actions();
+                self.set_cursor_locked(false);
+                self.reading_note = Some(text);
+            }
+        }
+    }
+
+    pub(super) fn close_note(&mut self) {
+        if self.reading_note.take().is_some() {
+            self.set_cursor_locked(true);
+        }
+    }
+
+    pub(super) fn open_esc_menu(&mut self) {
+        self.clear_held_actions();
+        self.publish_movement();
+        self.esc = EscMenu {
+            open: true,
+            ..EscMenu::default()
+        };
+        self.set_cursor_locked(false);
+    }
+
+    pub(super) fn close_esc_menu(&mut self) {
+        self.esc = EscMenu::default();
+        self.set_cursor_locked(true);
     }
 
     pub(super) fn close_pack(&mut self) {

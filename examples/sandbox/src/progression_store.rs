@@ -58,6 +58,11 @@ enum ProgressionCommand {
         removed: std::collections::BTreeMap<spall_core::MaterialId, u64>,
         reply: std::sync::mpsc::SyncSender<Result<Vec<ItemStack>, ProgressionStoreError>>,
     },
+    PickUp {
+        player_id: PlayerId,
+        item: game::ItemId,
+        reply: std::sync::mpsc::SyncSender<Result<Result<(), &'static str>, ProgressionStoreError>>,
+    },
 }
 
 struct ProgressionDatabase {
@@ -263,6 +268,25 @@ impl ProgressionDatabase {
         tx.commit()?;
         Ok(drops)
     }
+
+    /// Durably puts one picked-up world item in the player's pack, or returns
+    /// the refusal (a full pack) with nothing written.
+    pub fn pick_up_item(
+        &mut self,
+        player_id: PlayerId,
+        item: game::ItemId,
+    ) -> Result<Result<(), &'static str>, ProgressionStoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut inventory = load_inventory(&tx, player_id)?;
+        let outcome = crate::world_items::put_in_pack(&mut inventory, item);
+        if outcome.is_ok() {
+            write_inventory(&tx, player_id, &inventory)?;
+        }
+        tx.commit()?;
+        Ok(outcome)
+    }
 }
 
 impl ProgressionStore {
@@ -300,6 +324,13 @@ impl ProgressionStore {
                             let _ = reply.send(
                                 database.record_committed_cut(player_id, request_id, &removed),
                             );
+                        }
+                        ProgressionCommand::PickUp {
+                            player_id,
+                            item,
+                            reply,
+                        } => {
+                            let _ = reply.send(database.pick_up_item(player_id, item));
                         }
                     }
                 }
@@ -350,6 +381,27 @@ impl ProgressionStore {
                 player_id,
                 request_id,
                 removed: removed.clone(),
+                reply,
+            })
+            .map_err(|_| ProgressionStoreError::WriterStopped)?;
+        response
+            .recv()
+            .map_err(|_| ProgressionStoreError::WriterStopped)?
+    }
+}
+
+impl ProgressionStore {
+    /// See [`ProgressionDatabase::pick_up_item`]; waits for the commit.
+    pub fn pick_up_item(
+        &self,
+        player_id: PlayerId,
+        item: game::ItemId,
+    ) -> Result<Result<(), &'static str>, ProgressionStoreError> {
+        let (reply, response) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .send(ProgressionCommand::PickUp {
+                player_id,
+                item,
                 reply,
             })
             .map_err(|_| ProgressionStoreError::WriterStopped)?;
@@ -596,6 +648,44 @@ mod tests {
         assert_eq!(inventory.count(game::items::WOOD_LOG), 0);
         assert_eq!(inventory.count(game::items::WOOD_PLANK), 4);
         assert_eq!(inventory.revision(), 2);
+    }
+
+    #[test]
+    fn a_picked_up_item_is_durable_and_a_full_pack_refuses() {
+        let path = TestDatabasePath::new();
+        {
+            let mut database = ProgressionDatabase::open(&path.0).unwrap();
+            assert_eq!(
+                database
+                    .pick_up_item(player(5), game::items::SHOVEL)
+                    .unwrap(),
+                Ok(())
+            );
+            for id in 100..100 + crate::world_items::PACK_SLOTS as u16 - 1 {
+                database
+                    .pick_up_item(player(5), game::ItemId(id))
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(
+                database
+                    .pick_up_item(player(5), game::items::NOTE)
+                    .unwrap()
+                    .is_err(),
+                "every slot holds something else"
+            );
+            // A kind already in the pack still stacks.
+            assert_eq!(
+                database
+                    .pick_up_item(player(5), game::items::SHOVEL)
+                    .unwrap(),
+                Ok(())
+            );
+        }
+        let database = ProgressionDatabase::open(&path.0).unwrap();
+        let inventory = database.load_inventory(player(5)).unwrap();
+        assert_eq!(inventory.count(game::items::SHOVEL), 2);
+        assert_eq!(inventory.count(game::items::NOTE), 0);
     }
 
     #[test]

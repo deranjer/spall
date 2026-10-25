@@ -628,6 +628,7 @@ mod tests {
             column_water: None,
             weather: None,
             players: Vec::new(),
+            world_items: Default::default(),
             bricks: vec![],
         }
     }

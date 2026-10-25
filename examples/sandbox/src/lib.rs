@@ -20,6 +20,8 @@ pub mod pack_view;
 #[cfg(feature = "client")]
 pub mod player_view;
 pub mod progression_store;
+pub mod world_items;
+pub mod world_scatter;
 pub mod worldgen_scene;
 
 pub fn init_tracing() {

@@ -1,0 +1,7 @@
+// World items a new cabin world starts with (ENG-257), read by the sandbox's
+// editor-scene loader. Positions are metres; an item rests on the surface at
+// its translation. Keys: shovel, axe, compass, note, stick, log, stone.
+[
+    (kind: "shovel", translation: (8.0, 1.0, 9.5), yaw_degrees: 30.0),
+    (kind: "note", translation: (12.5, 2.0, 13.0), yaw_degrees: -10.0),
+]

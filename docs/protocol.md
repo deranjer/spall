@@ -1,11 +1,14 @@
 # Multiplayer, persistence, and recovery contract
 
-Cabin doors use `ActionKind::Interact` in the existing `ActionRequest` (wire
-version 22). The sandbox door tool is 5. The server ignores claimed aim for this
+Cabin doors use `ActionKind::Interact` in the existing `ActionRequest`. The
+sandbox door tool is 5. The server ignores claimed aim for this
 tool and requires a visible door within 3 m of the authoritative player's eye.
 Request deduplication and ordinary topology transactions carry the turn; no
 separate door-state record exists. Hinge materials and panel cell runs also
-replay through the existing journal. The save version is unchanged.
+replay through the existing journal.
+
+World items (ENG-257, wire version 23, save version 9) use the same
+`ActionKind::Interact` request: see [World items](#eng-257---world-items).
 
 This is a proposed version-1 contract. T01 turns these records into tested DTOs before dependent tasks use them. User requirements: multiplayer and full-world destruction are essential.
 
@@ -188,7 +191,7 @@ Canonical topology hashes include sorted volume IDs, cell-size codes, brick coor
 ## Transaction application
 
 1. Server constructs a complete transaction against specific input revisions. All source changes, children, mass/pose metadata, and required server collision updates are ready before commit.
-2. Server commits once at a tick boundary and journals the complete authoritative result. Once an action has passed authoritative validation and entered admission, repeated ActionRequest IDs return its stored `Queued`, `Committed`, or deterministic staging/commit `Rejected` status and cannot perform another cut. The replay lookup occurs before re-validating the wire claim, so a reconnect can recover a committed result even after that edit changed the ray target. Pre-admission validation and rate-limit refusals are not admitted actions: they do not reserve a request ID, and a corrected retry remains a new request for admission.
+2. Server commits once at a tick boundary and journals the complete authoritative result. Once an action has passed authoritative validation and entered admission, repeated ActionRequest IDs return its stored `Queued`, `Committed`, or deterministic staging/commit `Rejected` status and cannot perform another cut. The replay lookup occurs before re-validating the wire claim, so a reconnect can recover a committed result even after that edit changed the ray target. Pre-admission validation and rate-limit refusals are not admitted actions: they do not reserve a request ID, and a corrected retry remains a new request for admission. The ledger is per player, not per connection or global: request IDs are chosen by clients and every client counts from the same base, so the server keys the answer by the authenticated account (or the transport slot when the session has none) plus the client's request ID. That identity survives a reconnect, so a retry on a replacement session replays the original answer, while another player's identical ID is a separate request. The server remembers the last `MAX_RETAINED_REQUESTS_PER_PLAYER` IDs per player and the last `MAX_RETAINED_ACTION_STATUSES` settled answers overall; a retry older than that window is a new request.
 3. Client stages all parts and checks source revisions, IDs, length limits, and hashes. It applies operations in the encoded order into a candidate replica.
 4. Publish the candidate only when the whole transaction validates. Retain the previous consistent replica while dependencies or derived client collision data are pending. Local visual feedback may show a pending action but must not change authoritative replica geometry.
 5. Duplicate transactions are ignored using session/stream sequencing and IDs. Unexpected source revisions trigger bounded repair, not guessed replay. A failed candidate cannot partly replace live state.
@@ -315,8 +318,8 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 22): one wire version for the handshake and every record, bumped on
-any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 8, defined in
+`PROTOCOL_VERSION` (currently 23): one wire version for the handshake and every record, bumped on
+any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 9, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
 
@@ -701,6 +704,39 @@ bump). Save version 8 adds the `checkpoint_players` row: the health of every aut
 account (`PlayerId`) the world has seen. Unauthenticated sessions have no stable identity and
 always start at full health. Health is checkpointed, not journaled, so a crash can lose health
 changes since the last checkpoint.
+
+### ENG-257 - World items
+
+A world item is a server-owned thing lying in the world: a stable `item_id`
+(`u64`, assigned by the server, never reused in a world and never an ECS id), a
+game item `kind` (`u16`, the same id as `InventoryEntry::item_id`), and a pose
+(`translation_m`, `yaw_rad`). Protocol 23 adds `WorldItemUpdate` tag 30
+(`spawned: Vec<WorldItem>`, `removed: Vec<u64>`), server to client on the
+ordered control stream. Spawns plus removals are capped at
+`limits::MAX_WORLD_ITEMS_PER_UPDATE` (1024) per record; a larger set is split.
+Changes made during a tick go out after that tick's commits. A joining client
+gets every item that exists at its baseline capture as spawns, queued after the
+baseline and ahead of later updates; a new baseline clears the replica's items,
+and applying a repeated spawn or an unknown removal is harmless.
+
+There is no new client record. `ActionKind::Interact` first picks up the nearest
+item within 3 m of the server's own player eye with no terrain in the way
+(`spall_sim::world_items::nearest_visible_item`); the claimed aim and tool are
+ignored. Only if no item qualifies does the request continue to the door path.
+The game's pack callback (`HostConfig::item_pickup`) runs on the owning thread:
+on success the item leaves the world and the status is `Queued`; on refusal
+(the sandbox's full 12-slot pack) the status is `Rejected` with the game's
+reason and the item stays. Requests are serial, so an item reaches one pack.
+A successful pickup's `Queued` goes in the simulation's admission ledger, the
+one edit and door retries replay from (`Simulation::action_status`). A retry
+with the same request id is therefore answered from there and never reaches a
+door beside the item. That ledger is keyed by request id alone, as it is for
+edits and doors, so it also covers a reconnect retry on a new session.
+
+Save version 9 adds the `checkpoint_world_items` row: the items and the id
+counter. Items are checkpointed, not journaled. With the durable progression
+database, a crash after a pickup but before the next checkpoint restores the
+item in the world while the pack keeps it.
 
 ### ENG-206/208 - Ground snow and footprints
 

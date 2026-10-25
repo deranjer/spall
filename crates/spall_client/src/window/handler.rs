@@ -97,7 +97,27 @@ impl ApplicationHandler for InteractiveApp {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if !self.cursor_locked && !ui_consumed && !self.inventory_ui_open() => {
+            } if self.reading_note.is_some() => {
+                self.close_note();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if self.pack.is_open() && !ui_consumed => {
+                if let Some(item) = self.pack.hovered_item() {
+                    self.use_pack_item(item);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if !self.cursor_locked
+                && !ui_consumed
+                && !self.inventory_ui_open()
+                && !self.esc.open =>
+            {
                 self.set_cursor_locked(true);
             }
             WindowEvent::MouseInput {
@@ -135,72 +155,99 @@ impl ApplicationHandler for InteractiveApp {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
-                // Yakui sinks Tab for its focus navigation even with no
-                // widget focused; Tab is the pack's key.
-                if ui_consumed && code != KeyCode::Tab {
+                let held = event.state == ElementState::Pressed;
+                let fresh = held && !event.repeat;
+                // The Esc menu owns the keyboard: the next key rebinds the
+                // action being edited, and Esc closes the menu.
+                if self.esc.open {
+                    if fresh {
+                        if self.esc.capturing.is_some() {
+                            if self.esc.capture(&mut self.keys, code) {
+                                self.keys.save();
+                            }
+                        } else if code == KeyCode::Escape {
+                            self.close_esc_menu();
+                        }
+                    }
                     return;
                 }
-                let held = event.state == ElementState::Pressed;
-                // Tab or Esc packs up; walking or jumping gets going.
-                if held
-                    && !event.repeat
-                    && self.pack.is_open()
-                    && matches!(
-                        code,
-                        KeyCode::Tab
-                            | KeyCode::Escape
-                            | KeyCode::KeyW
-                            | KeyCode::KeyA
-                            | KeyCode::KeyS
-                            | KeyCode::KeyD
-                            | KeyCode::Space
+                let action = self.keys.action_for(code);
+                // Yakui sinks Tab for its focus navigation even with no
+                // widget focused; Tab is the pack's key.
+                if ui_consumed && action != Some(Action::Pack) {
+                    return;
+                }
+                let walking = matches!(
+                    action,
+                    Some(
+                        Action::Forward
+                            | Action::Back
+                            | Action::Left
+                            | Action::Right
+                            | Action::Jump
                     )
+                );
+                // Esc or any walking key puts a note away.
+                if self.reading_note.is_some() {
+                    if fresh
+                        && (code == KeyCode::Escape || walking || action == Some(Action::Interact))
+                    {
+                        self.close_note();
+                    }
+                    return;
+                }
+                // The pack key or Esc packs up; walking or jumping gets going.
+                if fresh
+                    && self.pack.is_open()
+                    && (code == KeyCode::Escape || action == Some(Action::Pack) || walking)
                 {
                     self.close_pack();
-                    if matches!(code, KeyCode::Tab | KeyCode::Escape) {
+                    if code == KeyCode::Escape || action == Some(Action::Pack) {
                         return;
                     }
                 }
-                // B or Esc closes the book; Tab swaps to the pack; walking
-                // or jumping gets going.
-                if held
-                    && !event.repeat
+                // The book key or Esc closes the book; walking or jumping
+                // gets going.
+                if fresh
                     && self.book.is_open()
-                    && matches!(
-                        code,
-                        KeyCode::KeyB
-                            | KeyCode::Escape
-                            | KeyCode::KeyW
-                            | KeyCode::KeyA
-                            | KeyCode::KeyS
-                            | KeyCode::KeyD
-                            | KeyCode::Space
-                    )
+                    && (code == KeyCode::Escape || action == Some(Action::Book) || walking)
                 {
                     self.close_book();
-                    if matches!(code, KeyCode::KeyB | KeyCode::Escape) {
+                    if code == KeyCode::Escape || action == Some(Action::Book) {
                         return;
                     }
                 }
-                match code {
-                    KeyCode::KeyW => self.held.forward = held,
-                    KeyCode::KeyS => self.held.back = held,
-                    KeyCode::KeyA => self.held.left = held,
-                    KeyCode::KeyD => self.held.right = held,
-                    KeyCode::Space => {
+                // Esc: close the admin menu, else open the Esc menu.
+                if code == KeyCode::Escape {
+                    if fresh {
+                        if self.admin_menu_open {
+                            self.admin_menu_open = false;
+                        } else {
+                            self.open_esc_menu();
+                        }
+                    }
+                    return;
+                }
+                let Some(action) = action else { return };
+                match action {
+                    Action::Forward => self.held.forward = held,
+                    Action::Back => self.held.back = held,
+                    Action::Left => self.held.left = held,
+                    Action::Right => self.held.right = held,
+                    Action::Jump => {
                         self.held.jump = held;
                         if self.fly_eye.is_none() {
                             self.session.input.set_button(BUTTON_JUMP, held);
                         }
                     }
-                    KeyCode::ControlLeft | KeyCode::ControlRight => self.held.descend = held,
-                    KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                    Action::Descend => self.held.descend = held,
+                    Action::Sprint => {
                         self.held.fast = held;
                         if self.fly_eye.is_none() {
                             self.session.input.set_button(BUTTON_SPRINT, held);
                         }
                     }
-                    KeyCode::F8 if held && !event.repeat => {
+                    Action::ThirdPerson if fresh => {
                         if self.player_view.is_some() {
                             self.third_person = !self.third_person;
                             println!(
@@ -210,7 +257,7 @@ impl ApplicationHandler for InteractiveApp {
                         }
                         return;
                     }
-                    KeyCode::F12 if held && !event.repeat => {
+                    Action::Screenshot if fresh => {
                         let stamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |d| d.as_millis());
@@ -219,47 +266,42 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         return;
                     }
-                    KeyCode::F9 if held && !event.repeat => {
+                    Action::CopyReport if fresh => {
                         self.copy_report_key = true;
                         return;
                     }
-                    KeyCode::F10 if held && !event.repeat => {
+                    Action::AdminMenu if fresh => {
                         self.admin_menu_open = !self.admin_menu_open;
                         if self.admin_menu_open {
                             self.set_cursor_locked(false);
                         }
                         return;
                     }
-                    KeyCode::KeyF if held && !event.repeat => {
+                    Action::Flight if fresh => {
                         self.toggle_flight();
                         return;
                     }
-                    KeyCode::KeyR if held && !event.repeat => {
+                    Action::Recentre if fresh => {
                         self.recentre_view();
                         return;
                     }
-                    KeyCode::Tab if held && !event.repeat => {
+                    Action::Pack if fresh => {
                         self.open_pack();
                         return;
                     }
-                    KeyCode::KeyB if held && !event.repeat => {
+                    Action::Book if fresh => {
                         self.open_book();
                         return;
                     }
-                    KeyCode::KeyE
-                        if held && !event.repeat && self.cursor_locked && !self.admin_menu_open =>
-                    {
-                        self.door_pending = true;
+                    Action::Interact if fresh && self.cursor_locked && !self.admin_menu_open => {
+                        self.interact_pending = true;
                         return;
                     }
-                    KeyCode::KeyT if held && !event.repeat => {
+                    Action::Torch if fresh => {
                         self.torch_pending = true;
                         return;
                     }
-                    KeyCode::Escape if held && !event.repeat => {
-                        self.set_cursor_locked(false);
-                    }
-                    KeyCode::F1 if held && !event.repeat => {
+                    Action::ToggleTerrain if fresh => {
                         self.show_terrain = !self.show_terrain;
                         println!(
                             "spall-interactive: terrain greedy meshes {}",
@@ -267,7 +309,7 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         return;
                     }
-                    KeyCode::F2 if held && !event.repeat => {
+                    Action::ToggleBodies if fresh => {
                         self.show_bodies = !self.show_bodies;
                         println!(
                             "spall-interactive: body instances {}",
@@ -275,7 +317,7 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         return;
                     }
-                    KeyCode::F3 if held && !event.repeat => {
+                    Action::ToggleCapsule if fresh => {
                         self.show_capsule = !self.show_capsule;
                         println!(
                             "spall-interactive: capsule debug markers {}",
@@ -283,19 +325,19 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         return;
                     }
-                    KeyCode::F5 if held && !event.repeat => {
+                    Action::Skylight if fresh => {
                         self.toggle_sky_visibility();
                         return;
                     }
-                    KeyCode::F6 if held && !event.repeat => {
+                    Action::Bounce if fresh => {
                         self.toggle_bounce();
                         return;
                     }
-                    KeyCode::F7 if held && !event.repeat => {
+                    Action::Lighting if fresh => {
                         self.set_lighting(self.lighting.next());
                         return;
                     }
-                    KeyCode::F4 if held && !event.repeat => {
+                    Action::DebugView if fresh => {
                         if let Some(renderer) = &mut self.renderer {
                             let view = next_debug_view(renderer.debug_view);
                             renderer.debug_view = view;
@@ -589,6 +631,18 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     overlay.extend_from_slice(&self.last_creature_cubes);
                 }
+                if let Some(view) = &self.pack_view {
+                    if let Some(replica) =
+                        self.session.replica.get().and_then(|r| r.try_lock().ok())
+                    {
+                        self.last_item_cubes = world_item_instances(
+                            replica.world_items(),
+                            view.as_ref(),
+                            self.item_tint_base,
+                        );
+                    }
+                    overlay.extend_from_slice(&self.last_item_cubes);
+                }
                 let water = self
                     .session
                     .column_surface
@@ -744,6 +798,11 @@ impl ApplicationHandler for InteractiveApp {
                             }
                             self.pack.frame(pack_view.as_ref(), screen, stacks)
                         });
+                        renderer.esc_menu = self.esc.open.then(|| self.esc.view(&self.keys));
+                        renderer.compass_yaw =
+                            (self.held_compass && cam.is_some() && !self.esc.open)
+                                .then_some(self.yaw);
+                        renderer.note_text = self.reading_note.clone();
                         renderer.book_frame = self.pack_view.as_ref().and_then(|pack_view| {
                             self.book.pointer(screen, cursor.unwrap_or([-1.0; 2]));
                             self.book.frame(pack_view.as_ref(), &self.inventory)
@@ -829,27 +888,24 @@ impl ApplicationHandler for InteractiveApp {
                                 .scene
                                 .set_overlay(&renderer.device, &renderer.queue, &overlay);
                         }
-                        let nearby_door = if !self.admin_menu_open && self.fly_eye.is_none() {
+                        let prompt = if !self.admin_menu_open && self.fly_eye.is_none() {
                             cam.and_then(|(eye, _)| {
-                                self.door_spec.and_then(|spec| {
-                                    let replica = self.session.replica.get()?.try_lock().ok()?;
-                                    spall_voxel::doors::nearby_door(
-                                        replica.terrain_volume()?,
-                                        eye.to_array().map(f64::from),
-                                        spec,
-                                        3.0,
-                                    )
-                                })
+                                let replica = self.session.replica.get()?.try_lock().ok()?;
+                                interaction_prompt(
+                                    &replica,
+                                    eye.to_array().map(f64::from),
+                                    self.door_spec,
+                                    self.pack_view.as_deref(),
+                                )
                             })
                         } else {
                             None
                         };
-                        renderer.set_door(nearby_door);
-                        if self.door_pending {
-                            self.door_pending = false;
-                            if nearby_door.is_some()
-                                && let Some((eye, dir)) = cam
-                            {
+                        let prompted = prompt.is_some();
+                        renderer.set_prompt(prompt);
+                        if self.interact_pending {
+                            self.interact_pending = false;
+                            if prompted && let Some((eye, dir)) = cam {
                                 let id = self.next_action_id;
                                 self.next_action_id += 1;
                                 self.session.push_action(tool_request(
@@ -865,6 +921,8 @@ impl ApplicationHandler for InteractiveApp {
                         renderer.set_endurance(self.endurance_view);
                         renderer.set_crosshair(
                             (!self.admin_menu_open
+                                && !self.esc.open
+                                && self.reading_note.is_none()
                                 && !self.pack.is_shown()
                                 && !self.book.is_shown()
                                 && cam.is_some())
@@ -1221,6 +1279,28 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 if menu_actions.close {
                     self.admin_menu_open = false;
+                }
+                let esc_actions = self
+                    .renderer
+                    .as_mut()
+                    .map(|r| std::mem::take(&mut r.esc_actions))
+                    .unwrap_or_default();
+                if esc_actions.quit {
+                    self.session.request_stop();
+                    event_loop.exit();
+                }
+                if esc_actions.reset_defaults {
+                    self.keys = KeyBindings::default();
+                    self.keys.save();
+                    self.esc.capturing = None;
+                    self.esc.message = None;
+                }
+                if let Some(action) = esc_actions.start_rebind {
+                    self.esc.capturing = Some(action);
+                    self.esc.message = None;
+                }
+                if esc_actions.resume {
+                    self.close_esc_menu();
                 }
                 // A reset baseline replaced the world: drop the old view.
                 let resets = self

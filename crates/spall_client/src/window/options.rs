@@ -46,6 +46,45 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
     /// The blueprints in the book (B), in page order. Each must match one of
     /// the game's server-side recipes.
     fn blueprints(&self) -> &[Blueprint];
+    /// How an item lying in the world is drawn: cubes in item-local metres
+    /// (+Y up, the origin on the surface it rests on), turned by the item's
+    /// yaw. Empty draws nothing.
+    fn item_model(&self, _item_id: u16) -> &[ItemVoxel] {
+        &[]
+    }
+    /// What clicking this item's stack in the pack does.
+    fn item_use(&self, _item_id: u16) -> ItemUse {
+        ItemUse::None
+    }
+    /// Tinted copies of manifest materials that [`ItemVoxel::tint`] indexes.
+    fn item_tints(&self) -> Vec<(spall_core::MaterialId, [u8; 3])> {
+        Vec::new()
+    }
+}
+
+/// What using an item from the pack does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemUse {
+    None,
+    /// Hold it (or put it away): a compass drawn lower right whose needle
+    /// follows world north (-Z).
+    Compass,
+    /// Read a paper note showing this text, one line per newline.
+    Note(String),
+}
+
+/// One cube of a world item's model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ItemVoxel {
+    /// Cube centre, item-local metres.
+    pub center: [f32; 3],
+    /// Edge lengths, metres.
+    pub size: [f32; 3],
+    /// Render material (a manifest `MaterialId`'s number).
+    pub material: u32,
+    /// Index into [`PackView::item_tints`], drawn instead of `material`'s
+    /// own colour; `None` keeps the material's colour.
+    pub tint: Option<u16>,
 }
 
 /// One page of the blueprint book: a recipe, and where its raw materials

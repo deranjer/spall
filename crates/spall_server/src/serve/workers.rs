@@ -118,6 +118,21 @@ impl ProgressionWorker {
             .expect("progression worker thread must start");
         Self { submit, completed }
     }
+
+    /// Sends up to 64 finished progression replies to their sessions.
+    pub(super) fn send_completed(&self, clients: &ClientMap) {
+        for _ in 0..64 {
+            match self.completed.try_recv() {
+                Ok(done) => send_to(
+                    clients,
+                    done.session,
+                    Outbound::Progression(Arc::new(done.response)),
+                ),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
 }
 
 #[cfg(test)]

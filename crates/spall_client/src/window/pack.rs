@@ -116,6 +116,11 @@ impl Pack {
         &all[..all.len().min(COLUMNS * ROWS)]
     }
 
+    /// The item under the cursor as of the last [`Self::hover`].
+    pub(super) fn hovered_item(&self) -> Option<u16> {
+        self.hovered
+    }
+
     /// Hovers the stack under `cursor` (logical pixels), if any.
     pub(super) fn hover(
         &mut self,

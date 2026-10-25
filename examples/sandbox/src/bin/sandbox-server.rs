@@ -530,7 +530,17 @@ fn run_serve(args: Args) -> ExitCode {
                 } else {
                     Vec::new()
                 };
-                custom_world = Some(generated.into_custom_world().with_initial_bodies(floaters));
+                let scattered = generated.scatter_items(
+                    args.seed,
+                    &sandbox::world_scatter::ScatterSettings::default(),
+                );
+                tracing::info!(items = scattered.len(), "scattered world items");
+                custom_world = Some(
+                    generated
+                        .into_custom_world()
+                        .with_initial_bodies(floaters)
+                        .with_world_items(scattered),
+                );
                 Scene::Custom
             }
             Err(error) => {
@@ -701,7 +711,7 @@ fn run_serve(args: Args) -> ExitCode {
         }
     };
 
-    let config = ServeConfig {
+    let mut config = ServeConfig {
         server: HostConfig {
             listen: args.listen,
             scene,
@@ -746,6 +756,7 @@ fn run_serve(args: Args) -> ExitCode {
             residency_disk_path,
             creatures,
             creature_shape,
+            item_pickup: None,
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),
@@ -819,6 +830,11 @@ fn run_serve(args: Args) -> ExitCode {
     let player_inventories = std::sync::Arc::new(std::sync::Mutex::new(
         sandbox::game::PlayerInventories::default(),
     ));
+    // E-key world item pickup (ENG-257) fills the same pack crafting reads.
+    config.server.item_pickup = Some(match durable_progression.clone() {
+        Some(store) => sandbox::world_items::durable_pickup(store),
+        None => sandbox::world_items::in_memory_pickup(player_inventories.clone()),
+    });
     let commit_inventories = player_inventories.clone();
     let commit_store = durable_progression.clone();
     let commit_handler: spall_server::CommittedEditHandler =

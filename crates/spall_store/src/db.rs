@@ -405,6 +405,7 @@ impl Writer {
         }
         let weather_blob = dto::encode(&checkpoint.weather)?;
         let players_blob = dto::encode(&checkpoint.players)?;
+        let items_blob = dto::encode(&checkpoint.world_items)?;
         if checkpoint
             .snow
             .as_ref()
@@ -470,6 +471,19 @@ impl Writer {
                 ],
             )?;
             payload_bytes += players_blob.len() as u64;
+            tx.execute(
+                "DELETE FROM checkpoint_world_items WHERE tick = ?",
+                [checkpoint.tick as i64],
+            )?;
+            tx.execute(
+                "INSERT INTO checkpoint_world_items (tick,state,crc) VALUES (?,?,?)",
+                params![
+                    checkpoint.tick as i64,
+                    &items_blob,
+                    crc16(&items_blob).as_slice()
+                ],
+            )?;
+            payload_bytes += items_blob.len() as u64;
             tx.execute(
                 "DELETE FROM checkpoint_snow WHERE tick = ?",
                 [checkpoint.tick as i64],
