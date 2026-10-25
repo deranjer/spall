@@ -10,7 +10,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rodio::{Decoder, OutputStreamBuilder, Sink};
+use rodio::{Decoder, OutputStreamBuilder, Sink, Source};
 
 const UPDATE: Duration = Duration::from_millis(25);
 
@@ -42,6 +42,8 @@ pub struct BiomeAudioConfig {
     pub creatures: crate::creature_sounds::CreatureSoundConfig,
     pub footsteps: crate::footsteps::FootstepConfig,
     pub breathing: crate::breathing::BreathingConfig,
+    /// Fire, ice, tool, item, door, ladder and body sounds for a scenario.
+    pub scenario: crate::scenario_sounds::ScenarioSounds,
 }
 
 /// One looping weather bed: plays at `gain` while the weather is `kind` (the
@@ -414,7 +416,12 @@ enum Shot {
     Weather(PathBuf),
     /// A sound heard from somewhere, at a loudness and pan (-1 left to 1
     /// right) fixed when it starts.
-    Panned { path: PathBuf, gain: f32, pan: f32 },
+    Panned {
+        path: PathBuf,
+        gain: f32,
+        pan: f32,
+        rate: f32,
+    },
 }
 
 /// Sends desired tracks to a worker that owns the audio device and both sinks.
@@ -470,12 +477,18 @@ impl AmbienceAudio {
         self.one_shots.try_send(Shot::Weather(path)).is_ok()
     }
 
-    /// Plays a sound once at `gain` (0..=1) and `pan` (-1 left to 1 right),
+    /// Plays a sound once at `gain` (0..=1), `pan` (-1 left to 1 right) and
+    /// playback `rate` (1 as recorded; 2 is an octave up and twice as fast),
     /// unless [`MAX_VOICES`] are already playing. Returns false when the
     /// worker is busy or gone.
-    pub fn play_panned(&self, path: PathBuf, gain: f32, pan: f32) -> bool {
+    pub fn play_panned(&self, path: PathBuf, gain: f32, pan: f32, rate: f32) -> bool {
         self.one_shots
-            .try_send(Shot::Panned { path, gain, pan })
+            .try_send(Shot::Panned {
+                path,
+                gain,
+                pan,
+                rate,
+            })
             .is_ok()
     }
 }
@@ -484,11 +497,24 @@ impl AmbienceAudio {
 fn panned(
     path: &std::path::Path,
     pan: f32,
-) -> Result<rodio::source::ChannelVolume<Decoder<std::io::BufReader<std::fs::File>>>, String> {
+    rate: f32,
+) -> Result<
+    rodio::source::ChannelVolume<rodio::source::Speed<Decoder<std::io::BufReader<std::fs::File>>>>,
+    String,
+> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let source = Decoder::try_from(file).map_err(|error| error.to_string())?;
     let (left, right) = pan_gains(pan);
-    Ok(rodio::source::ChannelVolume::new(source, vec![left, right]))
+    // Out-of-range rates would stall or squeal; the game picks small changes.
+    let rate = if rate.is_finite() {
+        rate.clamp(0.25, 4.0)
+    } else {
+        1.0
+    };
+    Ok(rodio::source::ChannelVolume::new(
+        source.speed(rate),
+        vec![left, right],
+    ))
 }
 
 /// Left and right channel gains for `pan` (-1 left to 1 right): equal power,
@@ -602,9 +628,14 @@ fn run_audio(
         while let Ok(shot) = shot_rx.try_recv() {
             let path = match shot {
                 Shot::Weather(path) => path,
-                Shot::Panned { path, gain, pan } => {
+                Shot::Panned {
+                    path,
+                    gain,
+                    pan,
+                    rate,
+                } => {
                     if voices.len() < MAX_VOICES {
-                        match panned(&path, pan) {
+                        match panned(&path, pan, rate) {
                             Ok(source) => {
                                 let sink = Sink::connect_new(stream.mixer());
                                 sink.append(source);

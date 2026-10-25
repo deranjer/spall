@@ -51,7 +51,7 @@ impl InteractiveApp {
                 .update(&self.biome_audio.creatures, now, listener, right, &heard);
         for event in events {
             // A full worker queue drops the sound; the next one plays.
-            let _ = audio.play_panned(event.path, event.gain, event.pan);
+            let _ = audio.play_panned(event.path, event.gain, event.pan, 1.0);
         }
     }
 }

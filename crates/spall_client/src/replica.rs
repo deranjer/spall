@@ -45,11 +45,13 @@ use spall_protocol::{
 };
 use spall_voxel::{Brick, BrickHash, EditPlan, Volume};
 
+mod edit_events;
 mod motion;
 mod replay;
 mod staged;
 mod trace;
 mod world_items;
+pub use edit_events::{TerrainEdit, TerrainEdits};
 use motion::*;
 pub use motion::{BodySampler, MotionTrack};
 use replay::*;
@@ -219,6 +221,7 @@ pub struct ReplicaWorld {
     weather_epoch_floor: u64,
     /// ENG-223: this client's own authoritative health, for a later HUD.
     player_health: Option<spall_protocol::PlayerHealth>,
+    edit_events: TerrainEdits,
     /// Shared so the renderer can take a snapshot without copying every frame
     /// while holding the replica lock the network and prediction threads need.
     snow: BTreeMap<(i32, i32, i32), std::sync::Arc<spall_protocol::SnowSurfaceFrame>>,
@@ -283,6 +286,7 @@ impl ReplicaWorld {
             catalogue_deferred: Vec::new(),
             weather: None,
             player_health: None,
+            edit_events: TerrainEdits::default(),
             weather_epoch_floor: 0,
             snow: BTreeMap::new(),
             snow_focus: (0, 0),
@@ -326,6 +330,7 @@ impl ReplicaWorld {
             catalogue_deferred: Vec::new(),
             weather: None,
             player_health: None,
+            edit_events: TerrainEdits::default(),
             weather_epoch_floor: 0,
             snow: BTreeMap::new(),
             snow_focus: (0, 0),
@@ -1502,6 +1507,8 @@ impl ReplicaWorld {
         ) {
             return ApplyOutcome::Rejected { reason };
         }
+        self.edit_events
+            .observe(ops, &self.volumes, self.terrain_id);
         // Source baseline patches can restore distant geometry without naming
         // every restored brick in `before`. Stage its superseded digest removal
         // alongside geometry, before hashing, while leaving live state intact
