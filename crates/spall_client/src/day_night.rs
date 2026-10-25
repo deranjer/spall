@@ -5,14 +5,14 @@
 //! client wall clock is used, so connected players see the same celestial state.
 
 use glam::Vec3;
-use spall_core::time_of_day::{DayNightState, state_at_tick};
+use spall_core::time_of_day::{DayClock, DayNightState};
 use spall_render::Environment;
 
 const TAU: f32 = std::f32::consts::TAU;
 
 #[allow(clippy::field_reassign_with_default)]
-pub fn environment_at_tick(server_tick: u64) -> (Environment, DayNightState) {
-    let state = state_at_tick(server_tick);
+pub fn environment_at_tick(server_tick: u64, clock: DayClock) -> (Environment, DayNightState) {
+    let state = clock.state_at(server_tick);
     let sun_angle = state.day_fraction * TAU;
     let sin_sun = state.sun_height();
     let cos_sun = sun_angle.cos();
@@ -61,11 +61,12 @@ pub fn environment_at_tick(server_tick: u64) -> (Environment, DayNightState) {
 /// `None` state means the caller should retain its manual clock label too.
 pub fn environment_for_clock(
     server_tick: u64,
+    clock: DayClock,
     cycle_enabled: bool,
     manual_environment: Environment,
 ) -> (Environment, Option<DayNightState>) {
     if cycle_enabled {
-        let (environment, state) = environment_at_tick(server_tick);
+        let (environment, state) = environment_at_tick(server_tick, clock);
         (environment, Some(state))
     } else {
         (manual_environment, None)
@@ -90,21 +91,26 @@ mod tests {
     use super::*;
     use spall_core::time_of_day::DAY_CYCLE_TICKS;
 
+    const CLOCK: DayClock = DayClock {
+        day_ticks: 72_000,
+        start_offset_ticks: 0,
+    };
+
     #[test]
     fn twenty_minute_cycle_has_minecraft_like_landmarks_and_wraps() {
-        let sunrise = state_at_tick(0);
-        let noon = state_at_tick(DAY_CYCLE_TICKS / 4);
-        let sunset = state_at_tick(DAY_CYCLE_TICKS / 2);
-        let midnight = state_at_tick(DAY_CYCLE_TICKS * 3 / 4);
+        let sunrise = CLOCK.state_at(0);
+        let noon = CLOCK.state_at(DAY_CYCLE_TICKS / 4);
+        let sunset = CLOCK.state_at(DAY_CYCLE_TICKS / 2);
+        let midnight = CLOCK.state_at(DAY_CYCLE_TICKS * 3 / 4);
         assert_eq!((sunrise.hour, sunrise.minute), (6, 0));
         assert_eq!((noon.hour, noon.minute), (12, 0));
         assert_eq!((sunset.hour, sunset.minute), (18, 0));
         assert_eq!((midnight.hour, midnight.minute), (0, 0));
-        let next_sunrise = state_at_tick(DAY_CYCLE_TICKS);
+        let next_sunrise = CLOCK.state_at(DAY_CYCLE_TICKS);
         assert_eq!((next_sunrise.hour, next_sunrise.minute), (6, 0));
         assert_eq!(next_sunrise.day_index, 1);
-        let (noon_env, _) = environment_at_tick(DAY_CYCLE_TICKS / 4);
-        let (night_env, _) = environment_at_tick(DAY_CYCLE_TICKS * 3 / 4);
+        let (noon_env, _) = environment_at_tick(DAY_CYCLE_TICKS / 4, CLOCK);
+        let (night_env, _) = environment_at_tick(DAY_CYCLE_TICKS * 3 / 4, CLOCK);
         assert!(noon_env.sun_dir.y < -0.99 && noon_env.sun_intensity > 4.9);
         assert!(night_env.sun_dir.y > 0.99 && night_env.sun_intensity < 0.01);
         assert!(night_env.sky.iter().all(|light| *light >= 0.075));
@@ -114,7 +120,7 @@ mod tests {
     fn quarter_moon_can_be_faintly_visible_in_daylight() {
         // Day six is first quarter; 10:00 puts it above the morning horizon.
         let tick = DAY_CYCLE_TICKS * 6 + DAY_CYCLE_TICKS / 6;
-        let (environment, state) = environment_at_tick(tick);
+        let (environment, state) = environment_at_tick(tick, CLOCK);
         assert!((state.lunar_phase - 0.25).abs() < 1e-5);
         assert!(environment.sun_intensity > 3.0);
         assert!(environment.moon_visibility > 0.0);
@@ -122,16 +128,31 @@ mod tests {
 
     #[test]
     fn sun_moon_separation_tracks_lunar_phase() {
-        let (new_moon, _) = environment_at_tick(DAY_CYCLE_TICKS * 4);
-        let (full_moon, _) = environment_at_tick(0);
+        let (new_moon, _) = environment_at_tick(DAY_CYCLE_TICKS * 4, CLOCK);
+        let (full_moon, _) = environment_at_tick(0, CLOCK);
         assert!(new_moon.sun_dir.dot(new_moon.moon_dir) > 0.999);
         assert!(full_moon.sun_dir.dot(full_moon.moon_dir) < -0.999);
     }
 
     #[test]
+    fn configured_day_drives_the_label_and_the_sun() {
+        // A 10-minute day starting at 15:30: 18:00 is 3,750 ticks in, and
+        // half a day later (03:30) the sun is down.
+        let clock = DayClock::new(36_000, 15.5).unwrap();
+        let (dusk, state) = environment_at_tick(3_750, clock);
+        assert_eq!((state.hour, state.minute), (18, 0));
+        assert!(dusk.sun_intensity < 2.0);
+        let (night, state) = environment_at_tick(18_000, clock);
+        assert_eq!((state.hour, state.minute), (3, 30));
+        assert!(night.sun_intensity < 0.01);
+        // The default clock at the same tick is a different hour.
+        assert_ne!(environment_at_tick(18_000, CLOCK).1.hour, 3);
+    }
+
+    #[test]
     fn disabling_the_cycle_preserves_manual_lighting() {
         let manual = spall_render::EnvironmentPreset::Sunset.environment();
-        let (selected, state) = environment_for_clock(12345, false, manual);
+        let (selected, state) = environment_for_clock(12345, DayClock::default(), false, manual);
         assert_eq!(selected, manual);
         assert!(state.is_none());
     }

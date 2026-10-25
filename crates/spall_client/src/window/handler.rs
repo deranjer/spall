@@ -1071,6 +1071,7 @@ impl ApplicationHandler for InteractiveApp {
                             None,
                             menu_view.as_ref().map(|view| (view, &mut menu_actions)),
                             view.map(|view| view.server_tick),
+                            self.session.day_clock.get().copied().unwrap_or_default(),
                         ) {
                             Ok(timing) => timing,
                             Err(error) => {

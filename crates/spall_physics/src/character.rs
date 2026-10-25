@@ -52,6 +52,17 @@ pub mod tuning {
     /// Terminal fall speed clamp, m/s.
     pub const MAX_FALL_SPEED_M_S: f32 = 55.0;
 
+    // ---- snow and storm ---------------------------------------------------
+    /// Walk and run speed lost on the deepest snow (0.5 m): speed falls
+    /// linearly with depth down to `1 - this` (60 %).
+    pub const SNOW_DEEP_SLOWDOWN: f32 = 0.4;
+    /// Extra fraction of speed a blizzard takes wherever snow lies under the
+    /// feet; multiplies with the depth slowdown (deep snow in a blizzard: 54 %).
+    pub const BLIZZARD_SLOWDOWN: f32 = 0.1;
+    /// Snow depth is bucketed to `1 / 2^(16 - this)` m (1/16 m) before it slows
+    /// a step, so server and replica agree despite replication lag.
+    pub const SNOW_DEPTH_BUCKET_SHIFT: u32 = 12;
+
     // ---- swimming ---------------------------------------------------------
     /// Water this deep over the feet (m) and the capsule swims instead of
     /// walking: roughly chest to neck deep.
@@ -272,7 +283,7 @@ pub fn step_character(
     dt_s: f32,
     sweep: impl FnMut([f64; 3], [f32; 3]) -> CharacterMove,
 ) -> CharacterState {
-    step_character_in_water(state, input, dt_s, None, None, sweep)
+    step_character_in_water(state, input, dt_s, None, None, 1.0, sweep)
 }
 
 /// The water around a character: where its surface is and how fast it runs.
@@ -319,12 +330,18 @@ pub fn is_swimming(water: Option<WaterSample>, feet_y: f64) -> bool {
 /// `ladder` is the ladder in reach ([`crate::ladder_contact`]), or `None`;
 /// like `water`, server and client must pass the same value for the same
 /// state. Climbing takes precedence over walking and swimming.
+///
+/// `ground_scale` multiplies walk and run speed (deep snow, blizzard:
+/// [`crate::snow_speed_scale`]); `1.0` on bare ground. It is clamped to
+/// `(0, 1]` and does not affect swimming or climbing. Server and client pass
+/// the same value for the same position, like `water`.
 pub fn step_character_in_water(
     mut state: CharacterState,
     input: PlayerInput,
     dt_s: f32,
     water: Option<WaterSample>,
     ladder: Option<crate::LadderContact>,
+    ground_scale: f32,
     mut sweep: impl FnMut([f64; 3], [f32; 3]) -> CharacterMove,
 ) -> CharacterState {
     let input = input.sanitized();
@@ -384,11 +401,17 @@ pub fn step_character_in_water(
     // server and the client predictor both read it.
     let sprint = state.can_sprint(&input);
     state.tick_endurance(dt, sprint && state.grounded && moving, false, moving);
-    let ground_speed = if sprint {
-        tuning::RUN_SPEED_M_S
+    let ground_scale = if ground_scale.is_finite() {
+        ground_scale.clamp(0.1, 1.0)
     } else {
-        tuning::WALK_SPEED_M_S
+        1.0
     };
+    let ground_speed = ground_scale
+        * if sprint {
+            tuning::RUN_SPEED_M_S
+        } else {
+            tuning::WALK_SPEED_M_S
+        };
     let wish_horiz = [
         wish[0] * ground_speed * wade + flow[0] * push,
         wish[1] * ground_speed * wade + flow[1] * push,
@@ -708,11 +731,12 @@ mod tests {
         let swim = |input| {
             let mut state = CharacterState::at([0.0, 3.0, 0.0]);
             for _ in 0..600 {
-                state =
-                    step_character_in_water(state, input, DT, water, None, |_, d| CharacterMove {
+                state = step_character_in_water(state, input, DT, water, None, 1.0, |_, d| {
+                    CharacterMove {
                         translation_m: d,
                         grounded: false,
-                    });
+                    }
+                });
                 state.position_m[1] = 3.0;
             }
             state
@@ -720,6 +744,34 @@ mod tests {
         let swum = swim(forward_input(BUTTON_SPRINT));
         assert!((swum.endurance - (1.0 - 10.0 * tuning::ENDURANCE_SWIM_DRAIN_PER_S)).abs() < 1e-3);
         assert_eq!(swim(PlayerInput::NEUTRAL).endurance, 1.0);
+    }
+
+    #[test]
+    fn ground_scale_slows_walk_and_run_and_is_sanitised() {
+        let grounded = CharacterState {
+            grounded: true,
+            ..CharacterState::at([0.0; 3])
+        };
+        let speed = |scale: f32, buttons: u32| {
+            let s = step_character_in_water(
+                grounded,
+                forward_input(buttons),
+                DT,
+                None,
+                None,
+                scale,
+                free_move,
+            );
+            s.velocity_m_s[0].hypot(s.velocity_m_s[2])
+        };
+        let deep = 1.0 - tuning::SNOW_DEEP_SLOWDOWN;
+        assert!((speed(deep, 0) - tuning::WALK_SPEED_M_S * deep).abs() < 1e-4);
+        assert!((speed(deep, BUTTON_SPRINT) - tuning::RUN_SPEED_M_S * deep).abs() < 1e-4);
+        assert!((speed(1.0, 0) - tuning::WALK_SPEED_M_S).abs() < 1e-4);
+        // A bad or out-of-range multiplier never speeds up, stalls or poisons the step.
+        assert!((speed(f32::NAN, 0) - tuning::WALK_SPEED_M_S).abs() < 1e-4);
+        assert!((speed(3.0, 0) - tuning::WALK_SPEED_M_S).abs() < 1e-4);
+        assert!(speed(0.0, 0) > 0.0);
     }
 
     #[test]
@@ -755,12 +807,18 @@ mod tests {
         let swim = |buttons| {
             let mut s = CharacterState::at([0.0, 5.0 - tuning::FLOAT_DEPTH_M as f64, 0.0]);
             for _ in 0..120 {
-                s = step_character_in_water(s, forward_input(buttons), DT, water, None, |_, d| {
-                    CharacterMove {
+                s = step_character_in_water(
+                    s,
+                    forward_input(buttons),
+                    DT,
+                    water,
+                    None,
+                    1.0,
+                    |_, d| CharacterMove {
                         translation_m: d,
                         grounded: false,
-                    }
-                });
+                    },
+                );
             }
             speed(s)
         };
@@ -1513,6 +1571,7 @@ mod tests {
                 DT,
                 Some(WaterSample::still(surface)),
                 None,
+                1.0,
                 |_, d| CharacterMove {
                     translation_m: d,
                     grounded: false,
@@ -1583,6 +1642,7 @@ mod tests {
                 DT,
                 Some(WaterSample::still(10.0)),
                 None,
+                1.0,
                 |_, d| CharacterMove {
                     translation_m: d,
                     grounded: false,
@@ -1626,6 +1686,7 @@ mod tests {
                 DT,
                 surface.map(WaterSample::still),
                 None,
+                1.0,
                 |_, d| CharacterMove {
                     translation_m: d,
                     grounded: true,
@@ -1658,7 +1719,7 @@ mod tests {
             flow_m_s: flow,
         };
         for _ in 0..ticks {
-            state = step_character_in_water(state, input, DT, Some(water), None, |_, d| {
+            state = step_character_in_water(state, input, DT, Some(water), None, 1.0, |_, d| {
                 CharacterMove {
                     translation_m: d,
                     grounded: false,
@@ -1708,9 +1769,11 @@ mod tests {
             ..CharacterState::at([0.0, 9.0, 0.0])
         };
         let step = |water: Option<WaterSample>| {
-            step_character_in_water(on_ground, idle, DT, water, None, |_, d| CharacterMove {
-                translation_m: d,
-                grounded: true,
+            step_character_in_water(on_ground, idle, DT, water, None, 1.0, |_, d| {
+                CharacterMove {
+                    translation_m: d,
+                    grounded: true,
+                }
             })
         };
         // Knee deep (surface 0.6 m over the feet): pushed along the current.

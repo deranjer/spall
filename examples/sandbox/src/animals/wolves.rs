@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 
+use spall_core::time_of_day::DayClock;
 use spall_core::{BrickCoord, EntityId, GlobalCell, LocalCell, MaterialId};
 use spall_server::creature_service::{CreatureAction, CreatureActionOutcome};
 use spall_sim::{CreatureKill, PlayerDamage, Simulation};
@@ -352,8 +353,8 @@ pub(super) fn on_outcome(packs: &mut Packs, wolf: u64, outcome: CreatureActionOu
     }
 }
 
-fn is_night(tick: u64) -> bool {
-    spall_core::time_of_day::state_at_tick(tick).sun_height() < 0.0
+fn is_night(clock: DayClock, tick: u64) -> bool {
+    clock.state_at(tick).sun_height() < 0.0
 }
 
 /// The lamp cells (the torch's fire) within `radius_m` of `centre`
@@ -571,7 +572,7 @@ fn lead(dir: &mut AnimalDirector, index: usize, cx: &Cx) {
                 pack.howl_at = None;
             }
         }
-        None if calm && is_night(tick) && tick >= pack.next_howl => {
+        None if calm && is_night(cx.clock, tick) && tick >= pack.next_howl => {
             tracing::info!(
                 leader = cx.id,
                 wolves = pack.members.len(),
@@ -619,7 +620,7 @@ fn meet_players(dir: &mut AnimalDirector, index: usize, cx: &Cx, members: &[[f64
         return;
     };
     let by_fire = nearest(&pack.fires, at).is_some_and(|(_, distance)| distance < FIRE_SAFE_M);
-    let mut chance = if is_night(tick) {
+    let mut chance = if is_night(cx.clock, tick) {
         CLOSE_ATTACK_NIGHT_CHANCE
     } else {
         CLOSE_ATTACK_CHANCE
@@ -666,7 +667,7 @@ fn choose_prey(dir: &mut AnimalDirector, index: usize, cx: &Cx, members: &[[f64;
         && tick >= pack.players_left_until
     {
         dir.wolves.packs[index].next_player_choice = tick + PLAYER_CHOICE_TICKS;
-        let chance = if is_night(tick) {
+        let chance = if is_night(cx.clock, tick) {
             PLAYER_HUNT_NIGHT_CHANCE
         } else {
             PLAYER_HUNT_CHANCE
@@ -1110,8 +1111,8 @@ mod tests {
         let hour = DAY_CYCLE_TICKS / 24;
         // The server tick starts at 06:00.
         let at = |h: u64| DAY_CYCLE_TICKS * 2 + ((h + 24 - 6) % 24) * hour;
-        assert!(is_night(at(0)) && is_night(at(22)));
-        assert!(!is_night(at(12)) && !is_night(at(9)));
+        assert!(is_night(DayClock::default(), at(0)) && is_night(DayClock::default(), at(22)));
+        assert!(!is_night(DayClock::default(), at(12)) && !is_night(DayClock::default(), at(9)));
         let start = at(23);
         assert!(howling(start, 0, start) && !howling(start, 1, start));
         assert!(howling(start, 1, start + HOWL_STAGGER_TICKS));

@@ -1,7 +1,7 @@
 # Multiplayer, persistence, and recovery contract
 
 Cabin doors use `ActionKind::Interact` in the existing `ActionRequest` (wire
-version 21). The sandbox door tool is 5. The server ignores claimed aim for this
+version 22). The sandbox door tool is 5. The server ignores claimed aim for this
 tool and requires a visible door within 3 m of the authoritative player's eye.
 Request deduplication and ordinary topology transactions carry the turn; no
 separate door-state record exists. Hinge materials and panel cell runs also
@@ -17,7 +17,7 @@ Use Quinn reliable streams and datagrams. One reliable ordered control/topology 
 
 Datagrams carry player inputs and body/player motion. Each payload fits `min(1100, connection.max_datagram_size())` bytes after our envelope; recalculate when path limits change. Fail the connection setup clearly if required datagrams are unavailable. Larger records are split into independently useful snapshots, not IP-fragmented giant packets. Reliable application records use explicit length framing and checked decoding.
 
-Handshake includes protocol version, exact content manifest hash, world ID, generator version, supported algorithms, server tick rate, cell-size codes, session identity, and negotiated limits. The sandbox combines its canonical material manifest hash with the optional versioned asset-manifest hash; clients serving custom content must provide the same asset manifest before connecting. Reject incompatibility before creating a player. For development use server certificate fingerprint pinning and a session join token; do not disable TLS verification globally. Dedicated Internet hosting is direct-address initially; QUIC does not provide NAT traversal, a relay, matchmaking, or account identity. Those need an explicit later platform choice.
+Handshake includes protocol version, exact content manifest hash, world ID, generator version, supported algorithms, server tick rate, cell-size codes, session identity, negotiated limits, and the server day clock (day length and start offset, ENG-252; sent in the server reply, not compared). The sandbox combines its canonical material manifest hash with the optional versioned asset-manifest hash; clients serving custom content must provide the same asset manifest before connecting. Reject incompatibility before creating a player. For development use server certificate fingerprint pinning and a session join token; do not disable TLS verification globally. Dedicated Internet hosting is direct-address initially; QUIC does not provide NAT traversal, a relay, matchmaking, or account identity. Those need an explicit later platform choice.
 
 ## Minimal record families
 
@@ -315,7 +315,7 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 21): one wire version for the handshake and every record, bumped on
+`PROTOCOL_VERSION` (currently 22): one wire version for the handshake and every record, bumped on
 any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 8, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
