@@ -1,0 +1,53 @@
+(
+    format_version: 1,
+    name: "Lookout Tower",
+    material_mapping: {
+        "dirt": 5,
+        "door.hinge.closed": 8,
+        "door.panel": 9,
+        "emissive.lamp": 6,
+        "foliage.oak": 3,
+        "grass": 4,
+        "ladder": 10,
+        "player.spawn": 7,
+        "stone.granite": 1,
+        "wood.oak": 2,
+    },
+    asset_database: (
+        format_version: 1,
+        next_asset_id: 5,
+        assets: {
+            (1): (
+                id: (1),
+                name: "Scene Voxels",
+                kind: Voxel,
+                storage: "assets\\ground.spvox",
+                authoring_bounds: None,
+            ),
+            (2): (
+                id: (2),
+                name: "Lookout tower",
+                kind: Voxel,
+                storage: "assets\\tower.spvox",
+                authoring_bounds: None,
+            ),
+            (3): (
+                id: (3),
+                name: "Hinged timber door",
+                kind: Voxel,
+                storage: "assets\\door.spvox",
+                authoring_bounds: None,
+            ),
+            (4): (
+                id: (4),
+                name: "Player start",
+                kind: Voxel,
+                storage: "assets\\starts.spvox",
+                authoring_bounds: None,
+            ),
+        },
+    ),
+    scenes: {
+        "Main": "scenes/main.ron",
+    },
+)

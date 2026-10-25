@@ -229,6 +229,43 @@ async fn server_and_two_clients_authenticate_and_exchange_records() {
     assert_eq!(sessions.len(), 2);
 }
 
+/// ENG-252: the client learns the server's configured day length and start
+/// hour from the handshake reply, whatever clock the client itself sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_receives_the_servers_day_clock() {
+    let identity = DevIdentity::generate().unwrap();
+    let token = JoinToken::generate().unwrap();
+    let mut handshake = demo_handshake(HARNESS_MANIFEST_TAG);
+    handshake.day_clock = spall_core::time_of_day::DayClock::new(36_000, 15.5).unwrap();
+    let server = Arc::new(
+        NetServer::bind(
+            loopback(),
+            &identity,
+            token,
+            handshake.clone(),
+            TransportConfig::for_tests(),
+        )
+        .await
+        .unwrap(),
+    );
+    let addr = server.local_addr().unwrap();
+    let accepting = server.clone();
+    let accept = tokio::spawn(async move { accepting.accept().await.unwrap() });
+    let client = connect(
+        addr,
+        identity.fingerprint(),
+        token,
+        demo_handshake(HARNESS_MANIFEST_TAG), // default clock
+        TransportConfig::for_tests(),
+    )
+    .await
+    .unwrap();
+    let _accepted = accept.await.unwrap();
+    assert_eq!(client.server_day_clock(), handshake.day_clock);
+    assert_ne!(client.server_day_clock(), Default::default());
+    server.close();
+}
+
 async fn spawn_server() -> (Arc<NetServer>, SocketAddr, DevIdentity, JoinToken) {
     let identity = DevIdentity::generate().unwrap();
     let token = JoinToken::generate().unwrap();

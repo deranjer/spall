@@ -152,9 +152,23 @@ impl Simulation {
             .collect();
         let frame = self.column_water.as_ref().map(|w| w.frame());
         let sampler = frame.as_ref().map(|f| f.sampler());
-        self.world.advance_players(TICK_DT_S, &boxes, &|x, y, z| {
-            sampler.as_ref().and_then(|s| s.sample_at_m(x, y, z))
-        });
+        let snow = &self.snow;
+        let blizzard = self.weather.kind == spall_protocol::WeatherKind::Blizzard;
+        self.world.advance_players(
+            TICK_DT_S,
+            &boxes,
+            &|x, y, z| sampler.as_ref().and_then(|s| s.sample_at_m(x, y, z)),
+            // Walking slows in deep snow and blizzards; the client predictor
+            // reads the same replicated snow depth under the feet.
+            &|terrain, feet| {
+                spall_physics::ground_cell_below(terrain, feet).map_or(1.0, |(cell, _)| {
+                    spall_physics::snow_speed_scale(
+                        snow.depth_q16_at(cell.x, cell.y, cell.z),
+                        blizzard,
+                    )
+                })
+            },
+        );
         self.motion_footprints
             .retain_players(self.world.players().map(|player| player.entity));
         self.footfall_candidates.clear();

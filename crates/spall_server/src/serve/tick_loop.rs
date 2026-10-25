@@ -54,7 +54,7 @@ pub(super) async fn serve_async(
         std::fs::rename(&tmp, path)?;
     }
 
-    let handshake = server_handshake(&materials, asset_manifest_hash);
+    let handshake = server_handshake(&materials, asset_manifest_hash, config.server.day_clock);
     let credential_registry_file = config.server.credential_registry_file.clone();
     if credential_registry_file.is_some() && player_credentials.is_none() {
         return Err(ServeError::Configuration(

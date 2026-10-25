@@ -758,6 +758,7 @@ impl WorldRenderer {
         demo_hud: Option<(&str, &str, &str)>,
         admin_menu: Option<(&AdminMenuView, &mut AdminMenuActions)>,
         server_tick: Option<u64>,
+        day_clock: spall_core::time_of_day::DayClock,
     ) -> Result<FrameTiming, ClientError> {
         let AcquiredFrame {
             frame_start,
@@ -769,8 +770,12 @@ impl WorldRenderer {
         } = acquired;
 
         if let Some(server_tick) = server_tick {
-            let (environment, state) =
-                environment_for_clock(server_tick, self.day_cycle_enabled, self.environment);
+            let (environment, state) = environment_for_clock(
+                server_tick,
+                day_clock,
+                self.day_cycle_enabled,
+                self.environment,
+            );
             self.environment = environment;
             if let Some(state) = state {
                 self.day_clock_label = format!(

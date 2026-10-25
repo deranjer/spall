@@ -659,6 +659,7 @@ fn serve_with_game_content_and_optional_setup(
 fn server_handshake(
     materials: &spall_core::MaterialManifest,
     asset_manifest_hash: Option<spall_protocol::Hash32>,
+    day_clock: spall_core::time_of_day::DayClock,
 ) -> Handshake {
     Handshake {
         protocol_version: PROTOCOL_VERSION,
@@ -678,5 +679,6 @@ fn server_handshake(
         cell_size_codes: vec![spall_core::CellSizeCode::Quarter],
         session: SessionId::from_parts(SlotId(0), 1),
         limits: NegotiatedLimits::DEFAULT,
+        day_clock,
     }
 }

@@ -32,6 +32,7 @@ pub mod occupancy;
 pub mod query_cache;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod report;
+pub mod snow_drag;
 pub mod world;
 
 pub use character::{
@@ -51,6 +52,7 @@ pub use occupancy::{ExtractError, OccupancyGrid};
 pub use query_cache::{CharacterQueryCache, REBUILD_MARGIN_M, WINDOW_RADIUS_M, WindowStats};
 #[cfg(any(test, feature = "fixtures"))]
 pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
+pub use snow_drag::{ground_cell_below, snow_speed_scale};
 pub use world::{
     BodyCommitFence, BodyId, BodyKind, BodySpec, BodyState, ColliderExclusion, ContactImpulse,
     PhysicsConfig, PhysicsWorld, PreparedBodySpec, PreparedCollider, StepTiming,
