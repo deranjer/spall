@@ -62,8 +62,9 @@ fn the_manifest_extends_the_linear_one_and_variants_keep_their_bases_rules() {
     );
     // v2 + the appearance variants + the emissive lamp (ENG-102) + the eight
     // generated-world terrain materials (ENG-114) + the cabin door's closed
-    // hinge, open hinge and panel (ENG-249) + the climbable ladder (ENG-263).
-    assert_eq!(current.len(), v2.len() + variants.len() + 1 + 8 + 3 + 1);
+    // hinge, open hinge and panel (ENG-249) + the climbable ladder (ENG-263)
+    // + ice and cracked ice (ENG-268).
+    assert_eq!(current.len(), v2.len() + variants.len() + 1 + 8 + 3 + 1 + 2);
     let mut names = std::collections::BTreeSet::new();
     for variant in &variants {
         assert!(variant.id.0 >= VARIANT_ID_BASE);

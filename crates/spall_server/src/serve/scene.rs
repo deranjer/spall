@@ -79,6 +79,7 @@ pub struct CustomWorld {
     pub(super) initial_bodies: Vec<InitialBody>,
     pub(super) dam_gate: Option<DamGate>,
     pub(super) vegetation: Option<spall_ecology::living::LivingState>,
+    pub(super) ice: Option<spall_sim::IceSettings>,
 }
 
 /// A dynamic body placed in a custom world when it is created: one solid box
@@ -114,6 +115,7 @@ impl CustomWorld {
             initial_bodies: Vec::new(),
             dam_gate: None,
             vegetation: None,
+            ice: None,
         }
     }
 
@@ -146,6 +148,17 @@ impl CustomWorld {
     pub fn with_vegetation(mut self, vegetation: spall_ecology::living::LivingState) -> Self {
         self.vegetation = Some(vegetation);
         self
+    }
+
+    /// Freezes this world's settled shallow water in winter (ENG-268).
+    #[must_use]
+    pub fn with_ice(mut self, ice: spall_sim::IceSettings) -> Self {
+        self.ice = Some(ice);
+        self
+    }
+
+    pub fn ice(&self) -> Option<&spall_sim::IceSettings> {
+        self.ice.as_ref()
     }
 
     pub fn player_spawns(&self) -> &[[f64; 3]] {
@@ -295,6 +308,9 @@ impl Scene {
         sim_config.column_water_worker = true;
         sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
+        if let Some(ice) = custom.and_then(|c| c.ice) {
+            sim.set_ice(ice);
+        }
         if let Some(custom) = custom {
             for body in &custom.initial_bodies {
                 spall_sim::playground::spawn_box_body(

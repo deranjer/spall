@@ -42,6 +42,10 @@ pub mod materials {
     /// Climbable ladder rungs (ENG-263): solid, destructible wood whose
     /// `CLIMBABLE` flag lets a player climb it. Above the cabin door ids.
     pub const LADDER: MaterialId = MaterialId(221);
+    /// Winter ice on shallow water and its warning-crack state (ENG-268).
+    /// Above the cabin door ids (218..=220) and the ladder (221).
+    pub const ICE: MaterialId = MaterialId(223);
+    pub const ICE_CRACKED: MaterialId = MaterialId(224);
 }
 
 /// Version of the sandbox's server-authoritative content rules.
@@ -916,10 +920,37 @@ pub fn manifest() -> MaterialManifest {
     );
     ladder.sim.flags.0 |= MaterialFlags::CLIMBABLE.0;
     entries.push(ladder);
+    entries.extend(ice_defs());
     entries.sort_by_key(|entry| entry.id);
     MaterialManifest::validated(entries)
         .and_then(|m| m.superseding_extension(&previous))
-        .expect("sandbox door and ladder materials")
+        .expect("sandbox door, ladder and ice materials")
+}
+
+/// Ice and cracked ice: pale, smooth, lighter than water (ENG-268).
+fn ice_defs() -> [MaterialDef; 2] {
+    let mut ice = def(
+        materials::ICE,
+        "ice",
+        917.0,
+        [0.74, 0.86, 0.95].map(srgb_to_linear),
+    );
+    ice.render.roughness = 0.2;
+    ice.sim.friction = 0.05;
+    let mut cracked = def(
+        materials::ICE_CRACKED,
+        "ice.cracked",
+        917.0,
+        [0.56, 0.66, 0.76].map(srgb_to_linear),
+    );
+    cracked.render.roughness = 0.5;
+    cracked.sim.friction = 0.05;
+    [ice, cracked]
+}
+
+/// Winter ice on the generated world's settled shallow water (ENG-268).
+pub fn ice_settings() -> spall_sim::IceSettings {
+    spall_sim::IceSettings::new(materials::ICE, materials::ICE_CRACKED)
 }
 
 /// The first modular door: 1.5 x 2.5 m, hinged at its local lower-left cell.

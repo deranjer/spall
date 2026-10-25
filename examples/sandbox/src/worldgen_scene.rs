@@ -535,7 +535,9 @@ impl GeneratedScene {
         let mut custom =
             CustomWorld::new(spawns, move || scene.world_setup()).with_vegetation(vegetation);
         if let Some(setup) = column_water {
-            custom = custom.with_column_water(setup);
+            custom = custom
+                .with_column_water(setup)
+                .with_ice(crate::game::ice_settings());
         }
         custom
     }
