@@ -78,6 +78,7 @@ mod persistence;
 mod scene;
 mod summary;
 mod tick_loop;
+mod tool_use;
 mod workers;
 
 use self::actions::*;
@@ -94,6 +95,8 @@ use self::persistence::*;
 pub use self::scene::*;
 pub use self::summary::*;
 use self::tick_loop::*;
+use self::tool_use::*;
+pub use self::tool_use::{ToolHooks, ToolRules, ToolUse};
 use self::workers::*;
 
 #[cfg(test)]

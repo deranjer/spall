@@ -80,6 +80,7 @@ fn config(
             creatures: None,
             creature_shape: None,
             item_pickup: None,
+            tool_hooks: None,
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,

@@ -688,6 +688,20 @@ compass and note down to life size. A model that fails to load is logged as an
 error and drawn as `pack_view::placeholder_model` cubes. The client also labels the
 nearest one `E  Pick up <name>`, ahead of a door prompt.
 
+## Tools
+
+The game's tool catalog (`ToolCatalog`) says what each tool id does, its reach
+and its radius cap. The game's `ToolRules`, installed as `HostConfig::tool_hooks`,
+say who may use a tool: the server asks `ToolRules::allow` before resolving any
+cut or placement and refuses the request with the game's reason. The server's
+only notion of admin is `HostConfig::admin_commands` (the sandbox's
+`--allow-admin-commands`, which `cargo xtask play` passes), handed to the rules as
+`ToolUse::admin`. The development `--dev-unvalidated-actions` path skips the rules.
+
+In the sandbox, players start empty-handed. The hammer (`DIG`) is an admin tool
+(ENG-259): the server refuses its swings unless admin commands are on, and the
+client keeps it put away until the admin menu (F10, Tools) puts it in hand.
+
 Quarter-metre doors use `spall_voxel::doors` to find a visible nearby hinge and
 plan a +X-to-+Z panel turn. The hinge material records open/closed state. E sends
 an interaction request; the server selects the door from its authoritative

@@ -199,6 +199,9 @@ pub(super) struct InteractiveApp {
     pub(super) interact_pending: bool,
     pub(super) last_hammer_at: Option<Instant>,
     pub(super) hammer_radius: i64,
+    /// The admin hammer is in hand (toggled from the admin menu; ENG-259).
+    /// Off, left click uses what the player picked up instead.
+    pub(super) hammer_on: bool,
     pub(super) next_action_id: u64,
     /// Emissive terrain boxes of the last rebuild (torches, lamps), for the
     /// per-frame point-light selection.
@@ -401,6 +404,7 @@ impl InteractiveApp {
             door_spec: options.door,
             last_hammer_at: None,
             hammer_radius: HAMMER_RADIUS_DEFAULT,
+            hammer_on: false,
             next_action_id: HAMMER_REQUEST_BASE,
             emitter_instances: Vec::new(),
             hammer_target: None,

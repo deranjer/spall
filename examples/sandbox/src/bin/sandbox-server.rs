@@ -727,6 +727,7 @@ fn run_serve(args: Args) -> ExitCode {
             creatures,
             creature_shape,
             item_pickup: None,
+            tool_hooks: None,
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),
@@ -804,6 +805,10 @@ fn run_serve(args: Args) -> ExitCode {
         Some(store) => sandbox::world_items::durable_pickup(store),
         None => sandbox::world_items::in_memory_pickup(player_inventories.clone()),
     });
+    // Tool rules (ENG-259): the hammer only for admins.
+    config.server.tool_hooks = Some(spall_server::ToolHooks::new(
+        sandbox::tools::SandboxToolRules,
+    ));
     let commit_inventories = player_inventories.clone();
     let commit_store = durable_progression.clone();
     let commit_handler: spall_server::CommittedEditHandler =

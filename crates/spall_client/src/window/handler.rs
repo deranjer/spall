@@ -115,7 +115,9 @@ impl ApplicationHandler for InteractiveApp {
                 self.hammer_held = state == ElementState::Pressed;
                 self.hammer_pending |= self.hammer_held;
             }
-            WindowEvent::MouseWheel { delta, .. } if self.cursor_locked && !ui_consumed => {
+            WindowEvent::MouseWheel { delta, .. }
+                if self.cursor_locked && self.hammer_on && !ui_consumed =>
+            {
                 let steps = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y.round() as i64,
                     winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 40.0).round() as i64,
@@ -761,7 +763,7 @@ impl ApplicationHandler for InteractiveApp {
                             self.book.frame(pack_view.as_ref(), &self.inventory)
                         });
                         self.hammer_target = match cam {
-                            Some((eye, dir)) => {
+                            Some((eye, dir)) if self.hammer_on => {
                                 match self.session.replica.get().and_then(|r| r.try_lock().ok()) {
                                     Some(replica) => replica
                                         .terrain_volume()
@@ -884,6 +886,7 @@ impl ApplicationHandler for InteractiveApp {
                                     _ if !self.cursor_locked => {
                                         "click to capture the mouse, then click to break".to_owned()
                                     }
+                                    _ if !self.hammer_on => "empty hands".to_owned(),
                                     Some((_, material)) => format!(
                                         "hammer r{}  {}",
                                         self.hammer_radius,
@@ -899,6 +902,7 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         if let Some((eye, dir)) = cam
                             && self.cursor_locked
+                            && self.hammer_on
                             && hammer_due(
                                 self.hammer_pending,
                                 self.hammer_held,
@@ -1014,6 +1018,7 @@ impl ApplicationHandler for InteractiveApp {
                                     .map(|(text, _)| text.clone()),
                                 frame_summary(&self.frame_history),
                             );
+                            menu.hammer_on = self.hammer_on;
                             menu.weather = self
                                 .latest_weather
                                 .as_ref()
@@ -1140,6 +1145,10 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 if menu_actions.toggle_flight {
                     self.toggle_flight();
+                }
+                if menu_actions.toggle_hammer {
+                    self.hammer_on = !self.hammer_on;
+                    self.hammer_pending = false;
                 }
                 if menu_actions.toggle_sky_visibility {
                     self.toggle_sky_visibility();

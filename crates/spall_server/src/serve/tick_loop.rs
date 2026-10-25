@@ -321,6 +321,7 @@ pub(super) async fn serve_async(
         .item_pickup
         .clone()
         .filter(|_| !dev_unvalidated_actions);
+    let tool_hooks = config.server.tool_hooks.clone();
     let creature_shape = config.server.creature_shape.clone();
     let contact_damage_cfg = config.server.contact_damage;
     let contact_damage_profiles = damage_profiles;
@@ -716,6 +717,17 @@ pub(super) async fn serve_async(
                             continue;
                         }
                         if try_pick_up(&mut sim, session, &req, &item_pickup, &clients_for_sim) {
+                            continue;
+                        }
+                        let principal = player_principals.get(&session.raw()).copied();
+                        if let Err(refused) = (!dev_unvalidated_actions)
+                            .then(|| {
+                                permit_tool(&tool_hooks, session, principal, &req, admin_commands)
+                            })
+                            .unwrap_or(Ok(()))
+                        {
+                            reject(&clients_for_sim, session, req.request_id, &refused.reason());
+                            rejected_total += 1;
                             continue;
                         }
                         // A strike that meets a creature kills it (ENG-237).
