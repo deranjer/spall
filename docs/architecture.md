@@ -198,6 +198,8 @@ drain, edge blur, and the injury reminder icon from one bear swipe down), which 
 respawn restores full health. Game creatures hurt players through the director's
 `CreatureAction::HitPlayer`, which the server refuses beyond 3 m of the creature's root (ENG-240).
 
+The host installs its configured `DayClock` with `Simulation::set_day_clock`, so cold follows the same day length and starting hour as the sky, including after save recovery and world replacement.
+
 ENG-264/265 warmth and wetness: each capsule also carries a runtime `warmth::BodyHeat` (warmth 1
 warm to 0 freezing, wetness 0 dry to 1 soaked; not saved, and a respawn or reconnect starts warm
 and dry). Once a second, at the end of `Simulation::tick`, `spall_sim::warmth` gathers each
