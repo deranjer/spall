@@ -886,8 +886,8 @@ pub fn terrain_palette() -> spall_worldgen::WorldgenPalette {
 }
 
 /// The sandbox world's validated material manifest: [`manifest_v5_terrain`] plus
-/// every appearance variant in `appearance_extensions.rs` (none yet, so it
-/// equals v5). Extending the palette appends variants under new ids, so it
+/// every appearance variant in `appearance_extensions.rs` (none yet) and the
+/// cabin door materials. Extending the palette appends variants under new ids, so it
 /// extends this manifest chain and worlds saved under any earlier manifest still
 /// restore with unchanged meaning. Clients and servers built with a different
 /// palette do not match the handshake hash.
