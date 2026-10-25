@@ -22,7 +22,7 @@ They can be moved or duplicated in the editor; runtime pickup is not implemented
 state, so damage, replication and saves use ordinary voxel transactions. The
 door refuses a turn when its swing area contains terrain, a player or a body;
 step back if necessary. Panel holes remain after opening/closing, and breaking
-the hinge disables interaction. This first door opens from local +X toward +Z;
+the hinge disables interaction. A wooden knob stands one cell proud of each face, 1 m up on the side away from the hinge; panel cells beside the leaf (one cell either side) turn with it. This first door opens from local +X toward +Z;
 place it with identity rotation and scale in a quarter-metre scene.
 
 `ground.spvox` supplies the lawn and

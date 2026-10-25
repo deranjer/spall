@@ -168,6 +168,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    // Wooden knob a metre up on the side away from the hinge, one cell proud of
+    // each face. Panel-material cells beside the leaf turn with it.
+    for z in [-1, 1] {
+        door.voxels.insert(VoxelCoord { x: 4, y: 4, z }, 9);
+    }
     add(&mut model, door, "door.spvox", [9.25, 1.0, 6.0])?;
     let mut starts = asset("Interior player starts");
     for (x, z) in [(16, 11), (12, 20), (20, 20), (16, 24)] {

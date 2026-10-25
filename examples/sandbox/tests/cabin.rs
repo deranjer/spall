@@ -150,6 +150,26 @@ fn door_turns_preserve_damage_and_replay_exactly() {
         ),
         "closed doorway clears"
     );
+    // The knob (panel cells one cell off the leaf, 1 m up, away from the hinge)
+    // turned with the panel: closed (41, 8, 23/25) -> open (36/38, 8, 28).
+    let panel = |v: &spall_voxel::Volume, x, z| {
+        matches!(
+            v.sample(GlobalCell::new(x, 8, z)),
+            Ok(Sample::Filled(m)) if m == sandbox::game::CABIN_DOOR.panel
+        )
+    };
+    assert!(
+        panel(&initial, 41, 23) && panel(&initial, 41, 25),
+        "knob on both faces"
+    );
+    assert!(
+        panel(opened, 36, 28) && panel(opened, 38, 28),
+        "knob opens with panel"
+    );
+    assert!(
+        !panel(opened, 41, 23) && !panel(opened, 41, 25),
+        "knob left the closed spot"
+    );
     let door = spall_voxel::doors::Door::at(
         opened,
         GlobalCell::new(37, 4, 24),
@@ -169,8 +189,8 @@ fn door_turns_preserve_damage_and_replay_exactly() {
     }
     assert_eq!(replay.world_hash(), sim.world().world_hash());
     for y in 4..14 {
-        for x in 37..43 {
-            for z in 24..30 {
+        for x in 36..43 {
+            for z in 23..30 {
                 let cell = GlobalCell::new(x, y, z);
                 assert_eq!(
                     sim.world().terrain().volume.sample(cell),
