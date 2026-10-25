@@ -61,6 +61,7 @@ pub mod snow_query;
 pub mod stage;
 pub mod transfer;
 pub mod world;
+pub mod world_items;
 
 /// Re-exported so game/example code names one `RequestId` type, not a copy.
 pub use spall_protocol::RequestId;

@@ -38,6 +38,7 @@ impl Simulation {
             carcasses: Vec::new(),
             player_health: Default::default(),
             ice: None,
+            world_items: Default::default(),
             tick: Tick::ZERO,
             next_control_seq: 1,
             next_damage_seq: 0,
@@ -109,6 +110,7 @@ impl Simulation {
             carcasses: Vec::new(),
             player_health: Default::default(),
             ice: None,
+            world_items: Default::default(),
             tick,
             next_control_seq: 1,
             next_damage_seq: 0,
@@ -161,6 +163,7 @@ impl Simulation {
             mut weather,
             weather_seed,
             snow,
+            world_items,
             ..
         } = fresh;
         let (f_entity, f_volume, f_transaction, f_journal_seq) = world.registry().counters();
@@ -177,6 +180,21 @@ impl Simulation {
         if let Some(settings) = self.ice.as_ref().map(|ice| *ice.settings()) {
             self.set_ice(settings);
         }
+        // The fresh world's items, under ids past every one this world used.
+        let mut next_item_id = self.world_items.next_id().max(world_items.next_id());
+        let items = world_items
+            .iter()
+            .map(|item| {
+                next_item_id += 1;
+                spall_protocol::WorldItem {
+                    item_id: next_item_id - 1,
+                    ..*item
+                }
+            })
+            .collect();
+        self.world_items
+            .restore(next_item_id, items)
+            .expect("a fresh world's items are valid");
         let off_thread = self.pipeline.stages_off_thread();
         let old_world = std::mem::replace(&mut self.world, world);
         let old_pipeline = std::mem::replace(&mut self.pipeline, pipeline);

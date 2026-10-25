@@ -147,6 +147,7 @@ pub fn material_mapping() -> BTreeMap<String, MaterialId> {
         ("grass", MaterialId(10)),
         ("dirt", materials::DIRT),
         ("emissive.lamp", materials::LAMP),
+        ("ladder", materials::LADDER),
         // Sentinels consumed by `load`: authored water seeds the server fluid
         // region (springs and drains keep streams running) and never becomes
         // a solid runtime material.
@@ -179,6 +180,9 @@ pub struct LoadedScene {
     /// Cells marked `dam.gate`, still solid in `cells`; handed to
     /// [`spall_server::CustomWorld::with_dam_gate`] so an admin can open them.
     dam_gate_cells: Vec<GlobalCell>,
+    /// World items a new world starts with, from the project's `items.ron`
+    /// (see [`crate::world_items::load_placements`]).
+    pub world_items: Vec<spall_server::InitialWorldItem>,
 }
 
 impl LoadedScene {
@@ -244,8 +248,10 @@ impl LoadedScene {
         let spawns = self.player_spawns.clone();
         let column_water = self.column_water.clone();
         let gate_cells = self.dam_gate_cells.clone();
+        let world_items = self.world_items.clone();
         let scene = Arc::new(self);
-        let mut custom = CustomWorld::new(spawns, move || scene.world_setup());
+        let mut custom =
+            CustomWorld::new(spawns, move || scene.world_setup()).with_world_items(world_items);
         if let Some(setup) = column_water {
             custom = custom.with_column_water(setup);
         }
@@ -399,6 +405,12 @@ pub fn load(path: &Path) -> Result<LoadedScene, EditorSceneError> {
         player_spawns,
         column_water,
         dam_gate_cells,
+        world_items: crate::world_items::load_placements(&root).map_err(|message| {
+            EditorSceneError::Read {
+                path: root.join("items.ron"),
+                message,
+            }
+        })?,
     })
 }
 

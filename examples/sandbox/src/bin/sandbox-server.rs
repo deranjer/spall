@@ -180,6 +180,16 @@ struct Args {
     /// animal journal replay exists; the server refuses to start otherwise.
     #[arg(long, default_value_t = 0)]
     animals: u32,
+    /// Length of one day/night cycle in real minutes (60 Hz ticks), sent to
+    /// every client so all players see the same sky and the animals keep the
+    /// same schedule. `20` is the long-standing default; a 10-12 minute day
+    /// makes a 1 km crossing span a full cycle.
+    #[arg(long, default_value_t = 20.0)]
+    day_minutes: f32,
+    /// Hour of the day (0-24, so 15.5 is 15:30) at server tick 0. `6` is
+    /// sunrise, the default.
+    #[arg(long, default_value_t = 6.0)]
+    start_hour: f32,
     // --- T23 / G3 row 7: default-off resident-cache eviction ---
     /// Enable the residency pass: evict terrain bricks outside every player's
     /// interest box (this many resident bricks is the reported ceiling), reload
@@ -520,7 +530,17 @@ fn run_serve(args: Args) -> ExitCode {
                 } else {
                     Vec::new()
                 };
-                custom_world = Some(generated.into_custom_world().with_initial_bodies(floaters));
+                let scattered = generated.scatter_items(
+                    args.seed,
+                    &sandbox::world_scatter::ScatterSettings::default(),
+                );
+                tracing::info!(items = scattered.len(), "scattered world items");
+                custom_world = Some(
+                    generated
+                        .into_custom_world()
+                        .with_initial_bodies(floaters)
+                        .with_world_items(scattered),
+                );
                 Scene::Custom
             }
             Err(error) => {
@@ -567,6 +587,16 @@ fn run_serve(args: Args) -> ExitCode {
     {
         let _ = std::fs::create_dir_all(parent);
     }
+    let day_clock = match spall_core::time_of_day::DayClock::new(
+        (args.day_minutes * 3_600.0).round() as u32,
+        args.start_hour,
+    ) {
+        Ok(clock) => clock,
+        Err(error) => {
+            eprintln!("sandbox-server: --day-minutes/--start-hour: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let creatures = if args.animals > 0 {
         let anchors: Vec<[f64; 3]> = custom_world
             .as_ref()
@@ -591,7 +621,7 @@ fn run_serve(args: Args) -> ExitCode {
             args.seed,
         ) {
             Ok(director) => Some(spall_server::creature_service::CreatureService::new(
-                Box::new(director),
+                Box::new(director.with_day_clock(day_clock)),
             )),
             Err(error) => {
                 eprintln!("sandbox-server: --animals: {error}");
@@ -681,7 +711,7 @@ fn run_serve(args: Args) -> ExitCode {
         }
     };
 
-    let config = ServeConfig {
+    let mut config = ServeConfig {
         server: HostConfig {
             listen: args.listen,
             scene,
@@ -726,11 +756,14 @@ fn run_serve(args: Args) -> ExitCode {
             residency_disk_path,
             creatures,
             creature_shape,
+            item_pickup: None,
+            fires: None,
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),
             dormancy,
             credential_registry_file: args.player_credentials_file.clone(),
+            day_clock,
             custom_world,
         },
         harness: HarnessConfig {
@@ -798,6 +831,16 @@ fn run_serve(args: Args) -> ExitCode {
     let player_inventories = std::sync::Arc::new(std::sync::Mutex::new(
         sandbox::game::PlayerInventories::default(),
     ));
+    // E-key world item pickup (ENG-257) fills the same pack crafting reads.
+    config.server.item_pickup = Some(match durable_progression.clone() {
+        Some(store) => sandbox::world_items::durable_pickup(store),
+        None => sandbox::world_items::in_memory_pickup(player_inventories.clone()),
+    });
+    // Fire pits set down and fed from the same pack (ENG-266).
+    config.server.fires = Some(match durable_progression.clone() {
+        Some(store) => sandbox::fires::durable_fires(store),
+        None => sandbox::fires::in_memory_fires(player_inventories.clone()),
+    });
     let commit_inventories = player_inventories.clone();
     let commit_store = durable_progression.clone();
     let commit_handler: spall_server::CommittedEditHandler =

@@ -54,7 +54,7 @@ pub(super) async fn serve_async(
         std::fs::rename(&tmp, path)?;
     }
 
-    let handshake = server_handshake(&materials, asset_manifest_hash);
+    let handshake = server_handshake(&materials, asset_manifest_hash, config.server.day_clock);
     let credential_registry_file = config.server.credential_registry_file.clone();
     if credential_registry_file.is_some() && player_credentials.is_none() {
         return Err(ServeError::Configuration(
@@ -316,6 +316,7 @@ pub(super) async fn serve_async(
     let residency_limits = config.server.residency;
     let residency_disk_path = config.server.residency_disk_path.clone();
     let creature_service = config.server.creatures.clone();
+    let item_hooks = ItemHooks::new(&config.server, dev_unvalidated_actions);
     let creature_shape = config.server.creature_shape.clone();
     let contact_damage_cfg = config.server.contact_damage;
     let contact_damage_profiles = damage_profiles;
@@ -452,8 +453,9 @@ pub(super) async fn serve_async(
         // The session that staged each still-pending request, so the tick-report
         // outcome (`action_statuses`) can be routed back to only that client
         // instead of every connected client.
-        let mut submitted_by: HashMap<RequestId, (SessionId, Option<spall_protocol::PlayerId>)> =
-            HashMap::new();
+        // Keyed by ledger id (see `request_ids`); the value ends with the client's id.
+        let mut submitted_by: HashMap<RequestId, SubmittedBy> = HashMap::new();
+        let mut request_ids = RequestIds::default();
         let mut player_principals: HashMap<u64, spall_protocol::PlayerId> = HashMap::new();
         let mut commit_latency = CommitLatency::default();
 
@@ -590,17 +592,7 @@ pub(super) async fn serve_async(
             let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
             let mut progression_admitted: HashMap<u64, u32> = HashMap::new();
             if let Some(worker) = progression_worker.as_ref() {
-                for _ in 0..64 {
-                    match worker.completed.try_recv() {
-                        Ok(done) => send_to(
-                            &clients_for_sim,
-                            done.session,
-                            Outbound::Progression(Arc::new(done.response)),
-                        ),
-                        Err(std::sync::mpsc::TryRecvError::Empty)
-                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                    }
-                }
+                worker.send_completed(&clients_for_sim);
             }
             let mut drained = 0usize;
             while drained < MAX_INBOUND_PER_TICK {
@@ -697,7 +689,8 @@ pub(super) async fn serve_async(
                         // reconnect may legitimately retry the same reliable
                         // request on its replacement session. Replaying this
                         // status must not restage or re-apply the edit.
-                        if let Some(status) = replay_admitted_status(&sim, req.request_id) {
+                        let account = player_principals.get(&session.raw()).copied();
+                        if let Some(status) = request_ids.replay(&sim, session, account, &req) {
                             send_to(
                                 &clients_for_sim,
                                 session,
@@ -718,6 +711,20 @@ pub(super) async fn serve_async(
                             );
                             rejected_total += 1;
                             actions_throttled += 1;
+                            continue;
+                        }
+                        // The simulation uses ledger ids; replies use client ids.
+                        let client_request_id = req.request_id;
+                        let mut req = req;
+                        req.request_id = request_ids.assign(session, account, client_request_id);
+                        if try_use_item(
+                            &mut sim,
+                            session,
+                            &req,
+                            &item_hooks,
+                            &clients_for_sim,
+                            client_request_id,
+                        ) {
                             continue;
                         }
                         // A strike that meets a creature kills it (ENG-237).
@@ -751,14 +758,16 @@ pub(super) async fn serve_async(
                         };
                         match resolved {
                             Ok(submitted) => match submitted {
-                                Ok(status) => {
+                                Ok(mut status) => {
                                     submitted_at
                                         .entry(req.request_id)
                                         .or_insert_with(std::time::Instant::now);
                                     submitted_by.entry(req.request_id).or_insert((
                                         session,
-                                        player_principals.get(&session.raw()).copied(),
+                                        account,
+                                        client_request_id,
                                     ));
+                                    status.request_id = client_request_id;
                                     actions_staged += 1;
                                     send_to(
                                         &clients_for_sim,
@@ -773,14 +782,14 @@ pub(super) async fn serve_async(
                                     reject(
                                         &clients_for_sim,
                                         session,
-                                        req.request_id,
+                                        client_request_id,
                                         &intent_rejection_reason(&e),
                                     );
                                     rejected_total += 1;
                                 }
                             },
                             Err(rej) => {
-                                reject(&clients_for_sim, session, req.request_id, &rej.reason());
+                                reject(&clients_for_sim, session, client_request_id, &rej.reason());
                                 rejected_total += 1;
                             }
                         }
@@ -951,7 +960,7 @@ pub(super) async fn serve_async(
                                     // commit (the new world has a new pipeline). Say so, so the
                                     // client retries it instead of waiting for a receipt that
                                     // cannot come.
-                                    for (request, (session, _)) in submitted_by.drain() {
+                                    for (_, (session, _, request)) in submitted_by.drain() {
                                         reject(
                                             &clients_for_sim,
                                             session,
@@ -1293,13 +1302,14 @@ pub(super) async fn serve_async(
             for (rid, committed) in &report.committed {
                 committed_total += 1;
                 if !committed.removed_materials.is_empty()
-                    && let Some((session, player_id)) = submitted_by.get(rid).copied()
+                    && let Some((session, player_id, client_request_id)) =
+                        submitted_by.get(rid).copied()
                 {
                     let encoded = outbox_encoder.as_mut().and_then(|encoder| {
                         encoder(
                             session,
                             player_id,
-                            *rid,
+                            client_request_id,
                             committed.journal_seq,
                             &committed.removed_materials,
                         )
@@ -1310,7 +1320,7 @@ pub(super) async fn serve_async(
                         match worker.submit.try_send(CommittedEditWork {
                             session,
                             player_id,
-                            request_id: *rid,
+                            request_id: client_request_id,
                             removed: committed.removed_materials.clone(),
                         }) {
                             Ok(()) => {}
@@ -1397,30 +1407,13 @@ pub(super) async fn serve_async(
                 }
             }
             drop(span_serve_commit_fanout);
+            publish_world_items(&mut sim, &mut lj, &clients_for_sim);
             if let Some(service) = creature_service.as_ref()
                 && let Err(error) = run_creatures(service, &mut sim, &mut lj, &clients_for_sim)
             {
                 return SimResult::error(error, ticks_run);
             }
-            for status in action_statuses(&report) {
-                if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
-                    rejected_total += 1;
-                }
-                // A tick-resolved outcome (commit or deterministic staging
-                // rejection) belongs to whichever session staged it — route it
-                // there only. `submitted_by` is best-effort bookkeeping (cleared
-                // here on first resolution); an untracked request (there
-                // shouldn't be one) falls back to the old broadcast so a status
-                // is never silently dropped.
-                match submitted_by.remove(&status.request_id) {
-                    Some((session, _player_id)) => send_to(
-                        &clients_for_sim,
-                        session,
-                        Outbound::Status(Arc::new(status)),
-                    ),
-                    None => broadcast(&clients_for_sim, Outbound::Status(Arc::new(status))),
-                }
-            }
+            rejected_total += route_tick_statuses(&report, &mut submitted_by, &clients_for_sim);
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never
             // interest-filtered).

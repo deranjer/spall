@@ -9,6 +9,7 @@
 //! ordinary terrain: a crow whose nest is damaged rebuilds the missing cells,
 //! and one whose tree top is gone picks a new site.
 
+use spall_core::time_of_day::DayClock;
 use spall_core::{GlobalCell, MaterialId};
 use spall_server::creature_service::CreatureAction;
 use spall_sim::Simulation;
@@ -51,8 +52,6 @@ const TREE_RISE_CELLS: i64 = 8;
 /// The site search looks this far above and below the circle, cells.
 const SEARCH_ABOVE_CELLS: i64 = 16;
 const SEARCH_BELOW_CELLS: i64 = 48;
-/// Bedtime and waking trail sunset and sunrise by up to an hour per crow.
-const ROOST_LAG_TICKS: u64 = spall_core::time_of_day::DAY_CYCLE_TICKS / 24;
 /// The material nests are built of.
 const NEST_MATERIAL: MaterialId = crate::game::materials::WOOD;
 
@@ -150,11 +149,11 @@ fn empty(sim: &Simulation, cell: GlobalCell) -> bool {
 
 /// Whether crow `id` roosts at `tick`: the sun is down at a time shifted back
 /// by a per-crow lag, so a flock does not move as one.
-fn roosting_time(tick: u64, id: u64) -> bool {
+fn roosting_time(clock: DayClock, tick: u64, id: u64) -> bool {
     let mut mix = id.wrapping_mul(0xD6E8_FEB8_6659_FD93);
     mix ^= mix >> 31;
-    let lag = mix % ROOST_LAG_TICKS;
-    tick >= lag && spall_core::time_of_day::state_at_tick(tick - lag).sun_height() < 0.0
+    let lag = mix % clock.hour_ticks();
+    tick >= lag && clock.state_at(tick - lag).sun_height() < 0.0
 }
 
 /// Centre of a terrain cell, metres.
@@ -560,7 +559,7 @@ impl AnimalDirector {
         let crow = self.crows.get(&cx.id)?;
         let top = crow.nest?;
         if nest_cells(top).iter().all(|&cell| filled(cx.sim, cell)) {
-            roosting_time(tick, cx.id).then_some(true)
+            roosting_time(cx.clock, tick, cx.id).then_some(true)
         } else {
             (tick >= crow.next_trip).then_some(false)
         }
@@ -778,7 +777,7 @@ impl AnimalDirector {
                 }
             }
             BirdGait::Roost { .. } => {
-                if !complete || !roosting_time(tick, cx.id) {
+                if !complete || !roosting_time(cx.clock, tick, cx.id) {
                     return leave(walker, step);
                 }
                 step.tag = LOCOMOTION_ROOST;
@@ -820,8 +819,14 @@ mod tests {
         // Tick 0 is 06:00.
         let at = |h: u64| DAY_CYCLE_TICKS * 2 + ((h + 18) % 24) * hour;
         for id in 0..100 {
-            assert!(!roosting_time(at(12), id), "crow {id} roosting at noon");
-            assert!(roosting_time(at(0), id), "crow {id} up at midnight");
+            assert!(
+                !roosting_time(DayClock::default(), at(12), id),
+                "crow {id} roosting at noon"
+            );
+            assert!(
+                roosting_time(DayClock::default(), at(0), id),
+                "crow {id} up at midnight"
+            );
         }
     }
 }

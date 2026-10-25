@@ -90,8 +90,10 @@ The sandbox's blueprints:
 | Sticks | Above | a log | 6 sticks |
 | Fire pit | Above | six sticks in the centre, six stones in a ring round them | 1 fire pit |
 
-Sticks and the fire pit are new items (recipe catalogue version 2). A fire pit
-sits in the pack; setting one down in the world is not built yet.
+Sticks and the fire pit are new items (recipe catalogue version 2). Clicking a
+fire pit in the open pack sets it down, lit, on open ground in front of the
+player (ENG-266); E beside it feeds it a log or a stick from the pack. See
+[architecture](architecture.md) for fires.
 
 - **Engine and game.** The engine draws the book and cloth
   (`crates/spall_client/assets/hud/book.png` and `cloth.png`, drawn by
@@ -101,7 +103,7 @@ sits in the pack; setting one down in the world is not built yet.
 - **Shared inventory.** The pack and the book read one `InventoryFeed`, refreshed
   every 1.5 s while either is open.
 - **Not yet:** more than 12 blueprints (paging), rotated items on the cloth,
-  blueprints learned in play, placing a fire pit, sounds.
+  blueprints learned in play, sounds.
 
 ## Planned
 

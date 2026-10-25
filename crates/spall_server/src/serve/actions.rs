@@ -20,7 +20,7 @@ pub(super) fn dev_intent_from_request(
     let kind = match req.action {
         ActionKind::Cut => EditKind::Cut,
         ActionKind::Place => EditKind::Place(spall_voxel::fixtures::STONE),
-        ActionKind::Interact => return None,
+        ActionKind::Interact | ActionKind::PlaceItem => return None,
     };
     Some(EditIntent {
         request_id: req.request_id,

@@ -385,7 +385,7 @@ pub async fn connect(
                 }
                 check_compatible(&client_handshake, &accept.server_handshake)
                     .map_err(|e| TransportError::Auth(AuthReject::Incompatible(e.to_string())))?;
-                Connection::from_parts(
+                let mut conn = Connection::from_parts(
                     quic,
                     send,
                     recv,
@@ -393,7 +393,9 @@ pub async fn connect(
                     accept.session,
                     accept.player_id,
                     Role::Client,
-                )
+                )?;
+                conn.server_day_clock = accept.server_handshake.day_clock;
+                Ok(conn)
             }
             ServerAuthReply::Rejected(reject) => Err(TransportError::Auth(reject)),
         }

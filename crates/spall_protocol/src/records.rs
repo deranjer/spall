@@ -58,6 +58,7 @@ pub enum WireTag {
     CreatureMotionFrame = 27,
     CreatureDespawn = 28,
     PlayerHealth = 29,
+    WorldItemUpdate = 30,
 }
 
 impl WireTag {
@@ -90,6 +91,7 @@ impl WireTag {
             27 => Self::CreatureMotionFrame,
             28 => Self::CreatureDespawn,
             29 => Self::PlayerHealth,
+            30 => Self::WorldItemUpdate,
             _ => return None,
         })
     }
@@ -359,6 +361,10 @@ pub enum ActionKind {
     Place = 1,
     /// Use a nearby world object; validated against the authoritative player.
     Interact = 2,
+    /// Set an item from the pack down in front of the player (ENG-266: a fire
+    /// pit). `tool` carries the game item kind; the server finds the spot
+    /// from its own player and the aim direction.
+    PlaceItem = 3,
 }
 
 /// What the client claims it is aiming at.

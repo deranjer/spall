@@ -79,9 +79,12 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
             residency_disk_path: None,
             creatures: None,
             creature_shape: None,
+            item_pickup: None,
+            fires: None,
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,
+            day_clock: Default::default(),
             custom_world: None,
         },
         harness: HarnessConfig {

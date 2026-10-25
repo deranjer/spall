@@ -69,6 +69,13 @@ pub struct HostConfig {
     /// that meets a creature before any geometry kills it and leaves a carcass
     /// of those voxels in the terrain. Ignored without `creatures`.
     pub creature_shape: Option<spall_sim::CreatureShape>,
+    /// The game's pack for E-key world item pickup (ENG-257). `None`: items
+    /// are still replicated and drawn, but nothing can be picked up.
+    pub item_pickup: Option<ItemPickup>,
+    /// The game's fire rules (ENG-266): setting a fire pit down from the pack
+    /// and feeding fires with E. `None`: fires still burn, replicate and warm,
+    /// but none can be set down or fed.
+    pub fires: Option<Fires>,
     /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
     /// damage pass. `None` keeps every prior run byte-identical (the pass is
     /// never invoked, exactly like every scene before this increment).
@@ -94,6 +101,9 @@ pub struct HostConfig {
     /// Optional credential registry path polled for atomic rotation/revocation
     /// updates. Only used by player-credential authentication.
     pub credential_registry_file: Option<PathBuf>,
+    /// Day length and starting hour of the shared sky and animal schedules;
+    /// sent to every client in the handshake.
+    pub day_clock: spall_core::time_of_day::DayClock,
     /// The world and player spawns for [`Scene::Custom`]; ignored for every
     /// other scene. `serve` fails fast if `scene` is `Custom` and this is `None`.
     pub custom_world: Option<CustomWorld>,
@@ -242,9 +252,12 @@ impl ServeConfig {
                 residency_disk_path: None,
                 creatures: None,
                 creature_shape: None,
+                item_pickup: None,
+                fires: None,
                 contact_damage: None,
                 dormancy: None,
                 credential_registry_file: None,
+                day_clock: Default::default(),
                 custom_world: None,
             },
             harness: HarnessConfig::default(),

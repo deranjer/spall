@@ -170,6 +170,11 @@ pub struct EditPipeline {
     /// pipeline rather than in a transport session: a reliable retry may arrive
     /// on a replacement connection.
     statuses: HashMap<u64, ActionStatus>,
+    /// Ids of settled entries in `statuses`, oldest first. Past
+    /// `status_cap` the oldest are forgotten, so the ledger is a bounded
+    /// window of recent answers rather than every request ever admitted.
+    settled_order: VecDeque<u64>,
+    status_cap: usize,
     /// Regions with a job in flight or staged-not-committed this tick.
     active_regions: HashSet<RegionKey>,
     max_pending: usize,
@@ -198,6 +203,8 @@ impl EditPipeline {
             serialized: HashSet::new(),
             committed: HashMap::new(),
             statuses: HashMap::new(),
+            settled_order: VecDeque::new(),
+            status_cap: spall_protocol::limits::MAX_RETAINED_ACTION_STATUSES,
             active_regions: HashSet::new(),
             max_pending,
             serialize_threshold: serialize_threshold.max(1),
@@ -253,6 +260,35 @@ impl EditPipeline {
     /// request id must receive this exact value without re-staging the intent.
     pub fn action_status(&self, request_id: RequestId) -> Option<&ActionStatus> {
         self.statuses.get(&request_id.0)
+    }
+
+    /// Records the answer to a request the host settled without an edit (a
+    /// world item pickup), so a retry replays it through
+    /// [`Self::action_status`] like any admitted request. An already admitted
+    /// id keeps its status.
+    pub fn record_status(&mut self, status: ActionStatus) {
+        let key = status.request_id.0;
+        if !self.statuses.contains_key(&key) {
+            self.settle_status(key, status);
+        }
+    }
+
+    /// Stores a settled (committed, rejected, or host-answered) status and
+    /// forgets the oldest settled ones beyond the ledger window. A retry older
+    /// than the window is treated as a new request.
+    fn settle_status(&mut self, key: u64, status: ActionStatus) {
+        let was_queued = self
+            .statuses
+            .insert(key, status)
+            .is_none_or(|old| matches!(old.outcome, ActionOutcome::Queued));
+        if was_queued {
+            self.settled_order.push_back(key);
+        }
+        while self.settled_order.len() > self.status_cap {
+            if let Some(old) = self.settled_order.pop_front() {
+                self.statuses.remove(&old);
+            }
+        }
     }
 
     /// `true` when nothing is pending, in flight, or awaiting install.
@@ -857,7 +893,7 @@ impl EditPipeline {
                 *next_control_seq += 1;
                 self.conflicts.remove(&region);
                 self.committed.insert(request.0, done.clone());
-                self.statuses.insert(request.0, done.action_status(request));
+                self.settle_status(request.0, done.action_status(request));
                 report.committed.push((request, done));
             }
             // T23 / G3 row 7, slice C: the collider rebuild needs an evicted
@@ -998,7 +1034,7 @@ impl EditPipeline {
     }
 
     fn record_rejection(&mut self, request: RequestId, reason: String) {
-        self.statuses.insert(
+        self.settle_status(
             request.0,
             ActionStatus {
                 request_id: request,
@@ -1211,5 +1247,31 @@ mod tests {
         );
         assert_eq!(world.world_hash(), world_before);
         assert_eq!(journal.entries(), journal_before.as_slice());
+    }
+
+    #[test]
+    fn the_status_ledger_keeps_a_bounded_window_of_settled_answers() {
+        let mut pipeline = EditPipeline::new(2, 3);
+        pipeline.status_cap = 8;
+        let answer = |id: u64| ActionStatus {
+            request_id: RequestId(id),
+            outcome: ActionOutcome::Queued,
+        };
+        for id in 0..1000 {
+            pipeline.record_status(answer(id));
+        }
+        assert_eq!(pipeline.statuses.len(), 8);
+        assert_eq!(pipeline.settled_order.len(), 8);
+        assert!(pipeline.action_status(RequestId(991)).is_none());
+        assert!(pipeline.action_status(RequestId(992)).is_some());
+        assert!(pipeline.action_status(RequestId(999)).is_some());
+
+        // An answer that is still queued is not in the window until it settles.
+        let world = SimWorld::new(crate::fixtures::bridged_terrain_setup()).unwrap();
+        pipeline
+            .submit_intent(cut(5_000, 10, 4, 1, 2), &world)
+            .unwrap();
+        assert_eq!(pipeline.settled_order.len(), 8);
+        assert!(pipeline.action_status(RequestId(5_000)).is_some());
     }
 }

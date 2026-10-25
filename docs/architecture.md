@@ -611,8 +611,8 @@ ENG-122 worker observability and transport profiling sections (2026-10-04, remov
 ### ENG-128 day/night presentation clock
 
 The sandbox's default sky, sun, moon, and environment lighting derive from the
-authoritative simulation tick. One Spall day is 72,000 ticks at 60 Hz (20 real
-minutes); tick zero is 06:00. Clients render the same clock from replicated
+authoritative simulation tick. By default one Spall day is 72,000 ticks at 60 Hz
+(20 real minutes) and tick zero is 06:00 (see "Configurable day" below). Clients render the same clock from replicated
 server ticks instead of maintaining wall clocks. The lunar phase advances by
 one eighth per day over an eight-day cycle, from full moon through new moon and
 back. Moon visibility follows its orbit and phase, including a subdued daytime
@@ -622,11 +622,47 @@ moonlight adds a small phase-dependent contribution.
 The clock is presentation state, not persisted world state: a newly started
 simulation begins at day one sunrise. Explicit environment selection and the
 in-game cycle pause are visual overrides; resuming restores tick-derived
-lighting. No protocol clock field is needed because the existing server tick
-already supplies synchronization. The tick -> time-of-day mapping
-(`spall_core::time_of_day::state_at_tick`) lives in `spall_core` so server-side
-game systems can read it without the client; client lighting builds on the same
-mapping, and night is when `DayNightState::sun_height()` is negative.
+lighting. The existing server tick supplies the time. The tick -> time-of-day
+mapping (`spall_core::time_of_day::DayClock::state_at`) lives in `spall_core` so
+server-side game systems can read it without the client; client lighting builds
+on the same mapping, and night is when `DayNightState::sun_height()` is negative.
+
+#### Configurable day (ENG-252)
+
+The day length and the hour at tick 0 are server settings, so a crossing of the
+1 km map can span a full day/night cycle. `DayClock { day_ticks, start_offset_ticks }`
+(`spall_core::time_of_day`, day length 3,600 to 5,184,000 ticks) is set on
+`HostConfig::day_clock` and carried in the server's `Handshake` reply
+(`Handshake::day_clock`; validated, not part of the compatibility check).
+`spall_net::Connection::server_day_clock` hands it to the client, which publishes
+it on `InteractiveSession::day_clock` for the renderer, so every player draws the
+same sky. The sandbox server sets it from `--day-minutes` (default 20) and
+`--start-hour` (default 6, sunrise) and gives the same clock to
+`AnimalDirector::with_day_clock`, so deer sleep, crows roost and wolves howl by the
+sky the clients see; their per-animal bedtime stagger scales with the day (one
+Spall hour). The defaults reproduce the fixed 72,000-tick day from sunrise. The
+clock is a startup setting, not saved world state; ticks still restart on a
+server restart. A Winter Crossing scenario would use about `--day-minutes 10` to
+`12` with `--start-hour 15.5`.
+
+#### Snow and blizzard slow walking (ENG-252)
+
+`step_character_in_water` takes a `ground_scale` that multiplies walk and run
+speed (clamped to `(0, 1]`; swimming and climbing ignore it). Both sides derive
+it the same way: `spall_physics::ground_cell_below` finds the terrain cell under
+the feet, each side reads the snow depth on that cell's top face
+(`SnowState::depth_q16_at` on the server in `Simulation::advance_players`;
+`ReplicaWorld::ground_speed_scale` over replicated snow frames and weather on the
+client), and `spall_physics::snow_speed_scale` maps depth to a multiplier: linear
+down to 60 % at the 0.5 m maximum depth (`tuning::SNOW_DEEP_SLOWDOWN`), times a
+further 90 % in a blizzard wherever snow lies under the feet
+(`tuning::BLIZZARD_SLOWDOWN`; snow under the feet stands in for being outdoors).
+Depth is bucketed to 1/16 m (`SNOW_DEPTH_BUCKET_SHIFT`) so replication lag rarely
+changes the result. The predictor takes the scale through
+`PredictedPlayer::set_ground_scale`, sampled by the mover loop from the feet
+position of its previous iteration (the replica is locked before the predictor),
+records it with each predicted step and replays reconcile steps with the recorded
+value. The testing-only client-authority physics thread does not set it.
 
 ### ENG-130 regional terrain startup
 
@@ -725,6 +761,52 @@ The sandbox ships `fixtures/cabin`, an editor project with a fixed SPVOX shell,
 four player starts, and separate bed, table, bench, lamp and door assets. The
 scene importer places these into normal destructible terrain. Furniture is
 modular for authoring; it has no runtime pickup behavior.
+
+World items (ENG-257) are separate from terrain: `spall_sim::Simulation` holds
+each item's stable id, game item kind and pose, creates and removes them only on
+the owning thread between ticks, and queues the change for the server to send
+as a `WorldItemUpdate` after the tick (join lists seed late joiners). Items own
+no voxels and have no physics. E sends `ActionKind::Interact`; the server picks
+the nearest item its own player can see within 3 m and asks the game's
+`ItemPickup` callback to put it in the pack, removing it only when the game
+accepts. The sandbox's pack is the ENG-244 inventory (in memory, or the durable
+progression database with player credentials), limited to 12 distinct kinds.
+New custom worlds get items from `CustomWorld::with_world_items`; the sandbox's
+editor-scene loader reads them from `<project>/items.ron` (the cabin has a
+shovel and the note). Items are saved in checkpoints. The client draws each item
+from `PackView::item_model`, tinted through `PackView::item_tints`. The sandbox
+decodes the ENG-254 `fixtures/items/assets/*.spvox` models once at startup
+(the compass with its needle), lays each on its largest face, and scales the
+compass and note down to life size. A model that fails to load is logged as an
+error and drawn as `pack_view::placeholder_model` cubes. The client also labels the
+nearest one `E  Pick up <name>`, ahead of a door prompt.
+
+Fires (ENG-266) are world items with fuel (`WorldItem::fire_fuel_s`), not
+terrain cells or a separate entity, so they reuse item replication, join lists
+and checkpoints. `Simulation::tick` burns every lit fire a second of fuel per
+second (`BLIZZARD_BURN_RATE`, 2x, for a fire with no solid cell within 8 m above
+it during a blizzard); one that runs out goes out at fuel 0 and stays as an unlit
+pit. A fire is re-announced only when it goes out or is fed, so a client's fuel
+is as of the last change. Clicking a stack in the open pack asks
+`PackView::item_use`; `ItemUse::Place` sends `ActionKind::PlaceItem` with the
+item kind. The server finds the spot with `spall_sim::world_items::fire_spot`
+from its own player's eye and the aim direction: the top face of solid ground
+the aim meets within 3 m, else the ground 1.2 m ahead, with open air over a
+0.6 m footprint 0.75 m high. Only then does the game's `FireRules::place` take
+the pit from the pack and give the starting fuel. E (`Interact`) whose nearest
+visible item is a fire calls `FireRules::refuel` (fuel from the pack) instead of
+pickup; adding fuel relights an unlit pit. Successes go in the admission ledger,
+so retries never place or feed twice. The sandbox's numbers are all in
+`sandbox::fires`: a pit starts with 180 s, a stick adds 180 s, a log 600 s (logs
+are used first), and a fire at 1800 s takes no more. Engine-side numbers (reach,
+footprint, heat, blizzard rate) are in `spall_sim::world_items`.
+`spall_sim::world_items::heat_at(items, position)` sums lit fires' warming in
+degrees of felt temperature, 30 at the centre falling as `1 - (d/4 m)^2` to 0 at 4 m; the client's
+presented cold (`body_state`) adds it from the replicated fires, and server
+warmth (ENG-264) is to call it with `Simulation::world_items`. The client draws
+a fire from `PackView::item_model` plus, while lit, `PackView::lit_model` (the
+sandbox's lamp-material glow blocks, until ENG-267), and each lit fire is a
+real-time `PointLight` competing with torch voxels for the nearest slots.
 
 Quarter-metre doors use `spall_voxel::doors` to find a visible nearby hinge and
 plan a +X-to-+Z panel turn. The hinge material records open/closed state. E sends

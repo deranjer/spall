@@ -77,6 +77,7 @@ pub struct CustomWorld {
     pub(super) build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
     pub(super) column_water: Option<spall_sim::column_water::ColumnWaterSetup>,
     pub(super) initial_bodies: Vec<InitialBody>,
+    pub(super) world_items: Vec<InitialWorldItem>,
     pub(super) dam_gate: Option<DamGate>,
     pub(super) vegetation: Option<spall_ecology::living::LivingState>,
     pub(super) ice: Option<spall_sim::IceSettings>,
@@ -91,6 +92,16 @@ pub struct InitialBody {
     pub material: spall_core::MaterialId,
     pub density_kg_m3: f32,
     pub position_m: [f64; 3],
+}
+
+/// A world item (ENG-257) placed when a custom world is created: a game item
+/// kind lying at `translation_m` (metres), turned `yaw_rad` about +Y. The
+/// server gives it its stable id.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InitialWorldItem {
+    pub kind: u16,
+    pub translation_m: [f64; 3],
+    pub yaw_rad: f32,
 }
 
 /// A scene-authored dam gate an admin can open or close at runtime: the cells
@@ -113,6 +124,7 @@ impl CustomWorld {
             build: Arc::new(build),
             column_water: None,
             initial_bodies: Vec::new(),
+            world_items: Vec::new(),
             dam_gate: None,
             vegetation: None,
             ice: None,
@@ -138,6 +150,13 @@ impl CustomWorld {
     #[must_use]
     pub fn with_initial_bodies(mut self, bodies: Vec<InitialBody>) -> Self {
         self.initial_bodies = bodies;
+        self
+    }
+
+    /// Items to place when the world is created; a restored save keeps its own.
+    #[must_use]
+    pub fn with_world_items(mut self, items: Vec<InitialWorldItem>) -> Self {
+        self.world_items = items;
         self
     }
 
@@ -320,6 +339,10 @@ impl Scene {
                     body.density_kg_m3,
                     spall_sim::BodyPose::new(glam::DQuat::IDENTITY, body.position_m),
                 );
+            }
+            for item in &custom.world_items {
+                sim.spawn_world_item(item.kind, item.translation_m, item.yaw_rad)
+                    .expect("custom world item is valid");
             }
         }
         if matches!(self, Scene::G4Workload) {

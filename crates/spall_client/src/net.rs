@@ -715,6 +715,7 @@ fn client_handshake(
         cell_size_codes: vec![spall_core::CellSizeCode::Quarter],
         session: spall_protocol::SessionId::from_parts(spall_protocol::SlotId(0), 1),
         limits: NegotiatedLimits::DEFAULT,
+        day_clock: spall_core::time_of_day::DayClock::default(),
     }
 }
 
@@ -1632,6 +1633,9 @@ async fn run_async(
             return Err(ClientNetError::Transport(e));
         }
     };
+    if let Some(session) = &config.interactive {
+        let _ = session.day_clock.set(conn.server_day_clock());
+    }
     let conn = Arc::new(ClientConnection::new(conn));
     log.write(&ProcessRecord::new(
         ProcessEvent::Ready,
@@ -1908,16 +1912,15 @@ async fn run_async(
                         lock(&replica).apply_player_health(health);
                     }
                     Ok(Some(WireRecord::CreatureSpawn(spawn))) => {
-                        if let Err(error) = replica
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .apply_creature_spawn(&spawn)
-                        {
+                        if let Err(error) = lock(&replica).apply_creature_spawn(&spawn) {
                             eprintln!("spall-client: rejected creature spawn: {error}");
                         }
                     }
                     Ok(Some(WireRecord::CreatureDespawn(despawn))) => {
                         lock(&replica).apply_creature_despawn(&despawn);
+                    }
+                    Ok(Some(WireRecord::WorldItemUpdate(update))) => {
+                        lock(&replica).apply_world_items(&update);
                     }
                     Ok(Some(WireRecord::SnowSurfaceFrame(frame))) => {
                         if frame.effective_tick < weather_floor {
@@ -2809,6 +2812,9 @@ async fn run_async(
             // `crate::tick_accumulator` for the fix.
             let mut tick_accumulator = TickAccumulator::new(Duration::from_secs_f32(MOVEMENT_DT_S));
             let mut last_tick_accumulator_at = std::time::Instant::now();
+            // Where the predicted feet were last iteration: the snow underfoot is
+            // sampled there, before the predictor lock (lock order: replica, then pred).
+            let mut last_feet: Option<[f64; 3]> = None;
             // Geometry changes rarely; motion snapshots do not. Remember the
             // last topology version so ordinary 60 Hz pose refreshes do not
             // clone every replicated voxel volume under the replica lock.
@@ -2856,6 +2862,13 @@ async fn run_async(
                     profile.snapshot.add(spent);
                 }
                 let terrain_volume = terrain.as_ref().map(|t| t.volume.clone());
+                let ground_scale = terrain_volume
+                    .as_ref()
+                    .zip(last_feet)
+                    .map_or(1.0, |(volume, feet)| {
+                        let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.ground_speed_scale(volume, feet)
+                    });
                 let section = std::time::Instant::now();
                 let (body_collisions, traced_samplers) = {
                     let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
@@ -3054,6 +3067,7 @@ async fn run_async(
                             // long. The same sampled `input`/`seq` covers
                             // every tick in the burst, exactly like ordinary
                             // held-input reuse already does.
+                            pl.set_ground_scale(ground_scale);
                             let allowed_ticks = crate::tick_accumulator::cap_prediction_ticks(
                                 ticks_to_run,
                                 pl.next_tick().0,
@@ -3181,6 +3195,7 @@ async fn run_async(
                     note_mover_stall("predictor", spent);
                     profile.predictor.add(spent);
                 }
+                last_feet = feet;
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
                 }

@@ -8,6 +8,7 @@
 //! Mismatch is a clear rejection, not speculative compatibility code.
 
 use serde::{Deserialize, Serialize};
+use spall_core::time_of_day::DayClock;
 use spall_core::{CellSizeCode, WorldId};
 
 use crate::canonical::Hash32;
@@ -17,7 +18,7 @@ use crate::session::SessionId;
 
 /// The one wire version. Client and server ship together, so every record, capability and
 /// handshake shares this number; any layout change bumps it. Pre-release: no per-record versions.
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 24;
 
 /// Fixed simulation and snapshot rates (Hz).
 pub const SERVER_TICK_HZ: u16 = 60;
@@ -72,6 +73,9 @@ pub struct Handshake {
     pub cell_size_codes: Vec<CellSizeCode>,
     pub session: SessionId,
     pub limits: NegotiatedLimits,
+    /// The server day length and start time; a client takes it from the
+    /// server reply. Not part of the compatibility check.
+    pub day_clock: DayClock,
 }
 
 impl Record for Handshake {
@@ -87,6 +91,12 @@ impl Record for Handshake {
             return Err(RecordError::OutOfRange {
                 field: "Handshake.limits",
                 detail: "limits must be non-zero and within protocol ceilings",
+            });
+        }
+        if !self.day_clock.is_valid() {
+            return Err(RecordError::OutOfRange {
+                field: "Handshake.day_clock",
+                detail: "day length or start offset out of range",
             });
         }
         // At most one entry per known cell-size code.
@@ -202,7 +212,21 @@ mod tests {
             cell_size_codes: vec![CellSizeCode::Quarter, CellSizeCode::Sixteenth],
             session: SessionId::from_parts(crate::session::SlotId(1), 1),
             limits: NegotiatedLimits::DEFAULT,
+            day_clock: spall_core::time_of_day::DayClock::default(),
         }
+    }
+
+    #[test]
+    fn day_clock_is_validated_but_not_compared() {
+        let server = server_handshake();
+        let mut client = server.clone();
+        client.day_clock = DayClock::new(36_000, 15.5).unwrap();
+        assert!(client.validate().is_ok());
+        assert!(check_compatible(&client, &server).is_ok());
+        client.day_clock.start_offset_ticks = client.day_clock.day_ticks;
+        assert!(client.validate().is_err());
+        client.day_clock.day_ticks = 0;
+        assert!(client.validate().is_err());
     }
 
     #[test]

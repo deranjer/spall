@@ -170,6 +170,8 @@ pub struct Simulation {
     player_health: std::collections::HashMap<spall_protocol::PlayerId, u16>,
     /// Winter ice, once the game installs its settings (ENG-268).
     ice: Option<ice::IceRuntime>,
+    /// Server-owned items lying in the world (ENG-257).
+    world_items: crate::world_items::WorldItems,
 }
 
 /// Frees a large value on a background thread. Dropping a full-size world (hundreds of thousands
@@ -220,6 +222,7 @@ mod snow_glue;
 mod tick;
 mod water;
 mod weather;
+mod world_items;
 use helpers::*;
 
 #[cfg(test)]

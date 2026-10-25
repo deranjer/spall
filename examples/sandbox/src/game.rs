@@ -144,8 +144,13 @@ pub mod items {
     pub const STONE_CHUNK: ItemId = ItemId(3);
     pub const STONE_BLOCK: ItemId = ItemId(4);
     pub const STICK: ItemId = ItemId(5);
-    /// A fire pit ready to set down (placing it is not built yet).
+    /// A fire pit, set down from the pack as a lit fire (ENG-266).
     pub const FIRE_PIT: ItemId = ItemId(6);
+    // Winter Crossing tools and the cabin note (ENG-257), picked up as world items.
+    pub const SHOVEL: ItemId = ItemId(7);
+    pub const AXE: ItemId = ItemId(8);
+    pub const COMPASS: ItemId = ItemId(9);
+    pub const NOTE: ItemId = ItemId(10);
 }
 
 pub mod recipe_ids {
@@ -321,6 +326,24 @@ impl Inventory {
 
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Takes one `item` out, advancing the revision; `false` (and nothing
+    /// changes) when there is none.
+    pub fn take(&mut self, item: ItemId) -> bool {
+        let Some(count) = self.stacks.get(&item).copied() else {
+            return false;
+        };
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        if count > 1 {
+            self.stacks.insert(item, count - 1);
+        } else {
+            self.stacks.remove(&item);
+        }
+        self.revision = revision;
+        true
     }
 
     pub fn count(&self, item: ItemId) -> u32 {
