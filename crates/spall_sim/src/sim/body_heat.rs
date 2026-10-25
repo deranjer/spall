@@ -121,6 +121,46 @@ mod tests {
         assert!(lowest < PLAYER_MAX_HEALTH - 20, "lowest health {lowest}");
     }
 
+    /// A winter blizzard in the open at server `tick`: the lowest warmth and
+    /// health over ten minutes, dry or soaked from the start.
+    fn blizzard_day(tick: u64, soaked: bool) -> (f32, u16) {
+        let (mut sim, player) = night(|_| {}, [10.0, 1.0, 2.0]);
+        sim.tick = Tick(tick);
+        sim.set_weather_override(Some(spall_protocol::WeatherKind::Blizzard), None);
+        if soaked {
+            sim.world
+                .players
+                .get_mut(&player.get())
+                .unwrap()
+                .body
+                .wetness = 1.0;
+        }
+        let mut floor = 1.0_f32;
+        let mut lowest = PLAYER_MAX_HEALTH;
+        for _ in 0..600 {
+            sim.advance_body_heat(1.0);
+            floor = floor.min(sim.world().player(player).unwrap().body.warmth);
+            lowest = lowest.min(sim.player_health(player).unwrap());
+        }
+        (floor, lowest)
+    }
+
+    #[test]
+    fn a_winter_blizzard_by_day_never_hurts_a_dry_player_in_the_open() {
+        use spall_core::time_of_day::DAY_CYCLE_TICKS;
+        // Noon, and sunrise (the coldest daylight: no day warming yet).
+        for (name, tick) in [("noon", DAY_CYCLE_TICKS / 4), ("sunrise", DAY_CYCLE_TICKS)] {
+            let (floor, lowest) = blizzard_day(tick, false);
+            eprintln!("dry blizzard {name}: warmth floor {floor:.3}, lowest health {lowest}");
+            assert_eq!(lowest, PLAYER_MAX_HEALTH, "{name}");
+            assert!(floor > warmth::DAMAGE_BELOW_WARMTH, "{name}: {floor}");
+        }
+        // Soaked is allowed to hurt by day; reported, not asserted.
+        for (name, tick) in [("noon", DAY_CYCLE_TICKS / 4), ("sunrise", DAY_CYCLE_TICKS)] {
+            let (floor, lowest) = blizzard_day(tick, true);
+            eprintln!("soaked blizzard {name}: warmth floor {floor:.3}, lowest health {lowest}");
+        }
+    }
     #[test]
     fn a_fire_beside_the_player_prevents_cold_damage() {
         let (mut sim, player) = night(|_| {}, [10.0, 1.0, 2.0]);

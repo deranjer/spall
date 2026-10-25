@@ -49,7 +49,8 @@ Fire checks (ENG-266):
   QUIC fire: set down from the pack, burnt out, fed alight with E, and seen
   burning by a client joining afterwards.
 - `cargo test -p spall_sim --lib -- warmth body_heat` checks that a winter night in the open drains
-  health while a fire, a roofed hut or an open pit prevents it, that a blizzard and being wet are
+  health while a fire, a roofed hut or an open pit prevents it, that a winter blizzard by day (noon
+  and sunrise) never hurts a dry player in the open, that a blizzard and being wet are
   colder, that deeper water wets more, and that wetness dries, faster by a fire.
 - `cargo test -p spall_client --lib body_state` checks that the server's warmth and wetness show
   as cold and wet looks without snapping.

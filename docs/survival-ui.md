@@ -23,7 +23,7 @@ authoritative `PlayerHealth` record (ENG-223, ENG-264/265).
 | State | Driven by | On screen |
 | --- | --- | --- |
 | Cold | Lost warmth from the server (`spall_sim::warmth`): air temperature and time of day, wind chill in the open, shelter, wetness and nearby fires | Edge frost creeps in, colour drains and cools toward blue |
-| Wet | Wetness from the server: water depth over the feet (1.5 m soaks), rain without a roof (snow counts 30%); drying takes a few minutes, faster when warm or by a fire | Slight dark, cool vignette and tint |
+| Wet | Wetness from the server: water depth over the feet (1.5 m soaks), rain without a roof (snow counts 10%); drying takes a few minutes, faster when warm or by a fire | Slight dark, cool vignette and tint |
 | Injury *(preview)* | Admin menu only until ENG-223 health lands | Colour drains, dark-red vignette with a slow, soft heartbeat (48 to 78 bpm as injury rises), slight edge blur |
 | Thirst *(preview)* | Admin menu only | Edge blur, slight desaturation |
 | Exhaustion *(preview)* | Admin menu only | Dark vignette, slight blur |

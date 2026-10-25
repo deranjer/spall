@@ -23,18 +23,20 @@ use spall_voxel::Volume;
 pub(crate) const BODY_HEAT_PERIOD_TICKS: u64 = 60;
 /// Midnight is this much colder than the weather's temperature, noon this
 /// much warmer; both scale with the sun's height.
-const NIGHT_DROP_C: f32 = 8.0;
+const NIGHT_DROP_C: f32 = 10.0;
 const DAY_WARMING_C: f32 = 3.0;
 /// Wind chill in the open, any weather.
 const WIND_CHILL_C: f32 = 3.0;
-/// Extra chill in the open by weather kind: a blizzard is the coldest.
+/// Extra chill in the open by weather kind: a blizzard is the coldest, but a
+/// dry player in the open never reaches the damage threshold by day (cold
+/// damage is for nights; see the noon blizzard test).
 fn weather_chill_c(kind: WeatherKind) -> f32 {
     match kind {
         WeatherKind::Clear => 0.0,
         WeatherKind::Rain | WeatherKind::Snow => 1.0,
-        WeatherKind::Storm => 3.0,
-        WeatherKind::HighWind => 4.0,
-        WeatherKind::Blizzard => 6.0,
+        WeatherKind::Storm => 1.5,
+        WeatherKind::HighWind => 2.0,
+        WeatherKind::Blizzard => 2.5,
     }
 }
 /// Fully enclosed (a cave, a dug hole) keeps off all wind and feels this
@@ -54,7 +56,7 @@ const WET_CHILL_C: f32 = 8.0;
 /// Felt temperature at and above which warmth recovers fully, and at and
 /// below which it falls to zero.
 const COMFORT_C: f32 = 5.0;
-const FREEZING_C: f32 = -17.0;
+const FREEZING_C: f32 = -23.0;
 /// Time constants for warmth falling and recovering, seconds.
 const COOLING_TAU_S: f32 = 60.0;
 const WARMING_TAU_S: f32 = 20.0;
@@ -73,7 +75,7 @@ const DRY_TAU_S: f32 = 300.0;
 const DRY_AIR_PER_C: f32 = 0.1;
 const DRY_FIRE_PER_C: f32 = 0.2;
 /// Falling snow wets this much as rain of the same amount.
-const SNOW_WETTING: f32 = 0.3;
+const SNOW_WETTING: f32 = 0.1;
 
 // -------------------------------------------------------------------------
 
@@ -273,7 +275,7 @@ mod tests {
 
     /// A clear winter midnight in the open, dry.
     const NIGHT: Exposure = Exposure {
-        air_c: -16.0,
+        air_c: -18.0,
         wind_chill_c: WIND_CHILL_C,
         shelter: Shelter {
             roof: false,
@@ -352,7 +354,7 @@ mod tests {
             ..NIGHT
         };
         let mut wet = BodyHeat::default();
-        assert!(run(&mut wet, cave, 120) > 0, "{wet:?}");
+        assert!(run(&mut wet, cave, 300) > 0, "{wet:?}");
     }
 
     #[test]
