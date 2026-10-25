@@ -217,6 +217,8 @@ fn stage_with(input: &StageInput, warm: Option<StructureIndex>) -> Result<Staged
             .ok_or(StageError::DoorBlocked("missing hinge"))?
             .plan(&input.volume)
             .map_err(StageError::DoorBlocked)?
+    } else if let EditKind::Replace(replace) = input.kind {
+        replace.plan(&input.volume)
     } else {
         EditPlan::sphere(input.volume_id, input.brush, input.kind.write_material())
     };

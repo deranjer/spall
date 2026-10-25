@@ -38,6 +38,7 @@ impl Simulation {
             creatures: None,
             carcasses: Vec::new(),
             player_health: Default::default(),
+            ice: None,
             world_items: Default::default(),
             tick: Tick::ZERO,
             day_clock: Default::default(),
@@ -115,6 +116,7 @@ impl Simulation {
             creatures: None,
             carcasses: Vec::new(),
             player_health: Default::default(),
+            ice: None,
             world_items: Default::default(),
             tick,
             day_clock: Default::default(),
@@ -185,6 +187,9 @@ impl Simulation {
             creatures.clear();
         }
         self.carcasses.clear();
+        if let Some(settings) = self.ice.as_ref().map(|ice| *ice.settings()) {
+            self.set_ice(settings);
+        }
         // The fresh world's items, under ids past every one this world used.
         let mut next_item_id = self.world_items.next_id().max(world_items.next_id());
         let items = world_items

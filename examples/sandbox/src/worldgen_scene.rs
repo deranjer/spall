@@ -531,8 +531,55 @@ impl GeneratedScene {
         }
     }
 
+    /// A world that starts in winter gets its ice before it is served: the
+    /// water is built once from the terrain (settled, if
+    /// [`Self::settle_water`] ran) and the shallow water of every region at
+    /// rest freezes straight into the terrain. Water still moving freezes in
+    /// play once it settles. Returns the ice cells written.
+    pub fn freeze_water(&mut self) -> usize {
+        if self.vegetation.start_season != spall_ecology::living::Season::Winter {
+            return 0;
+        }
+        let Some(setup) = self.column_water.clone() else {
+            return 0;
+        };
+        let started = std::time::Instant::now();
+        let Some(world) = Arc::get_mut(&mut self.world) else {
+            eprintln!("sandbox: terrain is shared; winter ice will form in play instead");
+            return 0;
+        };
+        let water =
+            match spall_sim::column_water::AuthoritativeColumnWater::new(&world.terrain, setup) {
+                Ok(water) => water,
+                Err(error) => {
+                    eprintln!("sandbox: cannot build the water to freeze it: {error}");
+                    return 0;
+                }
+            };
+        let written = match spall_sim::ice::freeze_at_rest(
+            &mut world.terrain,
+            &water,
+            &crate::game::ice_settings(),
+        ) {
+            Ok(written) => written,
+            Err(error) => {
+                eprintln!("sandbox: startup freeze stopped: {error}");
+                0
+            }
+        };
+        tracing::info!(
+            stage = "ice_freeze",
+            elapsed_us = started.elapsed().as_micros() as u64,
+            ice_cells = written,
+            "startup profile"
+        );
+        written
+    }
+
     /// Packages the world for [`spall_server::ServeConfig::custom_world`].
+    /// A world starting in winter is frozen first ([`Self::freeze_water`]).
     pub fn into_custom_world(mut self) -> CustomWorld {
+        self.freeze_water();
         let spawns = self.player_spawns().to_vec();
         // The scene's own copy of the planned water would outlive the world setup
         // that needs it; hand it over instead of cloning.
@@ -542,7 +589,9 @@ impl GeneratedScene {
         let mut custom =
             CustomWorld::new(spawns, move || scene.world_setup()).with_vegetation(vegetation);
         if let Some(setup) = column_water {
-            custom = custom.with_column_water(setup);
+            custom = custom
+                .with_column_water(setup)
+                .with_ice(crate::game::ice_settings());
         }
         custom
     }

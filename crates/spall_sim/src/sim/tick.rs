@@ -137,6 +137,7 @@ impl Simulation {
             self.advance_body_heat(crate::warmth::BODY_HEAT_PERIOD_TICKS as f32 * TICK_DT_S);
         }
         drop(players_span);
+        self.advance_ice();
         Ok(report)
     }
 

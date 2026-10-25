@@ -173,6 +173,8 @@ pub struct Simulation {
     /// currently bound (ENG-223). Live bound capsules hold their own health;
     /// checkpoints carry both.
     player_health: std::collections::HashMap<spall_protocol::PlayerId, u16>,
+    /// Winter ice, once the game installs its settings (ENG-268).
+    ice: Option<ice::IceRuntime>,
     /// Server-owned items lying in the world (ENG-257).
     world_items: crate::world_items::WorldItems,
 }
@@ -220,6 +222,7 @@ mod construction;
 mod contact_dormancy;
 mod edit_queries;
 mod helpers;
+mod ice;
 mod players;
 mod snow_glue;
 mod tick;

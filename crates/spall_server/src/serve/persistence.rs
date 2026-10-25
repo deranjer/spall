@@ -129,6 +129,9 @@ pub(super) fn setup_persistence_with_game_content(
                         .map_err(|e| format!("column water retune after recovery: {e}"))?;
                 }
                 sim.set_column_water_worker(true);
+                if let Some(ice) = custom_world.and_then(CustomWorld::ice) {
+                    sim.set_ice(*ice);
+                }
                 (sim, seq, 0, retained_transfer_ids)
             }
             // A genuinely new/empty database: seed it with the built-in scene.

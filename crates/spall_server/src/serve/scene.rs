@@ -80,6 +80,7 @@ pub struct CustomWorld {
     pub(super) world_items: Vec<InitialWorldItem>,
     pub(super) dam_gate: Option<DamGate>,
     pub(super) vegetation: Option<spall_ecology::living::LivingState>,
+    pub(super) ice: Option<spall_sim::IceSettings>,
     pub(super) weather_profile: spall_protocol::WeatherProfile,
 }
 
@@ -127,6 +128,7 @@ impl CustomWorld {
             world_items: Vec::new(),
             dam_gate: None,
             vegetation: None,
+            ice: None,
             weather_profile: spall_protocol::WeatherProfile::Standard,
         }
     }
@@ -167,6 +169,17 @@ impl CustomWorld {
     pub fn with_vegetation(mut self, vegetation: spall_ecology::living::LivingState) -> Self {
         self.vegetation = Some(vegetation);
         self
+    }
+
+    /// Freezes this world's settled shallow water in winter (ENG-268).
+    #[must_use]
+    pub fn with_ice(mut self, ice: spall_sim::IceSettings) -> Self {
+        self.ice = Some(ice);
+        self
+    }
+
+    pub fn ice(&self) -> Option<&spall_sim::IceSettings> {
+        self.ice.as_ref()
     }
 
     /// Chooses the seeded weather schedule (default: the four-season mix).
@@ -324,6 +337,9 @@ impl Scene {
         sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
         sim_config.weather_profile = custom.map_or(Default::default(), |c| c.weather_profile);
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
+        if let Some(ice) = custom.and_then(|c| c.ice) {
+            sim.set_ice(ice);
+        }
         if let Some(custom) = custom {
             for body in &custom.initial_bodies {
                 spall_sim::playground::spawn_box_body(
