@@ -57,3 +57,4 @@ pub fn init_tracing() {
 pub mod ecology_scene;
 
 pub mod vegetation;
+pub mod winter_crossing;

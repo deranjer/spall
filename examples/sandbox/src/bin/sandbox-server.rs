@@ -109,6 +109,11 @@ struct Args {
     /// Initial plant season; the saved plant clock advances every 15 minutes.
     #[arg(long, default_value = "summer", value_parser = ["spring", "summer", "autumn", "winter"], requires = "worldgen")]
     season: String,
+    /// The Winter Crossing profile: a held winter, frequent random blizzards,
+    /// heavy snowfall, and animals spread across the whole map (see
+    /// docs/winter-crossing.md). Replaces `--season` and `--animals`.
+    #[arg(long, requires = "worldgen", conflicts_with_all = ["season", "animals"])]
+    scenario_winter: bool,
     /// Use the legacy whole-terrain collider for a controlled comparison.
     /// Per-brick terrain collision is the normal mode.
     #[arg(long)]
@@ -469,9 +474,19 @@ fn run_serve(args: Args) -> ExitCode {
             preset,
             args.seed,
             args.worldgen_size,
-            spall_ecology::living::Season::parse(&args.season).unwrap(),
+            spall_ecology::living::Season::parse(if args.scenario_winter {
+                "winter"
+            } else {
+                &args.season
+            })
+            .unwrap(),
         ) {
             Ok(generated) => {
+                let generated = if args.scenario_winter {
+                    generated.with_held_season(sandbox::winter_crossing::HELD_SEASON_MS)
+                } else {
+                    generated
+                };
                 let generated = if args.spawn_at_lake {
                     let moved = generated.with_lake_spawn();
                     if moved.player_spawns() == moved.world().spawns.as_slice() {
@@ -535,12 +550,15 @@ fn run_serve(args: Args) -> ExitCode {
                     &sandbox::world_scatter::ScatterSettings::default(),
                 );
                 tracing::info!(items = scattered.len(), "scattered world items");
-                custom_world = Some(
-                    generated
-                        .into_custom_world()
-                        .with_initial_bodies(floaters)
-                        .with_world_items(scattered),
-                );
+                let mut world = generated
+                    .into_custom_world()
+                    .with_initial_bodies(floaters)
+                    .with_world_items(scattered);
+                if args.scenario_winter {
+                    world =
+                        world.with_weather_profile(spall_protocol::WeatherProfile::WinterCrossing);
+                }
+                custom_world = Some(world);
                 Scene::Custom
             }
             Err(error) => {
@@ -597,7 +615,7 @@ fn run_serve(args: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let creatures = if args.animals > 0 {
+    let creatures = if args.animals > 0 || args.scenario_winter {
         let anchors: Vec<[f64; 3]> = custom_world
             .as_ref()
             .map(|world| world.player_spawns().to_vec())
@@ -606,20 +624,38 @@ fn run_serve(args: Args) -> ExitCode {
         // Crowd the first spawn so a single player sees the animals without
         // having to find them; other spawns would dilute the count.
         let anchors: Vec<[f64; 3]> = anchors.into_iter().take(1).collect();
-        match sandbox::animals::AnimalDirector::new(
-            anchors,
+        // The winter profile spreads its animals across the map instead.
+        let anchors = match anchors.first() {
+            Some(spawn) if args.scenario_winter => {
+                sandbox::winter_crossing::animal_anchors(args.worldgen_size, spawn[1])
+            }
+            _ => anchors,
+        };
+        let targets = if args.scenario_winter {
+            sandbox::winter_crossing::ANIMAL_TARGETS
+        } else {
             // Deer, crows, trout (only in deep enough live water), bears, snow
             // leopards, and a pack of four wolves per 16.
-            &[
+            [
                 args.animals,
                 args.animals / 2,
                 args.animals.div_ceil(4),
                 args.animals.div_ceil(8),
                 args.animals.div_ceil(8),
                 args.animals.div_ceil(16) * 4,
-            ],
-            args.seed,
-        ) {
+            ]
+        };
+        let director =
+            sandbox::animals::AnimalDirector::new(anchors, &targets, args.seed).map(|director| {
+                match args.scenario_winter {
+                    true => {
+                        let (min, max) = sandbox::winter_crossing::ANIMAL_RADIUS_M;
+                        director.with_radius_m(min, max)
+                    }
+                    false => director,
+                }
+            });
+        match director {
             Ok(director) => Some(spall_server::creature_service::CreatureService::new(
                 Box::new(director.with_day_clock(day_clock)),
             )),
