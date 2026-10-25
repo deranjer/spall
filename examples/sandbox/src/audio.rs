@@ -13,6 +13,8 @@ use spall_worldgen::Biome;
 
 use crate::game::materials;
 
+pub mod scenario;
+
 /// Precipitation (0..=1) from which snow counts as heavy; light and medium
 /// snow (0.25, 0.5) lie below it and heavy (0.85) above.
 const HEAVY_SNOW: f32 = 0.7;
@@ -291,6 +293,7 @@ pub fn config() -> BiomeAudioConfig {
         creatures: creatures(&root),
         footsteps: footsteps(&root),
         breathing: breathing(&root),
+        scenario: scenario::sounds(&root),
     }
 }
 
@@ -592,7 +595,9 @@ mod tests {
     fn every_approved_runtime_asset_decodes_without_an_audio_device() {
         let root = source_audio_root();
         let mut checked = 0;
-        for category in ["biomes", "weather", "foley", "player", "animals"] {
+        for category in [
+            "biomes", "weather", "foley", "player", "animals", "scenario",
+        ] {
             for entry in std::fs::read_dir(root.join(category)).unwrap() {
                 let path = entry.unwrap().path();
                 assert_eq!(
@@ -604,7 +609,117 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 48, "all 48 user-approved recordings are packaged");
+        assert_eq!(checked, 90, "all 90 user-approved recordings are packaged");
+    }
+
+    /// The packaged recordings: every file under `audio/` but the two index
+    /// files, as paths relative to the root with forward slashes.
+    fn shipped_recordings() -> Vec<String> {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.path().is_dir() {
+                    walk(&entry.path(), &format!("{prefix}{name}/"), out);
+                } else if name.ends_with(".ogg") {
+                    out.push(format!("{prefix}{name}"));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&source_audio_root(), "", &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn every_shipped_recording_is_catalogued_and_credited_and_every_catalogue_entry_exists() {
+        let root = source_audio_root();
+        let catalogue: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("catalogue.json")).unwrap())
+                .unwrap();
+        let mut catalogued: Vec<String> = catalogue["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|asset| {
+                for key in ["creator", "license", "source"] {
+                    assert!(
+                        asset[key].as_str().is_some_and(|text| !text.is_empty()),
+                        "{asset} has no {key}"
+                    );
+                }
+                asset["file"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        catalogued.sort();
+        assert_eq!(catalogued, shipped_recordings());
+        let credits = std::fs::read_to_string(root.join("CREDITS.md")).unwrap();
+        for file in &catalogued {
+            assert!(
+                credits.contains(&format!("| {file} |")),
+                "{file} has no CREDITS.md row"
+            );
+            spall_client::audio::validate_asset(&root.join(file))
+                .unwrap_or_else(|error| panic!("{file}: {error}"));
+        }
+    }
+
+    #[test]
+    fn every_scenario_clip_names_a_shipped_recording() {
+        let sounds = scenario::sounds(&source_audio_root());
+        assert!(!sounds.is_empty());
+        let clips = [
+            &sounds.fire_loop,
+            &sounds.fire_ignite,
+            &sounds.fire_flare,
+            &sounds.fire_out,
+            &sounds.ice_creak,
+            &sounds.ice_crack,
+            &sounds.ice_break,
+            &sounds.splash,
+            &sounds.gasp,
+            &sounds.underwater_loop,
+            &sounds.tree_fall,
+            &sounds.note,
+            &sounds.door_open,
+            &sounds.door_latch,
+            &sounds.door_close,
+            &sounds.ladder_climb,
+            &sounds.ladder_slide,
+            &sounds.shiver_loop,
+            &sounds.hurt,
+            &sounds.death,
+            &sounds.heartbeat_slow,
+            &sounds.heartbeat_fast,
+            &sounds.ui_click,
+        ];
+        let digs = sounds.digs.iter().map(|rule| &rule.clip);
+        let pickups = sounds.pickups.iter().map(|rule| &rule.clip);
+        for clip in clips.into_iter().chain(digs).chain(pickups) {
+            assert!(!clip.files.is_empty());
+            assert!((0.0..=1.0).contains(&clip.gain));
+            for path in &clip.files {
+                assert!(path.is_file(), "missing {}", path.display());
+            }
+        }
+        // The ice materials are the game's ice, and the tools are its tools.
+        assert!(sounds.ice_materials.contains(&materials::ICE_CRACKED));
+        assert!(
+            sounds
+                .dig_clip(crate::game::tool_ids::AXE, materials::WOOD)
+                .is_some()
+        );
+        assert!(
+            sounds
+                .dig_clip(crate::game::tool_ids::AXE, materials::STONE)
+                .is_none()
+        );
+        assert!(
+            sounds
+                .dig_clip(crate::game::tool_ids::SHOVEL, materials::SNOW)
+                .is_some()
+        );
     }
 
     #[test]

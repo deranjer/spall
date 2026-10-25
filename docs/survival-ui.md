@@ -163,3 +163,28 @@ those searches. Accepted files go into `examples/sandbox/assets/audio/` and
 | Snow footsteps | Walking in snow | [Nimlos](https://freesound.org/people/Nimlos/sounds/432285/), [cabled_mess](https://freesound.org/people/cabled_mess/sounds/384422/) |
 | Rain on tarp | Shelter cue (dry under cover) | [freezound5](https://freesound.org/people/freezound5/sounds/141440/), [JDTTL](https://freesound.org/people/JDTTL/sounds/843503/) |
 | Bone crack | Fall injury | [Kane53126](https://freesound.org/people/Kane53126/sounds/257927/) |
+
+## Scenario audio (ENG-271)
+
+The Winter Crossing sounds are user-approved CC0 recordings under
+`examples/sandbox/assets/audio/scenario/`, listed in `catalogue.json` and
+`CREDITS.md`. The game's table is `sandbox::audio::scenario`; the client logic is
+`spall_client::scenario_sounds` and `window/scenario_audio.rs`, which play through a
+third ambience worker (one-shots with a pan and playback rate, and up to four loop
+beds: fire, underwater, shivering, heartbeat). Everything is presentation: no
+sound is sent to or decided by the server.
+
+| Sound | Heard when |
+| --- | --- |
+| Fire ignite, flare, out; crackle bed | A replicated fire turns lit, is fed while lit, or goes out; the bed fades out to 18 m from the nearest lit fire |
+| Ice crack, break | A terrain transaction writes the cracked-ice material, or turns ice to air, near the listener. The replica notes the first cell of each cell run it applies (`take_terrain_edits`); a melt far away is out of range |
+| Ice creak | Walking on ice or cracked ice |
+| Splash, cold-water gasp, underwater bed | Entering water (gasp if wet or just after a break); the camera under the surface |
+| Shovel, axe, tree fall | A tool swing, by the material under the cursor; a body split off the terrain within 4 s of a swing |
+| Pickup, door, note | E pressed on that prompt; a note opening |
+| Ladder climb, slide | Climbing; the slide is the climb recording played 1.7 times faster |
+| Shiver, hurt, death, heartbeat | The server's warmth, health drops, a jump back to full health (the respawn), and low health |
+| UI click | Esc menu buttons, pack items |
+
+Not wired yet: the beacon hum and the win chime are packaged, with no event on main
+to play them. The female hurt sound is deferred.

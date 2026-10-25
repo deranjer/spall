@@ -67,6 +67,7 @@ pub(super) struct InteractiveApp {
     weather_audio: Option<AmbienceAudio>,
     weather_mix: Vec<(PathBuf, f32)>,
     pub(super) footsteps: Option<crate::footsteps::FootstepAudio>,
+    pub(super) scenario: super::scenario_audio::ScenarioAudio,
     pub(super) footstep_volume: f32,
     /// One stride counter per walking player (`0` is the local player).
     pub(super) footstep_trackers: HashMap<u64, crate::footsteps::FootstepTracker>,
@@ -288,6 +289,7 @@ impl InteractiveApp {
         )?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         let ambience = AmbienceAudio::start(0.2);
+        let scenario_sounds = !options.biome_audio.scenario.is_empty();
         let footsteps = crate::footsteps::FootstepAudio::start(&options.biome_audio.footsteps, 0.5);
         let breathing =
             crate::breathing::BreathingAudio::start(&options.biome_audio.breathing, 0.6);
@@ -339,6 +341,7 @@ impl InteractiveApp {
             ambience_mix_at: None,
             weather_audio: AmbienceAudio::start(0.3),
             weather_mix: Vec::new(),
+            scenario: super::scenario_audio::ScenarioAudio::start(scenario_sounds),
             footsteps,
             footstep_volume: 0.5,
             footstep_trackers: HashMap::new(),

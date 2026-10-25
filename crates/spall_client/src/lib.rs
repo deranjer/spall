@@ -17,6 +17,7 @@ pub mod predict;
 pub mod replica;
 pub mod replica_creatures;
 pub mod residency;
+pub mod scenario_sounds;
 pub mod season_colour;
 pub mod segmented;
 pub mod sky;
