@@ -177,10 +177,18 @@ fn wide_columns_freeze_on_the_solver_surface_and_the_drawn_shore() {
     for _ in 0..120 {
         sim.tick().unwrap();
     }
-    assert_eq!(sim.world().body_count(), 0, "no ice split off as a loose body");
+    assert_eq!(
+        sim.world().body_count(),
+        0,
+        "no ice split off as a loose body"
+    );
     for x in 4..32 {
         for z in 4..12 {
-            assert_eq!(material(&sim, x, SURFACE, z), Some(ICE), "shallow ({x},{z})");
+            assert_eq!(
+                material(&sim, x, SURFACE, z),
+                Some(ICE),
+                "shallow ({x},{z})"
+            );
             assert_eq!(material(&sim, x, SURFACE - 1, z), None, "water stays below");
         }
     }
@@ -291,4 +299,3 @@ fn cracking_replays_identically_in_the_same_binary() {
     assert_eq!(a, b);
     assert_eq!(a.len(), 2);
 }
-

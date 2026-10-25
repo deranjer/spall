@@ -23,6 +23,9 @@ const ICE_ACTOR_ID: u64 = (1 << 40) + 4;
 const NEAR_PLAYER_M: f64 = 64.0;
 /// Ticks between rebuilding the list of water regions near players.
 const NEAR_REFRESH_TICKS: u64 = 60;
+/// Ticks between freeze edits: each is a full terrain commit (a few ms on a
+/// 1 km world), so a lake freezes over a minute rather than in a burst.
+const FREEZE_EDIT_SPACING_TICKS: u64 = 4;
 /// Ice cells looked for above a melting column's water.
 const MELT_SEARCH_CELLS: i64 = 3;
 
@@ -185,20 +188,20 @@ impl Simulation {
             let replace = if cracked {
                 let r = s.break_radius_cells;
                 let h = i64::from(ice_cells.max(2));
-                BoxReplace {
-                    min: GlobalCell::new(feet.x - r, feet.y - h + 1, feet.z - r),
-                    size: [(2 * r + 1) as u8, h as u8, (2 * r + 1) as u8],
-                    from: [s.ice, s.cracked],
-                    to: MaterialId::AIR,
-                }
+                BoxReplace::new(
+                    GlobalCell::new(feet.x - r, feet.y - h + 1, feet.z - r),
+                    [(2 * r + 1) as u8, h as u8, (2 * r + 1) as u8],
+                    [s.ice, s.cracked],
+                    MaterialId::AIR,
+                )
             } else {
                 let r = s.crack_radius_cells;
-                BoxReplace {
-                    min: GlobalCell::new(feet.x - r, feet.y, feet.z - r),
-                    size: [(2 * r + 1) as u8, 1, (2 * r + 1) as u8],
-                    from: [s.ice, s.ice],
-                    to: s.cracked,
-                }
+                BoxReplace::new(
+                    GlobalCell::new(feet.x - r, feet.y, feet.z - r),
+                    [(2 * r + 1) as u8, 1, (2 * r + 1) as u8],
+                    [s.ice, s.ice],
+                    s.cracked,
+                )
             };
             if let Some(request) = self.submit_ice(replace) {
                 ice.player_edits.insert(entity, request);
@@ -219,7 +222,11 @@ impl Simulation {
             return;
         }
         if let Some(layer) = ice.layers.pop_front() {
-            self.submit_ice_layer(ice, layer);
+            if self.tick.get() % FREEZE_EDIT_SPACING_TICKS == 0 {
+                self.submit_ice_layer(ice, layer);
+            } else {
+                ice.layers.push_front(layer);
+            }
             return;
         }
         let frame = water.frame();
@@ -301,7 +308,7 @@ impl Simulation {
         }
     }
 
-    /// Submits a support layer, keeping only boxes that would still touch
+    /// Submits the next box of a support layer, keeping only boxes that would still touch
     /// solid terrain now (an earlier box may have been refused).
     fn submit_ice_layer(&mut self, ice: &mut IceRuntime, layer: Vec<BoxReplace>) {
         let mut rest = Vec::new();
@@ -328,13 +335,14 @@ impl Simulation {
             if cells.is_empty() || !touches {
                 continue;
             }
-            if !rest.is_empty() {
+            // One box per call; the rest of the layer goes on later ticks
+            // (also when the queue is full).
+            if !ice.in_flight.is_empty() {
                 rest.push(replace);
                 continue;
             }
             match self.submit_ice(replace) {
                 Some(request) => ice.in_flight.push(request),
-                // The queue is full: the rest of the layer goes next time.
                 None => rest.push(replace),
             }
         }
@@ -492,11 +500,11 @@ impl Simulation {
             (hi[2] + 1).min(z0 + edge - 1),
         ];
         let size = [0, 1, 2].map(|i| (hi[i] - lo[i] + 1).clamp(1, 255) as u8);
-        Some(BoxReplace {
-            min: GlobalCell::new(lo[0], lo[1], lo[2]),
+        Some(BoxReplace::new(
+            GlobalCell::new(lo[0], lo[1], lo[2]),
             size,
-            from: [settings.ice, settings.cracked],
-            to: MaterialId::AIR,
-        })
+            [settings.ice, settings.cracked],
+            MaterialId::AIR,
+        ))
     }
 }

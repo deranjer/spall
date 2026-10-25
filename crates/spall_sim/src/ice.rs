@@ -11,7 +11,7 @@
 //! body, so the plan keeps only ice connected to the shore and hands the boxes
 //! out in layers: each layer touches terrain or a layer before it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use spall_core::{GlobalCell, MaterialId};
 use spall_voxel::{Sample, Volume};
@@ -230,65 +230,67 @@ struct Planned {
     holds_solid: bool,
 }
 
-/// Greedy rectangles per layer over the wanted cells, also spanning solid
-/// cells (an air-to-ice box leaves them alone) but never an air cell that is
-/// not wanted.
+/// Greedy boxes over the wanted cells, grown along x, then z, then up, also
+/// spanning solid cells (an air-to-ice box leaves them alone) but never an
+/// air cell that is not wanted. Ice two cells thick is one box, not two.
 fn cover_with_boxes(volume: &Volume, kept: &HashSet<GlobalCell>, ice: MaterialId) -> Vec<Planned> {
-    let mut by_layer: HashMap<i64, Vec<GlobalCell>> = HashMap::new();
-    for &cell in kept {
-        by_layer.entry(cell.y).or_default().push(cell);
-    }
-    let mut layers: Vec<i64> = by_layer.keys().copied().collect();
-    layers.sort_unstable();
+    let mut cells: Vec<GlobalCell> = kept.iter().copied().collect();
+    cells.sort_by_key(|c| (c.y, c.z, c.x));
+    let mut covered: HashSet<GlobalCell> = HashSet::new();
+    let open = |cell: GlobalCell, covered: &HashSet<GlobalCell>| {
+        if kept.contains(&cell) {
+            !covered.contains(&cell)
+        } else {
+            solid(volume, cell)
+        }
+    };
     let mut planned = Vec::new();
-    for y in layers {
-        let mut cells = by_layer.remove(&y).unwrap_or_default();
-        cells.sort_by_key(|c| (c.z, c.x));
-        let mut covered: HashSet<(i64, i64)> = HashSet::new();
-        let open = |x: i64, z: i64, covered: &HashSet<(i64, i64)>| {
-            let cell = GlobalCell::new(x, y, z);
-            if kept.contains(&cell) {
-                !covered.contains(&(x, z))
-            } else {
-                solid(volume, cell)
-            }
-        };
-        for start in &cells {
-            if covered.contains(&(start.x, start.z)) {
-                continue;
-            }
-            let mut w = 1;
-            while w < 32 && open(start.x + w, start.z, &covered) {
-                w += 1;
-            }
-            let mut h = 1;
-            while h < 32 && (0..w).all(|dx| open(start.x + dx, start.z + h, &covered)) {
-                h += 1;
-            }
-            let mut filled = Vec::new();
-            let mut holds_solid = false;
+    for start in cells {
+        if covered.contains(&start) {
+            continue;
+        }
+        let at =
+            |dx: i64, dy: i64, dz: i64| GlobalCell::new(start.x + dx, start.y + dy, start.z + dz);
+        let mut w = 1;
+        while w < 32 && open(at(w, 0, 0), &covered) {
+            w += 1;
+        }
+        let mut h = 1;
+        while h < 32 && (0..w).all(|dx| open(at(dx, 0, h), &covered)) {
+            h += 1;
+        }
+        let mut d = 1;
+        while d < 8
+            && (0..h).all(|dz| (0..w).all(|dx| open(at(dx, d, dz), &covered)))
+            && (0..h).any(|dz| (0..w).any(|dx| kept.contains(&at(dx, d, dz))))
+        {
+            d += 1;
+        }
+        let mut filled = Vec::new();
+        let mut holds_solid = false;
+        for dy in 0..d {
             for dz in 0..h {
                 for dx in 0..w {
-                    let cell = GlobalCell::new(start.x + dx, y, start.z + dz);
+                    let cell = at(dx, dy, dz);
                     if kept.contains(&cell) {
-                        covered.insert((cell.x, cell.z));
+                        covered.insert(cell);
                         filled.push(cell);
                     } else {
                         holds_solid = true;
                     }
                 }
             }
-            planned.push(Planned {
-                replace: BoxReplace {
-                    min: *start,
-                    size: [w as u8, 1, h as u8],
-                    from: [MaterialId::AIR, MaterialId::AIR],
-                    to: ice,
-                },
-                cells: filled,
-                holds_solid,
-            });
         }
+        planned.push(Planned {
+            replace: BoxReplace::new(
+                start,
+                [w as u8, d as u8, h as u8],
+                [MaterialId::AIR, MaterialId::AIR],
+                ice,
+            ),
+            cells: filled,
+            holds_solid,
+        });
     }
     planned
 }
@@ -314,7 +316,17 @@ fn support_layers(volume: &Volume, mut boxes: Vec<Planned>) -> Vec<Vec<BoxReplac
         for b in &ready {
             placed.extend(b.cells.iter().copied());
         }
-        layers.push(ready.into_iter().map(|b| b.replace).collect());
+        // Boxes of one layer go together, a few per commit.
+        let mut batched: Vec<BoxReplace> = Vec::new();
+        for b in ready {
+            if !batched
+                .last_mut()
+                .is_some_and(|last| last.try_merge(&b.replace))
+            {
+                batched.push(b.replace);
+            }
+        }
+        layers.push(batched);
         boxes = rest;
     }
     layers
