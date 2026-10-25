@@ -785,6 +785,7 @@ fn run_interactive(args: Args) -> ExitCode {
             pack_view: Some(std::sync::Arc::new(
                 sandbox::pack_view::SandboxPackView::new(),
             )),
+            game_hud: None,
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,

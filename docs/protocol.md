@@ -320,8 +320,8 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 25): one wire version for the handshake and every record, bumped on
-any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 9, defined in
+`PROTOCOL_VERSION` (currently 26): one wire version for the handshake and every record, bumped on
+any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 10, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
 
@@ -758,6 +758,16 @@ answers `Queued` or `Rejected` with a reason; a success is in the admission
 ledger. `Interact` whose nearest visible item is a fire feeds it from the pack
 instead of picking it up. There is no new record or limit. Save version 10
 stores the fuel with each item, so a fire's fuel is as of the last checkpoint.
+
+### ENG-251 - Game events
+
+Protocol 26 adds `GameEvent` tag 31 (`kind: u16`, `value: i32`), server to client on the
+ordered control stream. The engine only carries it: the game's per-tick rules
+(`spall_server::TickRules`) decide what a kind and value mean and whether the record goes to one
+live session or to every live session. There is no limit beyond the record's fixed size and no
+late-join replay; a game that needs a joining player to learn earlier events sends them itself
+when the session first goes live. The Winter Crossing scenario uses it for the objective (with the
+tower heading), a player's own death, and the shared win (see `docs/winter-crossing.md`).
 
 ### ENG-206/208 - Ground snow and footprints
 

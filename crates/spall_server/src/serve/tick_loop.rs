@@ -322,6 +322,7 @@ pub(super) async fn serve_async(
         .clone()
         .filter(|_| !dev_unvalidated_actions);
     let item_hooks = ItemHooks::new(&config.server, dev_unvalidated_actions);
+    let game_tick = config.server.game_tick.clone();
     let creature_shape = config.server.creature_shape.clone();
     let contact_damage_cfg = config.server.contact_damage;
     let contact_damage_profiles = damage_profiles;
@@ -1404,6 +1405,7 @@ pub(super) async fn serve_async(
             }
             // Publish health after this tick's creature damage.
             publish_player_health(&sim, &mut lj, &clients_for_sim);
+            run_tick_rules(game_tick.as_ref(), &mut sim, &lj, &clients_for_sim);
             rejected_total += route_tick_statuses(&report, &mut submitted_by, &clients_for_sim);
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never

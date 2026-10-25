@@ -79,6 +79,9 @@ pub struct HostConfig {
     /// and feeding fires with E. `None`: fires still burn, replicate and warm,
     /// but none can be set down or fed.
     pub fires: Option<Fires>,
+    /// The game's per-tick rules (ENG-251): answers deaths and announces game
+    /// events. `None`: no game event is ever sent.
+    pub game_tick: Option<GameTick>,
     /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
     /// damage pass. `None` keeps every prior run byte-identical (the pass is
     /// never invoked, exactly like every scene before this increment).
@@ -258,6 +261,7 @@ impl ServeConfig {
                 item_pickup: None,
                 tool_hooks: None,
                 fires: None,
+                game_tick: None,
                 contact_damage: None,
                 dormancy: None,
                 credential_registry_file: None,

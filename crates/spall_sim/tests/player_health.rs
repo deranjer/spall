@@ -66,6 +66,8 @@ fn damage_below_health_hurts_and_lethal_damage_respawns_at_full_health() {
         Some(PlayerDamage::Killed)
     );
     assert_eq!(sim.player_health(player), Some(PLAYER_MAX_HEALTH));
+    // Each death is counted, for the game's rules to answer (ENG-251).
+    assert_eq!(sim.world().player(player).unwrap().deaths, 2);
     assert_eq!(sim.damage_player(player_entity_for(7), 10), None);
 }
 

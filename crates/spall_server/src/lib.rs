@@ -51,14 +51,14 @@ pub use residency_pass::{
     PassTick, ResidencyLimits, ResidencyPass, ResidencyStats, total_resident_dense_bytes,
 };
 pub use serve::{
-    CommittedEditHandler, CommittedEditOutboxEncoder, CustomWorld, DamGate, FireRules, Fires,
-    HarnessConfig, HostConfig, InitialBody, InitialGameWorldSetup, InitialWorldItem, IntentStats,
-    ItemPickup, ItemPickupFn, MotionInterest, OutboxProcessor, PerClientEgress, ProgressionHandler,
-    Scene, ServeConfig, ServeError, ServeSummary, SwingEffect, TimingWindow, ToolCut, ToolEffects,
-    ToolHooks, ToolRules, ToolStrike, ToolUse, default_capture_workers, serve, serve_with_catalog,
-    serve_with_game_content, serve_with_game_content_and_asset_manifest,
-    serve_with_game_content_and_commit_handler, serve_with_game_content_and_handlers,
-    serve_with_game_content_and_player_credentials,
+    Audience, CommittedEditHandler, CommittedEditOutboxEncoder, CustomWorld, DamGate, FireRules,
+    Fires, GameTick, HarnessConfig, HostConfig, InitialBody, InitialGameWorldSetup,
+    InitialWorldItem, IntentStats, ItemPickup, ItemPickupFn, MotionInterest, OutboxProcessor,
+    PerClientEgress, ProgressionHandler, Scene, ServeConfig, ServeError, ServeSummary, SwingEffect,
+    TickRules, TimingWindow, ToolCut, ToolEffects, ToolHooks, ToolRules, ToolStrike, ToolUse,
+    default_capture_workers, serve, serve_with_catalog, serve_with_game_content,
+    serve_with_game_content_and_asset_manifest, serve_with_game_content_and_commit_handler,
+    serve_with_game_content_and_handlers, serve_with_game_content_and_player_credentials,
     serve_with_game_content_and_player_credentials_and_outbox,
     serve_with_game_content_and_policies, serve_with_game_content_and_setup,
 };

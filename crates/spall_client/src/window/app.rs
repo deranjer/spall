@@ -31,6 +31,9 @@ pub(super) struct InteractiveApp {
     pub(super) held_compass: bool,
     /// A note being read, its text from the game.
     pub(super) reading_note: Option<String>,
+    pub(super) game_hud: Option<std::sync::Arc<dyn GameHud>>,
+    /// What the game's events have put on the HUD (ENG-251).
+    pub(super) game_hud_state: GameHudState,
     /// The cursor, physical pixels, for hovering items in the open pack.
     pub(super) cursor_px: Option<[f32; 2]>,
     pub(super) player_view: Option<std::sync::Arc<dyn PlayerView>>,
@@ -313,6 +316,8 @@ impl InteractiveApp {
             esc: EscMenu::default(),
             held_compass: false,
             reading_note: None,
+            game_hud: options.game_hud,
+            game_hud_state: GameHudState::default(),
             cursor_px: None,
             player_view: options.player_view,
             third_person: false,

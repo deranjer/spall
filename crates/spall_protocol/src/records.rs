@@ -59,6 +59,7 @@ pub enum WireTag {
     CreatureDespawn = 28,
     PlayerHealth = 29,
     WorldItemUpdate = 30,
+    GameEvent = 31,
 }
 
 impl WireTag {
@@ -92,6 +93,7 @@ impl WireTag {
             28 => Self::CreatureDespawn,
             29 => Self::PlayerHealth,
             30 => Self::WorldItemUpdate,
+            31 => Self::GameEvent,
             _ => return None,
         })
     }
@@ -958,6 +960,23 @@ impl Record for PlayerHealth {
                 detail: "must be 1..=max_health",
             });
         }
+        Ok(())
+    }
+}
+
+/// `GameEvent` (ENG-251): something the game's rules announce to one client or
+/// to all (a player died, the scenario was won). The engine only carries it:
+/// `kind` and `value` mean whatever the game says they mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GameEvent {
+    pub kind: u16,
+    pub value: i32,
+}
+
+impl Record for GameEvent {
+    const TAG: WireTag = WireTag::GameEvent;
+
+    fn validate(&self) -> Result<(), RecordError> {
         Ok(())
     }
 }

@@ -74,7 +74,7 @@ pub use limits::SizeLimitError;
 pub use records::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, BaselineAck, BaselineBegin,
     BaselineEnd, BaselinePart, BaselineRegion, BrickRevision, ClaimedTarget, ControlSeq,
-    DurableThrough, InputFrame, InputSeq, InterestEpoch, InventoryEntry, MotionSnapshot,
+    DurableThrough, GameEvent, InputFrame, InputSeq, InterestEpoch, InventoryEntry, MotionSnapshot,
     PlayerHealth, ProgressionOperation, ProgressionOutcome, ProgressionRejectCode,
     ProgressionRequest, ProgressionResponse, RecentInput, Record, RecordError, RepairKey,
     RepairRequest, RequestId, SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq, TopologyOp,

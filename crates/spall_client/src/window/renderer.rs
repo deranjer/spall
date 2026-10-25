@@ -84,6 +84,9 @@ pub(crate) struct WorldRenderer {
     pub(super) compass_yaw: Option<f32>,
     /// A note being read.
     pub(super) note_text: Option<String>,
+    /// The game's objective line and banner (ENG-251).
+    pub(super) objective: Option<String>,
+    pub(super) banner: Option<Banner>,
     book_textures: BookTextures,
     /// The game's item icons, uploaded on first sight; `None` if one would
     /// not decode (reported once, then drawn as a plain marker).
@@ -485,6 +488,8 @@ impl WorldRenderer {
             esc_actions: EscMenuActions::default(),
             compass_yaw: None,
             note_text: None,
+            objective: None,
+            banner: None,
             book_textures,
             item_icons: HashMap::new(),
             yakui_buffers,
@@ -1141,11 +1146,17 @@ impl WorldRenderer {
             draw_endurance(bar);
         }
         let ui_size = self.ui_size();
+        if let Some(text) = &self.objective {
+            draw_objective(text);
+        }
         if let Some(yaw) = self.compass_yaw {
             draw_compass(yaw, ui_size);
         }
         if let Some(text) = &self.note_text {
             draw_note(text, ui_size);
+        }
+        if let Some(banner) = &self.banner {
+            draw_banner(banner, ui_size);
         }
         if let Some(view) = &self.esc_menu {
             draw_esc_menu(view, &mut self.esc_actions, ui_size);

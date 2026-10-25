@@ -795,6 +795,7 @@ fn run_serve(args: Args) -> ExitCode {
             item_pickup: None,
             tool_hooks: None,
             fires: None,
+            game_tick: None,
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),

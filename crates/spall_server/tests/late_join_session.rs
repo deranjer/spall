@@ -82,6 +82,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
             item_pickup: None,
             tool_hooks: None,
             fires: None,
+            game_tick: None,
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,

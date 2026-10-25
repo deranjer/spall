@@ -60,6 +60,7 @@ impl Simulation {
             });
         }
         player.health = PLAYER_MAX_HEALTH;
+        player.deaths += 1;
         player.body = crate::warmth::BodyHeat::default();
         let spawn = player.spawn.position_m;
         self.world.teleport_player(entity, spawn, TICK_DT_S);

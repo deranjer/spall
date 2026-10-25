@@ -80,6 +80,7 @@ mod request_ids;
 mod scene;
 mod summary;
 mod tick_loop;
+mod tick_rules;
 mod tool_use;
 mod workers;
 
@@ -100,6 +101,8 @@ use self::request_ids::{RequestIds, SubmittedBy};
 pub use self::scene::*;
 pub use self::summary::*;
 use self::tick_loop::*;
+use self::tick_rules::*;
+pub use self::tick_rules::{Audience, GameTick, TickRules};
 use self::tool_use::*;
 pub use self::tool_use::{
     SwingEffect, ToolCut, ToolEffects, ToolHooks, ToolRules, ToolStrike, ToolUse,
