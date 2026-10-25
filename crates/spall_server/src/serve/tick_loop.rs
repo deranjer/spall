@@ -1397,6 +1397,8 @@ pub(super) async fn serve_async(
             {
                 return SimResult::error(error, ticks_run);
             }
+            // After creatures, so a swipe this tick goes out with it.
+            publish_player_health(&sim, &mut lj, &clients_for_sim);
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;

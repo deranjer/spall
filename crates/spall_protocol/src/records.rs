@@ -935,12 +935,17 @@ impl Record for DurableThrough {
 }
 
 /// `PlayerHealth` (ENG-223): the receiving client's own authoritative health,
-/// sent when it changes and once when the session goes live. A death shows as
-/// a jump back to `max_health` together with the respawn teleport.
+/// warmth and wetness (ENG-264/265), sent when any changes and once when the
+/// session goes live. A death shows as a jump back to `max_health` together
+/// with the respawn teleport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlayerHealth {
     pub health: u16,
     pub max_health: u16,
+    /// 255 warm, 0 freezing.
+    pub warmth_q8: u8,
+    /// 0 dry, 255 soaked.
+    pub wetness_q8: u8,
 }
 
 impl Record for PlayerHealth {

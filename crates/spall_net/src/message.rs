@@ -428,6 +428,8 @@ mod tests {
         let health = spall_protocol::PlayerHealth {
             health: 40,
             max_health: 100,
+            warmth_q8: 90,
+            wetness_q8: 200,
         };
         let bytes = WireRecord::PlayerHealth(health).encode_framed().unwrap();
         assert_eq!(
@@ -438,6 +440,7 @@ mod tests {
             let record = WireRecord::PlayerHealth(spall_protocol::PlayerHealth {
                 health: bad.0,
                 max_health: bad.1,
+                ..health
             });
             assert!(record.encode_framed().is_err(), "{bad:?}");
         }
