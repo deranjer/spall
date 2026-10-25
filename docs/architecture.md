@@ -648,6 +648,55 @@ geometry even outside current interest. Global water/ecology replication is unch
 reduces initial terrain geometry transfer/client residency; it is not server region generation,
 interest-filtered transactions, or distant visual LOD. Those require separate measured work.
 
+## Winter ice (ENG-268)
+
+In winter (season 3 of the weather clock) the server freezes the shallowest
+settled water. `spall_sim::ice` holds the thresholds (`IceSettings`: no ice on
+water deeper than 1 m, two 0.25 m cells under 0.5 m, one cell deeper) and the
+planner; `Simulation::set_ice` turns it on, and the sandbox installs it for
+generated worlds with water (`CustomWorld::with_ice`). A water region freezes
+once its published frame has not changed for 20 s (with 1 m columns its solver
+region must also be asleep or steady); one region is visited per tick (every other tick one near a
+player). Ice is real terrain (sandbox materials `ice` 223 and `ice.cracked`
+224) placed by server-authored `EditKind::Replace` box edits through the normal
+pipeline, so it replicates, persists, journals and can be dug like any cell.
+
+Ice sits on the water, not in it: its lowest cell is the first cell wholly above
+the water's surface. At 0.25 m columns the published frame gives that surface
+to 1/128 cell (at most 1/256 cell can end up under the ice, too thin to publish
+or flow); with 1 m columns the frame is blended, so the solver's own spans are
+read through `AuthoritativeColumnWater::try_world`, which never waits for a step
+in flight (a busy solver retries the region next tick), and the shore the frame
+draws beyond the solver's wet columns freezes on the drawn surface. So freezing
+moves no water. The water under the ice is a closed span and keeps flowing; it
+never dams a river, and water that rises against the ice is held as pressure in
+the closed span (a later edit that remaps that column could still move such
+excess to the span above the ice). A freeze edit wakes the touched regions as any edit does; they fall asleep again
+once the water is still. Ice under a closed span does not evaporate. A one-cell
+crust covers level shore cells beside the ice and the boxes go in by layers that
+each touch terrain or an earlier layer, so no ice splits off as a loose body;
+ice not connected to the shore is not placed. A layer's boxes go up to eight to
+an edit, and at most one freeze edit is in flight and submitted every fourth
+tick, because each is a full terrain commit (a few ms on a 1 km world); a
+lake's ice therefore appears over seconds to a minute. No ice forms within
+1.5 m of a player. Outside winter each region's ice turns back to air.
+
+Because the first freeze is often the first terrain edit of a fresh generated
+world, it is also the commit that detaches the floating fragments worldgen left
+(structure support is world-wide), as any first dig would.
+
+A player standing on ice over water rolls each tick (a hash of the world seed,
+tick, player and cell, so a replay in the same binary repeats it): 0.12/s on one
+cell of ice, 0.02/s on two, times 4 while sprinting. A roll turns a 5 x 5 patch
+of the top layer into `ice.cracked`, the warning; a roll on cracked ice (0.5/s,
+times 4 sprinting) clears ice and cracked ice in a 9 x 9 box around the feet, and
+the player drops into the water. Ice resting on the ground (the crust) never
+cracks. Both steps are ordinary terrain transactions: a client sees the warning
+as `CellRun`s writing the cracked material and the break as ice and cracked
+cells turned to air near a player, and can hang sounds and effects on those
+(ENG-271); wetness reads the water the player then stands in (ENG-265). No wire
+record was added.
+
 ## Animals
 
 An animal is a plain server-authoritative entity: `CreatureRecord` (id, species

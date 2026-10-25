@@ -1191,6 +1191,28 @@ walk, then choose Clear to retain cold snow while inspecting tracks. Ground snow
 is a non-colliding coating; tracks clear on restart. Exact evidence, capture
 locations and unmeasured performance gates: reports/ENG-207-snow-playtest.md.
 
+## ENG-268 - Winter ice
+
+CPU checks: `cargo test -p spall_sim --lib ice` (planner: exact wanted cells and
+shore crust, support layers, crack rates, sprint breaks more often over 400
+seeds), `cargo test -p spall_sim --test ice` (only settled shallow water freezes
+and no water moves, wide columns, a player stands on ice, crack then break drops
+the player into water, same-binary replay) and
+`cargo test -p spall_server --test ice_persistence` (ice survives checkpoint,
+journal and recovery with an equal world hash). The appearance tests count the
+two ice materials.
+
+Server cost is measured headless with
+`cargo run --release -p sandbox --example ice_probe -- natural 1 4096 240`
+(server-built 1 km world, column water worker, one player, winter, real-time
+60 Hz; `NOICE=1` for the baseline, `SPALL_WATER_COARSE=1` for 1 m columns).
+Planning (`tick.ice`) is under 0.01 ms per tick on average. Each freeze edit is
+an ordinary terrain commit of about 4 ms on this world, one every fourth tick
+while ice is forming; ticks carrying one are about 7.5 ms at p50 and 19 ms at
+p99. The first edit also detaches the world's floating worldgen fragments.
+Measured numbers: reports/2026-10-25-eng-268-ice-cost.md. No GPU or play-window check is
+implied.
+
 ## Animals
 
 Animals are simple server entities (see [animal lifecycle](animal-lifecycle.md)).
