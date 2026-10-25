@@ -39,8 +39,11 @@ impl MaterialFlags {
     pub const COLLIDES: Self = Self(1 << 1);
     /// Participates in the structural support graph.
     pub const STRUCTURAL: Self = Self(1 << 2);
+    /// A character can climb it like a ladder (ENG-263). Still ordinary solid
+    /// voxel terrain: it collides and can be dug out like any other cell.
+    pub const CLIMBABLE: Self = Self(1 << 3);
 
-    const ALL_BITS: u32 = 0b111;
+    const ALL_BITS: u32 = 0b1111;
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {

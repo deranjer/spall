@@ -103,6 +103,45 @@ pub fn stone_density(_m: MaterialId) -> f64 {
     STONE_DENSITY as f64
 }
 
+/// Where [`ladder_wall`] puts things, metres (`CELL_M` cells).
+pub mod ladder {
+    /// Floor top (feet height standing on the floor).
+    pub const FLOOR_TOP_M: f64 = 1.0;
+    /// Platform top: the top of the wall block and of the ladder.
+    pub const PLATFORM_TOP_M: f64 = 5.0;
+    /// The ladder's outer face (`x`); the wall face is one cell further `+x`.
+    pub const LADDER_FACE_X_M: f64 = 7.75;
+    /// Centre of the ladder's width on `z`.
+    pub const LADDER_CENTRE_Z_M: f64 = 4.0;
+    /// A feet spawn on the floor, 0.75 m in front of the ladder; face `+x`.
+    pub const SPAWN_M: [f64; 3] = [7.0, FLOOR_TOP_M, LADDER_CENTRE_Z_M];
+}
+
+/// ENG-263's ladder scene: a 16 m x 8 m stone floor (top at
+/// [`ladder::FLOOR_TOP_M`]), a 2 m thick, 4 m tall stone wall block whose top
+/// is the platform (x 8..10 m, z 2..6 m, top at [`ladder::PLATFORM_TOP_M`]),
+/// and a four-cell-wide (1 m) column of `ladder` material on the wall's
+/// `-x` face (x 7.75..8 m, z 3.5..4.5 m) from the floor to the platform top.
+/// Air is resident up to y = 8 m.
+pub fn ladder_wall(id: VolumeId, ladder: MaterialId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    for (a, b, m) in [
+        ((0, 0, 0), (63, 3, 31), vox::STONE),
+        ((0, 4, 0), (63, 31, 31), MaterialId::AIR),
+        ((32, 4, 8), (39, 19, 23), vox::STONE),
+        ((31, 4, 14), (31, 19, 17), ladder),
+    ] {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(a.0, a.1, a.2),
+            GlobalCell::new(b.0, b.1, b.2),
+            m,
+        ))
+        .expect("ladder wall edit");
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

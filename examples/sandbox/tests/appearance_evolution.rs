@@ -103,11 +103,21 @@ fn shipped_manifests_are_frozen() {
         assert_eq!(v3.get(variant.id).unwrap().name, variant.name);
     }
     // No extensions are committed yet, so the current manifest is v5 plus the
-    // three cabin door materials (ENG-249), with every v5 entry unchanged.
+    // three cabin door materials (ENG-249) and the ladder (ENG-263), with every
+    // v5 entry unchanged.
     assert!(appearance::extension_variants().is_empty());
     let v5 = game::manifest_v5_terrain();
     let current = game::manifest();
-    assert_eq!(current.entries().len(), v5.entries().len() + 3);
+    assert_eq!(current.entries().len(), v5.entries().len() + 4);
+    let ladder = current
+        .get(game::materials::LADDER)
+        .expect("ladder material");
+    assert!(
+        ladder
+            .sim
+            .flags
+            .contains(spall_core::MaterialFlags::CLIMBABLE)
+    );
     for entry in v5.entries() {
         assert_eq!(current.get(entry.id), Some(entry));
     }

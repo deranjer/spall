@@ -14,6 +14,7 @@ pub(super) fn view(
             jump_held_last: false,
             endurance: 1.0,
             exhausted: false,
+            climbing: false,
         },
         server_tick: 0,
         published_at,

@@ -39,6 +39,9 @@ pub mod materials {
     pub const GRAVEL: MaterialId = MaterialId(215);
     pub const CLAY: MaterialId = MaterialId(216);
     pub const SNOW: MaterialId = MaterialId(217);
+    /// Climbable ladder rungs (ENG-263): solid, destructible wood whose
+    /// `CLIMBABLE` flag lets a player climb it. Above the cabin door ids.
+    pub const LADDER: MaterialId = MaterialId(221);
 }
 
 /// Version of the sandbox's server-authoritative content rules.
@@ -892,7 +895,7 @@ pub fn terrain_palette() -> spall_worldgen::WorldgenPalette {
 
 /// The sandbox world's validated material manifest: [`manifest_v5_terrain`] plus
 /// every appearance variant in `appearance_extensions.rs` (none yet) and the
-/// cabin door materials. Extending the palette appends variants under new ids, so it
+/// cabin door and ladder materials. Extending the palette appends variants under new ids, so it
 /// extends this manifest chain and worlds saved under any earlier manifest still
 /// restore with unchanged meaning. Clients and servers built with a different
 /// palette do not match the handshake hash.
@@ -910,10 +913,18 @@ pub fn manifest() -> MaterialManifest {
     ] {
         entries.push(def(id, name, 650.0, [0.42, 0.24, 0.10].map(srgb_to_linear)));
     }
+    let mut ladder = def(
+        materials::LADDER,
+        "ladder",
+        600.0,
+        [0.55, 0.36, 0.18].map(srgb_to_linear),
+    );
+    ladder.sim.flags.0 |= MaterialFlags::CLIMBABLE.0;
+    entries.push(ladder);
     entries.sort_by_key(|entry| entry.id);
     MaterialManifest::validated(entries)
         .and_then(|m| m.superseding_extension(&previous))
-        .expect("sandbox door materials")
+        .expect("sandbox door and ladder materials")
 }
 
 /// The first modular door: 1.5 x 2.5 m, hinged at its local lower-left cell.

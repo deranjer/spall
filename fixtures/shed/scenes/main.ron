@@ -1,0 +1,58 @@
+(
+    format_version: 1,
+    name: "Main",
+    next_entity_id: 6,
+    environment: "studio",
+    entities: {
+        (1): (
+            id: (1),
+            name: "Scene Voxels",
+            transform: (
+                translation: (0.0, 0.0, 0.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((1)),
+        ),
+        (2): (
+            id: (2),
+            name: "Woodshed",
+            transform: (
+                translation: (6.0, 0.5, 6.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((2)),
+        ),
+        (3): (
+            id: (3),
+            name: "Hinged timber door",
+            transform: (
+                translation: (6.75, 1.0, 6.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((3)),
+        ),
+        (4): (
+            id: (4),
+            name: "Interior player start",
+            transform: (
+                translation: (6.0, 0.5, 6.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (5): (
+            id: (5),
+            name: "axe_spawn",
+            transform: (
+                translation: (8.25, 1.5, 9.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: None,
+        ),
+    },
+)
