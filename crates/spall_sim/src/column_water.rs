@@ -1390,6 +1390,19 @@ impl AuthoritativeColumnWater {
         WorldGuard(lock(&self.shared.core))
     }
 
+    /// [`Self::world`] when no fluid step holds it right now: never waits, so
+    /// the tick can read the solver's exact spans without stalling behind a
+    /// step in flight. `None` means try again later.
+    pub fn try_world(&self) -> Option<WorldGuard<'_>> {
+        match self.shared.core.try_lock() {
+            Ok(guard) => Some(WorldGuard(guard)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(WorldGuard(poisoned.into_inner()))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     pub fn setup(&self) -> &ColumnWaterSetup {
         &self.shared.setup
     }

@@ -46,6 +46,7 @@ pub mod dormancy;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod footprints;
+pub mod ice;
 pub mod intent;
 pub mod journal;
 pub mod player;
@@ -76,7 +77,8 @@ pub use contact_damage::{
 };
 pub use creatures::{CreatureHostInitError, CreatureShape, CreatureSpawnError, CreatureVoxel};
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
-pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
+pub use ice::IceSettings;
+pub use intent::{BoxReplace, EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};
 pub use player::{
     HELD_INPUT_TIMEOUT_TICKS, PLAYER_MAX_HEALTH, Player, PlayerDamage, transaction_world_box,

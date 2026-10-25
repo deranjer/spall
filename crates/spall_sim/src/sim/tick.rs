@@ -129,6 +129,7 @@ impl Simulation {
         let players_span = crate::prof::Span::start("tick.players");
         self.advance_players(&report);
         drop(players_span);
+        self.advance_ice();
         Ok(report)
     }
 
