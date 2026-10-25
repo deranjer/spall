@@ -94,21 +94,24 @@ pub(super) fn pick_up_item(
     })
 }
 
-/// [`pick_up_item`] for the tick loop: answers the client and returns `true`
-/// when the request was a pickup.
+/// [`pick_up_item`] for the tick loop: answers the client (under the id it
+/// chose, `req` carrying the ledger id) and returns `true` when the request
+/// was a pickup.
 pub(super) fn try_pick_up(
     sim: &mut Simulation,
     session: SessionId,
     req: &ActionRequest,
     pickup: &Option<ItemPickup>,
     clients: &ClientMap,
+    client_request_id: RequestId,
 ) -> bool {
-    let Some(status) = pickup
+    let Some(mut status) = pickup
         .as_ref()
         .and_then(|pickup| pick_up_item(sim, session, req, pickup))
     else {
         return false;
     };
+    status.request_id = client_request_id;
     send_to(clients, session, Outbound::Status(Arc::new(status)));
     true
 }
