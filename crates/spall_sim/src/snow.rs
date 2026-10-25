@@ -315,7 +315,7 @@ impl SnowState {
 
     /// Thin-snow depth (Q16 metres) on the top face of `cell`, or `None` when
     /// no stored surface covers that face.
-    pub fn depth_q16_at(&mut self, cell: [i32; 3]) -> Option<u16> {
+    pub fn stored_depth_q16_at(&mut self, cell: [i32; 3]) -> Option<u16> {
         let key = (
             cell[0].div_euclid(SNOW_TILE_CELLS),
             cell[2].div_euclid(SNOW_TILE_CELLS),

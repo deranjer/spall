@@ -322,7 +322,7 @@ impl Simulation {
         let top = (point_m[1] / CELL_M).round() as i32 - 1;
         (top - 2..=top)
             .rev()
-            .find_map(|y| self.snow.depth_q16_at([x, y, z]))
+            .find_map(|y| self.snow.stored_depth_q16_at([x, y, z]))
             .map_or(0.0, |q16| f64::from(q16) / 65_536.0)
     }
 

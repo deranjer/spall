@@ -1159,6 +1159,10 @@ impl InteractiveApp {
     /// A click on a stack in the open pack: hold the compass, read a note.
     pub(super) fn use_pack_item(&mut self, item_id: u16) {
         let Some(view) = &self.pack_view else { return };
+        if view.item_tool(item_id).is_some() {
+            self.held_item = (self.held_item != Some(item_id)).then_some(item_id);
+            return;
+        }
         match view.item_use(item_id) {
             ItemUse::None => {}
             ItemUse::Compass => {

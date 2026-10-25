@@ -81,11 +81,6 @@ impl Pack {
         self.open
     }
 
-    /// The item kind under the cursor, while open.
-    pub(super) fn hovered(&self) -> Option<u16> {
-        self.hovered
-    }
-
     /// Open, or still sliding away.
     pub(super) fn is_shown(&self) -> bool {
         self.open || self.amount > 0.0

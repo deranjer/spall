@@ -741,7 +741,12 @@ pub(super) async fn serve_async(
                         if let Err(refused) =
                             permit_tool(&tool_hooks, session, principal, &req, admin_commands)
                         {
-                            reject(&clients_for_sim, session, client_request_id, &refused.reason());
+                            reject(
+                                &clients_for_sim,
+                                session,
+                                client_request_id,
+                                &refused.reason(),
+                            );
                             rejected_total += 1;
                             continue;
                         }

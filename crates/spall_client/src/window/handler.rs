@@ -128,21 +128,6 @@ impl ApplicationHandler for InteractiveApp {
                 self.book_button(state == ElementState::Pressed);
             }
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } if self.pack.is_open() && !ui_consumed => {
-                // Clicking a tool in the pack puts it in hand, or away again.
-                let item = self.pack.hovered().filter(|&item| {
-                    self.pack_view
-                        .as_ref()
-                        .is_some_and(|view| view.item_tool(item).is_some())
-                });
-                if let Some(item) = item {
-                    self.held_item = (self.held_item != Some(item)).then_some(item);
-                }
-            }
-            WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
