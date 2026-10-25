@@ -52,6 +52,10 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
     fn item_model(&self, _item_id: u16) -> &[ItemVoxel] {
         &[]
     }
+    /// Tinted copies of manifest materials that [`ItemVoxel::tint`] indexes.
+    fn item_tints(&self) -> Vec<(spall_core::MaterialId, [u8; 3])> {
+        Vec::new()
+    }
 }
 
 /// One cube of a world item's model.
@@ -63,6 +67,9 @@ pub struct ItemVoxel {
     pub size: [f32; 3],
     /// Render material (a manifest `MaterialId`'s number).
     pub material: u32,
+    /// Index into [`PackView::item_tints`], drawn instead of `material`'s
+    /// own colour; `None` keeps the material's colour.
+    pub tint: Option<u16>,
 }
 
 /// One page of the blueprint book: a recipe, and where its raw materials

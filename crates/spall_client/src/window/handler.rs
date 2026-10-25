@@ -593,8 +593,11 @@ impl ApplicationHandler for InteractiveApp {
                     if let Some(replica) =
                         self.session.replica.get().and_then(|r| r.try_lock().ok())
                     {
-                        self.last_item_cubes =
-                            world_item_instances(replica.world_items(), view.as_ref());
+                        self.last_item_cubes = world_item_instances(
+                            replica.world_items(),
+                            view.as_ref(),
+                            self.item_tint_base,
+                        );
                     }
                     overlay.extend_from_slice(&self.last_item_cubes);
                 }

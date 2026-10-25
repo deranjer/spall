@@ -681,8 +681,11 @@ progression database with player credentials), limited to 12 distinct kinds.
 New custom worlds get items from `CustomWorld::with_world_items`; the sandbox's
 editor-scene loader reads them from `<project>/items.ron` (the cabin has a
 shovel and the note). Items are saved in checkpoints. The client draws each item
-from `PackView::item_model` (sandbox placeholder cubes in
-`pack_view::placeholder_model` until SPVOX item models exist) and labels the
+from `PackView::item_model`, tinted through `PackView::item_tints`. The sandbox
+decodes the ENG-254 `fixtures/items/assets/*.spvox` models once at startup
+(the compass with its needle), lays each on its largest face, and scales the
+compass and note down to life size. A model that fails to load is logged as an
+error and drawn as `pack_view::placeholder_model` cubes. The client also labels the
 nearest one `E  Pick up <name>`, ahead of a door prompt.
 
 Quarter-metre doors use `spall_voxel::doors` to find a visible nearby hinge and

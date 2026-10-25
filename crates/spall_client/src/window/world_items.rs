@@ -4,10 +4,12 @@
 use super::*;
 use spall_protocol::WorldItem;
 
-/// Cubes for every item, posed at its translation and yaw.
+/// Cubes for every item, posed at its translation and yaw. A tinted voxel
+/// draws render material `tint_base + tint` (see [`PackView::item_tints`]).
 pub(super) fn world_item_instances<'a>(
     items: impl Iterator<Item = &'a WorldItem>,
     view: &dyn PackView,
+    tint_base: u32,
 ) -> Vec<Instance> {
     let mut out = Vec::new();
     for item in items {
@@ -16,7 +18,9 @@ pub(super) fn world_item_instances<'a>(
         out.extend(view.item_model(item.kind).iter().map(|voxel| {
             Instance::new(
                 (origin + rotation * Vec3::from_array(voxel.center)).to_array(),
-                voxel.material,
+                voxel
+                    .tint
+                    .map_or(voxel.material, |tint| tint_base + u32::from(tint)),
                 voxel.size,
                 rotation.to_array(),
             )
