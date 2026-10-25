@@ -404,7 +404,7 @@ mod network {
         });
         assert_eq!(cabin.held(0, game::items::FIRE_PIT), 0);
         // A retry of the same request sets nothing more down.
-        first.session.push_action(place);
+        first.session.push_action(place.clone());
         until("the fire burns out and the pit stays", || {
             (fires(&first.replica) == [(0.0, false)]).then_some(())
         });
@@ -422,6 +422,107 @@ mod network {
         let (fuel, lit) = seen[0];
         // Its current fuel, a little burnt since the feed.
         assert!(lit && fuel < 600.0 && fuel > 590.0, "{seen:?}");
+        // Another player may use the same client request id to place a fire.
+        // Integrating ENG-273 must namespace placements as well as pickups.
+        cabin
+            .inventories
+            .lock()
+            .unwrap()
+            .ensure(1)
+            .grant(game::items::FIRE_PIT, 1)
+            .unwrap();
+        second.session.push_action(place);
+        until(
+            "the second player's same-id placement creates its own fire",
+            || (fires(&second.replica).len() == 2).then_some(()),
+        );
+        assert_eq!(cabin.held(1, game::items::FIRE_PIT), 0);
         cabin.stop(vec![first, second]);
+    }
+    /// ENG-273: every client numbers its requests from the same base, so two
+    /// players pressing E with the same request id each still get their own
+    /// item; the server's ledger is per player.
+    #[test]
+    fn two_players_using_the_same_request_id_each_pick_up_their_own_item() {
+        let (shovel, note) = (game::items::SHOVEL, game::items::NOTE);
+        let cabin = Cabin::start(
+            "item-same-id",
+            vec![[10.125, 1.0, 8.5], [12.0, 1.0, 9.0]],
+            vec![
+                InitialWorldItem {
+                    kind: shovel.0,
+                    translation_m: [10.125, 1.0, 9.5],
+                    yaw_rad: 0.0,
+                },
+                InitialWorldItem {
+                    kind: note.0,
+                    translation_m: [12.0, 1.0, 10.0],
+                    yaw_rad: 0.0,
+                },
+            ],
+        );
+        let first = cabin.connect("first");
+        let second = cabin.connect("second");
+        until("both items are replicated", || {
+            (kinds(&first.replica).len() == 2 && kinds(&second.replica).len() == 2).then_some(())
+        });
+        first.session.push_action(interact(2_000_000));
+        second.session.push_action(interact(2_000_000));
+        until("both items are picked up", || {
+            (kinds(&first.replica).is_empty() && kinds(&second.replica).is_empty()).then_some(())
+        });
+        assert_eq!(cabin.held(0, shovel), 1);
+        assert_eq!(cabin.held(1, note), 1);
+        cabin.stop(vec![first, second]);
+    }
+
+    /// ENG-57 with ENG-273's per-player ledger: a retry sent after a
+    /// reconnect still replays the recorded answer and takes nothing more.
+    #[test]
+    fn a_retry_after_a_reconnect_replays_and_does_not_pick_up_again() {
+        let (shovel, note) = (game::items::SHOVEL, game::items::NOTE);
+        let cabin = Cabin::start(
+            "item-reconnect-retry",
+            vec![[10.125, 1.0, 8.5]],
+            vec![
+                InitialWorldItem {
+                    kind: shovel.0,
+                    translation_m: [10.125, 1.0, 9.5],
+                    yaw_rad: 0.0,
+                },
+                InitialWorldItem {
+                    kind: note.0,
+                    translation_m: [10.125, 1.0, 7.0],
+                    yaw_rad: 0.0,
+                },
+            ],
+        );
+        let before = cabin.connect("before");
+        until("both items", || {
+            (kinds(&before.replica).len() == 2).then_some(())
+        });
+        before.session.push_action(interact(2_000_000));
+        until("the shovel is picked up", || {
+            (kinds(&before.replica) == [note.0]).then_some(())
+        });
+        before.session.request_stop();
+        before.thread.join().unwrap();
+        let after = until("the slot is free to rejoin", || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cabin.connect("after"))).ok()
+        });
+        until("the note is still lying there", || {
+            (kinds(&after.replica) == [note.0]).then_some(())
+        });
+        // The same request id on the replacement session: replayed, not run
+        // again against the note now in reach.
+        after.session.push_action(interact(2_000_000));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(kinds(&after.replica), [note.0]);
+        assert_eq!(cabin.held(0, note), 0);
+        after.session.push_action(interact(2_000_001));
+        until("a new request id picks the note up", || {
+            kinds(&after.replica).is_empty().then_some(())
+        });
+        cabin.stop(vec![after]);
     }
 }

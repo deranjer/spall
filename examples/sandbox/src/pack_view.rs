@@ -118,22 +118,29 @@ impl PackView for SandboxPackView {
         &self.blueprints
     }
 
+    fn item_use(&self, item_id: u16) -> ItemUse {
+        match crate::game::ItemId(item_id) {
+            items::COMPASS => ItemUse::Compass,
+            items::FIRE_PIT => ItemUse::Place,
+            items::NOTE => ItemUse::Note(note_text(tower_heading_deg())),
+            _ => ItemUse::None,
+        }
+    }
+
     fn item_model(&self, item_id: u16) -> &[ItemVoxel] {
         self.models.models.get(&item_id).map_or(&[], Vec::as_slice)
     }
 
-    fn lit_model(&self, item_id: u16) -> &[ItemVoxel] {
+    fn lit_model(&self, item_id: u16, fuel_s: f32, time_s: f32, seed: u64) -> Vec<ItemVoxel> {
         if ItemId(item_id) == items::FIRE_PIT {
-            FIRE_GLOW
+            crate::fire_flame::flame_voxels(
+                fuel_s,
+                time_s,
+                crate::fire_flame::seed_phase(seed),
+                self.models.flame_palette,
+            )
         } else {
-            &[]
-        }
-    }
-
-    fn item_use(&self, item_id: u16) -> ItemUse {
-        match ItemId(item_id) {
-            items::FIRE_PIT => ItemUse::Place,
-            _ => ItemUse::None,
+            Vec::new()
         }
     }
 
@@ -141,23 +148,6 @@ impl PackView for SandboxPackView {
         self.models.tints.clone()
     }
 }
-
-/// A burning fire pit's flame for now: the torch's glowing lamp blocks, a
-/// larger one under a smaller one, among the sticks. ENG-267 replaces it.
-const FIRE_GLOW: &[ItemVoxel] = &[
-    ItemVoxel {
-        center: [0.0, 0.12, 0.0],
-        size: [0.2, 0.2, 0.2],
-        material: crate::game::materials::LAMP.0 as u32,
-        tint: None,
-    },
-    ItemVoxel {
-        center: [0.0, 0.3, 0.0],
-        size: [0.1, 0.16, 0.1],
-        material: crate::game::materials::LAMP.0 as u32,
-        tint: None,
-    },
-];
 
 /// A fire pit as its blueprint lays it out: six stones in a ring round
 /// sticks crossed in the middle, built from the stone and stick models.
@@ -191,6 +181,28 @@ fn fire_pit_model(stone: &[ItemVoxel], stick: &[ItemVoxel]) -> Vec<ItemVoxel> {
         }));
     }
     out
+}
+
+/// Compass heading, degrees clockwise from north (north 0, east 90), of the
+/// tower as seen from the cabin. ENG-251 places the cabin at the south edge and
+/// the tower at the north edge of the Winter Crossing scenario and should return
+/// the bearing computed from those placements here.
+// TODO(ENG-251): replace this placeholder with the computed bearing.
+const PLACEHOLDER_TOWER_HEADING_DEG: f32 = 12.0;
+
+pub fn tower_heading_deg() -> f32 {
+    PLACEHOLDER_TOWER_HEADING_DEG
+}
+
+/// What the cabin note says for a tower at `heading_deg` from the cabin.
+pub fn note_text(heading_deg: f32) -> String {
+    let heading = heading_deg.rem_euclid(360.0).round() as u32 % 360;
+    format!(
+        "The tower is at {heading:03} degrees
+from the cabin.
+The compass always points north.
+Keep the tower at {heading:03} and walk."
+    )
 }
 
 /// The SPVOX model of each kind that can lie in the world.
@@ -248,6 +260,8 @@ struct ItemModels {
     models: HashMap<u16, Vec<ItemVoxel>>,
     /// `(material, sRGB tint)` pairs that [`ItemVoxel::tint`] indexes.
     tints: Vec<(MaterialId, [u8; 3])>,
+    /// Index of [`crate::fire_flame::FLAME_PALETTE`]'s first entry in `tints`.
+    flame_palette: u16,
     /// Kinds whose asset failed and draw [`placeholder_model`] instead.
     fallbacks: Vec<u16>,
 }
@@ -280,6 +294,8 @@ impl ItemModels {
             &out.models[&items::STICK.0],
         );
         out.models.insert(items::FIRE_PIT.0, pit);
+        out.flame_palette = u16::try_from(out.tints.len()).expect("few item tints");
+        out.tints.extend(crate::fire_flame::FLAME_PALETTE);
         out
     }
 
@@ -435,6 +451,21 @@ pub fn placeholder_model(item: ItemId) -> &'static [ItemVoxel] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_note_gives_the_tower_heading_and_the_compass_and_note_are_usable() {
+        assert!(note_text(12.0).contains("012 degrees"));
+        assert!(note_text(0.0).contains("000 degrees"));
+        assert!(note_text(359.6).contains("000 degrees"), "rounds past 359");
+        assert!(note_text(-90.0).contains("270 degrees"), "wraps");
+        let view = SandboxPackView::new();
+        assert_eq!(view.item_use(items::COMPASS.0), ItemUse::Compass);
+        assert_eq!(
+            view.item_use(items::NOTE.0),
+            ItemUse::Note(note_text(tower_heading_deg()))
+        );
+        assert_eq!(view.item_use(items::STICK.0), ItemUse::None);
+    }
+
     /// Every item the game can award or craft has a name and an icon that
     /// decodes.
     #[test]
@@ -470,14 +501,16 @@ mod tests {
             view.item_model(items::FIRE_PIT.0).len(),
             6 * stones + 3 * sticks
         );
-        let lamp = u32::from(crate::game::materials::LAMP.0);
+        let tints = view.item_tints().len();
+        let flame = view.lit_model(items::FIRE_PIT.0, 180.0, 1.0, 7);
+        assert!(!flame.is_empty());
         assert!(
-            view.lit_model(items::FIRE_PIT.0)
+            flame
                 .iter()
-                .all(|v| v.material == lamp)
+                .all(|v| v.tint.is_some_and(|t| usize::from(t) < tints))
         );
-        assert!(!view.lit_model(items::FIRE_PIT.0).is_empty());
-        assert!(view.lit_model(items::STICK.0).is_empty());
+        assert!(view.lit_model(items::FIRE_PIT.0, 0.0, 1.0, 7).is_empty());
+        assert!(view.lit_model(items::STICK.0, 180.0, 1.0, 7).is_empty());
     }
 
     /// Every kind that can lie in the world has a name for the E prompt and a

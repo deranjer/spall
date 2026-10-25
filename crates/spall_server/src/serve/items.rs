@@ -120,9 +120,10 @@ pub(super) fn try_use_item(
     req: &ActionRequest,
     hooks: &ItemHooks,
     clients: &ClientMap,
+    client_request_id: RequestId,
 ) -> bool {
-    try_fire(sim, session, req, &hooks.fires, clients)
-        || try_pick_up(sim, session, req, &hooks.pickup, clients)
+    try_fire(sim, session, req, &hooks.fires, clients, client_request_id)
+        || try_pick_up(sim, session, req, &hooks.pickup, clients, client_request_id)
 }
 
 /// [`pick_up_item`] for the tick loop: answers the client and returns `true`
@@ -133,13 +134,15 @@ fn try_pick_up(
     req: &ActionRequest,
     pickup: &Option<ItemPickup>,
     clients: &ClientMap,
+    client_request_id: RequestId,
 ) -> bool {
-    let Some(status) = pickup
+    let Some(mut status) = pickup
         .as_ref()
         .and_then(|pickup| pick_up_item(sim, session, req, pickup))
     else {
         return false;
     };
+    status.request_id = client_request_id;
     send_to(clients, session, Outbound::Status(Arc::new(status)));
     true
 }

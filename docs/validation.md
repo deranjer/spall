@@ -339,7 +339,7 @@ minimal debug view draws nearby replicated terrain and detached bodies; its
 prediction collision world mirrors both, with detached-body poses remaining
 server-driven. F3 shows the local capsule bounds as 1.25 cm wire-like strokes
 rather than voxel-sized markers. It is not the G2 renderer.
-The window releases the cursor with Escape or focus loss, and focus loss clears
+Escape closes an open pack, book, note or admin menu first; otherwise it opens the Esc menu (ENG-270: Resume, Quit, and every keybind, click one then press the new key; clashes are refused; saved to `%APPDATA%\Spall\client-settings.json`, or `~/.config/spall/` elsewhere). Focus loss releases the cursor, and focus loss clears
 all held actions so a missing OS key-up cannot continue a walk or jump. The
 historical PR #109 record reports a hands-on run of `cargo xtask play --release
 --scene g1 --ticks 18000` in which the investigated frame-pacing jitter was no
@@ -353,6 +353,8 @@ scene, then moved to their emitter on activation. `spall_sim::playground` tests
 pin both cadences and prove each staged body's mass equals the sum of its
 quarter-metre voxels at the current material density. Full moving-body crush
 outcomes remain follow-up.
+
+ENG-262: clicking a compass in the open pack holds it (a screen-space dial lower right whose needle points to world north, -Z; clicking it again puts it away), and clicking a note shows a paper with the tower's compass heading from the cabin. The text comes from the game's `PackView::item_use`; the sandbox's heading is a placeholder until ENG-251 supplies the bearing. Not checked in a live window.
 
 For isolated physics UAT, `cargo xtask play --scene playground --late-join
 --client-authoritative` makes the interactive client authoritative for player
@@ -1085,8 +1087,27 @@ daytime moon visibility. Run
 client integration. Run the focused `spall_render` GPU renderer test to compile
 and exercise the skybox and surface-lighting shaders. Hardware presentation is
 separate; report it as unrun when no target GPU window is available. The clock
-derives from server ticks and intentionally restarts at 06:00 after a server
-restart because simulation ticks are not persisted.
+derives from server ticks and intentionally restarts at the configured start
+hour (06:00 by default) after a server restart because simulation ticks are not
+persisted.
+
+ENG-252 configurable day: `cargo test -p spall_core time_of_day::tests` also covers a
+10-minute day starting 15:30, the default clock matching the 72,000-tick day, and
+invalid clocks; `cargo test -p spall_client day_night::tests` checks the sun and
+label on that clock; `cargo test -p spall_protocol handshake::tests` checks the
+clock is validated but not compared; `cargo test -p spall_net --test transport
+client_receives_the_servers_day_clock` (loopback socket) checks the client gets the
+server's clock; `cargo test -p sandbox --lib sleep_follows_the_configured_day`
+checks the animal schedule follows it. Hands-on sky check with
+`--day-minutes 10 --start-hour 15.5` is unrun.
+
+ENG-252 snow slowdown: `cargo test -p spall_physics ground_scale` and `snow_drag::`
+cover the kernel multiplier and depth/blizzard mapping;
+`cargo test -p spall_client --test snow_prediction` accumulates real snow on a
+`spall_sim::Simulation` floor, walks the server player and a predictor fed the
+replicated snow and weather, and requires equal speeds (within 1e-3 m/s) at the
+expected reduced speed, and full speed on bare ground. Blizzard and the in-window
+feel are unit-tested/unplaytested only.
 
 ### ENG-126 larger world integration
 

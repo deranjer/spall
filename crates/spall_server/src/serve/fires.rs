@@ -177,6 +177,7 @@ pub(super) fn try_fire(
     req: &ActionRequest,
     fires: &Option<Fires>,
     clients: &ClientMap,
+    client_request_id: RequestId,
 ) -> bool {
     let answer = match fires {
         Some(fires) => place_fire(sim, session, req, fires),
@@ -184,9 +185,10 @@ pub(super) fn try_fire(
             .then(|| rejected(req, "nothing can be set down here")),
     }
     .or_else(|| feed_fire(sim, session, req, fires.as_ref()));
-    let Some(status) = answer else {
+    let Some(mut status) = answer else {
         return false;
     };
+    status.request_id = client_request_id;
     send_to(clients, session, Outbound::Status(Arc::new(status)));
     true
 }

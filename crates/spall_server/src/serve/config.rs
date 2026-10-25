@@ -101,6 +101,9 @@ pub struct HostConfig {
     /// Optional credential registry path polled for atomic rotation/revocation
     /// updates. Only used by player-credential authentication.
     pub credential_registry_file: Option<PathBuf>,
+    /// Day length and starting hour of the shared sky and animal schedules;
+    /// sent to every client in the handshake.
+    pub day_clock: spall_core::time_of_day::DayClock,
     /// The world and player spawns for [`Scene::Custom`]; ignored for every
     /// other scene. `serve` fails fast if `scene` is `Custom` and this is `None`.
     pub custom_world: Option<CustomWorld>,
@@ -254,6 +257,7 @@ impl ServeConfig {
                 contact_damage: None,
                 dormancy: None,
                 credential_registry_file: None,
+                day_clock: Default::default(),
                 custom_world: None,
             },
             harness: HarnessConfig::default(),

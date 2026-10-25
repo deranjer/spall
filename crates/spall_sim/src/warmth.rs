@@ -192,8 +192,12 @@ impl BodyHeat {
 
 /// Air temperature at server `tick`: the weather's, colder at night and a
 /// little warmer at midday.
-pub(crate) fn air_temperature_c(weather: &WeatherState, tick: u64) -> f32 {
-    let sun = spall_core::time_of_day::state_at_tick(tick).sun_height();
+pub(crate) fn air_temperature_c(
+    weather: &WeatherState,
+    clock: spall_core::time_of_day::DayClock,
+    tick: u64,
+) -> f32 {
+    let sun = clock.state_at(tick).sun_height();
     f32::from(weather.temperature_centi_c) / 100.0 + DAY_WARMING_C * sun.max(0.0)
         - NIGHT_DROP_C * (-sun).max(0.0)
 }
@@ -442,8 +446,9 @@ mod tests {
                 season_ms: 900_000,
             },
         );
-        let noon = air_temperature_c(&weather, DAY_CYCLE_TICKS / 4);
-        let midnight = air_temperature_c(&weather, DAY_CYCLE_TICKS * 3 / 4);
+        let clock = spall_core::time_of_day::DayClock::default();
+        let noon = air_temperature_c(&weather, clock, DAY_CYCLE_TICKS / 4);
+        let midnight = air_temperature_c(&weather, clock, DAY_CYCLE_TICKS * 3 / 4);
         assert!((noon - midnight - (DAY_WARMING_C + NIGHT_DROP_C)).abs() < 1e-3);
     }
 }

@@ -6,6 +6,11 @@ use super::*;
 use crate::warmth::{self, Exposure};
 
 impl Simulation {
+    /// Use the host's day mapping for authoritative temperature.
+    pub fn set_day_clock(&mut self, clock: spall_core::time_of_day::DayClock) {
+        self.day_clock = clock;
+    }
+
     /// Advances every player's [`warmth::BodyHeat`] by `dt_s` seconds and
     /// applies the cold damage due. Runs on the owning thread at the end of a
     /// tick, every [`warmth::BODY_HEAT_PERIOD_TICKS`].
@@ -13,7 +18,7 @@ impl Simulation {
         if self.world.player_count() == 0 {
             return;
         }
-        let air_c = warmth::air_temperature_c(&self.weather, self.tick.get());
+        let air_c = warmth::air_temperature_c(&self.weather, self.day_clock, self.tick.get());
         let wind_chill_c = warmth::wind_chill_c(&self.weather);
         let rain = warmth::rain(&self.weather);
         let frame = self.column_water.as_ref().map(|w| w.frame());
@@ -119,6 +124,14 @@ mod tests {
         assert_eq!(shelter, warmth::Shelter::default(), "open ground");
         let lowest = endure(&mut sim, player, 400);
         assert!(lowest < PLAYER_MAX_HEALTH - 20, "lowest health {lowest}");
+    }
+
+    #[test]
+    fn cold_follows_the_hosts_configured_midnight_at_tick_zero() {
+        let (mut sim, player) = night(|_| {}, [10.0, 1.0, 2.0]);
+        sim.tick = Tick::ZERO;
+        sim.set_day_clock(spall_core::time_of_day::DayClock::new(36_000, 0.0).unwrap());
+        assert!(endure(&mut sim, player, 400) < PLAYER_MAX_HEALTH - 20);
     }
 
     /// A winter blizzard in the open at server `tick`: the lowest warmth and

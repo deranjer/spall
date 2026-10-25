@@ -12,6 +12,8 @@ pub mod appearance_v3;
 pub mod audio;
 pub mod content;
 pub mod editor_scene;
+#[cfg(feature = "client")]
+pub mod fire_flame;
 pub mod fires;
 /// Minimal game content (material catalog, player tools) that turns tool use
 /// into engine [`spall_sim::EditIntent`]s. The engine never imports this.
@@ -22,6 +24,7 @@ pub mod pack_view;
 pub mod player_view;
 pub mod progression_store;
 pub mod world_items;
+pub mod world_scatter;
 pub mod worldgen_scene;
 
 pub fn init_tracing() {
