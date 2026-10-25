@@ -72,6 +72,25 @@ pub struct Player {
 }
 
 impl Player {
+    /// What the character kernel needs around this capsule besides collision:
+    /// the water over its feet (`water_at`, probed 5 cm up) and the ladder of
+    /// `terrain` in reach (ENG-263). The client predictor makes the same two
+    /// probes against its replica.
+    pub(crate) fn surroundings(
+        &self,
+        water_at: &dyn Fn(f64, f64, f64) -> Option<spall_physics::WaterSample>,
+        terrain: &spall_voxel::Volume,
+        materials: &spall_core::MaterialManifest,
+    ) -> (
+        Option<spall_physics::WaterSample>,
+        Option<spall_physics::LadderContact>,
+    ) {
+        let [x, y, z] = self.state.position_m;
+        let climbable = spall_physics::Climbable::from_manifest(materials);
+        let ladder = spall_physics::ladder_contact(terrain, &climbable, self.params, [x, y, z]);
+        (water_at(x, y + 0.05, z), ladder)
+    }
+
     /// A player spawned standing at `feet_m`.
     pub fn new(entity: EntityId, params: CharacterParams, feet_m: [f64; 3]) -> Self {
         let spawn = CharacterState::at(feet_m);

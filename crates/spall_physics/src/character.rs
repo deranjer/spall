@@ -96,6 +96,29 @@ pub mod tuning {
     /// endurance recovers past this level; the gap stops sprint flickering on
     /// and off at the limit.
     pub const EXHAUSTED_RECOVER: f32 = 0.30;
+
+    // --- ladders (ENG-263, see `crate::ladder`) ---
+    /// Climbing speed up a ladder (W), m/s.
+    pub const LADDER_CLIMB_M_S: f32 = 2.4;
+    /// Climbing speed down a ladder (S), m/s.
+    pub const LADDER_DESCEND_M_S: f32 = 3.0;
+    /// Sliding speed down a ladder (jump held), m/s.
+    pub const LADDER_SLIDE_M_S: f32 = 8.0;
+    /// Sideways shuffle along a ladder (A/D), m/s.
+    pub const LADDER_SIDE_M_S: f32 = 1.5;
+    /// How far past the capsule surface a ladder cell is in reach, metres.
+    pub const LADDER_REACH_M: f32 = 0.2;
+    /// How far under the feet the probe still holds on, metres, so a climber
+    /// keeps the ladder while lifting the feet over its top.
+    pub const LADDER_BELOW_FEET_M: f32 = 0.6;
+    /// A ladder must rise this far above the feet to be grabbed, metres.
+    pub const LADDER_ENTER_ABOVE_M: f32 = 0.3;
+    /// Minimum cosine between the look direction and the ladder to grab it.
+    pub const LADDER_ENTER_FACING: f32 = 0.5;
+    /// Feet height over the ladder top at which W steps onto the platform.
+    pub const LADDER_MOUNT_CLEARANCE_M: f32 = 0.15;
+    /// Longest ladder column the probe follows to find its top, cells.
+    pub const LADDER_MAX_SCAN_CELLS: usize = 4096;
 }
 
 /// Capsule dimensions for one player, metres. The capsule is upright (its axis
@@ -160,6 +183,8 @@ pub struct CharacterState {
     /// Set when endurance hit empty; sprint is unavailable (walk speed) until
     /// endurance recovers past [`tuning::EXHAUSTED_RECOVER`].
     pub exhausted: bool,
+    /// On a ladder (ENG-263): gravity is off and W/S/jump move vertically.
+    pub climbing: bool,
 }
 
 impl CharacterState {
@@ -172,6 +197,7 @@ impl CharacterState {
             jump_held_last: false,
             endurance: 1.0,
             exhausted: false,
+            climbing: false,
         }
     }
 
@@ -183,7 +209,13 @@ impl CharacterState {
 
     /// Advances endurance by one tick. `sprinting` is effective sprinting on the
     /// ground, `swimming` and `moving` describe the tick's input.
-    fn tick_endurance(&mut self, dt: f32, sprinting: bool, swimming: bool, moving: bool) {
+    pub(crate) fn tick_endurance(
+        &mut self,
+        dt: f32,
+        sprinting: bool,
+        swimming: bool,
+        moving: bool,
+    ) {
         let rate = if sprinting {
             -tuning::ENDURANCE_DRAIN_PER_S
         } else if swimming && moving {
@@ -240,7 +272,7 @@ pub fn step_character(
     dt_s: f32,
     sweep: impl FnMut([f64; 3], [f32; 3]) -> CharacterMove,
 ) -> CharacterState {
-    step_character_in_water(state, input, dt_s, None, sweep)
+    step_character_in_water(state, input, dt_s, None, None, sweep)
 }
 
 /// The water around a character: where its surface is and how fast it runs.
@@ -283,15 +315,23 @@ pub fn is_swimming(water: Option<WaterSample>, feet_y: f64) -> bool {
 /// swimmer (who swims relative to the water) and shoves a wader. Water deeper than [`tuning::SWIM_ENTER_DEPTH_M`] over the feet makes the capsule swim
 /// (look-direction movement, treading at [`tuning::FLOAT_DEPTH_M`], jump to rise
 /// and to leap out of the water); shallower water only slows walking.
+///
+/// `ladder` is the ladder in reach ([`crate::ladder_contact`]), or `None`;
+/// like `water`, server and client must pass the same value for the same
+/// state. Climbing takes precedence over walking and swimming.
 pub fn step_character_in_water(
     mut state: CharacterState,
     input: PlayerInput,
     dt_s: f32,
     water: Option<WaterSample>,
+    ladder: Option<crate::LadderContact>,
     mut sweep: impl FnMut([f64; 3], [f32; 3]) -> CharacterMove,
 ) -> CharacterState {
     let input = input.sanitized();
     let dt = dt_s.max(0.0);
+    if let Some(next) = crate::ladder::climb_step(&mut state, input, dt, ladder, &mut sweep) {
+        return next;
+    }
 
     // --- horizontal wish velocity, in the world frame -----------------------
     let (sin_y, cos_y) = input.yaw().sin_cos();
@@ -668,10 +708,11 @@ mod tests {
         let swim = |input| {
             let mut state = CharacterState::at([0.0, 3.0, 0.0]);
             for _ in 0..600 {
-                state = step_character_in_water(state, input, DT, water, |_, d| CharacterMove {
-                    translation_m: d,
-                    grounded: false,
-                });
+                state =
+                    step_character_in_water(state, input, DT, water, None, |_, d| CharacterMove {
+                        translation_m: d,
+                        grounded: false,
+                    });
                 state.position_m[1] = 3.0;
             }
             state
@@ -714,7 +755,7 @@ mod tests {
         let swim = |buttons| {
             let mut s = CharacterState::at([0.0, 5.0 - tuning::FLOAT_DEPTH_M as f64, 0.0]);
             for _ in 0..120 {
-                s = step_character_in_water(s, forward_input(buttons), DT, water, |_, d| {
+                s = step_character_in_water(s, forward_input(buttons), DT, water, None, |_, d| {
                     CharacterMove {
                         translation_m: d,
                         grounded: false,
@@ -744,6 +785,7 @@ mod tests {
             jump_held_last: false,
             endurance: 1.0,
             exhausted: false,
+            climbing: false,
         };
         let launch = PlayerInput {
             movement: [0.0, 0.0, 1.0],
@@ -780,6 +822,7 @@ mod tests {
             jump_held_last: false,
             endurance: 1.0,
             exhausted: false,
+            climbing: false,
         };
         let jump = PlayerInput {
             buttons: BUTTON_JUMP,
@@ -1469,6 +1512,7 @@ mod tests {
                 input,
                 DT,
                 Some(WaterSample::still(surface)),
+                None,
                 |_, d| CharacterMove {
                     translation_m: d,
                     grounded: false,
@@ -1538,6 +1582,7 @@ mod tests {
                 input,
                 DT,
                 Some(WaterSample::still(10.0)),
+                None,
                 |_, d| CharacterMove {
                     translation_m: d,
                     grounded: false,
@@ -1580,6 +1625,7 @@ mod tests {
                 walk,
                 DT,
                 surface.map(WaterSample::still),
+                None,
                 |_, d| CharacterMove {
                     translation_m: d,
                     grounded: true,
@@ -1612,9 +1658,11 @@ mod tests {
             flow_m_s: flow,
         };
         for _ in 0..ticks {
-            state = step_character_in_water(state, input, DT, Some(water), |_, d| CharacterMove {
-                translation_m: d,
-                grounded: false,
+            state = step_character_in_water(state, input, DT, Some(water), None, |_, d| {
+                CharacterMove {
+                    translation_m: d,
+                    grounded: false,
+                }
             });
         }
         state
@@ -1660,7 +1708,7 @@ mod tests {
             ..CharacterState::at([0.0, 9.0, 0.0])
         };
         let step = |water: Option<WaterSample>| {
-            step_character_in_water(on_ground, idle, DT, water, |_, d| CharacterMove {
+            step_character_in_water(on_ground, idle, DT, water, None, |_, d| CharacterMove {
                 translation_m: d,
                 grounded: true,
             })

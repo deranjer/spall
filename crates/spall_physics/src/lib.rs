@@ -24,6 +24,7 @@ pub mod collider;
 pub mod coordinates;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
+pub mod ladder;
 pub mod mass;
 pub mod merge;
 pub mod metrics;
@@ -42,6 +43,7 @@ pub use collider::{
     choose_representation,
 };
 pub use coordinates::PhysicsOrigin;
+pub use ladder::{Climbable, LadderContact, ladder_contact};
 pub use mass::{BodyMassProperties, MassProperties, analytic_mass_properties};
 pub use merge::{BoxSpan, greedy_boxes};
 pub use metrics::{DurationSamples, PercentileSummary};

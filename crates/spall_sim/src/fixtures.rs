@@ -286,6 +286,28 @@ pub fn walk_arena_setup() -> WorldSetup {
     }
 }
 
+/// Fixture ladder: id 3, climbable ([`MaterialFlags::CLIMBABLE`]).
+pub const LADDER: MaterialId = MaterialId(3);
+
+/// ENG-263's ladder scene ([`spall_physics::fixtures::ladder_wall`]): a floor,
+/// a 4 m wall block with a platform on top, and a ladder up its face. The
+/// manifest is [`stone_manifest`] plus [`LADDER`]. Spawn at
+/// [`spall_physics::fixtures::ladder::SPAWN_M`], facing `+x`.
+pub fn ladder_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    let mut entries = stone_manifest().entries().to_vec();
+    let mut ladder = material(LADDER.0, "ladder", 650.0);
+    ladder.sim.flags = MaterialFlags(ladder.sim.flags.0 | MaterialFlags::CLIMBABLE.0);
+    entries.push(ladder);
+    WorldSetup {
+        terrain: spall_physics::fixtures::ladder_wall(id, LADDER),
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(63, 31, 31)),
+        materials: MaterialManifest::validated(entries).expect("ladder manifest"),
+        anchor: AnchorPlane::at(0),
+        physics: sim_physics_config(),
+    }
+}
+
 /// Feet spawn positions (metres) for [`walk_arena_setup`]; index is the player /
 /// connection slot. The floor top is `y = 1.0 m`.
 pub const WALK_ARENA_SPAWNS: [[f64; 3]; 4] = [

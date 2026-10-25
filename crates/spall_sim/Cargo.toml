@@ -31,7 +31,7 @@ serde_json = { workspace = true, optional = true }
 # Pulls in the JSON serialisation used by the offline `sim-scenario` binary.
 scenario = ["dep:serde_json", "fixtures"]
 # Test-scene builders (also used by gates and benches).
-fixtures = ["spall_voxel/fixtures"]
+fixtures = ["spall_voxel/fixtures", "spall_physics/fixtures"]
 # Offline benchmark binaries.
 bench = ["fixtures", "spall_physics/fixtures"]
 
