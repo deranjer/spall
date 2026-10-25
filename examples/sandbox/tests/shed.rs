@@ -32,7 +32,16 @@ fn shed_player_walks_in_and_out_through_its_door() {
     )
     .expect("hinge present");
     assert!(!door.open);
+    // Knob cells ride the panel: closed (31, 8, 23/25) -> open (26/28, 8, 28).
+    let panel = |sim: &Simulation, x, z| {
+        matches!(
+            sim.world().terrain().volume.sample(GlobalCell::new(x, 8, z)),
+            Ok(Sample::Filled(m)) if m == sandbox::game::CABIN_DOOR.panel
+        )
+    };
+    assert!(panel(&sim, 31, 23) && panel(&sim, 31, 25));
     turn_door(&mut sim);
+    assert!(panel(&sim, 26, 28) && panel(&sim, 28, 28));
     let mut seq = 0;
     for (direction, ticks) in [(-1.0, 80), (1.0, 80)] {
         for _ in 0..ticks {

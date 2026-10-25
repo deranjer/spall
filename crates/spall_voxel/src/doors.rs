@@ -27,11 +27,13 @@ impl Door {
         };
         Some(Self { hinge, open, spec })
     }
-    fn cell(self, x: i64, y: i64, open: bool) -> GlobalCell {
+    /// Panel cell `x` along the leaf, `y` up and `d` off the panel plane
+    /// (`-1..=1`, for handles). Turning mirrors the leaf: `(x, d)` -> `(d, x)`.
+    fn cell(self, x: i64, y: i64, d: i64, open: bool) -> GlobalCell {
         GlobalCell::new(
-            self.hinge.x + if open { 0 } else { x },
+            self.hinge.x + if open { d } else { x },
             self.hinge.y + y,
-            self.hinge.z + if open { x } else { 0 },
+            self.hinge.z + if open { x } else { d },
         )
     }
     pub fn center_m(self) -> [f64; 3] {
@@ -45,9 +47,9 @@ impl Door {
     pub fn swing_bounds_m(self) -> ([f64; 3], [f64; 3]) {
         (
             [
-                self.hinge.x as f64 * 0.25,
+                (self.hinge.x - 1) as f64 * 0.25,
                 self.hinge.y as f64 * 0.25,
-                self.hinge.z as f64 * 0.25,
+                (self.hinge.z - 1) as f64 * 0.25,
             ],
             [
                 (self.hinge.x + self.spec.width) as f64 * 0.25,
@@ -74,29 +76,37 @@ impl Door {
         }
         let mut plan = EditPlan::new(volume.id());
         let mut moved = Vec::new();
-        for y in 0..self.spec.height {
-            for x in 0..self.spec.width {
-                if x == 0 && y == 0 {
-                    continue;
-                }
-                let source = self.cell(x, y, self.open);
-                match volume.sample(source) {
-                    Ok(Sample::Filled(m)) if m == self.spec.panel => {
-                        plan.set(source, MaterialId::AIR);
-                        moved.push(self.cell(x, y, !self.open));
+        let mut vacated = Vec::new();
+        for d in -1..=1 {
+            for y in 0..self.spec.height {
+                for x in 0..self.spec.width {
+                    if x == 0 && y == 0 && d == 0 {
+                        continue;
                     }
-                    Ok(Sample::Empty { .. }) => {}
-                    _ => return Err("door panel obstructed or unavailable"),
+                    let source = self.cell(x, y, d, self.open);
+                    match volume.sample(source) {
+                        Ok(Sample::Filled(m)) if m == self.spec.panel => {
+                            plan.set(source, MaterialId::AIR);
+                            vacated.push(source);
+                            let dest = self.cell(x, y, d, !self.open);
+                            moved.push(dest);
+                        }
+                        Ok(Sample::Empty { .. }) => {}
+                        // Foreign terrain beside the leaf is not part of the door.
+                        Ok(Sample::Filled(_)) if d != 0 => {}
+                        _ => return Err("door panel obstructed or unavailable"),
+                    }
                 }
             }
         }
-        // Conservative rectangular sweep, including both endpoint positions.
+        // Conservative rectangular sweep, including both endpoint positions. The
+        // source plane and its handle layer on the swing side hold the door itself.
         for z in 0..self.spec.width {
             for x in 0..self.spec.width {
                 for y in 0..self.spec.height {
                     let cell =
                         GlobalCell::new(self.hinge.x + x, self.hinge.y + y, self.hinge.z + z);
-                    let source = if self.open { x == 0 } else { z == 0 };
+                    let source = if self.open { x <= 1 } else { z <= 1 };
                     if source {
                         continue;
                     }
@@ -104,6 +114,13 @@ impl Door {
                         return Err("door swing is blocked");
                     }
                 }
+            }
+        }
+        // Every destination is free or is a cell this turn vacates.
+        for cell in &moved {
+            if !vacated.contains(cell) && !matches!(volume.sample(*cell), Ok(Sample::Empty { .. }))
+            {
+                return Err("door swing is blocked");
             }
         }
         for cell in moved {
@@ -154,11 +171,11 @@ pub fn nearby_door(volume: &Volume, eye: [f64; 3], spec: DoorSpec, reach: f64) -
                         c.y >= door.hinge.y
                             && c.y < door.hinge.y + spec.height
                             && if door.open {
-                                c.x == door.hinge.x
+                                (c.x - door.hinge.x).abs() <= 1
                                     && c.z >= door.hinge.z
                                     && c.z < door.hinge.z + spec.width
                             } else {
-                                c.z == door.hinge.z
+                                (c.z - door.hinge.z).abs() <= 1
                                     && c.x >= door.hinge.x
                                     && c.x < door.hinge.x + spec.width
                             }
@@ -174,4 +191,66 @@ pub fn nearby_door(volume: &Volume, eye: [f64; 3], spec: DoorSpec, reach: f64) -
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spall_core::{CellSizeCode, VolumeId};
+
+    const SPEC: DoorSpec = DoorSpec {
+        closed_hinge: MaterialId(218),
+        open_hinge: MaterialId(219),
+        panel: MaterialId(220),
+        width: 6,
+        height: 10,
+    };
+
+    fn put(volume: &mut Volume, x: i64, y: i64, z: i64, m: MaterialId) {
+        let mut plan = EditPlan::new(volume.id());
+        plan.set(GlobalCell::new(x, y, z), m);
+        volume.apply_edit(&plan).unwrap();
+    }
+    fn filled(volume: &Volume, x: i64, y: i64, z: i64) -> bool {
+        matches!(volume.sample(GlobalCell::new(x, y, z)), Ok(Sample::Filled(m)) if m == SPEC.panel)
+    }
+    fn turn(volume: &mut Volume, hinge: GlobalCell) -> Result<(), &'static str> {
+        let plan = Door::at(volume, hinge, SPEC).unwrap().plan(volume)?;
+        volume.apply_edit(&plan).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn handle_cells_off_the_panel_plane_round_trip() {
+        let mut v = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        let hinge = GlobalCell::new(10, 4, 20);
+        put(&mut v, 10, 4, 20, SPEC.closed_hinge);
+        for y in 0..10 {
+            for x in 0..6 {
+                if (x, y) != (0, 0) {
+                    put(&mut v, 10 + x, 4 + y, 20, SPEC.panel);
+                }
+            }
+        }
+        // A handle on each face, four cells along and four up.
+        put(&mut v, 14, 8, 19, SPEC.panel);
+        put(&mut v, 14, 8, 21, SPEC.panel);
+        turn(&mut v, hinge).unwrap();
+        // Closed (x, d) -> open (d, x): the handles now stand either side of x = 10.
+        assert!(filled(&v, 9, 8, 24) && filled(&v, 11, 8, 24));
+        assert!(!filled(&v, 14, 8, 19) && !filled(&v, 14, 8, 21));
+        turn(&mut v, hinge).unwrap();
+        assert!(filled(&v, 14, 8, 19) && filled(&v, 14, 8, 21));
+        assert!(!filled(&v, 9, 8, 24) && !filled(&v, 11, 8, 24));
+    }
+
+    #[test]
+    fn solid_where_a_handle_would_swing_blocks_the_turn() {
+        let mut v = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        let hinge = GlobalCell::new(10, 4, 20);
+        put(&mut v, 10, 4, 20, SPEC.closed_hinge);
+        put(&mut v, 14, 8, 19, SPEC.panel);
+        put(&mut v, 9, 8, 24, MaterialId(1));
+        assert!(turn(&mut v, hinge).is_err());
+    }
 }
