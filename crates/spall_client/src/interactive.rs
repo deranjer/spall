@@ -303,6 +303,8 @@ pub struct InteractiveSession {
     /// the window can read live terrain for its debug draw without owning
     /// (or racing) the mover's own lock acquisitions.
     pub replica: OnceLock<Arc<Mutex<ReplicaWorld>>>,
+    /// The server day clock, set once by the network thread after connecting.
+    pub day_clock: OnceLock<spall_core::time_of_day::DayClock>,
     /// Testing-only local rigid-body poses. `None` keeps normal server motion;
     /// `Some` overrides body rendering with the client's own physics world.
     pub local_body_poses: Mutex<Option<LocalBodyPoses>>,
@@ -438,6 +440,7 @@ impl InteractiveSession {
             input: LiveInput::new(),
             view: Mutex::new(None),
             replica: OnceLock::new(),
+            day_clock: OnceLock::new(),
             local_body_poses: Mutex::new(None),
             stop: AtomicBool::new(false),
             corrections,

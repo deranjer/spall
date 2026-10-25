@@ -1132,6 +1132,8 @@ struct Record {
     seq: InputSeq,
     input: PlayerInput,
     dt: f32,
+    /// The snow/blizzard speed multiplier this step used; replayed as recorded.
+    ground_scale: f32,
     predicted_after: CharacterState,
 }
 
@@ -1147,6 +1149,9 @@ pub struct PredictedPlayer {
     /// The manifest's climbable (ladder) materials; empty until set, which
     /// climbs nothing. Must be the server's manifest's.
     climbable: spall_physics::Climbable,
+    /// Walk-speed multiplier for the next tick (deep snow, blizzard); the caller
+    /// sets it from the replica each tick, see [`Self::set_ground_scale`].
+    ground_scale: f32,
     /// Cumulative applied correction vector for presentation only. Authority,
     /// replay, collision and raw correction telemetry remain unchanged.
     pub presentation_correction_total: [f64; 3],
@@ -1243,6 +1248,7 @@ impl PredictedPlayer {
         Self {
             water_surface: None,
             climbable: spall_physics::Climbable::default(),
+            ground_scale: 1.0,
             presentation_correction_total: [0.; 3],
             params,
             predicted: spawn,
@@ -1280,6 +1286,12 @@ impl PredictedPlayer {
 
     /// Gives the predictor the world's climbable materials (ENG-263); until set,
     /// ladders are plain walls to it.
+    /// Sets the walk-speed multiplier [`spall_physics::snow_speed_scale`] gave for
+    /// the snow under the character; the next [`Self::tick`] uses and records it.
+    pub fn set_ground_scale(&mut self, scale: f32) {
+        self.ground_scale = scale;
+    }
+
     pub fn set_climbable(&mut self, climbable: spall_physics::Climbable) {
         self.climbable = climbable;
     }
@@ -1323,15 +1335,21 @@ impl PredictedPlayer {
         let params = self.params;
         let surface = self.water_at(&self.predicted);
         let ladder = ladder_contact(volume, &self.climbable, params, self.predicted.position_m);
-        self.predicted =
-            step_character_in_water(self.predicted, input, dt_s, surface, ladder, |p, d| {
-                phys.sweep(volume, params, p, d, dt_s)
-            });
+        self.predicted = step_character_in_water(
+            self.predicted,
+            input,
+            dt_s,
+            surface,
+            ladder,
+            self.ground_scale,
+            |p, d| phys.sweep(volume, params, p, d, dt_s),
+        );
         self.history.push_back(Record {
             tick: self.next_tick,
             seq,
             input,
             dt: dt_s,
+            ground_scale: self.ground_scale,
             predicted_after: self.predicted,
         });
         self.next_tick = Tick(self.next_tick.0 + 1);
@@ -1521,9 +1539,15 @@ impl PredictedPlayer {
                 w(x, y + 0.05, z)
             });
             let ladder = ladder_contact(volume, &self.climbable, params, state.position_m);
-            state = step_character_in_water(state, rec.input, dt, surface, ladder, |p, d| {
-                phys.sweep(volume, params, p, d, dt)
-            });
+            state = step_character_in_water(
+                state,
+                rec.input,
+                dt,
+                surface,
+                ladder,
+                rec.ground_scale,
+                |p, d| phys.sweep(volume, params, p, d, dt),
+            );
             rec.predicted_after = state;
         }
         // `client_authoritative` (testing only — see its own doc): the

@@ -23,6 +23,14 @@ pub(super) struct InteractiveApp {
     /// The inventory the pack and book show, and the book's craft.
     pub(super) inventory: InventoryFeed,
     pub(super) pack_frame_at: Option<Instant>,
+    /// Keyboard bindings (ENG-270), loaded from the client settings file.
+    pub(super) keys: KeyBindings,
+    /// The Esc menu.
+    pub(super) esc: EscMenu,
+    /// The compass was picked from the pack and is held (ENG-262).
+    pub(super) held_compass: bool,
+    /// A note being read, its text from the game.
+    pub(super) reading_note: Option<String>,
     /// The cursor, physical pixels, for hovering items in the open pack.
     pub(super) cursor_px: Option<[f32; 2]>,
     pub(super) player_view: Option<std::sync::Arc<dyn PlayerView>>,
@@ -296,6 +304,10 @@ impl InteractiveApp {
             book: Book::new(),
             inventory: InventoryFeed::new(),
             pack_frame_at: None,
+            keys: KeyBindings::load(),
+            esc: EscMenu::default(),
+            held_compass: false,
+            reading_note: None,
             cursor_px: None,
             player_view: options.player_view,
             third_person: false,
@@ -1144,12 +1156,7 @@ impl InteractiveApp {
         self.pack.open();
     }
 
-    pub(super) fn close_pack(&mut self) {
-        self.pack.close();
-        self.set_cursor_locked(true);
-    }
-
-    /// A click on a stack in the open pack: set a fire pit down.
+    /// A click on a stack in the open pack: hold the compass, read a note.
     pub(super) fn use_pack_item(&mut self, item_id: u16) {
         let Some(view) = &self.pack_view else { return };
         match view.item_use(item_id) {
@@ -1158,7 +1165,43 @@ impl InteractiveApp {
                 self.place_pending = Some(item_id);
                 self.close_pack();
             }
+            ItemUse::Compass => {
+                self.held_compass = !self.held_compass;
+                self.close_pack();
+            }
+            ItemUse::Note(text) => {
+                self.close_pack();
+                self.clear_held_actions();
+                self.set_cursor_locked(false);
+                self.reading_note = Some(text);
+            }
         }
+    }
+
+    pub(super) fn close_note(&mut self) {
+        if self.reading_note.take().is_some() {
+            self.set_cursor_locked(true);
+        }
+    }
+
+    pub(super) fn open_esc_menu(&mut self) {
+        self.clear_held_actions();
+        self.publish_movement();
+        self.esc = EscMenu {
+            open: true,
+            ..EscMenu::default()
+        };
+        self.set_cursor_locked(false);
+    }
+
+    pub(super) fn close_esc_menu(&mut self) {
+        self.esc = EscMenu::default();
+        self.set_cursor_locked(true);
+    }
+
+    pub(super) fn close_pack(&mut self) {
+        self.pack.close();
+        self.set_cursor_locked(true);
     }
 
     /// B: open the blueprint book at its contents.

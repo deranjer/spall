@@ -77,6 +77,11 @@ pub enum ItemUse {
     /// Set it down in front of the player as a fire (ENG-266): the server
     /// takes it from the pack and finds the spot.
     Place,
+    /// Hold it (or put it away): a compass drawn lower right whose needle
+    /// follows world north (-Z).
+    Compass,
+    /// Read a paper note showing this text, one line per newline.
+    Note(String),
 }
 
 /// One cube of a world item's model.

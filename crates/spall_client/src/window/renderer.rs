@@ -77,6 +77,13 @@ pub(crate) struct WorldRenderer {
     pack_tarp: yakui::ManagedTextureId,
     /// The blueprint book laid out for this frame, if it is on screen.
     pub(super) book_frame: Option<BookFrame>,
+    /// The Esc menu, if open, and what was clicked in it last frame.
+    pub(super) esc_menu: Option<EscMenuView>,
+    pub(super) esc_actions: EscMenuActions,
+    /// The held compass: the camera yaw to draw its needle for.
+    pub(super) compass_yaw: Option<f32>,
+    /// A note being read.
+    pub(super) note_text: Option<String>,
     book_textures: BookTextures,
     /// The game's item icons, uploaded on first sight; `None` if one would
     /// not decode (reported once, then drawn as a plain marker).
@@ -474,6 +481,10 @@ impl WorldRenderer {
             pack_frame: None,
             pack_tarp,
             book_frame: None,
+            esc_menu: None,
+            esc_actions: EscMenuActions::default(),
+            compass_yaw: None,
+            note_text: None,
             book_textures,
             item_icons: HashMap::new(),
             yakui_buffers,
@@ -747,6 +758,7 @@ impl WorldRenderer {
         demo_hud: Option<(&str, &str, &str)>,
         admin_menu: Option<(&AdminMenuView, &mut AdminMenuActions)>,
         server_tick: Option<u64>,
+        day_clock: spall_core::time_of_day::DayClock,
     ) -> Result<FrameTiming, ClientError> {
         let AcquiredFrame {
             frame_start,
@@ -758,8 +770,12 @@ impl WorldRenderer {
         } = acquired;
 
         if let Some(server_tick) = server_tick {
-            let (environment, state) =
-                environment_for_clock(server_tick, self.day_cycle_enabled, self.environment);
+            let (environment, state) = environment_for_clock(
+                server_tick,
+                day_clock,
+                self.day_cycle_enabled,
+                self.environment,
+            );
             self.environment = environment;
             if let Some(state) = state {
                 self.day_clock_label = format!(
@@ -1123,6 +1139,16 @@ impl WorldRenderer {
         }
         if let Some(bar) = self.endurance {
             draw_endurance(bar);
+        }
+        let ui_size = self.ui_size();
+        if let Some(yaw) = self.compass_yaw {
+            draw_compass(yaw, ui_size);
+        }
+        if let Some(text) = &self.note_text {
+            draw_note(text, ui_size);
+        }
+        if let Some(view) = &self.esc_menu {
+            draw_esc_menu(view, &mut self.esc_actions, ui_size);
         }
         self.yakui.finish();
         if let Some(preset) = selected_environment {

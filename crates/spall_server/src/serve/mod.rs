@@ -76,6 +76,7 @@ mod items;
 mod late_join;
 mod outbound;
 mod persistence;
+mod request_ids;
 mod scene;
 mod summary;
 mod tick_loop;
@@ -94,6 +95,7 @@ pub use self::items::{ItemPickup, ItemPickupFn};
 use self::late_join::*;
 use self::outbound::*;
 use self::persistence::*;
+use self::request_ids::{RequestIds, SubmittedBy};
 pub use self::scene::*;
 pub use self::summary::*;
 use self::tick_loop::*;
@@ -660,6 +662,7 @@ fn serve_with_game_content_and_optional_setup(
 fn server_handshake(
     materials: &spall_core::MaterialManifest,
     asset_manifest_hash: Option<spall_protocol::Hash32>,
+    day_clock: spall_core::time_of_day::DayClock,
 ) -> Handshake {
     Handshake {
         protocol_version: PROTOCOL_VERSION,
@@ -679,5 +682,6 @@ fn server_handshake(
         cell_size_codes: vec![spall_core::CellSizeCode::Quarter],
         session: SessionId::from_parts(SlotId(0), 1),
         limits: NegotiatedLimits::DEFAULT,
+        day_clock,
     }
 }
