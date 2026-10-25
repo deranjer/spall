@@ -675,15 +675,23 @@ excess to the span above the ice). A freeze edit wakes the touched regions as an
 once the water is still. Ice under a closed span does not evaporate. A one-cell
 crust covers level shore cells beside the ice and the boxes go in by layers that
 each touch terrain or an earlier layer, so no ice splits off as a loose body;
-ice not connected to the shore is not placed. A layer's boxes go up to eight to
-an edit, and at most one freeze edit is in flight and submitted every fourth
-tick, because each is a full terrain commit (a few ms on a 1 km world); a
-lake's ice therefore appears over seconds to a minute. No ice forms within
-1.5 m of a player. Outside winter each region's ice turns back to air.
+ice not connected to the shore is not placed. No ice forms within 1.5 m of a
+player. Outside winter each region's ice turns back to air.
 
-Because the first freeze is often the first terrain edit of a fresh generated
-world, it is also the commit that detaches the floating fragments worldgen left
-(structure support is world-wide), as any first dig would.
+A generated world that starts in winter is frozen before it is served
+(`GeneratedScene::freeze_water`, called by `into_custom_world`): the water is
+built once from the terrain (settled first when `settle_water` ran) and
+`ice::freeze_at_rest` writes the ice of every region the solver has at rest
+straight into the generated terrain, so it is in the first checkpoint and
+costs no commits (about 640,000 cells in 3 s on the 1 km natural world). In
+play only water that settles later freezes, and freeze and melt edits are
+spaced: a layer's boxes go up to eight to an edit, one edit is in flight, and
+the next waits 2 s, because each is a full terrain commit (a few ms on a 1 km
+world).
+
+Writing the startup ice directly does not detach anything. The first terrain
+edit in play (a later freeze, a melt or any dig) detaches the floating
+fragments worldgen left (structure support is world-wide).
 
 A player standing on ice over water rolls each tick (a hash of the world seed,
 tick, player and cell, so a replay in the same binary repeats it): 0.12/s on one

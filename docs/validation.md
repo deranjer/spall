@@ -1196,22 +1196,23 @@ locations and unmeasured performance gates: reports/ENG-207-snow-playtest.md.
 CPU checks: `cargo test -p spall_sim --lib ice` (planner: exact wanted cells and
 shore crust, support layers, crack rates, sprint breaks more often over 400
 seeds), `cargo test -p spall_sim --test ice` (only settled shallow water freezes
-and no water moves, wide columns, a player stands on ice, crack then break drops
-the player into water, same-binary replay) and
+and no water moves, wide columns, a startup freeze writes the ice into the
+terrain and moves no water, a player stands on ice, crack then break drops the
+player into water, same-binary replay) and
 `cargo test -p spall_server --test ice_persistence` (ice survives checkpoint,
 journal and recovery with an equal world hash). The appearance tests count the
 two ice materials.
 
 Server cost is measured headless with
 `cargo run --release -p sandbox --example ice_probe -- natural 1 4096 240`
-(server-built 1 km world, column water worker, one player, winter, real-time
-60 Hz; `NOICE=1` for the baseline, `SPALL_WATER_COARSE=1` for 1 m columns).
-Planning (`tick.ice`) is under 0.01 ms per tick on average. Each freeze edit is
-an ordinary terrain commit of about 4 ms on this world, one every fourth tick
-while ice is forming; ticks carrying one are about 7.5 ms at p50 and 19 ms at
-p99. The first edit also detaches the world's floating worldgen fragments.
-Measured numbers: reports/2026-10-25-eng-268-ice-cost.md. No GPU or play-window check is
-implied.
+(server-built 1 km world generated in winter and frozen at startup as the server
+does, column water worker, one player, real-time 60 Hz; `NOICE=1` for the
+baseline, `FIRST_DIG=1` adds one small cut at 10 s so a baseline pays the same
+first-edit cost, `ICE_STARTUP_ONLY=1` freezes at startup without the play-time
+runtime, `SPALL_WATER_COARSE=1` for 1 m columns). Measured 2026-10-25: the
+startup freeze writes about 640,000 cells in about 3 s, and the tick p99 with
+ice stays within about 1 ms of the no-ice baseline. Numbers:
+reports/2026-10-25-eng-268-ice-cost.md. No GPU or play-window check is implied.
 
 ## Animals
 

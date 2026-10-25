@@ -26,8 +26,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seconds: f64 = a.get(3).map_or(Ok(240.0), |s| s.parse())?;
     let with_ice = std::env::var_os("NOICE").is_none();
     let t = Instant::now();
-    let scene = worldgen_scene::generate(&preset, seed, size)?;
+    let mut scene = worldgen_scene::generate_with_season(
+        &preset,
+        seed,
+        size,
+        spall_ecology::living::Season::Winter,
+    )?;
     eprintln!("worldgen {:.1}s", t.elapsed().as_secs_f64());
+    // As the server does: a winter world starts frozen (`NOSTARTFREEZE=1`
+    // leaves all of it to play, for comparison).
+    if with_ice && std::env::var_os("NOSTARTFREEZE").is_none() {
+        let t = Instant::now();
+        let cells = scene.freeze_water();
+        eprintln!(
+            "startup freeze: {cells} ice cells in {:.2}s",
+            t.elapsed().as_secs_f64()
+        );
+    }
     let spawn = scene.player_spawns()[0];
     let mut setup = scene.world_setup();
     setup.materials = game::manifest();
@@ -37,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.column_water_worker = true;
     let mut sim = Simulation::new(config)?;
     sim.enable_off_thread_staging();
-    if with_ice {
+    if with_ice && std::env::var_os("ICE_STARTUP_ONLY").is_none() {
         sim.set_ice(game::ice_settings());
     }
     sim.set_season(3)?;
@@ -56,6 +71,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut next_transfer = 0u64;
     let started = Instant::now();
     for i in 0..ticks {
+        // `FIRST_DIG=1`: one small player-style cut under the spawn at 10 s, so
+        // a no-ice baseline pays the same first-edit cost (it detaches the
+        // world's floating worldgen fragments) as a run whose ice commits do.
+        if i == 600 && std::env::var_os("FIRST_DIG").is_some() {
+            let cell = |v: f64| (v / 0.25).floor() as i64;
+            let units = |c: i64| c * spall_core::BRUSH_UNIT + spall_core::BRUSH_UNIT / 2;
+            let centre = spall_core::BrushPoint::from_units(
+                units(cell(spawn[0])),
+                units(cell(spawn[1]) - 3),
+                units(cell(spawn[2])),
+            );
+            sim.submit(spall_sim::EditIntent {
+                request_id: spall_protocol::RequestId(1),
+                actor: player,
+                target: spall_sim::EditTarget::Terrain,
+                kind: spall_sim::EditKind::Cut,
+                brush: spall_core::SphereBrush::new(centre, spall_core::BRUSH_UNIT)?,
+                explosion: None,
+            })?;
+        }
         let begin = Instant::now();
         // Bulk split IDs reserved before the tick, as the server does.
         let ids = (0..sim.transfer_reservation_bound())
