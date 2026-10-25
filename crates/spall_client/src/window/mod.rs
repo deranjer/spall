@@ -72,6 +72,7 @@ mod options;
 mod pack;
 mod rebuild;
 mod renderer;
+mod scenario_audio;
 mod shots;
 mod terrain_mesh;
 #[cfg(test)]

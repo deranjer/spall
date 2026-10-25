@@ -9,7 +9,7 @@ const HEARD_RANGE_M: f64 = 32.0;
 
 /// The solid cell a foot at `feet_m` stands on and its material: the cell just
 /// below the sole, or the one under that where the capsule floats a skin above.
-fn ground_below(volume: &Volume, feet_m: [f64; 3]) -> Option<(GlobalCell, MaterialId)> {
+pub(super) fn ground_below(volume: &Volume, feet_m: [f64; 3]) -> Option<(GlobalCell, MaterialId)> {
     let cell_m = f64::from(CELL_M);
     [0.05, 0.3].into_iter().find_map(|drop| {
         let cell = GlobalCell::new(

@@ -106,6 +106,7 @@ impl ApplicationHandler for InteractiveApp {
                 ..
             } if self.pack.is_open() && !ui_consumed => {
                 if let Some(item) = self.pack.hovered_item() {
+                    self.scenario_ui_click();
                     self.use_pack_item(item);
                 }
             }
@@ -358,6 +359,7 @@ impl ApplicationHandler for InteractiveApp {
                 self.update_ambience();
                 self.update_footsteps(now);
                 self.update_creature_sounds(now);
+                self.update_scenario_audio(now);
                 self.update_endurance();
                 let handler_started = now;
                 self.advance_script(now, event_loop);
@@ -920,9 +922,13 @@ impl ApplicationHandler for InteractiveApp {
                             None
                         };
                         let prompted = prompt.is_some();
+                        let prompt_label = prompt.as_ref().map(|(_, label)| label.clone());
                         renderer.set_prompt(prompt);
                         if self.interact_pending {
                             self.interact_pending = false;
+                            if let Some(label) = &prompt_label {
+                                self.scenario.pending_interact = Some(label.clone());
+                            }
                             if prompted && let Some((eye, dir)) = cam {
                                 let id = self.next_action_id;
                                 self.next_action_id += 1;
@@ -1054,6 +1060,8 @@ impl ApplicationHandler for InteractiveApp {
                                         ) =>
                                 {
                                     self.last_hammer_at = Some(render_now);
+                                    self.scenario.pending_swing =
+                                        Some((tool, eye, dir, render_now));
                                     let id = self.next_action_id;
                                     self.next_action_id += 1;
                                     // The server sets the stroke's radius.
@@ -1349,6 +1357,13 @@ impl ApplicationHandler for InteractiveApp {
                     .as_mut()
                     .map(|r| std::mem::take(&mut r.esc_actions))
                     .unwrap_or_default();
+                if esc_actions.quit
+                    || esc_actions.reset_defaults
+                    || esc_actions.start_rebind.is_some()
+                    || esc_actions.resume
+                {
+                    self.scenario_ui_click();
+                }
                 if esc_actions.quit {
                     self.session.request_stop();
                     event_loop.exit();
