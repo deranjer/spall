@@ -69,7 +69,7 @@ impl IceSettings {
 
     /// Ice cells a column of water `depth_m` deep gets: 0 when it is too deep.
     pub fn thickness_cells(&self, depth_m: f64) -> i64 {
-        if !(depth_m > 0.0) || depth_m > self.max_depth_m {
+        if depth_m.is_nan() || depth_m <= 0.0 || depth_m > self.max_depth_m {
             0
         } else if depth_m < self.thick_below_m {
             2

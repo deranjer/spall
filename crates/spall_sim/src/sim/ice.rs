@@ -29,6 +29,10 @@ const FREEZE_EDIT_SPACING_TICKS: u64 = 4;
 /// Ice cells looked for above a melting column's water.
 const MELT_SEARCH_CELLS: i64 = 3;
 
+/// A wide column's ice from the solver: `None` when it must not freeze
+/// (active, covered or overfull), else its ice bottom and cells if any.
+type WidePlan = Option<(i64, i64)>;
+
 /// Runtime state of winter ice, present once a game installs [`IceSettings`].
 pub(crate) struct IceRuntime {
     settings: IceSettings,
@@ -222,7 +226,7 @@ impl Simulation {
             return;
         }
         if let Some(layer) = ice.layers.pop_front() {
-            if self.tick.get() % FREEZE_EDIT_SPACING_TICKS == 0 {
+            if self.tick.get().is_multiple_of(FREEZE_EDIT_SPACING_TICKS) {
                 self.submit_ice_layer(ice, layer);
             } else {
                 ice.layers.push_front(layer);
@@ -261,7 +265,7 @@ impl Simulation {
         }
         let key = if let Some(key) = ice.retry.take().filter(|_| winter) {
             key
-        } else if tick % 2 == 0 && !ice.near.is_empty() {
+        } else if tick.is_multiple_of(2) && !ice.near.is_empty() {
             let key = ice.near[ice.near_next % ice.near.len()];
             ice.near_next += 1;
             key
@@ -381,7 +385,7 @@ impl Simulation {
             let cells = settings.thickness_cells(depth * cell_m);
             (cells > 0).then(|| (((floor as f64 + depth) - 1e-9).ceil() as i64, cells))
         };
-        let mut wide: HashMap<(i64, i64), Option<Option<(i64, i64)>>> = HashMap::new();
+        let mut wide: HashMap<(i64, i64), Option<WidePlan>> = HashMap::new();
         let mut columns = Vec::new();
         for (i, span) in region.spans.iter().enumerate() {
             // Only the column's top span, and only if it is open to the sky.

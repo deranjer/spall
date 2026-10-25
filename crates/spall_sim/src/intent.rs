@@ -47,13 +47,22 @@ struct CellBox {
     size: [u8; 3],
 }
 
+/// A box stored as an offset from the replace's origin (bounds stay within
+/// [`REPLACE_SPAN_CELLS`], so offsets fit `i8`), keeping intents small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackedBox {
+    offset: [i8; 3],
+    size: [u8; 3],
+}
+
 /// Every cell of up to [`REPLACE_BOXES`] axis-aligned boxes whose material is
 /// one of `from` becomes `to` ([`MaterialId::AIR`] in `from` matches resident
 /// air). The plan is read from the volume at staging, so it touches exactly the
 /// cells that match then; a non-resident cell never matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoxReplace {
-    boxes: [CellBox; REPLACE_BOXES],
+    origin: GlobalCell,
+    boxes: [PackedBox; REPLACE_BOXES],
     count: u8,
     pub from: [MaterialId; 2],
     pub to: MaterialId,
@@ -62,11 +71,12 @@ pub struct BoxReplace {
 impl BoxReplace {
     /// One box from `min`, `size` cells along x, y and z (each at least 1).
     pub fn new(min: GlobalCell, size: [u8; 3], from: [MaterialId; 2], to: MaterialId) -> Self {
-        let first = CellBox {
-            min,
+        let first = PackedBox {
+            offset: [0; 3],
             size: size.map(|s| s.max(1)),
         };
         Self {
+            origin: min,
             boxes: [first; REPLACE_BOXES],
             count: 1,
             from,
@@ -88,7 +98,15 @@ impl BoxReplace {
         if (0..3).any(|i| hi[i] - lo[i] > REPLACE_SPAN_CELLS) {
             return false;
         }
-        self.boxes[usize::from(self.count)] = added;
+        let offset = [
+            min.x - self.origin.x,
+            min.y - self.origin.y,
+            min.z - self.origin.z,
+        ];
+        self.boxes[usize::from(self.count)] = PackedBox {
+            offset: offset.map(|o| i8::try_from(o).expect("bounds keep offsets small")),
+            size: added.size,
+        };
         self.count += 1;
         true
     }
@@ -100,7 +118,7 @@ impl BoxReplace {
             return false;
         }
         let saved = *self;
-        for b in other.boxes() {
+        for b in &other.boxes() {
             if !self.try_add(b.min, b.size) {
                 *self = saved;
                 return false;
@@ -109,15 +127,25 @@ impl BoxReplace {
         true
     }
 
-    fn boxes(&self) -> &[CellBox] {
-        &self.boxes[..usize::from(self.count)]
+    fn boxes(&self) -> Vec<CellBox> {
+        self.boxes[..usize::from(self.count)]
+            .iter()
+            .map(|b| CellBox {
+                min: GlobalCell::new(
+                    self.origin.x + i64::from(b.offset[0]),
+                    self.origin.y + i64::from(b.offset[1]),
+                    self.origin.z + i64::from(b.offset[2]),
+                ),
+                size: b.size,
+            })
+            .collect()
     }
 
     /// The cells of the boxes that match `from` in `volume`, in `(z, y, x)`
     /// order.
     pub fn cells(&self, volume: &spall_voxel::Volume) -> Vec<GlobalCell> {
         let mut cells = Vec::new();
-        for b in self.boxes() {
+        for b in &self.boxes() {
             for dz in 0..i64::from(b.size[2]) {
                 for dy in 0..i64::from(b.size[1]) {
                     for dx in 0..i64::from(b.size[0]) {
