@@ -147,6 +147,7 @@ pub fn material_mapping() -> BTreeMap<String, MaterialId> {
         ("grass", MaterialId(10)),
         ("dirt", materials::DIRT),
         ("emissive.lamp", materials::LAMP),
+        ("ladder", materials::LADDER),
         // Sentinels consumed by `load`: authored water seeds the server fluid
         // region (springs and drains keep streams running) and never becomes
         // a solid runtime material.
