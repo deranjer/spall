@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::column_water::RegionFrame;
-use crate::ice::{CrackRoll, IceColumn, IceSettings, plan_freeze};
+use crate::ice::{CrackRoll, IceSettings};
 use crate::intent::BoxReplace;
 
 /// Journal provenance for server-authored ice edits (beside the dam gate,
@@ -23,15 +23,12 @@ const ICE_ACTOR_ID: u64 = (1 << 40) + 4;
 const NEAR_PLAYER_M: f64 = 64.0;
 /// Ticks between rebuilding the list of water regions near players.
 const NEAR_REFRESH_TICKS: u64 = 60;
-/// Ticks between freeze edits: each is a full terrain commit (a few ms on a
-/// 1 km world), so a lake freezes over a minute rather than in a burst.
-const FREEZE_EDIT_SPACING_TICKS: u64 = 4;
+/// Ticks between freeze or melt edits: each is a full terrain commit (a few
+/// ms on a 1 km world). A winter world starts frozen (`ice::freeze_at_rest`),
+/// so play only adds ice where water settles later, a little at a time.
+const ICE_EDIT_SPACING_TICKS: u64 = 120;
 /// Ice cells looked for above a melting column's water.
 const MELT_SEARCH_CELLS: i64 = 3;
-
-/// A wide column's ice from the solver: `None` when it must not freeze
-/// (active, covered or overfull), else its ice bottom and cells if any.
-type WidePlan = Option<(i64, i64)>;
 
 /// Runtime state of winter ice, present once a game installs [`IceSettings`].
 pub(crate) struct IceRuntime {
@@ -48,6 +45,8 @@ pub(crate) struct IceRuntime {
     /// Later support layers of the region being frozen.
     layers: VecDeque<Vec<BoxReplace>>,
     in_flight: Vec<RequestId>,
+    /// The first tick the next freeze or melt edit may go in.
+    next_edit: u64,
     /// The crack or break edit still queued for each player.
     player_edits: HashMap<EntityId, RequestId>,
 }
@@ -68,6 +67,7 @@ impl IceRuntime {
             retry: None,
             layers: VecDeque::new(),
             in_flight: Vec::new(),
+            next_edit: 0,
             player_edits: HashMap::new(),
         }
     }
@@ -78,11 +78,6 @@ impl Simulation {
     /// column water it has nothing to freeze.
     pub fn set_ice(&mut self, settings: IceSettings) {
         self.ice = Some(IceRuntime::new(settings));
-    }
-
-    /// The installed ice settings, if any.
-    pub fn ice_settings(&self) -> Option<&IceSettings> {
-        self.ice.as_ref().map(|ice| &ice.settings)
     }
 
     /// Current season from the weather clock (0 spring .. 3 winter).
@@ -214,25 +209,25 @@ impl Simulation {
     }
 
     fn advance_ice_regions(&mut self, ice: &mut IceRuntime) {
-        let Some(water) = &self.column_water else {
+        if self.column_water.is_none() {
             return;
-        };
+        }
         ice.in_flight.retain(|r| {
             self.pipeline
                 .action_status(*r)
                 .is_some_and(|s| s.outcome == spall_protocol::ActionOutcome::Queued)
         });
-        if !ice.in_flight.is_empty() {
+        let may_edit =
+            |ice: &IceRuntime, tick: u64| ice.in_flight.is_empty() && tick >= ice.next_edit;
+        if may_edit(ice, self.tick.get())
+            && let Some(layer) = ice.layers.pop_front()
+        {
+            self.submit_ice_layer(ice, layer);
             return;
         }
-        if let Some(layer) = ice.layers.pop_front() {
-            if self.tick.get().is_multiple_of(FREEZE_EDIT_SPACING_TICKS) {
-                self.submit_ice_layer(ice, layer);
-            } else {
-                ice.layers.push_front(layer);
-            }
+        let Some(water) = &self.column_water else {
             return;
-        }
+        };
         let frame = water.frame();
         let winter = self.season() == 3;
         if !winter {
@@ -294,7 +289,8 @@ impl Simulation {
                     return;
                 }
             };
-            if tick.saturating_sub(since) < settle_ticks {
+            // One region's plan at a time.
+            if tick.saturating_sub(since) < settle_ticks || !ice.layers.is_empty() {
                 return;
             }
             let Some(layers) = self.plan_region_ice(&ice.settings, &region) else {
@@ -302,13 +298,12 @@ impl Simulation {
                 return;
             };
             ice.layers.extend(layers);
-            if let Some(layer) = ice.layers.pop_front() {
-                self.submit_ice_layer(ice, layer);
-            }
-        } else if let Some(replace) = self.plan_region_melt(&ice.settings, &region)
+        } else if may_edit(ice, tick)
+            && let Some(replace) = self.plan_region_melt(&ice.settings, &region)
             && let Some(request) = self.submit_ice(replace)
         {
             ice.in_flight.push(request);
+            ice.next_edit = tick + ICE_EDIT_SPACING_TICKS;
         }
     }
 
@@ -346,7 +341,10 @@ impl Simulation {
                 continue;
             }
             match self.submit_ice(replace) {
-                Some(request) => ice.in_flight.push(request),
+                Some(request) => {
+                    ice.in_flight.push(request);
+                    ice.next_edit = self.tick.get() + ICE_EDIT_SPACING_TICKS;
+                }
                 None => rest.push(replace),
             }
         }
@@ -366,102 +364,19 @@ impl Simulation {
         region: &RegionFrame,
     ) -> Option<Vec<Vec<BoxReplace>>> {
         let water = self.column_water.as_ref()?;
-        let n = i64::from(water.setup().config.column_cells.max(1));
-        let y_hi = i64::from(water.setup().y_hi);
-        let world = if n > 1 {
+        let world = if water.setup().config.column_cells > 1 {
             Some(water.try_world()?)
         } else {
             None
         };
-        let cell_m = self.world.terrain().cell_size().metres();
-        let edge = spall_fluid::columns::REGION_EDGE;
-        let (x0, z0) = (
-            i64::from(region.key.0) * edge,
-            i64::from(region.key.1) * edge,
-        );
         let players: Vec<[f64; 3]> = self.world.players().map(|p| p.state.position_m).collect();
-        // Ice bottom and cells from water `depth` cells deep over `floor`.
-        let plan_for = |floor: i64, depth: f64| {
-            let cells = settings.thickness_cells(depth * cell_m);
-            (cells > 0).then(|| (((floor as f64 + depth) - 1e-9).ceil() as i64, cells))
-        };
-        let mut wide: HashMap<(i64, i64), Option<WidePlan>> = HashMap::new();
-        let mut columns = Vec::new();
-        for (i, span) in region.spans.iter().enumerate() {
-            // Only the column's top span, and only if it is open to the sky.
-            if region
-                .spans
-                .get(i + 1)
-                .is_some_and(|next| next.column == span.column)
-            {
-                continue;
-            }
-            let (fx, fz) = (
-                x0 + i64::from(span.column) % edge,
-                z0 + i64::from(span.column) / edge,
-            );
-            // The water the frame draws in this terrain column, if open to the
-            // sky. The frame rounds depth to 1/128 cell; at most half of that
-            // can end up under the ice, too thin to publish or flow.
-            let drawn = || {
-                (i64::from(span.ceiling_y) >= y_hi)
-                    .then(|| {
-                        let depth = (f64::from(span.depth_q) - 0.5)
-                            / crate::column_water::FRAME_DEPTH_SCALE;
-                        plan_for(i64::from(span.floor_y), depth)
-                    })
-                    .flatten()
-            };
-            let plan = match &world {
-                None => drawn(),
-                Some(world) => {
-                    let (wx, wz) = (fx.div_euclid(n), fz.div_euclid(n));
-                    // `None`: the solver holds no water here and the frame only
-                    // draws the pool on to its true shore, so nothing can be
-                    // displaced and the drawn water decides.
-                    let solver = *wide.entry((wx, wz)).or_insert_with(|| {
-                        let spans = world.spans_in_column(wx, wz);
-                        if spans.iter().all(|s| s.volume <= 1e-6) {
-                            return None;
-                        }
-                        if world.is_region_active(spall_fluid::columns::region_of(wx, wz)) {
-                            return Some(None);
-                        }
-                        let top = spans.last().expect("a wet span");
-                        if !top.sky || top.volume <= 1e-6 || top.overfill > 0.0 {
-                            return Some(None);
-                        }
-                        Some(plan_for(top.floor_y, top.depth))
-                    });
-                    solver.unwrap_or_else(drawn)
-                }
-            };
-            let Some((bottom_y, cells)) = plan else {
-                continue;
-            };
-            let centre = [(fx as f64 + 0.5) * cell_m, (fz as f64 + 0.5) * cell_m];
-            if players
-                .iter()
-                .any(|p| (p[0] - centre[0]).hypot(p[2] - centre[1]) < settings.keep_clear_m)
-            {
-                continue;
-            }
-            columns.push(IceColumn {
-                x: fx,
-                z: fz,
-                bottom_y,
-                cells,
-            });
-        }
-        drop(world);
-        if columns.is_empty() {
-            return Some(Vec::new());
-        }
-        Some(plan_freeze(
+        Some(crate::ice::plan_region(
             &self.world.terrain().volume,
-            &columns,
-            [x0, z0, x0 + edge - 1, z0 + edge - 1],
-            settings.ice,
+            water.setup(),
+            world.as_deref(),
+            settings,
+            region,
+            &players,
         ))
     }
 

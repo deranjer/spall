@@ -2,8 +2,8 @@
 //! cracking through it.
 
 use spall_core::{BrickCoord, CellSizeCode, EntityId, GlobalCell, MaterialId, Revision, VolumeId};
-use spall_sim::column_water::ColumnWaterSetup;
-use spall_sim::{IceSettings, Simulation, SimulationConfig, fixtures};
+use spall_sim::column_water::{AuthoritativeColumnWater, ColumnWaterSetup};
+use spall_sim::{IceSettings, Simulation, SimulationConfig, fixtures, ice};
 use spall_structure::AnchorPlane;
 use spall_voxel::{Brick, EditPlan, Sample, Volume};
 
@@ -19,8 +19,8 @@ fn simulation(ice: IceSettings) -> Simulation {
     simulation_with_columns(ice, 1)
 }
 
-/// [`simulation`] with water columns `column_cells` terrain cells wide.
-fn simulation_with_columns(ice: IceSettings, column_cells: u32) -> Simulation {
+/// The basin's terrain and its water cells, at rest.
+fn basin() -> (Volume, Vec<GlobalCell>) {
     let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
     // A whole 1 m water region (4 x 4 bricks) is resident, so wide columns run.
     for bz in 0..4 {
@@ -49,6 +49,12 @@ fn simulation_with_columns(ice: IceSettings, column_cells: u32) -> Simulation {
         }
     }
     terrain.apply_edit(&plan).unwrap();
+    (terrain, water)
+}
+
+/// [`simulation`] with water columns `column_cells` terrain cells wide.
+fn simulation_with_columns(ice: IceSettings, column_cells: u32) -> Simulation {
+    let (terrain, mut water) = basin();
     let mut world = fixtures::flat_terrain_setup();
     let mut materials = world.materials.entries().to_vec();
     let mut cracked = materials[2].clone();
@@ -298,4 +304,29 @@ fn cracking_replays_identically_in_the_same_binary() {
     let (b, _, _) = crack_through(breaking());
     assert_eq!(a, b);
     assert_eq!(a.len(), 2);
+}
+
+#[test]
+fn a_startup_freeze_writes_the_ice_into_the_terrain_and_moves_no_water() {
+    let (mut terrain, water) = basin();
+    let setup = ColumnWaterSetup::new(0, 32, water);
+    let at_rest = AuthoritativeColumnWater::new(&terrain, setup.clone()).unwrap();
+    let written = ice::freeze_at_rest(&mut terrain, &at_rest, &settings()).unwrap();
+    let at = |terrain: &Volume, x, y, z| match terrain.sample(GlobalCell::new(x, y, z)) {
+        Ok(Sample::Filled(m)) => Some(m),
+        _ => None,
+    };
+    for z in 1..15 {
+        for x in 1..32 {
+            assert_eq!(at(&terrain, x, SURFACE, z), Some(ICE), "shallow ({x},{z})");
+            assert_eq!(at(&terrain, x, SURFACE - 1, z), None, "water stays below");
+        }
+        for x in 33..63 {
+            assert_eq!(at(&terrain, x, SURFACE, z), None, "deep ({x},{z})");
+        }
+    }
+    assert!(written >= 31 * 14, "{written} cells");
+    // The same water seeded under the ice holds all of its volume.
+    let frozen = AuthoritativeColumnWater::new(&terrain, setup).unwrap();
+    assert!((frozen.frame().volume_m3 - at_rest.frame().volume_m3).abs() < 1e-9);
 }
