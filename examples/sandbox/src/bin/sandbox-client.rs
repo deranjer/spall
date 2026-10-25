@@ -762,6 +762,9 @@ fn run_interactive(args: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The Winter Crossing's objective, death and win screens (ENG-251): the
+    // server sends their events only in that scenario.
+    let scenario_hud = std::sync::Arc::new(sandbox::winter_crossing::hud::ScenarioHud::default());
     match spall_client::run_interactive_window_with_options(
         config,
         sandbox::game::manifest(),
@@ -783,8 +786,9 @@ fn run_interactive(args: Args) -> ExitCode {
                 sandbox::player_view::PlayerBodyView::new().expect("authored player asset builds"),
             )),
             pack_view: Some(std::sync::Arc::new(
-                sandbox::pack_view::SandboxPackView::new(),
+                sandbox::pack_view::SandboxPackView::new().with_scenario(scenario_hud.clone()),
             )),
+            game_hud: Some(scenario_hud),
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,

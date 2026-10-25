@@ -337,6 +337,10 @@ pub struct InteractiveSession {
     pub column_surface: Mutex<crate::column_surface::ColumnSurface>,
     /// Bumped each time an admin world reset replaced the replica.
     pub world_resets: std::sync::atomic::AtomicU64,
+    /// The game's events from the server (ENG-251), oldest first: the network
+    /// thread pushes with [Self::push_game_event] and the window drains them
+    /// each frame for the HUD (and, later, sounds).
+    pub game_events: Mutex<Vec<spall_protocol::GameEvent>>,
 }
 
 /// Unquantized pose of a locally simulated body (testing-only client authority).
@@ -406,6 +410,8 @@ impl std::fmt::Debug for InteractiveSession {
 const CORRECTION_LOG_PATH: &str = ".local/runs/interactive-corrections.jsonl";
 /// Where `FrameLog` writes — same rationale as `CORRECTION_LOG_PATH`.
 const FRAME_LOG_PATH: &str = ".local/runs/interactive-frames.jsonl";
+/// Game events held for a window that is not draining them (a coarse cap).
+const MAX_PENDING_GAME_EVENTS: usize = 64;
 
 impl InteractiveSession {
     pub fn clear_water(&self) {
@@ -453,7 +459,23 @@ impl InteractiveSession {
             vegetation: Mutex::new(None),
             column_surface: Mutex::new(crate::column_surface::ColumnSurface::new()),
             world_resets: std::sync::atomic::AtomicU64::new(0),
+            game_events: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Records a game event from the server. Nothing drains the queue without
+    /// a window, so only the newest [`MAX_PENDING_GAME_EVENTS`] are kept.
+    pub fn push_game_event(&self, event: spall_protocol::GameEvent) {
+        let mut events = self.game_events.lock().unwrap_or_else(|e| e.into_inner());
+        if events.len() >= MAX_PENDING_GAME_EVENTS {
+            events.remove(0);
+        }
+        events.push(event);
+    }
+
+    /// Takes every game event received since the last call, oldest first.
+    pub fn take_game_events(&self) -> Vec<spall_protocol::GameEvent> {
+        std::mem::take(&mut *self.game_events.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Queues an admin command for the network thread to send.

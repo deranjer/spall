@@ -14,9 +14,22 @@ use crate::game::{ItemId, RECIPE_CATALOG_VERSION, items, recipe_ids};
 pub struct SandboxPackView {
     blueprints: Vec<Blueprint>,
     models: ItemModels,
+    /// The Winter Crossing's HUD, which learns the tower heading the note
+    /// gives (ENG-251).
+    scenario: Option<std::sync::Arc<crate::winter_crossing::hud::ScenarioHud>>,
 }
 
 impl SandboxPackView {
+    /// The cabin note reads the tower heading from `hud`.
+    #[must_use]
+    pub fn with_scenario(
+        mut self,
+        hud: std::sync::Arc<crate::winter_crossing::hud::ScenarioHud>,
+    ) -> Self {
+        self.scenario = Some(hud);
+        self
+    }
+
     pub fn new() -> Self {
         let slot = |item: crate::game::ItemId, x: f32, y: f32, size: f32| BlueprintSlot {
             item: item.0,
@@ -35,6 +48,7 @@ impl SandboxPackView {
         let mut fire_pit = ring(items::STONE_CHUNK, 6, 0.34, 0.17, 0.0);
         fire_pit.extend(ring(items::STICK, 6, 0.1, 0.15, 0.5));
         Self {
+            scenario: None,
             models: ItemModels::load(),
             blueprints: vec![
                 // From the side: a log laid on the ground, sawn into planks.
@@ -122,7 +136,11 @@ impl PackView for SandboxPackView {
         match crate::game::ItemId(item_id) {
             items::COMPASS => ItemUse::Compass,
             items::FIRE_PIT => ItemUse::Place,
-            items::NOTE => ItemUse::Note(note_text(tower_heading_deg())),
+            items::NOTE => ItemUse::Note(note_text(
+                self.scenario
+                    .as_ref()
+                    .and_then(|hud| hud.tower_heading_deg()),
+            )),
             _ => ItemUse::None,
         }
     }
@@ -191,19 +209,13 @@ fn fire_pit_model(stone: &[ItemVoxel], stick: &[ItemVoxel]) -> Vec<ItemVoxel> {
     out
 }
 
-/// Compass heading, degrees clockwise from north (north 0, east 90), of the
-/// tower as seen from the cabin. ENG-251 places the cabin at the south edge and
-/// the tower at the north edge of the Winter Crossing scenario and should return
-/// the bearing computed from those placements here.
-// TODO(ENG-251): replace this placeholder with the computed bearing.
-const PLACEHOLDER_TOWER_HEADING_DEG: f32 = 12.0;
-
-pub fn tower_heading_deg() -> f32 {
-    PLACEHOLDER_TOWER_HEADING_DEG
-}
-
-/// What the cabin note says for a tower at `heading_deg` from the cabin.
-pub fn note_text(heading_deg: f32) -> String {
+/// What the cabin note says for a tower at `heading_deg` (degrees clockwise
+/// from north) from the cabin. Without a heading (outside the scenario) it
+/// says only which way to go.
+pub fn note_text(heading_deg: Option<f32>) -> String {
+    let Some(heading_deg) = heading_deg else {
+        return "The tower is to the north.\nThe compass always points north.".into();
+    };
     let heading = heading_deg.rem_euclid(360.0).round() as u32 % 360;
     format!(
         "The tower is at {heading:03} degrees
@@ -461,15 +473,30 @@ mod tests {
 
     #[test]
     fn the_note_gives_the_tower_heading_and_the_compass_and_note_are_usable() {
-        assert!(note_text(12.0).contains("012 degrees"));
-        assert!(note_text(0.0).contains("000 degrees"));
-        assert!(note_text(359.6).contains("000 degrees"), "rounds past 359");
-        assert!(note_text(-90.0).contains("270 degrees"), "wraps");
+        assert!(note_text(Some(12.0)).contains("012 degrees"));
+        assert!(note_text(Some(0.0)).contains("000 degrees"));
+        assert!(
+            note_text(Some(359.6)).contains("000 degrees"),
+            "rounds past 359"
+        );
+        assert!(note_text(Some(-90.0)).contains("270 degrees"), "wraps");
+        // Outside the scenario the note has no heading to give.
         let view = SandboxPackView::new();
         assert_eq!(view.item_use(items::COMPASS.0), ItemUse::Compass);
+        assert_eq!(view.item_use(items::NOTE.0), ItemUse::Note(note_text(None)));
+        // In it, the heading the server sent with the objective.
+        let hud = std::sync::Arc::new(crate::winter_crossing::hud::ScenarioHud::default());
+        let view = SandboxPackView::new().with_scenario(hud.clone());
+        spall_client::window::GameHud::on_event(
+            hud.as_ref(),
+            spall_protocol::GameEvent {
+                kind: crate::winter_crossing::rules::events::OBJECTIVE,
+                value: 123,
+            },
+        );
         assert_eq!(
             view.item_use(items::NOTE.0),
-            ItemUse::Note(note_text(tower_heading_deg()))
+            ItemUse::Note(note_text(Some(12.3)))
         );
         assert_eq!(view.item_use(items::STICK.0), ItemUse::None);
     }

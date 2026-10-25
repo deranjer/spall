@@ -819,6 +819,14 @@ impl ApplicationHandler for InteractiveApp {
                             (self.held_compass && cam.is_some() && !self.esc.open)
                                 .then_some(self.yaw);
                         renderer.note_text = self.reading_note.clone();
+                        let now = Instant::now();
+                        for event in self.session.take_game_events() {
+                            if let Some(hud) = &self.game_hud {
+                                self.game_hud_state.apply(hud.on_event(event), now);
+                            }
+                        }
+                        renderer.objective = self.game_hud_state.objective.clone();
+                        renderer.banner = self.game_hud_state.banner(now).cloned();
                         renderer.book_frame = self.pack_view.as_ref().and_then(|pack_view| {
                             self.book.pointer(screen, cursor.unwrap_or([-1.0; 2]));
                             self.book.frame(pack_view.as_ref(), &self.inventory)

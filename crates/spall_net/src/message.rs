@@ -53,6 +53,7 @@ pub enum WireRecord {
     CreatureDespawn(spall_protocol::CreatureDespawn),
     PlayerHealth(spall_protocol::PlayerHealth),
     WorldItemUpdate(spall_protocol::WorldItemUpdate),
+    GameEvent(spall_protocol::GameEvent),
 }
 
 impl WireRecord {
@@ -85,6 +86,7 @@ impl WireRecord {
             Self::CreatureDespawn(_) => WireTag::CreatureDespawn,
             Self::PlayerHealth(_) => WireTag::PlayerHealth,
             Self::WorldItemUpdate(_) => WireTag::WorldItemUpdate,
+            Self::GameEvent(_) => WireTag::GameEvent,
         }
     }
 
@@ -118,6 +120,7 @@ impl WireRecord {
             Self::CreatureDespawn(r) => encode_control(r),
             Self::PlayerHealth(r) => encode_control(r),
             Self::WorldItemUpdate(r) => encode_control(r),
+            Self::GameEvent(r) => encode_control(r),
         }
     }
 
@@ -160,6 +163,7 @@ impl WireRecord {
             WireTag::CreatureDespawn => Self::CreatureDespawn(decode_control(bytes)?),
             WireTag::PlayerHealth => Self::PlayerHealth(decode_control(bytes)?),
             WireTag::WorldItemUpdate => Self::WorldItemUpdate(decode_control(bytes)?),
+            WireTag::GameEvent => Self::GameEvent(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,
@@ -444,6 +448,16 @@ mod tests {
             });
             assert!(record.encode_framed().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_game_event_round_trips() {
+        let event = WireRecord::GameEvent(spall_protocol::GameEvent {
+            kind: 3,
+            value: -1234,
+        });
+        let bytes = event.encode_framed().unwrap();
+        assert_eq!(WireRecord::decode_framed(&bytes).unwrap(), event);
     }
 
     #[test]

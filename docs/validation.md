@@ -13,9 +13,9 @@ Cabin content and interaction checks:
   Capture the mouse, approach the door and press E to open/close it. The E label
   follows the door in the view; it disappears beyond reach or behind walls.
   Furniture placements can be edited independently in Spall Editor.
-  The shovel lies on the floor and the note on the table; within 3 m the label
-  reads `E  Pick up Shovel` / `E  Pick up Note`, E removes the item and Tab
-  shows it in the pack.
+  The shovel lies on the floor and the compass and note on the table; within 3 m
+  the label reads `E  Pick up Shovel` / `E  Pick up Note`, E removes the item
+  and Tab shows it in the pack.
 
 World item checks (ENG-257):
 
@@ -35,6 +35,30 @@ World item checks (ENG-257):
 - `cargo test -p sandbox --features client --lib pack_view` checks that every
   pickup kind draws its decoded SPVOX model, hand-sized and lying flat.
 
+Winter Crossing scenario checks (ENG-251):
+
+- `cargo test -p sandbox --features client --test winter_crossing_scenario`
+  checks compass headings; on a 128 m `natural` world (seed 1) that the layout
+  is the same twice, puts the cabin south of the shed and the shed south of the
+  tower, stands each building on dry ground, starts players on the cabin floor
+  under its roof, and rests the cabin items, axe and win zone on open surfaces;
+  that each player is greeted once with the objective, one player in the win
+  zone (not beside it) wins once for everyone, and a later joiner learns of it;
+  that a death tells only that player, respawns it in the cabin at full health
+  and restores the missing cabin items without duplicating the one still
+  there; and, over real QUIC, that a player already playing receives the win a
+  second player makes.
+- `cargo test -p spall_sim --test player_health` checks the death count.
+- `cargo test -p spall_net --lib a_game_event_round_trips` checks the record.
+- `cargo test -p spall_client --lib game_hud` and
+  `cargo test -p sandbox --features client --lib -- winter_crossing pack_view`
+  check banner timing, the scenario's screens and the note's heading.
+- Headless: `sandbox-server --serve --worldgen natural --seed 1
+  --scenario-winter ...` logs `winter crossing buildings placed` with the
+  cabin, tower and shed origin cells, the win zone and the heading. Measured
+  2026-10-25 at 1 km: cabin (2008, 231, 3468), tower (2104, 188, 733), shed
+  (2049, 209, 2085), heading 2.1 degrees, layout 0.5 s of a 76 s startup.
+  Hands-on play (walking the route, the screens) is not yet done.
 Fire checks (ENG-266):
 
 - `cargo test -p spall_sim --lib world_items` checks burn time per second of

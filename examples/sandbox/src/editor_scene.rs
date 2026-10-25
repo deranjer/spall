@@ -82,6 +82,8 @@ pub enum EditorSceneError {
     Asset { asset: String, message: String },
     #[error("entity `{entity}` has an unsupported transform: {message}")]
     Transform { entity: String, message: String },
+    #[error("scene has no entity named `{0}`")]
+    UnknownEntity(String),
     #[error("scene has no solid voxels to play")]
     Empty,
     #[error(
@@ -294,49 +296,8 @@ fn read_ron<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, EditorSceneE
 /// Loads an editor scene. `path` is a project directory (plays its `Main`
 /// scene, or its only scene) or a scene `.ron` file.
 pub fn load(path: &Path) -> Result<LoadedScene, EditorSceneError> {
-    let (root, scene_file) = resolve(path);
-    let project: Project = read_ron(&root.join("project.ron"))?;
-    let scene_file = match scene_file {
-        Some(file) => file,
-        None => {
-            let relative = project
-                .scenes
-                .get("Main")
-                .or_else(|| {
-                    (project.scenes.len() == 1)
-                        .then(|| project.scenes.values().next())
-                        .flatten()
-                })
-                .ok_or_else(|| EditorSceneError::UnknownScene("Main".into()))?;
-            root.join(relative)
-        }
-    };
-    let scene: Scene = read_ron(&scene_file)?;
-    let mapping = material_mapping();
-
-    let mut decoded: BTreeMap<Id, content::LoadedVoxelAsset> = BTreeMap::new();
-    let mut cells: BTreeMap<(i64, i64, i64), MaterialId> = BTreeMap::new();
-    // BTreeMap order is entity id order, matching the editor's "later wins".
-    for entity in scene.entities.values() {
-        let Some(asset_id) = entity.voxel_asset else {
-            continue;
-        };
-        let asset = match decoded.entry(asset_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let record = project
-                    .asset_database
-                    .assets
-                    .get(&asset_id)
-                    .ok_or_else(|| EditorSceneError::MissingAsset {
-                        entity: entity.name.clone(),
-                        asset: asset_id.0,
-                    })?;
-                entry.insert(load_asset(&root, asset_id, record, &mapping)?)
-            }
-        };
-        place(asset, entity, &mut cells)?;
-    }
+    let (root, project, scene) = read_scene(path)?;
+    let mut cells = place_entities(&root, &project, &scene, |_| true)?;
     let water_cells = take_marked(&mut cells, WATER_SOURCE_MATERIAL);
     let spring_cells = take_marked(&mut cells, WATER_SPRING_MATERIAL);
     let gated_spring_cells = take_marked(&mut cells, WATER_GATED_SPRING_MATERIAL);
@@ -411,6 +372,152 @@ pub fn load(path: &Path) -> Result<LoadedScene, EditorSceneError> {
                 message,
             }
         })?,
+    })
+}
+
+/// Reads a project's `project.ron` and the scene `path` names (see [`load`]).
+fn read_scene(path: &Path) -> Result<(PathBuf, Project, Scene), EditorSceneError> {
+    let (root, scene_file) = resolve(path);
+    let project: Project = read_ron(&root.join("project.ron"))?;
+    let scene_file = match scene_file {
+        Some(file) => file,
+        None => {
+            let relative = project
+                .scenes
+                .get("Main")
+                .or_else(|| {
+                    (project.scenes.len() == 1)
+                        .then(|| project.scenes.values().next())
+                        .flatten()
+                })
+                .ok_or_else(|| EditorSceneError::UnknownScene("Main".into()))?;
+            root.join(relative)
+        }
+    };
+    let scene: Scene = read_ron(&scene_file)?;
+    Ok((root, project, scene))
+}
+
+/// Places every entity `keep` accepts at the runtime cell size.
+fn place_entities(
+    root: &Path,
+    project: &Project,
+    scene: &Scene,
+    keep: impl Fn(&Entity) -> bool,
+) -> Result<BTreeMap<(i64, i64, i64), MaterialId>, EditorSceneError> {
+    let mapping = material_mapping();
+    let mut decoded: BTreeMap<Id, content::LoadedVoxelAsset> = BTreeMap::new();
+    let mut cells: BTreeMap<(i64, i64, i64), MaterialId> = BTreeMap::new();
+    // BTreeMap order is entity id order, matching the editor's "later wins".
+    for entity in scene.entities.values().filter(|e| keep(e)) {
+        let Some(asset_id) = entity.voxel_asset else {
+            continue;
+        };
+        let asset = match decoded.entry(asset_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let record = project
+                    .asset_database
+                    .assets
+                    .get(&asset_id)
+                    .ok_or_else(|| EditorSceneError::MissingAsset {
+                        entity: entity.name.clone(),
+                        asset: asset_id.0,
+                    })?;
+                entry.insert(load_asset(root, asset_id, record, &mapping)?)
+            }
+        };
+        place(asset, entity, &mut cells)?;
+    }
+    Ok(cells)
+}
+
+/// The editor's name for a scene's ground: the lawn a fixture building stands
+/// on, left out of a [`Prefab`].
+const GROUND_ENTITY: &str = "Scene Voxels";
+
+/// A building from an editor project, ready to stamp into another world
+/// (ENG-251): its solid cells, player starts, named markers and world items,
+/// all relative to one entity's placement (the origin), with the project's
+/// ground left out.
+#[derive(Debug, Clone)]
+pub struct Prefab {
+    /// Solid cells by offset from the origin cell.
+    pub cells: Vec<([i64; 3], MaterialId)>,
+    /// Inclusive bounds of `cells`, origin-relative.
+    pub min: [i64; 3],
+    pub max: [i64; 3],
+    /// Authored player starts (feet), metres from the origin.
+    pub spawns: Vec<[f64; 3]>,
+    /// Voxel-less entities (`win_zone`, `axe_spawn`), metres from the origin.
+    pub markers: BTreeMap<String, [f64; 3]>,
+    /// The project's `items.ron`, positions metres from the origin.
+    pub items: Vec<spall_server::InitialWorldItem>,
+}
+
+/// Loads the project at `path` as a [`Prefab`] whose origin is the placement of
+/// the entity named `origin_entity` (which must sit on whole cells).
+pub fn load_prefab(path: &Path, origin_entity: &str) -> Result<Prefab, EditorSceneError> {
+    let (root, project, scene) = read_scene(path)?;
+    let origin_m = scene
+        .entities
+        .values()
+        .find(|e| e.name == origin_entity)
+        .map(|e| e.transform.translation)
+        .ok_or_else(|| EditorSceneError::UnknownEntity(origin_entity.into()))?;
+    let origin = origin_m.map(|v| (v / RUNTIME_CELL_M).round() as i64);
+    let origin_m = origin.map(|c| c as f64 * f64::from(RUNTIME_CELL_M));
+    let mut cells = place_entities(&root, &project, &scene, |e| e.name != GROUND_ENTITY)?;
+    let spawns = marker_spawns(take_marked(&mut cells, SPAWN_MARKER_MATERIAL))
+        .into_iter()
+        .map(|p| [0, 1, 2].map(|i| p[i] - origin_m[i]))
+        .collect();
+    let cells: Vec<([i64; 3], MaterialId)> = cells
+        .into_iter()
+        .map(|((z, y, x), m)| ([x - origin[0], y - origin[1], z - origin[2]], m))
+        .collect();
+    let (min, max) = cells
+        .iter()
+        .fold(None, |acc: Option<([i64; 3], [i64; 3])>, (c, _)| {
+            Some(match acc {
+                None => (*c, *c),
+                Some((lo, hi)) => (
+                    [0, 1, 2].map(|i| lo[i].min(c[i])),
+                    [0, 1, 2].map(|i| hi[i].max(c[i])),
+                ),
+            })
+        })
+        .ok_or(EditorSceneError::Empty)?;
+    let markers = scene
+        .entities
+        .values()
+        .filter(|e| e.voxel_asset.is_none())
+        .map(|e| {
+            let t = e.transform.translation;
+            (
+                e.name.clone(),
+                [0, 1, 2].map(|i| f64::from(t[i]) - origin_m[i]),
+            )
+        })
+        .collect();
+    let items = crate::world_items::load_placements(&root)
+        .map_err(|message| EditorSceneError::Read {
+            path: root.join("items.ron"),
+            message,
+        })?
+        .into_iter()
+        .map(|mut item| {
+            item.translation_m = [0, 1, 2].map(|i| item.translation_m[i] - origin_m[i]);
+            item
+        })
+        .collect();
+    Ok(Prefab {
+        cells,
+        min,
+        max,
+        spawns,
+        markers,
+        items,
     })
 }
 

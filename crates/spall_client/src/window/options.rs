@@ -28,6 +28,35 @@ pub struct InteractiveOptions {
     /// Game-owned drawing of player bodies as lit cubes each frame. Without it
     /// other players are not drawn and the third-person toggle does nothing.
     pub player_view: Option<std::sync::Arc<dyn PlayerView>>,
+    /// Game-owned meaning of the server's game events (ENG-251): an objective
+    /// line and full-screen banners. Without it game events are ignored.
+    pub game_hud: Option<std::sync::Arc<dyn GameHud>>,
+}
+
+/// What the game's events show on the HUD. The engine owns receiving them and
+/// drawing; the game owns what a `kind` means and the words.
+pub trait GameHud: Send + Sync + std::fmt::Debug {
+    /// Called on the window thread for each event, oldest first.
+    fn on_event(&self, event: spall_protocol::GameEvent) -> HudChange;
+}
+
+/// What one game event changes on the HUD.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HudChange {
+    None,
+    /// Show this line at the top of the screen from now on.
+    Objective(String),
+    /// Cover the screen with this banner, replacing any earlier one.
+    Banner(Banner),
+}
+
+/// A full-screen message: a death screen or a win screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Banner {
+    pub title: String,
+    pub detail: String,
+    /// How long it shows, or `None` to keep it up for the rest of the session.
+    pub seconds: Option<f32>,
 }
 
 /// What the game's items look like laid out on the pack's tarp. The engine

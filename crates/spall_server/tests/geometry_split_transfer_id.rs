@@ -82,6 +82,7 @@ fn config(
             item_pickup: None,
             tool_hooks: None,
             fires: None,
+            game_tick: None,
             contact_damage: None,
             dormancy: None,
             credential_registry_file: None,

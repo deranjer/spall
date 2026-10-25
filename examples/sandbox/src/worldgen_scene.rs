@@ -27,6 +27,8 @@ pub enum WorldgenSceneError {
     Generate(#[from] GenError),
     #[error("vegetation: {0}")]
     Vegetation(String),
+    #[error("scenario layout: {0}")]
+    Layout(String),
 }
 
 /// A pipe quieter than this (cells^3/s, 8 mL/s at 0.5) lets its region sleep.
@@ -53,7 +55,7 @@ pub struct GeneratedScene {
     /// Stacked-column water (ENG-167).
     column_water: Option<ColumnWaterSetup>,
     /// Replaces the generated spawns (see [`Self::with_lake_spawn`]).
-    spawn_override: Option<[f64; 3]>,
+    spawn_override: Option<Vec<[f64; 3]>>,
     vegetation: spall_ecology::living::LivingState,
 }
 
@@ -76,6 +78,19 @@ pub fn generate_with_season(
     seed: u64,
     size_cells: u32,
     season: spall_ecology::living::Season,
+) -> Result<GeneratedScene, WorldgenSceneError> {
+    generate_with(preset, seed, size_cells, season, |_| Ok(Vec::new()))
+}
+
+/// [`generate_with_season`], with `build` run on the bare terrain before
+/// plants grow: it may add structures to the terrain and returns cells
+/// (`x, y, z`) that plants must keep clear of, as they do the spawns.
+pub fn generate_with(
+    preset: &str,
+    seed: u64,
+    size_cells: u32,
+    season: spall_ecology::living::Season,
+    build: impl FnOnce(&mut GeneratedWorld) -> Result<Vec<[i64; 3]>, String>,
 ) -> Result<GeneratedScene, WorldgenSceneError> {
     let preset = Preset::from_name(preset)
         .ok_or_else(|| WorldgenSceneError::UnknownPreset(preset.into()))?;
@@ -107,10 +122,12 @@ pub fn generate_with_season(
         size_cells,
         "startup profile"
     );
+    let kept_clear = build(&mut world).map_err(WorldgenSceneError::Layout)?;
     let spawns = world
         .spawns
         .iter()
         .map(|p| p.map(|v| (v / 0.25).floor() as i64))
+        .chain(kept_clear)
         .collect();
     let started = std::time::Instant::now();
     let vegetation = spall_ecology::living::LivingState::generate(
@@ -369,9 +386,16 @@ impl GeneratedScene {
     /// Player start positions in metres.
     pub fn player_spawns(&self) -> &[[f64; 3]] {
         match &self.spawn_override {
-            Some(spawn) => std::slice::from_ref(spawn),
+            Some(spawns) => spawns,
             None => &self.world.spawns,
         }
+    }
+
+    /// Replaces the player starts (metres, feet).
+    #[must_use]
+    pub fn with_spawns(mut self, spawns: Vec<[f64; 3]>) -> Self {
+        self.spawn_override = Some(spawns);
+        self
     }
 
     /// Spawns the player on solid ground beside the shore of the deepest lake
@@ -379,7 +403,7 @@ impl GeneratedScene {
     /// lake or no suitable ground is found (see [`Self::lake_spawn`]).
     #[must_use]
     pub fn with_lake_spawn(mut self) -> Self {
-        self.spawn_override = self.lake_spawn();
+        self.spawn_override = self.lake_spawn().map(|spawn| vec![spawn]);
         self
     }
 

@@ -19,6 +19,7 @@ fn cabin_items_rest_on_a_surface_inside_the_cabin() {
     let kinds: Vec<u16> = scene.world_items.iter().map(|item| item.kind).collect();
     assert!(kinds.contains(&game::items::SHOVEL.0), "{kinds:?}");
     assert!(kinds.contains(&game::items::NOTE.0), "{kinds:?}");
+    assert!(kinds.contains(&game::items::COMPASS.0), "{kinds:?}");
     let setup = scene.world_setup();
     let cell = |p: [f64; 3]| {
         let c = p.map(|v| (v * 4.0).floor() as i64);
@@ -266,20 +267,25 @@ mod network {
             vec![[9.0, 1.0, 9.5], [8.5, 1.0, 10.5], [10.125, 1.0, 8.5]],
             super::cabin().world_items,
         );
-        let (shovel, note) = (game::items::SHOVEL.0, game::items::NOTE.0);
+        let (shovel, compass, note) = (
+            game::items::SHOVEL.0,
+            game::items::COMPASS.0,
+            game::items::NOTE.0,
+        );
         let first = cabin.connect("first");
         until("first sees both items", || {
-            (kinds(&first.replica) == [shovel, note]).then_some(())
+            (kinds(&first.replica) == [shovel, compass, note]).then_some(())
         });
         let second = cabin.connect("second");
         until("late joiner sees both items", || {
-            (kinds(&second.replica) == [shovel, note]).then_some(())
+            (kinds(&second.replica) == [shovel, compass, note]).then_some(())
         });
-        // Both reach for the shovel at once; the note is out of reach.
+        // Both reach for the shovel at once; the compass and note are out of reach.
         first.session.push_action(interact(2_000_000));
         second.session.push_action(interact(2_000_000));
         until("the shovel leaves both worlds", || {
-            (kinds(&first.replica) == [note] && kinds(&second.replica) == [note]).then_some(())
+            (kinds(&first.replica) == [compass, note] && kinds(&second.replica) == [compass, note])
+                .then_some(())
         });
         // A repeat changes nothing.
         first.session.push_action(interact(2_000_001));
@@ -287,8 +293,8 @@ mod network {
         let held = cabin.held(0, game::items::SHOVEL) + cabin.held(1, game::items::SHOVEL);
         assert_eq!(held, 1, "exactly one pack has the shovel");
         let third = cabin.connect("third");
-        until("a later joiner sees only the note", || {
-            (kinds(&third.replica) == [note]).then_some(())
+        until("a later joiner sees only the compass and note", || {
+            (kinds(&third.replica) == [compass, note]).then_some(())
         });
         cabin.stop(vec![first, second, third]);
     }

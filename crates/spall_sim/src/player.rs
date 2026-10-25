@@ -72,6 +72,9 @@ pub struct Player {
     /// Warmth and wetness (ENG-264/265). Runtime only: a reconnect or a
     /// respawn starts warm and dry.
     pub body: crate::warmth::BodyHeat,
+    /// How many times this capsule has died (ENG-251). Runtime only: the game's
+    /// rules watch it to answer a death (restore items, show a death screen).
+    pub deaths: u32,
 }
 
 impl Player {
@@ -110,6 +113,7 @@ impl Player {
             health: PLAYER_MAX_HEALTH,
             principal: None,
             body: crate::warmth::BodyHeat::default(),
+            deaths: 0,
         }
     }
 

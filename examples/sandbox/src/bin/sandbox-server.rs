@@ -109,10 +109,11 @@ struct Args {
     /// Initial plant season; the saved plant clock advances every 15 minutes.
     #[arg(long, default_value = "summer", value_parser = ["spring", "summer", "autumn", "winter"], requires = "worldgen")]
     season: String,
-    /// The Winter Crossing profile: a held winter, frequent random blizzards,
-    /// heavy snowfall, and animals spread across the whole map (see
-    /// docs/winter-crossing.md). Replaces `--season` and `--animals`.
-    #[arg(long, requires = "worldgen", conflicts_with_all = ["season", "animals"])]
+    /// The Winter Crossing scenario: a held winter, frequent random blizzards,
+    /// heavy snowfall, animals across the whole map, the cabin, shed and
+    /// beacon tower, players starting in the cabin and the win at the top (see
+    /// docs/architecture.md, "Winter Crossing scenario"). Replaces `--season` and `--animals`.
+    #[arg(long, requires = "worldgen", conflicts_with_all = ["season", "animals", "spawn_at_lake"])]
     scenario_winter: bool,
     /// Use the legacy whole-terrain collider for a controlled comparison.
     /// Per-brick terrain collision is the normal mode.
@@ -188,13 +189,14 @@ struct Args {
     /// Length of one day/night cycle in real minutes (60 Hz ticks), sent to
     /// every client so all players see the same sky and the animals keep the
     /// same schedule. `20` is the long-standing default; a 10-12 minute day
-    /// makes a 1 km crossing span a full cycle.
-    #[arg(long, default_value_t = 20.0)]
-    day_minutes: f32,
+    /// makes a 1 km crossing span a full cycle. `--scenario-winter` defaults
+    /// to its own (11).
+    #[arg(long)]
+    day_minutes: Option<f32>,
     /// Hour of the day (0-24, so 15.5 is 15:30) at server tick 0. `6` is
-    /// sunrise, the default.
-    #[arg(long, default_value_t = 6.0)]
-    start_hour: f32,
+    /// sunrise, the default; `--scenario-winter` defaults to 15.5.
+    #[arg(long)]
+    start_hour: Option<f32>,
     // --- T23 / G3 row 7: default-off resident-cache eviction ---
     /// Enable the residency pass: evict terrain bricks outside every player's
     /// interest box (this many resident bricks is the reported ceiling), reload
@@ -468,25 +470,27 @@ fn run_serve(args: Args) -> ExitCode {
     };
 
     let mut custom_world = None;
+    // The Winter Crossing's buildings, when it runs (ENG-251).
+    let mut scenario_layout = None;
     let scene = if let Some(preset) = &args.worldgen {
         let started = std::time::Instant::now();
-        match sandbox::worldgen_scene::generate_with_season(
-            preset,
-            args.seed,
-            args.worldgen_size,
-            spall_ecology::living::Season::parse(if args.scenario_winter {
-                "winter"
-            } else {
-                &args.season
-            })
-            .unwrap(),
-        ) {
-            Ok(generated) => {
-                let generated = if args.scenario_winter {
-                    generated.with_held_season(sandbox::winter_crossing::HELD_SEASON_MS)
-                } else {
+        let generated = if args.scenario_winter {
+            sandbox::winter_crossing::generate(preset, args.seed, args.worldgen_size).map(
+                |(generated, layout)| {
+                    scenario_layout = Some(layout);
                     generated
-                };
+                },
+            )
+        } else {
+            sandbox::worldgen_scene::generate_with_season(
+                preset,
+                args.seed,
+                args.worldgen_size,
+                spall_ecology::living::Season::parse(&args.season).unwrap(),
+            )
+        };
+        match generated {
+            Ok(generated) => {
                 let generated = if args.spawn_at_lake {
                     let moved = generated.with_lake_spawn();
                     if moved.player_spawns() == moved.world().spawns.as_slice() {
@@ -504,7 +508,14 @@ fn run_serve(args: Args) -> ExitCode {
                         &args.world.join("water-cache"),
                         &format!(
                             "{preset}-{}-{}-{}",
-                            args.seed, args.worldgen_size, args.season
+                            args.seed,
+                            args.worldgen_size,
+                            // The scenario's buildings change the terrain.
+                            if args.scenario_winter {
+                                "winter-crossing"
+                            } else {
+                                &args.season
+                            }
                         ),
                     )
                 } else {
@@ -545,11 +556,23 @@ fn run_serve(args: Args) -> ExitCode {
                 } else {
                     Vec::new()
                 };
-                let scattered = generated.scatter_items(
+                let mut scattered = generated.scatter_items(
                     args.seed,
                     &sandbox::world_scatter::ScatterSettings::default(),
                 );
                 tracing::info!(items = scattered.len(), "scattered world items");
+                if let Some(layout) = &scenario_layout {
+                    tracing::info!(
+                        cabin = ?layout.cabin,
+                        tower = ?layout.tower,
+                        shed = ?layout.shed,
+                        win_zone_m = ?layout.win_zone.centre_m,
+                        tower_heading_deg = layout.tower_heading_deg,
+                        "winter crossing buildings placed"
+                    );
+                    scattered.extend(layout.cabin_items.iter().copied());
+                    scattered.push(layout.axe);
+                }
                 let mut world = generated
                     .into_custom_world()
                     .with_initial_bodies(floaters)
@@ -605,9 +628,17 @@ fn run_serve(args: Args) -> ExitCode {
     {
         let _ = std::fs::create_dir_all(parent);
     }
+    // The scenario brings its own pacing unless the flags say otherwise.
+    let (day_minutes, start_hour) = match args.scenario_winter {
+        true => (
+            sandbox::winter_crossing::DAY_MINUTES,
+            sandbox::winter_crossing::START_HOUR,
+        ),
+        false => (20.0, 6.0),
+    };
     let day_clock = match spall_core::time_of_day::DayClock::new(
-        (args.day_minutes * 3_600.0).round() as u32,
-        args.start_hour,
+        (args.day_minutes.unwrap_or(day_minutes) * 3_600.0).round() as u32,
+        args.start_hour.unwrap_or(start_hour),
     ) {
         Ok(clock) => clock,
         Err(error) => {
@@ -795,6 +826,11 @@ fn run_serve(args: Args) -> ExitCode {
             item_pickup: None,
             tool_hooks: None,
             fires: None,
+            game_tick: scenario_layout.as_ref().map(|layout| {
+                spall_server::GameTick::new(sandbox::winter_crossing::rules::ScenarioRules::new(
+                    layout,
+                ))
+            }),
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),

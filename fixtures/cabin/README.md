@@ -18,8 +18,8 @@ Everything solid uses the normal editable/destructible terrain path.
 foundation, floor, porch, hearth and chimney. Bed, table, bench and lamp are
 separate reusable assets with local origins and independent scene placements.
 They can be moved or duplicated in the editor; furniture cannot be picked up.
-`items.ron` places world items that can: a shovel on the floor and a note on the
-table. Press **E** near one to put it in your pack (Tab). This file is read by
+`items.ron` places world items that can: a shovel on the floor and a compass and
+a note on the table. Press **E** near one to put it in your pack (Tab). This file is read by
 the sandbox, not the editor.
 `door.spvox` is also separate. Its lower-left hinge cell records its open/closed
 state, so damage, replication and saves use ordinary voxel transactions. The
