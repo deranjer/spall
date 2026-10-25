@@ -602,10 +602,16 @@ impl ApplicationHandler for InteractiveApp {
                     let fires = replica.world_items().filter(|i| i.fire_fuel_s.is_some());
                     self.last_fires = fires.copied().collect();
                     if let Some(view) = &self.pack_view {
+                        let eye = self.fly_eye.map(|e| e.as_dvec3().to_array()).or_else(|| {
+                            (*self.session.view.lock().unwrap_or_else(|e| e.into_inner()))
+                                .map(|v| v.predicted.position_m)
+                        });
                         self.last_item_cubes = world_item_instances(
                             replica.world_items(),
                             view.as_ref(),
                             self.item_tint_base,
+                            self.body_epoch.elapsed().as_secs_f32(),
+                            eye,
                         );
                     }
                 }
@@ -786,7 +792,10 @@ impl ApplicationHandler for InteractiveApp {
                             renderer.scene.set_point_lights(&emitter_point_lights(
                                 &self.emitter_instances,
                                 &self.render_materials,
-                                &fire_lights(&self.last_fires),
+                                &fire_lights(
+                                    &self.last_fires,
+                                    self.body_epoch.elapsed().as_secs_f32(),
+                                ),
                                 eye,
                             ));
                         }
