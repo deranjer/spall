@@ -1012,63 +1012,19 @@ pub(super) async fn serve_async(
                             },
                         }
                     }
-                    spall_protocol::AdminCommand::SetWaterSpring { rate } => {
-                        let has_gated_spring = custom_world.as_ref().is_some_and(|c| {
-                            c.column_water_setup()
-                                .is_some_and(|w| w.gated_sources.iter().any(|t| !t.is_empty()))
-                        });
-                        if !admin_commands {
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: false,
-                                message: "admin commands are disabled on this server".into(),
-                            }
-                        } else if !has_gated_spring {
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: false,
-                                message: "this scene authored no gated water spring".into(),
-                            }
-                        } else if rate > spall_sim::column_water::MAX_GATED_SOURCE_RATE {
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: false,
-                                message: format!(
-                                    "water spring rate must be 0..={}",
-                                    spall_sim::column_water::MAX_GATED_SOURCE_RATE
-                                ),
-                            }
-                        } else {
-                            sim.set_water_spring_rate(rate);
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: true,
-                                message: if rate == 0 {
-                                    "water spring off".to_string()
-                                } else {
-                                    format!("water spring rate {rate}")
-                                },
-                            }
-                        }
-                    }
+                    spall_protocol::AdminCommand::SetWaterSpring { rate } => water_spring_admin(
+                        &mut sim,
+                        admin_commands,
+                        custom_world.as_ref(),
+                        req.request_id,
+                        rate,
+                    ),
                     command @ (spall_protocol::AdminCommand::SetWeather { .. }
                     | spall_protocol::AdminCommand::SetSeason { .. }) => {
                         weather_admin(&mut sim, admin_commands, req.request_id, command)
                     }
                     spall_protocol::AdminCommand::TeleportSelf { feet_mm } => {
-                        let feet = feet_mm.map(|mm| mm as f64 / 1000.0);
-                        let (accepted, message) = if !admin_commands {
-                            (false, "admin commands are disabled on this server")
-                        } else if sim.teleport_player(session_player_entity(session), feet) {
-                            (true, "teleported")
-                        } else {
-                            (false, "no player to teleport")
-                        };
-                        spall_protocol::AdminStatus {
-                            request_id: req.request_id,
-                            accepted,
-                            message: message.into(),
-                        }
+                        teleport_admin(&mut sim, admin_commands, session, req.request_id, feet_mm)
                     }
                     spall_protocol::AdminCommand::SetDamGate { open } => {
                         let gate = custom_world.as_ref().and_then(CustomWorld::dam_gate);
