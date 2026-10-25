@@ -63,7 +63,17 @@ enum ProgressionCommand {
         item: game::ItemId,
         reply: std::sync::mpsc::SyncSender<Result<Result<(), &'static str>, ProgressionStoreError>>,
     },
+    UsePack {
+        player_id: PlayerId,
+        apply: PackUse,
+        reply:
+            std::sync::mpsc::SyncSender<Result<Result<f32, &'static str>, ProgressionStoreError>>,
+    },
 }
+
+/// A change to one player's pack that answers an amount (fuel taken for a
+/// fire, ENG-266) or refuses with nothing changed.
+pub type PackUse = Box<dyn FnOnce(&mut Inventory) -> Result<f32, &'static str> + Send>;
 
 struct ProgressionDatabase {
     connection: Connection,
@@ -287,6 +297,25 @@ impl ProgressionDatabase {
         tx.commit()?;
         Ok(outcome)
     }
+
+    /// Applies `apply` to the player's pack and durably writes the pack when
+    /// it succeeds; a refusal writes nothing.
+    pub fn use_pack(
+        &mut self,
+        player_id: PlayerId,
+        apply: PackUse,
+    ) -> Result<Result<f32, &'static str>, ProgressionStoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut inventory = load_inventory(&tx, player_id)?;
+        let outcome = apply(&mut inventory);
+        if outcome.is_ok() {
+            write_inventory(&tx, player_id, &inventory)?;
+        }
+        tx.commit()?;
+        Ok(outcome)
+    }
 }
 
 impl ProgressionStore {
@@ -331,6 +360,13 @@ impl ProgressionStore {
                             reply,
                         } => {
                             let _ = reply.send(database.pick_up_item(player_id, item));
+                        }
+                        ProgressionCommand::UsePack {
+                            player_id,
+                            apply,
+                            reply,
+                        } => {
+                            let _ = reply.send(database.use_pack(player_id, apply));
                         }
                     }
                 }
@@ -391,6 +427,25 @@ impl ProgressionStore {
 }
 
 impl ProgressionStore {
+    /// See [`ProgressionDatabase::use_pack`]; waits for the commit.
+    pub fn use_pack(
+        &self,
+        player_id: PlayerId,
+        apply: PackUse,
+    ) -> Result<Result<f32, &'static str>, ProgressionStoreError> {
+        let (reply, response) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .send(ProgressionCommand::UsePack {
+                player_id,
+                apply,
+                reply,
+            })
+            .map_err(|_| ProgressionStoreError::WriterStopped)?;
+        response
+            .recv()
+            .map_err(|_| ProgressionStoreError::WriterStopped)?
+    }
+
     /// See [`ProgressionDatabase::pick_up_item`]; waits for the commit.
     pub fn pick_up_item(
         &self,
@@ -686,6 +741,32 @@ mod tests {
         let inventory = database.load_inventory(player(5)).unwrap();
         assert_eq!(inventory.count(game::items::SHOVEL), 2);
         assert_eq!(inventory.count(game::items::NOTE), 0);
+    }
+
+    #[test]
+    fn a_pack_use_is_durable_and_a_refusal_writes_nothing() {
+        let path = TestDatabasePath::new();
+        {
+            let mut database = ProgressionDatabase::open(&path.0).unwrap();
+            database
+                .pick_up_item(player(5), game::items::FIRE_PIT)
+                .unwrap()
+                .unwrap();
+            let place = |pack: &mut Inventory| crate::fires::place_from_pack(pack, 6);
+            assert_eq!(
+                database.use_pack(player(5), Box::new(place)).unwrap(),
+                Ok(crate::fires::START_FUEL_S)
+            );
+            assert!(
+                database
+                    .use_pack(player(5), Box::new(place))
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        let database = ProgressionDatabase::open(&path.0).unwrap();
+        let inventory = database.load_inventory(player(5)).unwrap();
+        assert_eq!(inventory.count(game::items::FIRE_PIT), 0);
     }
 
     #[test]

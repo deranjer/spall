@@ -98,6 +98,7 @@ impl Simulation {
         let weather_span = crate::prof::Span::start("tick.weather");
         self.advance_weather();
         drop(weather_span);
+        self.burn_fires();
         let snow_span = crate::prof::Span::start("tick.snow");
         self.snow
             .advance(&self.weather, self.tick.get())

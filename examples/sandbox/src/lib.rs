@@ -12,6 +12,7 @@ pub mod appearance_v3;
 pub mod audio;
 pub mod content;
 pub mod editor_scene;
+pub mod fires;
 /// Minimal game content (material catalog, player tools) that turns tool use
 /// into engine [`spall_sim::EditIntent`]s. The engine never imports this.
 pub mod game;

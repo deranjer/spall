@@ -39,6 +39,9 @@ pub(super) struct InteractiveApp {
     pub(super) last_creature_cubes: Vec<spall_render::CubeInstance>,
     /// World item cubes from the last frame the replica was free (ENG-257).
     pub(super) last_item_cubes: Vec<spall_render::CubeInstance>,
+    /// Fires among the world items as of that frame (ENG-266): their light
+    /// and the warmth the screen shows.
+    pub(super) last_fires: Vec<spall_protocol::WorldItem>,
     pub(super) last_remote_players: Vec<super::options::PlayerBody>,
     /// Third-person camera distance (metres): pulled in at once when terrain
     /// is in the way, eased back out, and held when the replica is busy.
@@ -197,6 +200,8 @@ pub(super) struct InteractiveApp {
     pub(super) door_spec: Option<spall_voxel::doors::DoorSpec>,
     /// E was pressed: use the prompted item or door.
     pub(super) interact_pending: bool,
+    /// A pack item to set down in front of the player this frame (ENG-266).
+    pub(super) place_pending: Option<u16>,
     pub(super) last_hammer_at: Option<Instant>,
     pub(super) hammer_radius: i64,
     pub(super) next_action_id: u64,
@@ -299,6 +304,7 @@ impl InteractiveApp {
             item_tint_base: 0,
             last_creature_cubes: Vec::new(),
             last_item_cubes: Vec::new(),
+            last_fires: Vec::new(),
             last_remote_players: Vec::new(),
             third_person_distance_m: super::camera::THIRD_PERSON_DISTANCE_M,
             third_person_at: None,
@@ -398,6 +404,7 @@ impl InteractiveApp {
             hammer_pending: false,
             torch_pending: false,
             interact_pending: false,
+            place_pending: None,
             door_spec: options.door,
             last_hammer_at: None,
             hammer_radius: HAMMER_RADIUS_DEFAULT,
@@ -1140,6 +1147,18 @@ impl InteractiveApp {
     pub(super) fn close_pack(&mut self) {
         self.pack.close();
         self.set_cursor_locked(true);
+    }
+
+    /// A click on a stack in the open pack: set a fire pit down.
+    pub(super) fn use_pack_item(&mut self, item_id: u16) {
+        let Some(view) = &self.pack_view else { return };
+        match view.item_use(item_id) {
+            ItemUse::None => {}
+            ItemUse::Place => {
+                self.place_pending = Some(item_id);
+                self.close_pack();
+            }
+        }
     }
 
     /// B: open the blueprint book at its contents.

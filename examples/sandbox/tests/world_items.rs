@@ -1,6 +1,8 @@
 //! ENG-257 world items in the cabin: each authored item rests on a surface in
 //! open air inside the cabin, and (with the client feature) a real QUIC run
-//! picks items up into the pack, once, with late-join replication.
+//! picks items up into the pack, once, with late-join replication. ENG-266
+//! fires: one set down from the pack goes out, is fed back alight with E, and
+//! reaches every client, late joiners included, in its current state.
 
 use sandbox::{editor_scene, game};
 use spall_core::GlobalCell;
@@ -60,7 +62,7 @@ mod network {
     use spall_core::{BrushPoint, MaterialId, SphereBrush};
     use spall_net::{Fingerprint, JoinToken, TransportConfig};
     use spall_protocol::{ActionKind, ActionRequest, ClaimedTarget, InputSeq, RequestId};
-    use spall_server::{CustomWorld, InitialWorldItem, Scene, ServeConfig};
+    use spall_server::{CustomWorld, FireRules, Fires, InitialWorldItem, Scene, ServeConfig};
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -106,14 +108,18 @@ mod network {
     }
 
     fn interact(id: u64) -> ActionRequest {
+        action(id, ActionKind::Interact, 5, [0.0, 0.0, -1.0])
+    }
+
+    fn action(id: u64, kind: ActionKind, tool: u16, aim_dir: [f32; 3]) -> ActionRequest {
         ActionRequest {
             request_id: RequestId(id),
             input_seq: InputSeq(id),
-            action: ActionKind::Interact,
-            tool: 5,
-            // Bogus aim: the server picks from its own player.
+            action: kind,
+            tool,
+            // Bogus origin: the server uses its own player.
             aim_origin_m: [999.0, 999.0, 999.0],
-            aim_dir: [0.0, 0.0, -1.0],
+            aim_dir,
             claimed_target: ClaimedTarget::Terrain,
             claimed_brush: SphereBrush::new(BrushPoint::from_units(0, 0, 0), 0).unwrap(),
         }
@@ -137,6 +143,16 @@ mod network {
 
     impl Cabin {
         fn start(name: &str, spawns: Vec<[f64; 3]>, items: Vec<InitialWorldItem>) -> Self {
+            Self::start_with(name, spawns, items, |_| None)
+        }
+
+        /// [`Self::start`] with fire rules built over the server's packs.
+        fn start_with(
+            name: &str,
+            spawns: Vec<[f64; 3]>,
+            items: Vec<InitialWorldItem>,
+            fires: impl FnOnce(Arc<Mutex<game::PlayerInventories>>) -> Option<Fires>,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!("spall-{name}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let scene = Arc::new(cabin());
@@ -148,6 +164,7 @@ mod network {
                 Some(CustomWorld::new(spawns, move || scene.world_setup()).with_world_items(items));
             let inventories = Arc::new(Mutex::new(game::PlayerInventories::default()));
             cfg.server.item_pickup = Some(in_memory_pickup(inventories.clone()));
+            cfg.server.fires = fires(inventories.clone());
             cfg.server.paced = true;
             cfg.server.log_json = dir.join("server.jsonl");
             cfg.server.transport = TransportConfig::for_tests();
@@ -315,5 +332,96 @@ mod network {
             (hinge(&client.replica) == Some(open)).then_some(())
         });
         cabin.stop(vec![client]);
+    }
+
+    /// The sandbox's pack rules with short fuel, so a fire goes out within
+    /// the run: a pit starts with 1 s, each feed adds 600 s.
+    struct ShortFuel(Arc<Mutex<game::PlayerInventories>>);
+
+    impl FireRules for ShortFuel {
+        fn place(
+            &mut self,
+            session: spall_protocol::SessionId,
+            _: Option<spall_protocol::PlayerId>,
+            kind: u16,
+        ) -> Result<f32, &'static str> {
+            let mut packs = self.0.lock().unwrap();
+            sandbox::fires::place_from_pack(packs.ensure(session.slot().0), kind).map(|_| 1.0)
+        }
+
+        fn refuel(
+            &mut self,
+            session: spall_protocol::SessionId,
+            _: Option<spall_protocol::PlayerId>,
+            fire: &spall_protocol::WorldItem,
+        ) -> Result<f32, &'static str> {
+            let mut packs = self.0.lock().unwrap();
+            sandbox::fires::feed_from_pack(packs.ensure(session.slot().0), fire).map(|_| 600.0)
+        }
+    }
+
+    /// Fires on `replica`: (fuel, lit).
+    fn fires(replica: &Arc<Mutex<ReplicaWorld>>) -> Vec<(f32, bool)> {
+        replica
+            .lock()
+            .unwrap()
+            .world_items()
+            .filter_map(|i| Some((i.fire_fuel_s?, i.is_lit())))
+            .collect()
+    }
+
+    /// A fire pit clicked out of the pack lands lit in the cabin, burns out
+    /// and stays as an unlit pit, E feeds it alight again from a stick in the
+    /// pack, and a client joining afterwards receives it burning.
+    #[test]
+    fn a_fire_goes_out_is_fed_alight_and_replicates_to_late_joiners() {
+        let cabin = Cabin::start_with(
+            "world-fires",
+            vec![[9.0, 1.0, 9.5], [8.5, 1.0, 10.5]],
+            Vec::new(),
+            |packs| Some(Fires::new(ShortFuel(packs))),
+        );
+        {
+            let mut packs = cabin.inventories.lock().unwrap();
+            let pack = packs.ensure(0);
+            pack.grant(game::items::FIRE_PIT, 1).unwrap();
+            pack.grant(game::items::STICK, 1).unwrap();
+        }
+        let first = cabin.connect("first");
+        until("first is in the world", || {
+            first.replica.lock().unwrap().terrain_volume().map(|_| ())
+        });
+        // Looking down at the floor a step ahead.
+        let place = action(
+            2_000_000,
+            ActionKind::PlaceItem,
+            game::items::FIRE_PIT.0,
+            [0.0, -1.0, 0.6],
+        );
+        first.session.push_action(place.clone());
+        until("the fire is set down lit", || {
+            (fires(&first.replica) == [(1.0, true)]).then_some(())
+        });
+        assert_eq!(cabin.held(0, game::items::FIRE_PIT), 0);
+        // A retry of the same request sets nothing more down.
+        first.session.push_action(place);
+        until("the fire burns out and the pit stays", || {
+            (fires(&first.replica) == [(0.0, false)]).then_some(())
+        });
+        first.session.push_action(interact(2_000_001));
+        until("E feeds it alight", || {
+            (fires(&first.replica) == [(600.0, true)]).then_some(())
+        });
+        assert_eq!(cabin.held(0, game::items::STICK), 0);
+        let second = cabin.connect("second");
+        let seen = until("a late joiner sees it burning", || {
+            let seen = fires(&second.replica);
+            (!seen.is_empty()).then_some(seen)
+        });
+        assert_eq!(seen.len(), 1, "one fire: {seen:?}");
+        let (fuel, lit) = seen[0];
+        // Its current fuel, a little burnt since the feed.
+        assert!(lit && fuel < 600.0 && fuel > 590.0, "{seen:?}");
+        cabin.stop(vec![first, second]);
     }
 }

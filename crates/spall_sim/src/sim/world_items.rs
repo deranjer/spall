@@ -13,7 +13,41 @@ impl Simulation {
         translation_m: [f64; 3],
         yaw_rad: f32,
     ) -> Result<WorldItem, WorldItemError> {
-        self.world_items.spawn(kind, translation_m, yaw_rad)
+        self.world_items.spawn(kind, translation_m, yaw_rad, None)
+    }
+
+    /// Sets a fire down (ENG-266): an item of `kind` with `fuel_s` seconds of
+    /// fuel, lit if that is above zero, queued for replication.
+    pub fn place_fire(
+        &mut self,
+        kind: u16,
+        translation_m: [f64; 3],
+        yaw_rad: f32,
+        fuel_s: f32,
+    ) -> Result<WorldItem, WorldItemError> {
+        self.world_items
+            .spawn(kind, translation_m, yaw_rad, Some(fuel_s))
+    }
+
+    /// Adds fuel to a fire, relighting it if it was out. `None` if the item
+    /// is gone or is not a fire, or `fuel_s` is not positive.
+    pub fn add_fire_fuel(&mut self, item_id: u64, fuel_s: f32) -> Option<WorldItem> {
+        self.world_items.add_fuel(item_id, fuel_s)
+    }
+
+    /// One tick of every lit fire: a second of fuel per second, or
+    /// [`crate::world_items::BLIZZARD_BURN_RATE`] for a fire in the open
+    /// during a blizzard.
+    pub(super) fn burn_fires(&mut self) {
+        let blizzard = self.weather.kind == spall_protocol::WeatherKind::Blizzard;
+        let volume = &self.world.terrain().volume;
+        self.world_items.burn(TICK_DT_S, |fire| {
+            if blizzard && !crate::world_items::sheltered(volume, fire) {
+                crate::world_items::BLIZZARD_BURN_RATE
+            } else {
+                1.0
+            }
+        });
     }
 
     /// Removes an item and queues its removal. `None` if it is already gone,

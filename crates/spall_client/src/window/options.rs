@@ -52,10 +52,28 @@ pub trait PackView: Send + Sync + std::fmt::Debug {
     fn item_model(&self, _item_id: u16) -> &[ItemVoxel] {
         &[]
     }
+    /// Cubes drawn on top of [`Self::item_model`] while a fire of this kind
+    /// burns (ENG-266), in the same item-local metres. Empty draws nothing.
+    fn lit_model(&self, _item_id: u16) -> &[ItemVoxel] {
+        &[]
+    }
+    /// What clicking this item's stack in the pack does.
+    fn item_use(&self, _item_id: u16) -> ItemUse {
+        ItemUse::None
+    }
     /// Tinted copies of manifest materials that [`ItemVoxel::tint`] indexes.
     fn item_tints(&self) -> Vec<(spall_core::MaterialId, [u8; 3])> {
         Vec::new()
     }
+}
+
+/// What using an item from the pack does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemUse {
+    None,
+    /// Set it down in front of the player as a fire (ENG-266): the server
+    /// takes it from the pack and finds the spot.
+    Place,
 }
 
 /// One cube of a world item's model.

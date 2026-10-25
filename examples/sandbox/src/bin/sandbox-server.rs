@@ -727,6 +727,7 @@ fn run_serve(args: Args) -> ExitCode {
             creatures,
             creature_shape,
             item_pickup: None,
+            fires: None,
             contact_damage: args
                 .contact_damage
                 .then_some(sandbox::game::contact_damage_config()),
@@ -803,6 +804,11 @@ fn run_serve(args: Args) -> ExitCode {
     config.server.item_pickup = Some(match durable_progression.clone() {
         Some(store) => sandbox::world_items::durable_pickup(store),
         None => sandbox::world_items::in_memory_pickup(player_inventories.clone()),
+    });
+    // Fire pits set down and fed from the same pack (ENG-266).
+    config.server.fires = Some(match durable_progression.clone() {
+        Some(store) => sandbox::fires::durable_fires(store),
+        None => sandbox::fires::in_memory_fires(player_inventories.clone()),
     });
     let commit_inventories = player_inventories.clone();
     let commit_store = durable_progression.clone();

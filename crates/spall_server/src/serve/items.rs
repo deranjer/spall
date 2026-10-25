@@ -94,9 +94,40 @@ pub(super) fn pick_up_item(
     })
 }
 
+/// The game's item hooks the tick loop uses. The development path (unvalidated
+/// actions) gets none.
+pub(super) struct ItemHooks {
+    pickup: Option<ItemPickup>,
+    fires: Option<Fires>,
+}
+
+impl ItemHooks {
+    pub(super) fn new(host: &HostConfig, dev_unvalidated_actions: bool) -> Self {
+        let validated = !dev_unvalidated_actions;
+        Self {
+            pickup: host.item_pickup.clone().filter(|_| validated),
+            fires: host.fires.clone().filter(|_| validated),
+        }
+    }
+}
+
+/// An action request that uses a world item: setting a fire down or feeding
+/// one first, then pickup. Answers the client and returns `true` when the
+/// request was handled here; `false` lets it carry on (a door, an edit).
+pub(super) fn try_use_item(
+    sim: &mut Simulation,
+    session: SessionId,
+    req: &ActionRequest,
+    hooks: &ItemHooks,
+    clients: &ClientMap,
+) -> bool {
+    try_fire(sim, session, req, &hooks.fires, clients)
+        || try_pick_up(sim, session, req, &hooks.pickup, clients)
+}
+
 /// [`pick_up_item`] for the tick loop: answers the client and returns `true`
 /// when the request was a pickup.
-pub(super) fn try_pick_up(
+fn try_pick_up(
     sim: &mut Simulation,
     session: SessionId,
     req: &ActionRequest,
