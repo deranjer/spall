@@ -9,7 +9,7 @@
 
 lines crates/spall_client/src/net.rs 3692
 lines crates/spall_render/src/capture.rs 2212
-lines crates/spall_server/src/serve/tick_loop.rs 2547
+lines crates/spall_server/src/serve/tick_loop.rs 2527
 lines crates/spall_sim/src/world.rs 2933
 lines examples/sandbox/src/bin/sandbox-capture.rs 2977
 lines tools/spall_editor/src/ui.rs 2165

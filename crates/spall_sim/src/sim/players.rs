@@ -49,8 +49,8 @@ impl Simulation {
     /// ENG-223: the one way to hurt a player. The caller runs on the owning
     /// thread between ticks, so the damage lands at a tick boundary. Damage
     /// that would leave no health kills the player, who respawns at once at
-    /// its spawn point with [`PLAYER_MAX_HEALTH`]. `None` for an unknown
-    /// player.
+    /// its spawn point with [`PLAYER_MAX_HEALTH`], warm and dry. `None` for an
+    /// unknown player.
     pub fn damage_player(&mut self, entity: EntityId, amount: u16) -> Option<PlayerDamage> {
         let player = self.world.players.get_mut(&entity.get())?;
         if amount < player.health {
@@ -60,6 +60,7 @@ impl Simulation {
             });
         }
         player.health = PLAYER_MAX_HEALTH;
+        player.body = crate::warmth::BodyHeat::default();
         let spawn = player.spawn.position_m;
         self.world.teleport_player(entity, spawn, TICK_DT_S);
         Some(PlayerDamage::Killed)

@@ -97,7 +97,7 @@ const BITE_REACH_M: f64 = 1.6;
 const BITE_TICKS: u64 = 30;
 const BACK_OFF_TICKS: u64 = 90;
 /// Bites a pack lands on a player before it gives up.
-const PLAYER_BITES: u32 = 3;
+const PLAYER_BITES: u32 = crate::game::WOLF_HUNT_BITES;
 /// Rest after a hunt that failed (40 s).
 const TIRED_TICKS: u64 = 60 * 40;
 
@@ -108,8 +108,8 @@ const PLAYER_HUNT_CHANCE: f64 = 0.2;
 const PLAYER_HUNT_NIGHT_CHANCE: f64 = 0.5;
 /// ...for a player this close to its leader...
 const PLAYER_NOTICE_M: f64 = 40.0;
-/// ...and leaves players alone this long after a player hunt (3 min).
-const PLAYER_REST_TICKS: u64 = 60 * 60 * 3;
+/// ...and leaves players alone this long after a player hunt (6 min).
+const PLAYER_REST_TICKS: u64 = 60 * 60 * 6;
 
 /// A player this close to any wolf, or sprinting this close, makes the pack
 /// react: back away, or attack.

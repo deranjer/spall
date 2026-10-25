@@ -118,6 +118,11 @@ surfaces and clears the source, preventing floating snow. Moving-body accumulati
 is deferred. Warm weather melts gradually; fresh snow fills footprints. No melt
 or rainfall mass is injected into the water solver in this phase.
 
+Shovelling (ENG-260) clears the layer: `Simulation::clear_snow` drops the shovelled
+faces from their cohorts and exposes them again at zero depth, so they replicate
+like any changed layer and fill again with fresh snowfall. More than 0.15 m of
+snow over a world item buries it (no pickup) until it is shovelled off.
+
 ## Footprints
 
 Derive footfalls from server-validated grounded movement and distance/stride,
@@ -365,3 +370,27 @@ Weather ducks biome ambience per layer (`ambience_mix`): other layers by up to 6
 water tracks (`BiomeAudioConfig::water_tracks`: stream, ocean, beach) by at most a
 quarter of that, and water layers take mix slots before other layers. Weather beds
 play on their own `AmbienceAudio` worker, so they never evict ambience layers.
+
+## Winter Crossing profile (ENG-269)
+
+`sandbox-server --worldgen <preset> --scenario-winter` selects a scenario
+profile (requires `--worldgen`; replaces `--season` and `--animals`). Without
+the flag nothing changes.
+
+- **Weather.** `WeatherProfile::WinterCrossing` (`spall_protocol`) runs 5-minute
+  fronts (`WINTER_CROSSING_FRONT_MS`) at a fixed -8 C base whatever the clock
+  season: 18 % blizzard, 67 % snow (heavy 60 %, medium 30 %, light 10 %), 10 %
+  clear, 5 % high wind; no rain or storms. At the default 20-minute day that is
+  a blizzard about every 1.7 days, 6 in-game hours per front. The server picks
+  it at startup (`CustomWorld::with_weather_profile`,
+  `SimulationConfig::weather_profile`); it is not persisted.
+- **Held winter.** The season clock starts in winter with `HELD_SEASON_MS`
+  (about 31 years) per season, so it never advances.
+- **Animals.** `sandbox::winter_crossing::ANIMAL_TARGETS` (deer 120, crows 60,
+  trout 12, bears 4, snow leopards 6, wolves 12 = three packs), born around a
+  25-point grid across a 1 km map. Animals still need an ephemeral world (no
+  `--save`).
+- **Wolves.** `WOLF_BITE_DAMAGE` is 12 (nine bites kill); one hunt is capped at
+  `WOLF_HUNT_BITES` = 3 (see animals.md). This applies to all worlds.
+
+Numbers: `docs/reports/ENG-269-winter-tuning.md`.

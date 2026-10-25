@@ -40,8 +40,9 @@ pub mod water;
 pub mod weather;
 pub mod world_item;
 pub use weather::{
-    SnowTier, WEATHER_PROFILE_MS, WEATHER_TRANSITION_MS, WeatherClock, WeatherClockSource,
-    WeatherError, WeatherKind, WeatherSnapshot, WeatherState, Wind, wind_at,
+    SnowTier, WEATHER_PROFILE_MS, WEATHER_TRANSITION_MS, WINTER_CROSSING_FRONT_MS, WeatherClock,
+    WeatherClockSource, WeatherError, WeatherKind, WeatherProfile, WeatherSnapshot, WeatherState,
+    Wind, wind_at,
 };
 pub use world_item::{WorldItem, WorldItemUpdate};
 

@@ -198,6 +198,27 @@ drain, edge blur, and the injury reminder icon from one bear swipe down), which 
 respawn restores full health. Game creatures hurt players through the director's
 `CreatureAction::HitPlayer`, which the server refuses beyond 3 m of the creature's root (ENG-240).
 
+The host installs its configured `DayClock` with `Simulation::set_day_clock`, so cold follows the same day length and starting hour as the sky, including after save recovery and world replacement.
+
+ENG-264/265 warmth and wetness: each capsule also carries a runtime `warmth::BodyHeat` (warmth 1
+warm to 0 freezing, wetness 0 dry to 1 soaked; not saved, and a respawn or reconnect starts warm
+and dry). Once a second, at the end of `Simulation::tick`, `spall_sim::warmth` gathers each
+player's exposure: the weather's temperature, colder at night (-10 C at midnight) and a little warmer
+at noon (+3 C); wind chill in the open by weather kind (3 C, plus up to 2.5 C more in a blizzard); shelter; water depth
+over the feet from the column water; rain unless roofed; and `world_items::heat_at` at the chest.
+Shelter is coarse: solid cells within 8 m straight overhead, and how many of 8 horizontal 4 m rays
+from the chest meet a wall, so a cave or a dug hole counts and open ground does not. Wetness rises
+toward depth / 1.5 m (wading wets a little, falling in soaks) and dries over minutes, faster near a
+fire. Felt temperature (air, minus wind chill and up to 8 C for being soaked, plus shelter and fire)
+sets the warmth target; below warmth 0.2 the cold hurts through `damage_player`, up to 0.5 health
+a second. All the numbers are in the tuning block at the top of `warmth.rs`. With these numbers a
+winter night in the open is lethal, a fire or full shelter prevents damage, and cold damage is
+for nights: a dry player in the open in a winter blizzard stays above the threshold all day (warmth
+floor 0.38 at noon, 0.28 at sunrise, against 0.2). A player soaked through can still be hurt
+around sunrise or sunset in a blizzard. Clothing and insulation are a later ticket. The server
+sends warmth and wetness in the owning session's `PlayerHealth` record, and the client's
+`body_state` eases its cold (lost warmth) and wet looks toward them.
+
 The interactive launcher also has an explicit testing-only escape hatch:
 `--client-authoritative`. In that mode `ClientPhysics` promotes replicated body
 colliders to locally stepped dynamic bodies, computes mass/COM/inertia from the
@@ -781,6 +802,52 @@ compass and note down to life size. A model that fails to load is logged as an
 error and drawn as `pack_view::placeholder_model` cubes. The client also labels the
 nearest one `E  Pick up <name>`, ahead of a door prompt.
 
+## Tools
+
+The game's tool catalog (`ToolCatalog`) says what each tool id does, its reach
+and its radius cap. The game's `ToolRules`, installed as `HostConfig::tool_hooks`,
+say who may use a tool: the server asks `ToolRules::allow` before resolving any
+cut or placement and refuses the request with the game's reason. The server's
+only notion of admin is `HostConfig::admin_commands` (the sandbox's
+`--allow-admin-commands`, which `cargo xtask play` passes), handed to the rules as
+`ToolUse::admin`. The development `--dev-unvalidated-actions` path skips the rules.
+
+For a cut, the server then finds its own hit and asks `ToolRules::swing` what
+the strike does to the struck material (and to any thin snow lying on it): an
+ordinary cut with a game-chosen radius, still capped by the catalog, or
+`SwingEffect::ClearSnow`, which zeroes the snow layer round the struck point
+(`Simulation::clear_snow`) without cutting anything and answers `Queued` at once.
+When a tool cut commits, the tick loop hands it to `ToolRules::committed`; the
+game puts awards in its pack and returns the item kinds the server spawns as
+world items on the ground at the cut, and optionally a topple rate: every body
+the commit split off then gets an angular velocity about the horizontal axis
+that tips its top away from the swing (plus a small push the same way), set
+once on the server's physics body, so the fall replicates like any body motion.
+
+In the sandbox, players start empty-handed. The hammer (`DIG`) is an admin tool
+(ENG-259): the server refuses its swings unless admin commands are on, and the
+client keeps it put away until the admin menu (F10, Tools) puts it in hand.
+Other tools are pack items: clicking one in the pack (Tab) puts it in hand
+(`PackView::item_tool`), and left click swings it (the server sets the radius).
+The shovel (ENG-260, tool 6,
+reach 3 m) needs a shovel in the pack. A stroke first shovels off any thin snow
+deeper than 2 cm within 0.75 m; then it cuts snow and soil at radius 2 (33 cells,
+one stroke every 350 ms while held) and stone at radius 0 (one cell), and refuses
+wood, bedrock and built materials. One soil stroke in 8 and one stone stroke in
+2 turns up a stone (a repeatable roll per request), put in the pack or left at
+the dig when the pack is full.
+
+The axe (ENG-261, tool 7, reach 3 m) also needs one in the pack and chops only
+wood, seven cells (radius 1) a chop. A chop that severs a standing trunk makes
+the split-off tree topple away from the swing at 0.8 rad/s (a hammer-felled tree
+still drops straight); a chop into a detached wood body (a fallen log) leaves
+one stick per two wood cells removed, up to three, as world items on the ground
+below. Like any cut into a body, a chop whose brush reaches past the body's
+resident bricks is refused.
+
+A world item under more than 0.15 m of thin snow
+(`spall_sim::world_items::ITEM_BURIED_SNOW_M`) is buried: its pickup is refused
+with "buried under snow" until someone shovels the snow off it.
 Fires (ENG-266) are world items with fuel (`WorldItem::fire_fuel_s`), not
 terrain cells or a separate entity, so they reuse item replication, join lists
 and checkpoints. `Simulation::tick` burns every lit fire a second of fuel per
@@ -801,9 +868,8 @@ so retries never place or feed twice. The sandbox's numbers are all in
 are used first), and a fire at 1800 s takes no more. Engine-side numbers (reach,
 footprint, heat, blizzard rate) are in `spall_sim::world_items`.
 `spall_sim::world_items::heat_at(items, position)` sums lit fires' warming in
-degrees of felt temperature, 30 at the centre falling as `1 - (d/4 m)^2` to 0 at 4 m; the client's
-presented cold (`body_state`) adds it from the replicated fires, and server
-warmth (ENG-264) is to call it with `Simulation::world_items`. The client draws
+degrees of felt temperature, 30 at the centre falling as `1 - (d/4 m)^2` to 0 at 4 m; server
+warmth (ENG-264, below) measures it at the player's chest. The client draws
 a fire from `PackView::item_model` plus, while lit, `PackView::lit_model` (the
 sandbox's lamp-material glow blocks, until ENG-267), and each lit fire is a
 real-time `PointLight` competing with torch voxels for the nearest slots.

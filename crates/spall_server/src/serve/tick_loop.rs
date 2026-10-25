@@ -316,6 +316,11 @@ pub(super) async fn serve_async(
     let residency_limits = config.server.residency;
     let residency_disk_path = config.server.residency_disk_path.clone();
     let creature_service = config.server.creatures.clone();
+    let tool_hooks = config
+        .server
+        .tool_hooks
+        .clone()
+        .filter(|_| !dev_unvalidated_actions);
     let item_hooks = ItemHooks::new(&config.server, dev_unvalidated_actions);
     let creature_shape = config.server.creature_shape.clone();
     let contact_damage_cfg = config.server.contact_damage;
@@ -334,6 +339,7 @@ pub(super) async fn serve_async(
     let progression_worker = progression_handler.map(ProgressionWorker::spawn);
     let committed_edit_worker = commit_handler.map(CommittedEditWorker::spawn);
 
+    let day_clock = config.server.day_clock;
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
         let setup_started = std::time::Instant::now();
         // Open the world database (T16). If it already holds a checkpoint,
@@ -366,6 +372,7 @@ pub(super) async fn serve_async(
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
+        sim.set_day_clock(day_clock);
         if creature_service.is_some() {
             if save.is_some() {
                 return SimResult::error(
@@ -727,6 +734,18 @@ pub(super) async fn serve_async(
                         ) {
                             continue;
                         }
+                        if let Err(refused) =
+                            permit_tool(&tool_hooks, session, account, &req, admin_commands)
+                        {
+                            reject(
+                                &clients_for_sim,
+                                session,
+                                client_request_id,
+                                &refused.reason(),
+                            );
+                            rejected_total += 1;
+                            continue;
+                        }
                         // A strike that meets a creature kills it (ENG-237).
                         let struck = (!dev_unvalidated_actions)
                             .then(|| {
@@ -748,13 +767,26 @@ pub(super) async fn serve_async(
                                     .ok_or(ActionReject::Unsupported("unsupported target"))
                                     .map(|intent| sim.submit(intent))
                             }
-                            None => resolve_intent_with_catalog(
-                                sim.world(),
+                            None => match resolve_swing(
+                                &mut sim,
                                 session,
+                                account,
                                 &req,
                                 &action_catalog,
-                            )
-                            .map(|intent| sim.submit(intent)),
+                                &tool_hooks,
+                            ) {
+                                Ok(Swing::Edit(intent)) => Ok(sim.submit(intent)),
+                                Ok(Swing::Done(mut status)) => {
+                                    status.request_id = client_request_id;
+                                    send_to(
+                                        &clients_for_sim,
+                                        session,
+                                        Outbound::Status(Arc::new(status)),
+                                    );
+                                    continue;
+                                }
+                                Err(rej) => Err(rej),
+                            },
                         };
                         match resolved {
                             Ok(submitted) => match submitted {
@@ -1023,63 +1055,19 @@ pub(super) async fn serve_async(
                             },
                         }
                     }
-                    spall_protocol::AdminCommand::SetWaterSpring { rate } => {
-                        let has_gated_spring = custom_world.as_ref().is_some_and(|c| {
-                            c.column_water_setup()
-                                .is_some_and(|w| w.gated_sources.iter().any(|t| !t.is_empty()))
-                        });
-                        if !admin_commands {
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: false,
-                                message: "admin commands are disabled on this server".into(),
-                            }
-                        } else if !has_gated_spring {
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: false,
-                                message: "this scene authored no gated water spring".into(),
-                            }
-                        } else if rate > spall_sim::column_water::MAX_GATED_SOURCE_RATE {
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: false,
-                                message: format!(
-                                    "water spring rate must be 0..={}",
-                                    spall_sim::column_water::MAX_GATED_SOURCE_RATE
-                                ),
-                            }
-                        } else {
-                            sim.set_water_spring_rate(rate);
-                            spall_protocol::AdminStatus {
-                                request_id: req.request_id,
-                                accepted: true,
-                                message: if rate == 0 {
-                                    "water spring off".to_string()
-                                } else {
-                                    format!("water spring rate {rate}")
-                                },
-                            }
-                        }
-                    }
+                    spall_protocol::AdminCommand::SetWaterSpring { rate } => water_spring_admin(
+                        &mut sim,
+                        admin_commands,
+                        custom_world.as_ref(),
+                        req.request_id,
+                        rate,
+                    ),
                     command @ (spall_protocol::AdminCommand::SetWeather { .. }
                     | spall_protocol::AdminCommand::SetSeason { .. }) => {
                         weather_admin(&mut sim, admin_commands, req.request_id, command)
                     }
                     spall_protocol::AdminCommand::TeleportSelf { feet_mm } => {
-                        let feet = feet_mm.map(|mm| mm as f64 / 1000.0);
-                        let (accepted, message) = if !admin_commands {
-                            (false, "admin commands are disabled on this server")
-                        } else if sim.teleport_player(session_player_entity(session), feet) {
-                            (true, "teleported")
-                        } else {
-                            (false, "no player to teleport")
-                        };
-                        spall_protocol::AdminStatus {
-                            request_id: req.request_id,
-                            accepted,
-                            message: message.into(),
-                        }
+                        teleport_admin(&mut sim, admin_commands, session, req.request_id, feet_mm)
                     }
                     spall_protocol::AdminCommand::SetDamGate { open } => {
                         let gate = custom_world.as_ref().and_then(CustomWorld::dam_gate);
@@ -1301,6 +1289,7 @@ pub(super) async fn serve_async(
             let span_serve_commit_fanout = spall_sim::prof::Span::start("serve.commit_fanout");
             for (rid, committed) in &report.committed {
                 committed_total += 1;
+                apply_tool_effects(&mut sim, &tool_hooks, *rid, committed);
                 if !committed.removed_materials.is_empty()
                     && let Some((session, player_id, client_request_id)) =
                         submitted_by.get(rid).copied()
@@ -1413,6 +1402,8 @@ pub(super) async fn serve_async(
             {
                 return SimResult::error(error, ticks_run);
             }
+            // Publish health after this tick's creature damage.
+            publish_player_health(&sim, &mut lj, &clients_for_sim);
             rejected_total += route_tick_statuses(&report, &mut submitted_by, &clients_for_sim);
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never

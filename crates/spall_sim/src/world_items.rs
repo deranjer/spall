@@ -17,6 +17,9 @@ use spall_voxel::Volume;
 /// How far from a player's eye an item can be picked up, metres. The server
 /// measures it from its own player; clients use it only for the prompt.
 pub const ITEM_PICKUP_REACH_M: f64 = 3.0;
+/// Thin snow deeper than this over an item buries it: it cannot be picked up
+/// until someone shovels the snow off.
+pub const ITEM_BURIED_SNOW_M: f64 = 0.15;
 
 // Fire tuning (ENG-266). How much fuel an item adds is the game's call; these
 // are the engine's side: where a fire may go, how it burns, how it warms.

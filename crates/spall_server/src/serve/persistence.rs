@@ -267,6 +267,76 @@ pub(super) fn admin_refused(request_id: RequestId, message: &str) -> spall_proto
     }
 }
 
+/// `SetWaterSpring`: sets the custom world's gated spring rate.
+pub(super) fn water_spring_admin(
+    sim: &mut Simulation,
+    admin_commands: bool,
+    custom_world: Option<&CustomWorld>,
+    request_id: RequestId,
+    rate: u8,
+) -> spall_protocol::AdminStatus {
+    let has_gated_spring = custom_world.is_some_and(|c| {
+        c.column_water_setup()
+            .is_some_and(|w| w.gated_sources.iter().any(|t| !t.is_empty()))
+    });
+    if !admin_commands {
+        spall_protocol::AdminStatus {
+            request_id,
+            accepted: false,
+            message: "admin commands are disabled on this server".into(),
+        }
+    } else if !has_gated_spring {
+        spall_protocol::AdminStatus {
+            request_id,
+            accepted: false,
+            message: "this scene authored no gated water spring".into(),
+        }
+    } else if rate > spall_sim::column_water::MAX_GATED_SOURCE_RATE {
+        spall_protocol::AdminStatus {
+            request_id,
+            accepted: false,
+            message: format!(
+                "water spring rate must be 0..={}",
+                spall_sim::column_water::MAX_GATED_SOURCE_RATE
+            ),
+        }
+    } else {
+        sim.set_water_spring_rate(rate);
+        spall_protocol::AdminStatus {
+            request_id,
+            accepted: true,
+            message: if rate == 0 {
+                "water spring off".to_string()
+            } else {
+                format!("water spring rate {rate}")
+            },
+        }
+    }
+}
+
+/// `TeleportSelf`: moves the sender's own player.
+pub(super) fn teleport_admin(
+    sim: &mut Simulation,
+    admin_commands: bool,
+    session: SessionId,
+    request_id: RequestId,
+    feet_mm: [i64; 3],
+) -> spall_protocol::AdminStatus {
+    let feet = feet_mm.map(|mm| mm as f64 / 1000.0);
+    let (accepted, message) = if !admin_commands {
+        (false, "admin commands are disabled on this server")
+    } else if sim.teleport_player(session_player_entity(session), feet) {
+        (true, "teleported")
+    } else {
+        (false, "no player to teleport")
+    };
+    spall_protocol::AdminStatus {
+        request_id,
+        accepted,
+        message: message.into(),
+    }
+}
+
 /// `SetSeason`: re-anchors the shared vegetation and weather clock.
 fn set_season_admin(
     sim: &mut Simulation,

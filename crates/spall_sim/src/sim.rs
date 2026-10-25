@@ -86,6 +86,8 @@ pub struct SimulationConfig {
     pub column_water_worker: bool,
     pub vegetation: Option<spall_ecology::living::LivingState>,
     pub weather_seed: u64,
+    /// Which seeded weather schedule the world follows.
+    pub weather_profile: spall_protocol::WeatherProfile,
 }
 
 impl SimulationConfig {
@@ -104,6 +106,7 @@ impl SimulationConfig {
             column_water_worker: false,
             vegetation: None,
             weather_seed: 0,
+            weather_profile: spall_protocol::WeatherProfile::Standard,
         }
     }
 }
@@ -140,6 +143,7 @@ pub struct Simulation {
     pipeline: EditPipeline,
     journal: JournalSink,
     pub(crate) tick: Tick,
+    day_clock: spall_core::time_of_day::DayClock,
     next_control_seq: u64,
     next_damage_seq: u64,
     column_water: Option<crate::column_water::AuthoritativeColumnWater>,
@@ -151,6 +155,7 @@ pub struct Simulation {
     pub(crate) weather: spall_protocol::WeatherState,
     pub(crate) weather_dirty: bool,
     weather_seed: u64,
+    weather_profile: spall_protocol::WeatherProfile,
     pub(crate) snow: crate::snow::SnowState,
     snow_priority_tiles: Vec<(i32, i32)>,
     snow_priority_players: Vec<(i32, i32)>,
@@ -212,6 +217,7 @@ impl Retiring {
     }
 }
 
+mod body_heat;
 mod construction;
 mod contact_dormancy;
 mod edit_queries;

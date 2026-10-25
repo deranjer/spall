@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
+use spall_protocol::{PlayerId, SessionId};
 use spall_server::{InitialWorldItem, ItemPickup};
 
 use crate::game::{Inventory, ItemId, PlayerInventories, items};
@@ -44,39 +45,75 @@ pub fn put_in_pack(inventory: &mut Inventory, item: ItemId) -> Result<(), &'stat
         .map_err(|_| "that item cannot go in the pack")
 }
 
-/// Pickup into the server's in-memory inventories (no progression database):
-/// keyed by account when the session has one, else by connection slot, the
-/// same as the progression handler.
-pub fn in_memory_pickup(inventories: Arc<Mutex<PlayerInventories>>) -> ItemPickup {
-    ItemPickup::new(move |session, player_id, item| {
-        let mut inventories = inventories.lock().unwrap_or_else(|e| e.into_inner());
-        let inventory = match player_id {
-            Some(player_id) => inventories.ensure_player(player_id),
-            None => inventories.ensure(session.slot().0),
-        };
-        put_in_pack(inventory, ItemId(item.kind))
-    })
+/// Where the server keeps players' packs: the in-memory inventories (keyed by
+/// account when the session has one, else by connection slot, the same as the
+/// progression handler), or the durable progression database, where only
+/// authenticated accounts have a pack.
+#[derive(Clone)]
+pub enum PackStore {
+    InMemory(Arc<Mutex<PlayerInventories>>),
+    Durable(Arc<Mutex<ProgressionStore>>),
 }
 
-/// Pickup into the durable progression database. Only authenticated accounts
-/// have a durable pack.
-pub fn durable_pickup(store: Arc<Mutex<ProgressionStore>>) -> ItemPickup {
-    ItemPickup::new(move |_session, player_id, item| {
-        let player_id = player_id.ok_or("no account to keep the item")?;
-        let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        match store.pick_up_item(player_id, ItemId(item.kind)) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::error!(
-                    ?player_id,
-                    item = item.item_id,
-                    ?error,
-                    "could not save pickup"
-                );
-                Err("the pack could not be saved")
+impl PackStore {
+    /// Whether the player's pack holds at least one `item`.
+    pub fn holds(&self, session: SessionId, player_id: Option<PlayerId>, item: ItemId) -> bool {
+        match self {
+            PackStore::InMemory(inventories) => {
+                let inventories = inventories.lock().unwrap_or_else(|e| e.into_inner());
+                match player_id {
+                    Some(player_id) => inventories.get_player(player_id),
+                    None => inventories.get(session.slot().0),
+                }
+                .is_some_and(|inventory| inventory.count(item) > 0)
+            }
+            PackStore::Durable(store) => player_id.is_some_and(|player_id| {
+                let store = store.lock().unwrap_or_else(|e| e.into_inner());
+                match store.load_inventory(player_id) {
+                    Ok(inventory) => inventory.count(item) > 0,
+                    Err(error) => {
+                        tracing::error!(?player_id, ?error, "could not read the pack");
+                        false
+                    }
+                }
+            }),
+        }
+    }
+
+    /// Adds one `item` to the player's pack ([`put_in_pack`]).
+    pub fn put(
+        &self,
+        session: SessionId,
+        player_id: Option<PlayerId>,
+        item: ItemId,
+    ) -> Result<(), &'static str> {
+        match self {
+            PackStore::InMemory(inventories) => {
+                let mut inventories = inventories.lock().unwrap_or_else(|e| e.into_inner());
+                let inventory = match player_id {
+                    Some(player_id) => inventories.ensure_player(player_id),
+                    None => inventories.ensure(session.slot().0),
+                };
+                put_in_pack(inventory, item)
+            }
+            PackStore::Durable(store) => {
+                let player_id = player_id.ok_or("no account to keep the item")?;
+                let store = store.lock().unwrap_or_else(|e| e.into_inner());
+                match store.pick_up_item(player_id, item) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        tracing::error!(?player_id, ?item, ?error, "could not save the pack");
+                        Err("the pack could not be saved")
+                    }
+                }
             }
         }
-    })
+    }
+}
+
+/// E-key pickup into `pack`.
+pub fn pickup(pack: PackStore) -> ItemPickup {
+    ItemPickup::new(move |session, player_id, item| pack.put(session, player_id, ItemId(item.kind)))
 }
 
 #[derive(Debug, Deserialize)]

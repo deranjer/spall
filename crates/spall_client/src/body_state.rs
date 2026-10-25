@@ -1,78 +1,41 @@
 //! How the local player's body state looks on screen. This is presentation,
-//! not gameplay: cold and wetness are eased from signals the client already
-//! has (the replicated weather, shelter, the replicated water surface, the
-//! replicated fires), and
-//! nothing here is sent to the server or decides an outcome. Injury comes from
-//! the server's authoritative health (ENG-223); when the other survival stats
-//! become server-authoritative they replace their inputs the same way.
+//! not gameplay: injury, warmth and wetness all come from the server's
+//! authoritative record for this client's own player (ENG-223, ENG-264,
+//! ENG-265), and nothing here is sent to the server or decides an outcome.
 
 use spall_render::ScreenGrade;
 
-/// What the body is exposed to this frame.
-#[derive(Debug, Clone, Copy)]
-pub struct BodyConditions {
-    pub air_temperature_c: f32,
-    /// 0 fully sheltered, 1 in the open.
-    pub exposure: f32,
-    /// Falling rain at the player, 0..=1 (snow counts for less).
-    pub precipitation: f32,
-    /// The body is in water.
-    pub submerged: bool,
-    /// Warming from nearby lit fires, degrees Celsius of felt temperature
-    /// (`spall_sim::world_items::heat_at`).
-    pub fire_heat_c: f32,
-}
-
-/// Felt cold and wetness, each 0..=1, eased over time so stepping under a
-/// roof or out of a lake does not snap the screen.
+/// Felt cold and wetness, each 0..=1, eased toward the server's latest values
+/// so their once-a-second steps do not show.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BodyState {
     pub cold: f32,
     pub wet: f32,
 }
 
-/// Felt temperature at which the screen starts to look cold, and the span
-/// below it over which the look reaches full strength.
-const COLD_START_C: f32 = 8.0;
-const COLD_SPAN_C: f32 = 20.0;
-/// Being soaked feels this many degrees colder; wind in the open, this many.
-const WET_CHILL_C: f32 = 8.0;
-const WIND_CHILL_C: f32 = 3.0;
+/// Seconds to close most of the gap to the server's latest values.
+const EASE_TAU_S: f32 = 1.0;
 
 impl BodyState {
-    pub fn advance(&mut self, conditions: &BodyConditions, dt_s: f32) {
+    /// The looks for the server's latest `health` record: cold is lost
+    /// warmth. Neutral before the first record arrives.
+    pub fn from_server(health: Option<spall_protocol::PlayerHealth>) -> Self {
+        health.map_or_else(Self::default, |h| Self {
+            cold: 1.0 - f32::from(h.warmth_q8) / 255.0,
+            wet: f32::from(h.wetness_q8) / 255.0,
+        })
+    }
+
+    /// Moves `dt_s` seconds toward `target`.
+    pub fn ease_toward(&mut self, target: &BodyState, dt_s: f32) {
         let dt_s = if dt_s.is_finite() {
             dt_s.clamp(0.0, 1.0)
         } else {
             0.0
         };
-        let air = if conditions.air_temperature_c.is_finite() {
-            conditions.air_temperature_c
-        } else {
-            15.0
-        };
-        let exposure = finite_unit(conditions.exposure);
-        let rain = finite_unit(conditions.precipitation) * exposure;
-        let (wet_target, wet_tau_s) = if conditions.submerged {
-            (1.0, 1.0)
-        } else if rain > self.wet {
-            (rain, 25.0)
-        } else {
-            // Drying: about two minutes at 10 C, quicker when warm.
-            (rain, 120.0 / (1.0 + air.max(0.0) / 10.0))
-        };
-        self.wet = ease(self.wet, wet_target, dt_s, wet_tau_s);
-
-        let fire = if conditions.fire_heat_c.is_finite() {
-            conditions.fire_heat_c.max(0.0)
-        } else {
-            0.0
-        };
-        let felt = air - self.wet * WET_CHILL_C - exposure * WIND_CHILL_C + fire;
-        let cold_target = ((COLD_START_C - felt) / COLD_SPAN_C).clamp(0.0, 1.0);
-        // Chill sets in slower than it lifts beside a fire.
-        let cold_tau_s = if cold_target > self.cold { 20.0 } else { 10.0 };
-        self.cold = ease(self.cold, cold_target, dt_s, cold_tau_s);
+        let blend = 1.0 - (-dt_s / EASE_TAU_S).exp();
+        self.cold += (finite_unit(target.cold) - self.cold) * blend;
+        self.wet += (finite_unit(target.wet) - self.wet) * blend;
     }
 }
 
@@ -220,10 +183,6 @@ fn heartbeat(time_s: f32, bpm: f32) -> f32 {
     thump(0.0).max(thump(1.0)).max(0.3 * thump(0.3))
 }
 
-fn ease(value: f32, target: f32, dt_s: f32, tau_s: f32) -> f32 {
-    value + (target - value) * (1.0 - (-dt_s / tau_s).exp())
-}
-
 fn finite_unit(value: f32) -> f32 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
@@ -241,118 +200,58 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 mod tests {
     use super::*;
 
-    const MILD: BodyConditions = BodyConditions {
-        air_temperature_c: 18.0,
-        exposure: 1.0,
-        precipitation: 0.0,
-        submerged: false,
-        fire_heat_c: 0.0,
-    };
+    /// The server's record with `warmth` and `wetness` as 0..=1.
+    fn server(warmth: f32, wetness: f32) -> Option<spall_protocol::PlayerHealth> {
+        Some(spall_protocol::PlayerHealth {
+            health: 100,
+            max_health: 100,
+            warmth_q8: (warmth * 255.0).round() as u8,
+            wetness_q8: (wetness * 255.0).round() as u8,
+        })
+    }
 
-    fn run(state: &mut BodyState, conditions: BodyConditions, seconds: u32) {
-        for _ in 0..seconds * 10 {
-            state.advance(&conditions, 0.1);
+    fn run(state: &mut BodyState, target: BodyState, seconds: f32) {
+        for _ in 0..(seconds * 10.0) as u32 {
+            state.ease_toward(&target, 0.1);
         }
     }
 
     #[test]
     fn a_neutral_body_leaves_the_screen_untouched() {
-        let mut state = BodyState::default();
-        run(&mut state, MILD, 60);
-        assert_eq!(state, BodyState::default());
-        for t in [0.0, 0.37, 12.5] {
-            assert_eq!(
-                screen_grade(&state, &BodyPreview::default(), t),
-                ScreenGrade::IDENTITY
-            );
+        for neutral in [None, server(1.0, 0.0)] {
+            let mut state = BodyState::default();
+            run(&mut state, BodyState::from_server(neutral), 60.0);
+            assert_eq!(state, BodyState::default());
+            for t in [0.0, 0.37, 12.5] {
+                assert_eq!(
+                    screen_grade(&state, &BodyPreview::default(), t),
+                    ScreenGrade::IDENTITY
+                );
+            }
         }
     }
 
     #[test]
-    fn swimming_soaks_quickly_and_drying_takes_minutes() {
-        let mut state = BodyState::default();
-        run(
-            &mut state,
-            BodyConditions {
-                submerged: true,
-                ..MILD
-            },
-            5,
-        );
-        assert!(state.wet > 0.95, "{state:?}");
-        run(&mut state, MILD, 30);
-        assert!(state.wet > 0.4, "dried too fast: {state:?}");
-        run(&mut state, MILD, 600);
-        assert!(state.wet < 0.01, "{state:?}");
-    }
-
-    #[test]
-    fn shelter_keeps_rain_off_and_wet_cold_is_colder() {
-        let rain = BodyConditions {
-            air_temperature_c: 4.0,
-            precipitation: 1.0,
-            ..MILD
-        };
-        let mut sheltered = BodyState::default();
-        run(
-            &mut sheltered,
-            BodyConditions {
-                exposure: 0.0,
-                ..rain
-            },
-            300,
-        );
-        let mut open = BodyState::default();
-        run(&mut open, rain, 300);
+    fn the_server_s_cold_and_wet_show_smoothly() {
+        let target = BodyState::from_server(server(0.1, 1.0));
         assert!(
-            sheltered.wet < 0.01 && open.wet > 0.9,
-            "{sheltered:?} {open:?}"
+            (target.cold - 0.9).abs() < 0.01 && target.wet == 1.0,
+            "{target:?}"
         );
-        assert!(open.cold > sheltered.cold + 0.3, "{sheltered:?} {open:?}");
-    }
-
-    #[test]
-    fn deep_cold_frosts_the_edges_and_warmth_clears_it() {
+        // One frame after a step: part of the way, not a snap.
         let mut state = BodyState::default();
-        run(
-            &mut state,
-            BodyConditions {
-                air_temperature_c: -15.0,
-                ..MILD
-            },
-            180,
-        );
+        state.ease_toward(&target, 1.0 / 60.0);
+        assert!(state.cold > 0.0 && state.cold < 0.1, "{state:?}");
+        run(&mut state, target, 5.0);
         let grade = screen_grade(&state, &BodyPreview::default(), 0.0);
-        assert!(grade.frost > 0.7 && grade.saturation < 0.8, "{grade:?}");
-        run(&mut state, MILD, 120);
+        assert!(grade.frost > 0.6 && grade.saturation < 0.8, "{grade:?}");
+        // Warmed up and dry again: the frost clears.
+        run(&mut state, BodyState::from_server(server(1.0, 0.0)), 15.0);
         assert_eq!(
             screen_grade(&state, &BodyPreview::default(), 0.0).frost,
             0.0
         );
     }
-
-    #[test]
-    fn a_fire_close_by_keeps_the_cold_off_and_one_out_of_reach_does_not() {
-        let fire = spall_protocol::WorldItem {
-            item_id: 1,
-            kind: 6,
-            translation_m: [0.0, 0.0, 0.0],
-            yaw_rad: 0.0,
-            fire_fuel_s: Some(120.0),
-        };
-        let night = |at: [f64; 3]| BodyConditions {
-            air_temperature_c: -10.0,
-            fire_heat_c: spall_sim::world_items::heat_at(&[fire], at),
-            ..MILD
-        };
-        let mut beside = BodyState::default();
-        run(&mut beside, night([1.0, 1.0, 0.0]), 180);
-        let mut away = BodyState::default();
-        run(&mut away, night([20.0, 1.0, 0.0]), 180);
-        assert!(beside.cold < 0.2, "{beside:?}");
-        assert!(away.cold > 0.8, "{away:?}");
-    }
-
     #[test]
     fn every_look_at_full_strength_stays_a_valid_grade() {
         let state = BodyState {
@@ -430,6 +329,8 @@ mod tests {
             Some(spall_protocol::PlayerHealth {
                 health,
                 max_health: 100,
+                warmth_q8: 255,
+                wetness_q8: 0,
             })
         };
         let none = BodyPreview::default();

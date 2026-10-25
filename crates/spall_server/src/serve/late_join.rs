@@ -137,8 +137,9 @@ pub(super) struct LateJoin {
     pub(super) capture_pool: CapturePool,
     /// Game creature service, when the world has animals.
     pub(super) creatures: Option<crate::creature_service::CreatureService>,
-    /// ENG-223: the health each live session was last sent for its own player.
-    pub(super) health_sent: HashMap<u64, u16>,
+    /// ENG-223: the health, warmth and wetness each live session was last
+    /// sent for its own player.
+    pub(super) health_sent: HashMap<u64, spall_protocol::PlayerHealth>,
 }
 
 #[derive(Debug, thiserror::Error)]

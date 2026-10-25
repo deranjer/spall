@@ -313,6 +313,46 @@ impl SnowState {
             .collect()
     }
 
+    /// Thin-snow depth (Q16 metres) on the top face of `cell`, or `None` when
+    /// no stored surface covers that face.
+    pub fn stored_depth_q16_at(&mut self, cell: [i32; 3]) -> Option<u16> {
+        let key = (
+            cell[0].div_euclid(SNOW_TILE_CELLS),
+            cell[2].div_euclid(SNOW_TILE_CELLS),
+            cell[1],
+        );
+        let face = face_index(cell);
+        self.catch_up_key(key);
+        self.tiles.get(&key)?.iter().find_map(|c| {
+            (c.mask[face / 64] & (1u64 << (face % 64)) != 0)
+                .then(|| (c.depth_q32 >> 16).min(u64::from(SNOW_MAX_DEPTH_Q16)) as u16)
+        })
+    }
+
+    /// Clears the snow off `faces` of one stored layer: they keep their
+    /// exposure but restart at zero depth, as if newly exposed. Returns
+    /// whether any stored face was cleared.
+    pub fn clear_faces(&mut self, key: (i32, i32, i32), faces: [u64; 4], tick: u64) -> bool {
+        let Some(cohorts) = self.tiles.get(&key) else {
+            return false;
+        };
+        let Some(revision) = cohorts.first().map(|c| c.geometry_revision) else {
+            return false;
+        };
+        let exposed: [u64; 4] =
+            std::array::from_fn(|i| cohorts.iter().fold(0, |acc, c| acc | c.mask[i]));
+        let cleared: [u64; 4] = std::array::from_fn(|i| exposed[i] & faces[i]);
+        if cleared.iter().all(|word| *word == 0) {
+            return false;
+        }
+        // Drop the faces, then expose them again: reconciliation gives newly
+        // exposed faces a fresh zero-depth cohort and replicates the layer.
+        let without = std::array::from_fn(|i| exposed[i] & !cleared[i]);
+        self.reconcile(key.0, key.1, key.2, revision, without, tick);
+        self.reconcile(key.0, key.1, key.2, revision, exposed, tick);
+        true
+    }
+
     pub fn snapshot_page(
         &mut self,
         bounds: Option<[i32; 4]>,
@@ -868,8 +908,7 @@ impl SnowState {
     ) -> bool {
         let tile_x = cell[0].div_euclid(SNOW_TILE_CELLS);
         let tile_z = cell[2].div_euclid(SNOW_TILE_CELLS);
-        let face = cell[2].rem_euclid(SNOW_TILE_CELLS) as usize * 16
-            + cell[0].rem_euclid(SNOW_TILE_CELLS) as usize;
+        let face = face_index(cell);
         let key = (tile_x, tile_z, cell[1]);
         self.catch_up_key(key);
         let Some(cohort) = self.tiles.get(&key).and_then(|cohorts| {
@@ -1099,6 +1138,11 @@ impl SnowState {
             .collect();
         self.footprint_credits.retain(|id, _| active.contains(id));
     }
+}
+
+/// Bit index of `cell`'s top face within its tile's 16 x 16 face mask.
+fn face_index(cell: [i32; 3]) -> usize {
+    cell[2].rem_euclid(SNOW_TILE_CELLS) as usize * 16 + cell[0].rem_euclid(SNOW_TILE_CELLS) as usize
 }
 
 fn surface_id(tile_x: i32, tile_z: i32, y: i32, generation: u32) -> SnowSurfaceId {

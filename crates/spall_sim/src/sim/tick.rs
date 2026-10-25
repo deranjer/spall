@@ -129,6 +129,13 @@ impl Simulation {
         drop(physics_span);
         let players_span = crate::prof::Span::start("tick.players");
         self.advance_players(&report);
+        if self
+            .tick
+            .get()
+            .is_multiple_of(crate::warmth::BODY_HEAT_PERIOD_TICKS)
+        {
+            self.advance_body_heat(crate::warmth::BODY_HEAT_PERIOD_TICKS as f32 * TICK_DT_S);
+        }
         drop(players_span);
         self.advance_ice();
         Ok(report)

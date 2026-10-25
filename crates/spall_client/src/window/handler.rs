@@ -135,7 +135,9 @@ impl ApplicationHandler for InteractiveApp {
                 self.hammer_held = state == ElementState::Pressed;
                 self.hammer_pending |= self.hammer_held;
             }
-            WindowEvent::MouseWheel { delta, .. } if self.cursor_locked && !ui_consumed => {
+            WindowEvent::MouseWheel { delta, .. }
+                if self.cursor_locked && self.hammer_on && !ui_consumed =>
+            {
                 let steps = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y.round() as i64,
                     winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 40.0).round() as i64,
@@ -802,7 +804,13 @@ impl ApplicationHandler for InteractiveApp {
                             if let Some(cursor) = cursor {
                                 self.pack.hover(screen, cursor, stacks);
                             }
-                            self.pack.frame(pack_view.as_ref(), screen, stacks)
+                            let mut frame = self.pack.frame(pack_view.as_ref(), screen, stacks)?;
+                            for slot in &mut frame.slots {
+                                if Some(slot.item_id) == self.held_item {
+                                    slot.name.push_str(" (in hand)");
+                                }
+                            }
+                            Some(frame)
                         });
                         renderer.esc_menu = self.esc.open.then(|| self.esc.view(&self.keys));
                         renderer.compass_yaw =
@@ -814,7 +822,7 @@ impl ApplicationHandler for InteractiveApp {
                             self.book.frame(pack_view.as_ref(), &self.inventory)
                         });
                         self.hammer_target = match cam {
-                            Some((eye, dir)) => {
+                            Some((eye, dir)) if self.hammer_on => {
                                 match self.session.replica.get().and_then(|r| r.try_lock().ok()) {
                                     Some(replica) => replica
                                         .terrain_volume()
@@ -945,6 +953,26 @@ impl ApplicationHandler for InteractiveApp {
                             ));
                         }
                         renderer.set_endurance(self.endurance_view);
+                        // A held item that has left the pack is no longer in hand.
+                        if let Some(item) = self.held_item
+                            && self.inventory.stacks().is_some()
+                            && self.inventory.count(item) == 0
+                        {
+                            self.held_item = None;
+                        }
+                        let held_tool = self.held_item.and_then(|item| {
+                            Some((item, self.pack_view.as_ref()?.item_tool(item)?))
+                        });
+                        let held_name = held_tool.map_or_else(
+                            || "empty hands".to_owned(),
+                            |(item, _)| {
+                                self.pack_view
+                                    .as_ref()
+                                    .and_then(|view| view.item_name(item))
+                                    .unwrap_or("tool")
+                                    .to_lowercase()
+                            },
+                        );
                         renderer.set_crosshair(
                             (!self.admin_menu_open
                                 && !self.esc.open
@@ -959,6 +987,7 @@ impl ApplicationHandler for InteractiveApp {
                                     _ if !self.cursor_locked => {
                                         "click to capture the mouse, then click to break".to_owned()
                                     }
+                                    _ if !self.hammer_on => held_name.clone(),
                                     Some((_, material)) => format!(
                                         "hammer r{}  {}",
                                         self.hammer_radius,
@@ -974,11 +1003,13 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         if let Some((eye, dir)) = cam
                             && self.cursor_locked
-                            && hammer_due(
+                            && self.hammer_on
+                            && swing_due(
                                 self.hammer_pending,
                                 self.hammer_held,
                                 self.last_hammer_at,
                                 render_now,
+                                HAMMER_REPEAT,
                             )
                         {
                             self.hammer_pending = false;
@@ -1008,6 +1039,37 @@ impl ApplicationHandler for InteractiveApp {
                                 self.hammer_radius,
                             ));
                         }
+                        // Off the hammer: left click swings the tool in hand;
+                        // empty-handed, a click does nothing.
+                        if !self.hammer_on {
+                            match (cam, held_tool) {
+                                (Some((eye, dir)), Some((_, tool)))
+                                    if self.cursor_locked
+                                        && swing_due(
+                                            self.hammer_pending,
+                                            self.hammer_held,
+                                            self.last_hammer_at,
+                                            render_now,
+                                            TOOL_REPEAT,
+                                        ) =>
+                                {
+                                    self.last_hammer_at = Some(render_now);
+                                    let id = self.next_action_id;
+                                    self.next_action_id += 1;
+                                    // The server sets the stroke's radius.
+                                    self.session.push_action(tool_request(
+                                        id,
+                                        tool,
+                                        spall_protocol::ActionKind::Cut,
+                                        eye,
+                                        dir,
+                                        0,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            self.hammer_pending = false;
+                        }
                         if self.torch_pending {
                             self.torch_pending = false;
                             if let Some((eye, dir)) = cam
@@ -1021,50 +1083,16 @@ impl ApplicationHandler for InteractiveApp {
                         if let Some(path) = self.pending_capture.take() {
                             renderer.screenshot_request = Some(path);
                         }
-                        // Body state: eased from the weather, shelter and
-                        // water the client already sees, then shown as a
+                        // Body state: the server's warmth and wetness, eased
+                        // between its once-a-second updates, then shown as a
                         // full-screen grade (presentation only).
                         let body_now = Instant::now();
                         let body_dt = self
                             .body_state_at
                             .map_or(0.0, |at| body_now.duration_since(at).as_secs_f32());
                         self.body_state_at = Some(body_now);
-                        let submerged = fresh_view.is_some_and(|v| {
-                            let [x, y, z] = v.predicted.position_m;
-                            // Waist height: wading ankle-deep does not soak you.
-                            let waist = y + 0.9;
-                            self.session
-                                .column_surface
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .surface_at_m(x, waist, z)
-                                .is_some_and(|surface| surface > waist)
-                        });
-                        let conditions = BodyConditions {
-                            air_temperature_c: self
-                                .latest_weather
-                                .as_ref()
-                                .map_or(15.0, |w| f32::from(w.temperature_centi_c) / 100.0),
-                            exposure: self.weather_exposure,
-                            precipitation: self.latest_weather.as_ref().map_or(0.0, |w| {
-                                let amount = f32::from(w.precipitation_q16) / f32::from(u16::MAX);
-                                match w.kind {
-                                    spall_protocol::WeatherKind::Rain
-                                    | spall_protocol::WeatherKind::Storm => amount,
-                                    // Snow mostly brushes off.
-                                    spall_protocol::WeatherKind::Snow
-                                    | spall_protocol::WeatherKind::Blizzard => 0.3 * amount,
-                                    _ => 0.0,
-                                }
-                            }),
-                            submerged,
-                            // Chest height, from the fires the replica holds.
-                            fire_heat_c: fresh_view.map_or(0.0, |v| {
-                                let [x, y, z] = v.predicted.position_m;
-                                spall_sim::world_items::heat_at(&self.last_fires, [x, y + 1.2, z])
-                            }),
-                        };
-                        self.body_state.advance(&conditions, body_dt);
+                        self.body_state
+                            .ease_toward(&BodyState::from_server(self.player_health), body_dt);
                         // Real injury from the server's health, or the admin
                         // preview when that is stronger.
                         let body_looks =
@@ -1094,6 +1122,7 @@ impl ApplicationHandler for InteractiveApp {
                                     .map(|(text, _)| text.clone()),
                                 frame_summary(&self.frame_history),
                             );
+                            menu.hammer_on = self.hammer_on;
                             menu.weather = self
                                 .latest_weather
                                 .as_ref()
@@ -1221,6 +1250,10 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 if menu_actions.toggle_flight {
                     self.toggle_flight();
+                }
+                if menu_actions.toggle_hammer {
+                    self.hammer_on = !self.hammer_on;
+                    self.hammer_pending = false;
                 }
                 if menu_actions.toggle_sky_visibility {
                     self.toggle_sky_visibility();

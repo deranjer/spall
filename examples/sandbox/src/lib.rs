@@ -23,6 +23,7 @@ pub mod pack_view;
 #[cfg(feature = "client")]
 pub mod player_view;
 pub mod progression_store;
+pub mod tools;
 pub mod world_items;
 pub mod world_scatter;
 pub mod worldgen_scene;
@@ -56,3 +57,4 @@ pub fn init_tracing() {
 pub mod ecology_scene;
 
 pub mod vegetation;
+pub mod winter_crossing;

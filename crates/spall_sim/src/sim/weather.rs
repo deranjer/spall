@@ -6,7 +6,8 @@ impl Simulation {
     /// Set the deterministic world seed before the first authoritative tick.
     pub fn set_weather_seed(&mut self, seed: u64) {
         self.weather_seed = seed;
-        self.weather = spall_protocol::WeatherState::for_clock(
+        self.weather = spall_protocol::WeatherState::for_clock_with(
+            self.weather_profile,
             seed,
             self.weather.world_epoch,
             self.tick.get(),
@@ -32,7 +33,8 @@ impl Simulation {
         if let Some(kind) = kind {
             self.weather.force_kind(Some(kind), snow_tier);
         } else {
-            self.weather = spall_protocol::WeatherState::for_clock(
+            self.weather = spall_protocol::WeatherState::for_clock_with(
+                self.weather_profile,
                 self.weather_seed,
                 self.weather.world_epoch,
                 self.tick.get(),
@@ -79,6 +81,11 @@ impl Simulation {
         self.weather_dirty = true;
         self.advance_weather();
         Ok(())
+    }
+
+    /// The weather schedule this world follows.
+    pub fn weather_profile(&self) -> spall_protocol::WeatherProfile {
+        self.weather_profile
     }
 
     /// Current authoritative weather state. Clock source is fixed per world.
@@ -149,7 +156,8 @@ impl Simulation {
             start_season,
             season_ms,
         };
-        let next = spall_protocol::WeatherState::for_clock(
+        let next = spall_protocol::WeatherState::for_clock_with(
+            self.weather_profile,
             self.weather_seed,
             self.weather.world_epoch,
             self.tick.get(),

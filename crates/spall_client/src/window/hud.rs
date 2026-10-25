@@ -393,6 +393,7 @@ pub(super) fn admin_menu_view(
     };
     AdminMenuView {
         flying,
+        hammer_on: false,
         admin_status,
         water,
         sky_visibility_on,

@@ -69,6 +69,9 @@ pub struct Player {
     /// authenticated with a player credential. Health is remembered and
     /// persisted per account, not per capsule.
     pub principal: Option<PlayerId>,
+    /// Warmth and wetness (ENG-264/265). Runtime only: a reconnect or a
+    /// respawn starts warm and dry.
+    pub body: crate::warmth::BodyHeat,
 }
 
 impl Player {
@@ -106,6 +109,7 @@ impl Player {
             movement_epoch: 0,
             health: PLAYER_MAX_HEALTH,
             principal: None,
+            body: crate::warmth::BodyHeat::default(),
         }
     }
 

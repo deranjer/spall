@@ -212,6 +212,11 @@ pub(super) struct InteractiveApp {
     pub(super) place_pending: Option<u16>,
     pub(super) last_hammer_at: Option<Instant>,
     pub(super) hammer_radius: i64,
+    /// The admin hammer is in hand (toggled from the admin menu; ENG-259).
+    /// Off, left click uses what the player picked up instead.
+    pub(super) hammer_on: bool,
+    /// The pack item in hand (clicked in the pack): a tool left click swings.
+    pub(super) held_item: Option<u16>,
     pub(super) next_action_id: u64,
     /// Emissive terrain boxes of the last rebuild (torches, lamps), for the
     /// per-frame point-light selection.
@@ -420,6 +425,8 @@ impl InteractiveApp {
             door_spec: options.door,
             last_hammer_at: None,
             hammer_radius: HAMMER_RADIUS_DEFAULT,
+            hammer_on: false,
+            held_item: None,
             next_action_id: HAMMER_REQUEST_BASE,
             emitter_instances: Vec::new(),
             hammer_target: None,
@@ -1159,6 +1166,10 @@ impl InteractiveApp {
     /// A click on a stack in the open pack: hold the compass, read a note.
     pub(super) fn use_pack_item(&mut self, item_id: u16) {
         let Some(view) = &self.pack_view else { return };
+        if view.item_tool(item_id).is_some() {
+            self.held_item = (self.held_item != Some(item_id)).then_some(item_id);
+            return;
+        }
         match view.item_use(item_id) {
             ItemUse::None => {}
             ItemUse::Place => {

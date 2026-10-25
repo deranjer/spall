@@ -320,7 +320,7 @@ baselines for an interest-crossing split.
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
 `spall_protocol` record headers carry `WIRE_SCHEMA_VERSION`, which is defined as
-`PROTOCOL_VERSION` (currently 24): one wire version for the handshake and every record, bumped on
+`PROTOCOL_VERSION` (currently 25): one wire version for the handshake and every record, bumped on
 any layout change. The save has the single `STORE_SCHEMA_VERSION` (currently 9, defined in
 `spall_core` and re-exported by `spall_store`). The per-record schema constants that used to
 exist (column water, weather, snow, transaction attachments, `BASELINE_WORLD_SCHEMA`) are now that same value.
@@ -706,6 +706,10 @@ bump). Save version 8 adds the `checkpoint_players` row: the health of every aut
 account (`PlayerId`) the world has seen. Unauthenticated sessions have no stable identity and
 always start at full health. Health is checkpointed, not journaled, so a crash can lose health
 changes since the last checkpoint.
+
+Protocol 25 (ENG-264/265) adds `warmth_q8` (255 warm, 0 freezing) and `wetness_q8` (0 dry, 255
+soaked) to `PlayerHealth`. The server recomputes them once a second and sends the record when any
+field changes, so a body that is cooling or drying costs at most one small record a second.
 
 ### ENG-257 - World items
 
