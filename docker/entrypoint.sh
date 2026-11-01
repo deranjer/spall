@@ -15,6 +15,10 @@ if [ ! -s "$DATA/join.token" ]; then
     echo "entrypoint: generated a new join token in $DATA/join.token"
 fi
 
+# /run persists across container restarts; drop the previous run's files so the web UI
+# never serves a stale fingerprint before the new server writes its own.
+rm -f "$RUN/server.fingerprint" "$RUN/server.addr"
+
 sandbox-server \
     --serve \
     --listen "0.0.0.0:${SPALL_GAME_PORT:-7777}" \
@@ -22,7 +26,7 @@ sandbox-server \
     --fingerprint-out "$RUN/server.fingerprint" \
     --addr-out "$RUN/server.addr" \
     --log-json "$DATA/logs/server.jsonl" \
-    --ticks 10000000 \
+    --ticks 4294967295 \
     --paced \
     --quiescence-ticks 0 \
     --min-clients 0 \
@@ -38,11 +42,20 @@ server_pid=$!
 SPALL_RUN_DIR=$RUN \
 SPALL_CLIENT_DIR=/opt/spall/client \
 SPALL_JOIN_TOKEN_FILE="$DATA/join.token" \
-SPALL_GAME_PORT="${SPALL_GAME_PORT:-7777}" \
+SPALL_PUBLIC_PORT="${SPALL_PUBLIC_PORT:-${SPALL_GAME_PORT:-7777}}" \
 SPALL_PUBLIC_ADDRESS="${SPALL_PUBLIC_ADDRESS:-}" \
 SPALL_WEB_PORT="${SPALL_WEB_PORT:-8080}" \
     python3 /opt/spall/webui/app.py &
 web_pid=$!
+
+# On docker stop, forward the signal so the server shuts down and saves, then wait for it.
+stop_all() {
+    kill "$server_pid" "$web_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    wait "$web_pid" 2>/dev/null || true
+    exit 0
+}
+trap stop_all TERM INT
 
 # Exit as soon as either process ends, and stop the other.
 wait_any() {

@@ -15,7 +15,7 @@ SPALL_PUBLIC_ADDRESS=your.host.or.ip docker compose up -d
 - Logs: `docker compose logs -f spall-server`. Server JSON log: `/data/logs/server.jsonl`.
 
 Settings are environment variables in [compose.yaml](compose.yaml):
-`SPALL_PUBLIC_ADDRESS` (required for clients outside your LAN), `SPALL_SEED`,
+`SPALL_PUBLIC_ADDRESS` (IPv4 address or host name, optional `:port`; required unless you open the page by IPv4 address), `SPALL_SEED`,
 `SPALL_WORLD_SIZE` (cells of 0.25 m; multiple of 32, 128 to 4096), `SPALL_SEASON`,
 `SPALL_MAX_CLIENTS`. The world, join token and logs live in the `spall-data` volume.
 
@@ -51,6 +51,7 @@ version you enter and `latest`.
 ## Limits
 
 - The client bundle is Windows-only. The GPU client does not run in the container.
+- IPv6 is not supported; the client dials IPv4 only.
 - The client connects by IP address. The download page resolves a host name once,
   when it builds the bundle.
 - The server has no per-player credentials; the shared join token gates entry.

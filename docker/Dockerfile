@@ -22,9 +22,11 @@ COPY --from=builder /sandbox-server /usr/local/bin/sandbox-server
 COPY docker/webui/app.py /opt/spall/webui/app.py
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/client/ /opt/spall/client/
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh     && useradd --system --home-dir /data --shell /usr/sbin/nologin spall     && mkdir -p /data /run/spall     && chown spall /data /run/spall
+USER spall
 
 # 7777/udp: QUIC game traffic. 8080/tcp: download web UI.
 EXPOSE 7777/udp 8080/tcp
 VOLUME ["/data"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \n    CMD python3 -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=2)" || exit 1
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

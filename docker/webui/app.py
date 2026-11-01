@@ -7,9 +7,11 @@ and a connect.bat that starts the client already pointed at this server.
 
 import html
 import io
+import ipaddress
 import os
 import socket
 import sys
+import threading
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -17,7 +19,7 @@ from urllib.parse import urlsplit
 RUN_DIR = os.environ.get("SPALL_RUN_DIR", "/run/spall")
 CLIENT_DIR = os.environ.get("SPALL_CLIENT_DIR", "/opt/spall/client")
 JOIN_TOKEN_FILE = os.environ.get("SPALL_JOIN_TOKEN_FILE", "/data/join.token")
-GAME_PORT = int(os.environ.get("SPALL_GAME_PORT", "7777"))
+PUBLIC_PORT = int(os.environ.get("SPALL_PUBLIC_PORT", "7777"))
 PUBLIC_ADDRESS = os.environ.get("SPALL_PUBLIC_ADDRESS", "").strip()
 WEB_PORT = int(os.environ.get("SPALL_WEB_PORT", "8080"))
 
@@ -46,21 +48,45 @@ def read_text(name):
         return handle.read().strip()
 
 
+def split_host_port(value):
+    """Split "host", "host:port", "1.2.3.4:port" or "[v6]:port" into (host, port)."""
+    try:
+        parts = urlsplit("//" + value)
+        return parts.hostname, parts.port or PUBLIC_PORT
+    except ValueError:
+        raise ValueError(f"cannot parse address {value!r}; use an IPv4 address or host name, optionally with :port") from None
+
+
 def server_address(host_header):
-    """The host:port clients should dial. The client accepts only an IP address,
-    so a host name is resolved here, when the bundle is built."""
+    """The ip:port clients should dial. The client accepts only an IPv4 address.
+    A configured SPALL_PUBLIC_ADDRESS may be a host name and is resolved here. The
+    request Host header is untrusted, so it is used only when it is already an IPv4
+    literal and never triggers a DNS lookup."""
     if PUBLIC_ADDRESS:
-        host, _, port = PUBLIC_ADDRESS.rpartition(":")
+        host, port = split_host_port(PUBLIC_ADDRESS)
         if not host:
-            host, port = PUBLIC_ADDRESS, str(GAME_PORT)
+            raise ValueError("SPALL_PUBLIC_ADDRESS is not a host name or IPv4 address")
+        try:
+            ip = str(ipaddress.IPv4Address(host))
+        except ValueError:
+            ip = socket.gethostbyname(host)
     else:
-        host = urlsplit("//" + host_header).hostname or "127.0.0.1"
-        port = str(GAME_PORT)
-    ip = socket.gethostbyname(host)
-    return f"{ip}:{int(port)}"
+        # The Host port is the web port, not the game port.
+        host, _ = split_host_port(host_header)
+        port = PUBLIC_PORT
+        try:
+            ip = str(ipaddress.IPv4Address(host))
+        except ValueError:
+            raise ValueError("open this page by IPv4 address, or set SPALL_PUBLIC_ADDRESS") from None
+    return f"{ip}:{port}"
+
+
+_bundle_cache = {}
+_bundle_lock = threading.Lock()
 
 
 def build_bundle(host_header):
+    """Zip the bundle once per (address, fingerprint, token); rebuilt when any changes."""
     exe_path = os.path.join(CLIENT_DIR, CLIENT_EXE)
     if not os.path.isfile(exe_path):
         raise FileNotFoundError("this server image has no client bundled")
@@ -69,6 +95,17 @@ def build_bundle(host_header):
     with open(JOIN_TOKEN_FILE, encoding="ascii") as handle:
         token = handle.read().strip()
 
+    key = (address, fingerprint, token)
+    with _bundle_lock:
+        if key in _bundle_cache:
+            return _bundle_cache[key], address
+        _bundle_cache.clear()
+        body = zip_bundle(exe_path, address, fingerprint, token)
+        _bundle_cache[key] = body
+    return body, address
+
+
+def zip_bundle(exe_path, address, fingerprint, token):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(exe_path, CLIENT_EXE)
@@ -81,7 +118,7 @@ def build_bundle(host_header):
         archive.writestr("join.token", token + "\n")
         archive.writestr("connect.bat", CONNECT_BAT.format(exe=CLIENT_EXE, address=address).replace("\n", "\r\n"))
         archive.writestr("README.txt", README.format(address=address).replace("\n", "\r\n"))
-    return buffer.getvalue(), address
+    return buffer.getvalue()
 
 
 def page(message):
