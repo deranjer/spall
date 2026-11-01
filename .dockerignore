@@ -1,0 +1,14 @@
+.git
+**/target
+.local
+dist
+artifacts
+tmp
+.codex
+.codex-worktrees
+.worktrees
+.claude
+.github
+docs
+fixtures
+abababababababababababababababababababababababababababababababab

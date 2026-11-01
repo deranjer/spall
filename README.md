@@ -4,6 +4,8 @@ Planning baseline: 2026-09-06. T00 implements the Rust workspace, headless serve
 
 Run `cargo xtask check` for formatting, lint, and tests; `cargo xtask smoke` for a bounded server lifecycle; or `cargo xtask smoke --graphical` to include real window presentation and resize. Run the window directly with `cargo run -p sandbox --features client --bin sandbox-client -- --offline`.
 
+Dedicated server container (download page for the Windows client, one `docker compose up`): see [docker/README.md](docker/README.md).
+
 Water is the stacked-column virtual-pipe model in `spall_fluid::columns`
 (ENG-164..169): one column per terrain cell, each split into vertical open
 spans holding a conserved water volume, joined to neighbouring spans by
