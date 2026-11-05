@@ -19,6 +19,8 @@ fi
 # never serves a stale fingerprint before the new server writes its own.
 rm -f "$RUN/server.fingerprint" "$RUN/server.addr"
 
+# The server caps --ticks at 10,000,000 (about 46 h at 60 Hz). It then exits and
+# `restart: unless-stopped` brings it back with the saved world.
 sandbox-server \
     --serve \
     --listen "0.0.0.0:${SPALL_GAME_PORT:-7777}" \
@@ -26,7 +28,7 @@ sandbox-server \
     --fingerprint-out "$RUN/server.fingerprint" \
     --addr-out "$RUN/server.addr" \
     --log-json "$DATA/logs/server.jsonl" \
-    --ticks 4294967295 \
+    --ticks 10000000 \
     --paced \
     --quiescence-ticks 0 \
     --min-clients 0 \

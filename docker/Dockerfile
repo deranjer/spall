@@ -28,5 +28,6 @@ USER spall
 # 7777/udp: QUIC game traffic. 8080/tcp: download web UI.
 EXPOSE 7777/udp 8080/tcp
 VOLUME ["/data"]
-HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \n    CMD python3 -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=2)" || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
+    CMD python3 -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=2)" || exit 1
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
