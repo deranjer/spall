@@ -1,0 +1,32 @@
+# Spall server stack. Run from this directory:
+#   SPALL_PUBLIC_ADDRESS=your.host.or.ip docker compose up -d
+# Players open http://your.host.or.ip:8080, download the client, and run connect.bat.
+services:
+  spall-server:
+    image: ${SPALL_IMAGE:-ghcr.io/deranjer/spall-server:latest}
+    # To build locally instead of pulling, uncomment and run `docker compose build`:
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${SPALL_GAME_PORT:-7777}:7777/udp"
+      - "${SPALL_WEB_PORT:-8080}:8080/tcp"
+    environment:
+      # The address players' clients dial, as a host name or IP. Add :port (the host
+      # port for 7777/udp) if it differs from 7777. Leave empty only if players open the
+      # page by IPv4 address; that address is then used.
+      SPALL_PUBLIC_ADDRESS: ${SPALL_PUBLIC_ADDRESS:-}
+      # Host port clients dial when SPALL_PUBLIC_ADDRESS has no :port.
+      SPALL_PUBLIC_PORT: ${SPALL_GAME_PORT:-7777}
+      SPALL_SEED: ${SPALL_SEED:-1}
+      SPALL_WORLD_SIZE: ${SPALL_WORLD_SIZE:-1024}
+      SPALL_SEASON: ${SPALL_SEASON:-summer}
+      SPALL_MAX_CLIENTS: ${SPALL_MAX_CLIENTS:-8}
+    volumes:
+      # Join token, world save, and logs. Keep it to preserve the world and the token.
+      - spall-data:/data
+
+volumes:
+  spall-data:

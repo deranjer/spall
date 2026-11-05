@@ -19,3 +19,10 @@ docs/reports/**/*.log
 
 # Raw ENG-103 grid-solver evidence (solver removed in ENG-169); kept on disk and in history only.
 docs/reports/ENG-103-evidence/
+
+# Client bundle staged by the release workflow (build output, not source).
+/docker/client/*
+!/docker/client/README.md
+
+# Python bytecode caches.
+__pycache__/
