@@ -23,6 +23,10 @@ services:
       SPALL_SEED: ${SPALL_SEED:-1}
       SPALL_WORLD_SIZE: ${SPALL_WORLD_SIZE:-1024}
       SPALL_SEASON: ${SPALL_SEASON:-summer}
+      # Set to "winter" for the Winter Crossing scenario (blizzards, animals, cabin, shed
+      # and tower). It overrides SPALL_SEASON and is not saved: the world is regenerated
+      # on every restart. Leave empty for the persistent showcase world.
+      SPALL_SCENARIO: ${SPALL_SCENARIO:-}
       SPALL_MAX_CLIENTS: ${SPALL_MAX_CLIENTS:-8}
     volumes:
       # Join token, world save, and logs. Keep it to preserve the world and the token.

@@ -22,6 +22,10 @@ COPY --from=builder /sandbox-server /usr/local/bin/sandbox-server
 COPY docker/webui/app.py /opt/spall/webui/app.py
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/client/ /opt/spall/client/
+# The winter scenario loads the cabin, tower and shed from fixtures/ at the path baked in
+# at build time: /src/examples/sandbox/../../fixtures. Recreate that layout.
+COPY fixtures/ /src/fixtures/
+RUN mkdir -p /src/examples/sandbox
 RUN chmod +x /usr/local/bin/entrypoint.sh     && useradd --system --home-dir /data --shell /usr/sbin/nologin spall     && mkdir -p /data /run/spall     && chown spall /data /run/spall
 USER spall
 
