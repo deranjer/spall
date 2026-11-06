@@ -565,7 +565,8 @@ fn load_asset(
     record: &AssetRecord,
     mapping: &BTreeMap<String, MaterialId>,
 ) -> Result<content::LoadedVoxelAsset, EditorSceneError> {
-    let file = root.join(&record.storage);
+    // Projects saved on Windows store `assets\x.spvox`; treat a backslash as a separator on every OS.
+    let file = root.join(record.storage.to_string_lossy().replace('\\', "/"));
     let asset_error = |message: String| EditorSceneError::Asset {
         asset: record.name.clone(),
         message,
