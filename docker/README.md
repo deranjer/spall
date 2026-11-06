@@ -19,6 +19,12 @@ Settings are environment variables in [compose.yaml](compose.yaml):
 `SPALL_WORLD_SIZE` (cells of 0.25 m; multiple of 32, 128 to 4096), `SPALL_SEASON`,
 `SPALL_MAX_CLIENTS`. The world, join token and logs live in the `spall-data` volume.
 
+`SPALL_SCENARIO=winter` runs the Winter Crossing scenario (held winter, blizzards,
+animals, and the cabin, shed and tower; see "Winter Crossing scenario" in
+[docs/architecture.md](../docs/architecture.md)) instead of the showcase world.
+It replaces `SPALL_SEASON`, and the world is not saved: animals need an ephemeral
+world, so every restart generates a fresh one. The join token still persists.
+
 ## Security
 
 The join token is the only credential. The download page gives it to anyone who can
