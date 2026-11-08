@@ -435,7 +435,7 @@ impl InteractiveApp {
             hammer_radius: HAMMER_RADIUS_DEFAULT,
             hammer_on: false,
             held_item: None,
-            next_action_id: HAMMER_REQUEST_BASE,
+            next_action_id: launch_request_base(),
             emitter_instances: Vec::new(),
             hammer_target: None,
             material_names: std::collections::BTreeMap::new(),

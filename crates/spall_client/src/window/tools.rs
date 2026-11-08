@@ -17,6 +17,19 @@ pub(super) const HAMMER_RADIUS_MAX: i64 = 8;
 /// and review-cut (`1_000_000 + n`) ranges.
 pub(super) const HAMMER_REQUEST_BASE: u64 = 2_000_000;
 
+/// The first request id of this launch. The server remembers each player's
+/// recent request ids (account, else transport slot) and answers a repeat from
+/// that memory without acting, so a relaunched client counting from the same
+/// base would have its first presses (door, pickup, swing) swallowed as retries
+/// of the previous launch's. Each launch starts a million ids past the last
+/// one a second earlier could have reached.
+pub(super) fn launch_request_base() -> u64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    HAMMER_REQUEST_BASE + (secs << 20)
+}
+
 /// The torch: the game's `PLACE_LAMP` tool, bound to `T`. It places a small
 /// emissive lamp ball against the surface under the crosshair.
 pub(super) const TORCH_TOOL: u16 = 4;
