@@ -50,9 +50,16 @@ client is bundled.
 
 ## Release
 
-The **release-server** workflow (Actions tab, manual trigger, from `main` only) builds
-the Windows client, then builds and pushes `ghcr.io/<owner>/spall-server` with the
-version you enter and `latest`.
+Every merge to `main` runs the **release** workflow. The tests, the Linux server build
+and the Windows client build run in parallel. The image is pushed as `sha-<commit>` once
+both builds finish; when the tests also pass, the workflow tags the next semantic version
+(`vX.Y.Z`, from the commit messages since the last tag: `feat:` is minor, `type!:` or a
+`BREAKING CHANGE` footer is major, anything else patch), retags the image as `X.Y.Z` and
+`latest`, and creates a GitHub release with the client zip. Squash-merge with a
+conventional PR title so the bump reflects the change.
+
+To run the same image build by hand, put a Linux `sandbox-server` in
+`docker/server-bin/` and pass `--build-arg SERVER_SOURCE=prebuilt`.
 
 ## Limits
 

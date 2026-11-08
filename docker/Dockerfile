@@ -13,12 +13,19 @@ COPY . .
 RUN cargo build --release --locked -p sandbox --bin sandbox-server \
     && cp target/release/sandbox-server /sandbox-server
 
+# The release workflow builds the server binary with a cached cargo build and
+# builds this image with --build-arg SERVER_SOURCE=prebuilt, which skips the
+# `builder` stage above; docker/server-bin/sandbox-server must exist then.
+FROM scratch AS prebuilt
+COPY docker/server-bin/sandbox-server /sandbox-server
+
 FROM debian:bookworm-slim
+ARG SERVER_SOURCE=builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /sandbox-server /usr/local/bin/sandbox-server
+COPY --from=${SERVER_SOURCE} /sandbox-server /usr/local/bin/sandbox-server
 COPY docker/webui/app.py /opt/spall/webui/app.py
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/client/ /opt/spall/client/

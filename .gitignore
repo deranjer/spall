@@ -26,3 +26,4 @@ docs/reports/ENG-103-evidence/
 
 # Python bytecode caches.
 __pycache__/
+/docker/server-bin/

@@ -1,14 +1,103 @@
 name: ci
 
+# Pull requests run this directly. A push to main runs it through release.yml
+# (workflow_call), in parallel with the release builds, so main is never tested
+# twice. Branch pushes are covered by their pull request.
+
 on:
-  push:
   pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Debug info is only for local debugging; CI builds link faster and cache smaller without it.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  foundation:
+  lint:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.1
-      - run: cargo xtask check
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo xtask proportionality
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # Compile every test binary once, then run them on several runners.
+  build-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest archive --workspace --all-features --archive-file tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-archive
+          path: tests.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  test:
+    needs: build-tests
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests-archive
+      # A test that fails once and passes on the retry is reported as flaky, not hidden.
+      - run: >-
+          cargo nextest run
+          --archive-file tests.tar.zst
+          --workspace-remap .
+          --partition count:${{ matrix.shard }}/4
+          --retries 1
+          --no-fail-fast
+
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: smoke
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo xtask smoke --ticks 60 --output .local/runs/ci-smoke
+
+  # One required check for branch protection.
+  ci-ok:
+    if: always()
+    needs: [lint, test, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "A required job did not pass" >&2
+            exit 1
+          fi
