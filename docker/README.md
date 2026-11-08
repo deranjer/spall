@@ -17,13 +17,13 @@ SPALL_PUBLIC_ADDRESS=your.host.or.ip docker compose up -d
 Settings are environment variables in [compose.yaml](compose.yaml):
 `SPALL_PUBLIC_ADDRESS` (IPv4 address or host name, optional `:port`; required unless you open the page by IPv4 address), `SPALL_SEED`,
 `SPALL_WORLD_SIZE` (cells of 0.25 m; multiple of 32, 128 to 4096), `SPALL_SEASON`,
-`SPALL_MAX_CLIENTS`, `SPALL_SCENARIO`. The world, join token and logs live in the `spall-data` volume.
+`SPALL_MAX_CLIENTS`. The world, join token and logs live in the `spall-data` volume.
 
-`SPALL_SCENARIO=winter` runs the Winter Crossing scenario (find the beacon tower) instead
-of the summer sandbox; it replaces `SPALL_SEASON`. The server reuses a world already saved
-in the volume, so to switch an existing deployment, start with a fresh volume
-(`docker compose down -v` deletes the current world and the join token, so players need
-a new bundle).
+`SPALL_SCENARIO=winter` runs the Winter Crossing scenario (held winter, blizzards,
+animals, and the cabin, shed and tower; see "Winter Crossing scenario" in
+[docs/architecture.md](../docs/architecture.md)) instead of the showcase world.
+It replaces `SPALL_SEASON`, and the world is not saved: animals need an ephemeral
+world, so every restart generates a fresh one. The join token still persists.
 
 ## Security
 

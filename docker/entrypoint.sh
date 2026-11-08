@@ -19,19 +19,25 @@ fi
 # never serves a stale fingerprint before the new server writes its own.
 rm -f "$RUN/server.fingerprint" "$RUN/server.addr"
 
-# SPALL_SCENARIO=winter runs the Winter Crossing scenario (cabin, beacon tower, held
-# winter, animals). The server rejects --scenario-winter together with --season, so
-# exactly one of them is passed. A saved world in $DATA/world is reused as it is, so
-# changing this on an existing volume needs a fresh volume (or a different world dir).
+# SPALL_SCENARIO=winter runs the Winter Crossing scenario: a held winter, blizzards,
+# animals, and the cabin, shed and tower. It replaces the season and cannot be saved
+# (animals need an ephemeral world), so the world is regenerated on every restart.
+# Anything else runs the persistent showcase world.
 case "${SPALL_SCENARIO:-}" in
-    "")     world_mode="--season ${SPALL_SEASON:-summer}" ;;
-    winter) world_mode="--scenario-winter" ;;
-    *)      echo "entrypoint: unknown SPALL_SCENARIO '${SPALL_SCENARIO}' (use 'winter' or leave empty)" >&2
-            exit 2 ;;
+    winter)
+        set -- --scenario-winter
+        ;;
+    "")
+        set -- --season "${SPALL_SEASON:-summer}" --save
+        ;;
+    *)
+        echo "entrypoint: unknown SPALL_SCENARIO '${SPALL_SCENARIO}' (use 'winter' or leave empty)" >&2
+        exit 2
+        ;;
 esac
 
 # The server caps --ticks at 10,000,000 (about 46 h at 60 Hz). It then exits and
-# `restart: unless-stopped` brings it back with the saved world.
+# `restart: unless-stopped` brings it back (with the saved world, unless winter).
 sandbox-server \
     --serve \
     --listen "0.0.0.0:${SPALL_GAME_PORT:-7777}" \
@@ -47,9 +53,8 @@ sandbox-server \
     --worldgen "${SPALL_WORLDGEN:-showcase}" \
     --seed "${SPALL_SEED:-1}" \
     --worldgen-size "${SPALL_WORLD_SIZE:-1024}" \
-    $world_mode \
     --world "$DATA/world" \
-    --save &
+    "$@" &
 server_pid=$!
 
 SPALL_RUN_DIR=$RUN \
