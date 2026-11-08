@@ -7,6 +7,8 @@
 # assets/audio). The release workflow fills it from a Windows build. Without it
 # the image still runs the server, and the web UI reports that no client is bundled.
 
+ARG SERVER_SOURCE=builder
+
 FROM rust:1.96.1-bookworm AS builder
 WORKDIR /src
 COPY . .
@@ -19,13 +21,15 @@ RUN cargo build --release --locked -p sandbox --bin sandbox-server \
 FROM scratch AS prebuilt
 COPY docker/server-bin/sandbox-server /sandbox-server
 
+# `COPY --from` cannot expand a variable, so pick the source through a stage.
+FROM ${SERVER_SOURCE} AS server
+
 FROM debian:bookworm-slim
-ARG SERVER_SOURCE=builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=${SERVER_SOURCE} /sandbox-server /usr/local/bin/sandbox-server
+COPY --from=server /sandbox-server /usr/local/bin/sandbox-server
 COPY docker/webui/app.py /opt/spall/webui/app.py
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/client/ /opt/spall/client/
